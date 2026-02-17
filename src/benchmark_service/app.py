@@ -172,7 +172,10 @@ def create_app(benchmark_service: BenchmarkService) -> FastAPI:
             error_chunk = StreamErrorChunk(type="error", data=error_msg)
             await websocket.send_json(error_chunk.model_dump())
         finally:
-            await websocket.close()
+            try:
+                await websocket.close()
+            except RuntimeError:
+                pass
 
     @app.post("/evaluate-response/")
     def evaluate_response(request: EvaluateResponseRequest) -> Any:
@@ -246,7 +249,10 @@ def create_app(benchmark_service: BenchmarkService) -> FastAPI:
             error_chunk = StreamErrorChunk(type="error", data=error_msg)
             await websocket.send_json(error_chunk.model_dump())
         finally:
-            await websocket.close()
+            try:
+                await websocket.close()
+            except RuntimeError:
+                pass
 
     @app.post("/final-score/")
     async def final_score(request: FinalScoreRequest) -> FinalScoreResponse:

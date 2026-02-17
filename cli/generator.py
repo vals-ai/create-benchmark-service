@@ -110,7 +110,6 @@ def generate_project(
     # Files to copy from root
     files_to_copy = [
         "Makefile",
-        "Dockerfile",
         ".gitignore",
         ".dockerignore",
         ".python-version",
@@ -158,3 +157,7 @@ def generate_project(
     # Copy benchmark_service.py template
     if (templates_dir / "benchmark_service.py").exists():
         copy_file(templates_dir / "benchmark_service.py", benchmark_package_dir / "benchmark_service.py")
+
+    # Copy Dockerfile from templates
+    if (templates_dir / "Dockerfile").exists():
+        copy_file(templates_dir / "Dockerfile", output_dir / "Dockerfile")

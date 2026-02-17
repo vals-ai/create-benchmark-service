@@ -2,6 +2,11 @@
 
 CLI tool to scaffold benchmark services.
 
+> **TODO**: When this repository becomes public, update `templates/pyproject.toml.jinja` to use HTTPS instead of SSH:
+> ```toml
+> "create-benchmark-service @ git+https://github.com/vals-ai/create-benchmark-service.git@main"
+> ```
+
 ## Installation
 
 ```bash

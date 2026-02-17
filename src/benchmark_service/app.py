@@ -5,6 +5,7 @@ This module provides a complete FastAPI implementation.
 Import create_app and pass your BenchmarkService implementation.
 """
 
+import logging
 import traceback
 from typing import Any
 
@@ -20,11 +21,14 @@ from benchmark_service.schemas import (
     HealthCheckResponse,
     RetrieveTaskResponse,
     SetupTaskRequest,
+    StreamErrorChunk,
     TaskFilter,
     VerifyTaskIdsResponse,
 )
 
 # pyright: reportUnusedFunction=false
+
+logger = logging.getLogger(__name__)
 
 
 def create_app(benchmark_service: BenchmarkService) -> FastAPI:
@@ -42,8 +46,8 @@ def create_app(benchmark_service: BenchmarkService) -> FastAPI:
     @app.exception_handler(Exception)
     async def exception_handler(_request: Request, exc: Exception):
         """Global exception handler for unhandled errors."""
-        print(f"Error: {exc}")
-        print(traceback.format_exc())
+        logger.error(f"Error: {exc}")
+        logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"{str(exc)}: {traceback.format_exc()}") from exc
 
     @app.get("/health")
@@ -138,30 +142,37 @@ def create_app(benchmark_service: BenchmarkService) -> FastAPI:
         """
         await websocket.accept()
 
-        # Extract headers
-        api_key = websocket.headers.get("x-api-key")
-        api_url = websocket.headers.get("x-api-url")
-        target = websocket.headers.get("x-target")
+        try:
+            # Extract headers
+            api_key = websocket.headers.get("x-api-key")
+            api_url = websocket.headers.get("x-api-url")
+            target = websocket.headers.get("x-target")
 
-        if not api_key or not api_url or not target:
-            await websocket.close(code=1008, reason="Missing required headers: x-api-key, x-api-url, x-target")
-            return
+            if not api_key or not api_url or not target:
+                await websocket.close(code=1008, reason="Missing required headers: x-api-key, x-api-url, x-target")
+                return
 
-        # Receive request data
-        data = await websocket.receive_json()
-        request = SetupTaskRequest(**data)
+            # Receive request data
+            data = await websocket.receive_json()
+            request = SetupTaskRequest(**data)
 
-        # Setup Daytona client and get sandbox
-        daytona_config = DaytonaConfig(api_key=api_key, api_url=api_url, target=target)
+            # Setup Daytona client and get sandbox
+            daytona_config = DaytonaConfig(api_key=api_key, api_url=api_url, target=target)
 
-        async with AsyncDaytona(config=daytona_config) as daytona:
-            sandbox = await daytona.get(request.instance_id)
+            async with AsyncDaytona(config=daytona_config) as daytona:
+                sandbox = await daytona.get(request.instance_id)
 
-            # Call benchmark service implementation and stream results
-            async for message in benchmark_service.setup_task(request.task_id, sandbox):
-                await websocket.send_json(message.model_dump())
+                # Call benchmark service implementation and stream results
+                async for message in benchmark_service.setup_task(request.task_id, sandbox):
+                    await websocket.send_json(message.model_dump())
 
-        await websocket.close()
+        except Exception as e:
+            error_msg = f"{str(e)}\n{traceback.format_exc()}"
+            logger.error(f"WebSocket error: {error_msg}")
+            error_chunk = StreamErrorChunk(type="error", data=error_msg)
+            await websocket.send_json(error_chunk.model_dump())
+        finally:
+            await websocket.close()
 
     @app.post("/evaluate-response/")
     def evaluate_response(request: EvaluateResponseRequest) -> Any:
@@ -205,30 +216,37 @@ def create_app(benchmark_service: BenchmarkService) -> FastAPI:
         """
         await websocket.accept()
 
-        # Extract headers
-        api_key = websocket.headers.get("x-api-key")
-        api_url = websocket.headers.get("x-api-url")
-        target = websocket.headers.get("x-target")
+        try:
+            # Extract headers
+            api_key = websocket.headers.get("x-api-key")
+            api_url = websocket.headers.get("x-api-url")
+            target = websocket.headers.get("x-target")
 
-        if not api_key or not api_url or not target:
-            await websocket.close(code=1008, reason="Missing required headers: x-api-key, x-api-url, x-target")
-            return
+            if not api_key or not api_url or not target:
+                await websocket.close(code=1008, reason="Missing required headers: x-api-key, x-api-url, x-target")
+                return
 
-        # Receive request data
-        data = await websocket.receive_json()
-        request = EvaluateInstanceRequest(**data)
+            # Receive request data
+            data = await websocket.receive_json()
+            request = EvaluateInstanceRequest(**data)
 
-        # Setup Daytona client and get sandbox
-        daytona_config = DaytonaConfig(api_key=api_key, api_url=api_url, target=target)
+            # Setup Daytona client and get sandbox
+            daytona_config = DaytonaConfig(api_key=api_key, api_url=api_url, target=target)
 
-        async with AsyncDaytona(config=daytona_config) as daytona:
-            sandbox = await daytona.get(request.instance_id)
+            async with AsyncDaytona(config=daytona_config) as daytona:
+                sandbox = await daytona.get(request.instance_id)
 
-            # Call benchmark service implementation and stream results
-            async for message in benchmark_service.evaluate_instance(request.task_id, sandbox):
-                await websocket.send_json(message.model_dump())
+                # Call benchmark service implementation and stream results
+                async for message in benchmark_service.evaluate_instance(request.task_id, sandbox):
+                    await websocket.send_json(message.model_dump())
 
-        await websocket.close()
+        except Exception as e:
+            error_msg = f"{str(e)}\n{traceback.format_exc()}"
+            logger.error(f"WebSocket error: {error_msg}")
+            error_chunk = StreamErrorChunk(type="error", data=error_msg)
+            await websocket.send_json(error_chunk.model_dump())
+        finally:
+            await websocket.close()
 
     @app.post("/final-score/")
     async def final_score(request: FinalScoreRequest) -> FinalScoreResponse:

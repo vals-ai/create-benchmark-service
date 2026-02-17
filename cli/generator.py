@@ -2,6 +2,7 @@
 
 import re
 import shutil
+import sys
 from pathlib import Path
 from typing import TypedDict
 
@@ -57,6 +58,14 @@ def validate_name(name: str) -> None:
     # Must start with a letter
     if not name[0].isalpha():
         raise ValueError("Benchmark name must start with a letter")
+
+    # Check for reserved names (Python standard library modules)
+    normalized_name = name.lower().replace("-", "_")
+    if normalized_name in sys.stdlib_module_names:
+        raise ValueError(
+            f"'{name}' conflicts with Python standard library module '{normalized_name}'. "
+            f"Please choose a different name."
+        )
 
 
 def copy_file(source: Path, dest: Path) -> None:

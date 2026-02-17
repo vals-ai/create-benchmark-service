@@ -57,6 +57,21 @@ class TestValidateName:
         with pytest.raises(ValueError, match="must start with a letter"):
             validate_name("123bench")
 
+    def test_reserved_name_test(self):
+        """Test that 'test' is rejected as reserved."""
+        with pytest.raises(ValueError, match="conflicts with Python standard library"):
+            validate_name("test")
+
+    def test_reserved_name_sys(self):
+        """Test that 'sys' is rejected as reserved."""
+        with pytest.raises(ValueError, match="conflicts with Python standard library"):
+            validate_name("sys")
+
+    def test_reserved_name_with_hyphens(self):
+        """Test that hyphenated names with reserved words are rejected."""
+        with pytest.raises(ValueError, match="conflicts with Python standard library"):
+            validate_name("json")  # Standard library module
+
 
 class TestGenerateProject:
     """Tests for generate_project function."""

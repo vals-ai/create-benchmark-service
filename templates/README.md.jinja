@@ -1,115 +1,25 @@
 # {{ benchmark_name }} Service
 
-## Quick Start
+## Getting started
+
+Edit `src/{{ benchmark_package }}/benchmark_service.py` and implement the six abstract methods on `ExampleBenchmark`:
+
+| Method | What to do |
+|--------|------------|
+| `load_dataset()` | Return `dict[task_id, ...]` of all tasks |
+| `retrieve_task()` | Return docker image, problem statement, and resource requirements |
+| `setup_task()` | Prepare the sandbox before evaluation (upload files, run install commands) |
+| `evaluate_response()` | Score a plain-text response without a sandbox |
+| `evaluate_instance()` | Run tests / evaluation scripts in the sandbox |
+| `calculate_final_score()` | Aggregate per-task results into a single score |
+
+`setup_task` and `evaluate_instance` are async generators — yield `StreamMessageChunk`, `StreamErrorChunk`, and finally `StreamResultChunk`.
+
+## Development
 
 ```bash
-# Install dependencies
-make install
-
-# Run the service
-make dev
-```
-
-## What to Implement
-
-The benchmark implementation is in `src/{benchmark_package}/benchmark_service.py`. Customize the `ExampleBenchmark` class:
-
-### Required Methods
-
-1. **`load_dataset()`** - Load your benchmark dataset
-   ```python
-   def load_dataset(self) -> dict[str, Any]:
-       return {
-           "task-1": {"problem": "...", "answer": "..."},
-           "task-2": {"problem": "...", "answer": "..."},
-       }
-   ```
-
-2. **`retrieve_task()`** - Return task metadata
-   ```python
-   def retrieve_task(self, task_id: str, skip_validation: bool = False):
-       task = self.tasks[task_id]
-       return RetrieveTaskResponse(
-           docker_image="python:3.12-slim",
-           problem_statement=task["problem"],
-           request_setup=False,
-           cwd="/workspace",
-           resources=Resources(vcpu=2, memory=4, disk=10)
-       )
-   ```
-
-3. **`calculate_final_score()`** - Calculate aggregate scores
-   ```python
-   def calculate_final_score(self, evaluation_results: dict[str, Any]):
-       total = len(evaluation_results)
-       passed = sum(1 for r in evaluation_results.values() if r.get("passed"))
-       score = (passed / total * 100) if total > 0 else 0.0
-       return FinalScoreResult(score=score, metadata={"total": total, "passed": passed})
-   ```
-
-### Optional Methods
-
-4. **`evaluate_response()`** - For text-based benchmarks
-5. **`setup_task()`** - For execution benchmarks (sandbox setup)
-6. **`evaluate_instance()`** - For execution benchmarks (sandbox evaluation)
-
-## API Endpoints
-
-| Endpoint | Method | Description |
-|----------|--------|-------------|
-| `/health` | GET | Health check |
-| `/verify-task-ids` | GET | Verify task IDs exist |
-| `/retrieve-task/` | GET | Get task metadata |
-| `/evaluate-response/` | POST | Evaluate text response |
-| `/ws/setup-task` | WebSocket | Setup task in sandbox |
-| `/ws/evaluate-instance` | WebSocket | Evaluate in sandbox |
-| `/final-score/` | POST | Calculate aggregate score |
-
-## Development Commands
-
-```bash
-make help                      # Show all available commands
-make install                   # Install dependencies
-make update-benchmark-service  # Update the framework
-make dev                       # Start development server
-make lint                      # Check code style
-make format                    # Format code
-make typecheck                 # Type check code
-make test                      # Run tests
-make docker-build              # Build Docker image
-make docker-run                # Run in Docker
-```
-
-## Project Structure
-
-```
-.
-├── main.py                           # Entry point (imports and creates app)
-├── src/
-│   └── {benchmark_package}/
-│       ├── __init__.py
-│       └── benchmark_service.py      # ExampleBenchmark implementation
-├── tests/                            # Tests
-├── .github/workflows/                # CI/CD
-├── pyproject.toml                    # Dependencies
-├── Dockerfile                        # Container image
-└── Makefile                          # Commands
-```
-
-The `main.py` file is just:
-```python
-from benchmark_service import create_app
-from {benchmark_package}.benchmark_service import ExampleBenchmark
-
-app = create_app(ExampleBenchmark())
-```
-
-All implementation details are in `src/{benchmark_package}/benchmark_service.py`.
-
-## Framework Updates
-
-To update the benchmark service framework:
-
-```bash
-make update-benchmark-service
+make install   # install dependencies
+make dev       # run local server
+make test      # run tests
+make help      # list all commands
 ```

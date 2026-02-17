@@ -1,41 +1,9 @@
 """Tests for BenchmarkService base class non-abstract methods."""
 
-from collections.abc import AsyncGenerator
-from typing import Any
-
 import pytest
-from daytona import AsyncSandbox
 
-from benchmark_service.base import BenchmarkService
-from benchmark_service.schemas import (
-    EvaluateResponseRequest,
-    FinalScoreResult,
-    RetrieveTaskResponse,
-    StreamChunk,
-    TaskFilter,
-)
-
-
-class StubBenchmark(BenchmarkService):
-    """Minimal concrete implementation for testing."""
-
-    def load_dataset(self) -> dict[str, Any]:
-        return {
-            "task-1": {"problem": "a"},
-            "task-2": {"problem": "b"},
-            "task-3": {"problem": "c"},
-        }
-
-    def retrieve_task(self, task_id: str, skip_validation: bool = False) -> RetrieveTaskResponse: ...
-    def setup_task(self, task_id: str, sandbox: AsyncSandbox) -> AsyncGenerator[StreamChunk, None]: ...
-    def evaluate_response(self, request: EvaluateResponseRequest) -> Any: ...
-    def evaluate_instance(self, task_id: str, sandbox: AsyncSandbox) -> AsyncGenerator[StreamChunk, None]: ...
-    def calculate_final_score(self, evaluation_results: dict[str, Any]) -> FinalScoreResult: ...
-
-
-@pytest.fixture
-def service() -> StubBenchmark:
-    return StubBenchmark()
+from benchmark_service.schemas import TaskFilter
+from tests.conftest import StubBenchmark
 
 
 @pytest.mark.parametrize(

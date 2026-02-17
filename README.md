@@ -10,7 +10,7 @@ CLI tool to scaffold benchmark services.
 ## Installation
 
 ```bash
-pip install git+https://github.com/vals-ai/create-benchmark-service.git@main
+pip install git+ssh://git@github.com/vals-ai/create-benchmark-service.git@main
 ```
 
 ## Usage

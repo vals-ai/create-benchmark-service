@@ -94,13 +94,13 @@ def generate_project(
     # Transform names
     names = transform_name(benchmark_name)
 
-    # Get template directory (skeleton root)
-    skeleton_dir = Path(__file__).parent.parent
+    # Get root directory
+    root = Path(__file__).parent.parent
 
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Files to copy from skeleton root
+    # Files to copy from root
     files_to_copy = [
         "Makefile",
         "Dockerfile",
@@ -111,12 +111,12 @@ def generate_project(
 
     # Copy files
     for file_name in files_to_copy:
-        source = skeleton_dir / file_name
+        source = root / file_name
         if source.exists():
             copy_file(source, output_dir / file_name)
 
     # Set up Jinja2 environment
-    templates_dir = skeleton_dir / "templates"
+    templates_dir = root / "templates"
     env = Environment(loader=FileSystemLoader(templates_dir))
 
     # Render Jinja2 templates
@@ -132,17 +132,14 @@ def generate_project(
             content = template.render(names)
             (output_dir / output_name).write_text(content)
 
-    # Copy directories
-    dirs_to_copy = [
-        ".github",
-        "tests",
-    ]
+    # Copy .github directory
+    github_dir = root / ".github"
+    if github_dir.exists():
+        shutil.copytree(github_dir, output_dir / ".github")
 
-    for dir_name in dirs_to_copy:
-        source_dir = skeleton_dir / dir_name
-        dest_dir = output_dir / dir_name
-        if source_dir.exists():
-            shutil.copytree(source_dir, dest_dir)
+    # Create empty tests directory
+    (output_dir / "tests").mkdir(exist_ok=True)
+    (output_dir / "tests" / "__init__.py").write_text("")
 
     # Create benchmark-specific package directory
     benchmark_package_dir = output_dir / "src" / names["benchmark_package"]

@@ -111,15 +111,12 @@ def generate_project(
     files_to_copy = [
         "Makefile",
         ".gitignore",
-        ".dockerignore",
         ".python-version",
     ]
 
     # Copy files
     for file_name in files_to_copy:
-        source = root / file_name
-        if source.exists():
-            copy_file(source, output_dir / file_name)
+        copy_file(root / file_name, output_dir / file_name)
 
     # Set up Jinja2 environment
     templates_dir = root / "templates"
@@ -133,15 +130,12 @@ def generate_project(
     }
 
     for template_name, output_name in template_files.items():
-        if (templates_dir / template_name).exists():
-            template = env.get_template(template_name)
-            content = template.render(names)
-            (output_dir / output_name).write_text(content)
+        template = env.get_template(template_name)
+        content = template.render(names)
+        (output_dir / output_name).write_text(content)
 
     # Copy .github directory
-    github_dir = root / ".github"
-    if github_dir.exists():
-        shutil.copytree(github_dir, output_dir / ".github")
+    shutil.copytree(root / ".github", output_dir / ".github")
 
     # Create empty tests directory
     (output_dir / "tests").mkdir(exist_ok=True)
@@ -154,10 +148,7 @@ def generate_project(
     # Create __init__.py in the package
     (benchmark_package_dir / "__init__.py").write_text(f'"""Utilities for {names["benchmark_name"]} benchmark."""\n')
 
-    # Copy benchmark_service.py template
-    if (templates_dir / "benchmark_service.py").exists():
-        copy_file(templates_dir / "benchmark_service.py", benchmark_package_dir / "benchmark_service.py")
-
-    # Copy Dockerfile from templates
-    if (templates_dir / "Dockerfile").exists():
-        copy_file(templates_dir / "Dockerfile", output_dir / "Dockerfile")
+    # Copy templates
+    copy_file(templates_dir / "benchmark_service.py", benchmark_package_dir / "benchmark_service.py")
+    copy_file(templates_dir / "Dockerfile", output_dir / "Dockerfile")
+    copy_file(templates_dir / ".dockerignore", output_dir / ".dockerignore")

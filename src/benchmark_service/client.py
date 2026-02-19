@@ -1,12 +1,11 @@
 """HTTP/WebSocket client for communicating with a benchmark service."""
 
-import json
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import Callable
 from typing import Any
 
 import httpx
 import websockets
-from websockets.asyncio.client import ClientConnection
+from pydantic import BaseModel, TypeAdapter
 from websockets.exceptions import ConnectionClosed
 
 from benchmark_service.schemas import (
@@ -16,8 +15,11 @@ from benchmark_service.schemas import (
     RetrieveTaskResponse,
     SetupTaskRequest,
     SetupTaskResponse,
+    StreamChunk,
     VerifyTaskIdsResponse,
 )
+
+_stream_chunk_adapter: TypeAdapter[StreamChunk] = TypeAdapter(StreamChunk)
 
 
 class BenchmarkServiceError(Exception):
@@ -37,36 +39,37 @@ class BenchmarkServiceClient:
         self._timeout = timeout
 
     @property
-    def ws_url(self) -> str:
+    def _ws_url(self) -> str:
         return self._url.replace("http://", "ws://").replace("https://", "wss://")
 
-    async def _stream_websocket(self, websocket: ClientConnection) -> AsyncGenerator[tuple[str, Any]]:
-        """
-        Dispatch on StreamChunk type field.
+    async def _websocket_request(
+        self, path: str, request: BaseModel, on_message: Callable[[str], None] | None = None
+    ) -> Any:
+        async with websockets.connect(
+            f"{self._ws_url}/ws/{path}",
+            additional_headers=self._headers,
+            open_timeout=60,
+        ) as websocket:
+            await websocket.send(request.model_dump_json())
 
-        Yields:
-            tuple[str, Any]: (chunk_type, data) for "message" and "result" chunks.
+            try:
+                async for message in websocket:
+                    chunk: StreamChunk = _stream_chunk_adapter.validate_json(message)
 
-        Raises:
-            BenchmarkServiceError: On "error" chunks.
-        """
-        try:
-            async for message in websocket:
-                parsed_message: dict[str, Any] = json.loads(message)
-                chunk_type: str = parsed_message["type"]
-                data: Any = parsed_message["data"]
+                    match chunk.type:
+                        case "error":
+                            raise BenchmarkServiceError(chunk.data)
+                        case "result":
+                            return chunk.data
+                        case "message":
+                            if on_message:
+                                on_message(chunk.data)
+            except ConnectionClosed:
+                pass
 
-                if chunk_type == "error":
-                    raise BenchmarkServiceError(data)
+        raise BenchmarkServiceError("Exited websocket without returning final result")
 
-                if not data:
-                    continue
-
-                yield (chunk_type, data)
-        except ConnectionClosed:
-            pass
-
-    async def request_health_check(self) -> HealthCheckResponse:
+    async def health_check(self) -> HealthCheckResponse:
         async with httpx.AsyncClient(follow_redirects=True, timeout=self._timeout) as client:
             response = await client.get(f"{self._url}/health")
 
@@ -77,7 +80,7 @@ class BenchmarkServiceClient:
 
         return HealthCheckResponse.model_validate(response.json())
 
-    async def request_verify_task_ids(
+    async def verify_task_ids(
         self, task_ids: list[str] | None, slice_str: str | None
     ) -> VerifyTaskIdsResponse:
         params: dict[str, list[str] | str] = {}
@@ -96,7 +99,7 @@ class BenchmarkServiceClient:
 
         return VerifyTaskIdsResponse.model_validate(response.json())
 
-    async def request_retrieve_task(self, task_id: str, skip_validation: bool = False) -> RetrieveTaskResponse:
+    async def retrieve_task(self, task_id: str, skip_validation: bool = False) -> RetrieveTaskResponse:
         params = {"task_id": task_id, "skip_validation": skip_validation}
         async with httpx.AsyncClient(follow_redirects=True, timeout=self._timeout) as client:
             response = await client.get(f"{self._url}/retrieve-task/", params=params)
@@ -108,49 +111,20 @@ class BenchmarkServiceClient:
 
         return RetrieveTaskResponse.model_validate(response.json())
 
-    async def request_setup_task(
+    async def setup_task(
         self, task_id: str, instance_id: str, on_message: Callable[[str], None] | None = None
     ) -> SetupTaskResponse:
         request = SetupTaskRequest(task_id=task_id, instance_id=instance_id)
+        result = await self._websocket_request("setup-task", request, on_message)
+        return SetupTaskResponse.model_validate(result)
 
-        async with websockets.connect(
-            f"{self.ws_url}/ws/setup-task",
-            additional_headers=self._headers,
-            open_timeout=60,
-        ) as websocket:
-            await websocket.send(request.model_dump_json())
-
-            async for chunk_type, data in self._stream_websocket(websocket):
-                if chunk_type == "result":
-                    return SetupTaskResponse.model_validate(data)
-
-                if on_message and chunk_type == "message":
-                    on_message(data)
-
-        raise BenchmarkServiceError("Exited websocket without returning final result")
-
-    async def request_evaluate_instance(
+    async def evaluate_instance(
         self, task_id: str, instance_id: str, on_message: Callable[[str], None] | None = None
     ) -> dict[str, Any]:
         request = EvaluateInstanceRequest(task_id=task_id, instance_id=instance_id)
+        return await self._websocket_request("evaluate-instance", request, on_message)
 
-        async with websockets.connect(
-            f"{self.ws_url}/ws/evaluate-instance",
-            additional_headers=self._headers,
-            open_timeout=60,
-        ) as websocket:
-            await websocket.send(request.model_dump_json())
-
-            async for chunk_type, data in self._stream_websocket(websocket):
-                if chunk_type == "result":
-                    return data
-
-                if on_message and chunk_type == "message":
-                    on_message(data)
-
-        raise BenchmarkServiceError("Exited websocket without returning final result")
-
-    async def request_final_score(self, evaluation_results: dict[str, Any]) -> FinalScoreResponse:
+    async def final_score(self, evaluation_results: dict[str, Any]) -> FinalScoreResponse:
         async with httpx.AsyncClient(follow_redirects=True, timeout=self._timeout) as client:
             response = await client.post(
                 f"{self._url}/final-score/",

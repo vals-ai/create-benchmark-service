@@ -19,8 +19,7 @@ from benchmark_service.schemas import (
 
 
 class ExampleBenchmark(BenchmarkService):
-    """
-    TODO: Replace this example with your benchmark implementation.
+    """TODO: Replace this example with your benchmark implementation.
 
     This example shows a simple text-based Q&A benchmark.
     Modify it to load your own dataset and implement your evaluation logic.

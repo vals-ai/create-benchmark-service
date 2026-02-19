@@ -1,5 +1,4 @@
-"""
-FastAPI application factory for benchmark services.
+"""FastAPI application factory for benchmark services.
 
 This module provides a complete FastAPI implementation.
 Import create_app and pass your BenchmarkService implementation.

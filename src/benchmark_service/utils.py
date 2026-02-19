@@ -1,5 +1,4 @@
-"""
-Utility functions for benchmark services.
+"""Utility functions for benchmark services.
 
 This module provides common helper functions for interacting with sandboxes.
 """
@@ -17,8 +16,7 @@ logger = logging.getLogger(__name__)
 async def stream_command(
     sandbox: AsyncSandbox, command: str, cwd: str, ignore_error: bool = False
 ) -> AsyncGenerator[str, None]:
-    """
-    Execute a command in a sandbox and stream output line by line in real-time.
+    """Execute a command in a sandbox and stream output line by line in real-time.
 
     Args:
         sandbox: The sandbox instance

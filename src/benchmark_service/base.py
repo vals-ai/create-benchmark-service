@@ -1,5 +1,4 @@
-"""
-Base class for benchmark service implementations.
+"""Base class for benchmark service implementations.
 
 To create your own benchmark service, subclass BenchmarkService and implement
 all the abstract methods. Then use the factory function in benchmark_service.app to create
@@ -22,8 +21,7 @@ from benchmark_service.schemas import (
 
 
 class BenchmarkService(ABC):
-    """
-    Abstract base class for benchmark implementations.
+    """Abstract base class for benchmark implementations.
 
     Implement all abstract methods to create a working benchmark service.
     The FastAPI endpoints are already implemented and will call these methods.
@@ -36,8 +34,7 @@ class BenchmarkService(ABC):
 
     @abstractmethod
     def load_dataset(self) -> dict[str, Any]:
-        """
-        Load the complete benchmark dataset.
+        """Load the complete benchmark dataset.
 
         Implement dataset loading logic:
         - Load all tasks from your benchmark source (files, database, etc.)
@@ -50,8 +47,7 @@ class BenchmarkService(ABC):
         ...
 
     def filter_tasks(self, task_filter: TaskFilter) -> list[str]:
-        """
-        Filter tasks based on provided criteria.
+        """Filter tasks based on provided criteria.
 
         Args:
             task_filter: Filter criteria for selecting tasks
@@ -71,8 +67,7 @@ class BenchmarkService(ABC):
         return all_task_ids
 
     def validate_task_ids(self, task_ids: list[str]) -> list[str]:
-        """
-        Validate that task IDs exist in your benchmark dataset.
+        """Validate that task IDs exist in your benchmark dataset.
 
         Args:
             task_ids: List of task IDs to validate
@@ -90,8 +85,7 @@ class BenchmarkService(ABC):
 
     @abstractmethod
     def retrieve_task(self, task_id: str, skip_validation: bool = False) -> RetrieveTaskResponse:
-        """
-        Retrieve task metadata including environment specification and problem statement.
+        """Retrieve task metadata including environment specification and problem statement.
 
         Implement metadata retrieval:
         - Validate task_id exists (unless skip_validation=True)
@@ -109,8 +103,7 @@ class BenchmarkService(ABC):
 
     @abstractmethod
     def setup_task(self, task_id: str, sandbox: AsyncSandbox) -> AsyncGenerator[StreamChunk, None]:
-        """
-        Setup a task in a sandbox environment.
+        """Setup a task in a sandbox environment.
 
         The sandbox is already connected and ready to use. Interact with it to
         upload files, execute commands, etc. Yield StreamChunk objects to stream progress.
@@ -133,8 +126,7 @@ class BenchmarkService(ABC):
 
     @abstractmethod
     def evaluate_response(self, request: EvaluateResponseRequest) -> Any:
-        """
-        Evaluate a text response directly (without sandbox execution).
+        """Evaluate a text response directly (without sandbox execution).
 
         Use this for benchmarks where you can evaluate responses without
         executing code or running tests.
@@ -155,8 +147,7 @@ class BenchmarkService(ABC):
 
     @abstractmethod
     def evaluate_instance(self, task_id: str, sandbox: AsyncSandbox) -> AsyncGenerator[StreamChunk, None]:
-        """
-        Evaluate a solution in a sandbox environment.
+        """Evaluate a solution in a sandbox environment.
 
         The sandbox is already connected and ready to use. Interact with it to
         execute tests, run evaluation scripts, etc. Yield StreamChunk objects to stream progress.
@@ -179,8 +170,7 @@ class BenchmarkService(ABC):
 
     @abstractmethod
     def calculate_final_score(self, evaluation_results: dict[str, Any]) -> FinalScoreResult:
-        """
-        Calculate final aggregate score from all evaluation results.
+        """Calculate final aggregate score from all evaluation results.
 
         Implement scoring logic:
         - Define how to aggregate individual task results

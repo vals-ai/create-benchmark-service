@@ -53,7 +53,7 @@ class BenchmarkServiceClient:
 
     async def _websocket_request(
         self, path: str, request: BaseModel, on_message: Callable[[str], None] | None = None
-    ) -> Any:
+    ) -> dict[str, Any]:
         """Send a request over WebSocket and stream the response.
 
         Args:

@@ -144,7 +144,7 @@ class StreamResultChunk(BaseModel):
     """Streaming chunk for final results."""
 
     type: Literal["result"] = Field(description="Chunk type identifier")
-    data: Any = Field(description="Final result data (benchmark-specific structure)")
+    data: dict[str, Any] = Field(description="Final result data (benchmark-specific structure)")
 
 
 class StreamErrorChunk(BaseModel):

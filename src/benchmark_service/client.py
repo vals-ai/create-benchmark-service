@@ -1,0 +1,166 @@
+"""HTTP/WebSocket client for communicating with a benchmark service."""
+
+import json
+from collections.abc import AsyncGenerator, Callable
+from typing import Any
+
+import httpx
+import websockets
+from websockets.asyncio.client import ClientConnection
+from websockets.exceptions import ConnectionClosed
+
+from benchmark_service.schemas import (
+    EvaluateInstanceRequest,
+    FinalScoreResponse,
+    HealthCheckResponse,
+    RetrieveTaskResponse,
+    SetupTaskRequest,
+    SetupTaskResponse,
+    VerifyTaskIdsResponse,
+)
+
+
+class BenchmarkServiceError(Exception):
+    """Exception raised for benchmark service communication errors."""
+
+    pass
+
+
+class BenchmarkServiceClient:
+    _url: str
+    _headers: dict[str, str]
+    _timeout: int
+
+    def __init__(self, url: str, headers: dict[str, str], timeout: int = 60):
+        self._url = url
+        self._headers = headers
+        self._timeout = timeout
+
+    @property
+    def ws_url(self) -> str:
+        return self._url.replace("http://", "ws://").replace("https://", "wss://")
+
+    async def _stream_websocket(self, websocket: ClientConnection) -> AsyncGenerator[tuple[str, Any]]:
+        """
+        Dispatch on StreamChunk type field.
+
+        Yields:
+            tuple[str, Any]: (chunk_type, data) for "message" and "result" chunks.
+
+        Raises:
+            BenchmarkServiceError: On "error" chunks.
+        """
+        try:
+            async for message in websocket:
+                parsed_message: dict[str, Any] = json.loads(message)
+                chunk_type: str = parsed_message["type"]
+                data: Any = parsed_message["data"]
+
+                if chunk_type == "error":
+                    raise BenchmarkServiceError(data)
+
+                if not data:
+                    continue
+
+                yield (chunk_type, data)
+        except ConnectionClosed:
+            pass
+
+    async def request_health_check(self) -> HealthCheckResponse:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=self._timeout) as client:
+            response = await client.get(f"{self._url}/health")
+
+        if response.status_code != 200:
+            raise BenchmarkServiceError(
+                f"Health check failed with status code {response.status_code}, response: {response.text}"
+            )
+
+        return HealthCheckResponse.model_validate(response.json())
+
+    async def request_verify_task_ids(
+        self, task_ids: list[str] | None, slice_str: str | None
+    ) -> VerifyTaskIdsResponse:
+        params: dict[str, list[str] | str] = {}
+        if task_ids is not None:
+            params["task_ids"] = task_ids
+        if slice_str is not None:
+            params["slice"] = slice_str
+
+        async with httpx.AsyncClient(follow_redirects=True, timeout=self._timeout) as client:
+            response = await client.get(f"{self._url}/verify-task-ids", params=params)
+
+        if response.status_code != 200:
+            raise BenchmarkServiceError(
+                f"Verify task ids failed with status code {response.status_code}, response: {response.text}"
+            )
+
+        return VerifyTaskIdsResponse.model_validate(response.json())
+
+    async def request_retrieve_task(self, task_id: str, skip_validation: bool = False) -> RetrieveTaskResponse:
+        params = {"task_id": task_id, "skip_validation": skip_validation}
+        async with httpx.AsyncClient(follow_redirects=True, timeout=self._timeout) as client:
+            response = await client.get(f"{self._url}/retrieve-task/", params=params)
+
+        if response.status_code != 200:
+            raise BenchmarkServiceError(
+                f"Retrieve task failed with status code {response.status_code}, response: {response.text}"
+            )
+
+        return RetrieveTaskResponse.model_validate(response.json())
+
+    async def request_setup_task(
+        self, task_id: str, instance_id: str, on_message: Callable[[str], None] | None = None
+    ) -> SetupTaskResponse:
+        request = SetupTaskRequest(task_id=task_id, instance_id=instance_id)
+
+        async with websockets.connect(
+            f"{self.ws_url}/ws/setup-task",
+            additional_headers=self._headers,
+            open_timeout=60,
+        ) as websocket:
+            await websocket.send(request.model_dump_json())
+
+            async for chunk_type, data in self._stream_websocket(websocket):
+                if chunk_type == "result":
+                    return SetupTaskResponse.model_validate(data)
+
+                if on_message and chunk_type == "message":
+                    on_message(data)
+
+        raise BenchmarkServiceError("Exited websocket without returning final result")
+
+    async def request_evaluate_instance(
+        self, task_id: str, instance_id: str, on_message: Callable[[str], None] | None = None
+    ) -> dict[str, Any]:
+        request = EvaluateInstanceRequest(task_id=task_id, instance_id=instance_id)
+
+        async with websockets.connect(
+            f"{self.ws_url}/ws/evaluate-instance",
+            additional_headers=self._headers,
+            open_timeout=60,
+        ) as websocket:
+            await websocket.send(request.model_dump_json())
+
+            async for chunk_type, data in self._stream_websocket(websocket):
+                if chunk_type == "result":
+                    return data
+
+                if on_message and chunk_type == "message":
+                    on_message(data)
+
+        raise BenchmarkServiceError("Exited websocket without returning final result")
+
+    async def request_final_score(self, evaluation_results: dict[str, Any]) -> FinalScoreResponse:
+        async with httpx.AsyncClient(follow_redirects=True, timeout=self._timeout) as client:
+            response = await client.post(
+                f"{self._url}/final-score/",
+                json={"evaluation_results": evaluation_results},
+                headers={"Content-Type": "application/json"},
+            )
+
+        if response.status_code != 200:
+            raise BenchmarkServiceError(
+                f"Final score failed with status code {response.status_code}, response: {response.text}"
+            )
+
+        return FinalScoreResponse.model_validate(response.json())

@@ -1,5 +1,5 @@
 version = 1
-revision = 2
+revision = 3
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.14'",
@@ -282,7 +282,9 @@ dependencies = [
     { name = "click" },
     { name = "daytona" },
     { name = "fastapi", extra = ["standard"] },
+    { name = "httpx" },
     { name = "jinja2" },
+    { name = "websockets" },
 ]
 
 [package.dev-dependencies]
@@ -298,7 +300,9 @@ requires-dist = [
     { name = "click", specifier = ">=8.1.0" },
     { name = "daytona", specifier = ">=0.143.0" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.127.1" },
+    { name = "httpx", specifier = ">=0.28.0" },
     { name = "jinja2", specifier = ">=3.1.0" },
+    { name = "websockets", specifier = ">=15.0" },
 ]
 
 [package.metadata.requires-dev]

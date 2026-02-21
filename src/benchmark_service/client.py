@@ -74,9 +74,7 @@ class BenchmarkServiceClient:
     def _ws_url(self) -> str:
         return self._url.replace("http://", "ws://").replace("https://", "wss://")
 
-    async def _websocket_request(
-        self, path: str, request: BaseModel, on_message: Callable[[str], None] | None = None
-    ) -> dict[str, Any]:
+    async def _websocket_request(self, path: str, request: BaseModel, on_message: Callable[[str], None] | None = None) -> dict[str, Any]:
         """Send a request over WebSocket and stream the response.
 
         Args:
@@ -95,6 +93,7 @@ class BenchmarkServiceClient:
             f"{self._ws_url}/ws/{path}",
             additional_headers=self._headers,
             open_timeout=60,
+            max_size=10,
         ) as websocket:
             await websocket.send(request.model_dump_json())
 
@@ -121,9 +120,7 @@ class BenchmarkServiceClient:
             response = await client.get(f"{self._url}/health")
 
         if response.status_code != 200:
-            raise BenchmarkServiceError(
-                f"Health check failed with status code {response.status_code}, response: {response.text}"
-            )
+            raise BenchmarkServiceError(f"Health check failed with status code {response.status_code}, response: {response.text}")
 
         return HealthCheckResponse.model_validate(response.json())
 
@@ -144,9 +141,7 @@ class BenchmarkServiceClient:
             response = await client.get(f"{self._url}/verify-task-ids", params=params)
 
         if response.status_code != 200:
-            raise BenchmarkServiceError(
-                f"Verify task ids failed with status code {response.status_code}, response: {response.text}"
-            )
+            raise BenchmarkServiceError(f"Verify task ids failed with status code {response.status_code}, response: {response.text}")
 
         return VerifyTaskIdsResponse.model_validate(response.json())
 
@@ -162,15 +157,11 @@ class BenchmarkServiceClient:
             response = await client.get(f"{self._url}/retrieve-task/", params=params)
 
         if response.status_code != 200:
-            raise BenchmarkServiceError(
-                f"Retrieve task failed with status code {response.status_code}, response: {response.text}"
-            )
+            raise BenchmarkServiceError(f"Retrieve task failed with status code {response.status_code}, response: {response.text}")
 
         return RetrieveTaskResponse.model_validate(response.json())
 
-    async def setup_task(
-        self, task_id: str, instance_id: str, on_message: Callable[[str], None] | None = None
-    ) -> SetupTaskResponse:
+    async def setup_task(self, task_id: str, instance_id: str, on_message: Callable[[str], None] | None = None) -> SetupTaskResponse:
         """Set up a task instance via WebSocket.
 
         Args:
@@ -182,9 +173,7 @@ class BenchmarkServiceClient:
         result = await self._websocket_request("setup-task", request, on_message)
         return SetupTaskResponse.model_validate(result)
 
-    async def evaluate_instance(
-        self, task_id: str, instance_id: str, on_message: Callable[[str], None] | None = None
-    ) -> dict[str, Any]:
+    async def evaluate_instance(self, task_id: str, instance_id: str, on_message: Callable[[str], None] | None = None) -> dict[str, Any]:
         """Evaluate a task instance via WebSocket.
 
         Args:
@@ -209,8 +198,6 @@ class BenchmarkServiceClient:
             )
 
         if response.status_code != 200:
-            raise BenchmarkServiceError(
-                f"Final score failed with status code {response.status_code}, response: {response.text}"
-            )
+            raise BenchmarkServiceError(f"Final score failed with status code {response.status_code}, response: {response.text}")
 
         return FinalScoreResponse.model_validate(response.json())

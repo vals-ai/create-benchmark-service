@@ -40,19 +40,16 @@ Creates a new service in `./<benchmark-name>-service/` in your current directory
 .
 ├── cli/                       # CLI tool
 │   ├── cli.py                 # Entry point
-│   ├── generator.py           # Project generator
-│   └── scaffold/              # Packaged scaffold assets for generated projects
-│       ├── .github/workflows/ # CI/CD templates
-│       ├── templates/         # Jinja + file templates
-│       ├── .gitignore
-│       ├── .python-version
-│       └── Makefile
+│   └── generator.py           # Project generator
 ├── src/benchmark_service/     # Framework code
 │   ├── __init__.py
 │   ├── app.py                 # FastAPI application
 │   ├── base.py                # BenchmarkService base class
 │   ├── schemas.py             # Pydantic models
 │   └── utils.py               # Utilities
+├── templates/                 # Templates for generated projects
+│   ├── pyproject.toml
+│   └── README.md
 ├── main.py                    # Example implementation
 ├── pyproject.toml             # CLI + framework config
 └── README.md                  # This file

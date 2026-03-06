@@ -33,6 +33,13 @@ build-backend = "hatchling.build"
 [tool.hatch.build.targets.wheel]
 packages = ["src/benchmark_service", "cli"]
 
+[tool.hatch.build.targets.wheel.force-include]
+".github" = ".github"
+".gitignore" = ".gitignore"
+".python-version" = ".python-version"
+"Makefile" = "Makefile"
+"templates" = "templates"
+
 [tool.ruff]
 line-length = 120
 target-version = "py312"

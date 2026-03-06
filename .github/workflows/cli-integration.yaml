@@ -18,13 +18,20 @@ jobs:
           enable-cache: true
           cache-dependency-glob: "uv.lock"
 
-      - name: Install CLI tool from local source
-        run: uv tool install .
+      - name: Build wheel
+        run: uv build --wheel
 
-      - name: Run create-benchmark-service
-        run: create-benchmark-service testbench
+      - name: Install CLI from wheel
+        run: uv tool install dist/*.whl
+
+      - name: Run create-benchmark-service from a clean directory
+        run: |
+          mkdir /tmp/cli-test
+          cd /tmp/cli-test
+          create-benchmark-service testbench
 
       - name: Verify generated project structure
+        working-directory: /tmp/cli-test
         run: |
           test -d testbench-service
           test -f testbench-service/main.py
@@ -42,7 +49,7 @@ jobs:
           test -d testbench-service/.github/workflows
 
       - name: Verify generated project installs and passes lint
-        working-directory: testbench-service
+        working-directory: /tmp/cli-test/testbench-service
         run: |
           make install
           make lint

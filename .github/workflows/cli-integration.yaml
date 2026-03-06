@@ -1,0 +1,48 @@
+name: cli-integration
+on: [pull_request, push]
+
+jobs:
+  cli-integration:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install CLI tool from local source
+        run: uv tool install .
+
+      - name: Run create-benchmark-service
+        run: create-benchmark-service testbench
+
+      - name: Verify generated project structure
+        run: |
+          test -d testbench-service
+          test -f testbench-service/main.py
+          test -f testbench-service/pyproject.toml
+          test -f testbench-service/README.md
+          test -f testbench-service/Makefile
+          test -f testbench-service/Dockerfile
+          test -f testbench-service/.gitignore
+          test -f testbench-service/.dockerignore
+          test -f testbench-service/.python-version
+          test -d testbench-service/src/testbench_service
+          test -f testbench-service/src/testbench_service/__init__.py
+          test -f testbench-service/src/testbench_service/benchmark_service.py
+          test -d testbench-service/tests
+          test -d testbench-service/.github/workflows
+
+      - name: Verify generated project installs and passes lint
+        working-directory: testbench-service
+        run: |
+          make install
+          make lint

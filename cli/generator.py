@@ -3,6 +3,7 @@
 import re
 import shutil
 import sys
+from importlib.resources import as_file, files
 from pathlib import Path
 from typing import TypedDict
 
@@ -101,54 +102,47 @@ def generate_project(
     # Transform names
     names = transform_name(benchmark_name)
 
-    # Get root directory
-    root = Path(__file__).parent.parent
+    scaffold_root = files("cli") / "scaffold"
 
     # Create output directory
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Files to copy from root
-    files_to_copy = [
-        "Makefile",
-        ".gitignore",
-        ".python-version",
-    ]
+    with as_file(scaffold_root) as scaffold_dir:
+        scaffold_dir = Path(scaffold_dir)
 
-    # Copy files
-    for file_name in files_to_copy:
-        copy_file(root / file_name, output_dir / file_name)
+        files_to_copy = [
+            "Makefile",
+            ".gitignore",
+            ".python-version",
+        ]
 
-    # Set up Jinja2 environment
-    templates_dir = root / "templates"
-    env = Environment(loader=FileSystemLoader(templates_dir))
+        for file_name in files_to_copy:
+            copy_file(scaffold_dir / file_name, output_dir / file_name)
 
-    # Render Jinja2 templates
-    template_files = {
-        "main.py.jinja": "main.py",
-        "pyproject.toml.jinja": "pyproject.toml",
-        "README.md.jinja": "README.md",
-    }
+        templates_dir = scaffold_dir / "templates"
+        env = Environment(loader=FileSystemLoader(templates_dir))
 
-    for template_name, output_name in template_files.items():
-        template = env.get_template(template_name)
-        content = template.render(names)
-        (output_dir / output_name).write_text(content)
+        template_files = {
+            "main.py.jinja": "main.py",
+            "pyproject.toml.jinja": "pyproject.toml",
+            "README.md.jinja": "README.md",
+        }
 
-    # Copy .github directory
-    shutil.copytree(root / ".github", output_dir / ".github")
+        for template_name, output_name in template_files.items():
+            template = env.get_template(template_name)
+            content = template.render(names)
+            (output_dir / output_name).write_text(content)
 
-    # Create empty tests directory
-    (output_dir / "tests").mkdir(exist_ok=True)
-    (output_dir / "tests" / "__init__.py").write_text("")
+        shutil.copytree(scaffold_dir / ".github", output_dir / ".github")
 
-    # Create benchmark-specific package directory
-    benchmark_package_dir = output_dir / "src" / names["benchmark_package"]
-    benchmark_package_dir.mkdir(parents=True, exist_ok=True)
+        (output_dir / "tests").mkdir(exist_ok=True)
+        (output_dir / "tests" / "__init__.py").write_text("")
 
-    # Create __init__.py in the package
-    (benchmark_package_dir / "__init__.py").write_text(f'"""Utilities for {names["benchmark_name"]} benchmark."""\n')
+        benchmark_package_dir = output_dir / "src" / names["benchmark_package"]
+        benchmark_package_dir.mkdir(parents=True, exist_ok=True)
 
-    # Copy templates
-    copy_file(templates_dir / "benchmark_service.py", benchmark_package_dir / "benchmark_service.py")
-    copy_file(templates_dir / "Dockerfile", output_dir / "Dockerfile")
-    copy_file(templates_dir / ".dockerignore", output_dir / ".dockerignore")
+        (benchmark_package_dir / "__init__.py").write_text(f'"""Utilities for {names["benchmark_name"]} benchmark."""\n')
+
+        copy_file(templates_dir / "benchmark_service.py", benchmark_package_dir / "benchmark_service.py")
+        copy_file(templates_dir / "Dockerfile", output_dir / "Dockerfile")
+        copy_file(templates_dir / ".dockerignore", output_dir / ".dockerignore")

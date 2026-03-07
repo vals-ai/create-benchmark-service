@@ -129,3 +129,18 @@ Pydantic models used across requests and responses:
 **`stream_command(sandbox, command, cwd, ignore_error=False)`**
 
 Runs a shell command inside a Daytona sandbox and yields stdout/stderr lines in real time. Creates a unique session per invocation, streams output via an async queue, checks the exit code, and cleans up the session on completion. Use it inside `setup_task` and `evaluate_instance` to run commands and forward their output as `StreamMessageChunk`s.
+
+### Reverse Tunnel setup
+
+You may want to test the benchmark service using the hosted agentic harness service instead of hosting it locally. We offer a simple way to do this through ngrok (although you can use any reverse tunnel tool)
+
+Setup
+
+1. [Signup / login to ngrok](https://dashboard.ngrok.com/login)
+2. [Follow the setup and installation steps](https://dashboard.ngrok.com/get-started/setup/macos)
+3. Start the project using either `make dev` or `make docker-build && make docker-run`
+4. Run ngrok on the matching port that is exposed: `ngrok http 8001` (forwards the traffic from the tunnel to the FastAPI server running on your machine)
+   - Copy the forwarding address on the left. Example: `https://hemagglutinative-vonnie-fungic.ngrok-free.dev`
+5. Using the agentic harness CLI, run `harness config service add <benchmark-name> <forwarding-address>`
+
+If the forwarding address changes you will need to run step 5 again.

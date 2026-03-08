@@ -35,4 +35,4 @@ docker-build: ## Build Docker image
 	docker build -t benchmark-service:latest .
 
 docker-run: ## Run Docker container
-	docker run -p 8000:8000 benchmark-service:latest
+	docker run -p 8001:8001 benchmark-service:latest

@@ -14,12 +14,12 @@ uv tool install git+ssh://git@github.com/vals-ai/create-benchmark-service.git@ma
 create-benchmark-service <benchmark-name>
 ```
 
-Creates a new service in `./<benchmark-name>-service/` in your current directory.
+Creates a new service in `./<benchmark-name>-benchmark-service/` in your current directory.
 
 ## What Gets Generated
 
 ```
-<benchmark-name>-service/
+<benchmark-name>-benchmark-service/
 ├── main.py                    # Service implementation
 ├── src/
 │   └── {benchmark_package}/   # Benchmark-specific utilities

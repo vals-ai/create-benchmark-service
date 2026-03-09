@@ -28,10 +28,10 @@ jobs:
         run: |
           mkdir /tmp/cli-test
           cd /tmp/cli-test
-          create-benchmark-service testbench
+          create-benchmark-service test
 
       - name: Verify generated project installs and passes lint
-        working-directory: /tmp/cli-test/testbench-service
+        working-directory: /tmp/cli-test/test-benchmark-service
         run: |
           make install
           make lint

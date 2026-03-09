@@ -1,13 +1,13 @@
 """Shared test fixtures and stub implementations."""
 
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Generator
 from typing import Any
 
 import pytest
 from daytona import AsyncSandbox
 from fastapi.testclient import TestClient
 
-from benchmark_service.app import create_app
+from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.base import BenchmarkService
 from benchmark_service.schemas import (
     EvaluateResponseRequest,
@@ -21,16 +21,16 @@ from benchmark_service.schemas import (
 class StubBenchmark(BenchmarkService):
     """Minimal concrete implementation for testing."""
 
-    def load_dataset(self) -> dict[str, Any]:
+    async def load_dataset(self) -> dict[str, Any]:
         return {
             "task-1": {"problem": "What is 1+1?", "answer": "2"},
             "task-2": {"problem": "What is 2+2?", "answer": "4"},
             "task-3": {"problem": "What is 3+3?", "answer": "6"},
         }
 
-    def retrieve_task(self, task_id: str, skip_validation: bool = False) -> RetrieveTaskResponse:
+    async def retrieve_task(self, task_id: str, skip_validation: bool = False) -> RetrieveTaskResponse:
         if not skip_validation:
-            self.validate_task_ids([task_id])
+            await self.validate_task_ids([task_id])
         task = self.tasks[task_id]
         return RetrieveTaskResponse(
             docker_image="python:3.12-slim",
@@ -42,13 +42,13 @@ class StubBenchmark(BenchmarkService):
 
     async def setup_task(self, task_id: str, sandbox: AsyncSandbox) -> AsyncGenerator[StreamChunk, None]: ...  # type: ignore[return]
 
-    def evaluate_response(self, request: EvaluateResponseRequest) -> Any:
+    async def evaluate_response(self, request: EvaluateResponseRequest) -> Any:
         task = self.tasks[request.task_id]
         return {"resolved": request.response == task["answer"]}
 
     async def evaluate_instance(self, task_id: str, sandbox: AsyncSandbox) -> AsyncGenerator[StreamChunk, None]: ...  # type: ignore[return]
 
-    def calculate_final_score(self, evaluation_results: dict[str, Any]) -> FinalScoreResult:
+    async def calculate_final_score(self, evaluation_results: dict[str, Any]) -> FinalScoreResult:
         total = len(evaluation_results)
         resolved = sum(1 for r in evaluation_results.values() if r.get("resolved"))
         score = (resolved / total * 100) if total > 0 else 0.0
@@ -56,10 +56,11 @@ class StubBenchmark(BenchmarkService):
 
 
 @pytest.fixture
-def service() -> StubBenchmark:
-    return StubBenchmark()
+async def service() -> StubBenchmark:
+    return await StubBenchmark.create()
 
 
 @pytest.fixture
-def client() -> TestClient:
-    return TestClient(create_app(StubBenchmark()))
+def client() -> Generator[TestClient, None, None]:
+    with TestClient(BenchmarkServiceApp(StubBenchmark)) as c:
+        yield c

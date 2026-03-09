@@ -7,7 +7,7 @@ a FastAPI app with your implementation.
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
-from typing import Any
+from typing import Any, Self
 
 from daytona import AsyncSandbox
 
@@ -27,13 +27,17 @@ class BenchmarkService(ABC):
     The FastAPI endpoints are already implemented and will call these methods.
     """
 
-    def __init__(self):
-        """Initialize the benchmark service."""
+    tasks: dict[str, Any]
 
-        self.tasks = self.load_dataset()
+    @classmethod
+    async def create(cls) -> Self:
+        """Factory method to create and initialize a benchmark service."""
+        instance = cls.__new__(cls)
+        instance.tasks = await instance.load_dataset()
+        return instance
 
     @abstractmethod
-    def load_dataset(self) -> dict[str, Any]:
+    async def load_dataset(self) -> dict[str, Any]:
         """Load the complete benchmark dataset.
 
         Implement dataset loading logic:
@@ -46,7 +50,7 @@ class BenchmarkService(ABC):
         """
         ...
 
-    def filter_tasks(self, task_filter: TaskFilter) -> list[str]:
+    async def filter_tasks(self, task_filter: TaskFilter) -> list[str]:
         """Filter tasks based on provided criteria.
 
         Args:
@@ -58,7 +62,7 @@ class BenchmarkService(ABC):
         all_task_ids = list(self.tasks.keys())
 
         if task_filter.task_ids:
-            return self.validate_task_ids(task_filter.task_ids)
+            return await self.validate_task_ids(task_filter.task_ids)
 
         if task_filter.slice_str:
             slice_obj = task_filter.parse_slice()
@@ -66,7 +70,7 @@ class BenchmarkService(ABC):
 
         return all_task_ids
 
-    def validate_task_ids(self, task_ids: list[str]) -> list[str]:
+    async def validate_task_ids(self, task_ids: list[str]) -> list[str]:
         """Validate that task IDs exist in your benchmark dataset.
 
         Args:
@@ -84,7 +88,7 @@ class BenchmarkService(ABC):
         return task_ids
 
     @abstractmethod
-    def retrieve_task(self, task_id: str, skip_validation: bool = False) -> RetrieveTaskResponse:
+    async def retrieve_task(self, task_id: str, skip_validation: bool = False) -> RetrieveTaskResponse:
         """Retrieve task metadata including environment specification and problem statement.
 
         Implement metadata retrieval:
@@ -125,7 +129,7 @@ class BenchmarkService(ABC):
         ...
 
     @abstractmethod
-    def evaluate_response(self, request: EvaluateResponseRequest) -> Any:
+    async def evaluate_response(self, request: EvaluateResponseRequest) -> Any:
         """Evaluate a text response directly (without sandbox execution).
 
         Use this for benchmarks where you can evaluate responses without
@@ -169,7 +173,7 @@ class BenchmarkService(ABC):
         ...
 
     @abstractmethod
-    def calculate_final_score(self, evaluation_results: dict[str, Any]) -> FinalScoreResult:
+    async def calculate_final_score(self, evaluation_results: dict[str, Any]) -> FinalScoreResult:
         """Calculate final aggregate score from all evaluation results.
 
         Implement scoring logic:

@@ -25,7 +25,7 @@ class ExampleBenchmark(BenchmarkService):
     Modify it to load your own dataset and implement your evaluation logic.
     """
 
-    def load_dataset(self) -> dict[str, Any]:
+    async def load_dataset(self) -> dict[str, Any]:
         """Load the benchmark dataset."""
         return {
             "example-task-1": {
@@ -38,10 +38,10 @@ class ExampleBenchmark(BenchmarkService):
             },
         }
 
-    def retrieve_task(self, task_id: str, skip_validation: bool = False) -> RetrieveTaskResponse:
+    async def retrieve_task(self, task_id: str, skip_validation: bool = False) -> RetrieveTaskResponse:
         """Retrieve task metadata."""
         if not skip_validation:
-            self.validate_task_ids([task_id])
+            await self.validate_task_ids([task_id])
 
         task = self.tasks[task_id]
 
@@ -59,7 +59,7 @@ class ExampleBenchmark(BenchmarkService):
         yield StreamMessageChunk(type="message", data="No setup required for example benchmark")
         yield StreamResultChunk(type="result", data={"status": "ok"})
 
-    def evaluate_response(self, request: EvaluateResponseRequest) -> Any:
+    async def evaluate_response(self, request: EvaluateResponseRequest) -> Any:
         """Evaluate a text response."""
         task = self.tasks[request.task_id]
 
@@ -83,7 +83,7 @@ class ExampleBenchmark(BenchmarkService):
             data="Sandbox evaluation not implemented. Use /evaluate-response/ endpoint instead.",
         )
 
-    def calculate_final_score(self, evaluation_results: dict[str, Any]) -> FinalScoreResult:
+    async def calculate_final_score(self, evaluation_results: dict[str, Any]) -> FinalScoreResult:
         """Calculate final score across all evaluations."""
         total = len(evaluation_results)
 

@@ -131,6 +131,41 @@ Pydantic models used across requests and responses:
 
 Runs a shell command inside a Daytona sandbox and yields stdout/stderr lines in real time. Creates a unique session per invocation, streams output via an async queue, checks the exit code, and cleans up the session on completion. Use it inside `setup_task` and `evaluate_instance` to run commands and forward their output as `StreamMessageChunk`s.
 
+### Authentication
+
+The harness can send custom headers (including `Authorization`) with every request to your benchmark service. To restrict access, add middleware to your `BenchmarkServiceApp`:
+
+```python
+from fastapi import Request
+from fastapi.responses import JSONResponse
+from benchmark_service.app import BenchmarkServiceApp
+
+app = BenchmarkServiceApp(MyBenchmarkService)
+
+@app.middleware("http")
+async def check_auth(request: Request, call_next):
+    # Skip auth for health checks
+    if request.url.path == "/health":
+        return await call_next(request)
+
+    token = request.headers.get("Authorization")
+    if token != "my-secret-token":
+        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+    return await call_next(request)
+```
+
+Harness users configure their auth token once via the CLI:
+
+```bash
+harness config auth set <benchmark-name> <token>
+```
+
+The token is stored in `~/.config/harness/harness.yaml` under `benchmark_auth` and sent as the `Authorization` header on every request. Users can also pass arbitrary headers at runtime with `-H`:
+
+```bash
+harness benchmark start --benchmark my-benchmark --agent my-agent -H X-Custom value
+```
+
 ### Reverse Tunnel setup
 
 You may want to test the benchmark service using the hosted agentic harness service instead of hosting it locally. We offer a simple way to do this through ngrok (although you can use any reverse tunnel tool)

@@ -1,7 +1,10 @@
 """Tests for FastAPI app endpoints."""
 
+from collections.abc import Generator
+
 import pytest
-from fastapi import HTTPException
+from fastapi import HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 
@@ -156,3 +159,45 @@ def test_websocket_setup_task_missing_headers(client: TestClient) -> None:
 def test_websocket_evaluate_instance_missing_headers(client: TestClient) -> None:
     with client.websocket_connect("/ws/evaluate-instance") as ws:
         ws.close()
+
+
+class TestAuthMiddleware:
+    """Test that benchmark services can add auth middleware to restrict access."""
+
+    AUTH_TOKEN = "my-secret-token"
+
+    @pytest.fixture
+    def auth_client(self) -> Generator[TestClient, None, None]:
+        from tests.conftest import StubBenchmark
+
+        from benchmark_service.app import BenchmarkServiceApp
+
+        app = BenchmarkServiceApp(StubBenchmark)
+
+        @app.middleware("http")
+        async def check_auth(request: Request, call_next):  # type: ignore[no-untyped-def]
+            if request.url.path == "/health":
+                return await call_next(request)  # type: ignore[reportUnknownVariableType]
+            token = request.headers.get("Authorization")
+            if token != TestAuthMiddleware.AUTH_TOKEN:
+                return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+            return await call_next(request)  # type: ignore[reportUnknownVariableType]
+
+        with TestClient(app) as c:
+            yield c
+
+    def test_no_auth_returns_401(self, auth_client: TestClient) -> None:
+        response = auth_client.get("/verify-task-ids")
+        assert response.status_code == 401
+
+    def test_wrong_auth_returns_401(self, auth_client: TestClient) -> None:
+        response = auth_client.get("/verify-task-ids", headers={"Authorization": "wrong"})
+        assert response.status_code == 401
+
+    def test_correct_auth_returns_200(self, auth_client: TestClient) -> None:
+        response = auth_client.get("/verify-task-ids", headers={"Authorization": self.AUTH_TOKEN})
+        assert response.status_code == 200
+
+    def test_health_skips_auth(self, auth_client: TestClient) -> None:
+        response = auth_client.get("/health")
+        assert response.status_code == 200

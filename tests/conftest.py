@@ -38,7 +38,6 @@ class StubBenchmark(BenchmarkService):
         ds = self.get_dataset(dataset)
         if not skip_validation:
             await self.validate_task_ids([task_id], dataset=dataset)
-        task = ds[task_id]
         return RetrieveTaskResponse(
             docker_image="python:3.12-slim",
             problem_path="/tmp/problem_statement.txt",

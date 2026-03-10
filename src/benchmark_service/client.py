@@ -119,7 +119,7 @@ class BenchmarkServiceClient:
     async def health_check(self) -> HealthCheckResponse:
         """Check if the benchmark service is healthy."""
         async with httpx.AsyncClient(follow_redirects=True, timeout=self._timeout) as client:
-            response = await client.get(f"{self._url}/health")
+            response = await client.get(f"{self._url}/health", headers=self._headers)
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
@@ -144,7 +144,7 @@ class BenchmarkServiceClient:
             params["dataset"] = dataset
 
         async with httpx.AsyncClient(follow_redirects=True, timeout=self._timeout) as client:
-            response = await client.get(f"{self._url}/verify-task-ids", params=params)
+            response = await client.get(f"{self._url}/verify-task-ids", params=params, headers=self._headers)
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
@@ -164,7 +164,7 @@ class BenchmarkServiceClient:
         if dataset is not None:
             params["dataset"] = dataset
         async with httpx.AsyncClient(follow_redirects=True, timeout=self._timeout) as client:
-            response = await client.get(f"{self._url}/retrieve-task/", params=params)
+            response = await client.get(f"{self._url}/retrieve-task/", params=params, headers=self._headers)
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
@@ -214,7 +214,7 @@ class BenchmarkServiceClient:
             response = await client.post(
                 f"{self._url}/final-score/",
                 json=body,
-                headers={"Content-Type": "application/json"},
+                headers={**self._headers, "Content-Type": "application/json"},
             )
 
         if response.status_code != 200:

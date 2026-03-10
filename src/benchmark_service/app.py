@@ -51,7 +51,7 @@ class BenchmarkServiceApp(FastAPI):
         self.add_api_websocket_route("/ws/evaluate-instance", self._evaluate_instance)
         self.add_api_route("/final-score/", self._final_score, methods=["POST"])
 
-    async def _value_error_handler(self, _request: Request, exc: ValueError) -> Response:
+    async def _value_error_handler(self, _request: Request, exc: Exception) -> Response:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     async def _exception_handler(self, _request: Request, exc: Exception) -> Response:

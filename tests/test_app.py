@@ -60,9 +60,8 @@ def test_retrieve_task_invalid(client: TestClient) -> None:
 
 
 def test_retrieve_task_skip_validation(client: TestClient) -> None:
-    with pytest.raises(HTTPException) as exc_info:
-        client.get("/retrieve-task/", params={"task_id": "nonexistent", "skip_validation": True})
-    assert exc_info.value.status_code == 500
+    response = client.get("/retrieve-task/", params={"task_id": "nonexistent", "skip_validation": True})
+    assert response.status_code == 200
 
 
 @pytest.mark.parametrize(

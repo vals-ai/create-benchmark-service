@@ -44,9 +44,6 @@ class ExampleBenchmark(BenchmarkService):
         """Retrieve task metadata."""
         if not skip_validation:
             await self.validate_task_ids([task_id], dataset=dataset)
-
-        task = self.get_dataset(dataset)[task_id]
-
         return RetrieveTaskResponse(
             docker_image="python:3.12-slim",
             problem_path="/tmp/problem_statement.txt",

@@ -35,7 +35,6 @@ class StubBenchmark(BenchmarkService):
         }
 
     async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> RetrieveTaskResponse:
-        ds = self.get_dataset(dataset)
         if not skip_validation:
             await self.validate_task_ids([task_id], dataset=dataset)
         return RetrieveTaskResponse(

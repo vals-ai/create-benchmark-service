@@ -21,17 +21,24 @@ from benchmark_service.schemas import (
 class StubBenchmark(BenchmarkService):
     """Minimal concrete implementation for testing."""
 
-    async def load_dataset(self) -> dict[str, Any]:
+    async def load_datasets(self) -> dict[str, dict[str, Any]]:
         return {
-            "task-1": {"problem": "What is 1+1?", "answer": "2"},
-            "task-2": {"problem": "What is 2+2?", "answer": "4"},
-            "task-3": {"problem": "What is 3+3?", "answer": "6"},
+            "default": {
+                "task-1": {"problem": "What is 1+1?", "answer": "2"},
+                "task-2": {"problem": "What is 2+2?", "answer": "4"},
+                "task-3": {"problem": "What is 3+3?", "answer": "6"},
+            },
+            "alt": {
+                "alt-task-1": {"problem": "What is 5+5?", "answer": "10"},
+                "alt-task-2": {"problem": "What is 6+6?", "answer": "12"},
+            },
         }
 
-    async def retrieve_task(self, task_id: str, skip_validation: bool = False) -> RetrieveTaskResponse:
+    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> RetrieveTaskResponse:
+        ds = self.get_dataset(dataset)
         if not skip_validation:
-            await self.validate_task_ids([task_id])
-        task = self.tasks[task_id]
+            await self.validate_task_ids([task_id], dataset=dataset)
+        task = ds[task_id]
         return RetrieveTaskResponse(
             docker_image="python:3.12-slim",
             problem_statement=task["problem"],
@@ -40,15 +47,16 @@ class StubBenchmark(BenchmarkService):
             resources=Resources(vcpu=2, memory=4, disk=10),
         )
 
-    async def setup_task(self, task_id: str, sandbox: AsyncSandbox) -> AsyncGenerator[StreamChunk, None]: ...  # type: ignore[return]
+    async def setup_task(self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None) -> AsyncGenerator[StreamChunk, None]: ...  # type: ignore[return]
 
-    async def evaluate_response(self, request: EvaluateResponseRequest) -> Any:
-        task = self.tasks[request.task_id]
+    async def evaluate_response(self, request: EvaluateResponseRequest, dataset: str | None = None) -> Any:
+        ds = self.get_dataset(dataset)
+        task = ds[request.task_id]
         return {"resolved": request.response == task["answer"]}
 
-    async def evaluate_instance(self, task_id: str, sandbox: AsyncSandbox) -> AsyncGenerator[StreamChunk, None]: ...  # type: ignore[return]
+    async def evaluate_instance(self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None) -> AsyncGenerator[StreamChunk, None]: ...  # type: ignore[return]
 
-    async def calculate_final_score(self, evaluation_results: dict[str, Any]) -> FinalScoreResult:
+    async def calculate_final_score(self, evaluation_results: dict[str, Any], dataset: str | None = None) -> FinalScoreResult:
         total = len(evaluation_results)
         resolved = sum(1 for r in evaluation_results.values() if r.get("resolved"))
         score = (resolved / total * 100) if total > 0 else 0.0

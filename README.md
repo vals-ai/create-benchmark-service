@@ -61,37 +61,38 @@ The `benchmark_service` package is the core framework that generated services bu
 
 ### `BenchmarkService` base class (`base.py`)
 
-Subclass `BenchmarkService` and implement its abstract methods. On instantiation, `__init__` automatically calls `load_dataset()` and stores the result as `self.tasks`.
+Subclass `BenchmarkService` and implement its abstract methods. On instantiation, the `create()` factory method calls `load_datasets()` and stores the result as `self.datasets`.
 
 **Abstract methods to implement:**
 
 | Method | Description |
 |--------|-------------|
-| `load_dataset()` | Load all tasks from your source; return `dict[task_id, task_object]` |
-| `retrieve_task(task_id, skip_validation)` | Return task metadata: docker image, problem statement, resources, etc. |
-| `setup_task(task_id, sandbox)` | Async generator — set up the task in a Daytona sandbox, yielding `StreamChunk`s |
-| `evaluate_response(request)` | Evaluate a text response directly (no sandbox needed) |
-| `evaluate_instance(task_id, sandbox)` | Async generator — run evaluation in a Daytona sandbox, yielding `StreamChunk`s |
-| `calculate_final_score(evaluation_results)` | Aggregate per-task results into a final `FinalScoreResult` |
+| `load_datasets()` | Load all tasks from your source; return `dict[dataset_name, dict[task_id, task_object]]` |
+| `retrieve_task(task_id, skip_validation, dataset)` | Return task metadata: docker image, problem statement, resources, etc. |
+| `setup_task(task_id, sandbox, dataset)` | Async generator — set up the task in a Daytona sandbox, yielding `StreamChunk`s |
+| `evaluate_response(request, dataset)` | Evaluate a text response directly (no sandbox needed) |
+| `evaluate_instance(task_id, sandbox, dataset)` | Async generator — run evaluation in a Daytona sandbox, yielding `StreamChunk`s |
+| `calculate_final_score(evaluation_results, dataset)` | Aggregate per-task results into a final `FinalScoreResult` |
 
 **Built-in methods:**
 
-- `filter_tasks(task_filter)` — return task IDs matching a list or Python slice notation (e.g. `"0:10:2"`)
-- `validate_task_ids(task_ids)` — raise `ValueError` if any ID is not in `self.tasks`
+- `get_dataset(dataset)` — return the task dictionary for a given dataset name (defaults to `"default"`)
+- `filter_tasks(task_filter, dataset)` — return task IDs matching a list or Python slice notation (e.g. `"0:10:2"`)
+- `validate_task_ids(task_ids, dataset)` — raise `ValueError` if any ID is not in the dataset
 
 ### FastAPI application factory (`app.py`)
 
-`create_app(benchmark_service)` wraps your `BenchmarkService` in a fully configured FastAPI app. Pass an instance of your subclass and run the result with any ASGI server.
+`BenchmarkServiceApp(service_cls)` wraps your `BenchmarkService` subclass in a fully configured FastAPI app. Pass your subclass and run the result with any ASGI server.
 
 **HTTP endpoints:**
 
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Returns `{"status": "ok"}` |
-| `GET` | `/verify-task-ids` | Return task IDs filtered by `?task_ids=…` or `?slice=start:stop:step` |
-| `GET` | `/retrieve-task/?task_id=…` | Return task metadata for a given task ID |
-| `POST` | `/evaluate-response/` | Evaluate a text response: `{"task_id": "…", "response": "…"}` |
-| `POST` | `/final-score/` | Aggregate results: `{"evaluation_results": {task_id: result, …}}` |
+| `GET` | `/verify-task-ids` | Return task IDs filtered by `?task_ids=…` or `?slice=start:stop:step` (optional `?dataset=…`) |
+| `GET` | `/retrieve-task/?task_id=…` | Return task metadata for a given task ID (optional `?dataset=…`) |
+| `POST` | `/evaluate-response/` | Evaluate a text response: `{"task_id": "…", "response": "…", "dataset": "…"}` |
+| `POST` | `/final-score/` | Aggregate results: `{"evaluation_results": {task_id: result, …}, "dataset": "…"}` |
 
 **WebSocket endpoints** (stream `StreamChunk` JSON objects):
 
@@ -100,7 +101,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | `/ws/setup-task` | Set up a task in a sandbox; streams progress, errors, and a final result |
 | `/ws/evaluate-instance` | Evaluate a solution in a sandbox; streams progress, errors, and a final result |
 
-Both WebSocket endpoints require three headers — `x-api-key`, `x-api-url`, `x-target` — used to connect to the Daytona sandbox, and accept a JSON body of `{"task_id": "…", "instance_id": "…"}`.
+Both WebSocket endpoints require three headers — `x-api-key`, `x-api-url`, `x-target` — used to connect to the Daytona sandbox, and accept a JSON body of `{"task_id": "…", "instance_id": "…", "dataset": "…"}` (dataset is optional, defaults to `"default"`).
 
 ### Streaming protocol
 
@@ -120,7 +121,7 @@ Pydantic models used across requests and responses:
 
 - **`RetrieveTaskResponse`** — `docker_image`, `problem_statement`, `request_setup`, `cwd`, `Resources`
 - **`Resources`** — `vcpu`, `memory` (GB), `disk` (GB)
-- **`EvaluateResponseRequest`** — `task_id`, `response`
+- **`EvaluateResponseRequest`** — `task_id`, `response`, `dataset`
 - **`FinalScoreResult`** / **`FinalScoreResponse`** — `score` (float), `metadata`, `tasks_evaluated`
 - **`TaskFilter`** — `task_ids` list or `slice_str`; `parse_slice()` converts `"start:stop:step"` to a Python `slice`
 

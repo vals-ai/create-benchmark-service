@@ -55,9 +55,8 @@ def test_retrieve_task(client: TestClient) -> None:
 
 
 def test_retrieve_task_invalid(client: TestClient) -> None:
-    with pytest.raises(HTTPException) as exc_info:
-        client.get("/retrieve-task/", params={"task_id": "nonexistent"})
-    assert exc_info.value.status_code == 500
+    response = client.get("/retrieve-task/", params={"task_id": "nonexistent"})
+    assert response.status_code == 400
 
 
 def test_retrieve_task_skip_validation(client: TestClient) -> None:
@@ -113,9 +112,40 @@ def test_final_score(
 
 
 def test_final_score_invalid_task(client: TestClient) -> None:
-    with pytest.raises(HTTPException) as exc_info:
-        client.post("/final-score/", json={"evaluation_results": {"nonexistent": {"resolved": True}}})
-    assert exc_info.value.status_code == 500
+    response = client.post("/final-score/", json={"evaluation_results": {"nonexistent": {"resolved": True}}})
+    assert response.status_code == 400
+
+
+def test_verify_task_ids_with_dataset(client: TestClient) -> None:
+    response = client.get("/verify-task-ids", params={"dataset": "alt"})
+    assert response.status_code == 200
+    assert response.json() == {"task_ids": ["alt-task-1", "alt-task-2"]}
+
+
+def test_verify_task_ids_invalid_dataset(client: TestClient) -> None:
+    response = client.get("/verify-task-ids", params={"dataset": "nonexistent"})
+    assert response.status_code == 400
+
+
+def test_retrieve_task_with_dataset(client: TestClient) -> None:
+    response = client.get("/retrieve-task/", params={"task_id": "alt-task-1", "dataset": "alt"})
+    assert response.status_code == 200
+    assert response.json()["problem_statement"] == "What is 5+5?"
+
+
+def test_evaluate_response_with_dataset(client: TestClient) -> None:
+    response = client.post("/evaluate-response/", json={"task_id": "alt-task-1", "response": "10", "dataset": "alt"})
+    assert response.status_code == 200
+    assert response.json()["resolved"] is True
+
+
+def test_final_score_with_dataset(client: TestClient) -> None:
+    response = client.post("/final-score/", json={
+        "evaluation_results": {"alt-task-1": {"resolved": True}},
+        "dataset": "alt",
+    })
+    assert response.status_code == 200
+    assert response.json()["final_score"] == 100.0
 
 
 def test_websocket_setup_task_missing_headers(client: TestClient) -> None:

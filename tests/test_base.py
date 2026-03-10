@@ -52,3 +52,38 @@ async def test_filter_tasks_by_ids(service: StubBenchmark, task_ids: list[str], 
 async def test_filter_tasks_by_slice(service: StubBenchmark, slice_str: str, expected: list[str]) -> None:
     result = await service.filter_tasks(TaskFilter(slice_str=slice_str))
     assert result == expected
+
+
+async def test_get_dataset_default(service: StubBenchmark) -> None:
+    dataset = service.get_dataset(None)
+    assert "task-1" in dataset
+
+
+async def test_get_dataset_explicit_default(service: StubBenchmark) -> None:
+    dataset = service.get_dataset("default")
+    assert "task-1" in dataset
+
+
+async def test_get_dataset_named(service: StubBenchmark) -> None:
+    dataset = service.get_dataset("alt")
+    assert "alt-task-1" in dataset
+
+
+async def test_get_dataset_invalid(service: StubBenchmark) -> None:
+    with pytest.raises(ValueError, match="Dataset 'nonexistent' not found"):
+        service.get_dataset("nonexistent")
+
+
+async def test_filter_tasks_with_dataset(service: StubBenchmark) -> None:
+    result = await service.filter_tasks(TaskFilter(), dataset="alt")
+    assert result == ["alt-task-1", "alt-task-2"]
+
+
+async def test_validate_task_ids_with_dataset(service: StubBenchmark) -> None:
+    result = await service.validate_task_ids(["alt-task-1"], dataset="alt")
+    assert result == ["alt-task-1"]
+
+
+async def test_validate_task_ids_wrong_dataset(service: StubBenchmark) -> None:
+    with pytest.raises(ValueError, match="Task ID not found"):
+        await service.validate_task_ids(["task-1"], dataset="alt")

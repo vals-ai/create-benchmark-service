@@ -79,6 +79,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 - `get_dataset(dataset)` — return the task dictionary for a given dataset name (defaults to `"default"`)
 - `filter_tasks(task_filter, dataset)` — return task IDs matching a list or Python slice notation (e.g. `"0:10:2"`)
 - `validate_task_ids(task_ids, dataset)` — raise `ValueError` if any ID is not in the dataset
+- `check_auth(headers)` — validate request authorization; returns `True` by default (no auth). Override to enforce authentication.
 
 ### FastAPI application factory (`app.py`)
 
@@ -133,34 +134,27 @@ Runs a shell command inside a Daytona sandbox and yields stdout/stderr lines in 
 
 ### Authentication
 
-The harness can send custom headers (including `Authorization`) with every request to your benchmark service. To restrict access, add middleware to your `BenchmarkServiceApp`:
+The framework includes a built-in `check_auth()` hook that is called on every HTTP request (except `/health`). By default it allows all requests. Override it in your `BenchmarkService` subclass to enforce authentication:
 
 ```python
-from fastapi import Request
-from fastapi.responses import JSONResponse
-from benchmark_service.app import BenchmarkServiceApp
+from benchmark_service import BenchmarkService
 
-app = BenchmarkServiceApp(MyBenchmarkService)
+class MyBenchmarkService(BenchmarkService):
+    async def check_auth(self, headers: dict[str, str]) -> bool:
+        return headers.get("authorization") == "my-secret-credential"
 
-@app.middleware("http")
-async def check_auth(request: Request, call_next):
-    # Skip auth for health checks
-    if request.url.path == "/health":
-        return await call_next(request)
-
-    token = request.headers.get("Authorization")
-    if token != "my-secret-token":
-        return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
-    return await call_next(request)
+    # ... other abstract methods
 ```
 
-Harness users configure their auth token once via the CLI:
+Header names are lowercase per HTTP convention. Requests that fail auth receive a `401 Unauthorized` response automatically.
+
+Harness users configure their credential once via the CLI:
 
 ```bash
-harness config auth set <benchmark-name> <token>
+harness config auth set <benchmark-name> <credential>
 ```
 
-The token is stored in `~/.config/harness/harness.yaml` under `benchmark_auth` and sent as the `Authorization` header on every request. Users can also pass arbitrary headers at runtime with `-H`:
+The credential is stored in `~/.config/harness/harness.yaml` under `benchmark_auth` and sent as the `Authorization` header on every request. Users can also pass arbitrary headers at runtime with `-H`:
 
 ```bash
 harness benchmark start --benchmark my-benchmark --agent my-agent -H X-Custom value

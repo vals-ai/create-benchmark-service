@@ -3,8 +3,7 @@
 from collections.abc import Generator
 
 import pytest
-from fastapi import HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 
@@ -162,7 +161,7 @@ def test_websocket_evaluate_instance_missing_headers(client: TestClient) -> None
 
 
 class TestAuthMiddleware:
-    """Test that benchmark services can add auth middleware to restrict access."""
+    """Test that the built-in check_auth hook rejects unauthorized requests."""
 
     AUTH_TOKEN = "my-secret-token"
 
@@ -172,18 +171,11 @@ class TestAuthMiddleware:
 
         from benchmark_service.app import BenchmarkServiceApp
 
-        app = BenchmarkServiceApp(StubBenchmark)
+        class AuthBenchmark(StubBenchmark):
+            async def check_auth(self, headers: dict[str, str]) -> bool:
+                return headers.get("authorization") == TestAuthMiddleware.AUTH_TOKEN
 
-        @app.middleware("http")
-        async def check_auth(request: Request, call_next):  # type: ignore[no-untyped-def]
-            if request.url.path == "/health":
-                return await call_next(request)  # type: ignore[reportUnknownVariableType]
-            token = request.headers.get("Authorization")
-            if token != TestAuthMiddleware.AUTH_TOKEN:
-                return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
-            return await call_next(request)  # type: ignore[reportUnknownVariableType]
-
-        with TestClient(app) as c:
+        with TestClient(BenchmarkServiceApp(AuthBenchmark)) as c:
             yield c
 
     def test_no_auth_returns_401(self, auth_client: TestClient) -> None:

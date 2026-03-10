@@ -51,6 +51,20 @@ class BenchmarkService(ABC):
         """
         ...
 
+    async def check_auth(self, headers: dict[str, str]) -> bool:
+        """Validate request authorization. Override to enforce authentication.
+
+        Called on every HTTP request except /health. Return False to reject
+        the request with 401 Unauthorized.
+
+        Args:
+            headers: Request headers (keys are lowercase per HTTP convention).
+
+        Returns:
+            True to allow the request (default), False to reject with 401.
+        """
+        return True
+
     def get_dataset(self, dataset: str | None = None) -> dict[str, Any]:
         """Get a specific dataset by name. Defaults to 'default'."""
         key = dataset or "default"

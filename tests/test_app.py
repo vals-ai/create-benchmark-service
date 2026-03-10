@@ -51,7 +51,6 @@ def test_retrieve_task(client: TestClient) -> None:
     data = response.json()
     assert data["problem_path"] == "/tmp/problem_statement.txt"
     assert data["docker_image"] == "python:3.12-slim"
-    assert data["request_setup"] is False
 
 
 def test_retrieve_task_invalid(client: TestClient) -> None:

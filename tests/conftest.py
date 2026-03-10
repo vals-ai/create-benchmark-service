@@ -40,7 +40,6 @@ class StubBenchmark(BenchmarkService):
         return RetrieveTaskResponse(
             docker_image="python:3.12-slim",
             problem_path="/tmp/problem_statement.txt",
-            request_setup=False,
             cwd="/workspace",
             resources=Resources(vcpu=2, memory=4, disk=10),
         )

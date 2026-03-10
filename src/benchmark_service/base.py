@@ -102,12 +102,15 @@ class BenchmarkService(ABC):
     async def retrieve_task(
         self, task_id: str, skip_validation: bool = False, dataset: str | None = None
     ) -> RetrieveTaskResponse:
-        """Retrieve task metadata including environment specification and problem statement.
+        """Retrieve task metadata including environment specification and problem path.
 
         Implement metadata retrieval:
         - Validate task_id exists (unless skip_validation=True)
         - Load task information from your dataset
-        - Return docker image, problem statement, and resource requirements
+        - Return docker image, problem path, and resource requirements
+
+        The problem_path is the path inside the sandbox where setup_task will
+        write the problem statement file.
 
         Args:
             task_id: The task to retrieve metadata for

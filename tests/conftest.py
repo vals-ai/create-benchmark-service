@@ -35,14 +35,11 @@ class StubBenchmark(BenchmarkService):
         }
 
     async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> RetrieveTaskResponse:
-        ds = self.get_dataset(dataset)
         if not skip_validation:
             await self.validate_task_ids([task_id], dataset=dataset)
-        task = ds[task_id]
         return RetrieveTaskResponse(
             docker_image="python:3.12-slim",
-            problem_statement=task["problem"],
-            request_setup=False,
+            problem_path="/tmp/problem_statement.txt",
             cwd="/workspace",
             resources=Resources(vcpu=2, memory=4, disk=10),
         )

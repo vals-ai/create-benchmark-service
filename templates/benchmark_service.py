@@ -44,21 +44,22 @@ class ExampleBenchmark(BenchmarkService):
         """Retrieve task metadata."""
         if not skip_validation:
             await self.validate_task_ids([task_id], dataset=dataset)
-
-        task = self.get_dataset(dataset)[task_id]
-
         return RetrieveTaskResponse(
             docker_image="python:3.12-slim",
-            problem_statement=task["problem"],
-            request_setup=False,
+            problem_path="/tmp/problem_statement.txt",
             cwd="/workspace",
             resources=Resources(vcpu=2, memory=4, disk=10),
         )
 
     async def setup_task(self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None) -> AsyncGenerator[StreamChunk, None]:
-        """Setup task in sandbox (not needed for this example)."""
+        """Setup task in sandbox — writes the problem statement to problem_path."""
         yield StreamMessageChunk(type="message", data=f"Setting up task {task_id}...")
-        yield StreamMessageChunk(type="message", data="No setup required for example benchmark")
+
+        task = self.get_dataset(dataset)[task_id]
+        problem_statement = task["problem"]
+        await sandbox.fs.upload_file(problem_statement.encode(), "/tmp/problem_statement.txt")
+
+        yield StreamMessageChunk(type="message", data="Problem statement written to sandbox")
         yield StreamResultChunk(type="result", data={"status": "ok"})
 
     async def evaluate_response(self, request: EvaluateResponseRequest, dataset: str | None = None) -> Any:

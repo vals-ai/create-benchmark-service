@@ -54,8 +54,7 @@ class RetrieveTaskResponse(BaseModel):
     """
 
     docker_image: str = Field(description="Docker image name or path")
-    problem_statement: str = Field(description="The task description/problem to solve")
-    request_setup: bool = Field(description="Whether setup is required before evaluation")
+    problem_path: str = Field(description="Path inside the sandbox where the problem statement file will be written during setup")
     cwd: str = Field(description="Working directory inside the container")
     resources: Resources = Field(description="Computational resources needed")
 

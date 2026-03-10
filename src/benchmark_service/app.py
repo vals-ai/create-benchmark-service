@@ -8,6 +8,7 @@ from typing import Any
 
 from daytona import AsyncDaytona, DaytonaConfig
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
+from fastapi.responses import JSONResponse
 
 from benchmark_service.base import BenchmarkService
 from benchmark_service.schemas import (
@@ -41,6 +42,14 @@ class BenchmarkServiceApp(FastAPI):
         self._register_routes()
 
     def _register_routes(self) -> None:
+        @self.middleware("http")
+        async def _check_auth(request: Request, call_next):  # type: ignore[no-untyped-def]
+            if request.url.path == "/health":
+                return await call_next(request)  # type: ignore[reportUnknownVariableType]
+            if not await self.service.check_auth(dict(request.headers)):
+                return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+            return await call_next(request)  # type: ignore[reportUnknownVariableType]
+
         self.add_exception_handler(ValueError, self._value_error_handler)
         self.add_exception_handler(Exception, self._exception_handler)
         self.add_api_route("/health", self._health_check, methods=["GET"])

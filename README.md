@@ -79,6 +79,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 - `get_dataset(dataset)` — return the task dictionary for a given dataset name (defaults to `"default"`)
 - `filter_tasks(task_filter, dataset)` — return task IDs matching a list or Python slice notation (e.g. `"0:10:2"`)
 - `validate_task_ids(task_ids, dataset)` — raise `ValueError` if any ID is not in the dataset
+- `check_auth(headers)` — validate request authorization; returns `True` by default (no auth). Override to enforce authentication.
 
 ### FastAPI application factory (`app.py`)
 
@@ -130,6 +131,34 @@ Pydantic models used across requests and responses:
 **`stream_command(sandbox, command, cwd, ignore_error=False)`**
 
 Runs a shell command inside a Daytona sandbox and yields stdout/stderr lines in real time. Creates a unique session per invocation, streams output via an async queue, checks the exit code, and cleans up the session on completion. Use it inside `setup_task` and `evaluate_instance` to run commands and forward their output as `StreamMessageChunk`s.
+
+### Authentication
+
+The framework includes a built-in `check_auth()` hook that is called on every HTTP request (except `/health`). By default it allows all requests. Override it in your `BenchmarkService` subclass to enforce authentication:
+
+```python
+from benchmark_service import BenchmarkService
+
+class MyBenchmarkService(BenchmarkService):
+    async def check_auth(self, headers: dict[str, str]) -> bool:
+        return headers.get("authorization") == "my-secret-credential"
+
+    # ... other abstract methods
+```
+
+Header names are lowercase per HTTP convention. Requests that fail auth receive a `401 Unauthorized` response automatically.
+
+Harness users configure their credential once via the CLI:
+
+```bash
+harness config auth set <benchmark-name> <credential>
+```
+
+The credential is stored in `~/.config/harness/harness.yaml` under `benchmark_auth` and sent as the `Authorization` header on every request. Users can also pass arbitrary headers at runtime with `-H`:
+
+```bash
+harness benchmark start --benchmark my-benchmark --agent my-agent -H X-Custom value
+```
 
 ### Reverse Tunnel setup
 

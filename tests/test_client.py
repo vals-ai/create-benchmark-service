@@ -124,7 +124,7 @@ async def test_verify_task_ids_params(
     with patch("benchmark_service.client.httpx.AsyncClient", return_value=mock_async_client):
         await client.verify_task_ids(task_ids, slice_str)
 
-    mock_async_client.get.assert_called_once_with(f"{BASE_URL}/verify-task-ids", params=expected_params)
+    mock_async_client.get.assert_called_once_with(f"{BASE_URL}/verify-task-ids", params=expected_params, headers=HEADERS)
 
 
 async def test_verify_task_ids_with_dataset() -> None:
@@ -140,7 +140,7 @@ async def test_verify_task_ids_with_dataset() -> None:
         await client.verify_task_ids(["a"], None, dataset="mydata")
 
     mock_async_client.get.assert_called_once_with(
-        f"{BASE_URL}/verify-task-ids", params={"task_ids": ["a"], "dataset": "mydata"}
+        f"{BASE_URL}/verify-task-ids", params={"task_ids": ["a"], "dataset": "mydata"}, headers=HEADERS
     )
 
 
@@ -162,7 +162,7 @@ async def test_retrieve_task_with_dataset() -> None:
         await client.retrieve_task("task-1", dataset="mydata")
 
     mock_async_client.get.assert_called_once_with(
-        f"{BASE_URL}/retrieve-task/", params={"task_id": "task-1", "skip_validation": False, "dataset": "mydata"}
+        f"{BASE_URL}/retrieve-task/", params={"task_id": "task-1", "skip_validation": False, "dataset": "mydata"}, headers=HEADERS
     )
 
 
@@ -181,7 +181,7 @@ async def test_final_score_with_dataset() -> None:
     mock_async_client.post.assert_called_once_with(
         f"{BASE_URL}/final-score/",
         json={"evaluation_results": {"t1": {"resolved": True}}, "dataset": "mydata"},
-        headers={"Content-Type": "application/json"},
+        headers={**HEADERS, "Content-Type": "application/json"},
     )
 
 
@@ -199,7 +199,7 @@ async def test_verify_task_ids_no_dataset_omitted() -> None:
         await client.verify_task_ids(["a"], None)
 
     mock_async_client.get.assert_called_once_with(
-        f"{BASE_URL}/verify-task-ids", params={"task_ids": ["a"]}
+        f"{BASE_URL}/verify-task-ids", params={"task_ids": ["a"]}, headers=HEADERS
     )
 
 

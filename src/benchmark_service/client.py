@@ -128,7 +128,7 @@ class BenchmarkServiceClient:
 
         return HealthCheckResponse.model_validate(response.json())
 
-    async def verify_task_ids(self, task_ids: list[str] | None, slice_str: str | None) -> VerifyTaskIdsResponse:
+    async def verify_task_ids(self, task_ids: list[str] | None, slice_str: str | None, dataset: str | None = None) -> VerifyTaskIdsResponse:
         """Verify that the given task IDs or slice are valid.
 
         Args:
@@ -140,6 +140,8 @@ class BenchmarkServiceClient:
             params["task_ids"] = task_ids
         if slice_str is not None:
             params["slice"] = slice_str
+        if dataset is not None:
+            params["dataset"] = dataset
 
         async with httpx.AsyncClient(follow_redirects=True, timeout=self._timeout) as client:
             response = await client.get(f"{self._url}/verify-task-ids", params=params)
@@ -151,14 +153,16 @@ class BenchmarkServiceClient:
 
         return VerifyTaskIdsResponse.model_validate(response.json())
 
-    async def retrieve_task(self, task_id: str, skip_validation: bool = False) -> RetrieveTaskResponse:
+    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> RetrieveTaskResponse:
         """Retrieve a task by ID.
 
         Args:
             task_id: The task to retrieve.
             skip_validation: If True, skip task validation.
         """
-        params = {"task_id": task_id, "skip_validation": skip_validation}
+        params: dict[str, Any] = {"task_id": task_id, "skip_validation": skip_validation}
+        if dataset is not None:
+            params["dataset"] = dataset
         async with httpx.AsyncClient(follow_redirects=True, timeout=self._timeout) as client:
             response = await client.get(f"{self._url}/retrieve-task/", params=params)
 
@@ -170,7 +174,7 @@ class BenchmarkServiceClient:
         return RetrieveTaskResponse.model_validate(response.json())
 
     async def setup_task(
-        self, task_id: str, instance_id: str, on_message: Callable[[str], None] | None = None
+        self, task_id: str, instance_id: str, on_message: Callable[[str], None] | None = None, dataset: str | None = None
     ) -> SetupTaskResponse:
         """Set up a task instance via WebSocket.
 
@@ -179,12 +183,12 @@ class BenchmarkServiceClient:
             instance_id: The instance to set up.
             on_message: Optional callback for intermediate progress messages.
         """
-        request = SetupTaskRequest(task_id=task_id, instance_id=instance_id)
+        request = SetupTaskRequest(task_id=task_id, instance_id=instance_id, dataset=dataset)
         result = await self._websocket_request("setup-task", request, on_message)
         return SetupTaskResponse.model_validate(result)
 
     async def evaluate_instance(
-        self, task_id: str, instance_id: str, on_message: Callable[[str], None] | None = None
+        self, task_id: str, instance_id: str, on_message: Callable[[str], None] | None = None, dataset: str | None = None
     ) -> dict[str, Any]:
         """Evaluate a task instance via WebSocket.
 
@@ -193,19 +197,23 @@ class BenchmarkServiceClient:
             instance_id: The instance to evaluate.
             on_message: Optional callback for intermediate progress messages.
         """
-        request = EvaluateInstanceRequest(task_id=task_id, instance_id=instance_id)
+        request = EvaluateInstanceRequest(task_id=task_id, instance_id=instance_id, dataset=dataset)
         return await self._websocket_request("evaluate-instance", request, on_message)
 
-    async def final_score(self, evaluation_results: dict[str, Any]) -> FinalScoreResponse:
+    async def final_score(self, evaluation_results: dict[str, Any], dataset: str | None = None) -> FinalScoreResponse:
         """Compute the final score from evaluation results.
 
         Args:
             evaluation_results: Mapping of evaluation results to score.
         """
+        body: dict[str, Any] = {"evaluation_results": evaluation_results}
+        if dataset is not None:
+            body["dataset"] = dataset
+
         async with httpx.AsyncClient(follow_redirects=True, timeout=self._timeout) as client:
             response = await client.post(
                 f"{self._url}/final-score/",
-                json={"evaluation_results": evaluation_results},
+                json=body,
                 headers={"Content-Type": "application/json"},
             )
 

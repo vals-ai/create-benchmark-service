@@ -99,7 +99,9 @@ class BenchmarkService(ABC):
         return task_ids
 
     @abstractmethod
-    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> RetrieveTaskResponse:
+    async def retrieve_task(
+        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+    ) -> RetrieveTaskResponse:
         """Retrieve task metadata including environment specification and problem statement.
 
         Implement metadata retrieval:
@@ -118,7 +120,9 @@ class BenchmarkService(ABC):
         ...
 
     @abstractmethod
-    def setup_task(self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None) -> AsyncGenerator[StreamChunk, None]:
+    def setup_task(
+        self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None
+    ) -> AsyncGenerator[StreamChunk, None]:
         """Setup a task in a sandbox environment.
 
         The sandbox is already connected and ready to use. Interact with it to
@@ -164,7 +168,9 @@ class BenchmarkService(ABC):
         ...
 
     @abstractmethod
-    def evaluate_instance(self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None) -> AsyncGenerator[StreamChunk, None]:
+    def evaluate_instance(
+        self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None
+    ) -> AsyncGenerator[StreamChunk, None]:
         """Evaluate a solution in a sandbox environment.
 
         The sandbox is already connected and ready to use. Interact with it to
@@ -188,7 +194,9 @@ class BenchmarkService(ABC):
         ...
 
     @abstractmethod
-    async def calculate_final_score(self, evaluation_results: dict[str, Any], dataset: str | None = None) -> FinalScoreResult:
+    async def calculate_final_score(
+        self, evaluation_results: dict[str, Any], dataset: str | None = None
+    ) -> FinalScoreResult:
         """Calculate final aggregate score from all evaluation results.
 
         Implement scoring logic:

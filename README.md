@@ -68,7 +68,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | Method | Description |
 |--------|-------------|
 | `load_datasets()` | Load all tasks from your source; return `dict[dataset_name, dict[task_id, task_object]]` |
-| `retrieve_task(task_id, skip_validation, dataset)` | Return task metadata: docker image, problem statement, resources, etc. |
+| `retrieve_task(task_id, skip_validation, dataset)` | Return task metadata: docker image, problem path, resources, etc. |
 | `setup_task(task_id, sandbox, dataset)` | Async generator — set up the task in a Daytona sandbox, yielding `StreamChunk`s |
 | `evaluate_response(request, dataset)` | Evaluate a text response directly (no sandbox needed) |
 | `evaluate_instance(task_id, sandbox, dataset)` | Async generator — run evaluation in a Daytona sandbox, yielding `StreamChunk`s |
@@ -119,7 +119,7 @@ Yield these from your generator methods; the framework serialises and forwards t
 
 Pydantic models used across requests and responses:
 
-- **`RetrieveTaskResponse`** — `docker_image`, `problem_statement`, `request_setup`, `cwd`, `Resources`
+- **`RetrieveTaskResponse`** — `docker_image`, `problem_path`, `request_setup`, `cwd`, `Resources`
 - **`Resources`** — `vcpu`, `memory` (GB), `disk` (GB)
 - **`EvaluateResponseRequest`** — `task_id`, `response`, `dataset`
 - **`FinalScoreResult`** / **`FinalScoreResponse`** — `score` (float), `metadata`, `tasks_evaluated`

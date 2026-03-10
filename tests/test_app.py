@@ -49,7 +49,7 @@ def test_retrieve_task(client: TestClient) -> None:
     response = client.get("/retrieve-task/", params={"task_id": "task-1"})
     assert response.status_code == 200
     data = response.json()
-    assert data["problem_statement"] == "What is 1+1?"
+    assert data["problem_path"] == "/tmp/problem_statement.txt"
     assert data["docker_image"] == "python:3.12-slim"
     assert data["request_setup"] is False
 
@@ -130,7 +130,7 @@ def test_verify_task_ids_invalid_dataset(client: TestClient) -> None:
 def test_retrieve_task_with_dataset(client: TestClient) -> None:
     response = client.get("/retrieve-task/", params={"task_id": "alt-task-1", "dataset": "alt"})
     assert response.status_code == 200
-    assert response.json()["problem_statement"] == "What is 5+5?"
+    assert response.json()["problem_path"] == "/tmp/problem_statement.txt"
 
 
 def test_evaluate_response_with_dataset(client: TestClient) -> None:

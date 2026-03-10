@@ -45,7 +45,7 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
             "/retrieve-task/",
             {
                 "docker_image": "python:3.12",
-                "problem_statement": "solve it",
+                "problem_path": "/tmp/problem_statement.txt",
                 "request_setup": False,
                 "cwd": "/work",
                 "resources": {"vcpu": 2, "memory": 4, "disk": 10},
@@ -149,7 +149,7 @@ async def test_retrieve_task_with_dataset() -> None:
     client = _make_client()
     mock_resp = _mock_response(json_data={
         "docker_image": "python:3.12",
-        "problem_statement": "solve it",
+        "problem_path": "/tmp/problem_statement.txt",
         "request_setup": False,
         "cwd": "/work",
         "resources": {"vcpu": 2, "memory": 4, "disk": 10},

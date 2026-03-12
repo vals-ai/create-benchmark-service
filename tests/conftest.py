@@ -41,6 +41,7 @@ class StubBenchmark(BenchmarkService):
             docker_image="python:3.12-slim",
             problem_path="/tmp/problem_statement.txt",
             cwd="/workspace",
+            agent_timeout=60.0,
             resources=Resources(vcpu=2, memory=4, disk=10),
         )
 

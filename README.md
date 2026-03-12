@@ -120,7 +120,7 @@ Yield these from your generator methods; the framework serialises and forwards t
 
 Pydantic models used across requests and responses:
 
-- **`RetrieveTaskResponse`** — `docker_image`, `problem_path`, `cwd`, `Resources`
+- **`RetrieveTaskResponse`** — `docker_image`, `problem_path`, `cwd`, `agent_timeout`, `Resources`
 - **`Resources`** — `vcpu`, `memory` (GB), `disk` (GB)
 - **`EvaluateResponseRequest`** — `task_id`, `response`, `dataset`
 - **`FinalScoreResult`** / **`FinalScoreResponse`** — `score` (float), `metadata`, `tasks_evaluated`

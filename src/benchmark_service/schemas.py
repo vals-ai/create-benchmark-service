@@ -56,6 +56,7 @@ class RetrieveTaskResponse(BaseModel):
     docker_image: str = Field(description="Docker image name or path")
     problem_path: str = Field(description="Path inside the sandbox where the problem statement file will be written during setup")
     cwd: str = Field(description="Working directory inside the container")
+    agent_timeout: float = Field(description="Timeout in seconds for agent execution")
     resources: Resources = Field(description="Computational resources needed")
 
 

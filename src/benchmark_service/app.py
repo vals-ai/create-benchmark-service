@@ -1,15 +1,14 @@
-"""FastAPI application factory for benchmark services.
-
-This module provides a complete FastAPI implementation.
-Import create_app and pass your BenchmarkService implementation.
-"""
+"""FastAPI application for benchmark services."""
 
 import logging
 import traceback
+from collections.abc import AsyncGenerator
+from contextlib import asynccontextmanager
 from typing import Any
 
 from daytona import AsyncDaytona, DaytonaConfig
-from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
+from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
+from fastapi.responses import JSONResponse
 
 from benchmark_service.base import BenchmarkService
 from benchmark_service.schemas import (
@@ -25,124 +24,83 @@ from benchmark_service.schemas import (
     VerifyTaskIdsResponse,
 )
 
-# pyright: reportUnusedFunction=false
-
 logger = logging.getLogger(__name__)
 
 
-def create_app(benchmark_service: BenchmarkService) -> FastAPI:
-    """
-    Create a FastAPI application with the provided benchmark service implementation.
+class BenchmarkServiceApp(FastAPI):
+    """FastAPI application backed by a BenchmarkService subclass."""
 
-    Args:
-        benchmark_service: Your BenchmarkService implementation
+    service: BenchmarkService
 
-    Returns:
-        Configured FastAPI application ready to run
-    """
-    app = FastAPI(title=benchmark_service.__class__.__name__)
+    def __init__(self, service_cls: type[BenchmarkService]) -> None:
+        @asynccontextmanager
+        async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
+            self.service = await service_cls.create()
+            yield
 
-    @app.exception_handler(Exception)
-    async def exception_handler(_request: Request, exc: Exception):
-        """Global exception handler for unhandled errors."""
+        super().__init__(title=service_cls.__name__, lifespan=lifespan)
+        self._register_routes()
+
+    def _register_routes(self) -> None:
+        @self.middleware("http")
+        async def _check_auth(request: Request, call_next):  # type: ignore[no-untyped-def]
+            if request.url.path == "/health":
+                return await call_next(request)  # type: ignore[reportUnknownVariableType]
+            if not await self.service.check_auth(dict(request.headers)):
+                return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+            return await call_next(request)  # type: ignore[reportUnknownVariableType]
+
+        self.add_exception_handler(ValueError, self._value_error_handler)
+        self.add_exception_handler(Exception, self._exception_handler)
+        self.add_api_route("/health", self._health_check, methods=["GET"])
+        self.add_api_route("/verify-task-ids", self._verify_task_ids, methods=["GET"])
+        self.add_api_route("/retrieve-task/", self._retrieve_task, methods=["GET"])
+        self.add_api_websocket_route("/ws/setup-task", self._setup_task)
+        self.add_api_route("/evaluate-response/", self._evaluate_response, methods=["POST"])
+        self.add_api_websocket_route("/ws/evaluate-instance", self._evaluate_instance)
+        self.add_api_route("/final-score/", self._final_score, methods=["POST"])
+
+    async def _value_error_handler(self, _request: Request, exc: Exception) -> Response:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    async def _exception_handler(self, _request: Request, exc: Exception) -> Response:
         logger.error(f"Error: {exc}")
         logger.error(traceback.format_exc())
         raise HTTPException(status_code=500, detail=f"{str(exc)}: {traceback.format_exc()}") from exc
 
-    @app.get("/health")
-    def health_check() -> HealthCheckResponse:
-        """
-        Health check endpoint to verify the service is running.
-
-        Usage:
-            curl -X GET http://localhost:8000/health
-
-        Returns:
-            {"status": "ok"}
-        """
+    async def _health_check(self) -> HealthCheckResponse:
         return HealthCheckResponse(status="ok")
 
-    @app.get("/verify-task-ids")
-    def verify_task_ids(
+    async def _verify_task_ids(
+        self,
         task_ids: list[str] | None = Query(default=None, description="List of task IDs to verify"),
         slice: str | None = Query(default=None, description="Slice of dataset (e.g., '3:10:1', '1:10:2')"),
+        dataset: str | None = Query(default=None, description="Dataset name to use (defaults to 'default')"),
     ) -> VerifyTaskIdsResponse:
-        """
-        Verify that task IDs exist in the benchmark dataset.
-
-        Usage:
-            # Verify specific task IDs
-            curl -X GET "http://localhost:8000/verify-task-ids?task_ids=task_1&task_ids=task_2"
-
-            # Verify all tasks
-            curl -X GET "http://localhost:8000/verify-task-ids"
-
-            # Verify with slice
-            curl -X GET "http://localhost:8000/verify-task-ids?slice=0:10:1"
-
-        Returns:
-            {"task_ids": ["task_1", "task_2", ...]}
-        """
         task_filter = TaskFilter()
 
         if task_ids:
-            task_filter.task_ids = list(dict.fromkeys(task_ids))  # Remove duplicates
+            task_filter.task_ids = list(dict.fromkeys(task_ids))
 
         if slice:
             task_filter.slice_str = slice
 
-        filtered_task_ids = benchmark_service.filter_tasks(task_filter)
+        filtered_task_ids = await self.service.filter_tasks(task_filter, dataset=dataset)
 
         return VerifyTaskIdsResponse(task_ids=filtered_task_ids)
 
-    @app.get("/retrieve-task/")
-    async def retrieve_task(
+    async def _retrieve_task(
+        self,
         task_id: str = Query(..., description="Task ID to retrieve"),
         skip_validation: bool = Query(False, description="Skip validation of task existence"),
+        dataset: str | None = Query(default=None, description="Dataset name to use (defaults to 'default')"),
     ) -> RetrieveTaskResponse:
-        """
-        Retrieve task metadata including environment specification and problem statement.
+        return await self.service.retrieve_task(task_id, skip_validation, dataset=dataset)
 
-        Usage:
-            curl -X GET "http://localhost:8000/retrieve-task/?task_id=task_1"
-
-        Returns:
-            {
-                "docker_image": "your-registry/benchmark-task:latest",
-                "problem_statement": "Solve this problem...",
-                "request_setup": true,
-                "cwd": "/workspace",
-                "resources": {"vcpu": 2, "memory": 4, "disk": 10}
-            }
-        """
-        return benchmark_service.retrieve_task(task_id, skip_validation)
-
-    @app.websocket("/ws/setup-task")
-    async def setup_task(websocket: WebSocket):
-        """
-        Setup a task in a sandbox environment (WebSocket endpoint).
-
-        This endpoint is called when a task requires setup before evaluation
-        (e.g., installing dependencies, preparing data, etc.).
-
-        Headers:
-            x-api-key: API key for sandbox service (e.g., Daytona)
-            x-api-url: API URL for sandbox service
-            x-target: Target identifier for sandbox
-
-        Body:
-            {"task_id": "task_1", "instance_id": "instance_123"}
-
-        The framework handles:
-        1. WebSocket connection management
-        2. Daytona client setup
-        3. Sandbox retrieval
-        4. Streaming yielded messages to client
-        """
+    async def _setup_task(self, websocket: WebSocket) -> None:
         await websocket.accept()
 
         try:
-            # Extract headers
             api_key = websocket.headers.get("x-api-key")
             api_url = websocket.headers.get("x-api-url")
             target = websocket.headers.get("x-target")
@@ -151,18 +109,15 @@ def create_app(benchmark_service: BenchmarkService) -> FastAPI:
                 await websocket.close(code=1008, reason="Missing required headers: x-api-key, x-api-url, x-target")
                 return
 
-            # Receive request data
             data = await websocket.receive_json()
             request = SetupTaskRequest(**data)
 
-            # Setup Daytona client and get sandbox
             daytona_config = DaytonaConfig(api_key=api_key, api_url=api_url, target=target)
 
             async with AsyncDaytona(config=daytona_config) as daytona:
                 sandbox = await daytona.get(request.instance_id)
 
-                # Call benchmark service implementation and stream results
-                async for message in benchmark_service.setup_task(request.task_id, sandbox):
+                async for message in self.service.setup_task(request.task_id, sandbox, dataset=request.dataset):
                     await websocket.send_json(message.model_dump())
 
         except Exception as e:
@@ -176,50 +131,13 @@ def create_app(benchmark_service: BenchmarkService) -> FastAPI:
             except RuntimeError:
                 pass
 
-    @app.post("/evaluate-response/")
-    def evaluate_response(request: EvaluateResponseRequest) -> Any:
-        """
-        Evaluate a text response directly (without sandbox execution).
+    async def _evaluate_response(self, request: EvaluateResponseRequest) -> Any:
+        return await self.service.evaluate_response(request, dataset=request.dataset)
 
-        Use this endpoint when your benchmark can evaluate responses without
-        executing code or running tests (e.g., text generation, QA tasks).
-
-        Usage:
-            curl -X POST http://localhost:8000/evaluate-response/ \
-                -H "Content-Type: application/json" \
-                -d '{"task_id": "task_1", "response": "The answer is..."}'
-
-        Returns:
-            Benchmark-specific evaluation result
-        """
-        return benchmark_service.evaluate_response(request)
-
-    @app.websocket("/ws/evaluate-instance")
-    async def evaluate_instance(websocket: WebSocket):
-        """
-        Evaluate a solution in a sandbox environment (WebSocket endpoint).
-
-        Use this endpoint when your benchmark requires executing code,
-        running tests, or otherwise interacting with a sandbox.
-
-        Headers:
-            x-api-key: API key for sandbox service
-            x-api-url: API URL for sandbox service
-            x-target: Target identifier for sandbox
-
-        Body:
-            {"task_id": "task_1", "instance_id": "instance_123"}
-
-        The framework handles:
-        1. WebSocket connection management
-        2. Daytona client setup
-        3. Sandbox retrieval
-        4. Streaming yielded messages to client
-        """
+    async def _evaluate_instance(self, websocket: WebSocket) -> None:
         await websocket.accept()
 
         try:
-            # Extract headers
             api_key = websocket.headers.get("x-api-key")
             api_url = websocket.headers.get("x-api-url")
             target = websocket.headers.get("x-target")
@@ -228,18 +146,15 @@ def create_app(benchmark_service: BenchmarkService) -> FastAPI:
                 await websocket.close(code=1008, reason="Missing required headers: x-api-key, x-api-url, x-target")
                 return
 
-            # Receive request data
             data = await websocket.receive_json()
             request = EvaluateInstanceRequest(**data)
 
-            # Setup Daytona client and get sandbox
             daytona_config = DaytonaConfig(api_key=api_key, api_url=api_url, target=target)
 
             async with AsyncDaytona(config=daytona_config) as daytona:
                 sandbox = await daytona.get(request.instance_id)
 
-                # Call benchmark service implementation and stream results
-                async for message in benchmark_service.evaluate_instance(request.task_id, sandbox):
+                async for message in self.service.evaluate_instance(request.task_id, sandbox, dataset=request.dataset):
                     await websocket.send_json(message.model_dump())
 
         except Exception as e:
@@ -253,35 +168,14 @@ def create_app(benchmark_service: BenchmarkService) -> FastAPI:
             except RuntimeError:
                 pass
 
-    @app.post("/final-score/")
-    async def final_score(request: FinalScoreRequest) -> FinalScoreResponse:
-        """
-        Calculate final aggregate score from all evaluation results.
-
-        Usage:
-            curl -X POST http://localhost:8000/final-score/ \
-                -H "Content-Type: application/json" \
-                -d '{"evaluation_results": {"task_1": {...}, "task_2": {...}}}'
-
-        Returns:
-            {
-                "tasks_evaluated": ["task_1", "task_2"],
-                "final_score": 75.0,
-                "metadata": {...}
-            }
-        """
+    async def _final_score(self, request: FinalScoreRequest) -> FinalScoreResponse:
         tasks_evaluated = list(request.evaluation_results.keys())
 
-        # Validate task IDs
-        validated_task_ids = benchmark_service.validate_task_ids(tasks_evaluated)
-
-        # Calculate final score using benchmark service implementation
-        result = benchmark_service.calculate_final_score(request.evaluation_results)
+        validated_task_ids = await self.service.validate_task_ids(tasks_evaluated, dataset=request.dataset)
+        result = await self.service.calculate_final_score(request.evaluation_results, dataset=request.dataset)
 
         return FinalScoreResponse(
             tasks_evaluated=validated_task_ids,
             final_score=result.score,
             metadata=result.metadata,
         )
-
-    return app

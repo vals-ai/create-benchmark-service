@@ -11,11 +11,11 @@ from cli.generator import BenchmarkNames, generate_project, transform_name, vali
 @pytest.mark.parametrize(
     ("input_name", "expected"),
     [
-        ("swebench", BenchmarkNames(benchmark_name="swebench", benchmark_package="swebench_service")),
-        ("swe-bench", BenchmarkNames(benchmark_name="swe-bench", benchmark_package="swe_bench_service")),
-        ("swe_bench", BenchmarkNames(benchmark_name="swe-bench", benchmark_package="swe_bench_service")),
-        ("SWEBench", BenchmarkNames(benchmark_name="swebench", benchmark_package="swebench_service")),
-        ("humaneval", BenchmarkNames(benchmark_name="humaneval", benchmark_package="humaneval_service")),
+        ("swebench", BenchmarkNames(benchmark_name="swebench", benchmark_package="swebench_benchmark_service")),
+        ("swe-bench", BenchmarkNames(benchmark_name="swe-bench", benchmark_package="swe_bench_benchmark_service")),
+        ("swe_bench", BenchmarkNames(benchmark_name="swe-bench", benchmark_package="swe_bench_benchmark_service")),
+        ("SWEBench", BenchmarkNames(benchmark_name="swebench", benchmark_package="swebench_benchmark_service")),
+        ("humaneval", BenchmarkNames(benchmark_name="humaneval", benchmark_package="humaneval_benchmark_service")),
     ],
 )
 def test_transform_name(input_name: str, expected: BenchmarkNames) -> None:
@@ -45,9 +45,9 @@ def test_invalid_names(name: str, error_match: str) -> None:
 @pytest.mark.parametrize(
     ("benchmark_name", "expected_package", "expected_project_name", "expected_readme_title"),
     [
-        ("swebench", "swebench_service", "swebench-service", "# swebench Service"),
-        ("swe-bench", "swe_bench_service", "swe-bench-service", "# swe-bench Service"),
-        ("humaneval", "humaneval_service", "humaneval-service", "# humaneval Service"),
+        ("swebench", "swebench_benchmark_service", "swebench-benchmark-service", "# swebench Service"),
+        ("swe-bench", "swe_bench_benchmark_service", "swe-bench-benchmark-service", "# swe-bench Service"),
+        ("humaneval", "humaneval_benchmark_service", "humaneval-benchmark-service", "# humaneval Service"),
     ],
 )
 def test_template_rendering(
@@ -57,7 +57,7 @@ def test_template_rendering(
     expected_readme_title: str,
 ) -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
-        output_dir = Path(tmpdir) / f"{benchmark_name}-service"
+        output_dir = Path(tmpdir) / f"{benchmark_name}-benchmark-service"
         generate_project(benchmark_name, output_dir)
 
         main_content = (output_dir / "main.py").read_text()
@@ -73,7 +73,7 @@ def test_template_rendering(
 
 def test_generates_project_structure() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
-        output_dir = Path(tmpdir) / "swebench-service"
+        output_dir = Path(tmpdir) / "swebench-benchmark-service"
         generate_project("swebench", output_dir)
 
         assert (output_dir / "main.py").exists()
@@ -84,16 +84,16 @@ def test_generates_project_structure() -> None:
         assert (output_dir / ".gitignore").exists()
         assert (output_dir / ".dockerignore").exists()
         assert (output_dir / ".python-version").exists()
-        assert (output_dir / "src" / "swebench_service").is_dir()
-        assert (output_dir / "src" / "swebench_service" / "__init__.py").exists()
-        assert (output_dir / "src" / "swebench_service" / "benchmark_service.py").exists()
+        assert (output_dir / "src" / "swebench_benchmark_service").is_dir()
+        assert (output_dir / "src" / "swebench_benchmark_service" / "__init__.py").exists()
+        assert (output_dir / "src" / "swebench_benchmark_service" / "benchmark_service.py").exists()
         assert (output_dir / "tests").is_dir()
         assert (output_dir / ".github" / "workflows").is_dir()
 
 
 def test_fails_if_directory_exists() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
-        output_dir = Path(tmpdir) / "swebench-service"
+        output_dir = Path(tmpdir) / "swebench-benchmark-service"
         output_dir.mkdir()
 
         with pytest.raises(FileExistsError, match="already exists"):

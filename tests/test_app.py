@@ -1,5 +1,7 @@
 """Tests for FastAPI app endpoints."""
 
+from collections.abc import Generator
+
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -49,21 +51,18 @@ def test_retrieve_task(client: TestClient) -> None:
     response = client.get("/retrieve-task/", params={"task_id": "task-1"})
     assert response.status_code == 200
     data = response.json()
-    assert data["problem_statement"] == "What is 1+1?"
+    assert data["problem_path"] == "/tmp/problem_statement.txt"
     assert data["docker_image"] == "python:3.12-slim"
-    assert data["request_setup"] is False
 
 
 def test_retrieve_task_invalid(client: TestClient) -> None:
-    with pytest.raises(HTTPException) as exc_info:
-        client.get("/retrieve-task/", params={"task_id": "nonexistent"})
-    assert exc_info.value.status_code == 500
+    response = client.get("/retrieve-task/", params={"task_id": "nonexistent"})
+    assert response.status_code == 400
 
 
 def test_retrieve_task_skip_validation(client: TestClient) -> None:
-    with pytest.raises(HTTPException) as exc_info:
-        client.get("/retrieve-task/", params={"task_id": "nonexistent", "skip_validation": True})
-    assert exc_info.value.status_code == 500
+    response = client.get("/retrieve-task/", params={"task_id": "nonexistent", "skip_validation": True})
+    assert response.status_code == 200
 
 
 @pytest.mark.parametrize(
@@ -113,9 +112,40 @@ def test_final_score(
 
 
 def test_final_score_invalid_task(client: TestClient) -> None:
-    with pytest.raises(HTTPException) as exc_info:
-        client.post("/final-score/", json={"evaluation_results": {"nonexistent": {"resolved": True}}})
-    assert exc_info.value.status_code == 500
+    response = client.post("/final-score/", json={"evaluation_results": {"nonexistent": {"resolved": True}}})
+    assert response.status_code == 400
+
+
+def test_verify_task_ids_with_dataset(client: TestClient) -> None:
+    response = client.get("/verify-task-ids", params={"dataset": "alt"})
+    assert response.status_code == 200
+    assert response.json() == {"task_ids": ["alt-task-1", "alt-task-2"]}
+
+
+def test_verify_task_ids_invalid_dataset(client: TestClient) -> None:
+    response = client.get("/verify-task-ids", params={"dataset": "nonexistent"})
+    assert response.status_code == 400
+
+
+def test_retrieve_task_with_dataset(client: TestClient) -> None:
+    response = client.get("/retrieve-task/", params={"task_id": "alt-task-1", "dataset": "alt"})
+    assert response.status_code == 200
+    assert response.json()["problem_path"] == "/tmp/problem_statement.txt"
+
+
+def test_evaluate_response_with_dataset(client: TestClient) -> None:
+    response = client.post("/evaluate-response/", json={"task_id": "alt-task-1", "response": "10", "dataset": "alt"})
+    assert response.status_code == 200
+    assert response.json()["resolved"] is True
+
+
+def test_final_score_with_dataset(client: TestClient) -> None:
+    response = client.post("/final-score/", json={
+        "evaluation_results": {"alt-task-1": {"resolved": True}},
+        "dataset": "alt",
+    })
+    assert response.status_code == 200
+    assert response.json()["final_score"] == 100.0
 
 
 def test_websocket_setup_task_missing_headers(client: TestClient) -> None:
@@ -126,3 +156,38 @@ def test_websocket_setup_task_missing_headers(client: TestClient) -> None:
 def test_websocket_evaluate_instance_missing_headers(client: TestClient) -> None:
     with client.websocket_connect("/ws/evaluate-instance") as ws:
         ws.close()
+
+
+class TestAuthMiddleware:
+    """Test that the built-in check_auth hook rejects unauthorized requests."""
+
+    AUTH_TOKEN = "my-secret-token"
+
+    @pytest.fixture
+    def auth_client(self) -> Generator[TestClient, None, None]:
+        from tests.conftest import StubBenchmark
+
+        from benchmark_service.app import BenchmarkServiceApp
+
+        class AuthBenchmark(StubBenchmark):
+            async def check_auth(self, headers: dict[str, str]) -> bool:
+                return headers.get("authorization") == TestAuthMiddleware.AUTH_TOKEN
+
+        with TestClient(BenchmarkServiceApp(AuthBenchmark)) as c:
+            yield c
+
+    def test_no_auth_returns_401(self, auth_client: TestClient) -> None:
+        response = auth_client.get("/verify-task-ids")
+        assert response.status_code == 401
+
+    def test_wrong_auth_returns_401(self, auth_client: TestClient) -> None:
+        response = auth_client.get("/verify-task-ids", headers={"Authorization": "wrong"})
+        assert response.status_code == 401
+
+    def test_correct_auth_returns_200(self, auth_client: TestClient) -> None:
+        response = auth_client.get("/verify-task-ids", headers={"Authorization": self.AUTH_TOKEN})
+        assert response.status_code == 200
+
+    def test_health_skips_auth(self, auth_client: TestClient) -> None:
+        response = auth_client.get("/health")
+        assert response.status_code == 200

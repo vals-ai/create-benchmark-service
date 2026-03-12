@@ -15,12 +15,12 @@ def main(benchmark_name: str) -> None:
     Example: create-benchmark-service swebench
     """
     names = transform_name(benchmark_name)
-    output_dir_path = Path.cwd() / f"{names['benchmark_name']}-service"
+    output_dir_path = Path.cwd() / f"{names['benchmark_name']}-benchmark-service"
 
     try:
         generate_project(benchmark_name=benchmark_name, output_dir=output_dir_path)
 
-        print(f"Created {names['benchmark_name']}-service at {output_dir_path}")
+        print(f"Created {names['benchmark_name']}-benchmark-service at {output_dir_path}")
         print()
         print("Next steps:")
         print(f"  cd {output_dir_path.name}")

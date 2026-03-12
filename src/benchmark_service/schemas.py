@@ -10,6 +10,7 @@ class TaskFilter(BaseModel):
 
     task_ids: list[str] | None = Field(default=None, description="List of specific task IDs to filter")
     slice_str: str | None = Field(default=None, description="Slice notation for selecting tasks (e.g., '3:10:1')")
+    dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
 
     def parse_slice(self) -> slice:
         """Parse slice string into Python slice object."""
@@ -53,8 +54,7 @@ class RetrieveTaskResponse(BaseModel):
     """
 
     docker_image: str = Field(description="Docker image name or path")
-    problem_statement: str = Field(description="The task description/problem to solve")
-    request_setup: bool = Field(description="Whether setup is required before evaluation")
+    problem_path: str = Field(description="Path inside the sandbox where the problem statement file will be written during setup")
     cwd: str = Field(description="Working directory inside the container")
     resources: Resources = Field(description="Computational resources needed")
 
@@ -64,6 +64,7 @@ class SetupTaskRequest(BaseModel):
 
     task_id: str = Field(description="Unique identifier for the task")
     instance_id: str = Field(description="Unique identifier for the sandbox instance")
+    dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
 
 
 class SetupTaskResponse(BaseModel):
@@ -82,6 +83,7 @@ class EvaluateResponseRequest(BaseModel):
 
     task_id: str = Field(description="Unique identifier for the task")
     response: str = Field(description="The agent's response to evaluate")
+    dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
 
 
 class EvaluateInstanceRequest(BaseModel):
@@ -94,6 +96,7 @@ class EvaluateInstanceRequest(BaseModel):
 
     task_id: str = Field(description="Unique identifier for the task")
     instance_id: str = Field(description="Sandbox instance where the solution was implemented")
+    dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
 
 
 class FinalScoreRequest(BaseModel):
@@ -110,6 +113,7 @@ class FinalScoreRequest(BaseModel):
     """
 
     evaluation_results: dict[str, Any] = Field(description="Mapping of task_id to benchmark-specific evaluation result")
+    dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
 
 
 class FinalScoreResult(BaseModel):

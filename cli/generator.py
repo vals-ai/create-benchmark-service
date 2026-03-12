@@ -25,11 +25,11 @@ def transform_name(name: str) -> BenchmarkNames:
     Returns:
         BenchmarkNames with:
         - benchmark_name: lowercase with hyphens (e.g., "swe-bench")
-        - benchmark_package: lowercase with underscores (e.g., "swe_bench_service")
+        - benchmark_package: lowercase with underscores (e.g., "swe_bench_benchmark_service")
     """
 
     benchmark_name = name.lower().replace("_", "-")
-    benchmark_package = benchmark_name.replace("-", "_") + "_service"
+    benchmark_package = benchmark_name.replace("-", "_") + "_benchmark_service"
 
     return {
         "benchmark_name": benchmark_name,

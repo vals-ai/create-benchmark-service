@@ -162,7 +162,7 @@ harness benchmark start --benchmark my-benchmark --agent my-agent -H X-Custom va
 
 ### Reverse Tunnel setup
 
-You may want to test the benchmark service using the hosted agentic harness service instead of hosting it locally. We offer a simple way to do this through ngrok (although you can use any reverse tunnel tool)
+You may want to test the benchmark service using valkyrie instead of hosting it locally. We offer a simple way to do this through ngrok (although you can use any reverse tunnel tool)
 
 Setup
 
@@ -171,6 +171,6 @@ Setup
 3. Start the project using either `make dev` or `make docker-build && make docker-run`
 4. Run ngrok on the matching port that is exposed: `ngrok http 8001` (forwards the traffic from the tunnel to the FastAPI server running on your machine)
    - Copy the forwarding address on the left. Example: `https://hemagglutinative-vonnie-fungic.ngrok-free.dev`
-5. Using the agentic harness CLI, run `harness config service add <benchmark-name> <forwarding-address>`
+5. Using Valkyrie, run `valkyrie config service add <benchmark-name> <forwarding-address>`
 
 If the forwarding address changes you will need to run step 5 again.

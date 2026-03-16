@@ -134,8 +134,12 @@ def generate_project(
         content = template.render(names)
         (output_dir / output_name).write_text(content)
 
-    # Copy .github directory
-    shutil.copytree(root / ".github", output_dir / ".github")
+    # Copy .github directory, excluding CLI-specific workflows
+    shutil.copytree(
+        root / ".github",
+        output_dir / ".github",
+        ignore=shutil.ignore_patterns("cli-integration.yaml"),
+    )
 
     # Create empty tests directory
     (output_dir / "tests").mkdir(exist_ok=True)

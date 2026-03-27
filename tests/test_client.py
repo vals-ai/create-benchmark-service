@@ -341,3 +341,16 @@ async def test_ws_connection_closed_without_result(method: str, args: list[str])
     with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
         with pytest.raises(BenchmarkServiceError, match="without returning final result"):
             await getattr(client, method)(*args)
+
+
+async def test_client_async_context_manager_closes_provider() -> None:
+    client = _make_client()
+    provider = MagicMock()
+    provider.close = AsyncMock()
+    client._sandbox_provider = provider
+
+    async with client as entered:
+        assert entered is client
+
+    provider.close.assert_awaited_once()
+    assert client._sandbox_provider is None

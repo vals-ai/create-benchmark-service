@@ -9,7 +9,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
 from typing import Any, Self
 
-from daytona import AsyncSandbox
+from benchmark_service.sandbox import Sandbox
 
 from benchmark_service.schemas import (
     EvaluateResponseRequest,
@@ -138,7 +138,7 @@ class BenchmarkService(ABC):
 
     @abstractmethod
     def setup_task(
-        self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None
+        self, task_id: str, sandbox: Sandbox, dataset: str | None = None
     ) -> AsyncGenerator[StreamChunk, None]:
         """Setup a task in a sandbox environment.
 
@@ -186,7 +186,7 @@ class BenchmarkService(ABC):
 
     @abstractmethod
     def evaluate_instance(
-        self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None
+        self, task_id: str, sandbox: Sandbox, dataset: str | None = None
     ) -> AsyncGenerator[StreamChunk, None]:
         """Evaluate a solution in a sandbox environment.
 

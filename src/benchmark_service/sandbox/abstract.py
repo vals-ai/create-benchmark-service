@@ -2,55 +2,63 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator, Callable, Mapping
-from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any, Self
 
-
-@dataclass
-class SandboxResources:
-    cpu: float
-    memory_gb: int
-    disk_gb: int
+from pydantic import BaseModel, Field
 
 
-@dataclass
-class SandboxQuery:
-    labels: dict[str, str] = field(default_factory=dict)
-    limit: int = 100
-    page: int = 1
+_DEFAULT_CREATION_TIMEOUT = 360
 
-@dataclass
-class ExecResult:
-    exit_code: int
+class SandboxResources(BaseModel):
+    cpu: int = Field(gt=0, le=32)
+    memory: int = Field(gt=0, le=64) # in GB
+    disk: int = Field(gt=0, le=256) # in GB
+
+
+class SandboxQuery(BaseModel):
+    labels: dict[str, str] = Field(default_factory=dict)
+    limit: int = 10
+
+
+class ExecResult(BaseModel):
+    exit_code: int | None = None
     stdout: str = ""
     stderr: str = ""
+    duration: float | None = None
 
-@dataclass
-class SandboxFile:
+
+class SandboxFile(BaseModel):
     content: bytes
     remote_path: str
+
+
+class SandboxProviderType(StrEnum):
+    DAYTONA = "daytona"
 
 
 class SandboxSourceType(StrEnum):
     IMAGE = "image"
     SNAPSHOT = "snapshot"
 
-@dataclass
-class SandboxCreateRequest:
-    source_id: str  # image name or snapshot id depending on source_type
+
+class SandboxCreateRequest(BaseModel):
+    source_id: str
     source_type: SandboxSourceType = SandboxSourceType.IMAGE
     resources: SandboxResources | None = None
     network_blocked: bool = False
-    env_vars: dict[str, str] = field(default_factory=dict)
-    labels: dict[str, str] = field(default_factory=dict)
+    env_vars: dict[str, str] = Field(default_factory=dict)
+    labels: dict[str, str] = Field(default_factory=dict)
     name: str | None = None
-    idle_timeout: int | None = None
     auto_delete_interval: int | None = None
-    timeout: float | None = None
+    creation_timeout: int = _DEFAULT_CREATION_TIMEOUT
 
 
 class SandboxError(Exception):
+    pass
+
+
+class InvalidSandboxConfigurationError(SandboxError):
     pass
 
 
@@ -63,12 +71,11 @@ class Sandbox(ABC):
         self.provider = provider
         self.id = id
         self.name = name
-    
+
     @abstractmethod
     async def exec(
         self,
         command: str,
-        *,
         cwd: str | None = None,
         env: Mapping[str, str] | None = None,
         timeout: float | None = None,
@@ -76,16 +83,14 @@ class Sandbox(ABC):
         on_stderr: Callable[[str], None] | None = None,
     ) -> ExecResult:
         """Execute a command in the sandbox.
-        accepts on_stdout and on_stderr callbacks to stream the output of the command.
-        e.g. internally this could use daytona websockets to stream the output of the command.
-        of for non-streaming, could call the callbacks on each new line of the output/stderr.
-        
-        Returns the exit code of the command and stdout/stderr.
+        When on_stdout/on_stderr are provided, output is streamed via callbacks.
+        When omitted, uses a simpler non-streaming execution path.
+        Returns exit code, stdout/stderr, and optionally duration.
         """
         pass
 
     @abstractmethod
-    async def upload_file(self, content: bytes, remote_path: str) -> None:
+    async def upload_file(self, file: SandboxFile) -> None:
         pass
 
     @abstractmethod
@@ -101,18 +106,15 @@ class Sandbox(ABC):
         pass
 
     @abstractmethod
-    async def upload_directory(self, local_path: str, remote_path: str) -> None:
-        pass
-
-    @abstractmethod
-    async def download_directory(self, remote_path: str) -> bytes:
+    async def wait_until_ready(self) -> None:
+        """Block until the sandbox is ready to accept commands."""
         pass
 
 
 class SandboxProvider(ABC):
     @classmethod
     @abstractmethod
-    def from_headers(cls, headers: Mapping[str, str], **kwargs: Any) -> Self:
+    async def from_headers(cls, headers: Mapping[str, str], **kwargs: Any) -> Self:
         """Authenticate with a sandbox provider using provided headers."""
         pass
 
@@ -130,8 +132,7 @@ class SandboxProvider(ABC):
         pass
 
     @abstractmethod
-    def list_sandboxes(self, query: SandboxQuery | None = None) -> AsyncIterator[Sandbox]:
-        """Yields sandboxes matching the query, handling pagination internally."""
+    async def list_sandboxes(self, query: SandboxQuery | None = None) -> AsyncIterator[Sandbox]:
         pass
 
     async def close(self) -> None:

@@ -1,10 +1,12 @@
 """Tests for FastAPI app endpoints."""
 
 from collections.abc import Generator
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 
 def test_health(client: TestClient) -> None:
@@ -156,6 +158,23 @@ def test_websocket_setup_task_missing_headers(client: TestClient) -> None:
 def test_websocket_evaluate_instance_missing_headers(client: TestClient) -> None:
     with client.websocket_connect("/ws/evaluate-instance") as ws:
         ws.close()
+
+
+@pytest.mark.parametrize("path", ["/ws/setup-task", "/ws/evaluate-instance"])
+def test_websocket_invalid_json_does_not_create_provider(client: TestClient, path: str) -> None:
+    mock_create_provider = AsyncMock()
+
+    with patch("benchmark_service.app.create_provider", mock_create_provider):
+        with client.websocket_connect(
+            path,
+            headers={"x-api-key": "key", "x-api-url": "https://example.com", "x-target": "target"},
+        ) as ws:
+            ws.send_text("not json")
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws.receive_json()
+
+    assert exc_info.value.code == 1008
+    mock_create_provider.assert_not_awaited()
 
 
 class TestAuthMiddleware:

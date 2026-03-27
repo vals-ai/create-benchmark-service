@@ -1,12 +1,14 @@
 """HTTP/WebSocket client for communicating with a benchmark service."""
 
+import asyncio
 from collections.abc import Callable
-from typing import Any
+from typing import Any, Self
 
 import httpx
 import websockets
-from daytona import AsyncDaytona, DaytonaConfig
 from pydantic import BaseModel, TypeAdapter
+
+from benchmark_service.sandbox import SandboxProvider, create_provider
 from websockets.exceptions import ConnectionClosed
 
 from benchmark_service.schemas import (
@@ -35,7 +37,8 @@ class BenchmarkServiceClient:
     _url: str
     _headers: dict[str, str]
     _timeout: int
-    _daytona_client: AsyncDaytona | None = None
+    _sandbox_provider: SandboxProvider | None = None
+    _provider_lock: asyncio.Lock
 
     def __init__(self, url: str, headers: dict[str, str], timeout: int = 60):
         """Initialize the client.
@@ -48,27 +51,29 @@ class BenchmarkServiceClient:
         self._url = url
         self._headers = headers
         self._timeout = timeout
+        self._provider_lock = asyncio.Lock()
 
-    @property
-    def daytona_client(self) -> AsyncDaytona:
-        """Lazy-initialized Daytona SDK client, built from the same headers used for API requests."""
-        if self._daytona_client:
-            return self._daytona_client
-
-        self._daytona_client = AsyncDaytona(
-            config=DaytonaConfig(
-                api_key=self._headers["x-api-key"],
-                api_url=self._headers["x-api-url"],
-                target=self._headers["x-target"],
-            )
-        )
-
-        return self._daytona_client
+    async def get_sandbox_provider(self) -> SandboxProvider:
+        """Lazy-initialized sandbox provider, built from the same headers used for API requests."""
+        async with self._provider_lock:
+            if self._sandbox_provider is None:
+                self._sandbox_provider = await create_provider(self._headers)
+        return self._sandbox_provider
 
     async def close(self) -> None:
-        """Close the Daytona client if it was initialized."""
-        if self._daytona_client:
-            await self._daytona_client.close()
+        """Close the sandbox provider if it was initialized."""
+        async with self._provider_lock:
+            provider = self._sandbox_provider
+            self._sandbox_provider = None
+
+        if provider is not None:
+            await provider.close()
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *exc: object) -> None:
+        await self.close()
 
     @property
     def _ws_url(self) -> str:

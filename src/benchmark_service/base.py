@@ -5,6 +5,7 @@ all the abstract methods. Then use the factory function in benchmark_service.app
 a FastAPI app with your implementation.
 """
 
+import hmac
 import os
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
@@ -70,7 +71,7 @@ class BenchmarkService(ABC):
         api_key = os.environ.get("BENCHMARK_API_KEY")
         if not api_key:
             return True
-        return headers.get("authorization") == f"Bearer {api_key}"
+        return hmac.compare_digest(headers.get("authorization", ""), f"Bearer {api_key}")
 
     def get_dataset(self, dataset: str | None = None) -> dict[str, Any]:
         """Get a specific dataset by name. Defaults to 'default'."""

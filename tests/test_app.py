@@ -191,3 +191,50 @@ class TestAuthMiddleware:
     def test_health_skips_auth(self, auth_client: TestClient) -> None:
         response = auth_client.get("/health")
         assert response.status_code == 200
+
+
+class TestEnvVarAuth:
+    """Test the default check_auth behavior with BENCHMARK_API_KEY env var."""
+
+    API_KEY = "test-api-key-123"
+
+    @pytest.fixture
+    def auth_client(self, monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
+        monkeypatch.setenv("BENCHMARK_API_KEY", self.API_KEY)
+        from benchmark_service.app import BenchmarkServiceApp
+        from tests.conftest import StubBenchmark
+
+        with TestClient(BenchmarkServiceApp(StubBenchmark)) as c:
+            yield c
+
+    @pytest.fixture
+    def no_auth_client(self, monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
+        monkeypatch.delenv("BENCHMARK_API_KEY", raising=False)
+        from benchmark_service.app import BenchmarkServiceApp
+        from tests.conftest import StubBenchmark
+
+        with TestClient(BenchmarkServiceApp(StubBenchmark)) as c:
+            yield c
+
+    def test_no_key_env_allows_all(self, no_auth_client: TestClient) -> None:
+        response = no_auth_client.get("/verify-task-ids")
+        assert response.status_code == 200
+
+    def test_key_env_rejects_missing_header(self, auth_client: TestClient) -> None:
+        response = auth_client.get("/verify-task-ids")
+        assert response.status_code == 401
+
+    def test_key_env_rejects_wrong_header(self, auth_client: TestClient) -> None:
+        response = auth_client.get("/verify-task-ids", headers={"Authorization": "Bearer wrong-key"})
+        assert response.status_code == 401
+
+    def test_key_env_accepts_correct_header(self, auth_client: TestClient) -> None:
+        response = auth_client.get(
+            "/verify-task-ids",
+            headers={"Authorization": f"Bearer {self.API_KEY}"},
+        )
+        assert response.status_code == 200
+
+    def test_key_env_health_skips_auth(self, auth_client: TestClient) -> None:
+        response = auth_client.get("/health")
+        assert response.status_code == 200

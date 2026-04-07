@@ -95,6 +95,7 @@ class BenchmarkServiceClient:
             f"{self._ws_url}/ws/{path}",
             additional_headers=self._headers,
             open_timeout=60,
+            ping_timeout=120,
             max_size=10 * 1024 * 1024,  # 10MB
         ) as websocket:
             await websocket.send(request.model_dump_json())
@@ -111,8 +112,10 @@ class BenchmarkServiceClient:
                         case "message":
                             if on_message:
                                 on_message(chunk.data)
-            except ConnectionClosed:
-                pass
+            except ConnectionClosed as e:
+                raise BenchmarkServiceError(
+                    f"WebSocket connection closed unexpectedly: {e}"
+                ) from e
 
         raise BenchmarkServiceError("Exited websocket without returning final result")
 

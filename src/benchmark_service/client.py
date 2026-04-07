@@ -94,7 +94,7 @@ class BenchmarkServiceClient:
             f"{self._ws_url}/ws/{path}",
             additional_headers=self._headers,
             open_timeout=60,
-            ping_timeout=120,
+            ping_timeout=None,
             max_size=10 * 1024 * 1024,  # 10MB
         ) as websocket:
             await websocket.send(request.model_dump_json())

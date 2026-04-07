@@ -7,7 +7,6 @@ import httpx
 import websockets
 from daytona import AsyncDaytona, DaytonaConfig
 from pydantic import BaseModel, TypeAdapter
-from websockets.exceptions import ConnectionClosed
 
 from benchmark_service.schemas import (
     EvaluateInstanceRequest,
@@ -100,22 +99,17 @@ class BenchmarkServiceClient:
         ) as websocket:
             await websocket.send(request.model_dump_json())
 
-            try:
-                async for message in websocket:
-                    chunk: StreamChunk = _stream_chunk_adapter.validate_json(message)
+            async for message in websocket:
+                chunk: StreamChunk = _stream_chunk_adapter.validate_json(message)
 
-                    match chunk.type:
-                        case "error":
-                            raise BenchmarkServiceError(chunk.data)
-                        case "result":
-                            return chunk.data
-                        case "message":
-                            if on_message:
-                                on_message(chunk.data)
-            except ConnectionClosed as e:
-                raise BenchmarkServiceError(
-                    f"WebSocket connection closed unexpectedly: {e}"
-                ) from e
+                match chunk.type:
+                    case "error":
+                        raise BenchmarkServiceError(chunk.data)
+                    case "result":
+                        return chunk.data
+                    case "message":
+                        if on_message:
+                            on_message(chunk.data)
 
         raise BenchmarkServiceError("Exited websocket without returning final result")
 
@@ -131,7 +125,9 @@ class BenchmarkServiceClient:
 
         return HealthCheckResponse.model_validate(response.json())
 
-    async def verify_task_ids(self, task_ids: list[str] | None, slice_str: str | None, dataset: str | None = None) -> VerifyTaskIdsResponse:
+    async def verify_task_ids(
+        self, task_ids: list[str] | None, slice_str: str | None, dataset: str | None = None
+    ) -> VerifyTaskIdsResponse:
         """Verify that the given task IDs or slice are valid.
 
         Args:
@@ -156,7 +152,9 @@ class BenchmarkServiceClient:
 
         return VerifyTaskIdsResponse.model_validate(response.json())
 
-    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> RetrieveTaskResponse:
+    async def retrieve_task(
+        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+    ) -> RetrieveTaskResponse:
         """Retrieve a task by ID.
 
         Args:
@@ -177,7 +175,11 @@ class BenchmarkServiceClient:
         return RetrieveTaskResponse.model_validate(response.json())
 
     async def setup_task(
-        self, task_id: str, instance_id: str, on_message: Callable[[str], None] | None = None, dataset: str | None = None
+        self,
+        task_id: str,
+        instance_id: str,
+        on_message: Callable[[str], None] | None = None,
+        dataset: str | None = None,
     ) -> SetupTaskResponse:
         """Set up a task instance via WebSocket.
 
@@ -191,7 +193,11 @@ class BenchmarkServiceClient:
         return SetupTaskResponse.model_validate(result)
 
     async def evaluate_instance(
-        self, task_id: str, instance_id: str, on_message: Callable[[str], None] | None = None, dataset: str | None = None
+        self,
+        task_id: str,
+        instance_id: str,
+        on_message: Callable[[str], None] | None = None,
+        dataset: str | None = None,
     ) -> dict[str, Any]:
         """Evaluate a task instance via WebSocket.
 

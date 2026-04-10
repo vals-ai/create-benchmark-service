@@ -20,5 +20,4 @@ tests/
 .github/
 
 # Development
-*.md
 Makefile

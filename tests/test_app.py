@@ -220,21 +220,28 @@ class TestEnvVarAuth:
         response = no_auth_client.get("/verify-task-ids")
         assert response.status_code == 200
 
-    def test_key_env_rejects_missing_header(self, auth_client: TestClient) -> None:
-        response = auth_client.get("/verify-task-ids")
+    def test_alb_rejects_missing_header(self, auth_client: TestClient) -> None:
+        response = auth_client.get("/verify-task-ids", headers={"X-Forwarded-Proto": "https"})
         assert response.status_code == 401
 
-    def test_key_env_rejects_wrong_header(self, auth_client: TestClient) -> None:
-        response = auth_client.get("/verify-task-ids", headers={"Authorization": "Bearer wrong-key"})
-        assert response.status_code == 401
-
-    def test_key_env_accepts_correct_header(self, auth_client: TestClient) -> None:
+    def test_alb_rejects_wrong_header(self, auth_client: TestClient) -> None:
         response = auth_client.get(
             "/verify-task-ids",
-            headers={"Authorization": f"Bearer {self.API_KEY}"},
+            headers={"X-Forwarded-Proto": "https", "Authorization": "Bearer wrong-key"},
+        )
+        assert response.status_code == 401
+
+    def test_alb_accepts_correct_header(self, auth_client: TestClient) -> None:
+        response = auth_client.get(
+            "/verify-task-ids",
+            headers={"X-Forwarded-Proto": "https", "Authorization": f"Bearer {self.API_KEY}"},
         )
         assert response.status_code == 200
 
-    def test_key_env_health_skips_auth(self, auth_client: TestClient) -> None:
+    def test_internal_request_skips_auth(self, auth_client: TestClient) -> None:
+        response = auth_client.get("/verify-task-ids")
+        assert response.status_code == 200
+
+    def test_health_skips_auth(self, auth_client: TestClient) -> None:
         response = auth_client.get("/health")
         assert response.status_code == 200

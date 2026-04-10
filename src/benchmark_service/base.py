@@ -57,8 +57,9 @@ class BenchmarkService(ABC):
         """Validate request authorization.
 
         If the BENCHMARK_API_KEY environment variable is set, requires
-        a matching "Bearer <key>" Authorization header. If not set,
-        allows all requests (for local development).
+        a matching "Bearer <key>" Authorization header for external requests.
+        Internal requests (without ALB forwarding headers) are allowed through.
+        If the env var is not set, allows all requests (for local development).
 
         Override this method to implement custom authentication logic.
 
@@ -70,6 +71,8 @@ class BenchmarkService(ABC):
         """
         api_key = os.environ.get("BENCHMARK_API_KEY")
         if not api_key:
+            return True
+        if "x-forwarded-proto" not in headers:
             return True
         return hmac.compare_digest(headers.get("authorization", ""), f"Bearer {api_key}")
 

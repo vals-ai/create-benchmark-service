@@ -10,6 +10,7 @@ from pydantic import BaseModel, TypeAdapter
 
 from benchmark_service.schemas import (
     EvaluateInstanceRequest,
+    EvaluateResponseRequest,
     FinalScoreResponse,
     HealthCheckResponse,
     RetrieveTaskResponse,
@@ -191,6 +192,36 @@ class BenchmarkServiceClient:
         request = SetupTaskRequest(task_id=task_id, instance_id=instance_id, dataset=dataset)
         result = await self._websocket_request("setup-task", request, on_message)
         return SetupTaskResponse.model_validate(result)
+
+    async def evaluate_response(
+        self,
+        task_id: str,
+        response: str,
+        dataset: str | None = None,
+    ) -> Any:
+        """Evaluate a text response directly (without sandbox execution).
+
+        Args:
+            task_id: The task to evaluate.
+            response: The agent's response to evaluate.
+            dataset: Optional dataset name.
+        """
+        request = EvaluateResponseRequest(task_id=task_id, response=response, dataset=dataset)
+        body = request.model_dump(exclude_none=True)
+
+        async with httpx.AsyncClient(follow_redirects=True, timeout=self._timeout) as client:
+            resp = await client.post(
+                f"{self._url}/evaluate-response/",
+                json=body,
+                headers={**self._headers, "Content-Type": "application/json"},
+            )
+
+        if resp.status_code != 200:
+            raise BenchmarkServiceError(
+                f"Evaluate response failed with status code {resp.status_code}, response: {resp.text}"
+            )
+
+        return resp.json()
 
     async def evaluate_instance(
         self,

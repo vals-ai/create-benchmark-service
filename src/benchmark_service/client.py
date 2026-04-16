@@ -11,7 +11,7 @@ from tenacity import (
     retry,
     retry_if_exception_type,
     stop_after_attempt,
-    wait_random_exponential,
+    wait_random,
 )
 
 from benchmark_service.schemas import (
@@ -29,9 +29,20 @@ from benchmark_service.schemas import (
 _stream_chunk_adapter: TypeAdapter[StreamChunk] = TypeAdapter(StreamChunk)
 
 _retry_http = retry(
-    retry=retry_if_exception_type((httpx.RemoteProtocolError, httpx.ConnectError, httpx.ReadError, httpx.ReadTimeout)),
+    retry=retry_if_exception_type(
+        (
+            httpx.RemoteProtocolError,
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.ReadError,
+            httpx.ReadTimeout,
+            httpx.WriteError,
+            httpx.WriteTimeout,
+            httpx.PoolTimeout,
+        )
+    ),
     stop=stop_after_attempt(5),
-    wait=wait_random_exponential(multiplier=1, max=10),
+    wait=wait_random(min=1, max=10),
     reraise=True,
 )
 
@@ -65,6 +76,7 @@ class BenchmarkServiceClient:
             follow_redirects=True,
             timeout=timeout,
             headers=headers,
+            limits=httpx.Limits(max_connections=200),
         )
 
     @property

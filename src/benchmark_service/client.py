@@ -60,6 +60,7 @@ class BenchmarkServiceClient:
                 api_key=self._headers["x-api-key"],
                 api_url=self._headers["x-api-url"],
                 target=self._headers["x-target"],
+                connection_pool_maxsize=None,
             )
         )
 

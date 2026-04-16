@@ -49,7 +49,7 @@ class StubBenchmark(BenchmarkService):
             resources=Resources(vcpu=2, memory=4, disk=10),
         )
 
-    async def setup_task(
+    def setup_task(
         self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None
     ) -> AsyncGenerator[StreamChunk, None]: ...  # type: ignore[return]
 
@@ -58,7 +58,7 @@ class StubBenchmark(BenchmarkService):
         task = ds[request.task_id]
         return {"resolved": request.response == task["answer"]}
 
-    async def evaluate_instance(
+    def evaluate_instance(
         self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None
     ) -> AsyncGenerator[StreamChunk, None]: ...  # type: ignore[return]
 
@@ -76,7 +76,7 @@ def benchmark_client() -> tuple[BenchmarkServiceClient, AsyncMock]:
     """A BenchmarkServiceClient with a mocked HTTP client."""
     client = BenchmarkServiceClient(url="http://localhost:8000", headers={"Authorization": "Bearer token"}, timeout=10)
     mock_http = AsyncMock()
-    client._http_client = mock_http
+    client._http_client = mock_http  # pyright: ignore[reportPrivateUsage]
     return client, mock_http
 
 

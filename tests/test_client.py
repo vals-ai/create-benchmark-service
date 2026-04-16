@@ -12,10 +12,6 @@ BASE_URL = "http://localhost:8000"
 HEADERS = {"Authorization": "Bearer token"}
 
 
-def _make_client(url: str = BASE_URL) -> BenchmarkServiceClient:
-    return BenchmarkServiceClient(url=url, headers=HEADERS, timeout=10)
-
-
 def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "error") -> MagicMock:
     resp = MagicMock()
     resp.status_code = status_code
@@ -60,18 +56,19 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
     ],
     ids=["health_check", "verify_task_ids", "retrieve_task", "final_score"],
 )
-async def test_http_happy_path(method: str, args: list[Any], expected_path: str, json_data: dict[str, Any]) -> None:
-    client = _make_client()
+async def test_http_happy_path(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    method: str,
+    args: list[Any],
+    expected_path: str,
+    json_data: dict[str, Any],
+) -> None:
+    client, mock_http = benchmark_client
     mock_resp = _mock_response(json_data=json_data)
+    mock_http.get = AsyncMock(return_value=mock_resp)
+    mock_http.post = AsyncMock(return_value=mock_resp)
 
-    mock_async_client = AsyncMock()
-    mock_async_client.__aenter__ = AsyncMock(return_value=mock_async_client)
-    mock_async_client.__aexit__ = AsyncMock(return_value=False)
-    mock_async_client.get = AsyncMock(return_value=mock_resp)
-    mock_async_client.post = AsyncMock(return_value=mock_resp)
-
-    with patch("benchmark_service.client.httpx.AsyncClient", return_value=mock_async_client):
-        result = await getattr(client, method)(*args)
+    result = await getattr(client, method)(*args)
 
     assert result.model_dump() == json_data
 
@@ -86,19 +83,18 @@ async def test_http_happy_path(method: str, args: list[Any], expected_path: str,
     ],
     ids=["health_check", "verify_task_ids", "retrieve_task", "final_score"],
 )
-async def test_http_error(method: str, args: list[Any]) -> None:
-    client = _make_client()
+async def test_http_error(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    method: str,
+    args: list[Any],
+) -> None:
+    client, mock_http = benchmark_client
     mock_resp = _mock_response(status_code=500)
+    mock_http.get = AsyncMock(return_value=mock_resp)
+    mock_http.post = AsyncMock(return_value=mock_resp)
 
-    mock_async_client = AsyncMock()
-    mock_async_client.__aenter__ = AsyncMock(return_value=mock_async_client)
-    mock_async_client.__aexit__ = AsyncMock(return_value=False)
-    mock_async_client.get = AsyncMock(return_value=mock_resp)
-    mock_async_client.post = AsyncMock(return_value=mock_resp)
-
-    with patch("benchmark_service.client.httpx.AsyncClient", return_value=mock_async_client):
-        with pytest.raises(BenchmarkServiceError):
-            await getattr(client, method)(*args)
+    with pytest.raises(BenchmarkServiceError):
+        await getattr(client, method)(*args)
 
 
 @pytest.mark.parametrize(
@@ -112,95 +108,80 @@ async def test_http_error(method: str, args: list[Any]) -> None:
     ids=["none-none", "ids-only", "slice-only", "both"],
 )
 async def test_verify_task_ids_params(
-    task_ids: list[str] | None, slice_str: str | None, expected_params: dict[str, Any]
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    task_ids: list[str] | None,
+    slice_str: str | None,
+    expected_params: dict[str, Any],
 ) -> None:
-    client = _make_client()
+    client, mock_http = benchmark_client
     mock_resp = _mock_response(json_data={"task_ids": ["a"]})
+    mock_http.get = AsyncMock(return_value=mock_resp)
 
-    mock_async_client = AsyncMock()
-    mock_async_client.__aenter__ = AsyncMock(return_value=mock_async_client)
-    mock_async_client.__aexit__ = AsyncMock(return_value=False)
-    mock_async_client.get = AsyncMock(return_value=mock_resp)
+    await client.verify_task_ids(task_ids, slice_str)
 
-    with patch("benchmark_service.client.httpx.AsyncClient", return_value=mock_async_client):
-        await client.verify_task_ids(task_ids, slice_str)
-
-    mock_async_client.get.assert_called_once_with(f"{BASE_URL}/verify-task-ids", params=expected_params, headers=HEADERS)
+    mock_http.get.assert_called_once_with(f"{BASE_URL}/verify-task-ids", params=expected_params)
 
 
-async def test_verify_task_ids_with_dataset() -> None:
-    client = _make_client()
+async def test_verify_task_ids_with_dataset(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
     mock_resp = _mock_response(json_data={"task_ids": ["a"]})
+    mock_http.get = AsyncMock(return_value=mock_resp)
 
-    mock_async_client = AsyncMock()
-    mock_async_client.__aenter__ = AsyncMock(return_value=mock_async_client)
-    mock_async_client.__aexit__ = AsyncMock(return_value=False)
-    mock_async_client.get = AsyncMock(return_value=mock_resp)
+    await client.verify_task_ids(["a"], None, dataset="mydata")
 
-    with patch("benchmark_service.client.httpx.AsyncClient", return_value=mock_async_client):
-        await client.verify_task_ids(["a"], None, dataset="mydata")
-
-    mock_async_client.get.assert_called_once_with(
-        f"{BASE_URL}/verify-task-ids", params={"task_ids": ["a"], "dataset": "mydata"}, headers=HEADERS
+    mock_http.get.assert_called_once_with(
+        f"{BASE_URL}/verify-task-ids", params={"task_ids": ["a"], "dataset": "mydata"}
     )
 
 
-async def test_retrieve_task_with_dataset() -> None:
-    client = _make_client()
+async def test_retrieve_task_with_dataset(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
     mock_resp = _mock_response(json_data={
         "docker_image": "python:3.12",
         "problem_path": "/tmp/problem_statement.txt",
         "cwd": "/work",
         "resources": {"vcpu": 2, "memory": 4, "disk": 10},
     })
+    mock_http.get = AsyncMock(return_value=mock_resp)
 
-    mock_async_client = AsyncMock()
-    mock_async_client.__aenter__ = AsyncMock(return_value=mock_async_client)
-    mock_async_client.__aexit__ = AsyncMock(return_value=False)
-    mock_async_client.get = AsyncMock(return_value=mock_resp)
+    await client.retrieve_task("task-1", dataset="mydata")
 
-    with patch("benchmark_service.client.httpx.AsyncClient", return_value=mock_async_client):
-        await client.retrieve_task("task-1", dataset="mydata")
-
-    mock_async_client.get.assert_called_once_with(
-        f"{BASE_URL}/retrieve-task/", params={"task_id": "task-1", "skip_validation": False, "dataset": "mydata"}, headers=HEADERS
+    mock_http.get.assert_called_once_with(
+        f"{BASE_URL}/retrieve-task/", params={"task_id": "task-1", "skip_validation": False, "dataset": "mydata"}
     )
 
 
-async def test_final_score_with_dataset() -> None:
-    client = _make_client()
+async def test_final_score_with_dataset(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
     mock_resp = _mock_response(json_data={"tasks_evaluated": ["t1"], "final_score": 100.0, "metadata": {}})
+    mock_http.post = AsyncMock(return_value=mock_resp)
 
-    mock_async_client = AsyncMock()
-    mock_async_client.__aenter__ = AsyncMock(return_value=mock_async_client)
-    mock_async_client.__aexit__ = AsyncMock(return_value=False)
-    mock_async_client.post = AsyncMock(return_value=mock_resp)
+    await client.final_score({"t1": {"resolved": True}}, dataset="mydata")
 
-    with patch("benchmark_service.client.httpx.AsyncClient", return_value=mock_async_client):
-        await client.final_score({"t1": {"resolved": True}}, dataset="mydata")
-
-    mock_async_client.post.assert_called_once_with(
+    mock_http.post.assert_called_once_with(
         f"{BASE_URL}/final-score/",
         json={"evaluation_results": {"t1": {"resolved": True}}, "dataset": "mydata"},
-        headers={**HEADERS, "Content-Type": "application/json"},
     )
 
 
-async def test_verify_task_ids_no_dataset_omitted() -> None:
+async def test_verify_task_ids_no_dataset_omitted(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
     """Verify dataset param is NOT included when None."""
-    client = _make_client()
+    client, mock_http = benchmark_client
     mock_resp = _mock_response(json_data={"task_ids": ["a"]})
+    mock_http.get = AsyncMock(return_value=mock_resp)
 
-    mock_async_client = AsyncMock()
-    mock_async_client.__aenter__ = AsyncMock(return_value=mock_async_client)
-    mock_async_client.__aexit__ = AsyncMock(return_value=False)
-    mock_async_client.get = AsyncMock(return_value=mock_resp)
+    await client.verify_task_ids(["a"], None)
 
-    with patch("benchmark_service.client.httpx.AsyncClient", return_value=mock_async_client):
-        await client.verify_task_ids(["a"], None)
-
-    mock_async_client.get.assert_called_once_with(
-        f"{BASE_URL}/verify-task-ids", params={"task_ids": ["a"]}, headers=HEADERS
+    mock_http.get.assert_called_once_with(
+        f"{BASE_URL}/verify-task-ids", params={"task_ids": ["a"]}
     )
 
 
@@ -229,6 +210,10 @@ def _ws_mock(messages: list[str]) -> AsyncMock:
     mock_connect.__aenter__ = AsyncMock(return_value=ws)
     mock_connect.__aexit__ = AsyncMock(return_value=False)
     return mock_connect
+
+
+def _make_client(url: str = BASE_URL) -> BenchmarkServiceClient:
+    return BenchmarkServiceClient(url=url, headers=HEADERS, timeout=10)
 
 
 @pytest.mark.parametrize(

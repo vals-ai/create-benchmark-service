@@ -7,6 +7,12 @@ import httpx
 import websockets
 from daytona import AsyncDaytona, DaytonaConfig
 from pydantic import BaseModel, TypeAdapter
+from tenacity import (
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_random,
+)
 
 from benchmark_service.schemas import (
     EvaluateInstanceRequest,
@@ -21,6 +27,24 @@ from benchmark_service.schemas import (
 )
 
 _stream_chunk_adapter: TypeAdapter[StreamChunk] = TypeAdapter(StreamChunk)
+
+_retry_http = retry(
+    retry=retry_if_exception_type(
+        (
+            httpx.RemoteProtocolError,
+            httpx.ConnectError,
+            httpx.ConnectTimeout,
+            httpx.ReadError,
+            httpx.ReadTimeout,
+            httpx.WriteError,
+            httpx.WriteTimeout,
+            httpx.PoolTimeout,
+        )
+    ),
+    stop=stop_after_attempt(5),
+    wait=wait_random(min=1, max=10),
+    reraise=True,
+)
 
 
 class BenchmarkServiceError(Exception):
@@ -52,6 +76,7 @@ class BenchmarkServiceClient:
             follow_redirects=True,
             timeout=timeout,
             headers=headers,
+            limits=httpx.Limits(max_connections=200),
         )
 
     @property
@@ -127,6 +152,7 @@ class BenchmarkServiceClient:
 
         raise BenchmarkServiceError("Exited websocket without returning final result")
 
+    @_retry_http
     async def health_check(self) -> HealthCheckResponse:
         """Check if the benchmark service is healthy."""
         response = await self._http_client.get(f"{self._url}/health")
@@ -138,6 +164,7 @@ class BenchmarkServiceClient:
 
         return HealthCheckResponse.model_validate(response.json())
 
+    @_retry_http
     async def verify_task_ids(
         self, task_ids: list[str] | None, slice_str: str | None, dataset: str | None = None
     ) -> VerifyTaskIdsResponse:
@@ -164,6 +191,7 @@ class BenchmarkServiceClient:
 
         return VerifyTaskIdsResponse.model_validate(response.json())
 
+    @_retry_http
     async def retrieve_task(
         self, task_id: str, skip_validation: bool = False, dataset: str | None = None
     ) -> RetrieveTaskResponse:
@@ -203,6 +231,7 @@ class BenchmarkServiceClient:
         result = await self._websocket_request("setup-task", request, on_message)
         return SetupTaskResponse.model_validate(result)
 
+    @_retry_http
     async def evaluate_response(
         self,
         task_id: str,
@@ -248,6 +277,7 @@ class BenchmarkServiceClient:
         request = EvaluateInstanceRequest(task_id=task_id, instance_id=instance_id, dataset=dataset)
         return await self._websocket_request("evaluate-instance", request, on_message)
 
+    @_retry_http
     async def final_score(self, evaluation_results: dict[str, Any], dataset: str | None = None) -> FinalScoreResponse:
         """Compute the final score from evaluation results.
 

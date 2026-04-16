@@ -72,12 +72,14 @@ class StubBenchmark(BenchmarkService):
 
 
 @pytest.fixture
-def benchmark_client() -> tuple[BenchmarkServiceClient, AsyncMock]:
+async def benchmark_client() -> AsyncGenerator[tuple[BenchmarkServiceClient, AsyncMock], None]:
     """A BenchmarkServiceClient with a mocked HTTP client."""
     client = BenchmarkServiceClient(url="http://localhost:8000", headers={"Authorization": "Bearer token"}, timeout=10)
+    real_http = client._http_client  # pyright: ignore[reportPrivateUsage]
     mock_http = AsyncMock()
     client._http_client = mock_http  # pyright: ignore[reportPrivateUsage]
-    return client, mock_http
+    yield client, mock_http
+    await real_http.aclose()
 
 
 @pytest.fixture

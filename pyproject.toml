@@ -12,6 +12,7 @@ dependencies = [
     "jinja2>=3.1.6",
     "websockets>=15.0.1",
     "httpx>=0.28.1",
+    "tenacity>=9.1.4",
 ]
 
 [project.scripts]

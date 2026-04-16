@@ -77,6 +77,12 @@ class BenchmarkServiceClient:
         if self._daytona_client:
             await self._daytona_client.close()
 
+    async def __aenter__(self) -> "BenchmarkServiceClient":
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        await self.close()
+
     @property
     def _ws_url(self) -> str:
         return self._url.replace("http://", "ws://").replace("https://", "wss://")

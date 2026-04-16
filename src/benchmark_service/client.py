@@ -48,6 +48,11 @@ class BenchmarkServiceClient:
         self._url = url
         self._headers = headers
         self._timeout = timeout
+        self._http_client = httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=timeout,
+            headers=headers,
+        )
 
     @property
     def daytona_client(self) -> AsyncDaytona:
@@ -67,9 +72,16 @@ class BenchmarkServiceClient:
         return self._daytona_client
 
     async def close(self) -> None:
-        """Close the Daytona client if it was initialized."""
+        """Close the HTTP and Daytona clients."""
+        await self._http_client.aclose()
         if self._daytona_client:
             await self._daytona_client.close()
+
+    async def __aenter__(self) -> "BenchmarkServiceClient":
+        return self
+
+    async def __aexit__(self, *args: object) -> None:
+        await self.close()
 
     @property
     def _ws_url(self) -> str:
@@ -117,8 +129,7 @@ class BenchmarkServiceClient:
 
     async def health_check(self) -> HealthCheckResponse:
         """Check if the benchmark service is healthy."""
-        async with httpx.AsyncClient(follow_redirects=True, timeout=self._timeout) as client:
-            response = await client.get(f"{self._url}/health", headers=self._headers)
+        response = await self._http_client.get(f"{self._url}/health")
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
@@ -144,8 +155,7 @@ class BenchmarkServiceClient:
         if dataset is not None:
             params["dataset"] = dataset
 
-        async with httpx.AsyncClient(follow_redirects=True, timeout=self._timeout) as client:
-            response = await client.get(f"{self._url}/verify-task-ids", params=params, headers=self._headers)
+        response = await self._http_client.get(f"{self._url}/verify-task-ids", params=params)
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
@@ -166,8 +176,7 @@ class BenchmarkServiceClient:
         params: dict[str, Any] = {"task_id": task_id, "skip_validation": skip_validation}
         if dataset is not None:
             params["dataset"] = dataset
-        async with httpx.AsyncClient(follow_redirects=True, timeout=self._timeout) as client:
-            response = await client.get(f"{self._url}/retrieve-task/", params=params, headers=self._headers)
+        response = await self._http_client.get(f"{self._url}/retrieve-task/", params=params)
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
@@ -210,12 +219,10 @@ class BenchmarkServiceClient:
         request = EvaluateResponseRequest(task_id=task_id, response=response, dataset=dataset)
         body = request.model_dump(exclude_none=True)
 
-        async with httpx.AsyncClient(follow_redirects=True, timeout=self._timeout) as client:
-            resp = await client.post(
-                f"{self._url}/evaluate-response/",
-                json=body,
-                headers={**self._headers, "Content-Type": "application/json"},
-            )
+        resp = await self._http_client.post(
+            f"{self._url}/evaluate-response/",
+            json=body,
+        )
 
         if resp.status_code != 200:
             raise BenchmarkServiceError(
@@ -251,12 +258,10 @@ class BenchmarkServiceClient:
         if dataset is not None:
             body["dataset"] = dataset
 
-        async with httpx.AsyncClient(follow_redirects=True, timeout=self._timeout) as client:
-            response = await client.post(
-                f"{self._url}/final-score/",
-                json=body,
-                headers={**self._headers, "Content-Type": "application/json"},
-            )
+        response = await self._http_client.post(
+            f"{self._url}/final-score/",
+            json=body,
+        )
 
         if response.status_code != 200:
             raise BenchmarkServiceError(

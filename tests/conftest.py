@@ -2,6 +2,7 @@
 
 from collections.abc import AsyncGenerator, Generator
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from daytona import AsyncSandbox
@@ -9,11 +10,12 @@ from fastapi.testclient import TestClient
 
 from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.base import BenchmarkService
+from benchmark_service.client import BenchmarkServiceClient
 from benchmark_service.schemas import (
     EvaluateResponseRequest,
     FinalScoreResult,
-    RetrieveTaskResponse,
     Resources,
+    RetrieveTaskResponse,
     StreamChunk,
 )
 
@@ -34,7 +36,9 @@ class StubBenchmark(BenchmarkService):
             },
         }
 
-    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> RetrieveTaskResponse:
+    async def retrieve_task(
+        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+    ) -> RetrieveTaskResponse:
         if not skip_validation:
             await self.validate_task_ids([task_id], dataset=dataset)
         return RetrieveTaskResponse(
@@ -45,20 +49,37 @@ class StubBenchmark(BenchmarkService):
             resources=Resources(vcpu=2, memory=4, disk=10),
         )
 
-    async def setup_task(self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None) -> AsyncGenerator[StreamChunk, None]: ...  # type: ignore[return]
+    def setup_task(
+        self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None
+    ) -> AsyncGenerator[StreamChunk, None]: ...  # type: ignore[return]
 
     async def evaluate_response(self, request: EvaluateResponseRequest, dataset: str | None = None) -> Any:
         ds = self.get_dataset(dataset)
         task = ds[request.task_id]
         return {"resolved": request.response == task["answer"]}
 
-    async def evaluate_instance(self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None) -> AsyncGenerator[StreamChunk, None]: ...  # type: ignore[return]
+    def evaluate_instance(
+        self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None
+    ) -> AsyncGenerator[StreamChunk, None]: ...  # type: ignore[return]
 
-    async def calculate_final_score(self, evaluation_results: dict[str, Any], dataset: str | None = None) -> FinalScoreResult:
+    async def calculate_final_score(
+        self, evaluation_results: dict[str, Any], dataset: str | None = None
+    ) -> FinalScoreResult:
         total = len(evaluation_results)
         resolved = sum(1 for r in evaluation_results.values() if r.get("resolved"))
         score = (resolved / total * 100) if total > 0 else 0.0
         return FinalScoreResult(score=score, metadata={"total": total, "resolved": resolved})
+
+
+@pytest.fixture
+async def benchmark_client() -> AsyncGenerator[tuple[BenchmarkServiceClient, AsyncMock], None]:
+    """A BenchmarkServiceClient with a mocked HTTP client."""
+    client = BenchmarkServiceClient(url="http://localhost:8000", headers={"Authorization": "Bearer token"}, timeout=10)
+    real_http = client._http_client  # pyright: ignore[reportPrivateUsage]
+    mock_http = AsyncMock()
+    client._http_client = mock_http  # pyright: ignore[reportPrivateUsage]
+    yield client, mock_http
+    await real_http.aclose()
 
 
 @pytest.fixture

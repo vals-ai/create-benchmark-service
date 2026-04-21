@@ -11,8 +11,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
 from typing import Any, Self
 
-from daytona import AsyncSandbox
-
+from benchmark_service.sandbox import Sandbox
 from benchmark_service.schemas import (
     EvaluateResponseRequest,
     FinalScoreResult,
@@ -146,7 +145,7 @@ class BenchmarkService(ABC):
 
     @abstractmethod
     def setup_task(
-        self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None
+        self, task_id: str, sandbox: Sandbox, dataset: str | None = None
     ) -> AsyncGenerator[StreamChunk, None]:
         """Setup a task in a sandbox environment.
 
@@ -155,14 +154,14 @@ class BenchmarkService(ABC):
 
         Implement setup logic:
         1. Upload any setup scripts or data to the sandbox
-        2. Execute setup commands using sandbox.process
+        2. Execute setup commands using sandbox.exec
         3. Yield progress messages: yield StreamMessageChunk(type="message", data="log line")
         4. Yield error messages: yield StreamErrorChunk(type="error", data="error message")
         5. Yield final result: yield StreamResultChunk(type="result", data={"status": "ok"})
 
         Args:
             task_id: The task identifier
-            sandbox: Connected Daytona sandbox instance
+            sandbox: Connected sandbox instance
             dataset: Name of the dataset. Defaults to 'default'.
 
         Yields:
@@ -194,7 +193,7 @@ class BenchmarkService(ABC):
 
     @abstractmethod
     def evaluate_instance(
-        self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None
+        self, task_id: str, sandbox: Sandbox, dataset: str | None = None
     ) -> AsyncGenerator[StreamChunk, None]:
         """Evaluate a solution in a sandbox environment.
 
@@ -202,7 +201,7 @@ class BenchmarkService(ABC):
         execute tests, run evaluation scripts, etc. Yield StreamChunk objects to stream progress.
 
         Implement evaluation logic:
-        1. Execute tests or evaluation scripts using sandbox.process
+        1. Execute tests or evaluation scripts using sandbox.exec
         2. Parse test output and grade results
         3. Yield progress logs: yield StreamMessageChunk(type="message", data="log line")
         4. Yield error messages: yield StreamErrorChunk(type="error", data="error message")
@@ -210,7 +209,7 @@ class BenchmarkService(ABC):
 
         Args:
             task_id: The task identifier
-            sandbox: Connected Daytona sandbox instance
+            sandbox: Connected sandbox instance
             dataset: Name of the dataset. Defaults to 'default'.
 
         Yields:

@@ -140,12 +140,14 @@ async def test_retrieve_task_with_dataset(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
     client, mock_http = benchmark_client
-    mock_resp = _mock_response(json_data={
-        "docker_image": "python:3.12",
-        "problem_path": "/tmp/problem_statement.txt",
-        "cwd": "/work",
-        "resources": {"vcpu": 2, "memory": 4, "disk": 10},
-    })
+    mock_resp = _mock_response(
+        json_data={
+            "docker_image": "python:3.12",
+            "problem_path": "/tmp/problem_statement.txt",
+            "cwd": "/work",
+            "resources": {"vcpu": 2, "memory": 4, "disk": 10},
+        }
+    )
     mock_http.get = AsyncMock(return_value=mock_resp)
 
     await client.retrieve_task("task-1", dataset="mydata")
@@ -180,9 +182,7 @@ async def test_verify_task_ids_no_dataset_omitted(
 
     await client.verify_task_ids(["a"], None)
 
-    mock_http.get.assert_called_once_with(
-        f"{BASE_URL}/verify-task-ids", params={"task_ids": ["a"]}
-    )
+    mock_http.get.assert_called_once_with(f"{BASE_URL}/verify-task-ids", params={"task_ids": ["a"]})
 
 
 class _AsyncIterator:

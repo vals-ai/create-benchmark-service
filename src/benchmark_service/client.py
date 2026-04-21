@@ -14,6 +14,7 @@ from tenacity import (
     wait_random,
 )
 
+from benchmark_service.sandbox import SandboxProvider, create_provider
 from benchmark_service.schemas import (
     EvaluateInstanceRequest,
     EvaluateResponseRequest,
@@ -59,6 +60,7 @@ class BenchmarkServiceClient:
     _url: str
     _headers: dict[str, str]
     _timeout: int
+    _sandbox_provider: SandboxProvider | None = None
     _daytona_client: AsyncDaytona | None = None
 
     def __init__(self, url: str, headers: dict[str, str], timeout: int = 60):
@@ -96,11 +98,20 @@ class BenchmarkServiceClient:
 
         return self._daytona_client
 
+    async def get_sandbox_provider(self) -> SandboxProvider:
+        if self._sandbox_provider is None:
+            self._sandbox_provider = await create_provider(self._headers)
+        return self._sandbox_provider
+
     async def close(self) -> None:
-        """Close the HTTP and Daytona clients."""
+        """Close the HTTP, sandbox provider, and Daytona clients."""
         await self._http_client.aclose()
-        if self._daytona_client:
+        if self._sandbox_provider is not None:
+            await self._sandbox_provider.close()
+            self._sandbox_provider = None
+        if self._daytona_client is not None:
             await self._daytona_client.close()
+            self._daytona_client = None
 
     async def __aenter__(self) -> "BenchmarkServiceClient":
         return self

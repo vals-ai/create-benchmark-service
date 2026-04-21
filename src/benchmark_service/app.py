@@ -6,11 +6,11 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from daytona import AsyncDaytona, DaytonaConfig
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.responses import JSONResponse
 
 from benchmark_service.base import BenchmarkService
+from benchmark_service.sandbox import create_provider
 from benchmark_service.schemas import (
     EvaluateInstanceRequest,
     EvaluateResponseRequest,
@@ -101,22 +101,11 @@ class BenchmarkServiceApp(FastAPI):
         await websocket.accept()
 
         try:
-            api_key = websocket.headers.get("x-api-key")
-            api_url = websocket.headers.get("x-api-url")
-            target = websocket.headers.get("x-target")
+            request = SetupTaskRequest(**await websocket.receive_json())
+            provider = await create_provider(dict(websocket.headers))
 
-            if not api_key or not api_url or not target:
-                await websocket.close(code=1008, reason="Missing required headers: x-api-key, x-api-url, x-target")
-                return
-
-            data = await websocket.receive_json()
-            request = SetupTaskRequest(**data)
-
-            daytona_config = DaytonaConfig(api_key=api_key, api_url=api_url, target=target)
-
-            async with AsyncDaytona(config=daytona_config) as daytona:
-                sandbox = await daytona.get(request.instance_id)
-
+            async with provider:
+                sandbox = await provider.get_sandbox(request.instance_id)
                 async for message in self.service.setup_task(request.task_id, sandbox, dataset=request.dataset):
                     await websocket.send_json(message.model_dump())
 
@@ -138,22 +127,11 @@ class BenchmarkServiceApp(FastAPI):
         await websocket.accept()
 
         try:
-            api_key = websocket.headers.get("x-api-key")
-            api_url = websocket.headers.get("x-api-url")
-            target = websocket.headers.get("x-target")
+            request = EvaluateInstanceRequest(**await websocket.receive_json())
+            provider = await create_provider(dict(websocket.headers))
 
-            if not api_key or not api_url or not target:
-                await websocket.close(code=1008, reason="Missing required headers: x-api-key, x-api-url, x-target")
-                return
-
-            data = await websocket.receive_json()
-            request = EvaluateInstanceRequest(**data)
-
-            daytona_config = DaytonaConfig(api_key=api_key, api_url=api_url, target=target)
-
-            async with AsyncDaytona(config=daytona_config) as daytona:
-                sandbox = await daytona.get(request.instance_id)
-
+            async with provider:
+                sandbox = await provider.get_sandbox(request.instance_id)
                 async for message in self.service.evaluate_instance(request.task_id, sandbox, dataset=request.dataset):
                     await websocket.send_json(message.model_dump())
 

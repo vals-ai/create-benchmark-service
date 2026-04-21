@@ -5,12 +5,12 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
-from daytona import AsyncSandbox
 from fastapi.testclient import TestClient
 
 from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.base import BenchmarkService
 from benchmark_service.client import BenchmarkServiceClient
+from benchmark_service.sandbox import Sandbox
 from benchmark_service.schemas import (
     EvaluateResponseRequest,
     FinalScoreResult,
@@ -50,7 +50,7 @@ class StubBenchmark(BenchmarkService):
         )
 
     def setup_task(
-        self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None
+        self, task_id: str, sandbox: Sandbox, dataset: str | None = None
     ) -> AsyncGenerator[StreamChunk, None]: ...  # type: ignore[return]
 
     async def evaluate_response(self, request: EvaluateResponseRequest, dataset: str | None = None) -> Any:
@@ -59,7 +59,7 @@ class StubBenchmark(BenchmarkService):
         return {"resolved": request.response == task["answer"]}
 
     def evaluate_instance(
-        self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None
+        self, task_id: str, sandbox: Sandbox, dataset: str | None = None
     ) -> AsyncGenerator[StreamChunk, None]: ...  # type: ignore[return]
 
     async def calculate_final_score(

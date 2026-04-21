@@ -140,10 +140,13 @@ def test_evaluate_response_with_dataset(client: TestClient) -> None:
 
 
 def test_final_score_with_dataset(client: TestClient) -> None:
-    response = client.post("/final-score/", json={
-        "evaluation_results": {"alt-task-1": {"resolved": True}},
-        "dataset": "alt",
-    })
+    response = client.post(
+        "/final-score/",
+        json={
+            "evaluation_results": {"alt-task-1": {"resolved": True}},
+            "dataset": "alt",
+        },
+    )
     assert response.status_code == 200
     assert response.json()["final_score"] == 100.0
 

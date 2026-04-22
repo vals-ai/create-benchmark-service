@@ -3,9 +3,7 @@
 from collections.abc import AsyncGenerator
 from typing import Any
 
-from daytona import AsyncSandbox
-
-from benchmark_service import BenchmarkService
+from benchmark_service import BenchmarkService, Sandbox, SandboxFile
 from benchmark_service.schemas import (
     EvaluateResponseRequest,
     FinalScoreResult,
@@ -52,13 +50,15 @@ class ExampleBenchmark(BenchmarkService):
             resources=Resources(vcpu=2, memory=4, disk=10),
         )
 
-    async def setup_task(self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None) -> AsyncGenerator[StreamChunk, None]:
+    async def setup_task(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> AsyncGenerator[StreamChunk, None]:
         """Setup task in sandbox — writes the problem statement to problem_path."""
         yield StreamMessageChunk(type="message", data=f"Setting up task {task_id}...")
 
         task = self.get_dataset(dataset)[task_id]
         problem_statement = task["problem"]
-        await sandbox.fs.upload_file(problem_statement.encode(), "/tmp/problem_statement.txt")
+        await sandbox.upload_file(
+            SandboxFile(content=problem_statement.encode("utf-8"), remote_path="/tmp/problem_statement.txt")
+        )
 
         yield StreamMessageChunk(type="message", data="Problem statement written to sandbox")
         yield StreamResultChunk(type="result", data={"status": "ok"})
@@ -79,7 +79,7 @@ class ExampleBenchmark(BenchmarkService):
             "received": request.response.strip(),
         }
 
-    async def evaluate_instance(self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None) -> AsyncGenerator[StreamChunk, None]:
+    async def evaluate_instance(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> AsyncGenerator[StreamChunk, None]:
         """Evaluate in sandbox (not implemented for this example)."""
         yield StreamMessageChunk(type="message", data=f"Evaluating task {task_id}...")
         yield StreamErrorChunk(

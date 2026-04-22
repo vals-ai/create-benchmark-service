@@ -85,10 +85,12 @@ class ModalSandbox(Sandbox):
         assert result.exit_code == 0
 
     async def wait_until_stopped(self) -> None:
-        try:
-            await self._inner.wait.aio(raise_on_termination=False)  # pyright: ignore[reportUnknownMemberType]
-        except ModalError as exc:
-            raise SandboxError(str(exc)) from exc
+        while True:
+            try:
+                await self.exec("true", timeout=10)
+            except SandboxError:
+                return
+            await asyncio.sleep(10)
 
 
 class ModalSandboxProvider(SandboxProvider):

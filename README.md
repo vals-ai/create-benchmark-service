@@ -69,9 +69,9 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 |--------|-------------|
 | `load_datasets()` | Load all tasks from your source; return `dict[dataset_name, dict[task_id, task_object]]` |
 | `retrieve_task(task_id, skip_validation, dataset)` | Return task metadata: docker image, problem path, resources, etc. |
-| `setup_task(task_id, sandbox, dataset)` | Async generator — set up the task in a Daytona sandbox, yielding `StreamChunk`s |
+| `setup_task(task_id, sandbox, dataset)` | Async generator — set up the task in a sandbox, yielding `StreamChunk`s |
 | `evaluate_response(request, dataset)` | Evaluate a text response directly (no sandbox needed) |
-| `evaluate_instance(task_id, sandbox, dataset)` | Async generator — run evaluation in a Daytona sandbox, yielding `StreamChunk`s |
+| `evaluate_instance(task_id, sandbox, dataset)` | Async generator — run evaluation in a sandbox, yielding `StreamChunk`s |
 | `calculate_final_score(evaluation_results, dataset)` | Aggregate per-task results into a final `FinalScoreResult` |
 
 **Built-in methods:**
@@ -102,7 +102,13 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | `/ws/setup-task` | Set up a task in a sandbox; streams progress, errors, and a final result |
 | `/ws/evaluate-instance` | Evaluate a solution in a sandbox; streams progress, errors, and a final result |
 
-Both WebSocket endpoints require three headers — `x-api-key`, `x-api-url`, `x-target` — used to connect to the Daytona sandbox, and accept a JSON body of `{"task_id": "…", "instance_id": "…", "dataset": "…"}` (dataset is optional, defaults to `"default"`).
+Both WebSocket endpoints accept a JSON body of `{"task_id": "…", "instance_id": "…", "dataset": "…"}`. `dataset` is optional and defaults to `"default"`.
+
+Sandbox provider selection comes from headers:
+
+- `x-sandbox-provider: daytona` uses Daytona and requires `x-api-key`, `x-api-url`, and `x-target`.
+- `x-sandbox-provider: modal` uses Modal credentials from the environment, or `x-modal-token-id` and `x-modal-token-secret`.
+- `x-registry-secret-name` or `x-registry-username` / `x-registry-password` can be passed when the provider needs private registry access.
 
 ### Streaming protocol
 
@@ -130,7 +136,7 @@ Pydantic models used across requests and responses:
 
 **`stream_command(sandbox, command, cwd, ignore_error=False)`**
 
-Runs a shell command inside a Daytona sandbox and yields stdout/stderr lines in real time. Creates a unique session per invocation, streams output via an async queue, checks the exit code, and cleans up the session on completion. Use it inside `setup_task` and `evaluate_instance` to run commands and forward their output as `StreamMessageChunk`s.
+Runs a shell command inside the sandbox and yields stdout/stderr lines. Use it inside `setup_task` and `evaluate_instance` to run commands and forward their output as `StreamMessageChunk`s.
 
 ### Authentication
 

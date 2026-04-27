@@ -8,16 +8,18 @@ import os
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from functools import lru_cache
 from typing import Any
+
+from descope.descope_client import DescopeClient
 
 logger = logging.getLogger(__name__)
 
-BENCHMARK_SERVICE_API_KEY_HEADER = "X-Descope-Api-Key"
+DESCOPE_API_KEY_HEADER = "x-descope-api-key"
 DEFAULT_AUTH_CACHE_TTL_SECONDS = 300
+AUTH_CACHE_MAX_SIZE = 1024
 
 _auth_cache: dict[tuple[str, str], float] = {}
-_descope_client: Any | None = None
-_descope_project_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -58,45 +60,31 @@ def clear_auth_cache() -> None:
     _auth_cache.clear()
 
 
-def _get_header(headers: Mapping[str, str], name: str) -> str | None:
-    target = name.lower()
-    for key, value in headers.items():
-        if key.lower() == target:
-            return value
-    return None
-
-
-def _get_descope_client(project_id: str) -> Any:
-    global _descope_client, _descope_project_id
-
-    if _descope_client is not None and _descope_project_id == project_id:
-        return _descope_client
-
-    from descope.descope_client import DescopeClient
-
-    _descope_client = DescopeClient(project_id=project_id)
-    _descope_project_id = project_id
-    return _descope_client
+@lru_cache(maxsize=1)
+def _get_descope_client(project_id: str) -> DescopeClient:
+    return DescopeClient(project_id=project_id)
 
 
 def _exchange_descope_access_key(project_id: str, access_key: str) -> Mapping[str, Any]:
-    client = _get_descope_client(project_id)
-    return client.exchange_access_key(access_key)
+    return _get_descope_client(project_id).exchange_access_key(access_key)  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
 
 
 def _is_cache_hit(project_id: str, access_key: str, now: float) -> bool:
-    expires_at = _auth_cache.get((project_id, access_key))
-    return expires_at is not None and expires_at > now
+    key = (project_id, access_key)
+    expires_at = _auth_cache.get(key)
+    if expires_at is None:
+        return False
+    if expires_at <= now:
+        del _auth_cache[key]
+        return False
+    return True
 
 
 def _cache_success(project_id: str, access_key: str, now: float, ttl_seconds: int) -> None:
     if ttl_seconds <= 0:
         return
-
-    for key, expires_at in list(_auth_cache.items()):
-        if expires_at <= now:
-            del _auth_cache[key]
-
+    if len(_auth_cache) >= AUTH_CACHE_MAX_SIZE:
+        _auth_cache.pop(next(iter(_auth_cache)))
     _auth_cache[(project_id, access_key)] = now + ttl_seconds
 
 
@@ -104,7 +92,7 @@ def _check_legacy_benchmark_api_key(headers: Mapping[str, str], settings: AuthSe
     if not settings.benchmark_api_key:
         return True
 
-    authorization = _get_header(headers, "Authorization") or ""
+    authorization = headers.get("authorization", "")
     expected = f"Bearer {settings.benchmark_api_key}"
     return hmac.compare_digest(authorization, expected)
 
@@ -114,7 +102,7 @@ def _check_descope_access_key(headers: Mapping[str, str], settings: AuthSettings
         logger.warning("AUTH_REQUIRED is true but DESCOPE_PROJECT_ID is not configured")
         return False
 
-    access_key = _get_header(headers, BENCHMARK_SERVICE_API_KEY_HEADER)
+    access_key = headers.get(DESCOPE_API_KEY_HEADER)
     if not access_key:
         return False
 

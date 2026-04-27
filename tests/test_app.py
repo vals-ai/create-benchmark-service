@@ -7,6 +7,10 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
+from benchmark_service import auth as auth_module
+from benchmark_service.app import BenchmarkServiceApp
+from tests.conftest import StubBenchmark
+
 
 def test_health(client: TestClient) -> None:
     response = client.get("/health")
@@ -169,10 +173,6 @@ class TestAuthMiddleware:
 
     @pytest.fixture
     def auth_client(self) -> Generator[TestClient, None, None]:
-        from tests.conftest import StubBenchmark
-
-        from benchmark_service.app import BenchmarkServiceApp
-
         class AuthBenchmark(StubBenchmark):
             async def check_auth(self, headers: dict[str, str]) -> bool:
                 return headers.get("authorization") == TestAuthMiddleware.AUTH_TOKEN
@@ -215,8 +215,6 @@ class TestEnvVarAuth:
         monkeypatch.delenv("AUTH_REQUIRED", raising=False)
         monkeypatch.delenv("DESCOPE_PROJECT_ID", raising=False)
         monkeypatch.setenv("BENCHMARK_API_KEY", self.API_KEY)
-        from benchmark_service.app import BenchmarkServiceApp
-        from tests.conftest import StubBenchmark
 
         with TestClient(BenchmarkServiceApp(StubBenchmark)) as c:
             yield c
@@ -226,8 +224,6 @@ class TestEnvVarAuth:
         monkeypatch.delenv("AUTH_REQUIRED", raising=False)
         monkeypatch.delenv("DESCOPE_PROJECT_ID", raising=False)
         monkeypatch.delenv("BENCHMARK_API_KEY", raising=False)
-        from benchmark_service.app import BenchmarkServiceApp
-        from tests.conftest import StubBenchmark
 
         with TestClient(BenchmarkServiceApp(StubBenchmark)) as c:
             yield c
@@ -263,8 +259,6 @@ class TestDescopeAuth:
 
     @pytest.fixture
     def exchange_calls(self, monkeypatch: pytest.MonkeyPatch) -> Generator[list[tuple[str, str]], None, None]:
-        import benchmark_service.auth as auth_module
-
         auth_module.clear_auth_cache()
         monkeypatch.setenv("AUTH_REQUIRED", "true")
         monkeypatch.setenv("DESCOPE_PROJECT_ID", self.PROJECT_ID)
@@ -288,9 +282,6 @@ class TestDescopeAuth:
 
     @pytest.fixture
     def auth_client(self, exchange_calls: list[tuple[str, str]]) -> Generator[TestClient, None, None]:
-        from benchmark_service.app import BenchmarkServiceApp
-        from tests.conftest import StubBenchmark
-
         with TestClient(BenchmarkServiceApp(StubBenchmark)) as c:
             yield c
 

@@ -55,11 +55,8 @@ class BenchmarkService(ABC):
     async def check_auth(self, headers: dict[str, str]) -> bool:
         """Validate request authorization.
 
-        If AUTH_REQUIRED=true, requires a valid Descope access key in
-        X-Descope-Api-Key. Otherwise, preserves the legacy BENCHMARK_API_KEY
-        behavior for local development and custom services.
-
-        Override this method to implement custom authentication logic.
+        Defaults to the env-driven behavior in `benchmark_service.auth`.
+        Override to implement custom authentication.
 
         Args:
             headers: Request headers (keys are lowercase per HTTP convention).

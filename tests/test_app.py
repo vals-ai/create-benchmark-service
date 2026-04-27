@@ -5,6 +5,7 @@ from collections.abc import Generator
 import pytest
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from starlette.websockets import WebSocketDisconnect
 
 
 def test_health(client: TestClient) -> None:
@@ -140,10 +141,13 @@ def test_evaluate_response_with_dataset(client: TestClient) -> None:
 
 
 def test_final_score_with_dataset(client: TestClient) -> None:
-    response = client.post("/final-score/", json={
-        "evaluation_results": {"alt-task-1": {"resolved": True}},
-        "dataset": "alt",
-    })
+    response = client.post(
+        "/final-score/",
+        json={
+            "evaluation_results": {"alt-task-1": {"resolved": True}},
+            "dataset": "alt",
+        },
+    )
     assert response.status_code == 200
     assert response.json()["final_score"] == 100.0
 
@@ -192,6 +196,14 @@ class TestAuthMiddleware:
         response = auth_client.get("/health")
         assert response.status_code == 200
 
+    @pytest.mark.parametrize("path", ["/ws/setup-task", "/ws/evaluate-instance"])
+    def test_websocket_auth_failure_closes_1008(self, auth_client: TestClient, path: str) -> None:
+        with auth_client.websocket_connect(path) as ws:
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws.receive_json()
+
+        assert exc_info.value.code == 1008
+
 
 class TestEnvVarAuth:
     """Test the default check_auth behavior with BENCHMARK_API_KEY env var."""
@@ -200,6 +212,8 @@ class TestEnvVarAuth:
 
     @pytest.fixture
     def auth_client(self, monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
+        monkeypatch.delenv("AUTH_REQUIRED", raising=False)
+        monkeypatch.delenv("DESCOPE_PROJECT_ID", raising=False)
         monkeypatch.setenv("BENCHMARK_API_KEY", self.API_KEY)
         from benchmark_service.app import BenchmarkServiceApp
         from tests.conftest import StubBenchmark
@@ -209,6 +223,8 @@ class TestEnvVarAuth:
 
     @pytest.fixture
     def no_auth_client(self, monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
+        monkeypatch.delenv("AUTH_REQUIRED", raising=False)
+        monkeypatch.delenv("DESCOPE_PROJECT_ID", raising=False)
         monkeypatch.delenv("BENCHMARK_API_KEY", raising=False)
         from benchmark_service.app import BenchmarkServiceApp
         from tests.conftest import StubBenchmark
@@ -238,3 +254,70 @@ class TestEnvVarAuth:
     def test_key_env_health_skips_auth(self, auth_client: TestClient) -> None:
         response = auth_client.get("/health")
         assert response.status_code == 200
+
+
+class TestDescopeAuth:
+    """Test the default check_auth behavior with AUTH_REQUIRED=true."""
+
+    PROJECT_ID = "descope-project"
+
+    @pytest.fixture
+    def exchange_calls(self, monkeypatch: pytest.MonkeyPatch) -> Generator[list[tuple[str, str]], None, None]:
+        import benchmark_service.auth as auth_module
+
+        auth_module.clear_auth_cache()
+        monkeypatch.setenv("AUTH_REQUIRED", "true")
+        monkeypatch.setenv("DESCOPE_PROJECT_ID", self.PROJECT_ID)
+        monkeypatch.delenv("BENCHMARK_API_KEY", raising=False)
+
+        calls: list[tuple[str, str]] = []
+
+        def exchange(project_id: str, access_key: str) -> dict[str, dict[str, dict[str, str]]]:
+            calls.append((project_id, access_key))
+            if access_key == "valid-key":
+                return {"tenants": {"tenant-a": {}}}
+            if access_key == "multi-tenant-key":
+                return {"tenants": {"tenant-a": {}, "tenant-b": {}}}
+            raise RuntimeError("invalid access key")
+
+        monkeypatch.setattr(auth_module, "_exchange_descope_access_key", exchange)
+
+        yield calls
+
+        auth_module.clear_auth_cache()
+
+    @pytest.fixture
+    def auth_client(self, exchange_calls: list[tuple[str, str]]) -> Generator[TestClient, None, None]:
+        from benchmark_service.app import BenchmarkServiceApp
+        from tests.conftest import StubBenchmark
+
+        with TestClient(BenchmarkServiceApp(StubBenchmark)) as c:
+            yield c
+
+    def test_missing_descope_header_returns_401(self, auth_client: TestClient) -> None:
+        response = auth_client.get("/verify-task-ids")
+        assert response.status_code == 401
+
+    def test_invalid_descope_key_returns_401(self, auth_client: TestClient) -> None:
+        response = auth_client.get("/verify-task-ids", headers={"X-Descope-Api-Key": "invalid-key"})
+        assert response.status_code == 401
+
+    def test_multi_tenant_descope_key_returns_401(self, auth_client: TestClient) -> None:
+        response = auth_client.get("/verify-task-ids", headers={"X-Descope-Api-Key": "multi-tenant-key"})
+        assert response.status_code == 401
+
+    def test_valid_descope_key_returns_200(self, auth_client: TestClient) -> None:
+        response = auth_client.get("/verify-task-ids", headers={"X-Descope-Api-Key": "valid-key"})
+        assert response.status_code == 200
+
+    def test_valid_descope_key_is_cached(
+        self,
+        auth_client: TestClient,
+        exchange_calls: list[tuple[str, str]],
+    ) -> None:
+        headers = {"X-Descope-Api-Key": "valid-key"}
+
+        assert auth_client.get("/verify-task-ids", headers=headers).status_code == 200
+        assert auth_client.get("/retrieve-task/", params={"task_id": "task-1"}, headers=headers).status_code == 200
+
+        assert exchange_calls == [(self.PROJECT_ID, "valid-key")]

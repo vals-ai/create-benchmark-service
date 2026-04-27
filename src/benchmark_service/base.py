@@ -5,14 +5,13 @@ all the abstract methods. Then use the factory function in benchmark_service.app
 a FastAPI app with your implementation.
 """
 
-import hmac
-import os
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
 from typing import Any, Self
 
 from daytona import AsyncSandbox
 
+from benchmark_service.auth import check_benchmark_service_auth
 from benchmark_service.schemas import (
     EvaluateResponseRequest,
     FinalScoreResult,
@@ -56,9 +55,9 @@ class BenchmarkService(ABC):
     async def check_auth(self, headers: dict[str, str]) -> bool:
         """Validate request authorization.
 
-        If the BENCHMARK_API_KEY environment variable is set, requires
-        a matching "Bearer <key>" Authorization header. If not set,
-        allows all requests (for local development).
+        If AUTH_REQUIRED=true, requires a valid Descope access key in
+        X-Descope-Api-Key. Otherwise, preserves the legacy BENCHMARK_API_KEY
+        behavior for local development and custom services.
 
         Override this method to implement custom authentication logic.
 
@@ -68,10 +67,7 @@ class BenchmarkService(ABC):
         Returns:
             True to allow the request, False to reject with 401.
         """
-        api_key = os.environ.get("BENCHMARK_API_KEY")
-        if not api_key:
-            return True
-        return hmac.compare_digest(headers.get("authorization", ""), f"Bearer {api_key}")
+        return check_benchmark_service_auth(headers)
 
     def get_dataset(self, dataset: str | None = None) -> dict[str, Any]:
         """Get a specific dataset by name. Defaults to 'default'."""

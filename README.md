@@ -168,15 +168,27 @@ valkyrie run start --benchmark my-benchmark --agent my-agent -H X-Custom value
 
 ### Reverse Tunnel setup
 
-You may want to test the benchmark service using valkyrie instead of hosting it locally. We offer a simple way to do this through ngrok (although you can use any reverse tunnel tool)
+You may want to test the benchmark service using valkyrie instead of hosting it locally. You can use any reverse tunnel tool — below are instructions for **Tailscale Funnel** (recommended) and **ngrok**.
 
-Setup
+1. Start the project using either `make dev` or `make docker-build && make docker-run`
+2. Expose the service with one of the options below
+3. Using Valkyrie, run `valkyrie config service add <benchmark-name> <forwarding-address>`
+
+If the forwarding address changes you will need to run step 3 again.
+
+#### Option A: Tailscale Funnel (recommended)
+
+[Tailscale Funnel](https://tailscale.com/kb/1223/funnel) exposes a local port to the public internet over your Tailscale network.
+
+1. [Install Tailscale](https://tailscale.com/download) and log in
+2. Run `tailscale funnel 8001` (forwards public traffic to the FastAPI server running on your machine)
+   - Copy the URL printed by the command. Example: `https://my-machine.tail1234.ts.net`
+3. Use the URL as the `<forwarding-address>` in step 3 above
+
+#### Option B: ngrok
 
 1. [Signup / login to ngrok](https://dashboard.ngrok.com/login)
 2. [Follow the setup and installation steps](https://dashboard.ngrok.com/get-started/setup/macos)
-3. Start the project using either `make dev` or `make docker-build && make docker-run`
-4. Run ngrok on the matching port that is exposed: `ngrok http 8001` (forwards the traffic from the tunnel to the FastAPI server running on your machine)
+3. Run `ngrok http 8001` (forwards the traffic from the tunnel to the FastAPI server running on your machine)
    - Copy the forwarding address on the left. Example: `https://hemagglutinative-vonnie-fungic.ngrok-free.dev`
-5. Using Valkyrie, run `valkyrie config service add <benchmark-name> <forwarding-address>`
-
-If the forwarding address changes you will need to run step 5 again.
+4. Use the URL as the `<forwarding-address>` in step 3 above

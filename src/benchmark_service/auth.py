@@ -6,12 +6,12 @@ import asyncio
 import hmac
 import logging
 import os
-import time
 from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from typing import Any
 
+from cachetools import TTLCache
 from descope.descope_client import DescopeClient
 
 logger = logging.getLogger(__name__)
@@ -20,7 +20,19 @@ DESCOPE_API_KEY_HEADER = "x-descope-api-key"
 DEFAULT_AUTH_CACHE_TTL_SECONDS = 300
 AUTH_CACHE_MAX_SIZE = 1024
 
-_auth_cache: dict[tuple[str, str], float] = {}
+
+def _initial_cache_ttl_seconds() -> int:
+    raw = os.environ.get("DESCOPE_AUTH_CACHE_TTL_SECONDS", str(DEFAULT_AUTH_CACHE_TTL_SECONDS))
+    try:
+        return max(int(raw), 1)
+    except ValueError:
+        return DEFAULT_AUTH_CACHE_TTL_SECONDS
+
+
+_auth_cache: TTLCache[tuple[str, str], bool] = TTLCache(
+    maxsize=AUTH_CACHE_MAX_SIZE,
+    ttl=_initial_cache_ttl_seconds(),
+)
 
 
 @dataclass(frozen=True)
@@ -30,7 +42,6 @@ class AuthSettings:
     auth_required: bool
     descope_project_id: str
     benchmark_api_key: str | None
-    cache_ttl_seconds: int
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -42,17 +53,10 @@ def _env_bool(name: str, default: bool = False) -> bool:
 
 def get_auth_settings() -> AuthSettings:
     """Load auth settings from the current process environment."""
-    ttl_raw = os.environ.get("DESCOPE_AUTH_CACHE_TTL_SECONDS", str(DEFAULT_AUTH_CACHE_TTL_SECONDS))
-    try:
-        cache_ttl_seconds = int(ttl_raw)
-    except ValueError:
-        cache_ttl_seconds = DEFAULT_AUTH_CACHE_TTL_SECONDS
-
     return AuthSettings(
         auth_required=_env_bool("AUTH_REQUIRED"),
         descope_project_id=os.environ.get("DESCOPE_PROJECT_ID", ""),
         benchmark_api_key=os.environ.get("BENCHMARK_API_KEY"),
-        cache_ttl_seconds=max(cache_ttl_seconds, 0),
     )
 
 
@@ -68,25 +72,6 @@ def _get_descope_client(project_id: str) -> DescopeClient:
 
 async def _exchange_descope_access_key(project_id: str, access_key: str) -> Mapping[str, Any]:
     return await asyncio.to_thread(_get_descope_client(project_id).exchange_access_key, access_key)  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
-
-
-def _is_cache_hit(project_id: str, access_key: str, now: float) -> bool:
-    key = (project_id, access_key)
-    expires_at = _auth_cache.get(key)
-    if expires_at is None:
-        return False
-    if expires_at <= now:
-        del _auth_cache[key]
-        return False
-    return True
-
-
-def _cache_success(project_id: str, access_key: str, now: float, ttl_seconds: int) -> None:
-    if ttl_seconds <= 0:
-        return
-    if len(_auth_cache) >= AUTH_CACHE_MAX_SIZE:
-        _auth_cache.pop(next(iter(_auth_cache)))
-    _auth_cache[(project_id, access_key)] = now + ttl_seconds
 
 
 def _check_legacy_benchmark_api_key(headers: Mapping[str, str], settings: AuthSettings) -> bool:
@@ -107,8 +92,8 @@ async def _check_descope_access_key(headers: Mapping[str, str], settings: AuthSe
     if not access_key:
         return False
 
-    now = time.monotonic()
-    if _is_cache_hit(settings.descope_project_id, access_key, now):
+    cache_key = (settings.descope_project_id, access_key)
+    if cache_key in _auth_cache:
         return True
 
     try:
@@ -122,7 +107,7 @@ async def _check_descope_access_key(headers: Mapping[str, str], settings: AuthSe
         logger.warning("Descope access key must be scoped to exactly one tenant, got %s", len(tenants))
         return False
 
-    _cache_success(settings.descope_project_id, access_key, now, settings.cache_ttl_seconds)
+    _auth_cache[cache_key] = True
     return True
 
 

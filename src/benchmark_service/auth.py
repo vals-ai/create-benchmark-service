@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import logging
 import os
@@ -65,8 +66,8 @@ def _get_descope_client(project_id: str) -> DescopeClient:
     return DescopeClient(project_id=project_id)
 
 
-def _exchange_descope_access_key(project_id: str, access_key: str) -> Mapping[str, Any]:
-    return _get_descope_client(project_id).exchange_access_key(access_key)  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
+async def _exchange_descope_access_key(project_id: str, access_key: str) -> Mapping[str, Any]:
+    return await asyncio.to_thread(_get_descope_client(project_id).exchange_access_key, access_key)  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
 
 
 def _is_cache_hit(project_id: str, access_key: str, now: float) -> bool:
@@ -97,7 +98,7 @@ def _check_legacy_benchmark_api_key(headers: Mapping[str, str], settings: AuthSe
     return hmac.compare_digest(authorization, expected)
 
 
-def _check_descope_access_key(headers: Mapping[str, str], settings: AuthSettings) -> bool:
+async def _check_descope_access_key(headers: Mapping[str, str], settings: AuthSettings) -> bool:
     if not settings.descope_project_id:
         logger.warning("AUTH_REQUIRED is true but DESCOPE_PROJECT_ID is not configured")
         return False
@@ -111,7 +112,7 @@ def _check_descope_access_key(headers: Mapping[str, str], settings: AuthSettings
         return True
 
     try:
-        jwt_response = _exchange_descope_access_key(settings.descope_project_id, access_key)
+        jwt_response = await _exchange_descope_access_key(settings.descope_project_id, access_key)
     except Exception:
         logger.warning("Failed to exchange Descope access key", exc_info=True)
         return False
@@ -125,9 +126,9 @@ def _check_descope_access_key(headers: Mapping[str, str], settings: AuthSettings
     return True
 
 
-def check_benchmark_service_auth(headers: Mapping[str, str]) -> bool:
+async def check_benchmark_service_auth(headers: Mapping[str, str]) -> bool:
     """Validate benchmark-service auth headers using the configured auth mode."""
     settings = get_auth_settings()
     if settings.auth_required:
-        return _check_descope_access_key(headers, settings)
+        return await _check_descope_access_key(headers, settings)
     return _check_legacy_benchmark_api_key(headers, settings)

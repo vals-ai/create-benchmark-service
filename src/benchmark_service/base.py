@@ -64,7 +64,7 @@ class BenchmarkService(ABC):
         Returns:
             True to allow the request, False to reject with 401.
         """
-        return check_benchmark_service_auth(headers)
+        return await check_benchmark_service_auth(headers)
 
     def get_dataset(self, dataset: str | None = None) -> dict[str, Any]:
         """Get a specific dataset by name. Defaults to 'default'."""

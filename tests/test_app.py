@@ -266,7 +266,7 @@ class TestDescopeAuth:
 
         calls: list[tuple[str, str]] = []
 
-        def exchange(project_id: str, access_key: str) -> dict[str, dict[str, dict[str, str]]]:
+        async def exchange(project_id: str, access_key: str) -> dict[str, dict[str, dict[str, str]]]:
             calls.append((project_id, access_key))
             if access_key == "valid-key":
                 return {"tenants": {"tenant-a": {}}}

@@ -134,7 +134,13 @@ Runs a shell command inside a Daytona sandbox and yields stdout/stderr lines in 
 
 ### Authentication
 
-The framework includes a built-in `check_auth()` hook that is called on every HTTP request (except `/health`). By default it allows all requests. Override it in your `BenchmarkService` subclass to enforce authentication:
+The framework includes a built-in `check_auth()` hook that is called on every HTTP request except `/health`, and on WebSocket routes before Daytona headers are used.
+
+For hosted Valkyrie benchmark services, set `AUTH_REQUIRED=true` and `DESCOPE_PROJECT_ID`. Requests must include a valid Descope access key in `X-Descope-Api-Key`. The key must be scoped to exactly one Descope tenant.
+
+For local development or legacy custom services, leave `AUTH_REQUIRED` unset or `false`. In that mode, `BENCHMARK_API_KEY` preserves the previous static-key behavior by requiring `Authorization: Bearer <key>`. If `BENCHMARK_API_KEY` is not set, requests are allowed.
+
+Override `check_auth()` in your `BenchmarkService` subclass to enforce custom authentication:
 
 ```python
 from benchmark_service import BenchmarkService
@@ -148,16 +154,16 @@ class MyBenchmarkService(BenchmarkService):
 
 Header names are lowercase per HTTP convention. Requests that fail auth receive a `401 Unauthorized` response automatically.
 
-Harness users configure their credential once via the CLI:
+Valkyrie users normally configure their Descope credential once via the CLI. Legacy/custom service credentials can still be configured separately:
 
 ```bash
-harness config auth set <benchmark-name> <credential>
+valkyrie config auth set <benchmark-name> <credential>
 ```
 
-The credential is stored in `~/.config/harness/harness.yaml` under `benchmark_auth` and sent as the `Authorization` header on every request. Users can also pass arbitrary headers at runtime with `-H`:
+The credential is stored under `benchmark_auth` and sent as the `Authorization` header on every request. Users can also pass arbitrary headers at runtime with `-H`:
 
 ```bash
-harness benchmark start --benchmark my-benchmark --agent my-agent -H X-Custom value
+valkyrie run start --benchmark my-benchmark --agent my-agent -H X-Custom value
 ```
 
 ### Reverse Tunnel setup

@@ -71,6 +71,13 @@ class BenchmarkServiceApp(FastAPI):
     async def _health_check(self) -> HealthCheckResponse:
         return HealthCheckResponse(status="ok")
 
+    async def _authorize_websocket(self, websocket: WebSocket) -> bool:
+        if await self.service.check_auth(dict(websocket.headers)):
+            return True
+
+        await websocket.close(code=1008, reason="Unauthorized")
+        return False
+
     async def _verify_task_ids(
         self,
         task_ids: list[str] | None = Query(default=None, description="List of task IDs to verify"),
@@ -101,6 +108,9 @@ class BenchmarkServiceApp(FastAPI):
         await websocket.accept()
 
         try:
+            if not await self._authorize_websocket(websocket):
+                return
+
             api_key = websocket.headers.get("x-api-key")
             api_url = websocket.headers.get("x-api-url")
             target = websocket.headers.get("x-target")
@@ -138,6 +148,9 @@ class BenchmarkServiceApp(FastAPI):
         await websocket.accept()
 
         try:
+            if not await self._authorize_websocket(websocket):
+                return
+
             api_key = websocket.headers.get("x-api-key")
             api_url = websocket.headers.get("x-api-url")
             target = websocket.headers.get("x-target")

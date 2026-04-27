@@ -375,7 +375,7 @@ dev = [
 requires-dist = [
     { name = "click", specifier = ">=8.3.2" },
     { name = "daytona", specifier = ">=0.161.0" },
-    { name = "descope", specifier = ">=0.9.0" },
+    { name = "descope", specifier = ">=1.13.0" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.135.3" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "jinja2", specifier = ">=3.1.6" },

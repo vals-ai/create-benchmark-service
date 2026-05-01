@@ -63,9 +63,10 @@ async def test_http_happy_path(
     expected_path: str,
     json_data: dict[str, Any],
 ) -> None:
-    client, mock_request = benchmark_client
+    client, mock_http = benchmark_client
     mock_resp = _mock_response(json_data=json_data)
-    mock_request.return_value = mock_resp
+    mock_http.get = AsyncMock(return_value=mock_resp)
+    mock_http.post = AsyncMock(return_value=mock_resp)
 
     result = await getattr(client, method)(*args)
 
@@ -87,9 +88,10 @@ async def test_http_error(
     method: str,
     args: list[Any],
 ) -> None:
-    client, mock_request = benchmark_client
+    client, mock_http = benchmark_client
     mock_resp = _mock_response(status_code=500)
-    mock_request.return_value = mock_resp
+    mock_http.get = AsyncMock(return_value=mock_resp)
+    mock_http.post = AsyncMock(return_value=mock_resp)
 
     with pytest.raises(BenchmarkServiceError):
         await getattr(client, method)(*args)
@@ -111,60 +113,59 @@ async def test_verify_task_ids_params(
     slice_str: str | None,
     expected_params: dict[str, Any],
 ) -> None:
-    client, mock_request = benchmark_client
+    client, mock_http = benchmark_client
     mock_resp = _mock_response(json_data={"task_ids": ["a"]})
-    mock_request.return_value = mock_resp
+    mock_http.get = AsyncMock(return_value=mock_resp)
 
     await client.verify_task_ids(task_ids, slice_str)
 
-    mock_request.assert_called_once_with("GET", "/verify-task-ids", params=expected_params)
+    mock_http.get.assert_called_once_with(f"{BASE_URL}/verify-task-ids", params=expected_params)
 
 
 async def test_verify_task_ids_with_dataset(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
-    client, mock_request = benchmark_client
+    client, mock_http = benchmark_client
     mock_resp = _mock_response(json_data={"task_ids": ["a"]})
-    mock_request.return_value = mock_resp
+    mock_http.get = AsyncMock(return_value=mock_resp)
 
     await client.verify_task_ids(["a"], None, dataset="mydata")
 
-    mock_request.assert_called_once_with("GET", "/verify-task-ids", params={"task_ids": ["a"], "dataset": "mydata"})
+    mock_http.get.assert_called_once_with(
+        f"{BASE_URL}/verify-task-ids", params={"task_ids": ["a"], "dataset": "mydata"}
+    )
 
 
 async def test_retrieve_task_with_dataset(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
-    client, mock_request = benchmark_client
-    mock_resp = _mock_response(
-        json_data={
-            "docker_image": "python:3.12",
-            "problem_path": "/tmp/problem_statement.txt",
-            "cwd": "/work",
-            "resources": {"vcpu": 2, "memory": 4, "disk": 10},
-        }
-    )
-    mock_request.return_value = mock_resp
+    client, mock_http = benchmark_client
+    mock_resp = _mock_response(json_data={
+        "docker_image": "python:3.12",
+        "problem_path": "/tmp/problem_statement.txt",
+        "cwd": "/work",
+        "resources": {"vcpu": 2, "memory": 4, "disk": 10},
+    })
+    mock_http.get = AsyncMock(return_value=mock_resp)
 
     await client.retrieve_task("task-1", dataset="mydata")
 
-    mock_request.assert_called_once_with(
-        "GET", "/retrieve-task/", params={"task_id": "task-1", "skip_validation": False, "dataset": "mydata"}
+    mock_http.get.assert_called_once_with(
+        f"{BASE_URL}/retrieve-task/", params={"task_id": "task-1", "skip_validation": False, "dataset": "mydata"}
     )
 
 
 async def test_final_score_with_dataset(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
-    client, mock_request = benchmark_client
+    client, mock_http = benchmark_client
     mock_resp = _mock_response(json_data={"tasks_evaluated": ["t1"], "final_score": 100.0, "metadata": {}})
-    mock_request.return_value = mock_resp
+    mock_http.post = AsyncMock(return_value=mock_resp)
 
     await client.final_score({"t1": {"resolved": True}}, dataset="mydata")
 
-    mock_request.assert_called_once_with(
-        "POST",
-        "/final-score/",
+    mock_http.post.assert_called_once_with(
+        f"{BASE_URL}/final-score/",
         json={"evaluation_results": {"t1": {"resolved": True}}, "dataset": "mydata"},
     )
 
@@ -173,13 +174,15 @@ async def test_verify_task_ids_no_dataset_omitted(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
     """Verify dataset param is NOT included when None."""
-    client, mock_request = benchmark_client
+    client, mock_http = benchmark_client
     mock_resp = _mock_response(json_data={"task_ids": ["a"]})
-    mock_request.return_value = mock_resp
+    mock_http.get = AsyncMock(return_value=mock_resp)
 
     await client.verify_task_ids(["a"], None)
 
-    mock_request.assert_called_once_with("GET", "/verify-task-ids", params={"task_ids": ["a"]})
+    mock_http.get.assert_called_once_with(
+        f"{BASE_URL}/verify-task-ids", params={"task_ids": ["a"]}
+    )
 
 
 class _AsyncIterator:

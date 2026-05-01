@@ -72,6 +72,12 @@ class BenchmarkServiceClient:
         self._url = url
         self._headers = headers
         self._timeout = timeout
+        self._http_client = httpx.AsyncClient(
+            follow_redirects=True,
+            timeout=timeout,
+            headers=headers,
+            limits=httpx.Limits(max_connections=200),
+        )
 
     @property
     def daytona_client(self) -> AsyncDaytona:
@@ -91,7 +97,8 @@ class BenchmarkServiceClient:
         return self._daytona_client
 
     async def close(self) -> None:
-        """Close the Daytona client."""
+        """Close the HTTP and Daytona clients."""
+        await self._http_client.aclose()
         if self._daytona_client:
             await self._daytona_client.close()
 
@@ -104,16 +111,6 @@ class BenchmarkServiceClient:
     @property
     def _ws_url(self) -> str:
         return self._url.replace("http://", "ws://").replace("https://", "wss://")
-
-    @_retry_http
-    async def _request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
-        async with httpx.AsyncClient(
-            follow_redirects=True,
-            timeout=self._timeout,
-            headers=self._headers,
-            limits=httpx.Limits(max_connections=200),
-        ) as client:
-            return await client.request(method, f"{self._url}{path}", **kwargs)
 
     async def _websocket_request(
         self, path: str, request: BaseModel, on_message: Callable[[str], None] | None = None
@@ -155,9 +152,10 @@ class BenchmarkServiceClient:
 
         raise BenchmarkServiceError("Exited websocket without returning final result")
 
+    @_retry_http
     async def health_check(self) -> HealthCheckResponse:
         """Check if the benchmark service is healthy."""
-        response = await self._request("GET", "/health")
+        response = await self._http_client.get(f"{self._url}/health")
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
@@ -166,6 +164,7 @@ class BenchmarkServiceClient:
 
         return HealthCheckResponse.model_validate(response.json())
 
+    @_retry_http
     async def verify_task_ids(
         self, task_ids: list[str] | None, slice_str: str | None, dataset: str | None = None
     ) -> VerifyTaskIdsResponse:
@@ -183,7 +182,7 @@ class BenchmarkServiceClient:
         if dataset is not None:
             params["dataset"] = dataset
 
-        response = await self._request("GET", "/verify-task-ids", params=params)
+        response = await self._http_client.get(f"{self._url}/verify-task-ids", params=params)
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
@@ -192,6 +191,7 @@ class BenchmarkServiceClient:
 
         return VerifyTaskIdsResponse.model_validate(response.json())
 
+    @_retry_http
     async def retrieve_task(
         self, task_id: str, skip_validation: bool = False, dataset: str | None = None
     ) -> RetrieveTaskResponse:
@@ -204,7 +204,7 @@ class BenchmarkServiceClient:
         params: dict[str, Any] = {"task_id": task_id, "skip_validation": skip_validation}
         if dataset is not None:
             params["dataset"] = dataset
-        response = await self._request("GET", "/retrieve-task/", params=params)
+        response = await self._http_client.get(f"{self._url}/retrieve-task/", params=params)
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
@@ -231,6 +231,7 @@ class BenchmarkServiceClient:
         result = await self._websocket_request("setup-task", request, on_message)
         return SetupTaskResponse.model_validate(result)
 
+    @_retry_http
     async def evaluate_response(
         self,
         task_id: str,
@@ -247,9 +248,8 @@ class BenchmarkServiceClient:
         request = EvaluateResponseRequest(task_id=task_id, response=response, dataset=dataset)
         body = request.model_dump(exclude_none=True)
 
-        resp = await self._request(
-            "POST",
-            "/evaluate-response/",
+        resp = await self._http_client.post(
+            f"{self._url}/evaluate-response/",
             json=body,
         )
 
@@ -277,6 +277,7 @@ class BenchmarkServiceClient:
         request = EvaluateInstanceRequest(task_id=task_id, instance_id=instance_id, dataset=dataset)
         return await self._websocket_request("evaluate-instance", request, on_message)
 
+    @_retry_http
     async def final_score(self, evaluation_results: dict[str, Any], dataset: str | None = None) -> FinalScoreResponse:
         """Compute the final score from evaluation results.
 
@@ -287,9 +288,8 @@ class BenchmarkServiceClient:
         if dataset is not None:
             body["dataset"] = dataset
 
-        response = await self._request(
-            "POST",
-            "/final-score/",
+        response = await self._http_client.post(
+            f"{self._url}/final-score/",
             json=body,
         )
 

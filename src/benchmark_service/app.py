@@ -3,12 +3,15 @@
 import logging
 import traceback
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 from daytona import AsyncDaytona, DaytonaConfig
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.responses import JSONResponse
+from starlette.websockets import WebSocketDisconnect
+from uvicorn.protocols.utils import ClientDisconnected
+from websockets.exceptions import ConnectionClosed
 
 from benchmark_service.base import BenchmarkService
 from benchmark_service.schemas import (
@@ -25,6 +28,14 @@ from benchmark_service.schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def send_json_if_connected(websocket: WebSocket, payload: dict[str, Any]) -> bool:
+    try:
+        await websocket.send_json(payload)
+        return True
+    except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed, RuntimeError):
+        return False
 
 
 class BenchmarkServiceApp(FastAPI):
@@ -128,18 +139,21 @@ class BenchmarkServiceApp(FastAPI):
                 sandbox = await daytona.get(request.instance_id)
 
                 async for message in self.service.setup_task(request.task_id, sandbox, dataset=request.dataset):
-                    await websocket.send_json(message.model_dump())
+                    if not await send_json_if_connected(websocket, message.model_dump()):
+                        logger.warning("setup-task websocket disconnected before benchmark service completed")
+                        return
 
+        except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
+            logger.warning("setup-task websocket disconnected")
         except Exception as e:
             error_msg = f"{str(e)}\n{traceback.format_exc()}"
             logger.error(f"WebSocket error: {error_msg}")
             error_chunk = StreamErrorChunk(type="error", data=error_msg)
-            await websocket.send_json(error_chunk.model_dump())
+            if not await send_json_if_connected(websocket, error_chunk.model_dump()):
+                logger.warning("setup-task websocket disconnected before error chunk could be sent")
         finally:
-            try:
+            with suppress(RuntimeError):
                 await websocket.close()
-            except RuntimeError:
-                pass
 
     async def _evaluate_response(self, request: EvaluateResponseRequest) -> Any:
         return await self.service.evaluate_response(request, dataset=request.dataset)
@@ -168,18 +182,21 @@ class BenchmarkServiceApp(FastAPI):
                 sandbox = await daytona.get(request.instance_id)
 
                 async for message in self.service.evaluate_instance(request.task_id, sandbox, dataset=request.dataset):
-                    await websocket.send_json(message.model_dump())
+                    if not await send_json_if_connected(websocket, message.model_dump()):
+                        logger.warning("evaluate-instance websocket disconnected before benchmark service completed")
+                        return
 
+        except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
+            logger.warning("evaluate-instance websocket disconnected")
         except Exception as e:
             error_msg = f"{str(e)}\n{traceback.format_exc()}"
             logger.error(f"WebSocket error: {error_msg}")
             error_chunk = StreamErrorChunk(type="error", data=error_msg)
-            await websocket.send_json(error_chunk.model_dump())
+            if not await send_json_if_connected(websocket, error_chunk.model_dump()):
+                logger.warning("evaluate-instance websocket disconnected before error chunk could be sent")
         finally:
-            try:
+            with suppress(RuntimeError):
                 await websocket.close()
-            except RuntimeError:
-                pass
 
     async def _final_score(self, request: FinalScoreRequest) -> FinalScoreResponse:
         tasks_evaluated = list(request.evaluation_results.keys())

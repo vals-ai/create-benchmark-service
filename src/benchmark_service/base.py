@@ -11,7 +11,7 @@ from typing import Any, Self
 
 from daytona import AsyncSandbox
 
-from benchmark_service.auth import check_benchmark_service_auth
+from benchmark_service.auth import check_benchmark_service_auth, load_allowlist, resolve_caller_tenant
 from benchmark_service.schemas import (
     EvaluateResponseRequest,
     FinalScoreResult,
@@ -65,6 +65,28 @@ class BenchmarkService(ABC):
             True to allow the request, False to reject with 401.
         """
         return await check_benchmark_service_auth(headers)
+
+    async def resolve_tenant(self, headers: dict[str, str]) -> str | None:
+        """Authenticate the caller and return their tenant id, or None to reject.
+
+        Subclasses with a legacy `check_auth` override keep their existing boolean
+        behavior. A successful legacy check returns the "_legacy" sentinel, which
+        skips dataset-level allowlist enforcement.
+        """
+        if type(self).check_auth is not BenchmarkService.check_auth:
+            ok = await self.check_auth(headers)
+            return "_legacy" if ok else None
+        return await resolve_caller_tenant(headers)
+
+    async def check_dataset_access(self, tenant: str, dataset: str | None) -> bool:
+        """Return True if `tenant` may use `dataset` on this service."""
+        if tenant == "_legacy":
+            return True
+        allowlist = load_allowlist()
+        entry = allowlist.tenants.get(tenant)
+        if entry is None:
+            return False
+        return (dataset or "default") in entry.datasets
 
     def get_dataset(self, dataset: str | None = None) -> dict[str, Any]:
         """Get a specific dataset by name. Defaults to 'default'."""

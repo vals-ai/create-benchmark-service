@@ -1,7 +1,9 @@
 """Tests for FastAPI app endpoints."""
 
+import json
 from collections.abc import Generator
-from typing import cast
+from typing import Any, cast
+from unittest.mock import patch
 
 import pytest
 from fastapi import HTTPException
@@ -275,6 +277,10 @@ class TestDescopeAuth:
         auth_module.clear_auth_cache()
         monkeypatch.setenv("AUTH_REQUIRED", "true")
         monkeypatch.setenv("DESCOPE_PROJECT_ID", self.PROJECT_ID)
+        monkeypatch.setenv(
+            "DESCOPE_TENANT_ALLOWLIST_JSON",
+            json.dumps({"tenants": {"tenant-a": {"datasets": ["default"]}}}),
+        )
         monkeypatch.delenv("BENCHMARK_API_KEY", raising=False)
 
         calls: list[tuple[str, str]] = []
@@ -325,3 +331,198 @@ class TestDescopeAuth:
         assert auth_client.get("/retrieve-task/", params={"task_id": "task-1"}, headers=headers).status_code == 200
 
         assert exchange_calls == [(self.PROJECT_ID, "valid-key")]
+
+
+@pytest.fixture
+def auth_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
+    monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
+    monkeypatch.setenv(
+        "DESCOPE_TENANT_ALLOWLIST_JSON",
+        json.dumps(
+            {
+                "tenants": {
+                    "acme-corp": {"datasets": ["validation"]},
+                    "vals-internal": {"datasets": ["default", "alt"]},
+                }
+            }
+        ),
+    )
+
+
+def _patch_descope(tenants: list[str]) -> Any:
+    return patch.object(
+        auth_module,
+        "_exchange_descope_access_key",
+        return_value={"tenants": {t: {} for t in tenants}},
+    )
+
+
+@pytest.fixture
+def auth_client(auth_env: None) -> Generator[TestClient, None, None]:
+    """A TestClient configured for AUTH_REQUIRED=true."""
+    with TestClient(BenchmarkServiceApp(StubBenchmark)) as c:
+        yield c
+
+
+def test_http_middleware_rejects_missing_descope_key(auth_client: TestClient) -> None:
+    response = auth_client.get("/verify-task-ids")
+    assert response.status_code == 401
+    assert response.json() == {"detail": "Unauthorized"}
+
+
+def test_http_middleware_rejects_unknown_tenant(auth_client: TestClient) -> None:
+    with _patch_descope(["unknown-org"]):
+        response = auth_client.get(
+            "/verify-task-ids",
+            headers={"x-descope-api-key": "key-rogue"},
+        )
+    assert response.status_code == 401
+
+
+def test_http_middleware_allows_known_tenant(auth_client: TestClient) -> None:
+    with _patch_descope(["vals-internal"]):
+        response = auth_client.get(
+            "/verify-task-ids",
+            headers={"x-descope-api-key": "key-internal"},
+        )
+    assert response.status_code == 200
+
+
+def test_http_middleware_uses_resolve_tenant() -> None:
+    class ResolveTenantBenchmark(StubBenchmark):
+        async def check_auth(self, headers: dict[str, str]) -> bool:
+            return True
+
+        async def resolve_tenant(self, headers: dict[str, str]) -> str | None:
+            return None
+
+    with TestClient(BenchmarkServiceApp(ResolveTenantBenchmark)) as client:
+        response = client.get("/verify-task-ids")
+
+    assert response.status_code == 401
+
+
+def test_verify_task_ids_403_for_disallowed_dataset(auth_client: TestClient) -> None:
+    with _patch_descope(["acme-corp"]):
+        response = auth_client.get(
+            "/verify-task-ids",
+            headers={"x-descope-api-key": "key-acme"},
+            params={"dataset": "alt"},
+        )
+    assert response.status_code == 403
+    assert response.json() == {"detail": "Dataset not allowed"}
+
+
+def test_verify_task_ids_200_for_allowed_dataset(auth_client: TestClient) -> None:
+    with _patch_descope(["vals-internal"]):
+        response = auth_client.get(
+            "/verify-task-ids",
+            headers={"x-descope-api-key": "key-internal"},
+            params={"dataset": "alt"},
+        )
+    assert response.status_code == 200
+    assert response.json() == {"task_ids": ["alt-task-1", "alt-task-2"]}
+
+
+def test_retrieve_task_403_for_disallowed_dataset(auth_client: TestClient) -> None:
+    with _patch_descope(["acme-corp"]):
+        response = auth_client.get(
+            "/retrieve-task/",
+            headers={"x-descope-api-key": "key-acme"},
+            params={"task_id": "task-1", "dataset": "alt"},
+        )
+    assert response.status_code == 403
+
+
+def test_evaluate_response_403_for_disallowed_dataset(auth_client: TestClient) -> None:
+    with _patch_descope(["acme-corp"]):
+        response = auth_client.post(
+            "/evaluate-response/",
+            headers={"x-descope-api-key": "key-acme"},
+            json={"task_id": "task-1", "response": "2", "dataset": "alt"},
+        )
+    assert response.status_code == 403
+
+
+def test_final_score_403_for_disallowed_dataset(auth_client: TestClient) -> None:
+    with _patch_descope(["acme-corp"]):
+        response = auth_client.post(
+            "/final-score/",
+            headers={"x-descope-api-key": "key-acme"},
+            json={"evaluation_results": {}, "dataset": "alt"},
+        )
+    assert response.status_code == 403
+
+
+def test_setup_task_ws_unauthorized_for_unknown_tenant(auth_client: TestClient) -> None:
+    with _patch_descope(["rogue-org"]):
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with auth_client.websocket_connect(
+                "/ws/setup-task",
+                headers={"x-descope-api-key": "key-rogue"},
+            ) as ws:
+                ws.receive_json()
+    assert exc_info.value.code == 1008
+    assert exc_info.value.reason == "Unauthorized"
+
+
+def test_setup_task_ws_no_descope_key_unauthorized(auth_client: TestClient) -> None:
+    with pytest.raises(WebSocketDisconnect) as exc_info:
+        with auth_client.websocket_connect("/ws/setup-task") as ws:
+            ws.receive_json()
+    assert exc_info.value.code == 1008
+    assert exc_info.value.reason == "Unauthorized"
+
+
+def test_setup_task_ws_uses_resolve_tenant() -> None:
+    class ResolveTenantBenchmark(StubBenchmark):
+        async def check_auth(self, headers: dict[str, str]) -> bool:
+            return True
+
+        async def resolve_tenant(self, headers: dict[str, str]) -> str | None:
+            return None
+
+    with TestClient(BenchmarkServiceApp(ResolveTenantBenchmark)) as client:
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with client.websocket_connect("/ws/setup-task") as ws:
+                ws.receive_json()
+
+    assert exc_info.value.code == 1008
+    assert exc_info.value.reason == "Unauthorized"
+
+
+def test_setup_task_ws_close_for_disallowed_dataset(auth_client: TestClient) -> None:
+    with _patch_descope(["acme-corp"]):
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with auth_client.websocket_connect(
+                "/ws/setup-task",
+                headers={
+                    "x-descope-api-key": "key-acme",
+                    "x-api-key": "daytona-key",
+                    "x-api-url": "http://daytona",
+                    "x-target": "us",
+                },
+            ) as ws:
+                ws.send_json({"task_id": "task-1", "instance_id": "i-1", "dataset": "alt"})
+                ws.receive_json()
+    assert exc_info.value.code == 1008
+    assert exc_info.value.reason == "Dataset not allowed"
+
+
+def test_evaluate_instance_ws_close_for_disallowed_dataset(auth_client: TestClient) -> None:
+    with _patch_descope(["acme-corp"]):
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with auth_client.websocket_connect(
+                "/ws/evaluate-instance",
+                headers={
+                    "x-descope-api-key": "key-acme",
+                    "x-api-key": "daytona-key",
+                    "x-api-url": "http://daytona",
+                    "x-target": "us",
+                },
+            ) as ws:
+                ws.send_json({"task_id": "task-1", "instance_id": "i-1", "dataset": "alt"})
+                ws.receive_json()
+    assert exc_info.value.code == 1008
+    assert exc_info.value.reason == "Dataset not allowed"

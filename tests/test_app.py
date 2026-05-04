@@ -1,14 +1,17 @@
 """Tests for FastAPI app endpoints."""
 
 from collections.abc import Generator
+from typing import cast
 
 import pytest
 from fastapi import HTTPException
+from fastapi import WebSocket
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from benchmark_service import auth as auth_module
 from benchmark_service.app import BenchmarkServiceApp
+from benchmark_service.app import send_json_if_connected
 from tests.conftest import StubBenchmark
 
 
@@ -164,6 +167,16 @@ def test_websocket_setup_task_missing_headers(client: TestClient) -> None:
 def test_websocket_evaluate_instance_missing_headers(client: TestClient) -> None:
     with client.websocket_connect("/ws/evaluate-instance") as ws:
         ws.close()
+
+
+async def test_send_json_if_connected_handles_disconnect() -> None:
+    class ClosedWebSocket:
+        async def send_json(self, _payload: dict[str, object]) -> None:
+            raise WebSocketDisconnect(1001)
+
+    websocket = cast(WebSocket, ClosedWebSocket())
+
+    assert await send_json_if_connected(websocket, {"type": "message"}) is False
 
 
 class TestAuthMiddleware:

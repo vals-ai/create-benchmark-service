@@ -1,5 +1,6 @@
 """HTTP/WebSocket client for communicating with a benchmark service."""
 
+import json
 from collections.abc import Callable
 from typing import Any
 
@@ -113,7 +114,11 @@ class BenchmarkServiceClient:
         return self._url.replace("http://", "ws://").replace("https://", "wss://")
 
     async def _websocket_request(
-        self, path: str, request: BaseModel, on_message: Callable[[str], None] | None = None
+        self,
+        path: str,
+        request: BaseModel | dict[str, Any],
+        on_message: Callable[[str], None] | None = None,
+        on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """Send a request over WebSocket and stream the response.
 
@@ -136,7 +141,10 @@ class BenchmarkServiceClient:
             ping_timeout=None,
             max_size=10 * 1024 * 1024,  # 10MB
         ) as websocket:
-            await websocket.send(request.model_dump_json())
+            if isinstance(request, BaseModel):
+                await websocket.send(request.model_dump_json(exclude_none=True))
+            else:
+                await websocket.send(json.dumps({k: v for k, v in request.items() if v is not None}))
 
             async for message in websocket:
                 chunk: StreamChunk = _stream_chunk_adapter.validate_json(message)
@@ -149,6 +157,9 @@ class BenchmarkServiceClient:
                     case "message":
                         if on_message:
                             on_message(chunk.data)
+                    case "eval_resume_state":
+                        if on_eval_resume_state:
+                            on_eval_resume_state(chunk.data)
 
         raise BenchmarkServiceError("Exited websocket without returning final result")
 
@@ -265,6 +276,7 @@ class BenchmarkServiceClient:
         task_id: str,
         instance_id: str,
         on_message: Callable[[str], None] | None = None,
+        on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
         dataset: str | None = None,
     ) -> dict[str, Any]:
         """Evaluate a task instance via WebSocket.
@@ -274,8 +286,20 @@ class BenchmarkServiceClient:
             instance_id: The instance to evaluate.
             on_message: Optional callback for intermediate progress messages.
         """
-        request = EvaluateInstanceRequest(task_id=task_id, instance_id=instance_id, dataset=dataset)
-        return await self._websocket_request("evaluate-instance", request, on_message)
+        request = {"task_id": task_id, "instance_id": instance_id, "dataset": dataset}
+        return await self._websocket_request("evaluate-instance", request, on_message, on_eval_resume_state)
+
+    async def resume_evaluation(
+        self,
+        task_id: str,
+        eval_resume_state: dict[str, Any],
+        on_message: Callable[[str], None] | None = None,
+        on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
+        dataset: str | None = None,
+    ) -> dict[str, Any]:
+        """Resume evaluation from benchmark-owned durable state."""
+        request = EvaluateInstanceRequest(task_id=task_id, eval_resume_state=eval_resume_state, dataset=dataset)
+        return await self._websocket_request("evaluate-instance", request, on_message, on_eval_resume_state)
 
     @_retry_http
     async def final_score(self, evaluation_results: dict[str, Any], dataset: str | None = None) -> FinalScoreResponse:

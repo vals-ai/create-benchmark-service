@@ -2,7 +2,7 @@
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class TaskFilter(BaseModel):
@@ -92,16 +92,22 @@ class EvaluateResponseRequest(BaseModel):
 
 
 class EvaluateInstanceRequest(BaseModel):
-    """
-    Request to evaluate an instance in a sandbox environment.
-
-    Use this for benchmarks where you need to execute code, run tests,
-    or otherwise interact with a sandbox to evaluate the solution.
-    """
+    """Request to evaluate either a live sandbox or durable benchmark-owned state."""
 
     task_id: str = Field(description="Unique identifier for the task")
-    instance_id: str = Field(description="Sandbox instance where the solution was implemented")
+    instance_id: str | None = Field(default=None, description="Sandbox instance where the solution was implemented")
+    eval_resume_state: dict[str, Any] | None = Field(
+        default=None, description="Opaque benchmark-owned evaluation resume state"
+    )
     dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
+
+    @model_validator(mode="after")
+    def require_one_eval_source(self) -> "EvaluateInstanceRequest":
+        has_instance = self.instance_id is not None
+        has_resume_state = self.eval_resume_state is not None
+        if has_instance == has_resume_state:
+            raise ValueError("Exactly one of instance_id or eval_resume_state is required")
+        return self
 
 
 class FinalScoreRequest(BaseModel):
@@ -163,5 +169,12 @@ class StreamErrorChunk(BaseModel):
     data: str = Field(description="Error message")
 
 
+class StreamEvalResumeStateChunk(BaseModel):
+    """Streaming chunk for benchmark-owned evaluation resume state."""
+
+    type: Literal["eval_resume_state"] = Field(description="Chunk type identifier")
+    data: dict[str, Any] = Field(description="Opaque benchmark-owned evaluation resume state")
+
+
 # Union type for all streaming chunks
-StreamChunk = StreamMessageChunk | StreamResultChunk | StreamErrorChunk
+StreamChunk = StreamMessageChunk | StreamResultChunk | StreamErrorChunk | StreamEvalResumeStateChunk

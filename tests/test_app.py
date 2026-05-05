@@ -169,6 +169,23 @@ def test_websocket_evaluate_instance_missing_headers(client: TestClient) -> None
         ws.close()
 
 
+def test_websocket_resume_evaluation_without_daytona_headers(client: TestClient) -> None:
+    with client.websocket_connect("/ws/evaluate-instance") as ws:
+        ws.send_json(
+            {
+                "task_id": "task-1",
+                "eval_resume_state": {"artifact_prefix": "s3://bucket/run"},
+            }
+        )
+        assert ws.receive_json() == {
+            "type": "result",
+            "data": {
+                "task_id": "task-1",
+                "state": {"artifact_prefix": "s3://bucket/run"},
+            },
+        }
+
+
 async def test_send_json_if_connected_handles_disconnect() -> None:
     class ClosedWebSocket:
         async def send_json(self, _payload: dict[str, object]) -> None:

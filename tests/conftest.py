@@ -17,6 +17,7 @@ from benchmark_service.schemas import (
     Resources,
     RetrieveTaskResponse,
     StreamChunk,
+    StreamResultChunk,
 )
 
 
@@ -61,6 +62,11 @@ class StubBenchmark(BenchmarkService):
     def evaluate_instance(
         self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None
     ) -> AsyncGenerator[StreamChunk, None]: ...  # type: ignore[return]
+
+    async def resume_evaluation(
+        self, task_id: str, eval_resume_state: dict[str, Any], dataset: str | None = None
+    ) -> AsyncGenerator[StreamChunk, None]:
+        yield StreamResultChunk(type="result", data={"task_id": task_id, "state": eval_resume_state})
 
     async def calculate_final_score(
         self, evaluation_results: dict[str, Any], dataset: str | None = None

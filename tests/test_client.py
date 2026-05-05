@@ -140,12 +140,14 @@ async def test_retrieve_task_with_dataset(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
     client, mock_http = benchmark_client
-    mock_resp = _mock_response(json_data={
-        "docker_image": "python:3.12",
-        "problem_path": "/tmp/problem_statement.txt",
-        "cwd": "/work",
-        "resources": {"vcpu": 2, "memory": 4, "disk": 10},
-    })
+    mock_resp = _mock_response(
+        json_data={
+            "docker_image": "python:3.12",
+            "problem_path": "/tmp/problem_statement.txt",
+            "cwd": "/work",
+            "resources": {"vcpu": 2, "memory": 4, "disk": 10},
+        }
+    )
     mock_http.get = AsyncMock(return_value=mock_resp)
 
     await client.retrieve_task("task-1", dataset="mydata")
@@ -180,9 +182,7 @@ async def test_verify_task_ids_no_dataset_omitted(
 
     await client.verify_task_ids(["a"], None)
 
-    mock_http.get.assert_called_once_with(
-        f"{BASE_URL}/verify-task-ids", params={"task_ids": ["a"]}
-    )
+    mock_http.get.assert_called_once_with(f"{BASE_URL}/verify-task-ids", params={"task_ids": ["a"]})
 
 
 class _AsyncIterator:
@@ -326,3 +326,35 @@ async def test_ws_connection_closed_without_result(method: str, args: list[str])
     with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
         with pytest.raises(BenchmarkServiceError, match="without returning final result"):
             await getattr(client, method)(*args)
+
+
+async def test_evaluate_instance_keeps_legacy_live_payload() -> None:
+    mock_connect = _ws_mock([json.dumps({"type": "result", "data": {"score": 1.0}})])
+
+    client = _make_client()
+    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+        await client.evaluate_instance("task-1", "inst-1")
+
+    ws = mock_connect.__aenter__.return_value
+    assert json.loads(ws.send.call_args.args[0]) == {"task_id": "task-1", "instance_id": "inst-1"}
+
+
+async def test_resume_evaluation_streams_resume_state() -> None:
+    state = {"artifact_prefix": "s3://bucket/run"}
+    newer_state = {"artifact_prefix": "s3://bucket/run", "job_id": "job-1"}
+    messages = [
+        json.dumps({"type": "eval_resume_state", "data": newer_state}),
+        json.dumps({"type": "result", "data": {"score": 1.0}}),
+    ]
+    mock_connect = _ws_mock(messages)
+    on_eval_resume_state = MagicMock()
+
+    client = _make_client()
+    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+        result = await client.resume_evaluation("task-1", state, on_eval_resume_state=on_eval_resume_state)
+
+    ws = mock_connect.__aenter__.return_value
+    payload = json.loads(ws.send.call_args.args[0])
+    assert payload == {"task_id": "task-1", "eval_resume_state": state}
+    assert result == {"score": 1.0}
+    on_eval_resume_state.assert_called_once_with(newer_state)

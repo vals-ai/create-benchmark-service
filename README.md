@@ -80,6 +80,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 - `filter_tasks(task_filter, dataset)` — return task IDs matching a list or Python slice notation (e.g. `"0:10:2"`)
 - `validate_task_ids(task_ids, dataset)` — raise `ValueError` if any ID is not in the dataset
 - `check_auth(headers)` — validate request authorization; returns `True` by default (no auth). Override to enforce authentication.
+- `resume_evaluation(task_id, eval_resume_state, dataset)` — optional eval-only resume from benchmark-owned durable state.
 
 ### FastAPI application factory (`app.py`)
 
@@ -100,18 +101,19 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | Path | Description |
 |------|-------------|
 | `/ws/setup-task` | Set up a task in a sandbox; streams progress, errors, and a final result |
-| `/ws/evaluate-instance` | Evaluate a solution in a sandbox; streams progress, errors, and a final result |
+| `/ws/evaluate-instance` | Evaluate a solution in a sandbox or resume evaluation from durable state; streams progress, errors, and a final result |
 
-Both WebSocket endpoints require three headers — `x-api-key`, `x-api-url`, `x-target` — used to connect to the Daytona sandbox, and accept a JSON body of `{"task_id": "…", "instance_id": "…", "dataset": "…"}` (dataset is optional, defaults to `"default"`).
+Sandbox setup and live sandbox evaluation require three headers — `x-api-key`, `x-api-url`, `x-target` — used to connect to Daytona. Live evaluation accepts `{"task_id": "…", "instance_id": "…", "dataset": "…"}`. Eval-only resume accepts `{"task_id": "…", "eval_resume_state": {...}, "dataset": "…"}` and does not require Daytona headers.
 
 ### Streaming protocol
 
-The WebSocket endpoints and the `setup_task` / `evaluate_instance` generators communicate via three chunk types:
+The WebSocket endpoints and generators communicate via four chunk types:
 
 ```python
-StreamMessageChunk(type="message", data="log line")     # progress / log output
-StreamErrorChunk(type="error",   data="error text")     # non-fatal errors
-StreamResultChunk(type="result", data=<any>)            # final result payload
+StreamMessageChunk(type="message", data="log line")                   # progress / log output
+StreamErrorChunk(type="error", data="error text")                     # non-fatal errors
+StreamEvalResumeStateChunk(type="eval_resume_state", data=<dict>)     # durable eval resume state
+StreamResultChunk(type="result", data=<any>)                          # final result payload
 ```
 
 Yield these from your generator methods; the framework serialises and forwards them to the WebSocket client.

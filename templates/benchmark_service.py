@@ -65,6 +65,7 @@ class ExampleBenchmark(BenchmarkService):
 
     async def evaluate_response(self, request: EvaluateResponseRequest, dataset: str | None = None) -> Any:
         """Evaluate a text response."""
+        assert request.response is not None
         task = self.get_dataset(dataset)[request.task_id]
 
         # Simple string comparison

@@ -80,34 +80,32 @@ class SetupTaskResponse(BaseModel):
 
 class EvaluateResponseRequest(BaseModel):
     """
-    Request to evaluate a text response (not in a sandbox).
+    Request to evaluate without a live sandbox.
 
-    Use this for benchmarks where you can evaluate a text response directly,
-    without needing to execute code or run tests.
+    Use this for benchmarks where evaluation can run from a text response or
+    benchmark-owned durable resume state.
     """
 
     task_id: str = Field(description="Unique identifier for the task")
-    response: str = Field(description="The agent's response to evaluate")
-    dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
-
-
-class EvaluateInstanceRequest(BaseModel):
-    """Request to evaluate either a live sandbox or durable benchmark-owned state."""
-
-    task_id: str = Field(description="Unique identifier for the task")
-    instance_id: str | None = Field(default=None, description="Sandbox instance where the solution was implemented")
+    response: str | None = Field(default=None, description="The agent's response to evaluate")
     eval_resume_state: dict[str, Any] | None = Field(
         default=None, description="Opaque benchmark-owned evaluation resume state"
     )
     dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
 
     @model_validator(mode="after")
-    def require_one_eval_source(self) -> "EvaluateInstanceRequest":
-        has_instance = self.instance_id is not None
-        has_resume_state = self.eval_resume_state is not None
-        if has_instance == has_resume_state:
-            raise ValueError("Exactly one of instance_id or eval_resume_state is required")
+    def require_one_eval_input(self) -> "EvaluateResponseRequest":
+        if (self.response is None) == (self.eval_resume_state is None):
+            raise ValueError("Exactly one of response or eval_resume_state is required")
         return self
+
+
+class EvaluateInstanceRequest(BaseModel):
+    """Request to evaluate a live sandbox."""
+
+    task_id: str = Field(description="Unique identifier for the task")
+    instance_id: str = Field(description="Sandbox instance where the solution was implemented")
+    dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
 
 
 class FinalScoreRequest(BaseModel):

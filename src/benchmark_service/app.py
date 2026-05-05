@@ -168,16 +168,6 @@ class BenchmarkServiceApp(FastAPI):
             data = await websocket.receive_json()
             request = EvaluateInstanceRequest(**data)
 
-            if request.eval_resume_state is not None:
-                async for message in self.service.resume_evaluation(
-                    request.task_id, request.eval_resume_state, dataset=request.dataset
-                ):
-                    if not await send_json_if_connected(websocket, message.model_dump()):
-                        logger.warning("evaluate-instance websocket disconnected before benchmark service completed")
-                        return
-                return
-
-            assert request.instance_id is not None
             api_key = websocket.headers.get("x-api-key")
             api_url = websocket.headers.get("x-api-url")
             target = websocket.headers.get("x-target")

@@ -172,6 +172,24 @@ async def test_final_score_with_dataset(
     )
 
 
+async def test_evaluate_response_with_eval_resume_state(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    state = {"artifact_prefix": "s3://bucket/run"}
+    mock_resp = _mock_response(json_data={"score": 1.0})
+    mock_http.post = AsyncMock(return_value=mock_resp)
+
+    result = await client.evaluate_response("task-1", eval_resume_state=state, dataset="mydata")
+
+    mock_http.post.assert_called_once_with(
+        f"{BASE_URL}/evaluate-response/",
+        json={"task_id": "task-1", "eval_resume_state": state, "dataset": "mydata"},
+        timeout=None,
+    )
+    assert result == {"score": 1.0}
+
+
 async def test_verify_task_ids_no_dataset_omitted(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
@@ -349,23 +367,3 @@ async def test_evaluate_instance_preserves_positional_dataset() -> None:
     ws = mock_connect.__aenter__.return_value
     assert json.loads(ws.send.call_args.args[0]) == {"task_id": "task-1", "instance_id": "inst-1", "dataset": "alt"}
 
-
-async def test_resume_evaluation_streams_resume_state() -> None:
-    state = {"artifact_prefix": "s3://bucket/run"}
-    newer_state = {"artifact_prefix": "s3://bucket/run", "job_id": "job-1"}
-    messages = [
-        json.dumps({"type": "eval_resume_state", "data": newer_state}),
-        json.dumps({"type": "result", "data": {"score": 1.0}}),
-    ]
-    mock_connect = _ws_mock(messages)
-    on_eval_resume_state = MagicMock()
-
-    client = _make_client()
-    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
-        result = await client.resume_evaluation("task-1", state, on_eval_resume_state=on_eval_resume_state)
-
-    ws = mock_connect.__aenter__.return_value
-    payload = json.loads(ws.send.call_args.args[0])
-    assert payload == {"task_id": "task-1", "eval_resume_state": state}
-    assert result == {"score": 1.0}
-    on_eval_resume_state.assert_called_once_with(newer_state)

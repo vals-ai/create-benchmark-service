@@ -211,13 +211,6 @@ class BenchmarkService(ABC):
         """
         ...
 
-    async def resume_evaluation(
-        self, task_id: str, eval_resume_state: dict[str, Any], dataset: str | None = None
-    ) -> AsyncGenerator[StreamChunk, None]:
-        """Resume evaluation from benchmark-owned durable state."""
-        raise NotImplementedError("This benchmark service does not support evaluation resume")
-        yield  # pragma: no cover
-
     @abstractmethod
     async def calculate_final_score(
         self, evaluation_results: dict[str, Any], dataset: str | None = None

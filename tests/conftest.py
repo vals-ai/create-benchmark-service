@@ -17,7 +17,6 @@ from benchmark_service.schemas import (
     Resources,
     RetrieveTaskResponse,
     StreamChunk,
-    StreamResultChunk,
 )
 
 
@@ -55,6 +54,10 @@ class StubBenchmark(BenchmarkService):
     ) -> AsyncGenerator[StreamChunk, None]: ...  # type: ignore[return]
 
     async def evaluate_response(self, request: EvaluateResponseRequest, dataset: str | None = None) -> Any:
+        if request.eval_resume_state is not None:
+            return {"task_id": request.task_id, "state": request.eval_resume_state}
+
+        assert request.response is not None
         ds = self.get_dataset(dataset)
         task = ds[request.task_id]
         return {"resolved": request.response == task["answer"]}
@@ -62,11 +65,6 @@ class StubBenchmark(BenchmarkService):
     def evaluate_instance(
         self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None
     ) -> AsyncGenerator[StreamChunk, None]: ...  # type: ignore[return]
-
-    async def resume_evaluation(
-        self, task_id: str, eval_resume_state: dict[str, Any], dataset: str | None = None
-    ) -> AsyncGenerator[StreamChunk, None]:
-        yield StreamResultChunk(type="result", data={"task_id": task_id, "state": eval_resume_state})
 
     async def calculate_final_score(
         self, evaluation_results: dict[str, Any], dataset: str | None = None

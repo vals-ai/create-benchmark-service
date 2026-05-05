@@ -16,7 +16,6 @@ from tenacity import (
 )
 
 from benchmark_service.schemas import (
-    EvaluateInstanceRequest,
     EvaluateResponseRequest,
     FinalScoreResponse,
     HealthCheckResponse,
@@ -246,22 +245,27 @@ class BenchmarkServiceClient:
     async def evaluate_response(
         self,
         task_id: str,
-        response: str,
+        response: str | None = None,
         dataset: str | None = None,
+        eval_resume_state: dict[str, Any] | None = None,
     ) -> Any:
-        """Evaluate a text response directly (without sandbox execution).
+        """Evaluate without a live sandbox.
 
         Args:
             task_id: The task to evaluate.
             response: The agent's response to evaluate.
             dataset: Optional dataset name.
+            eval_resume_state: Opaque benchmark-owned durable evaluation state.
         """
-        request = EvaluateResponseRequest(task_id=task_id, response=response, dataset=dataset)
+        request = EvaluateResponseRequest(
+            task_id=task_id, response=response, dataset=dataset, eval_resume_state=eval_resume_state
+        )
         body = request.model_dump(exclude_none=True)
 
         resp = await self._http_client.post(
             f"{self._url}/evaluate-response/",
             json=body,
+            timeout=None if eval_resume_state is not None else self._timeout,
         )
 
         if resp.status_code != 200:
@@ -287,18 +291,6 @@ class BenchmarkServiceClient:
             on_message: Optional callback for intermediate progress messages.
         """
         request = {"task_id": task_id, "instance_id": instance_id, "dataset": dataset}
-        return await self._websocket_request("evaluate-instance", request, on_message, on_eval_resume_state)
-
-    async def resume_evaluation(
-        self,
-        task_id: str,
-        eval_resume_state: dict[str, Any],
-        on_message: Callable[[str], None] | None = None,
-        dataset: str | None = None,
-        on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
-    ) -> dict[str, Any]:
-        """Resume evaluation from benchmark-owned durable state."""
-        request = EvaluateInstanceRequest(task_id=task_id, eval_resume_state=eval_resume_state, dataset=dataset)
         return await self._websocket_request("evaluate-instance", request, on_message, on_eval_resume_state)
 
     @_retry_http

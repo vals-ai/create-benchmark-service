@@ -11,7 +11,7 @@ from typing import Any, Self
 
 from daytona import AsyncSandbox
 
-from benchmark_service.auth import check_benchmark_service_auth, load_allowlist, resolve_caller_tenant
+from benchmark_service.auth import LEGACY_TENANT_SENTINEL, check_benchmark_service_auth, load_allowlist, resolve_caller_tenant
 from benchmark_service.schemas import (
     EvaluateResponseRequest,
     FinalScoreResult,
@@ -75,12 +75,12 @@ class BenchmarkService(ABC):
         """
         if type(self).check_auth is not BenchmarkService.check_auth:
             ok = await self.check_auth(headers)
-            return "_legacy" if ok else None
+            return LEGACY_TENANT_SENTINEL if ok else None
         return await resolve_caller_tenant(headers)
 
     async def check_dataset_access(self, tenant: str, dataset: str | None) -> bool:
         """Return True if `tenant` may use `dataset` on this service."""
-        if tenant == "_legacy":
+        if tenant == LEGACY_TENANT_SENTINEL:
             return True
         allowlist = load_allowlist()
         entry = allowlist.tenants.get(tenant)

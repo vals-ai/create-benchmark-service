@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 DESCOPE_API_KEY_HEADER = "x-descope-api-key"
 DEFAULT_AUTH_CACHE_TTL_SECONDS = 300
 AUTH_CACHE_MAX_SIZE = 1024
+LEGACY_TENANT_SENTINEL = "_legacy"
 
 
 class TenantConfig(BaseModel):
@@ -204,6 +205,10 @@ async def resolve_descope_tenant(headers: Mapping[str, str]) -> str | None:
         return None
 
     tenant = tenants[0]
+    if tenant == LEGACY_TENANT_SENTINEL:
+        logger.info("Descope tenant %s is reserved for legacy auth compatibility", tenant)
+        return None
+
     allowlist = load_allowlist()
     if tenant not in allowlist.tenants:
         logger.info("Descope tenant %s is not in the service allowlist", tenant)
@@ -218,7 +223,7 @@ async def resolve_caller_tenant(headers: Mapping[str, str]) -> str | None:
     settings = get_auth_settings()
     if settings.auth_required:
         return await resolve_descope_tenant(headers)
-    return "_legacy" if _check_legacy_benchmark_api_key(headers, settings) else None
+    return LEGACY_TENANT_SENTINEL if _check_legacy_benchmark_api_key(headers, settings) else None
 
 
 async def check_benchmark_service_auth(headers: Mapping[str, str]) -> bool:

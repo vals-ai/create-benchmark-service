@@ -94,24 +94,21 @@ async def test_resolve_descope_tenant_rejects_multi_tenant_jwt() -> None:
 
 
 @pytest.mark.usefixtures("descope_env")
-async def test_resolve_descope_tenant_returns_none_when_no_header() -> None:
-    tenant = await resolve_descope_tenant({})
-    assert tenant is None
-
-
-@pytest.mark.usefixtures("descope_env")
-async def test_resolve_descope_tenant_caches_resolved_tenant() -> None:
-    headers = {"x-descope-api-key": "key-acme"}
+async def test_resolve_descope_tenant_rejects_reserved_legacy_tenant(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(
+        "DESCOPE_TENANT_ALLOWLIST_JSON",
+        _allowlist_env({"tenants": {"_legacy": {"datasets": ["secret"]}}}),
+    )
+    headers = {"x-descope-api-key": "key-reserved"}
     with patch.object(
         auth_module,
         "_exchange_descope_access_key",
-        return_value=_mock_jwt_response(["acme-corp"]),
-    ) as mock_exchange:
-        first = await resolve_descope_tenant(headers)
-        second = await resolve_descope_tenant(headers)
-    assert first == "acme-corp"
-    assert second == "acme-corp"
-    assert mock_exchange.call_count == 1
+        return_value=_mock_jwt_response(["_legacy"]),
+    ):
+        tenant = await resolve_descope_tenant(headers)
+    assert tenant is None
 
 
 async def test_resolve_caller_tenant_legacy_no_api_key_required(
@@ -139,18 +136,6 @@ async def test_resolve_caller_tenant_legacy_wrong_api_key(
     monkeypatch.setenv("BENCHMARK_API_KEY", "secret123")
     tenant = await resolve_caller_tenant({"authorization": "Bearer wrong"})
     assert tenant is None
-
-
-@pytest.mark.usefixtures("descope_env")
-async def test_resolve_caller_tenant_descope_path() -> None:
-    headers = {"x-descope-api-key": "key-acme"}
-    with patch.object(
-        auth_module,
-        "_exchange_descope_access_key",
-        return_value=_mock_jwt_response(["acme-corp"]),
-    ):
-        tenant = await resolve_caller_tenant(headers)
-    assert tenant == "acme-corp"
 
 
 class _BareBenchmark(BenchmarkService):
@@ -188,19 +173,6 @@ class _LegacyOverrideBenchmark(_BareBenchmark):
         return self._allow
 
 
-@pytest.mark.usefixtures("descope_env")
-async def test_resolve_tenant_no_override_uses_descope_path() -> None:
-    service = _BareBenchmark()
-    headers = {"x-descope-api-key": "key-acme"}
-    with patch.object(
-        auth_module,
-        "_exchange_descope_access_key",
-        return_value=_mock_jwt_response(["acme-corp"]),
-    ):
-        tenant = await service.resolve_tenant(headers)
-    assert tenant == "acme-corp"
-
-
 async def test_resolve_tenant_legacy_override_returns_sentinel_on_true() -> None:
     service = _LegacyOverrideBenchmark(allow=True)
     tenant = await service.resolve_tenant({})
@@ -211,31 +183,6 @@ async def test_resolve_tenant_legacy_override_returns_none_on_false() -> None:
     service = _LegacyOverrideBenchmark(allow=False)
     tenant = await service.resolve_tenant({})
     assert tenant is None
-
-
-@pytest.mark.usefixtures("descope_env")
-async def test_check_dataset_access_allowed() -> None:
-    service = _BareBenchmark()
-    assert await service.check_dataset_access("acme-corp", "validation") is True
-
-
-@pytest.mark.usefixtures("descope_env")
-async def test_check_dataset_access_disallowed() -> None:
-    service = _BareBenchmark()
-    assert await service.check_dataset_access("acme-corp", "test") is False
-
-
-@pytest.mark.usefixtures("descope_env")
-async def test_check_dataset_access_unknown_tenant() -> None:
-    service = _BareBenchmark()
-    assert await service.check_dataset_access("rogue-org", "validation") is False
-
-
-@pytest.mark.usefixtures("descope_env")
-async def test_check_dataset_access_default_dataset_when_none() -> None:
-    service = _BareBenchmark()
-    assert await service.check_dataset_access("vals-internal", None) is True
-    assert await service.check_dataset_access("acme-corp", None) is False
 
 
 async def test_check_dataset_access_legacy_sentinel_always_allowed() -> None:

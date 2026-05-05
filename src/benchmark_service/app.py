@@ -13,6 +13,7 @@ from starlette.websockets import WebSocketDisconnect
 from uvicorn.protocols.utils import ClientDisconnected
 from websockets.exceptions import ConnectionClosed
 
+from benchmark_service.auth import get_auth_settings, load_allowlist
 from benchmark_service.base import BenchmarkService
 from benchmark_service.schemas import (
     EvaluateInstanceRequest,
@@ -46,6 +47,8 @@ class BenchmarkServiceApp(FastAPI):
     def __init__(self, service_cls: type[BenchmarkService]) -> None:
         @asynccontextmanager
         async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
+            if get_auth_settings().auth_required:
+                load_allowlist()
             self.service = await service_cls.create()
             yield
 
@@ -57,8 +60,10 @@ class BenchmarkServiceApp(FastAPI):
         async def _check_auth(request: Request, call_next):  # type: ignore[no-untyped-def]
             if request.url.path == "/health":
                 return await call_next(request)  # type: ignore[reportUnknownVariableType]
-            if not await self.service.check_auth(dict(request.headers)):
+            tenant = await self.service.resolve_tenant(dict(request.headers))
+            if tenant is None:
                 return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+            request.state.tenant = tenant
             return await call_next(request)  # type: ignore[reportUnknownVariableType]
 
         self.add_exception_handler(ValueError, self._value_error_handler)
@@ -82,19 +87,25 @@ class BenchmarkServiceApp(FastAPI):
     async def _health_check(self) -> HealthCheckResponse:
         return HealthCheckResponse(status="ok")
 
-    async def _authorize_websocket(self, websocket: WebSocket) -> bool:
-        if await self.service.check_auth(dict(websocket.headers)):
-            return True
-
-        await websocket.close(code=1008, reason="Unauthorized")
-        return False
+    async def _authorize_websocket(self, websocket: WebSocket) -> str | None:
+        """Authenticate a WebSocket caller. Returns tenant id, or None after closing 1008."""
+        tenant = await self.service.resolve_tenant(dict(websocket.headers))
+        if tenant is None:
+            await websocket.close(code=1008, reason="Unauthorized")
+            return None
+        websocket.state.tenant = tenant
+        return tenant
 
     async def _verify_task_ids(
         self,
+        request: Request,
         task_ids: list[str] | None = Query(default=None, description="List of task IDs to verify"),
         slice: str | None = Query(default=None, description="Slice of dataset (e.g., '3:10:1', '1:10:2')"),
         dataset: str | None = Query(default=None, description="Dataset name to use (defaults to 'default')"),
     ) -> VerifyTaskIdsResponse:
+        if not await self.service.check_dataset_access(request.state.tenant, dataset):
+            raise HTTPException(status_code=403, detail="Dataset not allowed")
+
         task_filter = TaskFilter()
 
         if task_ids:
@@ -109,17 +120,21 @@ class BenchmarkServiceApp(FastAPI):
 
     async def _retrieve_task(
         self,
+        request: Request,
         task_id: str = Query(..., description="Task ID to retrieve"),
         skip_validation: bool = Query(False, description="Skip validation of task existence"),
         dataset: str | None = Query(default=None, description="Dataset name to use (defaults to 'default')"),
     ) -> RetrieveTaskResponse:
+        if not await self.service.check_dataset_access(request.state.tenant, dataset):
+            raise HTTPException(status_code=403, detail="Dataset not allowed")
         return await self.service.retrieve_task(task_id, skip_validation, dataset=dataset)
 
     async def _setup_task(self, websocket: WebSocket) -> None:
         await websocket.accept()
 
         try:
-            if not await self._authorize_websocket(websocket):
+            tenant = await self._authorize_websocket(websocket)
+            if tenant is None:
                 return
 
             api_key = websocket.headers.get("x-api-key")
@@ -132,6 +147,10 @@ class BenchmarkServiceApp(FastAPI):
 
             data = await websocket.receive_json()
             request = SetupTaskRequest(**data)
+
+            if not await self.service.check_dataset_access(tenant, request.dataset):
+                await websocket.close(code=1008, reason="Dataset not allowed")
+                return
 
             daytona_config = DaytonaConfig(api_key=api_key, api_url=api_url, target=target)
 
@@ -155,18 +174,18 @@ class BenchmarkServiceApp(FastAPI):
             with suppress(RuntimeError):
                 await websocket.close()
 
-    async def _evaluate_response(self, request: EvaluateResponseRequest) -> Any:
-        return await self.service.evaluate_response(request, dataset=request.dataset)
+    async def _evaluate_response(self, request: Request, body: EvaluateResponseRequest) -> Any:
+        if not await self.service.check_dataset_access(request.state.tenant, body.dataset):
+            raise HTTPException(status_code=403, detail="Dataset not allowed")
+        return await self.service.evaluate_response(body, dataset=body.dataset)
 
     async def _evaluate_instance(self, websocket: WebSocket) -> None:
         await websocket.accept()
 
         try:
-            if not await self._authorize_websocket(websocket):
+            tenant = await self._authorize_websocket(websocket)
+            if tenant is None:
                 return
-
-            data = await websocket.receive_json()
-            request = EvaluateInstanceRequest(**data)
 
             api_key = websocket.headers.get("x-api-key")
             api_url = websocket.headers.get("x-api-url")
@@ -174,6 +193,13 @@ class BenchmarkServiceApp(FastAPI):
 
             if not api_key or not api_url or not target:
                 await websocket.close(code=1008, reason="Missing required headers: x-api-key, x-api-url, x-target")
+                return
+
+            data = await websocket.receive_json()
+            request = EvaluateInstanceRequest(**data)
+
+            if not await self.service.check_dataset_access(tenant, request.dataset):
+                await websocket.close(code=1008, reason="Dataset not allowed")
                 return
 
             daytona_config = DaytonaConfig(api_key=api_key, api_url=api_url, target=target)
@@ -198,11 +224,13 @@ class BenchmarkServiceApp(FastAPI):
             with suppress(RuntimeError):
                 await websocket.close()
 
-    async def _final_score(self, request: FinalScoreRequest) -> FinalScoreResponse:
-        tasks_evaluated = list(request.evaluation_results.keys())
+    async def _final_score(self, request: Request, body: FinalScoreRequest) -> FinalScoreResponse:
+        if not await self.service.check_dataset_access(request.state.tenant, body.dataset):
+            raise HTTPException(status_code=403, detail="Dataset not allowed")
 
-        validated_task_ids = await self.service.validate_task_ids(tasks_evaluated, dataset=request.dataset)
-        result = await self.service.calculate_final_score(request.evaluation_results, dataset=request.dataset)
+        tasks_evaluated = list(body.evaluation_results.keys())
+        validated_task_ids = await self.service.validate_task_ids(tasks_evaluated, dataset=body.dataset)
+        result = await self.service.calculate_final_score(body.evaluation_results, dataset=body.dataset)
 
         return FinalScoreResponse(
             tasks_evaluated=validated_task_ids,

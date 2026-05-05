@@ -44,12 +44,14 @@ Creates a new service in `./<benchmark-name>-benchmark-service/` in your current
 ├── src/benchmark_service/     # Framework code
 │   ├── __init__.py
 │   ├── app.py                 # FastAPI application
+│   ├── auth.py                # Auth, Descope tenant resolution, allowlist loading
 │   ├── base.py                # BenchmarkService base class
+│   ├── client.py              # HTTP/WebSocket client
 │   ├── schemas.py             # Pydantic models
 │   └── utils.py               # Utilities
 ├── templates/                 # Templates for generated projects
 │   ├── pyproject.toml
-│   └── README.md
+│   └── README.md.jinja
 ├── main.py                    # Example implementation
 ├── pyproject.toml             # CLI + framework config
 └── README.md                  # This file
@@ -79,8 +81,9 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 - `get_dataset(dataset)` — return the task dictionary for a given dataset name (defaults to `"default"`)
 - `filter_tasks(task_filter, dataset)` — return task IDs matching a list or Python slice notation (e.g. `"0:10:2"`)
 - `validate_task_ids(task_ids, dataset)` — raise `ValueError` if any ID is not in the dataset
-- `check_auth(headers)` — validate request authorization; returns `True` by default (no auth). Override to enforce authentication.
-- `resume_evaluation(task_id, eval_resume_state, dataset)` — optional eval-only resume from benchmark-owned durable state.
+- `check_auth(headers)` — legacy boolean auth hook. Override for custom auth that does not need tenant or dataset awareness.
+- `resolve_tenant(headers)` — validate request authorization and return a tenant ID, `"_legacy"` for legacy auth, or `None` to reject.
+- `check_dataset_access(tenant, dataset)` — return whether a resolved tenant may access a dataset.
 
 ### FastAPI application factory (`app.py`)
 
@@ -93,7 +96,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | `GET` | `/health` | Returns `{"status": "ok"}` |
 | `GET` | `/verify-task-ids` | Return task IDs filtered by `?task_ids=…` or `?slice=start:stop:step` (optional `?dataset=…`) |
 | `GET` | `/retrieve-task/?task_id=…` | Return task metadata for a given task ID (optional `?dataset=…`) |
-| `POST` | `/evaluate-response/` | Evaluate a text response: `{"task_id": "…", "response": "…", "dataset": "…"}` |
+| `POST` | `/evaluate-response/` | Evaluate without a sandbox using either `response` or `eval_resume_state` |
 | `POST` | `/final-score/` | Aggregate results: `{"evaluation_results": {task_id: result, …}, "dataset": "…"}` |
 
 **WebSocket endpoints** (stream `StreamChunk` JSON objects):
@@ -101,9 +104,9 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | Path | Description |
 |------|-------------|
 | `/ws/setup-task` | Set up a task in a sandbox; streams progress, errors, and a final result |
-| `/ws/evaluate-instance` | Evaluate a solution in a sandbox or resume evaluation from durable state; streams progress, errors, and a final result |
+| `/ws/evaluate-instance` | Evaluate a live sandbox solution; streams progress, errors, and a final result |
 
-Sandbox setup and live sandbox evaluation require three headers — `x-api-key`, `x-api-url`, `x-target` — used to connect to Daytona. Live evaluation accepts `{"task_id": "…", "instance_id": "…", "dataset": "…"}`. Eval-only resume accepts `{"task_id": "…", "eval_resume_state": {...}, "dataset": "…"}` and does not require Daytona headers.
+Sandbox setup and live sandbox evaluation require three headers — `x-api-key`, `x-api-url`, `x-target` — used to connect to Daytona. Live evaluation accepts `{"task_id": "…", "instance_id": "…", "dataset": "…"}`. Eval-only retry uses `POST /evaluate-response/` with `{"task_id": "…", "eval_resume_state": {...}, "dataset": "…"}` and does not require Daytona headers.
 
 ### Streaming protocol
 
@@ -136,13 +139,35 @@ Runs a shell command inside a Daytona sandbox and yields stdout/stderr lines in 
 
 ### Authentication
 
-The framework includes a built-in `check_auth()` hook that is called on every HTTP request except `/health`, and on WebSocket routes before Daytona headers are used.
+The framework authenticates every HTTP request except `/health`, and every WebSocket route before Daytona headers are used.
 
-For hosted Valkyrie benchmark services, set `AUTH_REQUIRED=true` and `DESCOPE_PROJECT_ID`. Requests must include a valid Descope access key in `X-Descope-Api-Key`. The key must be scoped to exactly one Descope tenant.
+For hosted Valkyrie benchmark services, set `AUTH_REQUIRED=true`, `DESCOPE_PROJECT_ID`, and a tenant + dataset allowlist. Requests must include a valid Descope access key in `X-Descope-Api-Key`. The key must be scoped to exactly one Descope tenant, and that tenant must appear in the service allowlist.
 
-For local development or legacy custom services, leave `AUTH_REQUIRED` unset or `false`. In that mode, `BENCHMARK_API_KEY` preserves the previous static-key behavior by requiring `Authorization: Bearer <key>`. If `BENCHMARK_API_KEY` is not set, requests are allowed.
+The allowlist is loaded in this order:
 
-Override `check_auth()` in your `BenchmarkService` subclass to enforce custom authentication:
+1. `DESCOPE_TENANT_ALLOWLIST_JSON` — JSON payload injected by production deployment.
+2. `DESCOPE_ALLOWLIST_PATH` — path to a local YAML file, useful for development.
+3. Empty config — allowed at startup, but Descope-authenticated requests fail closed when `AUTH_REQUIRED=true`.
+
+Example allowlist:
+
+```yaml
+tenants:
+  acme-corp:
+    datasets:
+      - validation
+  vals-internal:
+    datasets:
+      - default
+      - validation
+      - test
+```
+
+Malformed configured allowlists raise at app startup when `AUTH_REQUIRED=true`. Unknown tenants receive `401 Unauthorized`. Known tenants requesting a dataset outside their allowlist receive `403 Dataset not allowed`; WebSocket routes close with code `1008`. The tenant ID `"_legacy"` is reserved for compatibility mode and is rejected as a Descope tenant.
+
+For local development or legacy custom services, leave `AUTH_REQUIRED` unset or `false`. In that mode, `BENCHMARK_API_KEY` preserves the previous static-key behavior by requiring `Authorization: Bearer <key>`. If `BENCHMARK_API_KEY` is not set, requests are allowed. Legacy auth uses the `"_legacy"` sentinel and bypasses dataset-level allowlist enforcement because no tenant identity is available.
+
+Override `check_auth()` in your `BenchmarkService` subclass to keep using custom boolean authentication:
 
 ```python
 from benchmark_service import BenchmarkService
@@ -150,6 +175,24 @@ from benchmark_service import BenchmarkService
 class MyBenchmarkService(BenchmarkService):
     async def check_auth(self, headers: dict[str, str]) -> bool:
         return headers.get("authorization") == "my-secret-credential"
+
+    # ... other abstract methods
+```
+
+For tenant-aware custom authentication, override `resolve_tenant()` directly and return a tenant ID. Override `check_dataset_access()` if your service needs dataset rules that differ from the configured allowlist:
+
+```python
+from benchmark_service import BenchmarkService
+
+class MyBenchmarkService(BenchmarkService):
+    async def resolve_tenant(self, headers: dict[str, str]) -> str | None:
+        token = headers.get("authorization")
+        if token == "Bearer internal-token":
+            return "internal"
+        return None
+
+    async def check_dataset_access(self, tenant: str, dataset: str | None) -> bool:
+        return tenant == "internal" and (dataset or "default") in {"default", "validation"}
 
     # ... other abstract methods
 ```

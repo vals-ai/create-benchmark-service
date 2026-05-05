@@ -95,3 +95,11 @@ async def service() -> StubBenchmark:
 def client() -> Generator[TestClient, None, None]:
     with TestClient(BenchmarkServiceApp(StubBenchmark)) as c:
         yield c
+
+
+@pytest.fixture(autouse=True)
+def reset_auth_caches() -> None:
+    from benchmark_service.auth import clear_allowlist_cache, clear_auth_cache
+
+    clear_allowlist_cache()
+    clear_auth_cache()

@@ -276,8 +276,8 @@ class BenchmarkServiceClient:
         task_id: str,
         instance_id: str,
         on_message: Callable[[str], None] | None = None,
-        on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
         dataset: str | None = None,
+        on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """Evaluate a task instance via WebSocket.
 
@@ -294,8 +294,8 @@ class BenchmarkServiceClient:
         task_id: str,
         eval_resume_state: dict[str, Any],
         on_message: Callable[[str], None] | None = None,
-        on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
         dataset: str | None = None,
+        on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
         """Resume evaluation from benchmark-owned durable state."""
         request = EvaluateInstanceRequest(task_id=task_id, eval_resume_state=eval_resume_state, dataset=dataset)

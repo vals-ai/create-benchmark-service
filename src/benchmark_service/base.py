@@ -211,7 +211,7 @@ class BenchmarkService(ABC):
         """
         ...
 
-    def resume_evaluation(
+    async def resume_evaluation(
         self, task_id: str, eval_resume_state: dict[str, Any], dataset: str | None = None
     ) -> AsyncGenerator[StreamChunk, None]:
         """Resume evaluation from benchmark-owned durable state."""

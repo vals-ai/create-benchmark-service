@@ -339,6 +339,17 @@ async def test_evaluate_instance_keeps_legacy_live_payload() -> None:
     assert json.loads(ws.send.call_args.args[0]) == {"task_id": "task-1", "instance_id": "inst-1"}
 
 
+async def test_evaluate_instance_preserves_positional_dataset() -> None:
+    mock_connect = _ws_mock([json.dumps({"type": "result", "data": {"score": 1.0}})])
+
+    client = _make_client()
+    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+        await client.evaluate_instance("task-1", "inst-1", None, "alt")
+
+    ws = mock_connect.__aenter__.return_value
+    assert json.loads(ws.send.call_args.args[0]) == {"task_id": "task-1", "instance_id": "inst-1", "dataset": "alt"}
+
+
 async def test_resume_evaluation_streams_resume_state() -> None:
     state = {"artifact_prefix": "s3://bucket/run"}
     newer_state = {"artifact_prefix": "s3://bucket/run", "job_id": "job-1"}

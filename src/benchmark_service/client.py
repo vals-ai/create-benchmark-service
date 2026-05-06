@@ -246,8 +246,10 @@ class BenchmarkServiceClient:
         self,
         task_id: str,
         response: str | None = None,
+        on_message: Callable[[str], None] | None = None,
         dataset: str | None = None,
         eval_resume_state: dict[str, Any] | None = None,
+        on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
     ) -> Any:
         """Evaluate without a live sandbox.
 
@@ -260,12 +262,16 @@ class BenchmarkServiceClient:
         request = EvaluateResponseRequest(
             task_id=task_id, response=response, dataset=dataset, eval_resume_state=eval_resume_state
         )
+
+        if eval_resume_state is not None or on_message is not None or on_eval_resume_state is not None:
+            return await self._websocket_request("evaluate-response", request, on_message, on_eval_resume_state)
+
         body = request.model_dump(exclude_none=True)
 
         resp = await self._http_client.post(
             f"{self._url}/evaluate-response/",
             json=body,
-            timeout=None if eval_resume_state is not None else self._timeout,
+            timeout=self._timeout,
         )
 
         if resp.status_code != 200:

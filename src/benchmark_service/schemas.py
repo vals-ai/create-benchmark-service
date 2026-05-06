@@ -101,7 +101,7 @@ class EvaluateResponseRequest(BaseModel):
 
 
 class EvaluateInstanceRequest(BaseModel):
-    """Request to evaluate a live sandbox."""
+    """Request to evaluate a task instance in a sandbox."""
 
     task_id: str = Field(description="Unique identifier for the task")
     instance_id: str = Field(description="Sandbox instance where the solution was implemented")

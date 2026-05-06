@@ -171,19 +171,16 @@ def test_websocket_evaluate_instance_missing_headers(client: TestClient) -> None
         ws.close()
 
 
-def test_evaluate_response_with_eval_resume_state(client: TestClient) -> None:
-    response = client.post(
-        "/evaluate-response/",
-        json={
-            "task_id": "task-1",
-            "eval_resume_state": {"artifact_prefix": "s3://bucket/run"},
-        },
-    )
-    assert response.status_code == 200
-    assert response.json() == {
-        "task_id": "task-1",
-        "state": {"artifact_prefix": "s3://bucket/run"},
-    }
+def test_websocket_evaluate_response_with_eval_resume_state(client: TestClient) -> None:
+    with client.websocket_connect("/ws/evaluate-response") as ws:
+        ws.send_json({"task_id": "task-1", "eval_resume_state": {"artifact_prefix": "s3://bucket/run"}})
+        assert ws.receive_json() == {
+            "type": "result",
+            "data": {
+                "task_id": "task-1",
+                "state": {"artifact_prefix": "s3://bucket/run"},
+            },
+        }
 
 
 async def test_send_json_if_connected_handles_disconnect() -> None:
@@ -226,7 +223,7 @@ class TestAuthMiddleware:
         response = auth_client.get("/health")
         assert response.status_code == 200
 
-    @pytest.mark.parametrize("path", ["/ws/setup-task", "/ws/evaluate-instance"])
+    @pytest.mark.parametrize("path", ["/ws/setup-task", "/ws/evaluate-response", "/ws/evaluate-instance"])
     def test_websocket_auth_failure_closes_1008(self, auth_client: TestClient, path: str) -> None:
         with auth_client.websocket_connect(path) as ws:
             with pytest.raises(WebSocketDisconnect) as exc_info:

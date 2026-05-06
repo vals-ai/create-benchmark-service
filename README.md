@@ -96,7 +96,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | `GET` | `/health` | Returns `{"status": "ok"}` |
 | `GET` | `/verify-task-ids` | Return task IDs filtered by `?task_ids=…` or `?slice=start:stop:step` (optional `?dataset=…`) |
 | `GET` | `/retrieve-task/?task_id=…` | Return task metadata for a given task ID (optional `?dataset=…`) |
-| `POST` | `/evaluate-response/` | Evaluate without a sandbox using either `response` or `eval_resume_state` |
+| `POST` | `/evaluate-response/` | Evaluate without a sandbox and return one final response |
 | `POST` | `/final-score/` | Aggregate results: `{"evaluation_results": {task_id: result, …}, "dataset": "…"}` |
 
 **WebSocket endpoints** (stream `StreamChunk` JSON objects):
@@ -104,9 +104,10 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | Path | Description |
 |------|-------------|
 | `/ws/setup-task` | Set up a task in a sandbox; streams progress, errors, and a final result |
+| `/ws/evaluate-response` | Evaluate without a sandbox; streams progress, checkpoint state, errors, and a final result |
 | `/ws/evaluate-instance` | Evaluate a live sandbox solution; streams progress, errors, and a final result |
 
-Sandbox setup and live sandbox evaluation require three headers — `x-api-key`, `x-api-url`, `x-target` — used to connect to Daytona. Live evaluation accepts `{"task_id": "…", "instance_id": "…", "dataset": "…"}`. Eval-only retry uses `POST /evaluate-response/` with `{"task_id": "…", "eval_resume_state": {...}, "dataset": "…"}` and does not require Daytona headers.
+Sandbox setup and live sandbox evaluation require three headers — `x-api-key`, `x-api-url`, `x-target` — used to connect to Daytona. Live evaluation accepts `{"task_id": "…", "instance_id": "…", "dataset": "…"}`. Eval-only retry uses `/ws/evaluate-response` with `{"task_id": "…", "eval_resume_state": {...}, "dataset": "…"}` and does not require Daytona headers.
 
 ### Streaming protocol
 

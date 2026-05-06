@@ -73,6 +73,7 @@ class BenchmarkServiceApp(FastAPI):
         self.add_api_route("/retrieve-task/", self._retrieve_task, methods=["GET"])
         self.add_api_websocket_route("/ws/setup-task", self._setup_task)
         self.add_api_route("/evaluate-response/", self._evaluate_response, methods=["POST"])
+        self.add_api_websocket_route("/ws/evaluate-response", self._evaluate_response_stream)
         self.add_api_websocket_route("/ws/evaluate-instance", self._evaluate_instance)
         self.add_api_route("/final-score/", self._final_score, methods=["POST"])
 
@@ -178,6 +179,38 @@ class BenchmarkServiceApp(FastAPI):
         if not await self.service.check_dataset_access(request.state.tenant, body.dataset):
             raise HTTPException(status_code=403, detail="Dataset not allowed")
         return await self.service.evaluate_response(body, dataset=body.dataset)
+
+    async def _evaluate_response_stream(self, websocket: WebSocket) -> None:
+        await websocket.accept()
+
+        try:
+            tenant = await self._authorize_websocket(websocket)
+            if tenant is None:
+                return
+
+            data = await websocket.receive_json()
+            request = EvaluateResponseRequest(**data)
+
+            if not await self.service.check_dataset_access(tenant, request.dataset):
+                await websocket.close(code=1008, reason="Dataset not allowed")
+                return
+
+            async for message in self.service.stream_evaluate_response(request, dataset=request.dataset):
+                if not await send_json_if_connected(websocket, message.model_dump()):
+                    logger.warning("evaluate-response websocket disconnected before benchmark service completed")
+                    return
+
+        except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
+            logger.warning("evaluate-response websocket disconnected")
+        except Exception as e:
+            error_msg = f"{str(e)}\n{traceback.format_exc()}"
+            logger.error(f"WebSocket error: {error_msg}")
+            error_chunk = StreamErrorChunk(type="error", data=error_msg)
+            if not await send_json_if_connected(websocket, error_chunk.model_dump()):
+                logger.warning("evaluate-response websocket disconnected before error chunk could be sent")
+        finally:
+            with suppress(RuntimeError):
+                await websocket.close()
 
     async def _evaluate_instance(self, websocket: WebSocket) -> None:
         await websocket.accept()

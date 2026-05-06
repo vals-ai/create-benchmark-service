@@ -8,7 +8,7 @@ import pytest
 import benchmark_service
 from cli.generator import (
     BenchmarkNames,
-    _resolve_framework_ref,  # pyright: ignore[reportPrivateUsage]
+    _resolve_framework_dependency,  # pyright: ignore[reportPrivateUsage]
     generate_project,
     transform_name,
     validate_name,
@@ -49,15 +49,18 @@ def test_invalid_names(name: str, error_match: str) -> None:
         validate_name(name)
 
 
-def test_resolve_framework_ref_clean_semver() -> None:
-    assert _resolve_framework_ref("1.0.0") == "v1.0.0"
-    assert _resolve_framework_ref("1.2.3") == "v1.2.3"
+def test_resolve_framework_dependency_clean_semver() -> None:
+    assert _resolve_framework_dependency("1.0.0") == "create-benchmark-service==1.0.0"
+    assert _resolve_framework_dependency("1.2.3") == "create-benchmark-service==1.2.3"
 
 
-def test_resolve_framework_ref_dev_version_falls_back_to_main(capsys: pytest.CaptureFixture[str]) -> None:
-    assert _resolve_framework_ref("1.0.1.dev3+gabc1234") == "main"
+def test_resolve_framework_dependency_dev_version_falls_back_to_unpinned_pypi(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    assert _resolve_framework_dependency("1.0.1.dev3+gabc1234") == "create-benchmark-service>=0.0.0"
     captured = capsys.readouterr()
     assert "warning" in captured.err.lower()
+    assert "not a PyPI release" in captured.err
     assert captured.out == ""
 
 
@@ -90,25 +93,28 @@ def test_template_rendering(
         assert expected_readme_title in readme_content
 
 
-def test_generated_pyproject_pins_to_tag_for_clean_version(
+def test_generated_pyproject_pins_to_pypi_version_for_clean_version(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(benchmark_service, "__version__", "1.0.0")
     output_dir = tmp_path / "demo-benchmark-service"
     generate_project(benchmark_name="demo", output_dir=output_dir)
     pyproject = (output_dir / "pyproject.toml").read_text()
-    assert "create-benchmark-service.git@v1.0.0" in pyproject
+    assert '"create-benchmark-service==1.0.0"' in pyproject
+    assert "git+" not in pyproject
     assert "@main" not in pyproject
+    assert "allow-direct-references" not in pyproject
 
 
-def test_generated_pyproject_falls_back_to_main_for_dev_version(
+def test_generated_pyproject_falls_back_to_unpinned_pypi_for_dev_version(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setattr(benchmark_service, "__version__", "1.0.1.dev3+gabc1234")
     output_dir = tmp_path / "demo-benchmark-service"
     generate_project(benchmark_name="demo", output_dir=output_dir)
     pyproject = (output_dir / "pyproject.toml").read_text()
-    assert "create-benchmark-service.git@main" in pyproject
+    assert '"create-benchmark-service>=0.0.0"' in pyproject
+    assert "git+" not in pyproject
 
 
 def test_generates_project_structure() -> None:
@@ -142,6 +148,7 @@ def test_generated_project_excludes_framework_versioning_workflows(tmp_path: Pat
     assert not (workflows_dir / "cli-integration.yaml").exists()
     assert not (workflows_dir / "auto-tag-release.yaml").exists()
     assert not (workflows_dir / "check-pr-title.yaml").exists()
+    assert not (workflows_dir / "publish-pypi.yaml").exists()
 
 
 def test_fails_if_directory_exists() -> None:

@@ -20,6 +20,20 @@ Every PR targeting `main` must include one of `#patch`, `#minor`, or `#major` in
 
 The workflow requires a repository secret named `GH_PAT`. It must contain a GitHub personal access token that can check out the repository and push tags. If this secret is missing or lacks tag-write access, the release workflow will fail after merge.
 
+### Publish to PyPI
+
+`.github/workflows/publish-pypi.yaml` runs on `v*` tag pushes. It builds the wheel and source distribution with `uv build --clear`, then publishes them with `uv publish --trusted-publishing always`.
+
+PyPI publishing uses Trusted Publishing. Configure a PyPI trusted publisher for:
+
+- Project name: `create-benchmark-service`
+- Owner: `vals-ai`
+- Repository: `create-benchmark-service`
+- Workflow filename: `publish-pypi.yaml`
+- Environment: `pypi`
+
+No PyPI API token repository secret is needed. The publish job uses GitHub OIDC with `id-token: write`.
+
 ### Public surface for semver purposes
 
 - `benchmark_service.BenchmarkService` (abstract methods, signatures, behavior)
@@ -32,10 +46,10 @@ The workflow requires a repository secret named `GH_PAT`. It must contain a GitH
 
 ### Consumer pinning
 
-Generated benchmark services pin to a specific framework tag (`@vX.Y.Z`) in their `pyproject.toml`. To upgrade a consumer, edit the pin, run `uv lock`, and merge.
+Generated benchmark services pin to a specific framework package version (`create-benchmark-service==X.Y.Z`) in their `pyproject.toml`. To upgrade a consumer, edit the pin, run `uv lock`, and merge.
 
-If the CLI was installed from a non-tagged commit, scaffolds fall back to `@main` and the CLI prints a warning. To get reproducible scaffolds, install the CLI from a tag:
+If the CLI was installed from a non-release build, scaffolds fall back to `create-benchmark-service>=0.0.0` and the CLI prints a warning. To get reproducible scaffolds, install the CLI from a published PyPI version:
 
 ```bash
-uv tool install git+https://github.com/vals-ai/create-benchmark-service.git@vX.Y.Z
+uv tool install create-benchmark-service==X.Y.Z
 ```

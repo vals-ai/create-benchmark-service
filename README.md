@@ -109,6 +109,8 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 
 Sandbox setup and live sandbox evaluation require three headers — `x-api-key`, `x-api-url`, `x-target` — used to connect to Daytona. Live evaluation accepts `{"task_id": "…", "instance_id": "…", "dataset": "…"}`. Eval-only retry uses `/ws/evaluate-response` with `{"task_id": "…", "eval_resume_state": {...}, "dataset": "…"}` and does not require Daytona headers.
 
+`eval_resume_state` is an opaque benchmark-owned object. The tracker stores the latest value it receives and passes it back on eval-only retry; it does not inspect the shape. Use it for durable pointers such as uploaded artifacts, external job IDs, or partial check results that let the benchmark service continue evaluation without recreating the original agent sandbox.
+
 ### Streaming protocol
 
 The WebSocket endpoints and generators communicate via four chunk types:

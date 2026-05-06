@@ -170,7 +170,7 @@ class StreamErrorChunk(BaseModel):
 class StreamEvalResumeStateChunk(BaseModel):
     """Streaming chunk for benchmark-owned evaluation resume state."""
 
-    type: Literal["eval_resume_state"] = Field(description="Chunk type identifier")
+    type: Literal["eval_resume_state"]
     data: dict[str, Any] = Field(description="Opaque benchmark-owned evaluation resume state")
 
 

@@ -195,11 +195,28 @@ async def test_resume_evaluation_with_eval_resume_state(
     ws = mock_connect.__aenter__.return_value
     assert json.loads(ws.send.call_args.args[0]) == {
         "task_id": "task-1",
+        "response": None,
         "eval_resume_state": state,
         "dataset": "mydata",
     }
     assert result == {"score": 1.0}
     on_eval_resume_state.assert_called_once_with(state)
+
+
+async def test_websocket_request_includes_null_optional_fields() -> None:
+    messages = [json.dumps({"type": "result", "data": {"status": "ok"}})]
+    mock_connect = _ws_mock(messages)
+
+    client = _make_client()
+    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+        await client.setup_task("task-1", "inst-1")
+
+    ws = mock_connect.__aenter__.return_value
+    assert json.loads(ws.send.call_args.args[0]) == {
+        "task_id": "task-1",
+        "instance_id": "inst-1",
+        "dataset": None,
+    }
 
 
 async def test_verify_task_ids_no_dataset_omitted(

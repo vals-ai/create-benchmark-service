@@ -140,7 +140,7 @@ class BenchmarkServiceClient:
             ping_timeout=None,
             max_size=10 * 1024 * 1024,  # 10MB
         ) as websocket:
-            await websocket.send(request.model_dump_json(exclude_none=True))
+            await websocket.send(request.model_dump_json())
 
             async for message in websocket:
                 chunk: StreamChunk = _stream_chunk_adapter.validate_json(message)

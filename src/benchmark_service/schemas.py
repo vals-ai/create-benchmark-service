@@ -89,7 +89,7 @@ class EvaluateResponseRequest(BaseModel):
     task_id: str = Field(description="Unique identifier for the task")
     response: str | None = Field(default=None, description="The agent's response to evaluate")
     eval_resume_state: dict[str, Any] | None = Field(
-        default=None, description="Opaque benchmark-owned evaluation resume state"
+        default=None, description="Benchmark-specific evaluation progress state"
     )
     dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
 
@@ -171,7 +171,7 @@ class StreamEvalResumeStateChunk(BaseModel):
     """Streaming chunk for benchmark-owned evaluation resume state."""
 
     type: Literal["eval_resume_state"]
-    data: dict[str, Any] = Field(description="Opaque benchmark-owned evaluation resume state")
+    data: dict[str, Any] = Field(description="Benchmark-specific evaluation progress state")
 
 
 # Union type for all streaming chunks

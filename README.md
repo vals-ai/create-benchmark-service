@@ -111,6 +111,13 @@ Sandbox setup and live sandbox evaluation require three headers — `x-api-key`,
 
 `eval_resume_state` is an opaque benchmark-owned object. The tracker stores the latest value it receives and passes it back on eval-only retry; it does not inspect the shape. Use it for durable pointers such as uploaded artifacts, external job IDs, or partial check results that let the benchmark service continue evaluation without recreating the original agent sandbox.
 
+Eval-only retry flow:
+
+1. A benchmark service yields `StreamEvalResumeStateChunk` before starting failure-prone evaluation work.
+2. The tracker stores the latest `eval_resume_state` on the task row.
+3. If evaluation fails after that point, retry calls `/ws/evaluate-response` with the saved state.
+4. The benchmark service decides what the state means and streams a new result, plus any newer checkpoint state.
+
 ### Streaming protocol
 
 The WebSocket endpoints and generators communicate via four chunk types:

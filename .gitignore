@@ -8,3 +8,5 @@ __pycache__/
 
 # Environment variables
 .env
+
+src/benchmark_service/_version.py

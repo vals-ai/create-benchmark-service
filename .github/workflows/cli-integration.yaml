@@ -30,6 +30,11 @@ jobs:
           cd /tmp/cli-test
           create-benchmark-service test
 
+      - name: Point generated project at this PR's framework source
+        working-directory: /tmp/cli-test/test-benchmark-service
+        run: |
+          sed -i "s|create-benchmark-service @ git+https://github.com/vals-ai/create-benchmark-service.git@main|create-benchmark-service @ file://${GITHUB_WORKSPACE}|" pyproject.toml
+
       - name: Verify generated project installs and passes lint
         working-directory: /tmp/cli-test/test-benchmark-service
         run: |

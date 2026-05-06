@@ -1,6 +1,5 @@
 """HTTP/WebSocket client for communicating with a benchmark service."""
 
-import json
 from collections.abc import Callable
 from typing import Any
 
@@ -16,6 +15,7 @@ from tenacity import (
 )
 
 from benchmark_service.schemas import (
+    EvaluateInstanceRequest,
     EvaluateResponseRequest,
     FinalScoreResponse,
     HealthCheckResponse,
@@ -115,7 +115,7 @@ class BenchmarkServiceClient:
     async def _websocket_request(
         self,
         path: str,
-        request: BaseModel | dict[str, Any],
+        request: BaseModel,
         on_message: Callable[[str], None] | None = None,
         on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
     ) -> dict[str, Any]:
@@ -140,10 +140,7 @@ class BenchmarkServiceClient:
             ping_timeout=None,
             max_size=10 * 1024 * 1024,  # 10MB
         ) as websocket:
-            if isinstance(request, BaseModel):
-                await websocket.send(request.model_dump_json(exclude_none=True))
-            else:
-                await websocket.send(json.dumps({k: v for k, v in request.items() if v is not None}))
+            await websocket.send(request.model_dump_json(exclude_none=True))
 
             async for message in websocket:
                 chunk: StreamChunk = _stream_chunk_adapter.validate_json(message)
@@ -245,27 +242,17 @@ class BenchmarkServiceClient:
     async def evaluate_response(
         self,
         task_id: str,
-        response: str | None = None,
-        on_message: Callable[[str], None] | None = None,
+        response: str,
         dataset: str | None = None,
-        eval_resume_state: dict[str, Any] | None = None,
-        on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
     ) -> Any:
-        """Evaluate without a live sandbox.
+        """Evaluate a text response without a live sandbox.
 
         Args:
             task_id: The task to evaluate.
             response: The agent's response to evaluate.
             dataset: Optional dataset name.
-            eval_resume_state: Opaque benchmark-owned durable evaluation state.
         """
-        request = EvaluateResponseRequest(
-            task_id=task_id, response=response, dataset=dataset, eval_resume_state=eval_resume_state
-        )
-
-        if eval_resume_state is not None or on_message is not None or on_eval_resume_state is not None:
-            return await self._websocket_request("evaluate-response", request, on_message, on_eval_resume_state)
-
+        request = EvaluateResponseRequest(task_id=task_id, response=response, dataset=dataset)
         body = request.model_dump(exclude_none=True)
 
         resp = await self._http_client.post(
@@ -280,6 +267,18 @@ class BenchmarkServiceClient:
             )
 
         return resp.json()
+
+    async def resume_evaluation(
+        self,
+        task_id: str,
+        eval_resume_state: dict[str, Any],
+        on_message: Callable[[str], None] | None = None,
+        dataset: str | None = None,
+        on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
+    ) -> dict[str, Any]:
+        """Resume evaluation from state previously streamed by the benchmark service."""
+        request = EvaluateResponseRequest(task_id=task_id, eval_resume_state=eval_resume_state, dataset=dataset)
+        return await self._websocket_request("evaluate-response", request, on_message, on_eval_resume_state)
 
     async def evaluate_instance(
         self,
@@ -296,7 +295,7 @@ class BenchmarkServiceClient:
             instance_id: The instance to evaluate.
             on_message: Optional callback for intermediate progress messages.
         """
-        request = {"task_id": task_id, "instance_id": instance_id, "dataset": dataset}
+        request = EvaluateInstanceRequest(task_id=task_id, instance_id=instance_id, dataset=dataset)
         return await self._websocket_request("evaluate-instance", request, on_message, on_eval_resume_state)
 
     @_retry_http

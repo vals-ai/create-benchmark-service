@@ -172,7 +172,7 @@ async def test_final_score_with_dataset(
     )
 
 
-async def test_evaluate_response_with_eval_resume_state(
+async def test_resume_evaluation_with_eval_resume_state(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
     client, _mock_http = benchmark_client
@@ -185,7 +185,7 @@ async def test_evaluate_response_with_eval_resume_state(
     on_eval_resume_state = MagicMock()
 
     with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
-        result = await client.evaluate_response(
+        result = await client.resume_evaluation(
             "task-1",
             eval_resume_state=state,
             dataset="mydata",
@@ -356,4 +356,3 @@ async def test_ws_connection_closed_without_result(method: str, args: list[str])
     with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
         with pytest.raises(BenchmarkServiceError, match="without returning final result"):
             await getattr(client, method)(*args)
-

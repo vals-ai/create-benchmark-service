@@ -109,7 +109,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 
 Sandbox setup and live sandbox evaluation require three headers — `x-api-key`, `x-api-url`, `x-target` — used to connect to Daytona. Live evaluation accepts `{"task_id": "…", "instance_id": "…", "dataset": "…"}`. Eval-only retry uses `/ws/evaluate-response` with `{"task_id": "…", "eval_resume_state": {...}, "dataset": "…"}` and does not require Daytona headers.
 
-`eval_resume_state` is an opaque benchmark-owned object. The tracker stores the latest value it receives and passes it back on eval-only retry; it does not inspect the shape. Use it for durable pointers such as uploaded artifacts, external job IDs, or partial check results that let the benchmark service continue evaluation without recreating the original agent sandbox.
+Benchmark services can send `eval_resume_state` updates to the tracker while evaluation is running. The tracker stores the latest value and sends it back on eval-only retry, so the benchmark service can continue evaluation without recreating the original agent sandbox.
 
 Eval-only retry flow:
 
@@ -122,10 +122,12 @@ Eval-only retry flow:
 
 The WebSocket endpoints and generators communicate via four chunk types:
 
-- `message`: progress or log output.
-- `error`: failure text sent before the socket closes.
-- `eval_resume_state`: opaque durable checkpoint state. The client callback receives this chunk immediately so callers can persist it before later evaluation work fails.
-- `result`: final benchmark-specific result payload.
+```python
+StreamMessageChunk(type="message", data="log line")              # progress / log output
+StreamErrorChunk(type="error", data="error text")                # non-fatal errors
+StreamEvalResumeStateChunk(type="eval_resume_state", data={...}) # evaluation progress state
+StreamResultChunk(type="result", data=<any>)                     # final result payload
+```
 
 Yield these from your generator methods; the framework serialises and forwards them to the WebSocket client.
 
@@ -135,7 +137,7 @@ Pydantic models used across requests and responses:
 
 - **`RetrieveTaskResponse`** — `docker_image`, `problem_path`, `cwd`, `agent_timeout`, `Resources`
 - **`Resources`** — `vcpu`, `memory` (GB), `disk` (GB)
-- **`EvaluateResponseRequest`** — `task_id`, `response`, `dataset`
+- **`EvaluateResponseRequest`** — `task_id`, `response` or `eval_resume_state`, `dataset`
 - **`FinalScoreResult`** / **`FinalScoreResponse`** — `score` (float), `metadata`, `tasks_evaluated`
 - **`TaskFilter`** — `task_ids` list or `slice_str`; `parse_slice()` converts `"start:stop:step"` to a Python `slice`
 

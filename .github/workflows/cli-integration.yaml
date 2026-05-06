@@ -22,7 +22,7 @@ jobs:
         run: uv build --wheel
 
       - name: Install CLI from wheel
-        run: uv tool install --prerelease=allow dist/*.whl
+        run: uv tool install dist/*.whl
 
       - name: Run create-benchmark-service from a clean directory
         run: |

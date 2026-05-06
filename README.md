@@ -122,12 +122,10 @@ Eval-only retry flow:
 
 The WebSocket endpoints and generators communicate via four chunk types:
 
-```python
-StreamMessageChunk(type="message", data="log line")                   # progress / log output
-StreamErrorChunk(type="error", data="error text")                     # non-fatal errors
-StreamEvalResumeStateChunk(type="eval_resume_state", data=<dict>)     # durable eval resume state
-StreamResultChunk(type="result", data=<any>)                          # final result payload
-```
+- `message`: progress or log output.
+- `error`: failure text sent before the socket closes.
+- `eval_resume_state`: opaque durable checkpoint state. The client callback receives this chunk immediately so callers can persist it before later evaluation work fails.
+- `result`: final benchmark-specific result payload.
 
 Yield these from your generator methods; the framework serialises and forwards them to the WebSocket client.
 

@@ -17,6 +17,7 @@ from benchmark_service.schemas import (
     FinalScoreResult,
     RetrieveTaskResponse,
     StreamChunk,
+    StreamResultChunk,
     TaskFilter,
 )
 
@@ -206,6 +207,13 @@ class BenchmarkService(ABC):
             Your benchmark-specific evaluation result (dict, Pydantic model, etc.)
         """
         ...
+
+    async def stream_evaluate_response(
+        self, request: EvaluateResponseRequest, dataset: str | None = None
+    ) -> AsyncGenerator[StreamChunk, None]:
+        """Evaluate without a sandbox and stream the result."""
+        result = await self.evaluate_response(request, dataset=dataset)
+        yield StreamResultChunk(type="result", data=result)
 
     @abstractmethod
     def evaluate_instance(

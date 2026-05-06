@@ -96,7 +96,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | `GET` | `/health` | Returns `{"status": "ok"}` |
 | `GET` | `/verify-task-ids` | Return task IDs filtered by `?task_ids=…` or `?slice=start:stop:step` (optional `?dataset=…`) |
 | `GET` | `/retrieve-task/?task_id=…` | Return task metadata for a given task ID (optional `?dataset=…`) |
-| `POST` | `/evaluate-response/` | Evaluate a text response: `{"task_id": "…", "response": "…", "dataset": "…"}` |
+| `POST` | `/evaluate-response/` | Evaluate without a sandbox and return one final response |
 | `POST` | `/final-score/` | Aggregate results: `{"evaluation_results": {task_id: result, …}, "dataset": "…"}` |
 
 **WebSocket endpoints** (stream `StreamChunk` JSON objects):
@@ -104,18 +104,29 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | Path | Description |
 |------|-------------|
 | `/ws/setup-task` | Set up a task in a sandbox; streams progress, errors, and a final result |
-| `/ws/evaluate-instance` | Evaluate a solution in a sandbox; streams progress, errors, and a final result |
+| `/ws/evaluate-response` | Evaluate without a sandbox; streams progress, checkpoint state, errors, and a final result |
+| `/ws/evaluate-instance` | Evaluate a live sandbox solution; streams progress, errors, and a final result |
 
-Both WebSocket endpoints require three headers — `x-api-key`, `x-api-url`, `x-target` — used to connect to the Daytona sandbox, and accept a JSON body of `{"task_id": "…", "instance_id": "…", "dataset": "…"}` (dataset is optional, defaults to `"default"`).
+Sandbox setup and live sandbox evaluation require three headers — `x-api-key`, `x-api-url`, `x-target` — used to connect to Daytona. Live evaluation accepts `{"task_id": "…", "instance_id": "…", "dataset": "…"}`. Eval-only retry uses `/ws/evaluate-response` with `{"task_id": "…", "eval_resume_state": {...}, "dataset": "…"}` and does not require Daytona headers.
+
+Benchmark services can send `eval_resume_state` updates to the tracker while evaluation is running. The tracker stores the latest value and sends it back on eval-only retry, so the benchmark service can continue evaluation without recreating the original agent sandbox.
+
+Eval-only retry flow:
+
+1. A benchmark service yields `StreamEvalResumeStateChunk` before starting failure-prone evaluation work.
+2. The tracker stores the latest `eval_resume_state` on the task row.
+3. If evaluation fails after that point, retry calls `/ws/evaluate-response` with the saved state.
+4. The benchmark service decides what the state means and streams a new result, plus any newer checkpoint state.
 
 ### Streaming protocol
 
-The WebSocket endpoints and the `setup_task` / `evaluate_instance` generators communicate via three chunk types:
+The WebSocket endpoints and generators communicate via four chunk types:
 
 ```python
-StreamMessageChunk(type="message", data="log line")     # progress / log output
-StreamErrorChunk(type="error",   data="error text")     # non-fatal errors
-StreamResultChunk(type="result", data=<any>)            # final result payload
+StreamMessageChunk(type="message", data="log line")              # progress / log output
+StreamErrorChunk(type="error", data="error text")                # non-fatal errors
+StreamEvalResumeStateChunk(type="eval_resume_state", data={...}) # evaluation progress state
+StreamResultChunk(type="result", data=<any>)                     # final result payload
 ```
 
 Yield these from your generator methods; the framework serialises and forwards them to the WebSocket client.
@@ -126,7 +137,7 @@ Pydantic models used across requests and responses:
 
 - **`RetrieveTaskResponse`** — `docker_image`, `problem_path`, `cwd`, `agent_timeout`, `Resources`
 - **`Resources`** — `vcpu`, `memory` (GB), `disk` (GB)
-- **`EvaluateResponseRequest`** — `task_id`, `response`, `dataset`
+- **`EvaluateResponseRequest`** — `task_id`, `response` or `eval_resume_state`, `dataset`
 - **`FinalScoreResult`** / **`FinalScoreResponse`** — `score` (float), `metadata`, `tasks_evaluated`
 - **`TaskFilter`** — `task_ids` list or `slice_str`; `parse_slice()` converts `"start:stop:step"` to a Python `slice`
 

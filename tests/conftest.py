@@ -54,6 +54,10 @@ class StubBenchmark(BenchmarkService):
     ) -> AsyncGenerator[StreamChunk, None]: ...  # type: ignore[return]
 
     async def evaluate_response(self, request: EvaluateResponseRequest, dataset: str | None = None) -> Any:
+        if request.eval_resume_state is not None:
+            return {"task_id": request.task_id, "state": request.eval_resume_state}
+
+        assert request.response is not None
         ds = self.get_dataset(dataset)
         task = ds[request.task_id]
         return {"resolved": request.response == task["answer"]}

@@ -2,7 +2,7 @@
 
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class TaskFilter(BaseModel):
@@ -80,24 +80,28 @@ class SetupTaskResponse(BaseModel):
 
 class EvaluateResponseRequest(BaseModel):
     """
-    Request to evaluate a text response (not in a sandbox).
+    Request to evaluate without a live sandbox.
 
-    Use this for benchmarks where you can evaluate a text response directly,
-    without needing to execute code or run tests.
+    Use this for benchmarks where evaluation can run from a text response or
+    benchmark-owned durable resume state.
     """
 
     task_id: str = Field(description="Unique identifier for the task")
-    response: str = Field(description="The agent's response to evaluate")
+    response: str | None = Field(default=None, description="The agent's response to evaluate")
+    eval_resume_state: dict[str, Any] | None = Field(
+        default=None, description="Benchmark-specific evaluation progress state"
+    )
     dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
+
+    @model_validator(mode="after")
+    def require_one_eval_input(self) -> "EvaluateResponseRequest":
+        if (self.response is None) == (self.eval_resume_state is None):
+            raise ValueError("Exactly one of response or eval_resume_state is required")
+        return self
 
 
 class EvaluateInstanceRequest(BaseModel):
-    """
-    Request to evaluate an instance in a sandbox environment.
-
-    Use this for benchmarks where you need to execute code, run tests,
-    or otherwise interact with a sandbox to evaluate the solution.
-    """
+    """Request to evaluate a task instance in a sandbox."""
 
     task_id: str = Field(description="Unique identifier for the task")
     instance_id: str = Field(description="Sandbox instance where the solution was implemented")
@@ -163,5 +167,12 @@ class StreamErrorChunk(BaseModel):
     data: str = Field(description="Error message")
 
 
+class StreamEvalResumeStateChunk(BaseModel):
+    """Streaming chunk for benchmark-owned evaluation resume state."""
+
+    type: Literal["eval_resume_state"]
+    data: dict[str, Any] = Field(description="Benchmark-specific evaluation progress state")
+
+
 # Union type for all streaming chunks
-StreamChunk = StreamMessageChunk | StreamResultChunk | StreamErrorChunk
+StreamChunk = StreamMessageChunk | StreamResultChunk | StreamErrorChunk | StreamEvalResumeStateChunk

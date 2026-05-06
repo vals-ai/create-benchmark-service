@@ -6,7 +6,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 
 dependencies = [
-    "daytona>=0.161.0",
+    "daytona==0.172.1a1",
     "fastapi[standard]>=0.135.3",
     "click>=8.3.2",
     "jinja2>=3.1.6",
@@ -44,6 +44,9 @@ packages = ["src/benchmark_service", "cli"]
 ".python-version" = ".python-version"
 "Makefile" = "Makefile"
 "templates" = "templates"
+
+[tool.uv]
+prerelease = "allow"
 
 [tool.ruff]
 line-length = 120

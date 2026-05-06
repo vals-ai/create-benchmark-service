@@ -21,11 +21,6 @@ dependencies = [
 [project.scripts]
 create-benchmark-service = "cli.cli:main"
 
-[project.urls]
-Homepage = "https://github.com/vals-ai/create-benchmark-service"
-Repository = "https://github.com/vals-ai/create-benchmark-service"
-Issues = "https://github.com/vals-ai/create-benchmark-service/issues"
-
 [dependency-groups]
 dev = [
     "basedpyright>=1.39.0",

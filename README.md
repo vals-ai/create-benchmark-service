@@ -5,13 +5,7 @@ CLI tool to scaffold benchmark services.
 ## Installation
 
 ```bash
-uv tool install create-benchmark-service
-```
-
-For a reproducible CLI install, pin a published version:
-
-```bash
-uv tool install create-benchmark-service==X.Y.Z
+uv tool install git+ssh://git@github.com/vals-ai/create-benchmark-service.git@main
 ```
 
 ## Usage
@@ -31,7 +25,7 @@ Creates a new service in `./<benchmark-name>-benchmark-service/` in your current
 │   └── {benchmark_package}/   # Benchmark-specific utilities
 ├── tests/                     # Tests
 ├── .github/workflows/         # CI/CD (test, lint, typecheck)
-├── pyproject.toml             # Dependencies, including the pinned framework version
+├── pyproject.toml             # Dependencies
 ├── Dockerfile                 # Container image
 ├── Makefile                   # Commands
 ├── README.md                  # Documentation
@@ -100,7 +94,6 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Returns `{"status": "ok"}` |
-| `GET` | `/version` | Returns the framework version and best-effort deployed service package metadata |
 | `GET` | `/verify-task-ids` | Return task IDs filtered by `?task_ids=…` or `?slice=start:stop:step` (optional `?dataset=…`) |
 | `GET` | `/retrieve-task/?task_id=…` | Return task metadata for a given task ID (optional `?dataset=…`) |
 | `POST` | `/evaluate-response/` | Evaluate without a sandbox and return one final response |

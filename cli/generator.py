@@ -10,28 +10,26 @@ import benchmark_service
 from jinja2 import Environment, FileSystemLoader
 
 
+_FRAMEWORK_REPO_URL = "https://github.com/vals-ai/create-benchmark-service.git"
 _CLEAN_SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
-_FRAMEWORK_PACKAGE_NAME = "create-benchmark-service"
-_DEV_VERSION_DEPENDENCY = f"{_FRAMEWORK_PACKAGE_NAME}>=0.0.0"
 
 
-def _resolve_framework_dependency(version: str) -> str:
-    """Map a benchmark_service.__version__ string to a PyPI dependency for scaffolded projects.
+def _resolve_framework_ref(version: str) -> str:
+    """Map a benchmark_service.__version__ string to a git ref for scaffolded pyproject.toml.
 
-    Clean semver (e.g. "1.2.3") becomes an exact package pin. Dev / local versions fall
-    back to an unpinned PyPI dependency with a printed warning, since they do not map to
-    a published PyPI release.
+    Clean semver (e.g. "1.2.3") becomes "v1.2.3". Dev / local versions fall back to "main"
+    with a printed warning, since they aren't valid git refs.
     """
     if _CLEAN_SEMVER_RE.match(version):
-        return f"{_FRAMEWORK_PACKAGE_NAME}=={version}"
+        return f"v{version}"
     print(
-        f"Warning: create-benchmark-service was installed from a version that is not a PyPI release "
-        f"(version={version!r}). Falling back to '{_DEV_VERSION_DEPENDENCY}' for the scaffolded dependency. "
-        f"For reproducible scaffolds, install the CLI from PyPI: "
-        f"uv tool install {_FRAMEWORK_PACKAGE_NAME}==X.Y.Z",
+        f"Warning: create-benchmark-service was installed from a non-tagged commit "
+        f"(version={version!r}). Falling back to '@main' for the scaffolded pin. "
+        f"For reproducible scaffolds, reinstall the CLI from a tag: "
+        f"uv tool install git+{_FRAMEWORK_REPO_URL}@vX.Y.Z",
         file=sys.stderr,
     )
-    return _DEV_VERSION_DEPENDENCY
+    return "main"
 
 
 class BenchmarkNames(TypedDict):
@@ -154,10 +152,11 @@ def generate_project(
         "README.md.jinja": "README.md",
     }
 
-    framework_dependency = _resolve_framework_dependency(benchmark_service.__version__)
+    framework_ref = _resolve_framework_ref(benchmark_service.__version__)
     template_context = {
         **names,
-        "framework_dependency": framework_dependency,
+        "framework_ref": framework_ref,
+        "framework_repo_url": _FRAMEWORK_REPO_URL,
     }
 
     for template_name, output_name in template_files.items():
@@ -173,7 +172,6 @@ def generate_project(
             "auto-tag-release.yaml",
             "check-pr-title.yaml",
             "cli-integration.yaml",
-            "publish-pypi.yaml",
         ),
     )
 

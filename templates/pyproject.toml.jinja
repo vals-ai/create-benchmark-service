@@ -5,7 +5,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 
 dependencies = [
-    "{{ framework_dependency }}",
+    "create-benchmark-service @ git+{{ framework_repo_url }}@{{ framework_ref }}",
 ]
 
 [dependency-groups]
@@ -22,6 +22,9 @@ build-backend = "hatchling.build"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/{{ benchmark_package }}"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [tool.ruff]
 line-length = 120

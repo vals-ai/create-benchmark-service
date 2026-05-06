@@ -26,6 +26,9 @@ packages = ["src/{{ benchmark_package }}"]
 [tool.hatch.metadata]
 allow-direct-references = true
 
+[tool.uv]
+prerelease = "allow"
+
 [tool.ruff]
 line-length = 120
 target-version = "py312"

@@ -4,6 +4,8 @@
 
 This repo uses semantic versioning. The framework version is derived from git tags via `hatch-vcs` and exposed at runtime as `benchmark_service.__version__` and via the `GET /version` endpoint on every service.
 
+While the major version is `0`, treat minor bumps as potentially breaking. Once we ship `1.0.0`, normal semver compatibility expectations apply.
+
 ### PR title bump tags
 
 Every PR targeting `main` must include one of `#patch`, `#minor`, or `#major` in its title. This is enforced by `.github/workflows/check-pr-title.yaml`; PRs without a bump tag fail before merge.

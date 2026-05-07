@@ -133,7 +133,6 @@ def generate_project(
     # Files to copy from root
     files_to_copy = [
         "Makefile",
-        ".gitignore",
         ".python-version",
     ]
 
@@ -144,6 +143,8 @@ def generate_project(
     # Set up Jinja2 environment
     templates_dir = root / "templates"
     env = Environment(loader=FileSystemLoader(templates_dir))
+
+    copy_file(templates_dir / ".gitignore.scaffold", output_dir / ".gitignore")
 
     # Render Jinja2 templates
     template_files = {

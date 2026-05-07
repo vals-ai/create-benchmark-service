@@ -144,6 +144,17 @@ def test_generated_project_excludes_framework_versioning_workflows(tmp_path: Pat
     assert not (workflows_dir / "check-pr-title.yaml").exists()
 
 
+def test_generated_gitignore_excludes_framework_only_entries(tmp_path: Path) -> None:
+    output_dir = tmp_path / "swebench-benchmark-service"
+    generate_project("swebench", output_dir)
+
+    gitignore = (output_dir / ".gitignore").read_text()
+    assert "__pycache__/" in gitignore
+    assert ".venv/" in gitignore
+    assert ".env" in gitignore
+    assert "src/benchmark_service/_version.py" not in gitignore
+
+
 def test_fails_if_directory_exists() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         output_dir = Path(tmpdir) / "swebench-benchmark-service"

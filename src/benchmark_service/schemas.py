@@ -146,6 +146,14 @@ class HealthCheckResponse(BaseModel):
     status: str = Field(description="Status of the service ('ok' if running)")
 
 
+class VersionResponse(BaseModel):
+    """Response for GET /version reporting framework + deployed-service version."""
+
+    framework_version: str
+    service_name: str | None = None
+    service_version: str | None = None
+
+
 class StreamMessageChunk(BaseModel):
     """Streaming chunk for log messages and progress updates."""
 

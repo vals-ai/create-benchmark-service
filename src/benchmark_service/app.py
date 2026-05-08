@@ -1,5 +1,6 @@
 """FastAPI application for benchmark services."""
 
+import importlib.metadata
 import logging
 import traceback
 from collections.abc import AsyncGenerator
@@ -13,6 +14,7 @@ from starlette.websockets import WebSocketDisconnect
 from uvicorn.protocols.utils import ClientDisconnected
 from websockets.exceptions import ConnectionClosed
 
+from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import get_auth_settings, load_allowlist
 from benchmark_service.base import BenchmarkService
 from benchmark_service.schemas import (
@@ -26,6 +28,7 @@ from benchmark_service.schemas import (
     StreamErrorChunk,
     TaskFilter,
     VerifyTaskIdsResponse,
+    VersionResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -39,12 +42,34 @@ async def send_json_if_connected(websocket: WebSocket, payload: dict[str, Any]) 
         return False
 
 
+_PUBLIC_PATHS = frozenset({"/health", "/version"})
+
+
+def _get_service_metadata(service_cls: type[BenchmarkService]) -> tuple[str | None, str | None]:
+    """Resolve (distribution_name, version) for the installed package containing service_cls.
+
+    Returns (None, None) when the subclass's top-level module does not map to an installed
+    distribution (e.g., running from source, or defined inline in main.py).
+    """
+    top_level_pkg = service_cls.__module__.split(".")[0]
+    distributions = importlib.metadata.packages_distributions().get(top_level_pkg, [])
+    if not distributions:
+        return None, None
+    dist_name = distributions[0]
+    try:
+        return dist_name, importlib.metadata.version(dist_name)
+    except importlib.metadata.PackageNotFoundError:
+        return None, None
+
+
 class BenchmarkServiceApp(FastAPI):
     """FastAPI application backed by a BenchmarkService subclass."""
 
     service: BenchmarkService
 
     def __init__(self, service_cls: type[BenchmarkService]) -> None:
+        self._service_name, self._service_version = _get_service_metadata(service_cls)
+
         @asynccontextmanager
         async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
             if get_auth_settings().auth_required:
@@ -58,7 +83,7 @@ class BenchmarkServiceApp(FastAPI):
     def _register_routes(self) -> None:
         @self.middleware("http")
         async def _check_auth(request: Request, call_next):  # type: ignore[no-untyped-def]
-            if request.url.path == "/health":
+            if request.url.path in _PUBLIC_PATHS:
                 return await call_next(request)  # type: ignore[reportUnknownVariableType]
             tenant = await self.service.resolve_tenant(dict(request.headers))
             if tenant is None:
@@ -69,6 +94,7 @@ class BenchmarkServiceApp(FastAPI):
         self.add_exception_handler(ValueError, self._value_error_handler)
         self.add_exception_handler(Exception, self._exception_handler)
         self.add_api_route("/health", self._health_check, methods=["GET"])
+        self.add_api_route("/version", self._version, methods=["GET"])
         self.add_api_route("/verify-task-ids", self._verify_task_ids, methods=["GET"])
         self.add_api_route("/retrieve-task/", self._retrieve_task, methods=["GET"])
         self.add_api_websocket_route("/ws/setup-task", self._setup_task)
@@ -87,6 +113,13 @@ class BenchmarkServiceApp(FastAPI):
 
     async def _health_check(self) -> HealthCheckResponse:
         return HealthCheckResponse(status="ok")
+
+    async def _version(self) -> VersionResponse:
+        return VersionResponse(
+            framework_version=_framework_version,
+            service_name=self._service_name,
+            service_version=self._service_version,
+        )
 
     async def _authorize_websocket(self, websocket: WebSocket) -> str | None:
         """Authenticate a WebSocket caller. Returns tenant id, or None after closing 1008."""

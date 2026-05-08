@@ -59,10 +59,12 @@ class InflightMiddleware:
 
         await self._ensure_emitter()
         self._inflight += 1
+        self._emit_once()
         try:
             await self.app(scope, receive, send)
         finally:
             self._inflight -= 1
+            self._emit_once()
 
     async def _ensure_emitter(self) -> None:
         if self._emitter_task is None:

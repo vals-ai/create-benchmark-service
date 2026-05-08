@@ -46,7 +46,6 @@ packages = ["src/benchmark_service", "cli"]
 
 [tool.hatch.build.targets.wheel.force-include]
 ".github" = ".github"
-".gitignore" = ".gitignore"
 ".python-version" = ".python-version"
 "Makefile" = "Makefile"
 "templates" = "templates"

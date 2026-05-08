@@ -219,6 +219,28 @@ async def test_websocket_request_includes_null_optional_fields() -> None:
     }
 
 
+async def test_websocket_request_uses_keepalive_and_open_timeout() -> None:
+    """Client must enable keepalive pings and use a generous open_timeout.
+
+    Without ping_interval / ping_timeout the client never detects half-open
+    connections, so a hung websocket inside `evaluate_instance` would hold
+    the per-benchmark concurrency slot indefinitely. open_timeout must be
+    large enough to absorb a saturated benchmark service (e.g. fresh deploy
+    or a burst of concurrent connections).
+    """
+    messages = [json.dumps({"type": "result", "data": {"status": "ok"}})]
+    mock_connect = _ws_mock(messages)
+
+    client = _make_client()
+    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect) as connect:
+        await client.setup_task("task-1", "inst-1")
+
+    kwargs = connect.call_args.kwargs
+    assert kwargs["open_timeout"] >= 120
+    assert kwargs["ping_interval"] is not None and kwargs["ping_interval"] > 0
+    assert kwargs["ping_timeout"] is not None and kwargs["ping_timeout"] > 0
+
+
 async def test_verify_task_ids_no_dataset_omitted(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:

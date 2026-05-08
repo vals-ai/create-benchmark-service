@@ -6,7 +6,30 @@ import sys
 from pathlib import Path
 from typing import TypedDict
 
+import benchmark_service
 from jinja2 import Environment, FileSystemLoader
+
+
+_FRAMEWORK_REPO_URL = "https://github.com/vals-ai/create-benchmark-service.git"
+_CLEAN_SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
+
+
+def _resolve_framework_ref(version: str) -> str:
+    """Map a benchmark_service.__version__ string to a git ref for scaffolded pyproject.toml.
+
+    Clean semver (e.g. "1.2.3") becomes "v1.2.3". Dev / local versions fall back to "main"
+    with a printed warning, since they aren't valid git refs.
+    """
+    if _CLEAN_SEMVER_RE.match(version):
+        return f"v{version}"
+    print(
+        f"Warning: create-benchmark-service was installed from a non-tagged commit "
+        f"(version={version!r}). Falling back to '@main' for the scaffolded pin. "
+        f"For reproducible scaffolds, reinstall the CLI from a tag: "
+        f"uv tool install git+{_FRAMEWORK_REPO_URL}@vX.Y.Z",
+        file=sys.stderr,
+    )
+    return "main"
 
 
 class BenchmarkNames(TypedDict):
@@ -110,7 +133,6 @@ def generate_project(
     # Files to copy from root
     files_to_copy = [
         "Makefile",
-        ".gitignore",
         ".python-version",
     ]
 
@@ -122,6 +144,8 @@ def generate_project(
     templates_dir = root / "templates"
     env = Environment(loader=FileSystemLoader(templates_dir))
 
+    copy_file(templates_dir / ".gitignore.scaffold", output_dir / ".gitignore")
+
     # Render Jinja2 templates
     template_files = {
         "main.py.jinja": "main.py",
@@ -129,16 +153,27 @@ def generate_project(
         "README.md.jinja": "README.md",
     }
 
+    framework_ref = _resolve_framework_ref(benchmark_service.__version__)
+    template_context = {
+        **names,
+        "framework_ref": framework_ref,
+        "framework_repo_url": _FRAMEWORK_REPO_URL,
+    }
+
     for template_name, output_name in template_files.items():
         template = env.get_template(template_name)
-        content = template.render(names)
+        content = template.render(template_context)
         (output_dir / output_name).write_text(content)
 
-    # Copy .github directory, excluding CLI-specific workflows
+    # Copy .github directory, excluding framework maintenance workflows
     shutil.copytree(
         root / ".github",
         output_dir / ".github",
-        ignore=shutil.ignore_patterns("cli-integration.yaml"),
+        ignore=shutil.ignore_patterns(
+            "auto-tag-release.yaml",
+            "check-pr-title.yaml",
+            "cli-integration.yaml",
+        ),
     )
 
     # Create empty tests directory

@@ -5,7 +5,14 @@ from pathlib import Path
 
 import pytest
 
-from cli.generator import BenchmarkNames, generate_project, transform_name, validate_name
+import benchmark_service
+from cli.generator import (
+    BenchmarkNames,
+    _resolve_framework_ref,  # pyright: ignore[reportPrivateUsage]
+    generate_project,
+    transform_name,
+    validate_name,
+)
 
 
 @pytest.mark.parametrize(
@@ -42,6 +49,18 @@ def test_invalid_names(name: str, error_match: str) -> None:
         validate_name(name)
 
 
+def test_resolve_framework_ref_clean_semver() -> None:
+    assert _resolve_framework_ref("1.0.0") == "v1.0.0"
+    assert _resolve_framework_ref("1.2.3") == "v1.2.3"
+
+
+def test_resolve_framework_ref_dev_version_falls_back_to_main(capsys: pytest.CaptureFixture[str]) -> None:
+    assert _resolve_framework_ref("1.0.1.dev3+gabc1234") == "main"
+    captured = capsys.readouterr()
+    assert "warning" in captured.err.lower()
+    assert captured.out == ""
+
+
 @pytest.mark.parametrize(
     ("benchmark_name", "expected_package", "expected_project_name", "expected_readme_title"),
     [
@@ -71,6 +90,27 @@ def test_template_rendering(
         assert expected_readme_title in readme_content
 
 
+def test_generated_pyproject_pins_to_tag_for_clean_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(benchmark_service, "__version__", "1.0.0")
+    output_dir = tmp_path / "demo-benchmark-service"
+    generate_project(benchmark_name="demo", output_dir=output_dir)
+    pyproject = (output_dir / "pyproject.toml").read_text()
+    assert "create-benchmark-service.git@v1.0.0" in pyproject
+    assert "@main" not in pyproject
+
+
+def test_generated_pyproject_falls_back_to_main_for_dev_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(benchmark_service, "__version__", "1.0.1.dev3+gabc1234")
+    output_dir = tmp_path / "demo-benchmark-service"
+    generate_project(benchmark_name="demo", output_dir=output_dir)
+    pyproject = (output_dir / "pyproject.toml").read_text()
+    assert "create-benchmark-service.git@main" in pyproject
+
+
 def test_generates_project_structure() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         output_dir = Path(tmpdir) / "swebench-benchmark-service"
@@ -89,6 +129,30 @@ def test_generates_project_structure() -> None:
         assert (output_dir / "src" / "swebench_benchmark_service" / "benchmark_service.py").exists()
         assert (output_dir / "tests").is_dir()
         assert (output_dir / ".github" / "workflows").is_dir()
+
+
+def test_generated_project_excludes_framework_versioning_workflows(tmp_path: Path) -> None:
+    output_dir = tmp_path / "swebench-benchmark-service"
+    generate_project("swebench", output_dir)
+
+    workflows_dir = output_dir / ".github" / "workflows"
+    assert (workflows_dir / "test.yaml").exists()
+    assert (workflows_dir / "style.yaml").exists()
+    assert (workflows_dir / "typecheck.yaml").exists()
+    assert not (workflows_dir / "cli-integration.yaml").exists()
+    assert not (workflows_dir / "auto-tag-release.yaml").exists()
+    assert not (workflows_dir / "check-pr-title.yaml").exists()
+
+
+def test_generated_gitignore_excludes_framework_only_entries(tmp_path: Path) -> None:
+    output_dir = tmp_path / "swebench-benchmark-service"
+    generate_project("swebench", output_dir)
+
+    gitignore = (output_dir / ".gitignore").read_text()
+    assert "__pycache__/" in gitignore
+    assert ".venv/" in gitignore
+    assert ".env" in gitignore
+    assert "src/benchmark_service/_version.py" not in gitignore
 
 
 def test_fails_if_directory_exists() -> None:

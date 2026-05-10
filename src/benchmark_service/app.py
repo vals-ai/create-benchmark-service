@@ -2,6 +2,7 @@
 
 import importlib.metadata
 import logging
+import os
 import traceback
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
@@ -17,6 +18,7 @@ from websockets.exceptions import ConnectionClosed
 from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import get_auth_settings, load_allowlist
 from benchmark_service.base import BenchmarkService
+from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.schemas import (
     EvaluateInstanceRequest,
     EvaluateResponseRequest,
@@ -78,6 +80,8 @@ class BenchmarkServiceApp(FastAPI):
             yield
 
         super().__init__(title=service_cls.__name__, lifespan=lifespan)
+        service_name = os.getenv("SERVICE_NAME", service_cls.__name__)
+        self.add_middleware(InflightMiddleware, service_name=service_name)
         self._register_routes()
 
     def _register_routes(self) -> None:

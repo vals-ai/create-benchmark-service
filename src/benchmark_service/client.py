@@ -53,6 +53,24 @@ class BenchmarkServiceError(Exception):
     pass
 
 
+class BenchmarkServiceUnauthenticatedError(BenchmarkServiceError):
+    """Exception raised when the benchmark service returns 401 — credentials are missing or invalid."""
+
+    def __str__(self) -> str:
+        return "Authentication failed: " + super().__str__()
+
+
+def _unauthenticated_error(response: httpx.Response) -> "BenchmarkServiceUnauthenticatedError":
+    """Parse the value from the httpx response"""
+
+    try:
+        detail = response.json().get("detail", response.text)
+    except Exception:
+        detail = response.text
+
+    return BenchmarkServiceUnauthenticatedError(detail)
+
+
 class BenchmarkServiceClient:
     """HTTP/WebSocket client for communicating with a benchmark service."""
 
@@ -164,6 +182,9 @@ class BenchmarkServiceClient:
         """Check if the benchmark service is healthy."""
         response = await self._http_client.get(f"{self._url}/health")
 
+        if response.status_code == 401:
+            raise _unauthenticated_error(response)
+
         if response.status_code != 200:
             raise BenchmarkServiceError(
                 f"Health check failed with status code {response.status_code}, response: {response.text}"
@@ -191,6 +212,9 @@ class BenchmarkServiceClient:
 
         response = await self._http_client.get(f"{self._url}/verify-task-ids", params=params)
 
+        if response.status_code == 401:
+            raise _unauthenticated_error(response)
+
         if response.status_code != 200:
             raise BenchmarkServiceError(
                 f"Verify task ids failed with status code {response.status_code}, response: {response.text}"
@@ -212,6 +236,9 @@ class BenchmarkServiceClient:
         if dataset is not None:
             params["dataset"] = dataset
         response = await self._http_client.get(f"{self._url}/retrieve-task/", params=params)
+
+        if response.status_code == 401:
+            raise _unauthenticated_error(response)
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
@@ -260,6 +287,9 @@ class BenchmarkServiceClient:
             json=body,
             timeout=self._timeout,
         )
+
+        if resp.status_code == 401:
+            raise _unauthenticated_error(resp)
 
         if resp.status_code != 200:
             raise BenchmarkServiceError(
@@ -313,6 +343,9 @@ class BenchmarkServiceClient:
             f"{self._url}/final-score/",
             json=body,
         )
+
+        if response.status_code == 401:
+            raise _unauthenticated_error(response)
 
         if response.status_code != 200:
             raise BenchmarkServiceError(

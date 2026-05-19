@@ -62,7 +62,7 @@ def test_retrieve_task(client: TestClient) -> None:
     assert response.status_code == 200
     data = response.json()
     assert data["problem_path"] == "/tmp/problem_statement.txt"
-    assert data["source"] == {"type": "image", "image": "python:3.12-slim"}
+    assert data["docker_image"] == "python:3.12-slim"
 
 
 def test_retrieve_task_invalid(client: TestClient) -> None:

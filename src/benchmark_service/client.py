@@ -57,7 +57,7 @@ class BenchmarkServiceUnauthenticatedError(BenchmarkServiceError):
     """Exception raised when the benchmark service returns 401 — credentials are missing or invalid."""
 
     def __str__(self) -> str:
-        return "Requested resource could not be found: " + super().__str__()
+        return "Authentication failed: " + super().__str__()
 
 
 def _unauthenticated_error(response: httpx.Response) -> "BenchmarkServiceUnauthenticatedError":

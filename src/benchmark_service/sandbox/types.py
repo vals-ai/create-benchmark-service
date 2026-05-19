@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, Callable
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, Field
+from pydantic import AliasChoices, BaseModel, Field
 
 
 class ImageSource(BaseModel):
@@ -21,9 +21,9 @@ SandboxSource = Annotated[ImageSource | SnapshotSource, Field(discriminator="typ
 
 
 class Resources(BaseModel):
-    cpu: int = Field(description="Logical sandbox CPU count")
-    memory_gb: int = Field(description="Sandbox memory in GB")
-    disk_gb: int = Field(description="Sandbox ephemeral disk in GB")
+    cpu: int = Field(description="Logical sandbox CPU count", validation_alias=AliasChoices("cpu", "vcpu"))
+    memory_gb: int = Field(description="Sandbox memory in GB", validation_alias=AliasChoices("memory_gb", "memory"))
+    disk_gb: int = Field(description="Sandbox ephemeral disk in GB", validation_alias=AliasChoices("disk_gb", "disk"))
 
 
 class SandboxCreateRequest(BaseModel):

@@ -1,6 +1,6 @@
 """Request and response models for the benchmark service API."""
 
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -56,6 +56,16 @@ class RetrieveTaskResponse(BaseModel):
         default=None, description="Agent execution max time in seconds (None for no timeout)"
     )
     resources: Resources = Field(description="Computational resources needed")
+
+    @model_validator(mode="before")
+    @classmethod
+    def parse_legacy_fields(cls, data: object) -> object:
+        if not isinstance(data, dict):
+            return data
+        legacy = cast(dict[str, Any], data)
+        if "docker_image" not in legacy:
+            return legacy
+        return {**legacy, "source": {"type": "image", "image": legacy["docker_image"]}}
 
 
 class SetupTaskRequest(BaseModel):

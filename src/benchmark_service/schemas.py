@@ -4,6 +4,8 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+from benchmark_service.sandbox.types import Resources, SandboxSource
+
 
 class TaskFilter(BaseModel):
     """Filter for selecting tasks from your benchmark dataset."""
@@ -38,14 +40,6 @@ class VerifyTaskIdsResponse(BaseModel):
     task_ids: list[str] = Field(description="List of verified task IDs that exist in the benchmark")
 
 
-class Resources(BaseModel):
-    """Computational resources required to run a task."""
-
-    vcpu: int = Field(description="Number of vCPUs required")
-    memory: int = Field(description="Memory in GB")
-    disk: int = Field(description="Disk space in GB")
-
-
 class RetrieveTaskResponse(BaseModel):
     """
     Response containing task metadata and setup requirements.
@@ -53,7 +47,7 @@ class RetrieveTaskResponse(BaseModel):
     Customize fields based on what your benchmark tasks need.
     """
 
-    docker_image: str = Field(description="Docker image name or path")
+    source: SandboxSource = Field(description="Sandbox source image or snapshot")
     problem_path: str = Field(
         description="Path inside the sandbox where the problem statement file will be written during setup"
     )

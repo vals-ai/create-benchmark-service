@@ -8,7 +8,6 @@ from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
 from typing import Any
 
-from daytona import AsyncDaytona, DaytonaConfig
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.responses import JSONResponse
 from starlette.websockets import WebSocketDisconnect
@@ -19,6 +18,7 @@ from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import get_auth_settings, load_allowlist
 from benchmark_service.base import BenchmarkService
 from benchmark_service.inflight import InflightMiddleware
+from benchmark_service.sandbox import MissingSandboxConfigError, create_provider, sandbox_config_from_headers
 from benchmark_service.schemas import (
     EvaluateInstanceRequest,
     EvaluateResponseRequest,
@@ -175,12 +175,10 @@ class BenchmarkServiceApp(FastAPI):
             if tenant is None:
                 return
 
-            api_key = websocket.headers.get("x-api-key")
-            api_url = websocket.headers.get("x-api-url")
-            target = websocket.headers.get("x-target")
-
-            if not api_key or not api_url or not target:
-                await websocket.close(code=1008, reason="Missing required headers: x-api-key, x-api-url, x-target")
+            try:
+                sandbox_config = sandbox_config_from_headers(websocket.headers)
+            except MissingSandboxConfigError as e:
+                await websocket.close(code=1008, reason=str(e))
                 return
 
             data = await websocket.receive_json()
@@ -190,10 +188,8 @@ class BenchmarkServiceApp(FastAPI):
                 await websocket.close(code=1008, reason="Dataset not allowed")
                 return
 
-            daytona_config = DaytonaConfig(api_key=api_key, api_url=api_url, target=target)
-
-            async with AsyncDaytona(config=daytona_config) as daytona:
-                sandbox = await daytona.get(request.instance_id)
+            async with create_provider(sandbox_config) as provider:
+                sandbox = await provider.get_sandbox(request.instance_id)
 
                 async for message in self.service.setup_task(request.task_id, sandbox, dataset=request.dataset):
                     if not await send_json_if_connected(websocket, message.model_dump()):
@@ -257,12 +253,10 @@ class BenchmarkServiceApp(FastAPI):
             if tenant is None:
                 return
 
-            api_key = websocket.headers.get("x-api-key")
-            api_url = websocket.headers.get("x-api-url")
-            target = websocket.headers.get("x-target")
-
-            if not api_key or not api_url or not target:
-                await websocket.close(code=1008, reason="Missing required headers: x-api-key, x-api-url, x-target")
+            try:
+                sandbox_config = sandbox_config_from_headers(websocket.headers)
+            except MissingSandboxConfigError as e:
+                await websocket.close(code=1008, reason=str(e))
                 return
 
             data = await websocket.receive_json()
@@ -272,10 +266,8 @@ class BenchmarkServiceApp(FastAPI):
                 await websocket.close(code=1008, reason="Dataset not allowed")
                 return
 
-            daytona_config = DaytonaConfig(api_key=api_key, api_url=api_url, target=target)
-
-            async with AsyncDaytona(config=daytona_config) as daytona:
-                sandbox = await daytona.get(request.instance_id)
+            async with create_provider(sandbox_config) as provider:
+                sandbox = await provider.get_sandbox(request.instance_id)
 
                 async for message in self.service.evaluate_instance(request.task_id, sandbox, dataset=request.dataset):
                     if not await send_json_if_connected(websocket, message.model_dump()):

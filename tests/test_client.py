@@ -40,10 +40,10 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
             ["task-1"],
             "/retrieve-task/",
             {
-                "docker_image": "python:3.12",
+                "source": {"type": "image", "image": "python:3.12"},
                 "problem_path": "/tmp/problem_statement.txt",
                 "cwd": "/work",
-                "resources": {"vcpu": 2, "memory": 4, "disk": 10},
+                "resources": {"cpu": 2, "memory_gb": 4, "disk_gb": 10},
                 "agent_timeout": None,
             },
         ),
@@ -142,10 +142,10 @@ async def test_retrieve_task_with_dataset(
     client, mock_http = benchmark_client
     mock_resp = _mock_response(
         json_data={
-            "docker_image": "python:3.12",
+            "source": {"type": "image", "image": "python:3.12"},
             "problem_path": "/tmp/problem_statement.txt",
             "cwd": "/work",
-            "resources": {"vcpu": 2, "memory": 4, "disk": 10},
+            "resources": {"cpu": 2, "memory_gb": 4, "disk_gb": 10},
         }
     )
     mock_http.get = AsyncMock(return_value=mock_resp)

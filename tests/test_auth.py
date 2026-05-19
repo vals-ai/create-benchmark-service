@@ -8,8 +8,8 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
-from daytona import AsyncSandbox
 
+from benchmark_service import Sandbox
 from benchmark_service import auth as auth_module
 from benchmark_service.auth import (
     clear_allowlist_cache,
@@ -149,13 +149,13 @@ class _BareBenchmark(BenchmarkService):
     ) -> RetrieveTaskResponse: ...  # type: ignore[return]
 
     def setup_task(
-        self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None
+        self, task_id: str, sandbox: Sandbox, dataset: str | None = None
     ) -> AsyncGenerator[StreamChunk, None]: ...  # type: ignore[return]
 
     async def evaluate_response(self, request: EvaluateResponseRequest, dataset: str | None = None) -> Any: ...
 
     def evaluate_instance(
-        self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None
+        self, task_id: str, sandbox: Sandbox, dataset: str | None = None
     ) -> AsyncGenerator[StreamChunk, None]: ...  # type: ignore[return]
 
     async def calculate_final_score(

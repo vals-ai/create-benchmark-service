@@ -5,6 +5,22 @@ from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.base import BenchmarkService
 from benchmark_service.client import BenchmarkServiceUnauthenticatedError, BenchmarkServiceClient, BenchmarkServiceError
 from benchmark_service.inflight import InflightMiddleware
+from benchmark_service.sandbox import (
+    ExecResult,
+    ImageSource,
+    Resources,
+    Sandbox,
+    SandboxBackendConfig,
+    SandboxCreateRequest,
+    SandboxError,
+    SandboxProvider,
+    SandboxQuery,
+    SandboxSource,
+    SandboxNotFoundError,
+    SnapshotSource,
+    create_provider,
+    sandbox_config_from_headers,
+)
 
 __all__ = [
     "BenchmarkServiceApp",
@@ -12,6 +28,20 @@ __all__ = [
     "BenchmarkServiceUnauthenticatedError",
     "BenchmarkServiceClient",
     "BenchmarkServiceError",
+    "ExecResult",
+    "ImageSource",
     "InflightMiddleware",
+    "Resources",
+    "Sandbox",
+    "SandboxBackendConfig",
+    "SandboxCreateRequest",
+    "SandboxError",
+    "SandboxNotFoundError",
+    "SandboxProvider",
+    "SandboxQuery",
+    "SandboxSource",
+    "SnapshotSource",
+    "create_provider",
+    "sandbox_config_from_headers",
     "__version__",
 ]

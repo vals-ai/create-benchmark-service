@@ -3,13 +3,10 @@
 from collections.abc import AsyncGenerator
 from typing import Any
 
-from daytona import AsyncSandbox
-
-from benchmark_service import BenchmarkService
+from benchmark_service import BenchmarkService, ImageSource, Resources, Sandbox
 from benchmark_service.schemas import (
     EvaluateResponseRequest,
     FinalScoreResult,
-    Resources,
     RetrieveTaskResponse,
     StreamChunk,
     StreamErrorChunk,
@@ -43,30 +40,31 @@ class ExampleBenchmark(BenchmarkService):
 
     async def list_tasks(self, dataset: str | None = None) -> list[V1Task]:
         """Expose public task inputs for benchmark runners."""
-        return [
-            V1Task(id=task_id, question=task["problem"])
-            for task_id, task in self.get_dataset(dataset).items()
-        ]
+        return [V1Task(id=task_id, question=task["problem"]) for task_id, task in self.get_dataset(dataset).items()]
 
-    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> RetrieveTaskResponse:
+    async def retrieve_task(
+        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+    ) -> RetrieveTaskResponse:
         """Retrieve task metadata."""
         if not skip_validation:
             await self.validate_task_ids([task_id], dataset=dataset)
         return RetrieveTaskResponse(
-            docker_image="python:3.12-slim",
+            source=ImageSource(image="python:3.12-slim"),
             problem_path="/tmp/problem_statement.txt",
             cwd="/workspace",
             agent_timeout=60.0,
             resources=Resources(vcpu=2, memory=4, disk=10),
         )
 
-    async def setup_task(self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None) -> AsyncGenerator[StreamChunk, None]:
+    async def setup_task(
+        self, task_id: str, sandbox: Sandbox, dataset: str | None = None
+    ) -> AsyncGenerator[StreamChunk, None]:
         """Setup task in sandbox — writes the problem statement to problem_path."""
         yield StreamMessageChunk(type="message", data=f"Setting up task {task_id}...")
 
         task = self.get_dataset(dataset)[task_id]
         problem_statement = task["problem"]
-        await sandbox.fs.upload_file(problem_statement.encode(), "/tmp/problem_statement.txt")
+        await sandbox.upload_file("/tmp/problem_statement.txt", problem_statement.encode())
 
         yield StreamMessageChunk(type="message", data="Problem statement written to sandbox")
         yield StreamResultChunk(type="result", data={"status": "ok"})
@@ -89,7 +87,9 @@ class ExampleBenchmark(BenchmarkService):
             "received": request.response.strip(),
         }
 
-    async def evaluate_instance(self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None) -> AsyncGenerator[StreamChunk, None]:
+    async def evaluate_instance(
+        self, task_id: str, sandbox: Sandbox, dataset: str | None = None
+    ) -> AsyncGenerator[StreamChunk, None]:
         """Evaluate in sandbox (not implemented for this example)."""
         yield StreamMessageChunk(type="message", data=f"Evaluating task {task_id}...")
         yield StreamErrorChunk(
@@ -97,7 +97,9 @@ class ExampleBenchmark(BenchmarkService):
             data="Sandbox evaluation not implemented. Use /evaluate-response/ endpoint instead.",
         )
 
-    async def calculate_final_score(self, evaluation_results: dict[str, Any], dataset: str | None = None) -> FinalScoreResult:
+    async def calculate_final_score(
+        self, evaluation_results: dict[str, Any], dataset: str | None = None
+    ) -> FinalScoreResult:
         """Calculate final score across all evaluations."""
         total = len(evaluation_results)
 

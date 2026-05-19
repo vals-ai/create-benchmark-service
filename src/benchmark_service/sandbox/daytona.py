@@ -217,8 +217,8 @@ class DaytonaSandboxProvider(SandboxProvider):
 
 
 def _command(command: str, cwd: str | None, timeout: float | None) -> str:
-    if cwd:
-        command = f"cd {shlex.quote(cwd)} && {command}"
     if timeout is not None:
         command = f"timeout {int(timeout)} {command}"
+    if cwd:
+        command = f"cd {shlex.quote(cwd)} && {command}"
     return command

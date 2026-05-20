@@ -64,13 +64,12 @@ class SandboxNotFoundError(SandboxError):
 class ExecResult(BaseModel):
     exit_code: int
     stdout: str = ""
-    stderr: str = ""
 
 
 class Sandbox(ABC):
     id: str
     name: str
-    state: str | None = None
+    state: str
 
     @abstractmethod
     async def exec(

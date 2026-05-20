@@ -23,20 +23,10 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
     return resp
 
 
-def test_sandbox_config_uses_daytona_env_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SANDBOX_PROVIDER", "daytona")
+def test_sandbox_config_from_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SANDBOX_PROVIDER", raising=False)
 
     assert sandbox_config_from_headers(DAYTONA_HEADERS) == DaytonaBackendConfig(
-        api_key="key",
-        api_url="url",
-        target="target",
-    )
-
-
-def test_sandbox_config_header_overrides_env_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SANDBOX_PROVIDER", "not-daytona")
-
-    assert sandbox_config_from_headers({**DAYTONA_HEADERS, "x-sandbox-provider": "daytona"}) == DaytonaBackendConfig(
         api_key="key",
         api_url="url",
         target="target",

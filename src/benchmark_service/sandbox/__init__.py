@@ -23,7 +23,7 @@ from benchmark_service.sandbox.types import (
 
 
 def sandbox_config_from_headers(headers: Mapping[str, str]) -> SandboxBackendConfig:
-    provider = headers.get("x-sandbox-provider") or os.environ.get("SANDBOX_PROVIDER", "daytona")
+    provider = os.environ.get("SANDBOX_PROVIDER", "daytona")
     if provider != "daytona":
         raise ValueError(f"Unknown sandbox provider: {provider}")
 

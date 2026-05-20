@@ -5,15 +5,16 @@ from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
+from daytona import AsyncSandbox
 from fastapi.testclient import TestClient
 
-from benchmark_service import ImageSource, Resources, Sandbox
 from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.base import BenchmarkService
 from benchmark_service.client import BenchmarkServiceClient
 from benchmark_service.schemas import (
     EvaluateResponseRequest,
     FinalScoreResult,
+    Resources,
     RetrieveTaskResponse,
     StreamChunk,
 )
@@ -41,15 +42,15 @@ class StubBenchmark(BenchmarkService):
         if not skip_validation:
             await self.validate_task_ids([task_id], dataset=dataset)
         return RetrieveTaskResponse(
-            source=ImageSource(image="python:3.12-slim"),
+            docker_image="python:3.12-slim",
             problem_path="/tmp/problem_statement.txt",
             cwd="/workspace",
             agent_timeout=60.0,
-            resources=Resources(cpu=2, memory_gb=4, disk_gb=10),
+            resources=Resources(vcpu=2, memory=4, disk=10),
         )
 
     def setup_task(
-        self, task_id: str, sandbox: Sandbox, dataset: str | None = None
+        self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None
     ) -> AsyncGenerator[StreamChunk, None]: ...  # type: ignore[return]
 
     async def evaluate_response(self, request: EvaluateResponseRequest, dataset: str | None = None) -> Any:
@@ -62,7 +63,7 @@ class StubBenchmark(BenchmarkService):
         return {"resolved": request.response == task["answer"]}
 
     def evaluate_instance(
-        self, task_id: str, sandbox: Sandbox, dataset: str | None = None
+        self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None
     ) -> AsyncGenerator[StreamChunk, None]: ...  # type: ignore[return]
 
     async def calculate_final_score(

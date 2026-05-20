@@ -5,10 +5,10 @@ from collections.abc import AsyncGenerator
 from typing import Any
 from unittest.mock import patch
 
+from daytona import AsyncSandbox
 from fastapi.testclient import TestClient
 
 import benchmark_service
-from benchmark_service import Sandbox
 from benchmark_service.app import BenchmarkServiceApp, _get_service_metadata  # pyright: ignore[reportPrivateUsage]
 from benchmark_service.base import BenchmarkService
 from benchmark_service.schemas import (
@@ -37,14 +37,14 @@ class _FakeService(BenchmarkService):
         raise NotImplementedError
 
     def setup_task(
-        self, task_id: str, sandbox: Sandbox, dataset: str | None = None
+        self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None
     ) -> AsyncGenerator[StreamChunk, None]: ...  # type: ignore[return]
 
     async def evaluate_response(self, request: EvaluateResponseRequest, dataset: str | None = None) -> Any:
         raise NotImplementedError
 
     def evaluate_instance(
-        self, task_id: str, sandbox: Sandbox, dataset: str | None = None
+        self, task_id: str, sandbox: AsyncSandbox, dataset: str | None = None
     ) -> AsyncGenerator[StreamChunk, None]: ...  # type: ignore[return]
 
     async def calculate_final_score(

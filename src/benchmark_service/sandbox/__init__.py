@@ -24,16 +24,16 @@ from benchmark_service.sandbox.types import (
 
 def sandbox_config_from_headers(headers: Mapping[str, str]) -> SandboxBackendConfig:
     provider = os.environ.get("SANDBOX_PROVIDER", "daytona")
-    if provider != "daytona":
-        raise ValueError(f"Unknown sandbox provider: {provider}")
-
-    api_key = headers.get("x-api-key")
-    api_url = headers.get("x-api-url")
-    target = headers.get("x-target")
-    if not api_key or not api_url or not target:
-        raise MissingSandboxConfigError("Missing required headers: x-api-key, x-api-url, x-target")
-
-    return DaytonaBackendConfig(api_key=api_key, api_url=api_url, target=target)
+    match provider:
+        case "daytona":
+            api_key = headers.get("x-api-key")
+            api_url = headers.get("x-api-url")
+            target = headers.get("x-target")
+            if not api_key or not api_url or not target:
+                raise MissingSandboxConfigError("Missing required headers: x-api-key, x-api-url, x-target")
+            return DaytonaBackendConfig(api_key=api_key, api_url=api_url, target=target)
+        case _:
+            raise ValueError(f"Unknown sandbox provider: {provider}")
 
 
 def create_provider(config: SandboxBackendConfig) -> SandboxProvider:

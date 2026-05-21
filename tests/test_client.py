@@ -33,6 +33,13 @@ def test_sandbox_config_from_headers(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
+def test_sandbox_config_rejects_unknown_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SANDBOX_PROVIDER", "modal")
+
+    with pytest.raises(ValueError, match="Unknown sandbox provider: modal"):
+        sandbox_config_from_headers({})
+
+
 @pytest.mark.parametrize(
     ("method", "args", "expected_path", "json_data"),
     [

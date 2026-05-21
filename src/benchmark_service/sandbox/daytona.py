@@ -2,11 +2,9 @@ from __future__ import annotations
 
 import asyncio
 import shlex
-import tempfile
 import uuid
 from collections.abc import AsyncGenerator, Callable
 from contextlib import suppress
-from pathlib import Path
 
 from daytona import (
     AsyncDaytona,
@@ -65,7 +63,6 @@ class DaytonaSandbox(Sandbox):
         except DaytonaError as exc:
             raise SandboxError(str(exc)) from exc
 
-        assert result.exit_code is not None
         return ExecResult(exit_code=result.exit_code, stdout=result.result or "")
 
     async def upload_file(self, remote_path: str, content: bytes) -> None:
@@ -75,12 +72,11 @@ class DaytonaSandbox(Sandbox):
             raise SandboxError(str(exc)) from exc
 
     async def download_file(self, remote_path: str) -> bytes:
-        with tempfile.NamedTemporaryFile() as temp_file:
-            try:
-                await self._inner.fs.download_file(remote_path, temp_file.name)
-            except DaytonaError as exc:
-                raise SandboxError(str(exc)) from exc
-            return Path(temp_file.name).read_bytes()
+        try:
+            stream = await self._inner.fs.download_file_stream(remote_path)
+            return b"".join([chunk async for chunk in stream])
+        except DaytonaError as exc:
+            raise SandboxError(str(exc)) from exc
 
     async def _exec_pty(self, command: str, on_output: Callable[[str], None]) -> ExecResult:
         session_id = f"{self.id}:exec-{uuid.uuid4().hex}"
@@ -106,14 +102,13 @@ class DaytonaSandbox(Sandbox):
 
             while True:
                 result = await self._inner.process.exec(f"test -e {shlex.quote(status_path)}")
-                assert result.exit_code is not None
                 if result.exit_code == 0:
                     break
                 await asyncio.sleep(1)
 
             result = await self._inner.process.exec(f"cat {shlex.quote(status_path)}")
-            assert result.exit_code == 0
-            assert result.result
+            if result.exit_code != 0 or not result.result:
+                raise SandboxError("Failed to read Daytona PTY exit code")
             return ExecResult(exit_code=int(result.result.strip()), stdout="".join(stdout))
         except DaytonaError as exc:
             raise SandboxError(str(exc)) from exc
@@ -218,7 +213,7 @@ class DaytonaSandboxProvider(SandboxProvider):
 
 def _command(command: str, cwd: str | None, timeout: float | None) -> str:
     if timeout is not None:
-        command = f"timeout {int(timeout)} {command}"
+        command = f"timeout {timeout:g} {command}"
     if cwd:
         command = f"cd {shlex.quote(cwd)} && {command}"
     return command

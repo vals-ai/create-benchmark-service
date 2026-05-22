@@ -3,7 +3,6 @@
 import pytest
 
 from benchmark_service.schemas import TaskFilter
-from benchmark_service.v1_schemas import V1Task
 from tests.conftest import StubBenchmark
 
 
@@ -90,40 +89,7 @@ async def test_validate_task_ids_wrong_dataset(service: StubBenchmark) -> None:
         await service.validate_task_ids(["task-1"], dataset="alt")
 
 
-@pytest.mark.asyncio
-async def test_list_tasks_default_extracts_id_question_timeout_from_load_datasets() -> None:
-    """Default list_tasks walks get_dataset() and extracts id/question/timeout."""
+async def test_list_tasks_default_requires_explicit_public_projection() -> None:
     service = await StubBenchmark.create()
-    tasks = await service.list_tasks(dataset="default")
-    ids = [t.id for t in tasks]
-    assert set(ids) == {"task-1", "task-2", "task-3"}
-    by_id = {t.id: t for t in tasks}
-    assert by_id["task-1"].question == "What is 1+1?"
-    assert all(t.timeout is None for t in tasks)
-    assert all(isinstance(t, V1Task) for t in tasks)
-
-
-@pytest.mark.asyncio
-async def test_list_tasks_default_strips_evaluator_only_fields() -> None:
-    """The default impl projects only id/question/timeout. Evaluator-only fields
-    in the task dict (`answer`, rubric, grader hints, etc.) must NOT leak."""
-    service = await StubBenchmark.create()
-    tasks = await service.list_tasks(dataset="default")
-    # StubBenchmark tasks have `answer`; verify it's stripped from the V1Task projection.
-    for t in tasks:
-        dumped = t.model_dump()
-        assert "answer" not in dumped
-
-
-@pytest.mark.asyncio
-async def test_list_tasks_default_uses_default_dataset_when_none() -> None:
-    service = await StubBenchmark.create()
-    tasks = await service.list_tasks(dataset=None)
-    assert {t.id for t in tasks} == {"task-1", "task-2", "task-3"}
-
-
-@pytest.mark.asyncio
-async def test_list_tasks_default_raises_value_error_for_unknown_dataset() -> None:
-    service = await StubBenchmark.create()
-    with pytest.raises(ValueError):
-        await service.list_tasks(dataset="does-not-exist")
+    with pytest.raises(NotImplementedError, match="list_tasks"):
+        await service.list_tasks(dataset="default")

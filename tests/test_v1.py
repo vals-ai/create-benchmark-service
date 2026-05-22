@@ -25,6 +25,14 @@ from benchmark_service.v1_schemas import (
 from tests.conftest import StubBenchmark
 
 
+class TaskListingBenchmark(StubBenchmark):
+    async def list_tasks(self, dataset: str | None = None) -> list[V1Task]:
+        return [
+            V1Task(id=task_id, question=task["problem"])
+            for task_id, task in self.get_dataset(dataset).items()
+        ]
+
+
 @pytest.fixture
 def descope_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
     """A client with a Descope tenant 'acme' allowed to see the 'default' dataset."""
@@ -38,6 +46,26 @@ def descope_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, Non
     )
     app = BenchmarkServiceApp(StubBenchmark)
     app._service_version = "stub-service-1.0"  # pyright: ignore[reportPrivateUsage]
+
+    async def _stub_exchange(_project_id: str, _access_key: str) -> dict[str, dict[str, dict[str, str]]]:
+        return {"tenants": {"acme": {}}}
+
+    with patch.object(auth_module, "_exchange_descope_access_key", _stub_exchange):
+        with TestClient(app) as client:
+            yield client
+
+
+@pytest.fixture
+def task_listing_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
+    clear_allowlist_cache()
+    clear_auth_cache()
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
+    monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
+    monkeypatch.setenv(
+        "DESCOPE_TENANT_ALLOWLIST_JSON",
+        json.dumps({"tenants": {"acme": {"datasets": ["default"]}}}),
+    )
+    app = BenchmarkServiceApp(TaskListingBenchmark)
 
     async def _stub_exchange(_project_id: str, _access_key: str) -> dict[str, dict[str, dict[str, str]]]:
         return {"tenants": {"acme": {}}}
@@ -290,17 +318,14 @@ def test_v1_score_rejects_legacy_bearer_with_403(monkeypatch: pytest.MonkeyPatch
     assert "legacy" in resp.json()["detail"].lower()
 
 
-def test_v1_task_round_trip_preserves_extra_fields() -> None:
-    t = V1Task.model_validate({
-        "id": "01-011",
-        "question": "What is fair use?",
-        "timeout": 600,
-        "system_prompt": "be helpful",
-    })
-    assert t.id == "01-011"
-    assert t.timeout == 600
-    raw = t.model_dump(mode="json")
-    assert raw["system_prompt"] == "be helpful"
+def test_v1_task_rejects_fields_outside_runner_contract() -> None:
+    with pytest.raises(ValidationError):
+        V1Task.model_validate({
+            "id": "01-011",
+            "question": "What is fair use?",
+            "timeout": 600,
+            "system_prompt": "be helpful",
+        })
 
 
 def test_v1_dataset_tasks_response_round_trip() -> None:
@@ -317,8 +342,8 @@ def test_v1_dataset_tasks_response_round_trip() -> None:
     assert raw["tasks"][1]["timeout"] == 120
 
 
-def test_v1_list_dataset_tasks_returns_full_task_list(descope_client: TestClient) -> None:
-    resp = descope_client.get(
+def test_v1_list_dataset_tasks_returns_full_task_list(task_listing_client: TestClient) -> None:
+    resp = task_listing_client.get(
         "/v1/datasets/default/tasks",
         headers={"x-descope-api-key": "key-acme"},
     )
@@ -326,6 +351,16 @@ def test_v1_list_dataset_tasks_returns_full_task_list(descope_client: TestClient
     body = resp.json()
     assert body["dataset"] == "default"
     assert {t["id"] for t in body["tasks"]} == {"task-1", "task-2", "task-3"}
+    assert {t["question"] for t in body["tasks"]} == {"What is 1+1?", "What is 2+2?", "What is 3+3?"}
+
+
+def test_v1_list_dataset_tasks_requires_explicit_projection(descope_client: TestClient) -> None:
+    resp = descope_client.get(
+        "/v1/datasets/default/tasks",
+        headers={"x-descope-api-key": "key-acme"},
+    )
+    assert resp.status_code == 501
+    assert "list_tasks" in resp.json()["detail"]
 
 
 def test_v1_list_dataset_tasks_rejects_unauthorized_dataset_with_403(descope_client: TestClient) -> None:

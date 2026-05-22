@@ -76,12 +76,11 @@ class V1ScoreResponse(BaseModel):
 class V1Task(BaseModel):
     """A task as exposed on the lab-facing /v1/ surface.
 
-    `extra="allow"` so benchmarks can ship additional per-task fields
-    (system prompt overrides, docker image hints, etc.) without each
-    addition requiring a framework change.
+    This is the runner-facing task contract. Benchmarks should not include
+    evaluator-only fields or benchmark-specific extras on this surface.
     """
 
-    model_config = ConfigDict(extra="allow")
+    model_config = ConfigDict(extra="forbid")
     id: str
     question: str
     timeout: float | None = None

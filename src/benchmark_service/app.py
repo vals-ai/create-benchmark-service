@@ -387,9 +387,13 @@ class BenchmarkServiceApp(FastAPI):
         if not await self.service.check_dataset_access(request.state.tenant, dataset):
             raise HTTPException(status_code=403, detail="Dataset not allowed")
         try:
-            tasks = await self.service.list_tasks(dataset=dataset)
+            self.service.get_dataset(dataset)
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=f"Dataset not found: {dataset}") from exc
+        try:
+            tasks = await self.service.list_tasks(dataset=dataset)
+        except NotImplementedError as exc:
+            raise HTTPException(status_code=501, detail=str(exc)) from exc
         return V1DatasetTasksResponse(dataset=dataset, tasks=tasks)
 
     async def _final_score(self, request: Request, body: FinalScoreRequest) -> FinalScoreResponse:

@@ -87,3 +87,9 @@ async def test_validate_task_ids_with_dataset(service: StubBenchmark) -> None:
 async def test_validate_task_ids_wrong_dataset(service: StubBenchmark) -> None:
     with pytest.raises(ValueError, match="Task ID not found"):
         await service.validate_task_ids(["task-1"], dataset="alt")
+
+
+async def test_list_tasks_default_requires_explicit_public_projection() -> None:
+    service = await StubBenchmark.create()
+    with pytest.raises(NotImplementedError, match="list_tasks"):
+        await service.list_tasks(dataset="default")

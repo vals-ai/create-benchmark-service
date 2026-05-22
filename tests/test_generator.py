@@ -144,6 +144,16 @@ def test_generated_project_excludes_framework_versioning_workflows(tmp_path: Pat
     assert not (workflows_dir / "check-pr-title.yaml").exists()
 
 
+def test_generated_benchmark_service_implements_task_listing(tmp_path: Path) -> None:
+    output_dir = tmp_path / "demo-benchmark-service"
+    generate_project("demo", output_dir)
+
+    service = (output_dir / "src" / "demo_benchmark_service" / "benchmark_service.py").read_text()
+    assert "from benchmark_service.v1_schemas import V1Task" in service
+    assert "async def list_tasks(self, dataset: str | None = None) -> list[V1Task]:" in service
+    assert 'V1Task(id=task_id, question=task["problem"])' in service
+
+
 def test_generated_gitignore_excludes_framework_only_entries(tmp_path: Path) -> None:
     output_dir = tmp_path / "swebench-benchmark-service"
     generate_project("swebench", output_dir)

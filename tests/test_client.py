@@ -7,6 +7,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
+from benchmark_service.v1_schemas import V1DatasetTasksResponse
 
 BASE_URL = "http://localhost:8000"
 HEADERS = {"Authorization": "Bearer token"}
@@ -373,3 +374,28 @@ async def test_ws_connection_closed_without_result(method: str, args: list[str])
     with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
         with pytest.raises(BenchmarkServiceError, match="without returning final result"):
             await getattr(client, method)(*args)
+
+
+async def test_client_list_tasks_returns_v1_dataset_tasks_response(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    """client.list_tasks hits /v1/datasets/{dataset}/tasks and returns V1DatasetTasksResponse."""
+    client, mock_http = benchmark_client
+    mock_resp = _mock_response(
+        json_data={
+            "dataset": "default",
+            "tasks": [
+                {"id": "task-1", "question": "What is 1+1?"},
+                {"id": "task-2", "question": "What is 2+2?"},
+                {"id": "task-3", "question": "What is 3+3?"},
+            ],
+        }
+    )
+    mock_http.get = AsyncMock(return_value=mock_resp)
+
+    result = await client.list_tasks(dataset="default")
+
+    assert isinstance(result, V1DatasetTasksResponse)
+    assert result.dataset == "default"
+    assert {t.id for t in result.tasks} == {"task-1", "task-2", "task-3"}
+    mock_http.get.assert_called_once_with(f"{BASE_URL}/v1/datasets/default/tasks")

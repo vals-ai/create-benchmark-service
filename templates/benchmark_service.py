@@ -16,6 +16,7 @@ from benchmark_service.schemas import (
     StreamMessageChunk,
     StreamResultChunk,
 )
+from benchmark_service.v1_schemas import V1Task
 
 
 class ExampleBenchmark(BenchmarkService):
@@ -39,6 +40,13 @@ class ExampleBenchmark(BenchmarkService):
                 },
             },
         }
+
+    async def list_tasks(self, dataset: str | None = None) -> list[V1Task]:
+        """Expose public task inputs for benchmark runners."""
+        return [
+            V1Task(id=task_id, question=task["problem"])
+            for task_id, task in self.get_dataset(dataset).items()
+        ]
 
     async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> RetrieveTaskResponse:
         """Retrieve task metadata."""

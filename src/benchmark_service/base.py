@@ -20,6 +20,7 @@ from benchmark_service.schemas import (
     StreamResultChunk,
     TaskFilter,
 )
+from benchmark_service.v1_schemas import V1Task
 
 
 class BenchmarkService(ABC):
@@ -116,6 +117,23 @@ class BenchmarkService(ABC):
             return all_task_ids[slice_obj]
 
         return all_task_ids
+
+    async def list_tasks(self, dataset: str | None = None) -> list[V1Task]:
+        """Return tasks for `dataset` as the lab-facing /v1/ surface sees them.
+
+        Benchmark task objects often contain evaluator-only fields (rubrics,
+        expected answers, grader config, etc.) that must not leak to external
+        labs. The framework therefore does not infer a public representation
+        from arbitrary internal task objects. Benchmarks exposing the endpoint
+        must override this method and explicitly return V1Task(id, question,
+        timeout).
+
+        Raises:
+            NotImplementedError: if the benchmark has not opted into task listing.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__}.list_tasks must explicitly map internal tasks to V1Task"
+        )
 
     async def validate_task_ids(self, task_ids: list[str], dataset: str | None = None) -> list[str]:
         """Validate that task IDs exist in your benchmark dataset.

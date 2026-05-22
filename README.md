@@ -81,6 +81,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 - `get_dataset(dataset)` — return the task dictionary for a given dataset name (defaults to `"default"`)
 - `filter_tasks(task_filter, dataset)` — return task IDs matching a list or Python slice notation (e.g. `"0:10:2"`)
 - `validate_task_ids(task_ids, dataset)` — raise `ValueError` if any ID is not in the dataset
+- `list_tasks(dataset)` — return `list[V1Task]` (id, question, timeout) for the lab-facing `GET /v1/datasets/{dataset}/tasks` endpoint. Must be overridden before exposing task listing; the base implementation fails closed to avoid leaking evaluator-only data.
 - `check_auth(headers)` — legacy boolean auth hook. Override for custom auth that does not need tenant or dataset awareness.
 - `resolve_tenant(headers)` — validate request authorization and return a tenant ID, `"_legacy"` for legacy auth, or `None` to reject.
 - `check_dataset_access(tenant, dataset)` — return whether a resolved tenant may access a dataset.
@@ -100,6 +101,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | `POST` | `/final-score/` | Aggregate results: `{"evaluation_results": {task_id: result, …}, "dataset": "…"}` |
 | `POST` | `/v1/evaluate` | Lab-facing per-task evaluation (see [v1 Eval API](#v1-eval-api-lab-facing) below) |
 | `POST` | `/v1/score` | Lab-facing run aggregation (see [v1 Eval API](#v1-eval-api-lab-facing) below) |
+| `GET` | `/v1/datasets/{dataset}/tasks` | Lab-facing dataset task list (see [v1 Eval API](#v1-eval-api-lab-facing) below) |
 
 **WebSocket endpoints** (stream `StreamChunk` JSON objects):
 
@@ -168,7 +170,21 @@ Response:
 
 **Auth.** `/v1/*` is Descope-only. Callers using the legacy `BENCHMARK_API_KEY` bearer (i.e. those that resolve to the `_legacy` tenant sentinel) get 403. Migrate the deploy to Descope (`AUTH_REQUIRED=true` + `DESCOPE_PROJECT_ID` + allowlist) before opening `/v1/` to external traffic.
 
-**Deferred to follow-on plans.** `GET /v1/schema`, `GET /v1/tasks/{task_id}`, `/ws/v1/evaluate` (streamed judges), artifact payloads, async/`poll_url` response shape, idempotency on `(run_id, task_id)`.
+**`GET /v1/datasets/{dataset}/tasks`** — return the dataset's task list. Same Descope-only auth + tenant/dataset allowlist gate as the rest of `/v1/*`. Response:
+
+```json
+{
+  "dataset": "validation",
+  "tasks": [
+    {"id": "01-011", "question": "...", "timeout": null},
+    {"id": "01-012", "question": "...", "timeout": 600}
+  ]
+}
+```
+
+Status codes: 403 if the tenant isn't allowed the dataset *or* if the caller uses legacy bearer; 404 if the dataset is in the tenant's allowlist but the service's `load_datasets()` doesn't load it; 501 if the benchmark has not implemented `list_tasks`. The base `BenchmarkService.list_tasks` does not infer a public task shape from internal task objects because those objects often include evaluator-only data (`answer`, `checks`, rubrics, grader config). Benchmarks must explicitly map their loaded tasks to `V1Task(id, question, timeout, ...)`. `V1Task` allows benchmark-specific extras, so benchmarks that need to surface additional per-task fields (e.g. SWE-bench's `repo`/`base_commit`) can include them when constructing the `V1Task` — document them in your benchmark's README and validate on the runner side with a typed `Task` subclass.
+
+**Deferred to follow-on plans.** `GET /v1/schema`, `GET /v1/tasks/{task_id}` (single-task lookup), `/ws/v1/evaluate` (streamed judges), artifact payloads, async/`poll_url` response shape, idempotency on `(run_id, task_id)`.
 
 ### Schemas (`schemas.py`)
 

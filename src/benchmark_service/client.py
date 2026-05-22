@@ -25,6 +25,7 @@ from benchmark_service.schemas import (
     StreamChunk,
     VerifyTaskIdsResponse,
 )
+from benchmark_service.v1_schemas import V1DatasetTasksResponse
 
 _stream_chunk_adapter: TypeAdapter[StreamChunk] = TypeAdapter(StreamChunk)
 
@@ -353,3 +354,24 @@ class BenchmarkServiceClient:
             )
 
         return FinalScoreResponse.model_validate(response.json())
+
+    @_retry_http
+    async def list_tasks(self, dataset: str) -> V1DatasetTasksResponse:
+        """Fetch a dataset's task list via the lab-facing /v1/ surface.
+
+        Auth headers (Descope) are taken from self._headers as set at
+        construction. Server returns 403 for legacy bearer or unauthorized
+        datasets, 404 for unknown datasets, and 501 when the benchmark has
+        not implemented task listing.
+        """
+        response = await self._http_client.get(f"{self._url}/v1/datasets/{dataset}/tasks")
+
+        if response.status_code == 401:
+            raise _unauthenticated_error(response)
+
+        if response.status_code != 200:
+            raise BenchmarkServiceError(
+                f"List tasks failed with status code {response.status_code}, response: {response.text}"
+            )
+
+        return V1DatasetTasksResponse.model_validate(response.json())

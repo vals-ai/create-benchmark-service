@@ -318,14 +318,21 @@ def test_v1_score_rejects_legacy_bearer_with_403(monkeypatch: pytest.MonkeyPatch
     assert "legacy" in resp.json()["detail"].lower()
 
 
-def test_v1_task_rejects_fields_outside_runner_contract() -> None:
-    with pytest.raises(ValidationError):
-        V1Task.model_validate({
-            "id": "01-011",
-            "question": "What is fair use?",
-            "timeout": 600,
-            "system_prompt": "be helpful",
-        })
+def test_v1_task_allows_benchmark_specific_extras() -> None:
+    """V1Task accepts benchmark-specific per-task fields (e.g. SWE-bench's
+    repo/base_commit, an artifact benchmark's docker image hints). Per-benchmark
+    fields should be documented in each benchmark's README and validated on the
+    runner side with a typed Task subclass."""
+    t = V1Task.model_validate({
+        "id": "01-011",
+        "question": "What is fair use?",
+        "timeout": 600,
+        "system_prompt": "be helpful",
+    })
+    assert t.id == "01-011"
+    assert t.timeout == 600
+    raw = t.model_dump(mode="json")
+    assert raw["system_prompt"] == "be helpful"
 
 
 def test_v1_dataset_tasks_response_round_trip() -> None:

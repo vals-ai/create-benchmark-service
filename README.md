@@ -182,7 +182,7 @@ Response:
 }
 ```
 
-Status codes: 403 if the tenant isn't allowed the dataset *or* if the caller uses legacy bearer; 404 if the dataset is in the tenant's allowlist but the service's `load_datasets()` doesn't load it; 501 if the benchmark has not implemented `list_tasks`. The base `BenchmarkService.list_tasks` does not infer a public task shape from internal task objects because those objects often include evaluator-only data (`answer`, `checks`, rubrics, grader config). Benchmarks must explicitly map their loaded tasks to `V1Task(id, question, timeout)`.
+Status codes: 403 if the tenant isn't allowed the dataset *or* if the caller uses legacy bearer; 404 if the dataset is in the tenant's allowlist but the service's `load_datasets()` doesn't load it; 501 if the benchmark has not implemented `list_tasks`. The base `BenchmarkService.list_tasks` does not infer a public task shape from internal task objects because those objects often include evaluator-only data (`answer`, `checks`, rubrics, grader config). Benchmarks must explicitly map their loaded tasks to `V1Task(id, question, timeout, ...)`. `V1Task` allows benchmark-specific extras, so benchmarks that need to surface additional per-task fields (e.g. SWE-bench's `repo`/`base_commit`) can include them when constructing the `V1Task` — document them in your benchmark's README and validate on the runner side with a typed `Task` subclass.
 
 **Deferred to follow-on plans.** `GET /v1/schema`, `GET /v1/tasks/{task_id}` (single-task lookup), `/ws/v1/evaluate` (streamed judges), artifact payloads, async/`poll_url` response shape, idempotency on `(run_id, task_id)`.
 

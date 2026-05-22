@@ -27,7 +27,7 @@ class V1EvalStatus(StrEnum):
 
 class V1Payload(BaseModel):
     type: V1PayloadType
-    schema_: str = Field(alias="schema", description="Payload schema id, e.g. fabv2.text.v1")
+    schema_id: str = Field(alias="schema", description="Payload schema id, e.g. fabv2.text.v1")
     data: str = Field(description="Text answer or base64-encoded artifact bytes")
 
     model_config = ConfigDict(populate_by_name=True)

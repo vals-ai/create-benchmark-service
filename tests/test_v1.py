@@ -7,7 +7,7 @@ from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from benchmark_service import auth as auth_module
 from benchmark_service.app import BenchmarkServiceApp
@@ -55,10 +55,10 @@ def test_eval_request_accepts_text_payload() -> None:
     })
     assert req.payload.type == V1PayloadType.TEXT
     assert req.payload.data == "42"
-    assert req.payload.schema_ == "fabv2.text.v1"
+    assert req.payload.schema_id == "fabv2.text.v1"
     raw = req.model_dump(mode="json", by_alias=True)
     assert raw["payload"]["schema"] == "fabv2.text.v1"
-    assert "schema_" not in raw["payload"]
+    assert "schema_id" not in raw["payload"]
 
 
 def test_eval_request_rejects_unknown_payload_type() -> None:
@@ -137,8 +137,6 @@ def test_v1_evaluate_serializes_pydantic_result(
 ) -> None:
     """evaluate_response may return a Pydantic BaseModel; v1 must model_dump it
     rather than silently nulling the result field."""
-    from pydantic import BaseModel
-
     class StubEvalResult(BaseModel):
         pass_percentage: float
         eval_version: str

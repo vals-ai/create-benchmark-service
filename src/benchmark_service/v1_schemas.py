@@ -50,14 +50,20 @@ class V1EvalResponse(BaseModel):
     task_id: str
     status: V1EvalStatus
     evaluator_version: str | None = None
-    result: dict[str, Any] | None = None
+    result: Any | None = None
+    errors: list[str] = Field(default_factory=list)
+
+
+class V1ScoreItem(BaseModel):
+    status: V1EvalStatus
+    result: Any | None = None
     errors: list[str] = Field(default_factory=list)
 
 
 class V1ScoreRequest(BaseModel):
     run_id: str
     dataset: str | None = None
-    evaluation_results: dict[str, dict[str, Any] | None]
+    evaluation_results: dict[str, V1ScoreItem | None]
 
 
 class V1ScoreResponse(BaseModel):
@@ -73,6 +79,7 @@ __all__ = [
     "V1EvalStatus",
     "V1Payload",
     "V1PayloadType",
+    "V1ScoreItem",
     "V1ScoreRequest",
     "V1ScoreResponse",
     "V1Versions",

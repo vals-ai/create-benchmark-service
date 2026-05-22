@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Generator
+from dataclasses import dataclass
 from unittest.mock import patch
 
 import pytest
@@ -34,6 +35,7 @@ def descope_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, Non
         json.dumps({"tenants": {"acme": {"datasets": ["default"]}}}),
     )
     app = BenchmarkServiceApp(StubBenchmark)
+    app._service_version = "stub-service-1.0"  # pyright: ignore[reportPrivateUsage]
 
     async def _stub_exchange(_project_id: str, _access_key: str) -> dict[str, dict[str, dict[str, str]]]:
         return {"tenants": {"acme": {}}}
@@ -124,6 +126,7 @@ def test_v1_evaluate_returns_evaluated_envelope_for_text_payload(descope_client:
     assert body["run_id"] == "external-run-123"
     assert body["task_id"] == "task-1"
     assert body["status"] == "evaluated"
+    assert body["evaluator_version"] == "stub-service-1.0"
     # StubBenchmark.evaluate_response returns {"resolved": <bool>}.
     # The framework passes the benchmark-specific result through under `result`.
     assert body["result"] == {"resolved": True}
@@ -158,7 +161,34 @@ def test_v1_evaluate_serializes_pydantic_result(
     assert resp.status_code == 200
     body = resp.json()
     assert body["result"] == {"pass_percentage": 0.83, "eval_version": "v1.0"}
-    assert body["evaluator_version"] == "v1.0"
+    assert body["evaluator_version"] == "stub-service-1.0"
+
+
+def test_v1_evaluate_preserves_json_compatible_non_dict_result(
+    descope_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    @dataclass(frozen=True)
+    class StubEvalResult:
+        pass_percentage: float
+        explanation: str
+
+    async def stub_eval(self: object, request: object, dataset: object = None) -> StubEvalResult:
+        return StubEvalResult(pass_percentage=0.5, explanation="partial credit")
+
+    monkeypatch.setattr(StubBenchmark, "evaluate_response", stub_eval)
+
+    resp = descope_client.post(
+        "/v1/evaluate",
+        json={
+            "run_id": "r1",
+            "task_id": "task-1",
+            "dataset": "default",
+            "payload": {"type": "text", "schema": "stub.text.v1", "data": "x"},
+        },
+        headers={"x-descope-api-key": "key-acme"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["result"] == {"pass_percentage": 0.5, "explanation": "partial credit"}
 
 
 def test_v1_evaluate_rejects_artifact_payload_with_400(descope_client: TestClient) -> None:
@@ -196,8 +226,9 @@ def test_v1_score_aggregates_and_wraps_with_run_id(descope_client: TestClient) -
             "run_id": "external-run-123",
             "dataset": "default",
             "evaluation_results": {
-                "task-1": {"resolved": True},
-                "task-2": None,
+                "task-1": {"status": "evaluated", "result": {"resolved": True}},
+                "task-2": {"status": "did_not_complete"},
+                "task-3": None,
             },
         },
         headers={"x-descope-api-key": "key-acme"},
@@ -205,14 +236,18 @@ def test_v1_score_aggregates_and_wraps_with_run_id(descope_client: TestClient) -
     assert resp.status_code == 200
     body = resp.json()
     assert body["run_id"] == "external-run-123"
-    assert "final_score" in body
-    assert "tasks_evaluated" in body
+    assert abs(body["final_score"] - (100 / 3)) < 1e-9
+    assert body["tasks_evaluated"] == ["task-1", "task-2", "task-3"]
 
 
 def test_v1_score_rejects_unauthorized_dataset_with_403(descope_client: TestClient) -> None:
     resp = descope_client.post(
         "/v1/score",
-        json={"run_id": "r", "dataset": "alt", "evaluation_results": {"task-1": {"resolved": True}}},
+        json={
+            "run_id": "r",
+            "dataset": "alt",
+            "evaluation_results": {"task-1": {"status": "evaluated", "result": {"resolved": True}}},
+        },
         headers={"x-descope-api-key": "key-acme"},
     )
     assert resp.status_code == 403

@@ -162,9 +162,9 @@ Response:
 }
 ```
 
-`status` is one of `evaluated`, `did_not_complete`, `generation_error`, `error`. `result` is the benchmark-specific dict your `evaluate_response` returns, passed through. Only `payload.type == "text"` is implemented today; artifact rehydration is a follow-on.
+`status` is one of `evaluated`, `did_not_complete`, `generation_error`, `error`. `result` is the benchmark-specific JSON-compatible value your `evaluate_response` returns, passed through. Only `payload.type == "text"` is implemented today; artifact rehydration is a follow-on.
 
-**`POST /v1/score`** — aggregate across a run. Request `{run_id, dataset, evaluation_results: {task_id: {...} | null}}`. Response `{run_id, tasks_evaluated, final_score, metadata}`.
+**`POST /v1/score`** — aggregate across a run. Request `{run_id, dataset, evaluation_results: {task_id: {"status": "evaluated", "result": {...}} | {"status": "did_not_complete"} | null}}`. Before calling `calculate_final_score`, the framework unwraps evaluated task envelopes to their `result` value and treats non-evaluated or null tasks as `null`. Response `{run_id, tasks_evaluated, final_score, metadata}`.
 
 **Auth.** `/v1/*` is Descope-only. Callers using the legacy `BENCHMARK_API_KEY` bearer (i.e. those that resolve to the `_legacy` tenant sentinel) get 403. Migrate the deploy to Descope (`AUTH_REQUIRED=true` + `DESCOPE_PROJECT_ID` + allowlist) before opening `/v1/` to external traffic.
 

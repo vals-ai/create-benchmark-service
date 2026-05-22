@@ -6,12 +6,12 @@ import os
 import traceback
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
-from typing import Any, cast
+from typing import Any
 
 from daytona import AsyncDaytona, DaytonaConfig
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel as _PydanticBaseModel
 from starlette.websockets import WebSocketDisconnect
 from uvicorn.protocols.utils import ClientDisconnected
 from websockets.exceptions import ConnectionClosed
@@ -342,23 +342,16 @@ class BenchmarkServiceApp(FastAPI):
                 run_id=body.run_id,
                 task_id=body.task_id,
                 status=V1EvalStatus.ERROR,
+                evaluator_version=self._service_version,
                 errors=[str(exc)],
             )
 
-        result_dict: dict[str, Any] | None
-        if isinstance(raw_result, _PydanticBaseModel):
-            result_dict = raw_result.model_dump(mode="json")
-        elif isinstance(raw_result, dict):
-            result_dict = cast("dict[str, Any]", raw_result)
-        else:
-            result_dict = None
-        evaluator_version = result_dict.get("eval_version") if result_dict is not None else None
         return V1EvalResponse(
             run_id=body.run_id,
             task_id=body.task_id,
             status=V1EvalStatus.EVALUATED,
-            evaluator_version=evaluator_version,
-            result=result_dict,
+            evaluator_version=self._service_version,
+            result=jsonable_encoder(raw_result),
             errors=[],
         )
 
@@ -367,8 +360,12 @@ class BenchmarkServiceApp(FastAPI):
         if not await self.service.check_dataset_access(request.state.tenant, body.dataset):
             raise HTTPException(status_code=403, detail="Dataset not allowed")
 
-        tasks_evaluated = await self.service.validate_task_ids(list(body.evaluation_results.keys()), dataset=body.dataset)
-        result = await self.service.calculate_final_score(body.evaluation_results, dataset=body.dataset)
+        normalized_results: dict[str, Any] = {
+            task_id: item.result if item is not None and item.status == V1EvalStatus.EVALUATED else None
+            for task_id, item in body.evaluation_results.items()
+        }
+        tasks_evaluated = await self.service.validate_task_ids(list(normalized_results.keys()), dataset=body.dataset)
+        result = await self.service.calculate_final_score(normalized_results, dataset=body.dataset)
         return V1ScoreResponse(
             run_id=body.run_id,
             tasks_evaluated=tasks_evaluated,

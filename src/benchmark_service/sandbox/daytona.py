@@ -5,6 +5,7 @@ import shlex
 import uuid
 from collections.abc import AsyncGenerator, Callable
 from contextlib import suppress
+from typing import Any
 
 from daytona import (
     AsyncDaytona,
@@ -14,9 +15,11 @@ from daytona import (
     DaytonaConfig,
     DaytonaNotFoundError,
     Resources as DaytonaResources,
+    SandboxState,
 )
-from daytona.common.errors import DaytonaConnectionError, DaytonaError
+from daytona.common.errors import DaytonaConnectionError, DaytonaError, DaytonaRateLimitError, DaytonaTimeoutError
 from daytona.handle.async_pty_handle import AsyncPtyHandle
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
 from benchmark_service.sandbox.types import (
     DaytonaBackendConfig,
@@ -34,6 +37,19 @@ from benchmark_service.sandbox.types import (
 )
 
 _PTY_STATUS_CHECK_ATTEMPTS = 30
+_TRANSIENT_DAYTONA_ERRORS = (DaytonaConnectionError, DaytonaRateLimitError, DaytonaTimeoutError)
+_PROVIDER_RETRY = retry(
+    retry=retry_if_exception_type(SandboxConnectionError),
+    stop=stop_after_attempt(3),
+    wait=wait_fixed(2),
+    reraise=True,
+)
+
+
+def _sandbox_error(exc: DaytonaError) -> SandboxError:
+    if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS):
+        return SandboxConnectionError(str(exc))
+    return SandboxError(str(exc))
 
 
 class DaytonaSandbox(Sandbox):
@@ -56,6 +72,7 @@ class DaytonaSandbox(Sandbox):
     def state(self) -> str:
         return str(self._sandbox.state)
 
+    @_PROVIDER_RETRY
     async def exec(
         self,
         command: str,
@@ -66,10 +83,8 @@ class DaytonaSandbox(Sandbox):
         full_command = _command(command, cwd, timeout)
         try:
             result = await self._sandbox.process.exec(full_command)
-        except DaytonaConnectionError as exc:
-            raise SandboxConnectionError(str(exc)) from exc
         except DaytonaError as exc:
-            raise SandboxError(str(exc)) from exc
+            raise _sandbox_error(exc) from exc
 
         return ExecResult(exit_code=result.exit_code, output=result.result)
 
@@ -96,22 +111,20 @@ class DaytonaSandbox(Sandbox):
         if result.exit_code != 0:
             raise SandboxCommandError(result.exit_code)
 
+    @_PROVIDER_RETRY
     async def upload_file(self, remote_path: str, content: bytes) -> None:
         try:
             await self._sandbox.fs.upload_file(content, remote_path)
-        except DaytonaConnectionError as exc:
-            raise SandboxConnectionError(str(exc)) from exc
         except DaytonaError as exc:
-            raise SandboxError(str(exc)) from exc
+            raise _sandbox_error(exc) from exc
 
+    @_PROVIDER_RETRY
     async def download_file(self, remote_path: str) -> bytes:
         try:
             stream = await self._sandbox.fs.download_file_stream(remote_path)
             return b"".join([chunk async for chunk in stream])
-        except DaytonaConnectionError as exc:
-            raise SandboxConnectionError(str(exc)) from exc
         except DaytonaError as exc:
-            raise SandboxError(str(exc)) from exc
+            raise _sandbox_error(exc) from exc
 
     async def _exec_pty(self, command: str, on_output: Callable[[str], None]) -> ExecResult:
         session_id = f"{self.id}:exec-{uuid.uuid4().hex}"
@@ -147,10 +160,8 @@ class DaytonaSandbox(Sandbox):
             if result.exit_code != 0 or not result.result:
                 raise SandboxError("Failed to read Daytona PTY exit code")
             return ExecResult(exit_code=int(result.result.strip()), output="".join(stdout))
-        except DaytonaConnectionError as exc:
-            raise SandboxConnectionError(str(exc)) from exc
         except DaytonaError as exc:
-            raise SandboxError(str(exc)) from exc
+            raise _sandbox_error(exc) from exc
         finally:
             if handle:
                 with suppress(Exception):
@@ -172,7 +183,12 @@ class DaytonaSandboxProvider(SandboxProvider):
             )
         )
 
+    @_PROVIDER_RETRY
     async def create_sandbox(self, request: SandboxCreateRequest) -> DaytonaSandbox:
+        existing = await self._find_reusable_sandbox(request.name)
+        if existing is not None:
+            return DaytonaSandbox(existing)
+
         resources = DaytonaResources(
             cpu=request.resources.vcpu,
             memory=request.resources.memory,
@@ -211,37 +227,52 @@ class DaytonaSandboxProvider(SandboxProvider):
 
         return DaytonaSandbox(inner)
 
+    async def _find_reusable_sandbox(self, name: str) -> AsyncSandbox | None:
+        try:
+            sandbox = await self._daytona.get(name)
+        except DaytonaNotFoundError:
+            return None
+        except DaytonaError as exc:
+            raise _sandbox_error(exc) from exc
+
+        try:
+            if sandbox.state in (SandboxState.DESTROYING, SandboxState.DESTROYED, SandboxState.STOPPED):
+                return None
+            await sandbox.wait_for_sandbox_start(timeout=0)
+            return sandbox
+        except DaytonaError as exc:
+            raise _sandbox_error(exc) from exc
+
+    @_PROVIDER_RETRY
     async def get_sandbox(self, instance_id: str) -> DaytonaSandbox:
         try:
             return DaytonaSandbox(await self._daytona.get(instance_id))
         except DaytonaNotFoundError as exc:
             raise SandboxNotFoundError(str(exc)) from exc
-        except DaytonaConnectionError as exc:
-            raise SandboxConnectionError(str(exc)) from exc
         except DaytonaError as exc:
-            raise SandboxError(str(exc)) from exc
+            raise _sandbox_error(exc) from exc
 
+    @_PROVIDER_RETRY
     async def delete_sandbox(self, instance_id: str) -> None:
         try:
             sandbox = await self._daytona.get(instance_id)
+            if sandbox.state in (SandboxState.DESTROYING, SandboxState.DESTROYED):
+                return
+            await sandbox.set_autostop_interval(interval=1)
             await self._daytona.delete(sandbox)
         except DaytonaNotFoundError:
             return
-        except DaytonaConnectionError as exc:
-            raise SandboxConnectionError(str(exc)) from exc
         except DaytonaError as exc:
-            raise SandboxError(str(exc)) from exc
+            raise _sandbox_error(exc) from exc
 
     async def list_sandboxes(self, query: SandboxQuery) -> AsyncGenerator[DaytonaSandbox, None]:
         page = 1
         total_pages = 1
         while page <= total_pages:
             try:
-                sandboxes = await self._daytona.list(labels=query.labels, limit=query.page_size, page=page)
-            except DaytonaConnectionError as exc:
-                raise SandboxConnectionError(str(exc)) from exc
-            except DaytonaError as exc:
-                raise SandboxError(str(exc)) from exc
+                sandboxes = await self._list_sandboxes_page(query, page)
+            except SandboxError:
+                raise
 
             total_pages = sandboxes.total_pages
             if not sandboxes.items:
@@ -251,6 +282,13 @@ class DaytonaSandboxProvider(SandboxProvider):
                 yield DaytonaSandbox(sandbox)
 
             page = int(sandboxes.page) + 1
+
+    @_PROVIDER_RETRY
+    async def _list_sandboxes_page(self, query: SandboxQuery, page: int) -> Any:
+        try:
+            return await self._daytona.list(labels=query.labels, limit=query.page_size, page=page)
+        except DaytonaError as exc:
+            raise _sandbox_error(exc) from exc
 
     async def close(self) -> None:
         await self._daytona.close()

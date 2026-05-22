@@ -103,7 +103,7 @@ async def test_retrieve_task_accepts_legacy_shape(
                 "docker_image": "python:3.12",
                 "problem_path": "/tmp/problem_statement.txt",
                 "cwd": "/work",
-                "resources": {"vcpu": 2, "memory": 4, "disk": 10},
+                "resources": {"cpu": 2, "memory_gb": 4, "disk_gb": 10},
                 "agent_timeout": None,
             }
         )

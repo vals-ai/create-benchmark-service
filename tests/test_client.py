@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import benchmark_service.sandbox as sandbox_module
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
 from benchmark_service.sandbox import DaytonaBackendConfig, sandbox_config_from_headers
 from benchmark_service.v1_schemas import V1DatasetTasksResponse
@@ -24,7 +25,7 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
 
 
 def test_sandbox_config_from_headers(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("SANDBOX_PROVIDER", raising=False)
+    monkeypatch.setattr(sandbox_module, "_PROVIDER", "daytona")
 
     assert sandbox_config_from_headers(DAYTONA_HEADERS) == DaytonaBackendConfig(
         api_key="key",
@@ -34,7 +35,7 @@ def test_sandbox_config_from_headers(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_sandbox_config_rejects_unknown_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SANDBOX_PROVIDER", "modal")
+    monkeypatch.setattr(sandbox_module, "_PROVIDER", "modal")
 
     with pytest.raises(ValueError, match="Unknown sandbox provider: modal"):
         sandbox_config_from_headers({})

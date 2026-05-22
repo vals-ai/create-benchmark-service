@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import shlex
 import uuid
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import suppress
 from typing import Any
 
@@ -37,6 +37,7 @@ from benchmark_service.sandbox.types import (
 )
 
 _PTY_STATUS_CHECK_ATTEMPTS = 30
+_STATUS_DIR = "/tmp/.sandbox-provider"
 _TRANSIENT_DAYTONA_ERRORS = (DaytonaConnectionError, DaytonaRateLimitError, DaytonaTimeoutError)
 _PROVIDER_RETRY = retry(
     retry=retry_if_exception_type(SandboxConnectionError),
@@ -96,7 +97,11 @@ class DaytonaSandbox(Sandbox):
         timeout: float | None = None,
     ) -> AsyncGenerator[str, None]:
         output: asyncio.Queue[str] = asyncio.Queue()
-        exec_task = asyncio.create_task(self._exec_pty(_command(command, cwd, timeout), output.put_nowait))
+
+        async def on_output(text: str) -> None:
+            output.put_nowait(text)
+
+        exec_task = asyncio.create_task(self._exec_pty(_command(command, cwd, timeout), on_output))
 
         while not exec_task.done():
             try:
@@ -126,16 +131,18 @@ class DaytonaSandbox(Sandbox):
         except DaytonaError as exc:
             raise _sandbox_error(exc) from exc
 
-    async def _exec_pty(self, command: str, on_output: Callable[[str], None]) -> ExecResult:
+    async def _exec_pty(self, command: str, on_output: Callable[[str], None | Awaitable[None]]) -> ExecResult:
         session_id = f"{self.id}:exec-{uuid.uuid4().hex}"
-        status_path = f"/tmp/.benchmark-service/{uuid.uuid4().hex}.status"
+        status_path = f"{_STATUS_DIR}/{uuid.uuid4().hex}.status"
         stdout: list[str] = []
         handle: AsyncPtyHandle | None = None
 
-        def on_data(data: bytes) -> None:
+        async def on_data(data: bytes) -> None:
             text = data.decode("utf-8", errors="replace")
             stdout.append(text)
-            on_output(text)
+            result = on_output(text)
+            if result is not None:
+                await result
 
         try:
             handle = await self._sandbox.process.create_pty_session(
@@ -144,7 +151,9 @@ class DaytonaSandbox(Sandbox):
                 envs={"TERM": "dumb", "LANG": "C.UTF-8"},
             )
             await handle.send_input("stty -echo\n")
-            await handle.send_input(f"mkdir -p /tmp/.benchmark-service; {command}; echo $? > {status_path}; exit\n")
+            await handle.send_input(
+                f"mkdir -p {shlex.quote(_STATUS_DIR)}; {command}; echo $? > {shlex.quote(status_path)}; exit\n"
+            )
             with suppress(Exception):
                 await handle.wait()
 

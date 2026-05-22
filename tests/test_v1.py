@@ -376,6 +376,7 @@ def test_v1_list_dataset_tasks_rejects_unauthorized_dataset_with_403(descope_cli
         headers={"x-descope-api-key": "key-acme"},
     )
     assert resp.status_code == 403
+    assert resp.json()["detail"] == "Dataset=alt access not allowed"
 
 
 def test_v1_list_dataset_tasks_unauthorized_nonexistent_dataset_gets_403_not_404(descope_client: TestClient) -> None:

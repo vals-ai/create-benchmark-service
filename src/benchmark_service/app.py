@@ -385,7 +385,7 @@ class BenchmarkServiceApp(FastAPI):
     ) -> V1DatasetTasksResponse:
         _require_descope_tenant(request.state.tenant)
         if not await self.service.check_dataset_access(request.state.tenant, dataset):
-            raise HTTPException(status_code=403, detail="Dataset not allowed")
+            raise HTTPException(status_code=403, detail=f"Dataset={dataset} access not allowed")
         try:
             self.service.get_dataset(dataset)
         except ValueError as exc:

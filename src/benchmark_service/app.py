@@ -10,13 +10,14 @@ from typing import Any
 
 from daytona import AsyncDaytona, DaytonaConfig
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from starlette.websockets import WebSocketDisconnect
 from uvicorn.protocols.utils import ClientDisconnected
 from websockets.exceptions import ConnectionClosed
 
 from benchmark_service._version import __version__ as _framework_version
-from benchmark_service.auth import get_auth_settings, load_allowlist
+from benchmark_service.auth import LEGACY_TENANT_SENTINEL, get_auth_settings, load_allowlist
 from benchmark_service.base import BenchmarkService
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.schemas import (
@@ -32,6 +33,14 @@ from benchmark_service.schemas import (
     VerifyTaskIdsResponse,
     VersionResponse,
 )
+from benchmark_service.v1_schemas import (
+    V1EvalRequest,
+    V1EvalResponse,
+    V1EvalStatus,
+    V1PayloadType,
+    V1ScoreRequest,
+    V1ScoreResponse,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -45,6 +54,20 @@ async def send_json_if_connected(websocket: WebSocket, payload: dict[str, Any]) 
 
 
 _PUBLIC_PATHS = frozenset({"/health", "/version"})
+
+
+def _require_descope_tenant(tenant: str | None) -> None:
+    """Raise 403 when the resolved tenant is the legacy bearer sentinel.
+
+    The /v1/ surface requires Descope auth; legacy bearer callers resolve to
+    LEGACY_TENANT_SENTINEL and must be rejected even though they are technically
+    authenticated against the legacy key.
+    """
+    if tenant == LEGACY_TENANT_SENTINEL:
+        raise HTTPException(
+            status_code=403,
+            detail="The /v1/ surface requires Descope authentication; legacy bearer auth is not accepted.",
+        )
 
 
 def _get_service_metadata(service_cls: type[BenchmarkService]) -> tuple[str | None, str | None]:
@@ -106,6 +129,8 @@ class BenchmarkServiceApp(FastAPI):
         self.add_api_websocket_route("/ws/evaluate-response", self._evaluate_response_stream)
         self.add_api_websocket_route("/ws/evaluate-instance", self._evaluate_instance)
         self.add_api_route("/final-score/", self._final_score, methods=["POST"])
+        self.add_api_route("/v1/evaluate", self._v1_evaluate, methods=["POST"], response_model=V1EvalResponse)
+        self.add_api_route("/v1/score", self._v1_score, methods=["POST"], response_model=V1ScoreResponse)
 
     async def _value_error_handler(self, _request: Request, exc: Exception) -> Response:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -293,6 +318,60 @@ class BenchmarkServiceApp(FastAPI):
         finally:
             with suppress(RuntimeError):
                 await websocket.close()
+
+    async def _v1_evaluate(self, request: Request, body: V1EvalRequest) -> V1EvalResponse:
+        _require_descope_tenant(request.state.tenant)
+        if body.payload.type != V1PayloadType.TEXT:
+            raise HTTPException(
+                status_code=400,
+                detail=f"payload.type={body.payload.type.value} not supported; only 'text' is implemented in v1",
+            )
+        if not await self.service.check_dataset_access(request.state.tenant, body.dataset):
+            raise HTTPException(status_code=403, detail="Dataset not allowed")
+
+        internal_req = EvaluateResponseRequest(
+            task_id=body.task_id,
+            response=body.payload.data,
+            dataset=body.dataset,
+        )
+        try:
+            raw_result = await self.service.evaluate_response(internal_req, dataset=body.dataset)
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("v1/evaluate failed for run_id=%s task_id=%s", body.run_id, body.task_id)
+            return V1EvalResponse(
+                run_id=body.run_id,
+                task_id=body.task_id,
+                status=V1EvalStatus.ERROR,
+                evaluator_version=self._service_version,
+                errors=[str(exc)],
+            )
+
+        return V1EvalResponse(
+            run_id=body.run_id,
+            task_id=body.task_id,
+            status=V1EvalStatus.EVALUATED,
+            evaluator_version=self._service_version,
+            result=jsonable_encoder(raw_result),
+            errors=[],
+        )
+
+    async def _v1_score(self, request: Request, body: V1ScoreRequest) -> V1ScoreResponse:
+        _require_descope_tenant(request.state.tenant)
+        if not await self.service.check_dataset_access(request.state.tenant, body.dataset):
+            raise HTTPException(status_code=403, detail="Dataset not allowed")
+
+        normalized_results: dict[str, Any] = {
+            task_id: item.result if item is not None and item.status == V1EvalStatus.EVALUATED else None
+            for task_id, item in body.evaluation_results.items()
+        }
+        tasks_evaluated = await self.service.validate_task_ids(list(normalized_results.keys()), dataset=body.dataset)
+        result = await self.service.calculate_final_score(normalized_results, dataset=body.dataset)
+        return V1ScoreResponse(
+            run_id=body.run_id,
+            tasks_evaluated=tasks_evaluated,
+            final_score=result.score,
+            metadata=result.metadata,
+        )
 
     async def _final_score(self, request: Request, body: FinalScoreRequest) -> FinalScoreResponse:
         if not await self.service.check_dataset_access(request.state.tenant, body.dataset):

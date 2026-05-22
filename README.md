@@ -98,6 +98,8 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | `GET` | `/retrieve-task/?task_id=…` | Return task metadata for a given task ID (optional `?dataset=…`) |
 | `POST` | `/evaluate-response/` | Evaluate without a sandbox and return one final response |
 | `POST` | `/final-score/` | Aggregate results: `{"evaluation_results": {task_id: result, …}, "dataset": "…"}` |
+| `POST` | `/v1/evaluate` | Lab-facing per-task evaluation (see [v1 Eval API](#v1-eval-api-lab-facing) below) |
+| `POST` | `/v1/score` | Lab-facing run aggregation (see [v1 Eval API](#v1-eval-api-lab-facing) below) |
 
 **WebSocket endpoints** (stream `StreamChunk` JSON objects):
 
@@ -130,6 +132,43 @@ StreamResultChunk(type="result", data=<any>)                     # final result 
 ```
 
 Yield these from your generator methods; the framework serialises and forwards them to the WebSocket client.
+
+### v1 Eval API (lab-facing)
+
+`/v1/evaluate` and `/v1/score` are the lab-facing surface. They share scoring handlers with the internal `/evaluate-response/` and `/final-score/` endpoints — a benchmark implements `evaluate_response` and `calculate_final_score` once and inherits both surfaces.
+
+**`POST /v1/evaluate`** — grade one task. Request:
+
+```json
+{
+  "run_id": "external-run-123",
+  "task_id": "01-011",
+  "dataset": "validation",
+  "payload": {"type": "text", "schema": "fabv2.text.v1", "data": "..."},
+  "versions": {"runner": "0.0.10-a1b2c3d"}
+}
+```
+
+Response:
+
+```json
+{
+  "run_id": "external-run-123",
+  "task_id": "01-011",
+  "status": "evaluated",
+  "evaluator_version": "0.0.2",
+  "result": {"pass_percentage": 0.83, "...": "..."},
+  "errors": []
+}
+```
+
+`status` is one of `evaluated`, `did_not_complete`, `generation_error`, `error`. `result` is the benchmark-specific JSON-compatible value your `evaluate_response` returns, passed through. Only `payload.type == "text"` is implemented today; artifact rehydration is a follow-on.
+
+**`POST /v1/score`** — aggregate across a run. Request `{run_id, dataset, evaluation_results: {task_id: {"status": "evaluated", "result": {...}} | {"status": "did_not_complete"} | null}}`. Before calling `calculate_final_score`, the framework unwraps evaluated task envelopes to their `result` value and treats non-evaluated or null tasks as `null`. Response `{run_id, tasks_evaluated, final_score, metadata}`.
+
+**Auth.** `/v1/*` is Descope-only. Callers using the legacy `BENCHMARK_API_KEY` bearer (i.e. those that resolve to the `_legacy` tenant sentinel) get 403. Migrate the deploy to Descope (`AUTH_REQUIRED=true` + `DESCOPE_PROJECT_ID` + allowlist) before opening `/v1/` to external traffic.
+
+**Deferred to follow-on plans.** `GET /v1/schema`, `GET /v1/tasks/{task_id}`, `/ws/v1/evaluate` (streamed judges), artifact payloads, async/`poll_url` response shape, idempotency on `(run_id, task_id)`.
 
 ### Schemas (`schemas.py`)
 

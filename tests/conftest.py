@@ -70,7 +70,7 @@ class StubBenchmark(BenchmarkService):
         self, evaluation_results: dict[str, Any], dataset: str | None = None
     ) -> FinalScoreResult:
         total = len(evaluation_results)
-        resolved = sum(1 for r in evaluation_results.values() if r.get("resolved"))
+        resolved = sum(1 for r in evaluation_results.values() if r is not None and r.get("resolved"))
         score = (resolved / total * 100) if total > 0 else 0.0
         return FinalScoreResult(score=score, metadata={"total": total, "resolved": resolved})
 

@@ -63,7 +63,7 @@ def test_sandbox_config_rejects_unknown_provider(monkeypatch: pytest.MonkeyPatch
                 "source": {"type": "image", "image": "python:3.12"},
                 "problem_path": "/tmp/problem_statement.txt",
                 "cwd": "/work",
-                "resources": {"cpu": 2, "memory_gb": 4, "disk_gb": 10},
+                "resources": {"vcpu": 2, "memory": 4, "disk": 10},
                 "agent_timeout": None,
             },
         ),
@@ -112,7 +112,7 @@ async def test_retrieve_task_accepts_legacy_shape(
     result = await client.retrieve_task("task-1")
 
     assert result.source.model_dump() == {"type": "image", "image": "python:3.12"}
-    assert result.resources.model_dump() == {"cpu": 2, "memory_gb": 4, "disk_gb": 10}
+    assert result.resources.model_dump() == {"vcpu": 2, "memory": 4, "disk": 10}
 
 
 @pytest.mark.parametrize(
@@ -187,7 +187,7 @@ async def test_retrieve_task_with_dataset(
             "source": {"type": "image", "image": "python:3.12"},
             "problem_path": "/tmp/problem_statement.txt",
             "cwd": "/work",
-            "resources": {"cpu": 2, "memory_gb": 4, "disk_gb": 10},
+            "resources": {"vcpu": 2, "memory": 4, "disk": 10},
         }
     )
     mock_http.get = AsyncMock(return_value=mock_resp)

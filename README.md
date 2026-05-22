@@ -192,7 +192,7 @@ Pydantic models used across requests and responses:
 
 - **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `Resources`
 - **`SandboxSource`** — `ImageSource(type="image", image=...)` or `SnapshotSource(type="snapshot", snapshot=...)`
-- **`Resources`** — `cpu`, `memory_gb`, `disk_gb`
+- **`Resources`** — `vcpu`, `memory`, `disk`
 - **`EvaluateResponseRequest`** — `task_id`, `response` or `eval_resume_state`, `dataset`
 - **`FinalScoreResult`** / **`FinalScoreResponse`** — `score` (float), `metadata`, `tasks_evaluated`
 - **`TaskFilter`** — `task_ids` list or `slice_str`; `parse_slice()` converts `"start:stop:step"` to a Python `slice`
@@ -201,7 +201,7 @@ Pydantic models used across requests and responses:
 
 **`stream_command(sandbox, command, cwd, ignore_error=False)`**
 
-Runs a shell command inside a sandbox and yields output lines in real time. Checks the exit code after the command finishes. Use it inside `setup_task` and `evaluate_instance` to run commands and forward output as `StreamMessageChunk`s.
+Runs a shell command inside a sandbox and yields output in real time. Checks the exit code after the command finishes. Use it inside `setup_task` and `evaluate_instance` to run commands and forward output as `StreamMessageChunk`s.
 
 ### Authentication
 

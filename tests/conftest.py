@@ -45,7 +45,7 @@ class StubBenchmark(BenchmarkService):
             problem_path="/tmp/problem_statement.txt",
             cwd="/workspace",
             agent_timeout=60.0,
-            resources=Resources(cpu=2, memory_gb=4, disk_gb=10),
+            resources=Resources(vcpu=2, memory=4, disk=10),
         )
 
     def setup_task(

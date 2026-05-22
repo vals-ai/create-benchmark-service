@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator, Callable
+from collections.abc import AsyncGenerator
 from typing import Annotated, Literal, Self
 
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import BaseModel, Field
 
 
 class ImageSource(BaseModel):
@@ -21,9 +21,9 @@ SandboxSource = Annotated[ImageSource | SnapshotSource, Field(discriminator="typ
 
 
 class Resources(BaseModel):
-    cpu: int = Field(description="Logical sandbox CPU count", validation_alias=AliasChoices("cpu", "vcpu"))
-    memory_gb: int = Field(description="Sandbox memory in GB", validation_alias=AliasChoices("memory_gb", "memory"))
-    disk_gb: int = Field(description="Sandbox ephemeral disk in GB", validation_alias=AliasChoices("disk_gb", "disk"))
+    vcpu: int = Field(description="Logical sandbox CPU count")
+    memory: int = Field(description="Sandbox memory")
+    disk: int = Field(description="Sandbox ephemeral disk")
 
 
 class SandboxCreateRequest(BaseModel):
@@ -32,6 +32,8 @@ class SandboxCreateRequest(BaseModel):
     name: str
     labels: dict[str, str]
     env_vars: dict[str, str]
+    auto_stop_interval: int
+    create_timeout: int
 
 
 class SandboxQuery(BaseModel):
@@ -44,6 +46,11 @@ class DaytonaBackendConfig(BaseModel):
     api_key: str
     api_url: str
     target: str
+
+    def create_provider(self) -> SandboxProvider:
+        from benchmark_service.sandbox.daytona import DaytonaSandboxProvider
+
+        return DaytonaSandboxProvider(self)
 
 
 SandboxBackendConfig = DaytonaBackendConfig
@@ -61,15 +68,37 @@ class SandboxNotFoundError(SandboxError):
     pass
 
 
+class SandboxConnectionError(SandboxError):
+    pass
+
+
+class SandboxCommandError(SandboxError):
+    def __init__(self, exit_code: int) -> None:
+        self.exit_code = exit_code
+        super().__init__(f"Command failed with exit code {exit_code}")
+
+
 class ExecResult(BaseModel):
     exit_code: int
-    stdout: str = ""
+    output: str | None = None
+
+    @property
+    def stdout(self) -> str:
+        return self.output or ""
 
 
 class Sandbox(ABC):
-    id: str
-    name: str
-    state: str
+    @property
+    @abstractmethod
+    def id(self) -> str: ...
+
+    @property
+    @abstractmethod
+    def name(self) -> str: ...
+
+    @property
+    @abstractmethod
+    def state(self) -> str: ...
 
     @abstractmethod
     async def exec(
@@ -78,8 +107,16 @@ class Sandbox(ABC):
         *,
         cwd: str | None = None,
         timeout: float | None = None,
-        on_output: Callable[[str], None] | None = None,
     ) -> ExecResult: ...
+
+    @abstractmethod
+    def command(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        timeout: float | None = None,
+    ) -> AsyncGenerator[str, None]: ...
 
     @abstractmethod
     async def upload_file(self, remote_path: str, content: bytes) -> None: ...

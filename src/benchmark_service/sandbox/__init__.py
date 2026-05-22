@@ -12,6 +12,8 @@ from benchmark_service.sandbox.types import (
     Resources,
     Sandbox,
     SandboxBackendConfig,
+    SandboxCommandError,
+    SandboxConnectionError,
     SandboxCreateRequest,
     SandboxError,
     SandboxNotFoundError,
@@ -37,9 +39,7 @@ def sandbox_config_from_headers(headers: Mapping[str, str]) -> SandboxBackendCon
 
 
 def create_provider(config: SandboxBackendConfig) -> SandboxProvider:
-    match config:
-        case DaytonaBackendConfig():
-            return DaytonaSandboxProvider(config)
+    return config.create_provider()
 
 
 __all__ = [
@@ -52,6 +52,8 @@ __all__ = [
     "Resources",
     "Sandbox",
     "SandboxBackendConfig",
+    "SandboxCommandError",
+    "SandboxConnectionError",
     "SandboxCreateRequest",
     "SandboxError",
     "SandboxNotFoundError",

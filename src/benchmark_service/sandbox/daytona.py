@@ -15,7 +15,7 @@ from daytona import (
     DaytonaNotFoundError,
     Resources as DaytonaResources,
 )
-from daytona.common.errors import DaytonaError
+from daytona.common.errors import DaytonaConnectionError, DaytonaError
 from daytona.handle.async_pty_handle import AsyncPtyHandle
 
 from benchmark_service.sandbox.types import (
@@ -23,6 +23,8 @@ from benchmark_service.sandbox.types import (
     ExecResult,
     ImageSource,
     Sandbox,
+    SandboxCommandError,
+    SandboxConnectionError,
     SandboxCreateRequest,
     SandboxError,
     SandboxNotFoundError,
@@ -31,20 +33,28 @@ from benchmark_service.sandbox.types import (
     SnapshotSource,
 )
 
-_SANDBOX_AUTOSTOP_INTERVAL_MINUTES = 10 * 60
-_SANDBOX_CREATE_TIMEOUT_SECONDS = 360
+_PTY_STATUS_CHECK_ATTEMPTS = 30
 
 
 class DaytonaSandbox(Sandbox):
-    def __init__(self, inner: AsyncSandbox) -> None:
-        self._inner = inner
-        self.id = inner.id
-        self.name = inner.name
-        self.state = str(inner.state)
+    def __init__(self, sandbox: AsyncSandbox) -> None:
+        self._sandbox = sandbox
 
     @property
     def inner(self) -> AsyncSandbox:
-        return self._inner
+        return self._sandbox
+
+    @property
+    def id(self) -> str:
+        return self._sandbox.id
+
+    @property
+    def name(self) -> str:
+        return self._sandbox.name
+
+    @property
+    def state(self) -> str:
+        return str(self._sandbox.state)
 
     async def exec(
         self,
@@ -52,29 +62,54 @@ class DaytonaSandbox(Sandbox):
         *,
         cwd: str | None = None,
         timeout: float | None = None,
-        on_output: Callable[[str], None] | None = None,
     ) -> ExecResult:
         full_command = _command(command, cwd, timeout)
-        if on_output:
-            return await self._exec_pty(full_command, on_output)
-
         try:
-            result = await self._inner.process.exec(full_command)
+            result = await self._sandbox.process.exec(full_command)
+        except DaytonaConnectionError as exc:
+            raise SandboxConnectionError(str(exc)) from exc
         except DaytonaError as exc:
             raise SandboxError(str(exc)) from exc
 
-        return ExecResult(exit_code=result.exit_code, stdout=result.result or "")
+        return ExecResult(exit_code=result.exit_code, output=result.result)
+
+    async def command(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        timeout: float | None = None,
+    ) -> AsyncGenerator[str, None]:
+        output: asyncio.Queue[str] = asyncio.Queue()
+        exec_task = asyncio.create_task(self._exec_pty(_command(command, cwd, timeout), output.put_nowait))
+
+        while not exec_task.done():
+            try:
+                yield await asyncio.wait_for(output.get(), timeout=0.1)
+            except TimeoutError:
+                continue
+
+        while not output.empty():
+            yield output.get_nowait()
+
+        result = await exec_task
+        if result.exit_code != 0:
+            raise SandboxCommandError(result.exit_code)
 
     async def upload_file(self, remote_path: str, content: bytes) -> None:
         try:
-            await self._inner.fs.upload_file(content, remote_path)
+            await self._sandbox.fs.upload_file(content, remote_path)
+        except DaytonaConnectionError as exc:
+            raise SandboxConnectionError(str(exc)) from exc
         except DaytonaError as exc:
             raise SandboxError(str(exc)) from exc
 
     async def download_file(self, remote_path: str) -> bytes:
         try:
-            stream = await self._inner.fs.download_file_stream(remote_path)
+            stream = await self._sandbox.fs.download_file_stream(remote_path)
             return b"".join([chunk async for chunk in stream])
+        except DaytonaConnectionError as exc:
+            raise SandboxConnectionError(str(exc)) from exc
         except DaytonaError as exc:
             raise SandboxError(str(exc)) from exc
 
@@ -90,7 +125,7 @@ class DaytonaSandbox(Sandbox):
             on_output(text)
 
         try:
-            handle = await self._inner.process.create_pty_session(
+            handle = await self._sandbox.process.create_pty_session(
                 id=session_id,
                 on_data=on_data,
                 envs={"TERM": "dumb", "LANG": "C.UTF-8"},
@@ -100,16 +135,20 @@ class DaytonaSandbox(Sandbox):
             with suppress(Exception):
                 await handle.wait()
 
-            while True:
-                result = await self._inner.process.exec(f"test -e {shlex.quote(status_path)}")
+            for _ in range(_PTY_STATUS_CHECK_ATTEMPTS):
+                result = await self._sandbox.process.exec(f"test -e {shlex.quote(status_path)}")
                 if result.exit_code == 0:
                     break
                 await asyncio.sleep(1)
+            else:
+                raise SandboxConnectionError("Daytona PTY closed before writing exit code")
 
-            result = await self._inner.process.exec(f"cat {shlex.quote(status_path)}")
+            result = await self._sandbox.process.exec(f"cat {shlex.quote(status_path)}")
             if result.exit_code != 0 or not result.result:
                 raise SandboxError("Failed to read Daytona PTY exit code")
-            return ExecResult(exit_code=int(result.result.strip()), stdout="".join(stdout))
+            return ExecResult(exit_code=int(result.result.strip()), output="".join(stdout))
+        except DaytonaConnectionError as exc:
+            raise SandboxConnectionError(str(exc)) from exc
         except DaytonaError as exc:
             raise SandboxError(str(exc)) from exc
         finally:
@@ -117,9 +156,9 @@ class DaytonaSandbox(Sandbox):
                 with suppress(Exception):
                     await handle.disconnect()
             with suppress(Exception):
-                await self._inner.process.kill_pty_session(session_id)
+                await self._sandbox.process.kill_pty_session(session_id)
             with suppress(Exception):
-                await self._inner.process.exec(f"rm -f {shlex.quote(status_path)}")
+                await self._sandbox.process.exec(f"rm -f {shlex.quote(status_path)}")
 
 
 class DaytonaSandboxProvider(SandboxProvider):
@@ -135,16 +174,16 @@ class DaytonaSandboxProvider(SandboxProvider):
 
     async def create_sandbox(self, request: SandboxCreateRequest) -> DaytonaSandbox:
         resources = DaytonaResources(
-            cpu=request.resources.cpu,
-            memory=request.resources.memory_gb,
-            disk=request.resources.disk_gb,
+            cpu=request.resources.vcpu,
+            memory=request.resources.memory,
+            disk=request.resources.disk,
         )
 
         match request.source:
             case ImageSource(image=image):
                 inner = await self._daytona.create(
                     CreateSandboxFromImageParams(
-                        auto_stop_interval=_SANDBOX_AUTOSTOP_INTERVAL_MINUTES,
+                        auto_stop_interval=request.auto_stop_interval,
                         auto_delete_interval=0,
                         name=request.name,
                         labels=request.labels,
@@ -153,12 +192,12 @@ class DaytonaSandboxProvider(SandboxProvider):
                         resources=resources,
                         env_vars=request.env_vars,
                     ),
-                    timeout=_SANDBOX_CREATE_TIMEOUT_SECONDS,
+                    timeout=request.create_timeout,
                 )
             case SnapshotSource(snapshot=snapshot):
                 inner = await self._daytona.create(
                     CreateSandboxFromSnapshotParams(
-                        auto_stop_interval=_SANDBOX_AUTOSTOP_INTERVAL_MINUTES,
+                        auto_stop_interval=request.auto_stop_interval,
                         auto_delete_interval=0,
                         name=request.name,
                         labels=request.labels,
@@ -167,7 +206,7 @@ class DaytonaSandboxProvider(SandboxProvider):
                         network_block_all=False,
                         env_vars=request.env_vars,
                     ),
-                    timeout=_SANDBOX_CREATE_TIMEOUT_SECONDS,
+                    timeout=request.create_timeout,
                 )
 
         return DaytonaSandbox(inner)
@@ -177,6 +216,8 @@ class DaytonaSandboxProvider(SandboxProvider):
             return DaytonaSandbox(await self._daytona.get(instance_id))
         except DaytonaNotFoundError as exc:
             raise SandboxNotFoundError(str(exc)) from exc
+        except DaytonaConnectionError as exc:
+            raise SandboxConnectionError(str(exc)) from exc
         except DaytonaError as exc:
             raise SandboxError(str(exc)) from exc
 
@@ -186,6 +227,8 @@ class DaytonaSandboxProvider(SandboxProvider):
             await self._daytona.delete(sandbox)
         except DaytonaNotFoundError:
             return
+        except DaytonaConnectionError as exc:
+            raise SandboxConnectionError(str(exc)) from exc
         except DaytonaError as exc:
             raise SandboxError(str(exc)) from exc
 
@@ -195,6 +238,8 @@ class DaytonaSandboxProvider(SandboxProvider):
         while page <= total_pages:
             try:
                 sandboxes = await self._daytona.list(labels=query.labels, limit=query.page_size, page=page)
+            except DaytonaConnectionError as exc:
+                raise SandboxConnectionError(str(exc)) from exc
             except DaytonaError as exc:
                 raise SandboxError(str(exc)) from exc
 

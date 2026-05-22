@@ -3,11 +3,10 @@
 This module provides common helper functions for interacting with sandboxes.
 """
 
-import asyncio
 import logging
 from collections.abc import AsyncGenerator
 
-from benchmark_service.sandbox import Sandbox
+from benchmark_service.sandbox import Sandbox, SandboxCommandError
 
 logger = logging.getLogger(__name__)
 
@@ -26,22 +25,10 @@ async def stream_command(
     Yields:
         Output lines from the command as they are produced
     """
-    output_queue: asyncio.Queue[str] = asyncio.Queue()
-
-    def on_output(text: str) -> None:
-        if text.strip():
-            output_queue.put_nowait(text)
-
-    exec_task = asyncio.create_task(sandbox.exec(command, cwd=cwd, on_output=on_output))
-    while not exec_task.done():
-        try:
-            yield await asyncio.wait_for(output_queue.get(), timeout=0.1)
-        except asyncio.TimeoutError:
-            continue
-
-    while not output_queue.empty():
-        yield output_queue.get_nowait()
-
-    result = await exec_task
-    if result.exit_code != 0 and not ignore_error:
-        raise ValueError(f"Command failed with exit code {result.exit_code}")
+    try:
+        async for text in sandbox.command(command, cwd=cwd):
+            if text.strip():
+                yield text
+    except SandboxCommandError as exc:
+        if not ignore_error:
+            raise ValueError(f"Command failed with exit code {exc.exit_code}") from exc

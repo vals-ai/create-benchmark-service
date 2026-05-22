@@ -73,7 +73,27 @@ class V1ScoreResponse(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class V1Task(BaseModel):
+    """A task as exposed on the lab-facing /v1/ surface.
+
+    `extra="allow"` so benchmarks can ship additional per-task fields
+    (system prompt overrides, docker image hints, etc.) without each
+    addition requiring a framework change.
+    """
+
+    model_config = ConfigDict(extra="allow")
+    id: str
+    question: str
+    timeout: float | None = None
+
+
+class V1DatasetTasksResponse(BaseModel):
+    dataset: str
+    tasks: list[V1Task]
+
+
 __all__ = [
+    "V1DatasetTasksResponse",
     "V1EvalRequest",
     "V1EvalResponse",
     "V1EvalStatus",
@@ -82,5 +102,6 @@ __all__ = [
     "V1ScoreItem",
     "V1ScoreRequest",
     "V1ScoreResponse",
+    "V1Task",
     "V1Versions",
 ]

@@ -34,6 +34,7 @@ from benchmark_service.schemas import (
     VersionResponse,
 )
 from benchmark_service.v1_schemas import (
+    V1DatasetTasksResponse,
     V1EvalRequest,
     V1EvalResponse,
     V1EvalStatus,
@@ -131,6 +132,12 @@ class BenchmarkServiceApp(FastAPI):
         self.add_api_route("/final-score/", self._final_score, methods=["POST"])
         self.add_api_route("/v1/evaluate", self._v1_evaluate, methods=["POST"], response_model=V1EvalResponse)
         self.add_api_route("/v1/score", self._v1_score, methods=["POST"], response_model=V1ScoreResponse)
+        self.add_api_route(
+            "/v1/datasets/{dataset}/tasks",
+            self._v1_list_dataset_tasks,
+            methods=["GET"],
+            response_model=V1DatasetTasksResponse,
+        )
 
     async def _value_error_handler(self, _request: Request, exc: Exception) -> Response:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -372,6 +379,18 @@ class BenchmarkServiceApp(FastAPI):
             final_score=result.score,
             metadata=result.metadata,
         )
+
+    async def _v1_list_dataset_tasks(
+        self, request: Request, dataset: str
+    ) -> V1DatasetTasksResponse:
+        _require_descope_tenant(request.state.tenant)
+        if not await self.service.check_dataset_access(request.state.tenant, dataset):
+            raise HTTPException(status_code=403, detail="Dataset not allowed")
+        try:
+            tasks = await self.service.list_tasks(dataset=dataset)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=f"Dataset not found: {dataset}") from exc
+        return V1DatasetTasksResponse(dataset=dataset, tasks=tasks)
 
     async def _final_score(self, request: Request, body: FinalScoreRequest) -> FinalScoreResponse:
         if not await self.service.check_dataset_access(request.state.tenant, body.dataset):

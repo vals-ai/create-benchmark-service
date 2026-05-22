@@ -7,7 +7,7 @@ a FastAPI app with your implementation.
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
-from typing import Any, Self
+from typing import Any, Self, cast
 
 from daytona import AsyncSandbox
 
@@ -20,6 +20,7 @@ from benchmark_service.schemas import (
     StreamResultChunk,
     TaskFilter,
 )
+from benchmark_service.v1_schemas import V1Task
 
 
 class BenchmarkService(ABC):
@@ -116,6 +117,33 @@ class BenchmarkService(ABC):
             return all_task_ids[slice_obj]
 
         return all_task_ids
+
+    async def list_tasks(self, dataset: str | None = None) -> list[V1Task]:
+        """Return tasks for `dataset` as the lab-facing /v1/ surface sees them.
+
+        Default impl walks `get_dataset(dataset)` and projects only `id`,
+        `question` (falling back to `problem`), and `timeout`. Benchmark
+        task dicts may contain evaluator-only fields (rubric, expected
+        answer, grader config, etc.) that must NOT leak to external labs,
+        so the default deliberately strips all extras. Benchmarks that
+        want to expose richer per-task surfaces override `list_tasks` and
+        explicitly choose which fields to pass through.
+
+        Raises:
+            ValueError: if the dataset is not known (delegates to `get_dataset`).
+        """
+        tasks_dict = self.get_dataset(dataset)
+        out: list[V1Task] = []
+        for task_id, task_data in tasks_dict.items():
+            if isinstance(task_data, dict):
+                d = cast(dict[str, Any], task_data)
+                question = d.get("question") or d.get("problem") or ""
+                timeout = d.get("timeout")
+            else:
+                question = str(task_data)
+                timeout = None
+            out.append(V1Task(id=task_id, question=question, timeout=timeout))
+        return out
 
     async def validate_task_ids(self, task_ids: list[str], dataset: str | None = None) -> list[str]:
         """Validate that task IDs exist in your benchmark dataset.

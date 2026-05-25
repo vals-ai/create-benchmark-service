@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
-from typing import Annotated, Literal, Self, cast
+from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator
 
 
 class ImageSource(BaseModel):
@@ -24,18 +24,6 @@ class Resources(BaseModel):
     vcpu: int = Field(description="Logical sandbox CPU count")
     memory: int = Field(description="Sandbox memory")
     disk: int = Field(description="Sandbox ephemeral disk")
-
-    @model_validator(mode="before")
-    @classmethod
-    def parse_legacy_fields(cls, data: object) -> object:
-        if not isinstance(data, dict):
-            return data
-        raw = cast(dict[str, object], data)
-        return {
-            "vcpu": raw.get("vcpu", raw.get("cpu")),
-            "memory": raw.get("memory", raw.get("memory_gb")),
-            "disk": raw.get("disk", raw.get("disk_gb")),
-        }
 
 
 class SandboxCreateRequest(BaseModel):
@@ -94,6 +82,13 @@ class ExecResult(BaseModel):
     exit_code: int
     output: str | None = None
 
+    @field_validator("output", mode="before")
+    @classmethod
+    def empty_output_to_none(cls, value: object) -> object:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
     @property
     def stdout(self) -> str:
         return self.output or ""
@@ -122,7 +117,7 @@ class Sandbox(ABC):
     ) -> ExecResult: ...
 
     @abstractmethod
-    def command(
+    def stream_command(
         self,
         command: str,
         *,

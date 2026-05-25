@@ -65,7 +65,15 @@ class RetrieveTaskResponse(BaseModel):
         legacy = cast(dict[str, Any], data)
         if "docker_image" not in legacy:
             return legacy
-        return {**legacy, "source": {"type": "image", "image": legacy["docker_image"]}}
+
+        raw_resources = cast(dict[str, Any], legacy["resources"])
+        resources = {
+            "vcpu": raw_resources.get("vcpu", raw_resources.get("cpu")),
+            "memory": raw_resources.get("memory", raw_resources.get("memory_gb")),
+            "disk": raw_resources.get("disk", raw_resources.get("disk_gb")),
+        }
+
+        return {**legacy, "source": {"type": "image", "image": legacy["docker_image"]}, "resources": resources}
 
 
 class SetupTaskRequest(BaseModel):

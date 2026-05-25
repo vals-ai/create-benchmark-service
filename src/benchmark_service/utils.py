@@ -26,7 +26,7 @@ async def stream_command(
         Output lines from the command as they are produced
     """
     try:
-        async for text in sandbox.command(command, cwd=cwd):
+        async for text in sandbox.stream_command(command, cwd=cwd):
             if text.strip():
                 yield text
     except SandboxCommandError as exc:

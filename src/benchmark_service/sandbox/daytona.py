@@ -89,7 +89,7 @@ class DaytonaSandbox(Sandbox):
 
         return ExecResult(exit_code=result.exit_code, output=result.result)
 
-    async def command(
+    async def stream_command(
         self,
         command: str,
         *,
@@ -288,6 +288,8 @@ class DaytonaSandboxProvider(SandboxProvider):
                 return
 
             for sandbox in sandboxes.items:
+                if sandbox.state in (SandboxState.DESTROYING, SandboxState.DESTROYED):
+                    continue
                 yield DaytonaSandbox(sandbox)
 
             page = int(sandboxes.page) + 1

@@ -3,6 +3,7 @@
 import json
 from collections.abc import Generator
 from dataclasses import dataclass
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -12,6 +13,7 @@ from pydantic import BaseModel, ValidationError
 from benchmark_service import auth as auth_module
 from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.auth import clear_allowlist_cache, clear_auth_cache
+from benchmark_service.schemas import FinalScoreResult
 from benchmark_service.v1_schemas import (
     V1DatasetTasksResponse,
     V1EvalRequest,
@@ -31,6 +33,18 @@ class TaskListingBenchmark(StubBenchmark):
             V1Task(id=task_id, question=task["problem"])
             for task_id, task in self.get_dataset(dataset).items()
         ]
+
+
+class CapturingScoreBenchmark(StubBenchmark):
+    captured_evaluation_results: dict[str, Any] | None = None
+    captured_dataset: str | None = None
+
+    async def calculate_final_score(
+        self, evaluation_results: dict[str, Any], dataset: str | None = None
+    ) -> FinalScoreResult:
+        type(self).captured_evaluation_results = evaluation_results
+        type(self).captured_dataset = dataset
+        return await super().calculate_final_score(evaluation_results, dataset=dataset)
 
 
 @pytest.fixture
@@ -66,6 +80,28 @@ def task_listing_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient
         json.dumps({"tenants": {"acme": {"datasets": ["default"]}}}),
     )
     app = BenchmarkServiceApp(TaskListingBenchmark)
+
+    async def _stub_exchange(_project_id: str, _access_key: str) -> dict[str, dict[str, dict[str, str]]]:
+        return {"tenants": {"acme": {}}}
+
+    with patch.object(auth_module, "_exchange_descope_access_key", _stub_exchange):
+        with TestClient(app) as client:
+            yield client
+
+
+@pytest.fixture
+def scoring_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
+    clear_allowlist_cache()
+    clear_auth_cache()
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
+    monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
+    monkeypatch.setenv(
+        "DESCOPE_TENANT_ALLOWLIST_JSON",
+        json.dumps({"tenants": {"acme": {"datasets": ["default"]}}}),
+    )
+    CapturingScoreBenchmark.captured_evaluation_results = None
+    CapturingScoreBenchmark.captured_dataset = None
+    app = BenchmarkServiceApp(CapturingScoreBenchmark)
 
     async def _stub_exchange(_project_id: str, _access_key: str) -> dict[str, dict[str, dict[str, str]]]:
         return {"tenants": {"acme": {}}}
@@ -247,15 +283,15 @@ def test_v1_evaluate_rejects_unauthorized_dataset_with_403(descope_client: TestC
     assert resp.status_code == 403
 
 
-def test_v1_score_aggregates_and_wraps_with_run_id(descope_client: TestClient) -> None:
-    resp = descope_client.post(
+def test_v1_score_passes_eval_envelopes_to_final_scoring(scoring_client: TestClient) -> None:
+    resp = scoring_client.post(
         "/v1/score",
         json={
             "run_id": "external-run-123",
             "dataset": "default",
             "evaluation_results": {
-                "task-1": {"status": "evaluated", "result": {"resolved": True}},
-                "task-2": {"status": "did_not_complete"},
+                "task-1": {"status": "evaluated", "result": {"resolved": True}, "errors": []},
+                "task-2": {"status": "did_not_complete", "errors": ["timed out"]},
                 "task-3": None,
             },
         },
@@ -264,8 +300,24 @@ def test_v1_score_aggregates_and_wraps_with_run_id(descope_client: TestClient) -
     assert resp.status_code == 200
     body = resp.json()
     assert body["run_id"] == "external-run-123"
-    assert abs(body["final_score"] - (100 / 3)) < 1e-9
+    assert abs(float(body["final_score"]) - (100 / 3)) < 1e-9
+    assert body["metadata"] == {"total": 3, "resolved": 1}
     assert body["tasks_evaluated"] == ["task-1", "task-2", "task-3"]
+    assert CapturingScoreBenchmark.captured_dataset == "default"
+    assert CapturingScoreBenchmark.captured_evaluation_results == {
+        "task-1": {
+            "task_id": "task-1",
+            "status": "evaluated",
+            "result": {"resolved": True},
+        },
+        "task-2": {
+            "task_id": "task-2",
+            "status": "did_not_complete",
+            "result": None,
+            "error": "timed out",
+        },
+        "task-3": None,
+    }
 
 
 def test_v1_score_rejects_unauthorized_dataset_with_403(descope_client: TestClient) -> None:

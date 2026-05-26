@@ -39,6 +39,7 @@ from benchmark_service.v1_schemas import (
     V1EvalResponse,
     V1EvalStatus,
     V1PayloadType,
+    V1ScoreItem,
     V1ScoreRequest,
     V1ScoreResponse,
 )
@@ -86,6 +87,21 @@ def _get_service_metadata(service_cls: type[BenchmarkService]) -> tuple[str | No
         return dist_name, importlib.metadata.version(dist_name)
     except importlib.metadata.PackageNotFoundError:
         return None, None
+
+
+def _v1_score_item_to_eval_result(task_id: str, item: V1ScoreItem | None) -> dict[str, Any] | None:
+    if item is None:
+        return None
+
+    result: dict[str, Any] = {
+        "task_id": task_id,
+        "status": item.status.value,
+        "result": jsonable_encoder(item.result),
+    }
+    if item.errors:
+        # Runner-side EvalResult.error is str | None, so v1's error list collapses here.
+        result["error"] = "; ".join(item.errors)
+    return result
 
 
 class BenchmarkServiceApp(FastAPI):
@@ -367,8 +383,8 @@ class BenchmarkServiceApp(FastAPI):
         if not await self.service.check_dataset_access(request.state.tenant, body.dataset):
             raise HTTPException(status_code=403, detail="Dataset not allowed")
 
-        normalized_results: dict[str, Any] = {
-            task_id: item.result if item is not None and item.status == V1EvalStatus.EVALUATED else None
+        normalized_results = {
+            task_id: _v1_score_item_to_eval_result(task_id, item)
             for task_id, item in body.evaluation_results.items()
         }
         tasks_evaluated = await self.service.validate_task_ids(list(normalized_results.keys()), dataset=body.dataset)

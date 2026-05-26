@@ -1,7 +1,7 @@
 """Shared test fixtures and stub implementations."""
 
 from collections.abc import AsyncGenerator, Generator
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock
 
 import pytest
@@ -18,6 +18,21 @@ from benchmark_service.schemas import (
     RetrieveTaskResponse,
     StreamChunk,
 )
+
+
+def _score_item_resolved(score_item: object) -> bool:
+    if not isinstance(score_item, dict):
+        return False
+
+    item = cast(dict[str, object], score_item)
+    if "status" in item and "result" in item:
+        result = item.get("result")
+        if not isinstance(result, dict):
+            return False
+        nested_result = cast(dict[str, object], result)
+        return item.get("status") == "evaluated" and nested_result.get("resolved") is True
+
+    return item.get("resolved") is True
 
 
 class StubBenchmark(BenchmarkService):
@@ -70,7 +85,7 @@ class StubBenchmark(BenchmarkService):
         self, evaluation_results: dict[str, Any], dataset: str | None = None
     ) -> FinalScoreResult:
         total = len(evaluation_results)
-        resolved = sum(1 for r in evaluation_results.values() if r is not None and r.get("resolved"))
+        resolved = sum(1 for r in evaluation_results.values() if _score_item_resolved(r))
         score = (resolved / total * 100) if total > 0 else 0.0
         return FinalScoreResult(score=score, metadata={"total": total, "resolved": resolved})
 

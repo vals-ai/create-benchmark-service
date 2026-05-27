@@ -62,18 +62,11 @@ class RetrieveTaskResponse(BaseModel):
     def parse_legacy_fields(cls, data: object) -> object:
         if not isinstance(data, dict):
             return data
-        legacy = cast(dict[str, Any], data)
+        legacy = cast(dict[str, object], data)
         if "docker_image" not in legacy:
             return legacy
 
-        raw_resources = cast(dict[str, Any], legacy["resources"])
-        resources = {
-            "vcpu": raw_resources.get("vcpu", raw_resources.get("cpu")),
-            "memory": raw_resources.get("memory", raw_resources.get("memory_gb")),
-            "disk": raw_resources.get("disk", raw_resources.get("disk_gb")),
-        }
-
-        return {**legacy, "source": {"type": "image", "image": legacy["docker_image"]}, "resources": resources}
+        return {**legacy, "source": {"type": "image", "image": legacy["docker_image"]}}
 
 
 class SetupTaskRequest(BaseModel):

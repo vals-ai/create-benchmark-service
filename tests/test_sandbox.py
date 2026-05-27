@@ -4,12 +4,11 @@ from typing import Any, Awaitable, Callable, cast
 from daytona import SandboxState
 
 from benchmark_service.sandbox import (
-    DaytonaSandbox,
-    DaytonaSandboxProvider,
     ImageSource,
     Resources,
     SandboxCreateRequest,
 )
+from benchmark_service.sandbox.daytona import DaytonaSandbox, DaytonaSandboxProvider
 
 
 class Process:
@@ -145,10 +144,10 @@ async def test_daytona_download_file_streams_content() -> None:
     assert await sandbox.download_file("/tmp/result.txt") == b"hello world"
 
 
-async def test_daytona_stream_command_streams_output() -> None:
+async def test_daytona_command_streams_output() -> None:
     sandbox = DaytonaSandbox(cast(Any, InnerSandbox()))
 
-    output = [chunk async for chunk in sandbox.stream_command("printf hello")]
+    output = [chunk async for chunk in sandbox.command("printf hello")]
 
     assert output == ["hello"]
 
@@ -159,7 +158,7 @@ async def test_daytona_provider_reuses_started_sandbox() -> None:
 
     sandbox = await _provider(daytona).create_sandbox(_request(inner.name))
 
-    assert sandbox.inner is inner
+    assert sandbox.id == inner.id
     assert daytona.created is False
 
 

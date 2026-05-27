@@ -8,7 +8,8 @@ import pytest
 
 import benchmark_service.sandbox as sandbox_module
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
-from benchmark_service.sandbox import DaytonaBackendConfig, sandbox_config_from_headers
+from benchmark_service.sandbox import sandbox_config_from_headers
+from benchmark_service.sandbox.types import DaytonaBackendConfig
 from benchmark_service.v1_schemas import V1DatasetTasksResponse
 
 BASE_URL = "http://localhost:8000"

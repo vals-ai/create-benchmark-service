@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import shlex
 import uuid
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator
 from contextlib import suppress
 from typing import Any
 
@@ -58,10 +58,6 @@ class DaytonaSandbox(Sandbox):
         self._sandbox = sandbox
 
     @property
-    def inner(self) -> AsyncSandbox:
-        return self._sandbox
-
-    @property
     def id(self) -> str:
         return self._sandbox.id
 
@@ -87,9 +83,9 @@ class DaytonaSandbox(Sandbox):
         except DaytonaError as exc:
             raise _sandbox_error(exc) from exc
 
-        return ExecResult(exit_code=result.exit_code, output=result.result)
+        return ExecResult(exit_code=result.exit_code, output=result.result or "")
 
-    async def stream_command(
+    async def command(
         self,
         command: str,
         *,
@@ -97,11 +93,7 @@ class DaytonaSandbox(Sandbox):
         timeout: float | None = None,
     ) -> AsyncGenerator[str, None]:
         output: asyncio.Queue[str] = asyncio.Queue()
-
-        async def on_output(text: str) -> None:
-            output.put_nowait(text)
-
-        exec_task = asyncio.create_task(self._exec_pty(_command(command, cwd, timeout), on_output))
+        exec_task = asyncio.create_task(self._exec_pty(_command(command, cwd, timeout), output))
 
         while not exec_task.done():
             try:
@@ -131,7 +123,7 @@ class DaytonaSandbox(Sandbox):
         except DaytonaError as exc:
             raise _sandbox_error(exc) from exc
 
-    async def _exec_pty(self, command: str, on_output: Callable[[str], None | Awaitable[None]]) -> ExecResult:
+    async def _exec_pty(self, command: str, output: asyncio.Queue[str]) -> ExecResult:
         session_id = f"{self.id}:exec-{uuid.uuid4().hex}"
         status_path = f"{_STATUS_DIR}/{uuid.uuid4().hex}.status"
         stdout: list[str] = []
@@ -140,9 +132,7 @@ class DaytonaSandbox(Sandbox):
         async def on_data(data: bytes) -> None:
             text = data.decode("utf-8", errors="replace")
             stdout.append(text)
-            result = on_output(text)
-            if result is not None:
-                await result
+            output.put_nowait(text)
 
         try:
             handle = await self._sandbox.process.create_pty_session(
@@ -278,11 +268,7 @@ class DaytonaSandboxProvider(SandboxProvider):
         page = 1
         total_pages = 1
         while page <= total_pages:
-            try:
-                sandboxes = await self._list_sandboxes_page(query, page)
-            except SandboxError:
-                raise
-
+            sandboxes = await self._list_sandboxes_page(query, page)
             total_pages = sandboxes.total_pages
             if not sandboxes.items:
                 return

@@ -10,7 +10,6 @@ from benchmark_service.sandbox import (
     ImageSource,
     Resources,
     Sandbox,
-    SandboxBackendConfig,
     SandboxCommandError,
     SandboxConnectionError,
     SandboxCreateRequest,
@@ -20,7 +19,6 @@ from benchmark_service.sandbox import (
     SandboxSource,
     SandboxNotFoundError,
     SnapshotSource,
-    create_provider,
     sandbox_config_from_headers,
 )
 
@@ -35,7 +33,6 @@ __all__ = [
     "InflightMiddleware",
     "Resources",
     "Sandbox",
-    "SandboxBackendConfig",
     "SandboxCommandError",
     "SandboxConnectionError",
     "SandboxCreateRequest",
@@ -45,7 +42,6 @@ __all__ = [
     "SandboxQuery",
     "SandboxSource",
     "SnapshotSource",
-    "create_provider",
     "sandbox_config_from_headers",
     "__version__",
 ]

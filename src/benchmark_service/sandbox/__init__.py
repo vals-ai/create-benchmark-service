@@ -3,7 +3,6 @@ from __future__ import annotations
 import os
 from collections.abc import Mapping
 
-from benchmark_service.sandbox.daytona import DaytonaSandbox, DaytonaSandboxProvider
 from benchmark_service.sandbox.types import (
     DaytonaBackendConfig,
     ExecResult,
@@ -39,20 +38,12 @@ def sandbox_config_from_headers(headers: Mapping[str, str]) -> SandboxBackendCon
             raise ValueError(f"Unknown sandbox provider: {_PROVIDER}")
 
 
-def create_provider(config: SandboxBackendConfig) -> SandboxProvider:
-    return config.create_provider()
-
-
 __all__ = [
-    "DaytonaBackendConfig",
-    "DaytonaSandbox",
-    "DaytonaSandboxProvider",
     "ExecResult",
     "ImageSource",
     "MissingSandboxConfigError",
     "Resources",
     "Sandbox",
-    "SandboxBackendConfig",
     "SandboxCommandError",
     "SandboxConnectionError",
     "SandboxCreateRequest",
@@ -62,6 +53,5 @@ __all__ = [
     "SandboxQuery",
     "SandboxSource",
     "SnapshotSource",
-    "create_provider",
     "sandbox_config_from_headers",
 ]

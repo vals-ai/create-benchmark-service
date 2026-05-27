@@ -13,7 +13,7 @@ from tenacity import (
     wait_random,
 )
 
-from benchmark_service.sandbox import SandboxProvider, create_provider, sandbox_config_from_headers
+from benchmark_service.sandbox import SandboxProvider, sandbox_config_from_headers
 from benchmark_service.schemas import (
     EvaluateInstanceRequest,
     EvaluateResponseRequest,
@@ -100,7 +100,7 @@ class BenchmarkServiceClient:
 
     def get_sandbox_provider(self) -> SandboxProvider:
         if self._sandbox_provider is None:
-            self._sandbox_provider = create_provider(sandbox_config_from_headers(self._headers))
+            self._sandbox_provider = sandbox_config_from_headers(self._headers).create_provider()
         return self._sandbox_provider
 
     async def close(self) -> None:

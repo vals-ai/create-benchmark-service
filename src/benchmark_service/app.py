@@ -19,7 +19,7 @@ from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import LEGACY_TENANT_SENTINEL, get_auth_settings, load_allowlist
 from benchmark_service.base import BenchmarkService
 from benchmark_service.inflight import InflightMiddleware
-from benchmark_service.sandbox import MissingSandboxConfigError, create_provider, sandbox_config_from_headers
+from benchmark_service.sandbox import MissingSandboxConfigError, sandbox_config_from_headers
 from benchmark_service.schemas import (
     EvaluateInstanceRequest,
     EvaluateResponseRequest,
@@ -220,7 +220,7 @@ class BenchmarkServiceApp(FastAPI):
                 await websocket.close(code=1008, reason="Dataset not allowed")
                 return
 
-            async with create_provider(sandbox_config) as provider:
+            async with sandbox_config.create_provider() as provider:
                 sandbox = await provider.get_sandbox(request.instance_id)
 
                 async for message in self.service.setup_task(request.task_id, sandbox, dataset=request.dataset):
@@ -298,7 +298,7 @@ class BenchmarkServiceApp(FastAPI):
                 await websocket.close(code=1008, reason="Dataset not allowed")
                 return
 
-            async with create_provider(sandbox_config) as provider:
+            async with sandbox_config.create_provider() as provider:
                 sandbox = await provider.get_sandbox(request.instance_id)
 
                 async for message in self.service.evaluate_instance(request.task_id, sandbox, dataset=request.dataset):
@@ -372,9 +372,7 @@ class BenchmarkServiceApp(FastAPI):
             metadata=result.metadata,
         )
 
-    async def _v1_list_dataset_tasks(
-        self, request: Request, dataset: str
-    ) -> V1DatasetTasksResponse:
+    async def _v1_list_dataset_tasks(self, request: Request, dataset: str) -> V1DatasetTasksResponse:
         _require_descope_tenant(request.state.tenant)
         if not await self.service.check_dataset_access(request.state.tenant, dataset):
             raise HTTPException(status_code=403, detail=f"Dataset={dataset} access not allowed")

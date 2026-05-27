@@ -4,7 +4,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field
 
 
 class ImageSource(BaseModel):
@@ -80,18 +80,11 @@ class SandboxCommandError(SandboxError):
 
 class ExecResult(BaseModel):
     exit_code: int
-    output: str | None = None
-
-    @field_validator("output", mode="before")
-    @classmethod
-    def empty_output_to_none(cls, value: object) -> object:
-        if isinstance(value, str) and not value.strip():
-            return None
-        return value
+    output: str = ""
 
     @property
     def stdout(self) -> str:
-        return self.output or ""
+        return self.output
 
 
 class Sandbox(ABC):
@@ -117,7 +110,7 @@ class Sandbox(ABC):
     ) -> ExecResult: ...
 
     @abstractmethod
-    def stream_command(
+    def command(
         self,
         command: str,
         *,

@@ -17,7 +17,7 @@ from uvicorn.protocols.utils import ClientDisconnected
 from websockets.exceptions import ConnectionClosed
 
 from benchmark_service._version import __version__ as _framework_version
-from benchmark_service.auth import LEGACY_TENANT_SENTINEL, get_auth_settings, load_allowlist
+from benchmark_service.auth import LEGACY_TENANT_SENTINEL, get_auth_settings, get_tenant_config, load_allowlist
 from benchmark_service.base import BenchmarkService
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.schemas import (
@@ -32,6 +32,11 @@ from benchmark_service.schemas import (
     TaskFilter,
     VerifyTaskIdsResponse,
     VersionResponse,
+)
+from benchmark_service.trial import (
+    sanitize_v1_dataset_tasks_response,
+    sanitize_v1_eval_response,
+    sanitize_v1_score_response,
 )
 from benchmark_service.v1_schemas import (
     V1DatasetTasksResponse,
@@ -70,6 +75,26 @@ def _require_descope_tenant(tenant: str | None) -> None:
             status_code=403,
             detail="The /v1/ surface requires Descope authentication; legacy bearer auth is not accepted.",
         )
+
+
+def _is_trial_tenant(tenant: str | None) -> bool:
+    if tenant is None:
+        return False
+    cfg = get_tenant_config(tenant)
+    return cfg is not None and cfg.trial_mode
+
+
+def _trial_tenant_may_access_path(path: str) -> bool:
+    if path in {"/v1/evaluate", "/v1/score"}:
+        return True
+    parts = path.split("/")
+    return (
+        len(parts) == 5
+        and parts[1] == "v1"
+        and parts[2] == "datasets"
+        and parts[3] != ""
+        and parts[4] == "tasks"
+    )
 
 
 def _get_service_metadata(service_cls: type[BenchmarkService]) -> tuple[str | None, str | None]:
@@ -133,6 +158,11 @@ class BenchmarkServiceApp(FastAPI):
             if tenant is None:
                 return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
             request.state.tenant = tenant
+            if _is_trial_tenant(tenant) and not _trial_tenant_may_access_path(request.url.path):
+                return JSONResponse(
+                    status_code=403,
+                    content={"detail": "Trial tenants may only access approved /v1 endpoints (/v1/*)"},
+                )
             return await call_next(request)  # type: ignore[reportUnknownVariableType]
 
         self.add_exception_handler(ValueError, self._value_error_handler)
@@ -161,7 +191,7 @@ class BenchmarkServiceApp(FastAPI):
     async def _exception_handler(self, _request: Request, exc: Exception) -> Response:
         logger.error(f"Error: {exc}")
         logger.error(traceback.format_exc())
-        raise HTTPException(status_code=500, detail=f"{str(exc)}: {traceback.format_exc()}") from exc
+        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
 
     async def _health_check(self) -> HealthCheckResponse:
         return HealthCheckResponse(status="ok")
@@ -178,6 +208,9 @@ class BenchmarkServiceApp(FastAPI):
         tenant = await self.service.resolve_tenant(dict(websocket.headers))
         if tenant is None:
             await websocket.close(code=1008, reason="Unauthorized")
+            return None
+        if _is_trial_tenant(tenant):
+            await websocket.close(code=1008, reason="Trial tenants may only access /v1/*")
             return None
         websocket.state.tenant = tenant
         return tenant
@@ -361,22 +394,25 @@ class BenchmarkServiceApp(FastAPI):
             raw_result = await self.service.evaluate_response(internal_req, dataset=body.dataset)
         except Exception as exc:  # noqa: BLE001
             logger.exception("v1/evaluate failed for run_id=%s task_id=%s", body.run_id, body.task_id)
-            return V1EvalResponse(
+            response = V1EvalResponse(
                 run_id=body.run_id,
                 task_id=body.task_id,
                 status=V1EvalStatus.ERROR,
                 evaluator_version=self._service_version,
                 errors=[str(exc)],
             )
-
-        return V1EvalResponse(
-            run_id=body.run_id,
-            task_id=body.task_id,
-            status=V1EvalStatus.EVALUATED,
-            evaluator_version=self._service_version,
-            result=jsonable_encoder(raw_result),
-            errors=[],
-        )
+        else:
+            response = V1EvalResponse(
+                run_id=body.run_id,
+                task_id=body.task_id,
+                status=V1EvalStatus.EVALUATED,
+                evaluator_version=self._service_version,
+                result=jsonable_encoder(raw_result),
+                errors=[],
+            )
+        if _is_trial_tenant(request.state.tenant):
+            return sanitize_v1_eval_response(response)
+        return response
 
     async def _v1_score(self, request: Request, body: V1ScoreRequest) -> V1ScoreResponse:
         _require_descope_tenant(request.state.tenant)
@@ -389,12 +425,15 @@ class BenchmarkServiceApp(FastAPI):
         }
         tasks_evaluated = await self.service.validate_task_ids(list(normalized_results.keys()), dataset=body.dataset)
         result = await self.service.calculate_final_score(normalized_results, dataset=body.dataset)
-        return V1ScoreResponse(
+        response = V1ScoreResponse(
             run_id=body.run_id,
             tasks_evaluated=tasks_evaluated,
             final_score=result.score,
             metadata=result.metadata,
         )
+        if _is_trial_tenant(request.state.tenant):
+            return sanitize_v1_score_response(response)
+        return response
 
     async def _v1_list_dataset_tasks(
         self, request: Request, dataset: str
@@ -410,7 +449,10 @@ class BenchmarkServiceApp(FastAPI):
             tasks = await self.service.list_tasks(dataset=dataset)
         except NotImplementedError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc
-        return V1DatasetTasksResponse(dataset=dataset, tasks=tasks)
+        response = V1DatasetTasksResponse(dataset=dataset, tasks=tasks)
+        if _is_trial_tenant(request.state.tenant):
+            return sanitize_v1_dataset_tasks_response(response)
+        return response
 
     async def _final_score(self, request: Request, body: FinalScoreRequest) -> FinalScoreResponse:
         if not await self.service.check_dataset_access(request.state.tenant, body.dataset):

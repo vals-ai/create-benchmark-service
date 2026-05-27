@@ -6,7 +6,6 @@ from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
-from fastapi import HTTPException
 from fastapi import WebSocket
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -95,10 +94,13 @@ def test_evaluate_response(
     assert response.json()["resolved"] is expected_resolved
 
 
-def test_evaluate_response_invalid_task(client: TestClient) -> None:
-    with pytest.raises(HTTPException) as exc_info:
-        client.post("/evaluate-response/", json={"task_id": "nonexistent", "response": "2"})
-    assert exc_info.value.status_code == 500
+def test_evaluate_response_invalid_task() -> None:
+    # raise_server_exceptions=False so we observe the handler's 500 response rather than
+    # ServerErrorMiddleware re-raising the underlying error into the test.
+    with TestClient(BenchmarkServiceApp(StubBenchmark), raise_server_exceptions=False) as c:
+        response = c.post("/evaluate-response/", json={"task_id": "nonexistent", "response": "2"})
+    assert response.status_code == 500
+    assert response.json() == {"detail": "Internal server error"}
 
 
 @pytest.mark.parametrize(

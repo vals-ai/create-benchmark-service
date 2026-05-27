@@ -30,6 +30,13 @@ class TenantConfig(BaseModel):
     """Per-tenant access rules within a benchmark service."""
 
     datasets: list[str] = Field(default_factory=list)
+    trial_mode: bool = Field(
+        default=False,
+        description=(
+            "If true, responses on /v1/evaluate and /v1/score are sanitized to "
+            "score-only fields. Set this on prospects' tenants in allowlist.yaml."
+        ),
+    )
 
 
 class AllowlistConfig(BaseModel):
@@ -113,6 +120,11 @@ def load_allowlist() -> AllowlistConfig:
         )
         _allowlist_warned = True
     return config
+
+
+def get_tenant_config(tenant: str) -> TenantConfig | None:
+    """Return the TenantConfig for `tenant`, or None if not allowlisted."""
+    return load_allowlist().tenants.get(tenant)
 
 
 def _initial_cache_ttl_seconds() -> int:

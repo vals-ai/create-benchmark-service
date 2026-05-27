@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from benchmark_service.auth import clear_allowlist_cache, load_allowlist
+from benchmark_service.auth import clear_allowlist_cache, get_tenant_config, load_allowlist
 
 
 @pytest.fixture(autouse=True)
@@ -62,3 +62,28 @@ def test_load_allowlist_empty_when_neither_set(
 
     assert config.tenants == {}
     assert any("No tenant allowlist configured" in rec.message for rec in caplog.records)
+
+
+def test_tenant_config_parses_trial_mode_from_allowlist_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        "DESCOPE_TENANT_ALLOWLIST_JSON",
+        json.dumps({
+            "tenants": {
+                "acme-corp": {"datasets": ["validation"]},
+                "trial": {"datasets": ["trial"], "trial_mode": True},
+            }
+        }),
+    )
+    allowlist = load_allowlist()
+    assert allowlist.tenants["acme-corp"].trial_mode is False
+    assert allowlist.tenants["trial"].trial_mode is True
+
+
+def test_get_tenant_config_returns_none_for_unknown_tenant(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        "DESCOPE_TENANT_ALLOWLIST_JSON",
+        json.dumps({"tenants": {"acme-corp": {"datasets": ["validation"]}}}),
+    )
+    assert get_tenant_config("ghost") is None
+    cfg = get_tenant_config("acme-corp")
+    assert cfg is not None and cfg.trial_mode is False

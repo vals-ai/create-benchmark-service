@@ -2,18 +2,15 @@
 
 They trim the v1 response models to score-only fields so a prospect can see how
 their model scored without getting back the rubric, judge identity, or per-task
-breakdowns. `pass_percentage` is read from the top level of the benchmark's raw
-result dict; a benchmark whose evaluator doesn't surface it returns `null` to
-trial callers (fix the evaluator before enabling trial mode for it).
-
-KNOWN COUPLING (v0): hard-coding `pass_percentage` bakes a benchmark-specific
-convention into the framework. Acceptable while one benchmark is in trial mode;
-the second adopter is the trigger to replace it with a benchmark-owned
-projection hook or a required top-level score field in the v1 contract.
+breakdowns. The per-task result projection is benchmark-owned: the handler
+passes `BenchmarkService.project_trial_result`, which returns the trial-safe
+view. That projection must retain any field the benchmark's
+`calculate_final_score` needs, since a trial caller only ever resubmits it to
+/v1/score.
 """
 
-from collections.abc import Mapping
-from typing import Any, cast
+from collections.abc import Callable
+from typing import Any
 
 from benchmark_service.v1_schemas import (
     V1DatasetTasksResponse,
@@ -23,11 +20,10 @@ from benchmark_service.v1_schemas import (
 )
 
 
-def sanitize_v1_eval_response(resp: V1EvalResponse) -> V1EvalResponse:
-    sanitized_result: dict[str, Any] | None = None
-    if isinstance(resp.result, Mapping):
-        result = cast(Mapping[str, Any], resp.result)
-        sanitized_result = {"pass_percentage": result.get("pass_percentage")}
+def sanitize_v1_eval_response(
+    resp: V1EvalResponse, project: Callable[[Any], Any]
+) -> V1EvalResponse:
+    sanitized_result = project(resp.result) if resp.result is not None else None
 
     sanitized_errors: list[str] = []
     if resp.errors:

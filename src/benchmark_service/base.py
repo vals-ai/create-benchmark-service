@@ -135,6 +135,25 @@ class BenchmarkService(ABC):
             f"{type(self).__name__}.list_tasks must explicitly map internal tasks to V1Task"
         )
 
+    def project_trial_result(self, result: Any) -> Any:
+        """Trial-safe projection of a per-task eval result.
+
+        For `trial_mode` tenants, /v1/evaluate responses are reduced to what this
+        returns, and that projection is all a trial caller can resubmit to
+        /v1/score. So it must include both the score fields a prospect may see
+        AND any field `calculate_final_score` needs to aggregate -- anything
+        dropped here is gone from the final score too.
+
+        Like `list_tasks`, the default raises so trial mode requires an explicit,
+        audited projection rather than leaking rubric / judge data by omission.
+
+        Raises:
+            NotImplementedError: if the benchmark has not opted into trial mode.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__}.project_trial_result must be implemented for trial_mode tenants"
+        )
+
     async def validate_task_ids(self, task_ids: list[str], dataset: str | None = None) -> list[str]:
         """Validate that task IDs exist in your benchmark dataset.
 

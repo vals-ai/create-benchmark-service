@@ -408,7 +408,7 @@ class BenchmarkServiceApp(FastAPI):
                 errors=[],
             )
         if _is_trial_tenant(request.state.tenant):
-            return sanitize_v1_eval_response(response)
+            return sanitize_v1_eval_response(response, self.service.project_trial_result)
         return response
 
     async def _v1_score(self, request: Request, body: V1ScoreRequest) -> V1ScoreResponse:

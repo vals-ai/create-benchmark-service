@@ -290,3 +290,5 @@ Setup
 5. Using Valkyrie, run `valkyrie config service add <benchmark-name> <forwarding-address>`
 
 If the forwarding address changes you will need to run step 5 again.
+
+<!-- Declarative environment verification: 2026-05-27 -->

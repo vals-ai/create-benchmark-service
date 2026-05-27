@@ -95,18 +95,24 @@ class DaytonaSandbox(Sandbox):
         output: asyncio.Queue[str] = asyncio.Queue()
         exec_task = asyncio.create_task(self._exec_pty(_command(command, cwd, timeout), output))
 
-        while not exec_task.done():
-            try:
-                yield await asyncio.wait_for(output.get(), timeout=0.1)
-            except TimeoutError:
-                continue
+        try:
+            while not exec_task.done():
+                try:
+                    yield await asyncio.wait_for(output.get(), timeout=0.1)
+                except TimeoutError:
+                    continue
 
-        while not output.empty():
-            yield output.get_nowait()
+            while not output.empty():
+                yield output.get_nowait()
 
-        result = await exec_task
-        if result.exit_code != 0:
-            raise SandboxCommandError(result.exit_code)
+            result = await exec_task
+            if result.exit_code != 0:
+                raise SandboxCommandError(result.exit_code)
+        finally:
+            if not exec_task.done():
+                exec_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await exec_task
 
     @_PROVIDER_RETRY
     async def upload_file(self, remote_path: str, content: bytes) -> None:

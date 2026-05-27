@@ -1,3 +1,4 @@
+import asyncio
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, cast
 
@@ -12,7 +13,8 @@ from benchmark_service.sandbox.daytona import DaytonaSandbox, DaytonaSandboxProv
 
 
 class Process:
-    command: str | None = None
+    def __init__(self) -> None:
+        self.command: str | None = None
 
     async def exec(self, command: str) -> SimpleNamespace:
         self.command = command
@@ -53,6 +55,38 @@ class PtyHandle:
 
     async def disconnect(self) -> None:
         pass
+
+
+class BlockingPtyHandle(PtyHandle):
+    disconnected = False
+
+    async def wait(self) -> None:
+        await asyncio.Event().wait()
+
+    async def disconnect(self) -> None:
+        self.disconnected = True
+
+
+class BlockingProcess(Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.handle: BlockingPtyHandle | None = None
+        self.killed_session_id: str | None = None
+
+    async def create_pty_session(
+        self,
+        *,
+        id: str,
+        on_data: Callable[[bytes], None | Awaitable[None]],
+        envs: dict[str, str],
+    ) -> BlockingPtyHandle:
+        assert id
+        assert envs == {"TERM": "dumb", "LANG": "C.UTF-8"}
+        self.handle = BlockingPtyHandle(on_data)
+        return self.handle
+
+    async def kill_pty_session(self, session_id: str) -> None:
+        self.killed_session_id = session_id
 
 
 class Files:
@@ -150,6 +184,22 @@ async def test_daytona_command_streams_output() -> None:
     output = [chunk async for chunk in sandbox.command("printf hello")]
 
     assert output == ["hello"]
+
+
+async def test_daytona_command_cleans_up_when_consumer_stops() -> None:
+    inner = InnerSandbox()
+    process = BlockingProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    stream = sandbox.command("printf hello")
+    assert await anext(stream) == "hello"
+
+    await stream.aclose()
+
+    assert process.handle is not None
+    assert process.handle.disconnected is True
+    assert process.killed_session_id is not None
 
 
 async def test_daytona_provider_reuses_started_sandbox() -> None:

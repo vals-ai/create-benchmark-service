@@ -3,6 +3,7 @@
 import importlib.metadata
 import logging
 import os
+import re
 import traceback
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
@@ -84,17 +85,13 @@ def _is_trial_tenant(tenant: str | None) -> bool:
     return cfg is not None and cfg.trial_mode
 
 
+# Lab-facing /v1 endpoints a trial tenant may reach. Deny-by-default: add new
+# trial-accessible endpoints here so they don't silently auto-expose.
+_TRIAL_ALLOWED_PATH = re.compile(r"/v1/(?:evaluate|score|datasets/[^/]+/tasks)")
+
+
 def _trial_tenant_may_access_path(path: str) -> bool:
-    if path in {"/v1/evaluate", "/v1/score"}:
-        return True
-    parts = path.split("/")
-    return (
-        len(parts) == 5
-        and parts[1] == "v1"
-        and parts[2] == "datasets"
-        and parts[3] != ""
-        and parts[4] == "tasks"
-    )
+    return _TRIAL_ALLOWED_PATH.fullmatch(path) is not None
 
 
 def _get_service_metadata(service_cls: type[BenchmarkService]) -> tuple[str | None, str | None]:

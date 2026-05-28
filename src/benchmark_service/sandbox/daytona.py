@@ -38,6 +38,7 @@ from benchmark_service.sandbox.types import (
 
 _PTY_STATUS_CHECK_ATTEMPTS = 30
 _STATUS_DIR = "/tmp/.sandbox-provider"
+_DEAD_SANDBOX_STATES = (SandboxState.DESTROYING, SandboxState.DESTROYED, SandboxState.STOPPED, SandboxState.ERROR)
 _TRANSIENT_DAYTONA_ERRORS = (DaytonaConnectionError, DaytonaRateLimitError, DaytonaTimeoutError)
 _PROVIDER_RETRY = retry(
     retry=retry_if_exception_type(SandboxConnectionError),
@@ -154,6 +155,7 @@ class DaytonaSandbox(Sandbox):
                 await handle.wait()
 
             for _ in range(_PTY_STATUS_CHECK_ATTEMPTS):
+                await self._check_sandbox_alive()
                 result = await self._sandbox.process.exec(f"test -e {shlex.quote(status_path)}")
                 if result.exit_code == 0:
                     break
@@ -192,6 +194,15 @@ class DaytonaSandbox(Sandbox):
             raise SandboxConnectionError(f"Daytona PTY session {session_id} no longer exists") from exc
         except DaytonaError as exc:
             raise _sandbox_error(exc) from exc
+
+    async def _check_sandbox_alive(self) -> None:
+        try:
+            await self._sandbox.refresh_data()
+        except DaytonaError as exc:
+            raise _sandbox_error(exc) from exc
+
+        if self._sandbox.state in _DEAD_SANDBOX_STATES:
+            raise SandboxError(f"Sandbox {self.name} crashed during command execution (state: {self.state})")
 
 
 class DaytonaSandboxProvider(SandboxProvider):

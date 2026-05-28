@@ -2,11 +2,13 @@ import asyncio
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, cast
 
+import pytest
 from daytona import SandboxState
 
 from benchmark_service.sandbox import (
     ImageSource,
     Resources,
+    SandboxError,
     SandboxCreateRequest,
 )
 from benchmark_service.sandbox.daytona import DaytonaSandbox, DaytonaSandboxProvider
@@ -151,12 +153,16 @@ class InnerSandbox:
         self.process = Process()
         self.fs = Files()
         self.autostop_interval: int | None = None
+        self.refresh_count = 0
 
     async def set_autostop_interval(self, interval: int) -> None:
         self.autostop_interval = interval
 
     async def wait_for_sandbox_start(self, timeout: int) -> None:
         assert timeout == 0
+
+    async def refresh_data(self) -> None:
+        self.refresh_count += 1
 
 
 class DaytonaClient:
@@ -239,6 +245,18 @@ async def test_daytona_command_checks_pty_before_reconnecting() -> None:
     assert output == ["hello"]
     assert process.checked_session_id is not None
     assert process.connected_session_id == process.checked_session_id
+
+
+async def test_daytona_command_checks_sandbox_health_before_reconnecting() -> None:
+    inner = InnerSandbox()
+    inner.process = ReconnectingProcess()
+    inner.state = SandboxState.DESTROYED
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxError, match="crashed during command execution"):
+        _ = [chunk async for chunk in sandbox.command("printf hello")]
+
+    assert inner.refresh_count == 1
 
 
 async def test_daytona_command_cleans_up_when_consumer_stops() -> None:

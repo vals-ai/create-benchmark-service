@@ -5,7 +5,7 @@ import shlex
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import suppress
-from typing import Any, cast
+from typing import Any
 
 from daytona import (
     AsyncDaytona,
@@ -13,13 +13,14 @@ from daytona import (
     CreateSandboxFromImageParams,
     CreateSandboxFromSnapshotParams,
     DaytonaConfig,
+    ListSandboxesQuery,
     DaytonaNotFoundError,
     Resources as DaytonaResources,
     SandboxState,
 )
 from daytona.common.errors import DaytonaConnectionError, DaytonaError, DaytonaRateLimitError, DaytonaTimeoutError
 from daytona.handle.async_pty_handle import AsyncPtyHandle
-from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
+from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_exponential, wait_fixed
 
 from benchmark_service.sandbox.types import (
     DaytonaBackendConfig,
@@ -40,18 +41,87 @@ _PTY_STATUS_CHECK_ATTEMPTS = 30
 _STATUS_DIR = "/tmp/.sandbox-provider"
 _DEAD_SANDBOX_STATES = (SandboxState.DESTROYING, SandboxState.DESTROYED, SandboxState.STOPPED, SandboxState.ERROR)
 _TRANSIENT_DAYTONA_ERRORS = (DaytonaConnectionError, DaytonaRateLimitError, DaytonaTimeoutError)
-_PROVIDER_RETRY = retry(
-    retry=retry_if_exception_type(SandboxConnectionError),
-    stop=stop_after_attempt(3),
-    wait=wait_fixed(2),
-    reraise=True,
-)
+_RETRY_AFTER_PREFIX = "retry-after-"
+_KNOWN_THROTTLERS = ("sandbox-create", "sandbox-lifecycle", "authenticated", "anonymous")
+_FIXED_PROVIDER_WAIT = wait_fixed(2)
+_RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
 
 
 def _sandbox_error(exc: DaytonaError) -> SandboxError:
     if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS):
         return SandboxConnectionError(str(exc))
     return SandboxError(str(exc))
+
+
+def _provider_retry_wait(retry_state: RetryCallState) -> float:
+    assert retry_state.outcome is not None
+    exc = retry_state.outcome.exception()
+    assert exc is not None
+
+    rate_limit_error = _rate_limit_error(exc)
+    if rate_limit_error is None:
+        return _FIXED_PROVIDER_WAIT(retry_state)
+
+    seconds = daytona_retry_after_seconds(rate_limit_error)
+    if seconds is not None:
+        return seconds
+
+    return _RATE_LIMIT_WAIT(retry_state)
+
+
+def _rate_limit_error(exc: BaseException) -> DaytonaRateLimitError | None:
+    if isinstance(exc, DaytonaRateLimitError):
+        return exc
+    if isinstance(exc.__cause__, DaytonaRateLimitError):
+        return exc.__cause__
+    return None
+
+
+def _parse_retry_after_seconds(value: object) -> float | None:
+    try:
+        seconds = float(str(value))
+    except ValueError:
+        return None
+
+    if seconds < 0:
+        return None
+
+    return seconds
+
+
+def _get_header(headers: dict[str, Any], header_name: str) -> object | None:
+    header_name = header_name.lower()
+    for key, value in headers.items():
+        if str(key).lower() == header_name:
+            return value
+    return None
+
+
+def daytona_retry_after_seconds(exc: DaytonaRateLimitError) -> float | None:
+    for throttler in _KNOWN_THROTTLERS:
+        seconds = _parse_retry_after_seconds(_get_header(exc.headers, f"retry-after-{throttler}"))
+        if seconds is not None:
+            return seconds
+
+    seconds = _parse_retry_after_seconds(_get_header(exc.headers, "retry-after"))
+    if seconds is not None:
+        return seconds
+
+    for key, value in exc.headers.items():
+        if str(key).lower().startswith(_RETRY_AFTER_PREFIX):
+            seconds = _parse_retry_after_seconds(value)
+            if seconds is not None:
+                return seconds
+
+    return None
+
+
+_PROVIDER_RETRY = retry(
+    retry=retry_if_exception_type(SandboxConnectionError),
+    stop=stop_after_attempt(3),
+    wait=_provider_retry_wait,
+    reraise=True,
+)
 
 
 class DaytonaSandbox(Sandbox):
@@ -142,11 +212,7 @@ class DaytonaSandbox(Sandbox):
             output.put_nowait(text)
 
         try:
-            handle = await self._sandbox.process.create_pty_session(
-                id=session_id,
-                on_data=on_data,
-                envs={"TERM": "dumb", "LANG": "C.UTF-8"},
-            )
+            handle = await self._create_pty_session(session_id, on_data)
             await handle.send_input("stty -echo\n")
             await handle.send_input(
                 f"mkdir -p {shlex.quote(_STATUS_DIR)}; {command}; echo $? > {shlex.quote(status_path)}; exit\n"
@@ -156,7 +222,7 @@ class DaytonaSandbox(Sandbox):
 
             for _ in range(_PTY_STATUS_CHECK_ATTEMPTS):
                 await self._check_sandbox_alive()
-                result = await self._sandbox.process.exec(f"test -e {shlex.quote(status_path)}")
+                result = await self.exec(f"test -e {shlex.quote(status_path)}")
                 if result.exit_code == 0:
                     break
                 handle = await self._reconnect_pty(session_id, on_data)
@@ -164,10 +230,10 @@ class DaytonaSandbox(Sandbox):
             else:
                 raise SandboxConnectionError("Daytona PTY closed before writing exit code")
 
-            result = await self._sandbox.process.exec(f"cat {shlex.quote(status_path)}")
-            if result.exit_code != 0 or not result.result:
+            result = await self.exec(f"cat {shlex.quote(status_path)}")
+            if result.exit_code != 0 or not result.output:
                 raise SandboxError("Failed to read Daytona PTY exit code")
-            return ExecResult(exit_code=int(result.result.strip()), output="".join(stdout))
+            return ExecResult(exit_code=int(result.output.strip()), output="".join(stdout))
         except DaytonaError as exc:
             raise _sandbox_error(exc) from exc
         finally:
@@ -177,8 +243,24 @@ class DaytonaSandbox(Sandbox):
             with suppress(Exception):
                 await self._sandbox.process.kill_pty_session(session_id)
             with suppress(Exception):
-                await self._sandbox.process.exec(f"rm -f {shlex.quote(status_path)}")
+                await self.exec(f"rm -f {shlex.quote(status_path)}")
 
+    @_PROVIDER_RETRY
+    async def _create_pty_session(
+        self,
+        session_id: str,
+        on_data: Callable[[bytes], Awaitable[None]],
+    ) -> AsyncPtyHandle:
+        try:
+            return await self._sandbox.process.create_pty_session(
+                id=session_id,
+                on_data=on_data,
+                envs={"TERM": "dumb", "LANG": "C.UTF-8"},
+            )
+        except DaytonaError as exc:
+            raise _sandbox_error(exc) from exc
+
+    @_PROVIDER_RETRY
     async def _reconnect_pty(
         self,
         session_id: str,
@@ -191,10 +273,11 @@ class DaytonaSandbox(Sandbox):
                 await handle.wait()
             return handle
         except DaytonaNotFoundError as exc:
-            raise SandboxConnectionError(f"Daytona PTY session {session_id} no longer exists") from exc
+            raise SandboxError(f"Daytona PTY session {session_id} no longer exists") from exc
         except DaytonaError as exc:
             raise _sandbox_error(exc) from exc
 
+    @_PROVIDER_RETRY
     async def _check_sandbox_alive(self) -> None:
         try:
             await self._sandbox.refresh_data()
@@ -299,26 +382,16 @@ class DaytonaSandboxProvider(SandboxProvider):
             raise _sandbox_error(exc) from exc
 
     async def list_sandboxes(self, query: SandboxQuery) -> AsyncGenerator[DaytonaSandbox, None]:
-        page = 1
-        total_pages = 1
-        while page <= total_pages:
-            sandboxes = await self._list_sandboxes_page(query, page)
-            total_pages = sandboxes.total_pages
-            if not sandboxes.items:
-                return
-
-            for sandbox in sandboxes.items:
-                if sandbox.state in (SandboxState.DESTROYING, SandboxState.DESTROYED):
-                    continue
-                yield DaytonaSandbox(sandbox)
-
-            page = int(sandboxes.page) + 1
+        for sandbox in await self._list_sandboxes(query):
+            if sandbox.state in (SandboxState.DESTROYING, SandboxState.DESTROYED):
+                continue
+            yield DaytonaSandbox(sandbox)
 
     @_PROVIDER_RETRY
-    async def _list_sandboxes_page(self, query: SandboxQuery, page: int) -> Any:
+    async def _list_sandboxes(self, query: SandboxQuery) -> list[AsyncSandbox]:
         try:
-            daytona = cast(Any, self._daytona)
-            return await daytona.list(labels=query.labels, limit=query.page_size, page=page)
+            daytona_query = ListSandboxesQuery(labels=query.labels, limit=query.page_size)
+            return [sandbox async for sandbox in self._daytona.list(daytona_query)]
         except DaytonaError as exc:
             raise _sandbox_error(exc) from exc
 

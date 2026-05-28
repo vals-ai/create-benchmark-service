@@ -4,14 +4,16 @@ from typing import Any, Awaitable, Callable, cast
 
 import pytest
 from daytona import SandboxState
+from daytona.common.errors import DaytonaRateLimitError
 
 from benchmark_service.sandbox import (
     ImageSource,
     Resources,
     SandboxError,
     SandboxCreateRequest,
+    SandboxQuery,
 )
-from benchmark_service.sandbox.daytona import DaytonaSandbox, DaytonaSandboxProvider
+from benchmark_service.sandbox.daytona import DaytonaSandbox, DaytonaSandboxProvider, daytona_retry_after_seconds
 
 
 class Process:
@@ -39,6 +41,18 @@ class Process:
 
     async def kill_pty_session(self, session_id: str) -> None:
         assert session_id
+
+
+class RateLimitedProcess(Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        self.attempts += 1
+        if self.attempts == 1:
+            raise DaytonaRateLimitError("rate limited", headers={"retry-after-sandbox-create": "0"})
+        return await super().exec(command)
 
 
 class PtyHandle:
@@ -170,6 +184,7 @@ class DaytonaClient:
         self.sandbox = sandbox
         self.created = False
         self.deleted = False
+        self.listed_query: Any | None = None
 
     async def get(self, instance_id: str) -> InnerSandbox:
         assert instance_id == self.sandbox.name
@@ -182,6 +197,14 @@ class DaytonaClient:
     async def delete(self, sandbox: InnerSandbox) -> None:
         assert sandbox is self.sandbox
         self.deleted = True
+
+    def list(self, query: object) -> Any:
+        self.listed_query = query
+
+        async def sandboxes() -> Any:
+            yield self.sandbox
+
+        return sandboxes()
 
 
 def _provider(daytona: DaytonaClient) -> DaytonaSandboxProvider:
@@ -218,6 +241,32 @@ async def test_daytona_command_preserves_fractional_timeout() -> None:
     await sandbox.exec("pytest", timeout=0.5)
 
     assert inner.process.command == "timeout 0.5 pytest"
+
+
+def test_daytona_retry_after_uses_specific_header_first() -> None:
+    exc = DaytonaRateLimitError(
+        "rate limited",
+        headers={"retry-after": "10", "retry-after-sandbox-create": "3"},
+    )
+
+    assert daytona_retry_after_seconds(exc) == 3
+
+
+def test_daytona_retry_after_uses_any_retry_after_header() -> None:
+    exc = DaytonaRateLimitError("rate limited", headers={"retry-after-custom": "5"})
+
+    assert daytona_retry_after_seconds(exc) == 5
+
+
+async def test_daytona_exec_retries_rate_limits() -> None:
+    inner = InnerSandbox()
+    process = RateLimitedProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    await sandbox.exec("pytest")
+
+    assert process.attempts == 2
 
 
 async def test_daytona_download_file_streams_content() -> None:
@@ -293,3 +342,17 @@ async def test_daytona_provider_delete_sets_autostop_before_delete() -> None:
 
     assert inner.autostop_interval == 1
     assert daytona.deleted is True
+
+
+async def test_daytona_provider_lists_sandboxes_with_query() -> None:
+    inner = InnerSandbox()
+    daytona = DaytonaClient(inner)
+
+    sandboxes = [
+        sandbox async for sandbox in _provider(daytona).list_sandboxes(SandboxQuery(labels={"Benchmark": "vcb"}))
+    ]
+
+    assert [sandbox.id for sandbox in sandboxes] == [inner.id]
+    assert daytona.listed_query is not None
+    assert daytona.listed_query.labels == {"Benchmark": "vcb"}
+    assert daytona.listed_query.limit == 10

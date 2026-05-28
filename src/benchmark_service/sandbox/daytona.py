@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import shlex
 import uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import suppress
 from typing import Any
 
@@ -157,6 +157,7 @@ class DaytonaSandbox(Sandbox):
                 result = await self._sandbox.process.exec(f"test -e {shlex.quote(status_path)}")
                 if result.exit_code == 0:
                     break
+                handle = await self._reconnect_pty(session_id, on_data)
                 await asyncio.sleep(1)
             else:
                 raise SandboxConnectionError("Daytona PTY closed before writing exit code")
@@ -175,6 +176,22 @@ class DaytonaSandbox(Sandbox):
                 await self._sandbox.process.kill_pty_session(session_id)
             with suppress(Exception):
                 await self._sandbox.process.exec(f"rm -f {shlex.quote(status_path)}")
+
+    async def _reconnect_pty(
+        self,
+        session_id: str,
+        on_data: Callable[[bytes], Awaitable[None]],
+    ) -> AsyncPtyHandle:
+        try:
+            await self._sandbox.process.get_pty_session_info(session_id)
+            handle = await self._sandbox.process.connect_pty_session(session_id, on_data)
+            with suppress(Exception):
+                await handle.wait()
+            return handle
+        except DaytonaNotFoundError as exc:
+            raise SandboxConnectionError(f"Daytona PTY session {session_id} no longer exists") from exc
+        except DaytonaError as exc:
+            raise _sandbox_error(exc) from exc
 
 
 class DaytonaSandboxProvider(SandboxProvider):

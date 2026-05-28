@@ -57,6 +57,48 @@ class PtyHandle:
         pass
 
 
+class DisconnectedPtyHandle(PtyHandle):
+    async def wait(self) -> None:
+        raise RuntimeError("disconnected")
+
+
+class ReconnectingProcess(Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.checked_session_id: str | None = None
+        self.connected_session_id: str | None = None
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        if command.startswith("test -e "):
+            return SimpleNamespace(exit_code=0 if self.connected_session_id else 1, result="")
+        return await super().exec(command)
+
+    async def create_pty_session(
+        self,
+        *,
+        id: str,
+        on_data: Callable[[bytes], None | Awaitable[None]],
+        envs: dict[str, str],
+    ) -> DisconnectedPtyHandle:
+        assert id
+        assert envs == {"TERM": "dumb", "LANG": "C.UTF-8"}
+        return DisconnectedPtyHandle(on_data)
+
+    async def get_pty_session_info(self, session_id: str) -> SimpleNamespace:
+        assert self.connected_session_id is None
+        self.checked_session_id = session_id
+        return SimpleNamespace()
+
+    async def connect_pty_session(
+        self,
+        session_id: str,
+        on_data: Callable[[bytes], None | Awaitable[None]],
+    ) -> PtyHandle:
+        assert self.checked_session_id == session_id
+        self.connected_session_id = session_id
+        return PtyHandle(on_data)
+
+
 class BlockingPtyHandle(PtyHandle):
     disconnected = False
 
@@ -184,6 +226,19 @@ async def test_daytona_command_streams_output() -> None:
     output = [chunk async for chunk in sandbox.command("printf hello")]
 
     assert output == ["hello"]
+
+
+async def test_daytona_command_checks_pty_before_reconnecting() -> None:
+    inner = InnerSandbox()
+    process = ReconnectingProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    output = [chunk async for chunk in sandbox.command("printf hello")]
+
+    assert output == ["hello"]
+    assert process.checked_session_id is not None
+    assert process.connected_session_id == process.checked_session_id
 
 
 async def test_daytona_command_cleans_up_when_consumer_stops() -> None:

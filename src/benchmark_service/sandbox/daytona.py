@@ -5,7 +5,7 @@ import shlex
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import suppress
-from typing import Any
+from typing import Any, cast
 
 from daytona import (
     AsyncDaytona,
@@ -317,7 +317,8 @@ class DaytonaSandboxProvider(SandboxProvider):
     @_PROVIDER_RETRY
     async def _list_sandboxes_page(self, query: SandboxQuery, page: int) -> Any:
         try:
-            return await self._daytona.list(labels=query.labels, limit=query.page_size, page=page)
+            daytona = cast(Any, self._daytona)
+            return await daytona.list(labels=query.labels, limit=query.page_size, page=page)
         except DaytonaError as exc:
             raise _sandbox_error(exc) from exc
 

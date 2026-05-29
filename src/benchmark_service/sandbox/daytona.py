@@ -274,7 +274,13 @@ class DaytonaSandbox(Sandbox):
             return handle
         except DaytonaNotFoundError as exc:
             raise SandboxError(f"Daytona PTY session {session_id} no longer exists") from exc
+        except DaytonaConnectionError as exc:
+            await self._check_sandbox_alive()
+            if "not found" in str(exc).lower():
+                raise SandboxError(f"Daytona PTY session {session_id} no longer exists") from exc
+            raise _sandbox_error(exc) from exc
         except DaytonaError as exc:
+            await self._check_sandbox_alive()
             raise _sandbox_error(exc) from exc
 
     @_PROVIDER_RETRY

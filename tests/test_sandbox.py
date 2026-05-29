@@ -4,7 +4,7 @@ from typing import Any, Awaitable, Callable, cast
 
 import pytest
 from daytona import SandboxState
-from daytona.common.errors import DaytonaRateLimitError
+from daytona.common.errors import DaytonaConnectionError, DaytonaRateLimitError
 
 from benchmark_service.sandbox import (
     ImageSource,
@@ -113,6 +113,16 @@ class ReconnectingProcess(Process):
         assert self.checked_session_id == session_id
         self.connected_session_id = session_id
         return PtyHandle(on_data)
+
+
+class CrashingReconnectProcess(ReconnectingProcess):
+    def __init__(self, sandbox: "InnerSandbox") -> None:
+        super().__init__()
+        self._sandbox = sandbox
+
+    async def get_pty_session_info(self, session_id: str) -> SimpleNamespace:
+        self._sandbox.state = SandboxState.DESTROYED
+        raise DaytonaConnectionError("toolbox unreachable")
 
 
 class BlockingPtyHandle(PtyHandle):
@@ -306,6 +316,17 @@ async def test_daytona_command_checks_sandbox_health_before_reconnecting() -> No
         _ = [chunk async for chunk in sandbox.command("printf hello")]
 
     assert inner.refresh_count == 1
+
+
+async def test_daytona_command_checks_sandbox_health_after_reconnect_failure() -> None:
+    inner = InnerSandbox()
+    inner.process = CrashingReconnectProcess(inner)
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxError, match="crashed during command execution"):
+        _ = [chunk async for chunk in sandbox.command("printf hello")]
+
+    assert inner.refresh_count == 2
 
 
 async def test_daytona_command_cleans_up_when_consumer_stops() -> None:

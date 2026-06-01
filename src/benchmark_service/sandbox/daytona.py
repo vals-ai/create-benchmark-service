@@ -18,7 +18,13 @@ from daytona import (
     Resources as DaytonaResources,
     SandboxState,
 )
-from daytona.common.errors import DaytonaConnectionError, DaytonaError, DaytonaRateLimitError, DaytonaTimeoutError
+from daytona.common.errors import (
+    DaytonaConflictError,
+    DaytonaConnectionError,
+    DaytonaError,
+    DaytonaRateLimitError,
+    DaytonaTimeoutError,
+)
 from daytona.handle.async_pty_handle import AsyncPtyHandle
 from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_exponential, wait_fixed
 
@@ -43,6 +49,7 @@ _DEAD_SANDBOX_STATES = (SandboxState.DESTROYING, SandboxState.DESTROYED, Sandbox
 _TRANSIENT_DAYTONA_ERRORS = (DaytonaConnectionError, DaytonaRateLimitError, DaytonaTimeoutError)
 _RETRY_AFTER_PREFIX = "retry-after-"
 _KNOWN_THROTTLERS = ("sandbox-create", "sandbox-lifecycle", "authenticated", "anonymous")
+_DELETE_CONFLICT_MESSAGES = ("state change in progress", "modified by another operation")
 _FIXED_PROVIDER_WAIT = wait_fixed(2)
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
 
@@ -75,6 +82,11 @@ def _rate_limit_error(exc: BaseException) -> DaytonaRateLimitError | None:
     if isinstance(exc.__cause__, DaytonaRateLimitError):
         return exc.__cause__
     return None
+
+
+def _is_delete_conflict(exc: DaytonaConflictError) -> bool:
+    error = str(exc).lower()
+    return any(message in error for message in _DELETE_CONFLICT_MESSAGES)
 
 
 def _parse_retry_after_seconds(value: object) -> float | None:
@@ -258,6 +270,7 @@ class DaytonaSandbox(Sandbox):
                 envs={"TERM": "dumb", "LANG": "C.UTF-8"},
             )
         except DaytonaError as exc:
+            await self._check_sandbox_alive()
             raise _sandbox_error(exc) from exc
 
     @_PROVIDER_RETRY
@@ -380,10 +393,18 @@ class DaytonaSandboxProvider(SandboxProvider):
             sandbox = await self._daytona.get(instance_id)
             if sandbox.state in (SandboxState.DESTROYING, SandboxState.DESTROYED):
                 return
+            await sandbox.wait_for_sandbox_start(timeout=0)
+            await sandbox.refresh_data()
+            if sandbox.state in (SandboxState.DESTROYING, SandboxState.DESTROYED):
+                return
             await sandbox.set_autostop_interval(interval=1)
             await self._daytona.delete(sandbox)
         except DaytonaNotFoundError:
             return
+        except DaytonaConflictError as exc:
+            if _is_delete_conflict(exc):
+                raise SandboxConnectionError(str(exc)) from exc
+            raise _sandbox_error(exc) from exc
         except DaytonaError as exc:
             raise _sandbox_error(exc) from exc
 

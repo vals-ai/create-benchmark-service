@@ -4,7 +4,7 @@ from typing import Any, Awaitable, Callable, cast
 
 import pytest
 from daytona import SandboxState
-from daytona.common.errors import DaytonaConnectionError, DaytonaRateLimitError
+from daytona.common.errors import DaytonaConflictError, DaytonaConnectionError, DaytonaRateLimitError
 
 from benchmark_service.sandbox import (
     ImageSource,
@@ -115,6 +115,17 @@ class ReconnectingProcess(Process):
         return PtyHandle(on_data)
 
 
+class CreatePtyFailureProcess(Process):
+    async def create_pty_session(
+        self,
+        *,
+        id: str,
+        on_data: Callable[[bytes], None | Awaitable[None]],
+        envs: dict[str, str],
+    ) -> PtyHandle:
+        raise DaytonaConnectionError("toolbox unreachable")
+
+
 class CrashingReconnectProcess(ReconnectingProcess):
     def __init__(self, sandbox: "InnerSandbox") -> None:
         super().__init__()
@@ -187,6 +198,18 @@ class InnerSandbox:
 
     async def refresh_data(self) -> None:
         self.refresh_count += 1
+
+
+class DeleteConflictSandbox(InnerSandbox):
+    def __init__(self) -> None:
+        super().__init__()
+        self.autostop_attempts = 0
+
+    async def set_autostop_interval(self, interval: int) -> None:
+        self.autostop_attempts += 1
+        if self.autostop_attempts == 1:
+            raise DaytonaConflictError("Failed to set auto-stop interval: Sandbox was modified by another operation")
+        await super().set_autostop_interval(interval)
 
 
 class DaytonaClient:
@@ -318,6 +341,18 @@ async def test_daytona_command_checks_sandbox_health_before_reconnecting() -> No
     assert inner.refresh_count == 1
 
 
+async def test_daytona_command_checks_sandbox_health_after_pty_create_failure() -> None:
+    inner = InnerSandbox()
+    inner.process = CreatePtyFailureProcess()
+    inner.state = SandboxState.DESTROYED
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxError, match="crashed during command execution"):
+        _ = [chunk async for chunk in sandbox.command("printf hello")]
+
+    assert inner.refresh_count == 1
+
+
 async def test_daytona_command_checks_sandbox_health_after_reconnect_failure() -> None:
     inner = InnerSandbox()
     inner.process = CrashingReconnectProcess(inner)
@@ -362,6 +397,16 @@ async def test_daytona_provider_delete_sets_autostop_before_delete() -> None:
     await _provider(daytona).delete_sandbox(inner.name)
 
     assert inner.autostop_interval == 1
+    assert daytona.deleted is True
+
+
+async def test_daytona_provider_delete_retries_state_conflicts() -> None:
+    inner = DeleteConflictSandbox()
+    daytona = DaytonaClient(inner)
+
+    await _provider(daytona).delete_sandbox(inner.name)
+
+    assert inner.autostop_attempts == 2
     assert daytona.deleted is True
 
 

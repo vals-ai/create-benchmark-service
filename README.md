@@ -70,10 +70,10 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | Method | Description |
 |--------|-------------|
 | `load_datasets()` | Load all tasks from your source; return `dict[dataset_name, dict[task_id, task_object]]` |
-| `retrieve_task(task_id, skip_validation, dataset)` | Return task metadata: docker image, problem path, resources, etc. |
-| `setup_task(task_id, sandbox, dataset)` | Async generator — set up the task in a Daytona sandbox, yielding `StreamChunk`s |
+| `retrieve_task(task_id, skip_validation, dataset)` | Return task metadata: sandbox source, problem path, resources, etc. |
+| `setup_task(task_id, sandbox, dataset)` | Async generator — set up the task in a sandbox, yielding `StreamChunk`s |
 | `evaluate_response(request, dataset)` | Evaluate a text response directly (no sandbox needed) |
-| `evaluate_instance(task_id, sandbox, dataset)` | Async generator — run evaluation in a Daytona sandbox, yielding `StreamChunk`s |
+| `evaluate_instance(task_id, sandbox, dataset)` | Async generator — run evaluation in a sandbox, yielding `StreamChunk`s |
 | `calculate_final_score(evaluation_results, dataset)` | Aggregate per-task results into a final `FinalScoreResult` |
 
 **Built-in methods:**
@@ -111,7 +111,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | `/ws/evaluate-response` | Evaluate without a sandbox; streams progress, checkpoint state, errors, and a final result |
 | `/ws/evaluate-instance` | Evaluate a live sandbox solution; streams progress, errors, and a final result |
 
-Sandbox setup and live sandbox evaluation require three headers — `x-api-key`, `x-api-url`, `x-target` — used to connect to Daytona. Live evaluation accepts `{"task_id": "…", "instance_id": "…", "dataset": "…"}`. Eval-only retry uses `/ws/evaluate-response` with `{"task_id": "…", "eval_resume_state": {...}, "dataset": "…"}` and does not require Daytona headers.
+Sandbox setup and live sandbox evaluation require sandbox-provider headers. Daytona is the default provider and uses `x-api-key`, `x-api-url`, and `x-target`. Live evaluation accepts `{"task_id": "…", "instance_id": "…", "dataset": "…"}`. Eval-only retry uses `/ws/evaluate-response` with `{"task_id": "…", "eval_resume_state": {...}, "dataset": "…"}` and does not require sandbox-provider headers.
 
 Benchmark services can send `eval_resume_state` updates to the tracker while evaluation is running. The tracker stores the latest value and sends it back on eval-only retry, so the benchmark service can continue evaluation without recreating the original agent sandbox.
 
@@ -192,8 +192,9 @@ Status codes: 403 if the tenant isn't allowed the dataset *or* if the caller use
 
 Pydantic models used across requests and responses:
 
-- **`RetrieveTaskResponse`** — `docker_image`, `problem_path`, `cwd`, `agent_timeout`, `Resources`
-- **`Resources`** — `vcpu`, `memory` (GB), `disk` (GB)
+- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `Resources`
+- **`SandboxSource`** — `ImageSource(type="image", image=...)` or `SnapshotSource(type="snapshot", snapshot=...)`
+- **`Resources`** — `vcpu`, `memory`, `disk`
 - **`EvaluateResponseRequest`** — `task_id`, `response` or `eval_resume_state`, `dataset`
 - **`FinalScoreResult`** / **`FinalScoreResponse`** — `score` (float), `metadata`, `tasks_evaluated`
 - **`TaskFilter`** — `task_ids` list or `slice_str`; `parse_slice()` converts `"start:stop:step"` to a Python `slice`
@@ -202,11 +203,11 @@ Pydantic models used across requests and responses:
 
 **`stream_command(sandbox, command, cwd, ignore_error=False)`**
 
-Runs a shell command inside a Daytona sandbox and yields stdout/stderr lines in real time. Creates a unique session per invocation, streams output via an async queue, checks the exit code, and cleans up the session on completion. Use it inside `setup_task` and `evaluate_instance` to run commands and forward their output as `StreamMessageChunk`s.
+Runs a shell command inside a sandbox and yields output in real time. Checks the exit code after the command finishes. Use it inside `setup_task` and `evaluate_instance` to run commands and forward output as `StreamMessageChunk`s.
 
 ### Authentication
 
-The framework authenticates every HTTP request except `/health`, and every WebSocket route before Daytona headers are used.
+The framework authenticates every HTTP request except `/health`, and every WebSocket route before sandbox-provider headers are used.
 
 For hosted Valkyrie benchmark services, set `AUTH_REQUIRED=true`, `DESCOPE_PROJECT_ID`, and a tenant + dataset allowlist. Requests must include a valid Descope access key in `X-Descope-Api-Key`. The key must be scoped to exactly one Descope tenant, and that tenant must appear in the service allowlist.
 

@@ -5,7 +5,6 @@ from typing import Any
 
 import httpx
 import websockets
-from daytona import AsyncDaytona, DaytonaConfig
 from pydantic import BaseModel, TypeAdapter
 from tenacity import (
     retry,
@@ -14,6 +13,7 @@ from tenacity import (
     wait_random,
 )
 
+from benchmark_service.sandbox import SandboxProvider, sandbox_config_from_headers
 from benchmark_service.schemas import (
     EvaluateInstanceRequest,
     EvaluateResponseRequest,
@@ -78,7 +78,7 @@ class BenchmarkServiceClient:
     _url: str
     _headers: dict[str, str]
     _timeout: int
-    _daytona_client: AsyncDaytona | None = None
+    _sandbox_provider: SandboxProvider | None = None
 
     def __init__(self, url: str, headers: dict[str, str], timeout: int = 60):
         """Initialize the client.
@@ -98,28 +98,16 @@ class BenchmarkServiceClient:
             limits=httpx.Limits(max_connections=200),
         )
 
-    @property
-    def daytona_client(self) -> AsyncDaytona:
-        """Lazy-initialized Daytona SDK client, built from the same headers used for API requests."""
-        if self._daytona_client:
-            return self._daytona_client
-
-        self._daytona_client = AsyncDaytona(
-            config=DaytonaConfig(
-                api_key=self._headers["x-api-key"],
-                api_url=self._headers["x-api-url"],
-                target=self._headers["x-target"],
-                connection_pool_maxsize=None,
-            )
-        )
-
-        return self._daytona_client
+    def get_sandbox_provider(self) -> SandboxProvider:
+        if self._sandbox_provider is None:
+            self._sandbox_provider = sandbox_config_from_headers(self._headers).create_provider()
+        return self._sandbox_provider
 
     async def close(self) -> None:
-        """Close the HTTP and Daytona clients."""
+        """Close the HTTP and sandbox provider clients."""
         await self._http_client.aclose()
-        if self._daytona_client:
-            await self._daytona_client.close()
+        if self._sandbox_provider:
+            await self._sandbox_provider.close()
 
     async def __aenter__(self) -> "BenchmarkServiceClient":
         return self

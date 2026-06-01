@@ -7,7 +7,7 @@ Edit `src/{{ benchmark_package }}/benchmark_service.py` and implement the six ab
 | Method | What to do |
 |--------|------------|
 | `load_datasets()` | Return `dict[dataset_name, dict[task_id, ...]]` of all datasets |
-| `retrieve_task()` | Return docker image, problem statement, and resource requirements |
+| `retrieve_task()` | Return sandbox source, problem statement, and resource requirements |
 | `setup_task()` | Prepare the sandbox before evaluation (upload files, run install commands) |
 | `evaluate_response()` | Score a plain-text response without a sandbox |
 | `evaluate_instance()` | Run tests / evaluation scripts in the sandbox |

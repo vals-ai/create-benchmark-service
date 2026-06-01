@@ -1,0 +1,148 @@
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from collections.abc import AsyncGenerator
+from typing import Annotated, Literal, Self
+
+from pydantic import BaseModel, Field
+
+
+class ImageSource(BaseModel):
+    type: Literal["image"] = "image"
+    image: str
+
+
+class SnapshotSource(BaseModel):
+    type: Literal["snapshot"] = "snapshot"
+    snapshot: str
+
+
+SandboxSource = Annotated[ImageSource | SnapshotSource, Field(discriminator="type")]
+
+
+class Resources(BaseModel):
+    vcpu: int = Field(description="Logical sandbox CPU count")
+    memory: int = Field(description="Sandbox memory")
+    disk: int = Field(description="Sandbox ephemeral disk")
+
+
+class SandboxCreateRequest(BaseModel):
+    source: SandboxSource
+    resources: Resources
+    name: str
+    labels: dict[str, str]
+    env_vars: dict[str, str]
+    auto_stop_interval: int
+    create_timeout: int
+
+
+class SandboxQuery(BaseModel):
+    labels: dict[str, str]
+    page_size: int = 10
+
+
+class DaytonaBackendConfig(BaseModel):
+    type: Literal["daytona"] = "daytona"
+    api_key: str
+    api_url: str
+    target: str
+
+    def create_provider(self) -> SandboxProvider:
+        from benchmark_service.sandbox.daytona import DaytonaSandboxProvider
+
+        return DaytonaSandboxProvider(self)
+
+
+SandboxBackendConfig = DaytonaBackendConfig
+
+
+class MissingSandboxConfigError(ValueError):
+    pass
+
+
+class SandboxError(Exception):
+    pass
+
+
+class SandboxNotFoundError(SandboxError):
+    pass
+
+
+class SandboxConnectionError(SandboxError):
+    pass
+
+
+class SandboxCommandError(SandboxError):
+    def __init__(self, exit_code: int) -> None:
+        self.exit_code = exit_code
+        super().__init__(f"Command failed with exit code {exit_code}")
+
+
+class ExecResult(BaseModel):
+    exit_code: int
+    output: str = ""
+
+    @property
+    def stdout(self) -> str:
+        return self.output
+
+
+class Sandbox(ABC):
+    @property
+    @abstractmethod
+    def id(self) -> str: ...
+
+    @property
+    @abstractmethod
+    def name(self) -> str: ...
+
+    @property
+    @abstractmethod
+    def state(self) -> str: ...
+
+    @abstractmethod
+    async def exec(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        timeout: float | None = None,
+    ) -> ExecResult: ...
+
+    @abstractmethod
+    def command(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        timeout: float | None = None,
+    ) -> AsyncGenerator[str, None]: ...
+
+    @abstractmethod
+    async def upload_file(self, remote_path: str, content: bytes) -> None: ...
+
+    @abstractmethod
+    async def download_file(self, remote_path: str) -> bytes: ...
+
+
+class SandboxProvider(ABC):
+    @abstractmethod
+    async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox: ...
+
+    @abstractmethod
+    async def get_sandbox(self, instance_id: str) -> Sandbox: ...
+
+    @abstractmethod
+    async def delete_sandbox(self, instance_id: str) -> None: ...
+
+    @abstractmethod
+    def list_sandboxes(self, query: SandboxQuery) -> AsyncGenerator[Sandbox, None]: ...
+
+    async def close(self) -> None:
+        pass
+
+    async def __aenter__(self) -> Self:
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        await self.close()

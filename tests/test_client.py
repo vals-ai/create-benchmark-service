@@ -6,11 +6,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import benchmark_service.sandbox as sandbox_module
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
+from benchmark_service.sandbox import sandbox_config_from_headers
+from benchmark_service.sandbox.types import DaytonaBackendConfig
 from benchmark_service.v1_schemas import V1DatasetTasksResponse
 
 BASE_URL = "http://localhost:8000"
 HEADERS = {"Authorization": "Bearer token"}
+DAYTONA_HEADERS = {"x-api-key": "key", "x-api-url": "url", "x-target": "target"}
 
 
 def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "error") -> MagicMock:
@@ -19,6 +23,23 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
     resp.json.return_value = json_data
     resp.text = text
     return resp
+
+
+def test_sandbox_config_from_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sandbox_module, "_PROVIDER", "daytona")
+
+    assert sandbox_config_from_headers(DAYTONA_HEADERS) == DaytonaBackendConfig(
+        api_key="key",
+        api_url="url",
+        target="target",
+    )
+
+
+def test_sandbox_config_rejects_unknown_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(sandbox_module, "_PROVIDER", "modal")
+
+    with pytest.raises(ValueError, match="Unknown sandbox provider: modal"):
+        sandbox_config_from_headers({})
 
 
 @pytest.mark.parametrize(
@@ -41,7 +62,7 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
             ["task-1"],
             "/retrieve-task/",
             {
-                "docker_image": "python:3.12",
+                "source": {"type": "image", "image": "python:3.12"},
                 "problem_path": "/tmp/problem_statement.txt",
                 "cwd": "/work",
                 "resources": {"vcpu": 2, "memory": 4, "disk": 10},
@@ -72,6 +93,28 @@ async def test_http_happy_path(
     result = await getattr(client, method)(*args)
 
     assert result.model_dump() == json_data
+
+
+async def test_retrieve_task_accepts_legacy_shape(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    mock_http.get = AsyncMock(
+        return_value=_mock_response(
+            json_data={
+                "docker_image": "python:3.12",
+                "problem_path": "/tmp/problem_statement.txt",
+                "cwd": "/work",
+                "resources": {"vcpu": 2, "memory": 4, "disk": 10},
+                "agent_timeout": None,
+            }
+        )
+    )
+
+    result = await client.retrieve_task("task-1")
+
+    assert result.source.model_dump() == {"type": "image", "image": "python:3.12"}
+    assert result.resources.model_dump() == {"vcpu": 2, "memory": 4, "disk": 10}
 
 
 @pytest.mark.parametrize(
@@ -143,7 +186,7 @@ async def test_retrieve_task_with_dataset(
     client, mock_http = benchmark_client
     mock_resp = _mock_response(
         json_data={
-            "docker_image": "python:3.12",
+            "source": {"type": "image", "image": "python:3.12"},
             "problem_path": "/tmp/problem_statement.txt",
             "cwd": "/work",
             "resources": {"vcpu": 2, "memory": 4, "disk": 10},

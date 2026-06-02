@@ -50,6 +50,7 @@ _TRANSIENT_DAYTONA_ERRORS = (DaytonaConnectionError, DaytonaRateLimitError, Dayt
 _RETRY_AFTER_PREFIX = "retry-after-"
 _KNOWN_THROTTLERS = ("sandbox-create", "sandbox-lifecycle", "authenticated", "anonymous")
 _DELETE_CONFLICT_MESSAGES = ("state change in progress", "modified by another operation")
+_CREATE_NAME_CONFLICT_MESSAGES = ("sandbox name already exists",)
 _FIXED_PROVIDER_WAIT = wait_fixed(2)
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
 
@@ -87,6 +88,11 @@ def _rate_limit_error(exc: BaseException) -> DaytonaRateLimitError | None:
 def _is_delete_conflict(exc: DaytonaConflictError) -> bool:
     error = str(exc).lower()
     return any(message in error for message in _DELETE_CONFLICT_MESSAGES)
+
+
+def _is_create_name_conflict(exc: DaytonaConflictError) -> bool:
+    error = str(exc).lower()
+    return any(message in error for message in _CREATE_NAME_CONFLICT_MESSAGES)
 
 
 def _parse_retry_after_seconds(value: object) -> float | None:
@@ -332,35 +338,54 @@ class DaytonaSandboxProvider(SandboxProvider):
 
         match request.source:
             case ImageSource(image=image):
-                inner = await self._daytona.create(
-                    CreateSandboxFromImageParams(
-                        auto_stop_interval=request.auto_stop_interval,
-                        auto_delete_interval=0,
-                        name=request.name,
-                        labels=request.labels,
-                        image=image,
-                        network_block_all=False,
-                        resources=resources,
-                        env_vars=request.env_vars,
-                    ),
-                    timeout=request.create_timeout,
+                params = CreateSandboxFromImageParams(
+                    auto_stop_interval=request.auto_stop_interval,
+                    auto_delete_interval=0,
+                    name=request.name,
+                    labels=request.labels,
+                    image=image,
+                    network_block_all=False,
+                    resources=resources,
+                    env_vars=request.env_vars,
                 )
             case SnapshotSource(snapshot=snapshot):
-                inner = await self._daytona.create(
-                    CreateSandboxFromSnapshotParams(
-                        auto_stop_interval=request.auto_stop_interval,
-                        auto_delete_interval=0,
-                        name=request.name,
-                        labels=request.labels,
-                        snapshot=snapshot,
-                        language="python",
-                        network_block_all=False,
-                        env_vars=request.env_vars,
-                    ),
-                    timeout=request.create_timeout,
+                params = CreateSandboxFromSnapshotParams(
+                    auto_stop_interval=request.auto_stop_interval,
+                    auto_delete_interval=0,
+                    name=request.name,
+                    labels=request.labels,
+                    snapshot=snapshot,
+                    language="python",
+                    network_block_all=False,
+                    env_vars=request.env_vars,
                 )
 
+        try:
+            inner = await self._daytona.create(params, timeout=request.create_timeout)
+        except DaytonaConflictError as exc:
+            if not _is_create_name_conflict(exc):
+                raise _sandbox_error(exc) from exc
+            await self._wait_for_destroyed_sandbox_name(request.name, request.create_timeout)
+            inner = await self._daytona.create(params, timeout=request.create_timeout)
+        except DaytonaError as exc:
+            raise _sandbox_error(exc) from exc
+
         return DaytonaSandbox(inner)
+
+    async def _wait_for_destroyed_sandbox_name(self, name: str, timeout: int) -> None:
+        for _ in range(max(1, timeout // 2)):
+            try:
+                sandbox = await self._daytona.get(name)
+            except DaytonaNotFoundError:
+                return
+            except DaytonaError as exc:
+                raise _sandbox_error(exc) from exc
+
+            if sandbox.state == SandboxState.DESTROYED:
+                return
+            await asyncio.sleep(2)
+
+        raise SandboxConnectionError(f"Timed out waiting for Daytona sandbox name {name} to be released")
 
     async def _find_reusable_sandbox(self, name: str) -> AsyncSandbox | None:
         try:

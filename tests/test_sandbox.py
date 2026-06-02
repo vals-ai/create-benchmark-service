@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, cast
 
 import pytest
-from daytona import SandboxState
+from daytona import DaytonaNotFoundError, SandboxState
 from daytona.common.errors import DaytonaConflictError, DaytonaConnectionError, DaytonaRateLimitError
 
 from benchmark_service.sandbox import (
@@ -240,6 +240,30 @@ class DaytonaClient:
         return sandboxes()
 
 
+class DestroyingNameConflictDaytonaClient(DaytonaClient):
+    def __init__(self, sandbox: InnerSandbox) -> None:
+        super().__init__(sandbox)
+        self.create_attempts = 0
+        self.get_attempts = 0
+        self.name_released = False
+
+    async def get(self, instance_id: str) -> InnerSandbox:
+        self.get_attempts += 1
+        if self.get_attempts >= 3:
+            self.name_released = True
+            raise DaytonaNotFoundError("not found")
+        return await super().get(instance_id)
+
+    async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
+        self.create_attempts += 1
+        if self.create_attempts == 1:
+            raise DaytonaConflictError("Sandbox name already exists")
+        assert self.name_released
+        self.created = True
+        self.sandbox.state = SandboxState.STARTED
+        return self.sandbox
+
+
 def _provider(daytona: DaytonaClient) -> DaytonaSandboxProvider:
     provider = DaytonaSandboxProvider.__new__(DaytonaSandboxProvider)
     provider._daytona = cast(Any, daytona)  # pyright: ignore[reportPrivateUsage]
@@ -388,6 +412,35 @@ async def test_daytona_provider_reuses_started_sandbox() -> None:
 
     assert sandbox.id == inner.id
     assert daytona.created is False
+
+
+async def test_daytona_provider_waits_for_destroying_sandbox_name_before_create(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Daytona can keep a sandbox name reserved while a previous sandbox is still destroying.
+
+    Test cases:
+    - Create name conflict waits for the destroying sandbox to disappear.
+    - Creation retries with the original name after Daytona releases it.
+    """
+    inner = InnerSandbox()
+    inner.state = SandboxState.DESTROYING
+    daytona = DestroyingNameConflictDaytonaClient(inner)
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr("benchmark_service.sandbox.daytona.asyncio.sleep", fake_sleep)
+
+    sandbox = await _provider(daytona).create_sandbox(_request(inner.name))
+
+    assert sandbox.id == inner.id
+    assert daytona.name_released is True
+    assert daytona.create_attempts == 2
+    assert daytona.get_attempts == 3
+    assert sleep_calls == [2]
 
 
 async def test_daytona_provider_delete_sets_autostop_before_delete() -> None:

@@ -50,7 +50,7 @@ _TRANSIENT_DAYTONA_ERRORS = (DaytonaConnectionError, DaytonaRateLimitError, Dayt
 _RETRY_AFTER_PREFIX = "retry-after-"
 _KNOWN_THROTTLERS = ("sandbox-create", "sandbox-lifecycle", "authenticated", "anonymous")
 _DELETE_CONFLICT_MESSAGES = ("state change in progress", "modified by another operation")
-_CREATE_NAME_CONFLICT_MESSAGES = ("sandbox name already exists",)
+_CREATE_NAME_CONFLICT_MESSAGES = ("sandbox name already exists", "sandbox with name")
 _FIXED_PROVIDER_WAIT = wait_fixed(2)
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
 
@@ -360,23 +360,25 @@ class DaytonaSandboxProvider(SandboxProvider):
                     env_vars=request.env_vars,
                 )
 
-        try:
-            inner = await self._daytona.create(params, timeout=request.create_timeout)
-        except DaytonaConflictError as exc:
-            if not _is_create_name_conflict(exc):
+        for _ in range(max(1, request.create_timeout // 2)):
+            try:
+                inner = await self._daytona.create(params, timeout=request.create_timeout)
+                return DaytonaSandbox(inner)
+            except DaytonaConflictError as exc:
+                if not _is_create_name_conflict(exc):
+                    raise _sandbox_error(exc) from exc
+                await self._wait_for_destroyed_sandbox_name(request.name, request.create_timeout)
+            except DaytonaError as exc:
                 raise _sandbox_error(exc) from exc
-            await self._wait_for_destroyed_sandbox_name(request.name, request.create_timeout)
-            inner = await self._daytona.create(params, timeout=request.create_timeout)
-        except DaytonaError as exc:
-            raise _sandbox_error(exc) from exc
 
-        return DaytonaSandbox(inner)
+        raise SandboxError(f"Timed out waiting for Daytona sandbox name {request.name} to be released")
 
     async def _wait_for_destroyed_sandbox_name(self, name: str, timeout: int) -> None:
         for _ in range(max(1, timeout // 2)):
             try:
                 sandbox = await self._daytona.get(name)
             except DaytonaNotFoundError:
+                await asyncio.sleep(2)
                 return
             except DaytonaError as exc:
                 raise _sandbox_error(exc) from exc

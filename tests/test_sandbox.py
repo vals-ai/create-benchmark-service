@@ -241,8 +241,9 @@ class DaytonaClient:
 
 
 class DestroyingNameConflictDaytonaClient(DaytonaClient):
-    def __init__(self, sandbox: InnerSandbox) -> None:
+    def __init__(self, sandbox: InnerSandbox, conflict_message: str = "Sandbox name already exists") -> None:
         super().__init__(sandbox)
+        self.conflict_message = conflict_message
         self.create_attempts = 0
         self.get_attempts = 0
         self.name_released = False
@@ -257,7 +258,7 @@ class DestroyingNameConflictDaytonaClient(DaytonaClient):
     async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
         self.create_attempts += 1
         if self.create_attempts == 1:
-            raise DaytonaConflictError("Sandbox name already exists")
+            raise DaytonaConflictError(self.conflict_message)
         assert self.name_released
         self.created = True
         self.sandbox.state = SandboxState.STARTED
@@ -272,6 +273,25 @@ class NonDestroyingNameConflictDaytonaClient(DaytonaClient):
     async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
         self.create_attempts += 1
         raise DaytonaConflictError("Sandbox name already exists")
+
+
+class InvisibleReservedNameConflictDaytonaClient(DaytonaClient):
+    def __init__(self, sandbox: InnerSandbox) -> None:
+        super().__init__(sandbox)
+        self.create_attempts = 0
+        self.get_attempts = 0
+
+    async def get(self, instance_id: str) -> InnerSandbox:
+        self.get_attempts += 1
+        raise DaytonaNotFoundError("not found")
+
+    async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
+        self.create_attempts += 1
+        if self.create_attempts < 3:
+            raise DaytonaConflictError(f"Sandbox with name {self.sandbox.name} already exists")
+        self.created = True
+        self.sandbox.state = SandboxState.STARTED
+        return self.sandbox
 
 
 def _provider(daytona: DaytonaClient) -> DaytonaSandboxProvider:
@@ -450,7 +470,63 @@ async def test_daytona_provider_waits_for_destroying_sandbox_name_before_create(
     assert daytona.name_released is True
     assert daytona.create_attempts == 2
     assert daytona.get_attempts == 3
-    assert sleep_calls == [2]
+    assert sleep_calls == [2, 2]
+
+
+async def test_daytona_provider_waits_for_production_destroying_name_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Daytona create conflicts include the conflicting sandbox name in production.
+
+    Test cases:
+    - The production conflict wording waits for a destroying sandbox to disappear.
+    - Creation retries with the original name after Daytona releases it.
+    """
+    inner = InnerSandbox()
+    inner.state = SandboxState.DESTROYING
+    daytona = DestroyingNameConflictDaytonaClient(inner, f"Sandbox with name {inner.name} already exists")
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr("benchmark_service.sandbox.daytona.asyncio.sleep", fake_sleep)
+
+    sandbox = await _provider(daytona).create_sandbox(_request(inner.name))
+
+    assert sandbox.id == inner.id
+    assert daytona.name_released is True
+    assert daytona.create_attempts == 2
+    assert daytona.get_attempts == 3
+    assert sleep_calls == [2, 2]
+
+
+async def test_daytona_provider_retries_when_reserved_name_is_not_visible(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Daytona can reserve a sandbox name even when fetching that name returns not found.
+
+    Test cases:
+    - Create name conflict keeps retrying when the reserved name is not visible.
+    - Creation succeeds after Daytona releases the invisible reservation.
+    """
+    inner = InnerSandbox()
+    daytona = InvisibleReservedNameConflictDaytonaClient(inner)
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr("benchmark_service.sandbox.daytona.asyncio.sleep", fake_sleep)
+
+    sandbox = await _provider(daytona).create_sandbox(_request(inner.name))
+
+    assert sandbox.id == inner.id
+    assert daytona.create_attempts == 3
+    assert daytona.get_attempts == 3
+    assert sleep_calls == [2, 2]
 
 
 async def test_daytona_provider_does_not_wait_for_non_destroying_name_conflict(

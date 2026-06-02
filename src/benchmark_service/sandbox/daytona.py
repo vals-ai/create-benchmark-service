@@ -383,9 +383,14 @@ class DaytonaSandboxProvider(SandboxProvider):
 
             if sandbox.state == SandboxState.DESTROYED:
                 return
+            if sandbox.state != SandboxState.DESTROYING:
+                raise SandboxError(
+                    f"Daytona sandbox name {name} is reserved by an existing sandbox "
+                    f"in state {sandbox.state}; it is not being destroyed"
+                )
             await asyncio.sleep(2)
 
-        raise SandboxConnectionError(f"Timed out waiting for Daytona sandbox name {name} to be released")
+        raise SandboxError(f"Timed out waiting for Daytona sandbox name {name} to be released")
 
     async def _find_reusable_sandbox(self, name: str) -> AsyncSandbox | None:
         try:

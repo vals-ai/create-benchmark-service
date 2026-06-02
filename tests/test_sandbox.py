@@ -264,6 +264,16 @@ class DestroyingNameConflictDaytonaClient(DaytonaClient):
         return self.sandbox
 
 
+class NonDestroyingNameConflictDaytonaClient(DaytonaClient):
+    def __init__(self, sandbox: InnerSandbox) -> None:
+        super().__init__(sandbox)
+        self.create_attempts = 0
+
+    async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
+        self.create_attempts += 1
+        raise DaytonaConflictError("Sandbox name already exists")
+
+
 def _provider(daytona: DaytonaClient) -> DaytonaSandboxProvider:
     provider = DaytonaSandboxProvider.__new__(DaytonaSandboxProvider)
     provider._daytona = cast(Any, daytona)  # pyright: ignore[reportPrivateUsage]
@@ -441,6 +451,33 @@ async def test_daytona_provider_waits_for_destroying_sandbox_name_before_create(
     assert daytona.create_attempts == 2
     assert daytona.get_attempts == 3
     assert sleep_calls == [2]
+
+
+async def test_daytona_provider_does_not_wait_for_non_destroying_name_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A name conflict is only retryable when Daytona reports the existing sandbox is still destroying.
+
+    Test cases:
+    - A stopped sandbox name conflict raises without polling the full timeout.
+    - No create retry happens when the existing sandbox is not being destroyed.
+    """
+    inner = InnerSandbox()
+    inner.state = SandboxState.STOPPED
+    daytona = NonDestroyingNameConflictDaytonaClient(inner)
+    sleep_calls: list[float] = []
+
+    async def fake_sleep(seconds: float) -> None:
+        sleep_calls.append(seconds)
+
+    monkeypatch.setattr("benchmark_service.sandbox.daytona.asyncio.sleep", fake_sleep)
+
+    with pytest.raises(SandboxError, match="not being destroyed"):
+        await _provider(daytona).create_sandbox(_request(inner.name))
+
+    assert daytona.create_attempts == 1
+    assert sleep_calls == []
 
 
 async def test_daytona_provider_delete_sets_autostop_before_delete() -> None:

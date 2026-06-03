@@ -2,9 +2,9 @@
 
 from typing import Any, Literal, cast
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, computed_field, model_validator
 
-from benchmark_service.sandbox.types import Resources, SandboxSource
+from benchmark_service.sandbox.types import Resources, SandboxSource, SnapshotSource
 
 
 class TaskFilter(BaseModel):
@@ -57,16 +57,26 @@ class RetrieveTaskResponse(BaseModel):
     )
     resources: Resources = Field(description="Computational resources needed")
 
+    @computed_field(description="Legacy sandbox image field for older Valkyrie clients")
+    @property
+    def docker_image(self) -> str:
+        if isinstance(self.source, SnapshotSource):
+            return f"snapshot:{self.source.snapshot}"
+        return self.source.image
+
     @model_validator(mode="before")
     @classmethod
     def parse_legacy_fields(cls, data: object) -> object:
         if not isinstance(data, dict):
             return data
         legacy = cast(dict[str, object], data)
-        if "docker_image" not in legacy:
+        if "source" in legacy or "docker_image" not in legacy:
             return legacy
 
-        return {**legacy, "source": {"type": "image", "image": legacy["docker_image"]}}
+        docker_image = legacy["docker_image"]
+        if isinstance(docker_image, str) and docker_image.startswith("snapshot:"):
+            return {**legacy, "source": {"type": "snapshot", "snapshot": docker_image.removeprefix("snapshot:")}}
+        return {**legacy, "source": {"type": "image", "image": docker_image}}
 
 
 class SetupTaskRequest(BaseModel):

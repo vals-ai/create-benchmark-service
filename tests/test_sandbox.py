@@ -3,14 +3,22 @@ from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, cast
 
 import pytest
+from aiohttp import ClientResponseError
 from daytona import SandboxState
-from daytona.common.errors import DaytonaConflictError, DaytonaConnectionError, DaytonaRateLimitError
+from daytona.common.errors import (
+    DaytonaConflictError,
+    DaytonaConnectionError,
+    DaytonaError,
+    DaytonaNotFoundError,
+    DaytonaRateLimitError,
+)
 
 from benchmark_service.sandbox import (
     ImageSource,
     Resources,
-    SandboxError,
     SandboxCreateRequest,
+    SandboxError,
+    SandboxNotFoundError,
     SandboxQuery,
 )
 from benchmark_service.sandbox.daytona import DaytonaSandbox, DaytonaSandboxProvider, daytona_retry_after_seconds
@@ -53,6 +61,11 @@ class RateLimitedProcess(Process):
         if self.attempts == 1:
             raise DaytonaRateLimitError("rate limited", headers={"retry-after-sandbox-create": "0"})
         return await super().exec(command)
+
+
+class RemovedSandboxProcess(Process):
+    async def exec(self, command: str) -> SimpleNamespace:
+        raise DaytonaNotFoundError("sandbox not found")
 
 
 class PtyHandle:
@@ -169,12 +182,28 @@ class BlockingProcess(Process):
 
 
 class Files:
+    async def upload_file(self, content: bytes, remote_path: str) -> None:
+        assert content == b"hello world"
+        assert remote_path == "/tmp/result.txt"
+
     async def download_file_stream(self, remote_path: str) -> Any:
         assert remote_path == "/tmp/result.txt"
 
         async def chunks() -> Any:
             yield b"hello"
             yield b" world"
+
+        return chunks()
+
+
+class RemovedSandboxFiles(Files):
+    async def upload_file(self, content: bytes, remote_path: str) -> None:
+        raise DaytonaError("sandbox not found", status_code=404, error_code="NOT_FOUND")
+
+    async def download_file_stream(self, remote_path: str) -> Any:
+        async def chunks() -> Any:
+            raise ClientResponseError(None, (), status=404, message="Not Found")
+            yield b""
 
         return chunks()
 
@@ -200,6 +229,11 @@ class InnerSandbox:
         self.refresh_count += 1
 
 
+class RemovedInnerSandbox(InnerSandbox):
+    async def refresh_data(self) -> None:
+        raise DaytonaNotFoundError("sandbox not found")
+
+
 class DeleteConflictSandbox(InnerSandbox):
     def __init__(self) -> None:
         super().__init__()
@@ -210,6 +244,13 @@ class DeleteConflictSandbox(InnerSandbox):
         if self.autostop_attempts == 1:
             raise DaytonaConflictError("Failed to set auto-stop interval: Sandbox was modified by another operation")
         await super().set_autostop_interval(interval)
+
+
+class ErrorStateSandbox(InnerSandbox):
+    state = SandboxState.ERROR
+
+    async def wait_for_sandbox_start(self, timeout: int) -> None:
+        raise DaytonaError("sandbox failed to start")
 
 
 class DaytonaClient:
@@ -238,6 +279,14 @@ class DaytonaClient:
             yield self.sandbox
 
         return sandboxes()
+
+
+class CreateFailureDaytonaClient(DaytonaClient):
+    async def get(self, instance_id: str) -> InnerSandbox:
+        raise DaytonaNotFoundError("sandbox not found")
+
+    async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
+        raise DaytonaError("sandbox failed to start")
 
 
 def _provider(daytona: DaytonaClient) -> DaytonaSandboxProvider:
@@ -302,6 +351,52 @@ async def test_daytona_exec_retries_rate_limits() -> None:
     assert process.attempts == 2
 
 
+async def test_daytona_exec_raises_sandbox_not_found_when_removed() -> None:
+    """Exec failures from removed Daytona sandboxes should use the provider not-found type.
+
+    Test cases:
+    - A Daytona not-found response from process exec raises SandboxNotFoundError with sandbox identity.
+    """
+    inner = InnerSandbox()
+    inner.process = RemovedSandboxProcess()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxNotFoundError, match="Sandbox sandbox-name sandbox-id has been deleted"):
+        await sandbox.exec("pytest")
+
+
+async def test_daytona_file_operations_raise_sandbox_not_found_when_removed() -> None:
+    """File operation failures from removed Daytona sandboxes should use the provider not-found type.
+
+    Test cases:
+    - A Daytona not-found response from file upload raises SandboxNotFoundError with sandbox identity.
+    - A Daytona not-found response from file download raises SandboxNotFoundError with sandbox identity.
+    """
+    inner = InnerSandbox()
+    inner.fs = RemovedSandboxFiles()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxNotFoundError, match="Sandbox sandbox-name sandbox-id has been deleted"):
+        await sandbox.upload_file("/tmp/result.txt", b"hello world")
+
+    with pytest.raises(SandboxNotFoundError, match="Sandbox sandbox-name sandbox-id has been deleted"):
+        await sandbox.download_file("/tmp/result.txt")
+
+
+async def test_daytona_command_raises_sandbox_not_found_when_removed() -> None:
+    """PTY command failures from removed Daytona sandboxes should use the provider not-found type.
+
+    Test cases:
+    - A Daytona not-found response from command health checks raises SandboxNotFoundError with sandbox identity.
+    """
+    inner = RemovedInnerSandbox()
+    inner.process = CreatePtyFailureProcess()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxNotFoundError, match="Sandbox sandbox-name sandbox-id has been deleted"):
+        _ = [chunk async for chunk in sandbox.command("pytest")]
+
+
 async def test_daytona_download_file_streams_content() -> None:
     sandbox = DaytonaSandbox(cast(Any, InnerSandbox()))
 
@@ -335,7 +430,7 @@ async def test_daytona_command_checks_sandbox_health_before_reconnecting() -> No
     inner.state = SandboxState.DESTROYED
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    with pytest.raises(SandboxError, match="crashed during command execution"):
+    with pytest.raises(SandboxNotFoundError, match="Sandbox sandbox-name sandbox-id has been deleted"):
         _ = [chunk async for chunk in sandbox.command("printf hello")]
 
     assert inner.refresh_count == 1
@@ -347,7 +442,7 @@ async def test_daytona_command_checks_sandbox_health_after_pty_create_failure() 
     inner.state = SandboxState.DESTROYED
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    with pytest.raises(SandboxError, match="crashed during command execution"):
+    with pytest.raises(SandboxNotFoundError, match="Sandbox sandbox-name sandbox-id has been deleted"):
         _ = [chunk async for chunk in sandbox.command("printf hello")]
 
     assert inner.refresh_count == 1
@@ -358,10 +453,25 @@ async def test_daytona_command_checks_sandbox_health_after_reconnect_failure() -
     inner.process = CrashingReconnectProcess(inner)
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    with pytest.raises(SandboxError, match="crashed during command execution"):
+    with pytest.raises(SandboxNotFoundError, match="Sandbox sandbox-name sandbox-id has been deleted"):
         _ = [chunk async for chunk in sandbox.command("printf hello")]
 
     assert inner.refresh_count == 2
+
+
+async def test_daytona_command_keeps_error_state_as_sandbox_error() -> None:
+    """Non-removal dead states should still report a generic sandbox failure.
+
+    Test cases:
+    - SandboxState.ERROR raises SandboxError during command health checks.
+    """
+    inner = InnerSandbox()
+    inner.process = CreatePtyFailureProcess()
+    inner.state = SandboxState.ERROR
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxError, match="crashed during command execution"):
+        _ = [chunk async for chunk in sandbox.command("printf hello")]
 
 
 async def test_daytona_command_cleans_up_when_consumer_stops() -> None:
@@ -407,6 +517,32 @@ async def test_daytona_provider_delete_retries_state_conflicts() -> None:
     await _provider(daytona).delete_sandbox(inner.name)
 
     assert inner.autostop_attempts == 2
+    assert daytona.deleted is True
+
+
+async def test_daytona_provider_create_maps_daytona_errors() -> None:
+    """Create failures from Daytona should use the provider sandbox error type.
+
+    Test cases:
+    - A Daytona create failure raises SandboxError instead of leaking DaytonaError.
+    """
+    daytona = CreateFailureDaytonaClient(InnerSandbox())
+
+    with pytest.raises(SandboxError, match="sandbox failed to start"):
+        await _provider(daytona).create_sandbox(_request("sandbox-name"))
+
+
+async def test_daytona_provider_delete_removes_error_state_sandbox() -> None:
+    """Failed-state sandboxes should be deletable without waiting for startup.
+
+    Test cases:
+    - A sandbox in SandboxState.ERROR is deleted even though waiting for startup fails.
+    """
+    inner = ErrorStateSandbox()
+    daytona = DaytonaClient(inner)
+
+    await _provider(daytona).delete_sandbox(inner.name)
+
     assert daytona.deleted is True
 
 

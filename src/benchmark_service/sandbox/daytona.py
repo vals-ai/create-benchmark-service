@@ -161,15 +161,19 @@ class DaytonaSandbox(Sandbox):
     def state(self) -> str:
         return str(self._sandbox.state)
 
+    @property
+    def _sandbox_ref(self) -> str:
+        return f"name={self.name}, id={self.id}"
+
     def _removed_error(self) -> SandboxNotFoundError:
-        return SandboxNotFoundError(f"Sandbox {self.name} {self.id} has been deleted.")
+        return SandboxNotFoundError(f"Sandbox not found: {self._sandbox_ref}.")
 
     def _sandbox_error(self, exc: DaytonaError | ClientResponseError) -> SandboxError:
         if _is_not_found_error(exc):
             return self._removed_error()
         if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS):
-            return SandboxConnectionError(str(exc))
-        return SandboxError(str(exc))
+            return SandboxConnectionError(f"Sandbox connection error for {self._sandbox_ref}: {exc}")
+        return SandboxError(f"Sandbox operation failed for {self._sandbox_ref}: {exc}")
 
     @_PROVIDER_RETRY
     async def exec(
@@ -259,11 +263,15 @@ class DaytonaSandbox(Sandbox):
                 handle = await self._reconnect_pty(session_id, on_data)
                 await asyncio.sleep(1)
             else:
-                raise SandboxConnectionError("Daytona PTY closed before writing exit code")
+                raise SandboxConnectionError(
+                    f"Daytona PTY command did not write an exit code for {self._sandbox_ref}: session_id={session_id}"
+                )
 
             result = await self.exec(f"cat {shlex.quote(status_path)}")
             if result.exit_code != 0 or not result.output:
-                raise SandboxError("Failed to read Daytona PTY exit code")
+                raise SandboxError(
+                    f"Failed to read Daytona PTY exit code for {self._sandbox_ref}: status_path={status_path}"
+                )
             return ExecResult(exit_code=int(result.output.strip()), output="".join(stdout))
         except DaytonaError as exc:
             raise self._sandbox_error(exc) from exc
@@ -305,11 +313,15 @@ class DaytonaSandbox(Sandbox):
                 await handle.wait()
             return handle
         except DaytonaNotFoundError as exc:
-            raise SandboxError(f"Daytona PTY session {session_id} no longer exists") from exc
+            raise SandboxError(
+                f"Daytona PTY session no longer exists for {self._sandbox_ref}: session_id={session_id}"
+            ) from exc
         except DaytonaConnectionError as exc:
             await self._check_sandbox_alive()
             if "not found" in str(exc).lower():
-                raise SandboxError(f"Daytona PTY session {session_id} no longer exists") from exc
+                raise SandboxError(
+                    f"Daytona PTY session no longer exists for {self._sandbox_ref}: session_id={session_id}"
+                ) from exc
             raise self._sandbox_error(exc) from exc
         except DaytonaError as exc:
             await self._check_sandbox_alive()
@@ -325,7 +337,7 @@ class DaytonaSandbox(Sandbox):
         if self._sandbox.state in _DEAD_SANDBOX_STATES:
             if self._sandbox.state in _REMOVED_SANDBOX_STATES:
                 raise self._removed_error()
-            raise SandboxError(f"Sandbox {self.name} crashed during command execution (state: {self.state})")
+            raise SandboxError(f"Sandbox is not running: {self._sandbox_ref}, state={self.state}.")
 
 
 class DaytonaSandboxProvider(SandboxProvider):
@@ -341,8 +353,8 @@ class DaytonaSandboxProvider(SandboxProvider):
 
     def _sandbox_error(self, exc: DaytonaError) -> SandboxError:
         if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS):
-            return SandboxConnectionError(str(exc))
-        return SandboxError(str(exc))
+            return SandboxConnectionError(f"Daytona sandbox provider connection error: {exc}")
+        return SandboxError(f"Daytona sandbox provider error: {exc}")
 
     @_PROVIDER_RETRY
     async def create_sandbox(self, request: SandboxCreateRequest) -> DaytonaSandbox:
@@ -408,7 +420,7 @@ class DaytonaSandboxProvider(SandboxProvider):
         try:
             return DaytonaSandbox(await self._daytona.get(instance_id))
         except DaytonaNotFoundError as exc:
-            raise SandboxNotFoundError(str(exc)) from exc
+            raise SandboxNotFoundError(f"Sandbox not found: id_or_name={instance_id}.") from exc
         except DaytonaError as exc:
             raise self._sandbox_error(exc) from exc
 

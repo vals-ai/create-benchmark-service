@@ -367,7 +367,7 @@ async def test_daytona_exec_raises_sandbox_not_found_when_removed() -> None:
     inner.process = RemovedSandboxProcess()
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    with pytest.raises(SandboxNotFoundError, match="Sandbox sandbox-name sandbox-id has been deleted"):
+    with pytest.raises(SandboxNotFoundError, match="Sandbox not found: name=sandbox-name, id=sandbox-id\\."):
         await sandbox.exec("pytest")
 
 
@@ -382,10 +382,10 @@ async def test_daytona_file_operations_raise_sandbox_not_found_when_removed() ->
     inner.fs = RemovedSandboxFiles()
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    with pytest.raises(SandboxNotFoundError, match="Sandbox sandbox-name sandbox-id has been deleted"):
+    with pytest.raises(SandboxNotFoundError, match="Sandbox not found: name=sandbox-name, id=sandbox-id\\."):
         await sandbox.upload_file("/tmp/result.txt", b"hello world")
 
-    with pytest.raises(SandboxNotFoundError, match="Sandbox sandbox-name sandbox-id has been deleted"):
+    with pytest.raises(SandboxNotFoundError, match="Sandbox not found: name=sandbox-name, id=sandbox-id\\."):
         await sandbox.download_file("/tmp/result.txt")
 
 
@@ -399,7 +399,7 @@ async def test_daytona_command_raises_sandbox_not_found_when_removed() -> None:
     inner.process = CreatePtyFailureProcess()
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    with pytest.raises(SandboxNotFoundError, match="Sandbox sandbox-name sandbox-id has been deleted"):
+    with pytest.raises(SandboxNotFoundError, match="Sandbox not found: name=sandbox-name, id=sandbox-id\\."):
         _ = [chunk async for chunk in sandbox.command("pytest")]
 
 
@@ -436,7 +436,7 @@ async def test_daytona_command_checks_sandbox_health_before_reconnecting() -> No
     inner.state = SandboxState.DESTROYED
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    with pytest.raises(SandboxNotFoundError, match="Sandbox sandbox-name sandbox-id has been deleted"):
+    with pytest.raises(SandboxNotFoundError, match="Sandbox not found: name=sandbox-name, id=sandbox-id\\."):
         _ = [chunk async for chunk in sandbox.command("printf hello")]
 
     assert inner.refresh_count == 1
@@ -448,7 +448,7 @@ async def test_daytona_command_checks_sandbox_health_after_pty_create_failure() 
     inner.state = SandboxState.DESTROYED
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    with pytest.raises(SandboxNotFoundError, match="Sandbox sandbox-name sandbox-id has been deleted"):
+    with pytest.raises(SandboxNotFoundError, match="Sandbox not found: name=sandbox-name, id=sandbox-id\\."):
         _ = [chunk async for chunk in sandbox.command("printf hello")]
 
     assert inner.refresh_count == 1
@@ -459,7 +459,7 @@ async def test_daytona_command_checks_sandbox_health_after_reconnect_failure() -
     inner.process = CrashingReconnectProcess(inner)
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    with pytest.raises(SandboxNotFoundError, match="Sandbox sandbox-name sandbox-id has been deleted"):
+    with pytest.raises(SandboxNotFoundError, match="Sandbox not found: name=sandbox-name, id=sandbox-id\\."):
         _ = [chunk async for chunk in sandbox.command("printf hello")]
 
     assert inner.refresh_count == 2
@@ -476,7 +476,7 @@ async def test_daytona_command_keeps_error_state_as_sandbox_error() -> None:
     inner.state = SandboxState.ERROR
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    with pytest.raises(SandboxError, match="crashed during command execution"):
+    with pytest.raises(SandboxError, match="Sandbox is not running: name=sandbox-name, id=sandbox-id"):
         _ = [chunk async for chunk in sandbox.command("printf hello")]
 
 

@@ -182,9 +182,7 @@ class DaytonaSandbox(Sandbox):
         full_command = _command(command, cwd, timeout)
         try:
             result = await self._sandbox.process.exec(full_command)
-        except DaytonaError as exc:
-            raise self._sandbox_error(exc) from exc
-        except ClientResponseError as exc:
+        except (DaytonaError, ClientResponseError) as exc:
             raise self._sandbox_error(exc) from exc
 
         return ExecResult(exit_code=result.exit_code, output=result.result or "")
@@ -230,9 +228,7 @@ class DaytonaSandbox(Sandbox):
         try:
             stream = await self._sandbox.fs.download_file_stream(remote_path)
             return b"".join([chunk async for chunk in stream])
-        except DaytonaError as exc:
-            raise self._sandbox_error(exc) from exc
-        except ClientResponseError as exc:
+        except (DaytonaError, ClientResponseError) as exc:
             raise self._sandbox_error(exc) from exc
 
     async def _exec_pty(self, command: str, output: asyncio.Queue[str]) -> ExecResult:
@@ -421,19 +417,13 @@ class DaytonaSandboxProvider(SandboxProvider):
     async def delete_sandbox(self, instance_id: str) -> None:
         try:
             sandbox = await self._daytona.get(instance_id)
-            if sandbox.state in (SandboxState.DESTROYING, SandboxState.DESTROYED):
+            if sandbox.state not in (*_REMOVED_SANDBOX_STATES, *_FAILED_SANDBOX_STATES):
+                await sandbox.wait_for_sandbox_start(timeout=0)
+                await sandbox.refresh_data()
+            if sandbox.state in _REMOVED_SANDBOX_STATES:
                 return
-            if sandbox.state in _FAILED_SANDBOX_STATES:
-                await self._daytona.delete(sandbox)
-                return
-            await sandbox.wait_for_sandbox_start(timeout=0)
-            await sandbox.refresh_data()
-            if sandbox.state in (SandboxState.DESTROYING, SandboxState.DESTROYED):
-                return
-            if sandbox.state in _FAILED_SANDBOX_STATES:
-                await self._daytona.delete(sandbox)
-                return
-            await sandbox.set_autostop_interval(interval=1)
+            if sandbox.state not in _FAILED_SANDBOX_STATES:
+                await sandbox.set_autostop_interval(interval=1)
             await self._daytona.delete(sandbox)
         except DaytonaNotFoundError:
             return

@@ -253,6 +253,12 @@ class ErrorStateSandbox(InnerSandbox):
         raise DaytonaError("sandbox failed to start")
 
 
+class RefreshToErrorSandbox(InnerSandbox):
+    async def refresh_data(self) -> None:
+        await super().refresh_data()
+        self.state = SandboxState.ERROR
+
+
 class DaytonaClient:
     def __init__(self, sandbox: InnerSandbox) -> None:
         self.sandbox = sandbox
@@ -543,6 +549,22 @@ async def test_daytona_provider_delete_removes_error_state_sandbox() -> None:
 
     await _provider(daytona).delete_sandbox(inner.name)
 
+    assert daytona.deleted is True
+
+
+async def test_daytona_provider_delete_removes_sandbox_that_fails_after_refresh() -> None:
+    """Sandbox state can change after the initial get and still be deletable.
+
+    Test cases:
+    - A sandbox that refreshes into SandboxState.ERROR is deleted without setting autostop.
+    """
+    inner = RefreshToErrorSandbox()
+    daytona = DaytonaClient(inner)
+
+    await _provider(daytona).delete_sandbox(inner.name)
+
+    assert inner.refresh_count == 1
+    assert inner.autostop_interval is None
     assert daytona.deleted is True
 
 

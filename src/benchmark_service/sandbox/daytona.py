@@ -51,6 +51,7 @@ _STATUS_DIR = "/tmp/.sandbox-provider"
 _REMOVED_SANDBOX_STATES = (SandboxState.DESTROYING, SandboxState.DESTROYED)
 _FAILED_SANDBOX_STATES = (SandboxState.ERROR, SandboxState.BUILD_FAILED)
 _DEAD_SANDBOX_STATES = (*_REMOVED_SANDBOX_STATES, SandboxState.STOPPED, *_FAILED_SANDBOX_STATES)
+_SANDBOX_OPERATION_ERRORS = (DaytonaError, ClientResponseError)
 _TRANSIENT_DAYTONA_ERRORS = (DaytonaConnectionError, DaytonaRateLimitError, DaytonaTimeoutError)
 _RETRY_AFTER_PREFIX = "retry-after-"
 _KNOWN_THROTTLERS = ("sandbox-create", "sandbox-lifecycle", "authenticated", "anonymous")
@@ -186,7 +187,7 @@ class DaytonaSandbox(Sandbox):
         full_command = _command(command, cwd, timeout)
         try:
             result = await self._sandbox.process.exec(full_command)
-        except (DaytonaError, ClientResponseError) as exc:
+        except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
 
         return ExecResult(exit_code=result.exit_code, output=result.result or "")
@@ -224,7 +225,7 @@ class DaytonaSandbox(Sandbox):
     async def upload_file(self, remote_path: str, content: bytes) -> None:
         try:
             await self._sandbox.fs.upload_file(content, remote_path)
-        except DaytonaError as exc:
+        except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
 
     @_PROVIDER_RETRY
@@ -232,7 +233,7 @@ class DaytonaSandbox(Sandbox):
         try:
             stream = await self._sandbox.fs.download_file_stream(remote_path)
             return b"".join([chunk async for chunk in stream])
-        except (DaytonaError, ClientResponseError) as exc:
+        except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
 
     async def _exec_pty(self, command: str, output: asyncio.Queue[str]) -> ExecResult:
@@ -273,7 +274,7 @@ class DaytonaSandbox(Sandbox):
                     f"Failed to read Daytona PTY exit code for {self._sandbox_ref}: status_path={status_path}"
                 )
             return ExecResult(exit_code=int(result.output.strip()), output="".join(stdout))
-        except DaytonaError as exc:
+        except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
         finally:
             if handle:
@@ -296,7 +297,7 @@ class DaytonaSandbox(Sandbox):
                 on_data=on_data,
                 envs={"TERM": "dumb", "LANG": "C.UTF-8"},
             )
-        except DaytonaError as exc:
+        except _SANDBOX_OPERATION_ERRORS as exc:
             await self._check_sandbox_alive()
             raise self._sandbox_error(exc) from exc
 
@@ -323,7 +324,7 @@ class DaytonaSandbox(Sandbox):
                     f"Daytona PTY session no longer exists for {self._sandbox_ref}: session_id={session_id}"
                 ) from exc
             raise self._sandbox_error(exc) from exc
-        except DaytonaError as exc:
+        except _SANDBOX_OPERATION_ERRORS as exc:
             await self._check_sandbox_alive()
             raise self._sandbox_error(exc) from exc
 
@@ -331,7 +332,7 @@ class DaytonaSandbox(Sandbox):
     async def _check_sandbox_alive(self) -> None:
         try:
             await self._sandbox.refresh_data()
-        except DaytonaError as exc:
+        except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
 
         if self._sandbox.state in _DEAD_SANDBOX_STATES:

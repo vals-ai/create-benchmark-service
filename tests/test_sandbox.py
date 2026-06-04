@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, cast
 
 import pytest
-from aiohttp import ClientResponseError
+from aiohttp import ClientResponseError, RequestInfo
 from daytona import SandboxState
 from daytona.common.errors import (
     DaytonaConflictError,
@@ -12,6 +12,8 @@ from daytona.common.errors import (
     DaytonaNotFoundError,
     DaytonaRateLimitError,
 )
+from multidict import CIMultiDict, CIMultiDictProxy
+from yarl import URL
 
 from benchmark_service.sandbox import (
     ImageSource,
@@ -22,6 +24,13 @@ from benchmark_service.sandbox import (
     SandboxQuery,
 )
 from benchmark_service.sandbox.daytona import DaytonaSandbox, DaytonaSandboxProvider, daytona_retry_after_seconds
+
+
+def _client_response_error(status: int, message: str) -> ClientResponseError:
+    url = URL("https://daytona.example.test")
+    headers: CIMultiDict[str] = CIMultiDict()
+    request_info = RequestInfo(url=url, method="GET", headers=CIMultiDictProxy(headers), real_url=url)
+    return ClientResponseError(request_info, (), status=status, message=message)
 
 
 class Process:
@@ -198,11 +207,11 @@ class Files:
 
 class RemovedSandboxFiles(Files):
     async def upload_file(self, content: bytes, remote_path: str) -> None:
-        raise DaytonaError("sandbox not found", status_code=404, error_code="NOT_FOUND")
+        raise _client_response_error(status=404, message="Not Found")
 
     async def download_file_stream(self, remote_path: str) -> Any:
         async def chunks() -> Any:
-            raise ClientResponseError(None, (), status=404, message="Not Found")
+            raise _client_response_error(status=404, message="Not Found")
             yield b""
 
         return chunks()

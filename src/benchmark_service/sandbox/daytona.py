@@ -322,10 +322,9 @@ class DaytonaSandbox(Sandbox):
         except DaytonaError as exc:
             raise self._sandbox_error(exc) from exc
 
-        if self._sandbox.state in _REMOVED_SANDBOX_STATES:
-            raise self._removed_error()
-
         if self._sandbox.state in _DEAD_SANDBOX_STATES:
+            if self._sandbox.state in _REMOVED_SANDBOX_STATES:
+                raise self._removed_error()
             raise SandboxError(f"Sandbox {self.name} crashed during command execution (state: {self.state})")
 
 

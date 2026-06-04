@@ -304,6 +304,11 @@ class CreateFailureDaytonaClient(DaytonaClient):
         raise DaytonaError("sandbox failed to start")
 
 
+class CreateNotFoundDaytonaClient(CreateFailureDaytonaClient):
+    async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
+        raise DaytonaError("sandbox not found", status_code=404)
+
+
 def _provider(daytona: DaytonaClient) -> DaytonaSandboxProvider:
     provider = DaytonaSandboxProvider.__new__(DaytonaSandboxProvider)
     provider._daytona = cast(Any, daytona)  # pyright: ignore[reportPrivateUsage]
@@ -544,6 +549,18 @@ async def test_daytona_provider_create_maps_daytona_errors() -> None:
     daytona = CreateFailureDaytonaClient(InnerSandbox())
 
     with pytest.raises(SandboxError, match="sandbox failed to start"):
+        await _provider(daytona).create_sandbox(_request("sandbox-name"))
+
+
+async def test_daytona_provider_create_maps_not_found_errors() -> None:
+    """Create races with deleted Daytona sandboxes should preserve not-found semantics.
+
+    Test cases:
+    - A not-found Daytona create failure raises SandboxNotFoundError instead of generic SandboxError.
+    """
+    daytona = CreateNotFoundDaytonaClient(InnerSandbox())
+
+    with pytest.raises(SandboxNotFoundError, match="Sandbox not found: sandbox not found"):
         await _provider(daytona).create_sandbox(_request("sandbox-name"))
 
 

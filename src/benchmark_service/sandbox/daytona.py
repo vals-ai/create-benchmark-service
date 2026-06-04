@@ -353,6 +353,8 @@ class DaytonaSandboxProvider(SandboxProvider):
         )
 
     def _sandbox_error(self, exc: DaytonaError) -> SandboxError:
+        if _is_not_found_error(exc):
+            return SandboxNotFoundError(f"Sandbox not found: {exc}")
         if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS):
             return SandboxConnectionError(f"Daytona sandbox provider connection error: {exc}")
         return SandboxError(f"Daytona sandbox provider error: {exc}")

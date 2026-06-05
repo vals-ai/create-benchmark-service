@@ -56,6 +56,8 @@ _TRANSIENT_DAYTONA_ERRORS = (DaytonaConnectionError, DaytonaRateLimitError, Dayt
 _RETRY_AFTER_PREFIX = "retry-after-"
 _KNOWN_THROTTLERS = ("sandbox-create", "sandbox-lifecycle", "authenticated", "anonymous")
 _DELETE_CONFLICT_MESSAGES = ("state change in progress", "modified by another operation")
+_REMOVED_SANDBOX_CLIENT_STATUSES = (404, 502)
+_FAILED_EXECUTE_COMMAND_PREFIX = "failed to execute command:"
 _FIXED_PROVIDER_WAIT = wait_fixed(2)
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
 
@@ -91,12 +93,16 @@ def _is_delete_conflict(exc: DaytonaConflictError) -> bool:
 
 def _is_not_found_error(exc: DaytonaError | ClientResponseError) -> bool:
     if isinstance(exc, ClientResponseError):
-        return exc.status == 404
+        return exc.status in _REMOVED_SANDBOX_CLIENT_STATUSES
     return (
         isinstance(exc, DaytonaNotFoundError)
         or exc.status_code == 404
         or (exc.error_code is not None and exc.error_code.upper() == "NOT_FOUND")
     )
+
+
+def _is_failed_execute_command_error(exc: DaytonaError | ClientResponseError) -> bool:
+    return isinstance(exc, DaytonaError) and str(exc).strip().lower() == _FAILED_EXECUTE_COMMAND_PREFIX
 
 
 def _parse_retry_after_seconds(value: object) -> float | None:
@@ -172,7 +178,7 @@ class DaytonaSandbox(Sandbox):
     def _sandbox_error(self, exc: DaytonaError | ClientResponseError) -> SandboxError:
         if _is_not_found_error(exc):
             return self._removed_error()
-        if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS):
+        if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS) or _is_failed_execute_command_error(exc):
             return SandboxConnectionError(f"Sandbox connection error for {self._sandbox_ref}: {exc}")
         return SandboxError(f"Sandbox operation failed for {self._sandbox_ref}: {exc}")
 

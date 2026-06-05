@@ -10,7 +10,6 @@ from contextlib import asynccontextmanager, suppress
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
-from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
 from starlette.websockets import WebSocketDisconnect
 from uvicorn.protocols.utils import ClientDisconnected
@@ -36,18 +35,9 @@ from benchmark_service.schemas import (
 )
 from benchmark_service.trial import (
     sanitize_v1_dataset_tasks_response,
-    sanitize_v1_eval_response,
-    sanitize_v1_score_response,
 )
 from benchmark_service.v1_schemas import (
     V1DatasetTasksResponse,
-    V1EvalRequest,
-    V1EvalResponse,
-    V1EvalStatus,
-    V1PayloadType,
-    V1ScoreItem,
-    V1ScoreRequest,
-    V1ScoreResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -87,7 +77,7 @@ def _is_trial_tenant(tenant: str | None) -> bool:
 
 # Lab-facing /v1 endpoints a trial tenant may reach. Deny-by-default: add new
 # trial-accessible endpoints here so they don't silently auto-expose.
-_TRIAL_ALLOWED_PATH = re.compile(r"/v1/(?:evaluate|score|datasets/[^/]+/tasks)")
+_TRIAL_ALLOWED_PATH = re.compile(r"/v1/datasets/[^/]+/tasks")
 
 
 def _trial_tenant_may_access_path(path: str) -> bool:
@@ -109,21 +99,6 @@ def _get_service_metadata(service_cls: type[BenchmarkService]) -> tuple[str | No
         return dist_name, importlib.metadata.version(dist_name)
     except importlib.metadata.PackageNotFoundError:
         return None, None
-
-
-def _v1_score_item_to_eval_result(task_id: str, item: V1ScoreItem | None) -> dict[str, Any] | None:
-    if item is None:
-        return None
-
-    result: dict[str, Any] = {
-        "task_id": task_id,
-        "status": item.status.value,
-        "result": jsonable_encoder(item.result),
-    }
-    if item.errors:
-        # Runner-side EvalResult.error is str | None, so v1's error list collapses here.
-        result["error"] = "; ".join(item.errors)
-    return result
 
 
 class BenchmarkServiceApp(FastAPI):
@@ -173,8 +148,6 @@ class BenchmarkServiceApp(FastAPI):
         self.add_api_websocket_route("/ws/evaluate-response", self._evaluate_response_stream)
         self.add_api_websocket_route("/ws/evaluate-instance", self._evaluate_instance)
         self.add_api_route("/final-score/", self._final_score, methods=["POST"])
-        self.add_api_route("/v1/evaluate", self._v1_evaluate, methods=["POST"], response_model=V1EvalResponse)
-        self.add_api_route("/v1/score", self._v1_score, methods=["POST"], response_model=V1ScoreResponse)
         self.add_api_route(
             "/v1/datasets/{dataset}/tasks",
             self._v1_list_dataset_tasks,
@@ -363,66 +336,6 @@ class BenchmarkServiceApp(FastAPI):
         finally:
             with suppress(RuntimeError):
                 await websocket.close()
-
-    async def _v1_evaluate(self, request: Request, body: V1EvalRequest) -> V1EvalResponse:
-        _require_descope_tenant(request.state.tenant)
-        if body.payload.type != V1PayloadType.TEXT:
-            raise HTTPException(
-                status_code=400,
-                detail=f"payload.type={body.payload.type.value} not supported; only 'text' is implemented in v1",
-            )
-        if not await self.service.check_dataset_access(request.state.tenant, body.dataset):
-            raise HTTPException(status_code=403, detail="Dataset not allowed")
-
-        internal_req = EvaluateResponseRequest(
-            task_id=body.task_id,
-            response=body.payload.data,
-            dataset=body.dataset,
-        )
-        try:
-            raw_result = await self.service.evaluate_response(internal_req, dataset=body.dataset)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("v1/evaluate failed for run_id=%s task_id=%s", body.run_id, body.task_id)
-            response = V1EvalResponse(
-                run_id=body.run_id,
-                task_id=body.task_id,
-                status=V1EvalStatus.ERROR,
-                evaluator_version=self._service_version,
-                errors=[str(exc)],
-            )
-        else:
-            response = V1EvalResponse(
-                run_id=body.run_id,
-                task_id=body.task_id,
-                status=V1EvalStatus.EVALUATED,
-                evaluator_version=self._service_version,
-                result=jsonable_encoder(raw_result),
-                errors=[],
-            )
-        if _is_trial_tenant(request.state.tenant):
-            return sanitize_v1_eval_response(response, self.service.project_trial_result)
-        return response
-
-    async def _v1_score(self, request: Request, body: V1ScoreRequest) -> V1ScoreResponse:
-        _require_descope_tenant(request.state.tenant)
-        if not await self.service.check_dataset_access(request.state.tenant, body.dataset):
-            raise HTTPException(status_code=403, detail="Dataset not allowed")
-
-        normalized_results = {
-            task_id: _v1_score_item_to_eval_result(task_id, item)
-            for task_id, item in body.evaluation_results.items()
-        }
-        tasks_evaluated = await self.service.validate_task_ids(list(normalized_results.keys()), dataset=body.dataset)
-        result = await self.service.calculate_final_score(normalized_results, dataset=body.dataset)
-        response = V1ScoreResponse(
-            run_id=body.run_id,
-            tasks_evaluated=tasks_evaluated,
-            final_score=result.score,
-            metadata=result.metadata,
-        )
-        if _is_trial_tenant(request.state.tenant):
-            return sanitize_v1_score_response(response)
-        return response
 
     async def _v1_list_dataset_tasks(self, request: Request, dataset: str) -> V1DatasetTasksResponse:
         _require_descope_tenant(request.state.tenant)

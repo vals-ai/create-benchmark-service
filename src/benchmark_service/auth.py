@@ -33,8 +33,8 @@ class TenantConfig(BaseModel):
     trial_mode: bool = Field(
         default=False,
         description=(
-            "If true, responses on /v1/evaluate and /v1/score are sanitized to "
-            "score-only fields. Set this on prospects' tenants in allowlist.yaml."
+            "If true, tenants are restricted to approved trial-safe /v1 endpoints. "
+            "Set this on prospects' tenants in allowlist.yaml."
         ),
     )
 

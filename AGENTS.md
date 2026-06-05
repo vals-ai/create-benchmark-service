@@ -31,3 +31,4 @@ The "public surface" is defined in `docs/DEVELOPMENT.md`. In short: `BenchmarkSe
 - Schema field changes: adding a field with a default = `#minor`; removing or renaming = `#major`.
 - Don't modify the auto-generated `_version.py` — `hatch-vcs` derives it from git tags.
 - The `/v1/*` surface is Descope-only by design; legacy `BENCHMARK_API_KEY` callers should 403, not pass through.
+- When removing endpoints, delete tests that reference the dead endpoint paths; keep tests focused on live behavior.

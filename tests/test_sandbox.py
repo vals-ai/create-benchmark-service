@@ -72,6 +72,28 @@ class RateLimitedProcess(Process):
         return await super().exec(command)
 
 
+class FailedExecuteCommandProcess(Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        self.attempts += 1
+        if self.attempts == 1:
+            raise DaytonaError("Failed to execute command:")
+        return await super().exec(command)
+
+
+class DetailedFailedExecuteCommandProcess(Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        self.attempts += 1
+        raise DaytonaError("Failed to execute command: permission denied")
+
+
 class RemovedSandboxProcess(Process):
     async def exec(self, command: str) -> SimpleNamespace:
         raise DaytonaNotFoundError("sandbox not found")
@@ -211,7 +233,7 @@ class RemovedSandboxFiles(Files):
 
     async def download_file_stream(self, remote_path: str) -> Any:
         async def chunks() -> Any:
-            raise _client_response_error(status=404, message="Not Found")
+            raise _client_response_error(status=502, message="Bad Gateway")
             yield b""
 
         return chunks()
@@ -371,6 +393,42 @@ async def test_daytona_exec_retries_rate_limits() -> None:
     assert process.attempts == 2
 
 
+async def test_daytona_exec_retries_failed_execute_command_errors() -> None:
+    """Blank Daytona exec failures should be retried because they are usually transient.
+
+    Test cases:
+    - A generic DaytonaError with "Failed to execute command:" is retried.
+    - The retry returns the successful exec result instead of surfacing SandboxError.
+    """
+    inner = InnerSandbox()
+    process = FailedExecuteCommandProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    result = await sandbox.exec("pytest")
+
+    assert result.exit_code == 0
+    assert process.attempts == 2
+
+
+async def test_daytona_exec_does_not_retry_detailed_execute_command_errors() -> None:
+    """Detailed Daytona exec failures should not be retried as transient blank errors.
+
+    Test cases:
+    - A DaytonaError with details after "Failed to execute command:" raises SandboxError.
+    - The detailed error is attempted once instead of being retried.
+    """
+    inner = InnerSandbox()
+    process = DetailedFailedExecuteCommandProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxError, match="permission denied"):
+        await sandbox.exec("pytest")
+
+    assert process.attempts == 1
+
+
 async def test_daytona_exec_raises_sandbox_not_found_when_removed() -> None:
     """Exec failures from removed Daytona sandboxes should use the provider not-found type.
 
@@ -390,7 +448,7 @@ async def test_daytona_file_operations_raise_sandbox_not_found_when_removed() ->
 
     Test cases:
     - A Daytona not-found response from file upload raises SandboxNotFoundError with sandbox identity.
-    - A Daytona not-found response from file download raises SandboxNotFoundError with sandbox identity.
+    - A Daytona proxy 502 from file download raises SandboxNotFoundError with sandbox identity.
     """
     inner = InnerSandbox()
     inner.fs = RemovedSandboxFiles()

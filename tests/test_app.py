@@ -11,8 +11,16 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from benchmark_service import auth as auth_module
-from benchmark_service.app import BenchmarkServiceApp
-from benchmark_service.app import send_json_if_connected
+from benchmark_service.app import BenchmarkServiceApp, send_json_if_connected
+from benchmark_service.sandbox.modal import ModalProviderConfig
+from benchmark_service.sandbox.types import (
+    ExecResult,
+    Sandbox,
+    SandboxCreateRequest,
+    SandboxProvider,
+    SandboxQuery,
+)
+from benchmark_service.schemas import StreamResultChunk
 from tests.conftest import StubBenchmark
 
 
@@ -183,6 +191,90 @@ def test_websocket_evaluate_response_with_eval_resume_state(client: TestClient) 
                 "state": {"artifact_prefix": "s3://bucket/run"},
             },
         }
+
+
+def test_websocket_setup_task_uses_request_sandbox_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sandbox-backed websocket routes should create providers from the request body.
+
+    Test cases:
+    - A Modal provider literal selects the request config without provider headers.
+    - The benchmark service only receives the resolved sandbox instance.
+    """
+
+    class FakeSandbox(Sandbox):
+        @property
+        def id(self) -> str:
+            return "modal-sandbox-id"
+
+        @property
+        def name(self) -> str:
+            return "modal-sandbox-name"
+
+        @property
+        def state(self) -> str:
+            return "running"
+
+        async def exec(self, command: str, *, cwd: str | None = None, timeout: float | None = None) -> ExecResult:
+            return ExecResult(exit_code=0, output="")
+
+        async def upload_file(self, remote_path: str, content: bytes) -> None:
+            pass
+
+        async def download_file(self, remote_path: str) -> bytes:
+            return b""
+
+        async def command(self, command: str, *, cwd: str | None = None, timeout: float | None = None):
+            if False:
+                yield ""
+
+    class FakeProvider(SandboxProvider):
+        async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
+            return FakeSandbox()
+
+        async def get_sandbox(self, instance_id: str) -> Sandbox:
+            assert instance_id == "i-1"
+            return FakeSandbox()
+
+        async def delete_sandbox(self, instance_id: str) -> None:
+            pass
+
+        async def list_sandboxes(self, query: SandboxQuery):
+            if False:
+                yield FakeSandbox()
+
+        async def close(self) -> None:
+            pass
+
+    selected_configs: list[ModalProviderConfig] = []
+    received_sandbox_names: list[str] = []
+
+    def create_provider(config: ModalProviderConfig) -> SandboxProvider:
+        selected_configs.append(config)
+        return FakeProvider()
+
+    class RuntimeBackendBenchmark(StubBenchmark):
+        async def setup_task(self, task_id: str, sandbox: Sandbox, dataset: str | None = None):
+            received_sandbox_names.append(sandbox.name)
+            yield StreamResultChunk(type="result", data={"task_id": task_id, "sandbox_name": sandbox.name})
+
+    monkeypatch.setattr(ModalProviderConfig, "create_provider", create_provider)
+
+    with TestClient(BenchmarkServiceApp(RuntimeBackendBenchmark)) as c:
+        with c.websocket_connect("/ws/setup-task") as ws:
+            ws.send_json(
+                {
+                    "task_id": "task-1",
+                    "instance_id": "i-1",
+                    "sandbox_provider": {"type": "modal"},
+                }
+            )
+            assert ws.receive_json() == {
+                "type": "result",
+                "data": {"task_id": "task-1", "sandbox_name": "modal-sandbox-name"},
+            }
+
+    assert selected_configs == [ModalProviderConfig()]
+    assert received_sandbox_names == ["modal-sandbox-name"]
 
 
 async def test_send_json_if_connected_handles_disconnect() -> None:

@@ -41,21 +41,6 @@ class SandboxQuery(BaseModel):
     page_size: int = 10
 
 
-class DaytonaBackendConfig(BaseModel):
-    type: Literal["daytona"] = "daytona"
-    api_key: str
-    api_url: str
-    target: str
-
-    def create_provider(self) -> SandboxProvider:
-        from benchmark_service.sandbox.daytona import DaytonaSandboxProvider
-
-        return DaytonaSandboxProvider(self)
-
-
-SandboxBackendConfig = DaytonaBackendConfig
-
-
 class MissingSandboxConfigError(ValueError):
     pass
 

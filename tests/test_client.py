@@ -6,15 +6,24 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import benchmark_service.sandbox as sandbox_module
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
-from benchmark_service.sandbox import sandbox_config_from_headers
-from benchmark_service.sandbox.types import DaytonaBackendConfig
+from benchmark_service.sandbox import (
+    SandboxProviderConfig,
+    sandbox_config_from_headers,
+    sandbox_provider_config_from_mapping,
+)
+from benchmark_service.sandbox.daytona import DaytonaProviderConfig
+from benchmark_service.sandbox.modal import ModalProviderConfig
 from benchmark_service.v1_schemas import V1DatasetTasksResponse
 
 BASE_URL = "http://localhost:8000"
 HEADERS = {"Authorization": "Bearer token"}
-DAYTONA_HEADERS = {"x-api-key": "key", "x-api-url": "url", "x-target": "target"}
+DAYTONA_HEADERS = {
+    "x-sandbox-provider": "daytona",
+    "x-api-key": "key",
+    "x-api-url": "url",
+    "x-target": "target",
+}
 
 
 def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "error") -> MagicMock:
@@ -25,21 +34,38 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
     return resp
 
 
-def test_sandbox_config_from_headers(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sandbox_module, "_PROVIDER", "daytona")
-
-    assert sandbox_config_from_headers(DAYTONA_HEADERS) == DaytonaBackendConfig(
+def test_sandbox_config_from_headers() -> None:
+    assert sandbox_config_from_headers(DAYTONA_HEADERS) == DaytonaProviderConfig(
         api_key="key",
         api_url="url",
         target="target",
     )
+    assert sandbox_config_from_headers({"x-sandbox-provider": "modal"}) == ModalProviderConfig()
 
 
-def test_sandbox_config_rejects_unknown_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sandbox_module, "_PROVIDER", "modal")
+def test_sandbox_provider_config_from_mapping() -> None:
+    """Provider config parsing should be provider-neutral for callers.
 
-    with pytest.raises(ValueError, match="Unknown sandbox provider: modal"):
-        sandbox_config_from_headers({})
+    Test cases:
+    - Discriminated mapping validates Daytona provider config.
+    - Discriminated mapping validates Modal provider config.
+    """
+    configs: list[SandboxProviderConfig] = [
+        sandbox_provider_config_from_mapping(
+            {"type": "daytona", "api_key": "key", "api_url": "url", "target": "target"}
+        ),
+        sandbox_provider_config_from_mapping({"type": "modal"}),
+    ]
+
+    assert configs == [
+        DaytonaProviderConfig(api_key="key", api_url="url", target="target"),
+        ModalProviderConfig(),
+    ]
+
+
+def test_sandbox_config_rejects_unknown_provider() -> None:
+    with pytest.raises(ValueError, match="Unknown sandbox provider: unknown"):
+        sandbox_config_from_headers({"x-sandbox-provider": "unknown"})
 
 
 @pytest.mark.parametrize(
@@ -259,8 +285,33 @@ async def test_websocket_request_includes_null_optional_fields() -> None:
     assert json.loads(ws.send.call_args.args[0]) == {
         "task_id": "task-1",
         "instance_id": "inst-1",
+        "sandbox_provider": None,
         "dataset": None,
     }
+
+
+async def test_websocket_request_includes_sandbox_provider() -> None:
+    """Client websocket helpers should include the requested sandbox provider.
+
+    Test cases:
+    - setup_task serializes a Modal provider selected by the caller.
+    - evaluate_instance serializes the same provider shape.
+    """
+    for method in ("setup_task", "evaluate_instance"):
+        messages = [json.dumps({"type": "result", "data": {"status": "ok"}})]
+        mock_connect = _ws_mock(messages)
+
+        client = _make_client()
+        with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+            await getattr(client, method)("task-1", "inst-1", sandbox_provider=ModalProviderConfig())
+
+        ws = mock_connect.__aenter__.return_value
+        assert json.loads(ws.send.call_args.args[0]) == {
+            "task_id": "task-1",
+            "instance_id": "inst-1",
+            "sandbox_provider": {"type": "modal"},
+            "dataset": None,
+        }
 
 
 async def test_verify_task_ids_no_dataset_omitted(

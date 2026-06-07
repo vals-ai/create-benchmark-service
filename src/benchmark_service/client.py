@@ -13,7 +13,7 @@ from tenacity import (
     wait_random,
 )
 
-from benchmark_service.sandbox import SandboxProvider, sandbox_config_from_headers
+from benchmark_service.sandbox import SandboxProvider, SandboxProviderConfig, sandbox_config_from_headers
 from benchmark_service.schemas import (
     EvaluateInstanceRequest,
     EvaluateResponseRequest,
@@ -242,6 +242,7 @@ class BenchmarkServiceClient:
         instance_id: str,
         on_message: Callable[[str], None] | None = None,
         dataset: str | None = None,
+        sandbox_provider: SandboxProviderConfig | None = None,
     ) -> SetupTaskResponse:
         """Set up a task instance via WebSocket.
 
@@ -250,7 +251,12 @@ class BenchmarkServiceClient:
             instance_id: The instance to set up.
             on_message: Optional callback for intermediate progress messages.
         """
-        request = SetupTaskRequest(task_id=task_id, instance_id=instance_id, dataset=dataset)
+        request = SetupTaskRequest(
+            task_id=task_id,
+            instance_id=instance_id,
+            sandbox_provider=sandbox_provider,
+            dataset=dataset,
+        )
         result = await self._websocket_request("setup-task", request, on_message)
         return SetupTaskResponse.model_validate(result)
 
@@ -306,6 +312,7 @@ class BenchmarkServiceClient:
         on_message: Callable[[str], None] | None = None,
         dataset: str | None = None,
         on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
+        sandbox_provider: SandboxProviderConfig | None = None,
     ) -> dict[str, Any]:
         """Evaluate a task instance via WebSocket.
 
@@ -314,7 +321,12 @@ class BenchmarkServiceClient:
             instance_id: The instance to evaluate.
             on_message: Optional callback for intermediate progress messages.
         """
-        request = EvaluateInstanceRequest(task_id=task_id, instance_id=instance_id, dataset=dataset)
+        request = EvaluateInstanceRequest(
+            task_id=task_id,
+            instance_id=instance_id,
+            sandbox_provider=sandbox_provider,
+            dataset=dataset,
+        )
         return await self._websocket_request("evaluate-instance", request, on_message, on_eval_resume_state)
 
     @_retry_http

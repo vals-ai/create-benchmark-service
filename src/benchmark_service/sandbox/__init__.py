@@ -1,16 +1,18 @@
 from __future__ import annotations
 
-import os
 from collections.abc import Mapping
+from typing import Annotated, Any
 
+from pydantic import Field, TypeAdapter
+
+from benchmark_service.sandbox.daytona import DaytonaProviderConfig
+from benchmark_service.sandbox.modal import ModalProviderConfig
 from benchmark_service.sandbox.types import (
-    DaytonaBackendConfig,
     ExecResult,
     ImageSource,
     MissingSandboxConfigError,
     Resources,
     Sandbox,
-    SandboxBackendConfig,
     SandboxCommandError,
     SandboxConnectionError,
     SandboxCreateRequest,
@@ -22,26 +24,33 @@ from benchmark_service.sandbox.types import (
     SnapshotSource,
 )
 
-_PROVIDER = os.environ.get("SANDBOX_PROVIDER", "daytona")
+SandboxProviderConfig = Annotated[DaytonaProviderConfig | ModalProviderConfig, Field(discriminator="type")]
+
+_provider_config_adapter: TypeAdapter[SandboxProviderConfig] = TypeAdapter(SandboxProviderConfig)
+_provider_config_from_headers = {
+    "daytona": DaytonaProviderConfig.from_headers,
+    "modal": ModalProviderConfig.from_headers,
+}
 
 
-def sandbox_config_from_headers(headers: Mapping[str, str]) -> SandboxBackendConfig:
-    match _PROVIDER:
-        case "daytona":
-            api_key = headers.get("x-api-key")
-            api_url = headers.get("x-api-url")
-            target = headers.get("x-target")
-            if not api_key or not api_url or not target:
-                raise MissingSandboxConfigError("Missing required headers: x-api-key, x-api-url, x-target")
-            return DaytonaBackendConfig(api_key=api_key, api_url=api_url, target=target)
-        case _:
-            raise ValueError(f"Unknown sandbox provider: {_PROVIDER}")
+def sandbox_provider_config_from_mapping(data: Mapping[str, Any]) -> SandboxProviderConfig:
+    return _provider_config_adapter.validate_python(data)
+
+
+def sandbox_config_from_headers(headers: Mapping[str, str]) -> SandboxProviderConfig:
+    provider = headers.get("x-sandbox-provider", "daytona")
+    config_from_headers = _provider_config_from_headers.get(provider)
+    if config_from_headers is None:
+        raise ValueError(f"Unknown sandbox provider: {provider}")
+    return config_from_headers(headers)
 
 
 __all__ = [
+    "DaytonaProviderConfig",
     "ExecResult",
     "ImageSource",
     "MissingSandboxConfigError",
+    "ModalProviderConfig",
     "Resources",
     "Sandbox",
     "SandboxCommandError",
@@ -50,8 +59,10 @@ __all__ = [
     "SandboxError",
     "SandboxNotFoundError",
     "SandboxProvider",
+    "SandboxProviderConfig",
     "SandboxQuery",
     "SandboxSource",
     "SnapshotSource",
     "sandbox_config_from_headers",
+    "sandbox_provider_config_from_mapping",
 ]

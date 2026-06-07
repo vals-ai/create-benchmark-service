@@ -5,7 +5,7 @@ import logging
 import os
 import re
 import traceback
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from contextlib import asynccontextmanager, suppress
 from typing import Any
 
@@ -20,7 +20,7 @@ from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import LEGACY_TENANT_SENTINEL, get_auth_settings, get_tenant_config, load_allowlist
 from benchmark_service.base import BenchmarkService
 from benchmark_service.inflight import InflightMiddleware
-from benchmark_service.sandbox import MissingSandboxConfigError, sandbox_config_from_headers
+from benchmark_service.sandbox import MissingSandboxConfigError, SandboxProviderConfig, sandbox_config_from_headers
 from benchmark_service.schemas import (
     EvaluateInstanceRequest,
     EvaluateResponseRequest,
@@ -92,6 +92,15 @@ _TRIAL_ALLOWED_PATH = re.compile(r"/v1/(?:evaluate|score|datasets/[^/]+/tasks)")
 
 def _trial_tenant_may_access_path(path: str) -> bool:
     return _TRIAL_ALLOWED_PATH.fullmatch(path) is not None
+
+
+def _sandbox_provider_config(
+    request: SetupTaskRequest | EvaluateInstanceRequest,
+    headers: Mapping[str, str],
+) -> SandboxProviderConfig:
+    if request.sandbox_provider is not None:
+        return request.sandbox_provider
+    return sandbox_config_from_headers(headers)
 
 
 def _get_service_metadata(service_cls: type[BenchmarkService]) -> tuple[str | None, str | None]:
@@ -253,14 +262,13 @@ class BenchmarkServiceApp(FastAPI):
             if tenant is None:
                 return
 
+            data = await websocket.receive_json()
+            request = SetupTaskRequest(**data)
             try:
-                sandbox_config = sandbox_config_from_headers(websocket.headers)
+                sandbox_config = _sandbox_provider_config(request, websocket.headers)
             except MissingSandboxConfigError as e:
                 await websocket.close(code=1008, reason=str(e))
                 return
-
-            data = await websocket.receive_json()
-            request = SetupTaskRequest(**data)
 
             if not await self.service.check_dataset_access(tenant, request.dataset):
                 await websocket.close(code=1008, reason="Dataset not allowed")
@@ -331,14 +339,13 @@ class BenchmarkServiceApp(FastAPI):
             if tenant is None:
                 return
 
+            data = await websocket.receive_json()
+            request = EvaluateInstanceRequest(**data)
             try:
-                sandbox_config = sandbox_config_from_headers(websocket.headers)
+                sandbox_config = _sandbox_provider_config(request, websocket.headers)
             except MissingSandboxConfigError as e:
                 await websocket.close(code=1008, reason=str(e))
                 return
-
-            data = await websocket.receive_json()
-            request = EvaluateInstanceRequest(**data)
 
             if not await self.service.check_dataset_access(tenant, request.dataset):
                 await websocket.close(code=1008, reason="Dataset not allowed")

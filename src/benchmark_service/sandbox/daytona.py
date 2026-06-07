@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import shlex
 import uuid
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import suppress
-from typing import Any
+from typing import Any, Literal
 
 from aiohttp import ClientResponseError
 from daytona import (
@@ -29,12 +29,13 @@ from daytona.common.errors import (
     DaytonaTimeoutError,
 )
 from daytona.handle.async_pty_handle import AsyncPtyHandle
+from pydantic import BaseModel
 from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_exponential, wait_fixed
 
 from benchmark_service.sandbox.types import (
-    DaytonaBackendConfig,
     ExecResult,
     ImageSource,
+    MissingSandboxConfigError,
     Sandbox,
     SandboxCommandError,
     SandboxConnectionError,
@@ -58,6 +59,25 @@ _KNOWN_THROTTLERS = ("sandbox-create", "sandbox-lifecycle", "authenticated", "an
 _DELETE_CONFLICT_MESSAGES = ("state change in progress", "modified by another operation")
 _FIXED_PROVIDER_WAIT = wait_fixed(2)
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
+
+
+class DaytonaProviderConfig(BaseModel):
+    type: Literal["daytona"] = "daytona"
+    api_key: str
+    api_url: str
+    target: str
+
+    @classmethod
+    def from_headers(cls, headers: Mapping[str, str]) -> "DaytonaProviderConfig":
+        api_key = headers.get("x-api-key")
+        api_url = headers.get("x-api-url")
+        target = headers.get("x-target")
+        if not api_key or not api_url or not target:
+            raise MissingSandboxConfigError("Missing required headers: x-api-key, x-api-url, x-target")
+        return cls(api_key=api_key, api_url=api_url, target=target)
+
+    def create_provider(self) -> SandboxProvider:
+        return DaytonaSandboxProvider(self)
 
 
 def _provider_retry_wait(retry_state: RetryCallState) -> float:
@@ -342,7 +362,7 @@ class DaytonaSandbox(Sandbox):
 
 
 class DaytonaSandboxProvider(SandboxProvider):
-    def __init__(self, config: DaytonaBackendConfig) -> None:
+    def __init__(self, config: DaytonaProviderConfig) -> None:
         self._daytona = AsyncDaytona(
             config=DaytonaConfig(
                 api_key=config.api_key,

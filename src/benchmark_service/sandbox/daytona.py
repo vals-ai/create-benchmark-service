@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import shlex
 import uuid
-from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import suppress
-from typing import Any, Literal
+from typing import Any
 
 from aiohttp import ClientResponseError
 from daytona import (
@@ -29,13 +29,11 @@ from daytona.common.errors import (
     DaytonaTimeoutError,
 )
 from daytona.handle.async_pty_handle import AsyncPtyHandle
-from pydantic import BaseModel
 from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_exponential, wait_fixed
 
 from benchmark_service.sandbox.types import (
     ExecResult,
     ImageSource,
-    MissingSandboxConfigError,
     Sandbox,
     SandboxCommandError,
     SandboxConnectionError,
@@ -57,27 +55,10 @@ _TRANSIENT_DAYTONA_ERRORS = (DaytonaConnectionError, DaytonaRateLimitError, Dayt
 _RETRY_AFTER_PREFIX = "retry-after-"
 _KNOWN_THROTTLERS = ("sandbox-create", "sandbox-lifecycle", "authenticated", "anonymous")
 _DELETE_CONFLICT_MESSAGES = ("state change in progress", "modified by another operation")
+_REMOVED_SANDBOX_CLIENT_STATUSES = (404, 502)
+_FAILED_EXECUTE_COMMAND_PREFIX = "failed to execute command:"
 _FIXED_PROVIDER_WAIT = wait_fixed(2)
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
-
-
-class DaytonaProviderConfig(BaseModel):
-    type: Literal["daytona"] = "daytona"
-    api_key: str
-    api_url: str
-    target: str
-
-    @classmethod
-    def from_headers(cls, headers: Mapping[str, str]) -> "DaytonaProviderConfig":
-        api_key = headers.get("x-api-key")
-        api_url = headers.get("x-api-url")
-        target = headers.get("x-target")
-        if not api_key or not api_url or not target:
-            raise MissingSandboxConfigError("Missing required headers: x-api-key, x-api-url, x-target")
-        return cls(api_key=api_key, api_url=api_url, target=target)
-
-    def create_provider(self) -> SandboxProvider:
-        return DaytonaSandboxProvider(self)
 
 
 def _provider_retry_wait(retry_state: RetryCallState) -> float:
@@ -111,12 +92,16 @@ def _is_delete_conflict(exc: DaytonaConflictError) -> bool:
 
 def _is_not_found_error(exc: DaytonaError | ClientResponseError) -> bool:
     if isinstance(exc, ClientResponseError):
-        return exc.status == 404
+        return exc.status in _REMOVED_SANDBOX_CLIENT_STATUSES
     return (
         isinstance(exc, DaytonaNotFoundError)
         or exc.status_code == 404
         or (exc.error_code is not None and exc.error_code.upper() == "NOT_FOUND")
     )
+
+
+def _is_failed_execute_command_error(exc: DaytonaError | ClientResponseError) -> bool:
+    return isinstance(exc, DaytonaError) and str(exc).strip().lower() == _FAILED_EXECUTE_COMMAND_PREFIX
 
 
 def _parse_retry_after_seconds(value: object) -> float | None:
@@ -192,7 +177,7 @@ class DaytonaSandbox(Sandbox):
     def _sandbox_error(self, exc: DaytonaError | ClientResponseError) -> SandboxError:
         if _is_not_found_error(exc):
             return self._removed_error()
-        if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS):
+        if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS) or _is_failed_execute_command_error(exc):
             return SandboxConnectionError(f"Sandbox connection error for {self._sandbox_ref}: {exc}")
         return SandboxError(f"Sandbox operation failed for {self._sandbox_ref}: {exc}")
 

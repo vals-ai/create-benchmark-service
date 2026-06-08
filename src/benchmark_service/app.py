@@ -98,6 +98,8 @@ def _sandbox_provider_config(
     request: SetupTaskRequest | EvaluateInstanceRequest,
     headers: Mapping[str, str],
 ) -> SandboxProviderConfig:
+    if isinstance(request.sandbox_provider, str):
+        return sandbox_config_from_headers(headers, request.sandbox_provider)
     if request.sandbox_provider is not None:
         return request.sandbox_provider
     return sandbox_config_from_headers(headers)

@@ -13,7 +13,7 @@ from tenacity import (
     wait_random,
 )
 
-from benchmark_service.sandbox import SandboxProvider, SandboxProviderConfig, sandbox_config_from_headers
+from benchmark_service.sandbox import SandboxProvider, sandbox_config_from_headers
 from benchmark_service.schemas import (
     EvaluateInstanceRequest,
     EvaluateResponseRequest,
@@ -98,9 +98,9 @@ class BenchmarkServiceClient:
             limits=httpx.Limits(max_connections=200),
         )
 
-    def get_sandbox_provider(self) -> SandboxProvider:
+    def get_sandbox_provider(self, provider: str | None = None) -> SandboxProvider:
         if self._sandbox_provider is None:
-            self._sandbox_provider = sandbox_config_from_headers(self._headers).create_provider()
+            self._sandbox_provider = sandbox_config_from_headers(self._headers, provider).create_provider()
         return self._sandbox_provider
 
     async def close(self) -> None:
@@ -242,7 +242,7 @@ class BenchmarkServiceClient:
         instance_id: str,
         on_message: Callable[[str], None] | None = None,
         dataset: str | None = None,
-        sandbox_provider: SandboxProviderConfig | None = None,
+        sandbox_provider: str | None = None,
     ) -> SetupTaskResponse:
         """Set up a task instance via WebSocket.
 
@@ -312,7 +312,7 @@ class BenchmarkServiceClient:
         on_message: Callable[[str], None] | None = None,
         dataset: str | None = None,
         on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
-        sandbox_provider: SandboxProviderConfig | None = None,
+        sandbox_provider: str | None = None,
     ) -> dict[str, Any]:
         """Evaluate a task instance via WebSocket.
 

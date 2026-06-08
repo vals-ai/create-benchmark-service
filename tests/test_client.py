@@ -41,6 +41,14 @@ def test_sandbox_config_from_headers() -> None:
         target="target",
     )
     assert sandbox_config_from_headers({"x-sandbox-provider": "modal"}) == ModalProviderConfig()
+    assert sandbox_config_from_headers(
+        {
+            "DAYTONA_API_KEY": "raw-key",
+            "DAYTONA_API_URL": "raw-url",
+            "DAYTONA_TARGET": "raw-target",
+        },
+        "daytona",
+    ) == DaytonaProviderConfig(api_key="raw-key", api_url="raw-url", target="raw-target")
 
 
 def test_sandbox_provider_config_from_mapping() -> None:
@@ -290,12 +298,12 @@ async def test_websocket_request_includes_null_optional_fields() -> None:
     }
 
 
-async def test_websocket_request_includes_sandbox_provider() -> None:
-    """Client websocket helpers should include the requested sandbox provider.
+async def test_websocket_request_includes_provider_name() -> None:
+    """Client websocket helpers should include provider names selected by callers.
 
     Test cases:
-    - setup_task serializes a Modal provider selected by the caller.
-    - evaluate_instance serializes the same provider shape.
+    - setup_task serializes a Daytona provider name.
+    - evaluate_instance serializes the same provider name.
     """
     for method in ("setup_task", "evaluate_instance"):
         messages = [json.dumps({"type": "result", "data": {"status": "ok"}})]
@@ -303,13 +311,13 @@ async def test_websocket_request_includes_sandbox_provider() -> None:
 
         client = _make_client()
         with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
-            await getattr(client, method)("task-1", "inst-1", sandbox_provider=ModalProviderConfig())
+            await getattr(client, method)("task-1", "inst-1", sandbox_provider="daytona")
 
         ws = mock_connect.__aenter__.return_value
         assert json.loads(ws.send.call_args.args[0]) == {
             "task_id": "task-1",
             "instance_id": "inst-1",
-            "sandbox_provider": {"type": "modal"},
+            "sandbox_provider": "daytona",
             "dataset": None,
         }
 

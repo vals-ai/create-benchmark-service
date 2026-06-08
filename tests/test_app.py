@@ -12,6 +12,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from benchmark_service import auth as auth_module
 from benchmark_service.app import BenchmarkServiceApp, send_json_if_connected
+from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
 from benchmark_service.sandbox.types import (
     ExecResult,
@@ -275,6 +276,93 @@ def test_websocket_setup_task_uses_request_sandbox_provider(monkeypatch: pytest.
 
     assert selected_configs == [ModalProviderConfig()]
     assert received_sandbox_names == ["modal-sandbox-name"]
+
+
+def test_websocket_setup_task_uses_provider_name_to_parse_headers(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Sandbox-backed websocket routes should use provider names to parse secret headers.
+
+    Test cases:
+    - A Daytona provider name in the request body selects Daytona header parsing.
+    - The provider selector does not need to be duplicated in the headers.
+    """
+
+    class FakeSandbox(Sandbox):
+        @property
+        def id(self) -> str:
+            return "daytona-sandbox-id"
+
+        @property
+        def name(self) -> str:
+            return "daytona-sandbox-name"
+
+        @property
+        def state(self) -> str:
+            return "running"
+
+        async def exec(self, command: str, *, cwd: str | None = None, timeout: float | None = None) -> ExecResult:
+            return ExecResult(exit_code=0, output="")
+
+        async def upload_file(self, remote_path: str, content: bytes) -> None:
+            pass
+
+        async def download_file(self, remote_path: str) -> bytes:
+            return b""
+
+        async def command(self, command: str, *, cwd: str | None = None, timeout: float | None = None):
+            if False:
+                yield ""
+
+    class FakeProvider(SandboxProvider):
+        async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
+            return FakeSandbox()
+
+        async def get_sandbox(self, instance_id: str) -> Sandbox:
+            assert instance_id == "i-1"
+            return FakeSandbox()
+
+        async def delete_sandbox(self, instance_id: str) -> None:
+            pass
+
+        async def list_sandboxes(self, query: SandboxQuery):
+            if False:
+                yield FakeSandbox()
+
+        async def close(self) -> None:
+            pass
+
+    selected_configs: list[DaytonaProviderConfig] = []
+
+    def create_provider(config: DaytonaProviderConfig) -> SandboxProvider:
+        selected_configs.append(config)
+        return FakeProvider()
+
+    monkeypatch.setattr(DaytonaProviderConfig, "create_provider", create_provider)
+
+    headers = {
+        "x-api-key": "key",
+        "x-api-url": "url",
+        "x-target": "target",
+    }
+
+    class RuntimeProviderBenchmark(StubBenchmark):
+        async def setup_task(self, task_id: str, sandbox: Sandbox, dataset: str | None = None):
+            yield StreamResultChunk(type="result", data={"task_id": task_id, "sandbox_name": sandbox.name})
+
+    with TestClient(BenchmarkServiceApp(RuntimeProviderBenchmark), headers=headers) as c:
+        with c.websocket_connect("/ws/setup-task") as ws:
+            ws.send_json(
+                {
+                    "task_id": "task-1",
+                    "instance_id": "i-1",
+                    "sandbox_provider": "daytona",
+                }
+            )
+            assert ws.receive_json() == {
+                "type": "result",
+                "data": {"task_id": "task-1", "sandbox_name": "daytona-sandbox-name"},
+            }
+
+    assert selected_configs == [DaytonaProviderConfig(api_key="key", api_url="url", target="target")]
 
 
 async def test_send_json_if_connected_handles_disconnect() -> None:

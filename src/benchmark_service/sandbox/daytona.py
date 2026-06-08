@@ -71,15 +71,23 @@ class DaytonaProviderConfig(BaseModel):
 
     @classmethod
     def from_headers(cls, headers: Mapping[str, str]) -> "DaytonaProviderConfig":
-        api_key = headers.get("x-api-key")
-        api_url = headers.get("x-api-url")
-        target = headers.get("x-target")
+        api_key = _get_config_header(headers, "x-api-key", "daytona_api_key")
+        api_url = _get_config_header(headers, "x-api-url", "daytona_api_url")
+        target = _get_config_header(headers, "x-target", "daytona_target")
         if not api_key or not api_url or not target:
             raise MissingSandboxConfigError("Missing required headers: x-api-key, x-api-url, x-target")
         return cls(api_key=api_key, api_url=api_url, target=target)
 
     def create_provider(self) -> SandboxProvider:
         return DaytonaSandboxProvider(self)
+
+
+def _get_config_header(headers: Mapping[str, str], *names: str) -> str | None:
+    for name in names:
+        value = headers.get(name) or headers.get(name.upper())
+        if value:
+            return value
+    return None
 
 
 def _provider_retry_wait(retry_state: RetryCallState) -> float:

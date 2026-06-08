@@ -37,11 +37,14 @@ def sandbox_provider_config_from_mapping(data: Mapping[str, Any]) -> SandboxProv
     return _provider_config_adapter.validate_python(data)
 
 
-def sandbox_config_from_headers(headers: Mapping[str, str]) -> SandboxProviderConfig:
-    provider = headers.get("x-sandbox-provider", "daytona")
-    config_from_headers = _provider_config_from_headers.get(provider)
-    if config_from_headers is None:
-        raise ValueError(f"Unknown sandbox provider: {provider}")
+def sandbox_config_from_headers(
+    headers: Mapping[str, str],
+    provider: str | None = None,
+) -> SandboxProviderConfig:
+    raw_provider = provider or headers.get("x-sandbox-provider", "daytona")
+    if raw_provider not in _provider_config_from_headers:
+        raise ValueError(f"Unknown sandbox provider: {raw_provider}")
+    config_from_headers = _provider_config_from_headers[raw_provider]
     return config_from_headers(headers)
 
 

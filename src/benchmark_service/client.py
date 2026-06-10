@@ -13,7 +13,7 @@ from tenacity import (
     wait_random,
 )
 
-from benchmark_service.sandbox import SandboxProvider, sandbox_config_from_headers
+from benchmark_service.sandbox import SandboxProvider, SandboxProviderConfig
 from benchmark_service.schemas import (
     EvaluateInstanceRequest,
     EvaluateResponseRequest,
@@ -98,9 +98,9 @@ class BenchmarkServiceClient:
             limits=httpx.Limits(max_connections=200),
         )
 
-    def get_sandbox_provider(self, provider: str | None = None) -> SandboxProvider:
+    def get_sandbox_provider(self, provider: SandboxProviderConfig) -> SandboxProvider:
         if self._sandbox_provider is None:
-            self._sandbox_provider = sandbox_config_from_headers(self._headers, provider).create_provider()
+            self._sandbox_provider = provider.create_provider()
         return self._sandbox_provider
 
     async def close(self) -> None:
@@ -240,15 +240,16 @@ class BenchmarkServiceClient:
         self,
         task_id: str,
         instance_id: str,
+        sandbox_provider: SandboxProviderConfig,
         on_message: Callable[[str], None] | None = None,
         dataset: str | None = None,
-        sandbox_provider: str | None = None,
     ) -> SetupTaskResponse:
         """Set up a task instance via WebSocket.
 
         Args:
             task_id: The task to set up.
             instance_id: The instance to set up.
+            sandbox_provider: Sandbox provider config for the task sandbox.
             on_message: Optional callback for intermediate progress messages.
         """
         request = SetupTaskRequest(
@@ -309,16 +310,17 @@ class BenchmarkServiceClient:
         self,
         task_id: str,
         instance_id: str,
+        sandbox_provider: SandboxProviderConfig,
         on_message: Callable[[str], None] | None = None,
         dataset: str | None = None,
         on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
-        sandbox_provider: str | None = None,
     ) -> dict[str, Any]:
         """Evaluate a task instance via WebSocket.
 
         Args:
             task_id: The task to evaluate.
             instance_id: The instance to evaluate.
+            sandbox_provider: Sandbox provider config for the task sandbox.
             on_message: Optional callback for intermediate progress messages.
         """
         request = EvaluateInstanceRequest(

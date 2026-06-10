@@ -22,7 +22,6 @@ from benchmark_service.sandbox import (
     SandboxQuery,
     SandboxSource,
     SnapshotSource,
-    sandbox_config_from_headers,
     sandbox_provider_config_from_mapping,
 )
 
@@ -49,7 +48,6 @@ __all__ = [
     "SandboxQuery",
     "SandboxSource",
     "SnapshotSource",
-    "sandbox_config_from_headers",
     "sandbox_provider_config_from_mapping",
     "__version__",
 ]

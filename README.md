@@ -111,7 +111,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | `/ws/evaluate-response` | Evaluate without a sandbox; streams progress, checkpoint state, errors, and a final result |
 | `/ws/evaluate-instance` | Evaluate a live sandbox solution; streams progress, errors, and a final result |
 
-Sandbox setup and live sandbox evaluation accept request-scoped `sandbox_provider` config so one hosted service can use different sandbox providers per request. If `sandbox_provider` is omitted, the service falls back to legacy provider headers. Eval-only retry uses `/ws/evaluate-response` with `{"task_id": "…", "eval_resume_state": {...}, "dataset": "…"}` and does not require a sandbox provider.
+Sandbox setup and live sandbox evaluation require request-scoped `sandbox_provider` config so one hosted service can use different sandbox providers per request. Eval-only retry uses `/ws/evaluate-response` with `{"task_id": "…", "eval_resume_state": {...}, "dataset": "…"}` and does not require a sandbox provider.
 
 Benchmark services can send `eval_resume_state` updates to the tracker while evaluation is running. The tracker stores the latest value and sends it back on eval-only retry, so the benchmark service can continue evaluation without recreating the original agent sandbox.
 
@@ -196,7 +196,7 @@ Pydantic models used across requests and responses:
 - **`SandboxSource`** — `ImageSource(type="image", image=...)` or `SnapshotSource(type="snapshot", snapshot=...)`
 - **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; currently `DaytonaProviderConfig(type="daytona", api_key, api_url, target)` or `ModalProviderConfig(type="modal")` (adapter not implemented yet)
 - **`Resources`** — `vcpu`, `memory`, `disk`
-- **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, optional `sandbox_provider`, `dataset`
+- **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, required `sandbox_provider`, `dataset`
 - **`EvaluateResponseRequest`** — `task_id`, `response` or `eval_resume_state`, `dataset`
 - **`FinalScoreResult`** / **`FinalScoreResponse`** — `score` (float), `metadata`, `tasks_evaluated`
 - **`TaskFilter`** — `task_ids` list or `slice_str`; `parse_slice()` converts `"start:stop:step"` to a Python `slice`

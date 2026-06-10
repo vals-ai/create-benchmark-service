@@ -75,10 +75,7 @@ class SetupTaskRequest(BaseModel):
 
     task_id: str = Field(description="Unique identifier for the task")
     instance_id: str = Field(description="Unique identifier for the sandbox instance")
-    sandbox_provider: SandboxProviderConfig | str | None = Field(
-        default=None,
-        description="Sandbox provider config, or provider name for legacy header-based config",
-    )
+    sandbox_provider: SandboxProviderConfig = Field(description="Sandbox provider config")
     dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
 
 
@@ -115,10 +112,7 @@ class EvaluateInstanceRequest(BaseModel):
 
     task_id: str = Field(description="Unique identifier for the task")
     instance_id: str = Field(description="Sandbox instance where the solution was implemented")
-    sandbox_provider: SandboxProviderConfig | str | None = Field(
-        default=None,
-        description="Sandbox provider config, or provider name for legacy header-based config",
-    )
+    sandbox_provider: SandboxProviderConfig = Field(description="Sandbox provider config")
     dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
 
 

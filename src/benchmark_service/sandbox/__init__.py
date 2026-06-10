@@ -27,25 +27,10 @@ from benchmark_service.sandbox.types import (
 SandboxProviderConfig = Annotated[DaytonaProviderConfig | ModalProviderConfig, Field(discriminator="type")]
 
 _provider_config_adapter: TypeAdapter[SandboxProviderConfig] = TypeAdapter(SandboxProviderConfig)
-_provider_config_from_headers = {
-    "daytona": DaytonaProviderConfig.from_headers,
-    "modal": ModalProviderConfig.from_headers,
-}
 
 
 def sandbox_provider_config_from_mapping(data: Mapping[str, Any]) -> SandboxProviderConfig:
     return _provider_config_adapter.validate_python(data)
-
-
-def sandbox_config_from_headers(
-    headers: Mapping[str, str],
-    provider: str | None = None,
-) -> SandboxProviderConfig:
-    raw_provider = provider or headers.get("x-sandbox-provider", "daytona")
-    if raw_provider not in _provider_config_from_headers:
-        raise ValueError(f"Unknown sandbox provider: {raw_provider}")
-    config_from_headers = _provider_config_from_headers[raw_provider]
-    return config_from_headers(headers)
 
 
 __all__ = [
@@ -66,6 +51,5 @@ __all__ = [
     "SandboxQuery",
     "SandboxSource",
     "SnapshotSource",
-    "sandbox_config_from_headers",
     "sandbox_provider_config_from_mapping",
 ]

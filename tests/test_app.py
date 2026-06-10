@@ -239,28 +239,13 @@ def test_websocket_evaluate_response_with_eval_resume_state(client: TestClient) 
         }
 
 
-@pytest.mark.parametrize(
-    ("sandbox_provider", "headers", "expected_config"),
-    [
-        ({"type": "modal"}, {}, ModalProviderConfig()),
-        (
-            "daytona",
-            {"x-api-key": "key", "x-api-url": "url", "x-target": "target"},
-            DaytonaProviderConfig(api_key="key", api_url="url", target="target"),
-        ),
-    ],
-)
 def test_websocket_setup_task_resolves_sandbox_provider(
     monkeypatch: pytest.MonkeyPatch,
-    sandbox_provider: dict[str, str] | str,
-    headers: dict[str, str],
-    expected_config: ModalProviderConfig | DaytonaProviderConfig,
 ) -> None:
     """Setup-task websockets should resolve request-scoped sandbox provider config.
 
     Test cases:
     - A provider config object in the request body creates that provider directly.
-    - A provider name in the request body selects legacy headers for that provider.
     """
     selected_configs: list[ModalProviderConfig | DaytonaProviderConfig] = []
 
@@ -275,15 +260,15 @@ def test_websocket_setup_task_resolves_sandbox_provider(
     monkeypatch.setattr(DaytonaProviderConfig, "create_provider", create_provider)
     monkeypatch.setattr(ModalProviderConfig, "create_provider", create_provider)
 
-    with TestClient(BenchmarkServiceApp(RuntimeProviderBenchmark), headers=headers) as c:
+    with TestClient(BenchmarkServiceApp(RuntimeProviderBenchmark)) as c:
         with c.websocket_connect("/ws/setup-task") as ws:
-            ws.send_json({"task_id": "task-1", "instance_id": "i-1", "sandbox_provider": sandbox_provider})
+            ws.send_json({"task_id": "task-1", "instance_id": "i-1", "sandbox_provider": {"type": "modal"}})
             assert ws.receive_json() == {
                 "type": "result",
                 "data": {"task_id": "task-1", "sandbox_name": "selected-sandbox-name"},
             }
 
-    assert selected_configs == [expected_config]
+    assert selected_configs == [ModalProviderConfig()]
 
 
 async def test_send_json_if_connected_handles_disconnect() -> None:
@@ -496,14 +481,11 @@ def test_setup_task_ws_close_for_disallowed_dataset(auth_client: TestClient) -> 
         with pytest.raises(WebSocketDisconnect) as exc_info:
             with auth_client.websocket_connect(
                 "/ws/setup-task",
-                headers={
-                    "x-descope-api-key": "key-acme",
-                    "x-api-key": "daytona-key",
-                    "x-api-url": "http://daytona",
-                    "x-target": "us",
-                },
+                headers={"x-descope-api-key": "key-acme"},
             ) as ws:
-                ws.send_json({"task_id": "task-1", "instance_id": "i-1", "dataset": "alt"})
+                ws.send_json(
+                    {"task_id": "task-1", "instance_id": "i-1", "sandbox_provider": {"type": "modal"}, "dataset": "alt"}
+                )
                 ws.receive_json()
     assert exc_info.value.code == 1008
     assert exc_info.value.reason == "Dataset not allowed"

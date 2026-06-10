@@ -83,8 +83,9 @@ class DaytonaProviderConfig(BaseModel):
 
 
 def _get_config_header(headers: Mapping[str, str], *names: str) -> str | None:
+    normalized_headers = {key.lower(): value for key, value in headers.items()}
     for name in names:
-        value = headers.get(name) or headers.get(name.upper())
+        value = normalized_headers.get(name.lower())
         if value:
             return value
     return None

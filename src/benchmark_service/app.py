@@ -98,11 +98,11 @@ def _sandbox_provider_config(
     request: SetupTaskRequest | EvaluateInstanceRequest,
     headers: Mapping[str, str],
 ) -> SandboxProviderConfig:
-    if isinstance(request.sandbox_provider, str):
-        return sandbox_config_from_headers(headers, request.sandbox_provider)
-    if request.sandbox_provider is not None:
-        return request.sandbox_provider
-    return sandbox_config_from_headers(headers)
+    """Resolve sandbox provider config from request body or legacy headers."""
+    provider = request.sandbox_provider
+    if provider is None or isinstance(provider, str):
+        return sandbox_config_from_headers(headers, provider)
+    return provider
 
 
 def _get_service_metadata(service_cls: type[BenchmarkService]) -> tuple[str | None, str | None]:
@@ -264,9 +264,8 @@ class BenchmarkServiceApp(FastAPI):
             if tenant is None:
                 return
 
-            data = await websocket.receive_json()
-            request = SetupTaskRequest(**data)
             try:
+                request = SetupTaskRequest(**await websocket.receive_json())
                 sandbox_config = _sandbox_provider_config(request, websocket.headers)
             except MissingSandboxConfigError as e:
                 await websocket.close(code=1008, reason=str(e))
@@ -341,9 +340,8 @@ class BenchmarkServiceApp(FastAPI):
             if tenant is None:
                 return
 
-            data = await websocket.receive_json()
-            request = EvaluateInstanceRequest(**data)
             try:
+                request = EvaluateInstanceRequest(**await websocket.receive_json())
                 sandbox_config = _sandbox_provider_config(request, websocket.headers)
             except MissingSandboxConfigError as e:
                 await websocket.close(code=1008, reason=str(e))
@@ -418,8 +416,7 @@ class BenchmarkServiceApp(FastAPI):
             raise HTTPException(status_code=403, detail="Dataset not allowed")
 
         normalized_results = {
-            task_id: _v1_score_item_to_eval_result(task_id, item)
-            for task_id, item in body.evaluation_results.items()
+            task_id: _v1_score_item_to_eval_result(task_id, item) for task_id, item in body.evaluation_results.items()
         }
         tasks_evaluated = await self.service.validate_task_ids(list(normalized_results.keys()), dataset=body.dataset)
         result = await self.service.calculate_final_score(normalized_results, dataset=body.dataset)

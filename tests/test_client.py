@@ -8,9 +8,7 @@ import pytest
 
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
 from benchmark_service.sandbox import (
-    SandboxProviderConfig,
     sandbox_config_from_headers,
-    sandbox_provider_config_from_mapping,
 )
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
@@ -35,6 +33,12 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
 
 
 def test_sandbox_config_from_headers() -> None:
+    """Header parsing should resolve provider-specific config without global state.
+
+    Test cases:
+    - Daytona is selected from headers and from explicit provider names.
+    - Modal can be selected from headers without Daytona credentials.
+    """
     assert sandbox_config_from_headers(DAYTONA_HEADERS) == DaytonaProviderConfig(
         api_key="key",
         api_url="url",
@@ -51,27 +55,12 @@ def test_sandbox_config_from_headers() -> None:
     ) == DaytonaProviderConfig(api_key="raw-key", api_url="raw-url", target="raw-target")
 
 
-def test_sandbox_provider_config_from_mapping() -> None:
-    """Provider config parsing should be provider-neutral for callers.
+def test_sandbox_config_rejects_unknown_provider() -> None:
+    """Unknown provider names should fail before any provider is constructed.
 
     Test cases:
-    - Discriminated mapping validates Daytona provider config.
-    - Discriminated mapping validates Modal provider config.
+    - An unregistered provider header raises a clear ValueError.
     """
-    configs: list[SandboxProviderConfig] = [
-        sandbox_provider_config_from_mapping(
-            {"type": "daytona", "api_key": "key", "api_url": "url", "target": "target"}
-        ),
-        sandbox_provider_config_from_mapping({"type": "modal"}),
-    ]
-
-    assert configs == [
-        DaytonaProviderConfig(api_key="key", api_url="url", target="target"),
-        ModalProviderConfig(),
-    ]
-
-
-def test_sandbox_config_rejects_unknown_provider() -> None:
     with pytest.raises(ValueError, match="Unknown sandbox provider: unknown"):
         sandbox_config_from_headers({"x-sandbox-provider": "unknown"})
 
@@ -282,6 +271,11 @@ async def test_resume_evaluation_with_eval_resume_state(
 
 
 async def test_websocket_request_includes_null_optional_fields() -> None:
+    """Client websocket helpers should serialize default optional fields consistently.
+
+    Test cases:
+    - setup_task includes null sandbox provider and dataset when omitted.
+    """
     messages = [json.dumps({"type": "result", "data": {"status": "ok"}})]
     mock_connect = _ws_mock(messages)
 

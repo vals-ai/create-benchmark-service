@@ -1,7 +1,7 @@
 """Tests for FastAPI app endpoints."""
 
 import json
-from collections.abc import Generator
+from collections.abc import AsyncGenerator, Generator
 from typing import Any, cast
 from unittest.mock import patch
 
@@ -23,6 +23,51 @@ from benchmark_service.sandbox.types import (
 )
 from benchmark_service.schemas import StreamResultChunk
 from tests.conftest import StubBenchmark
+
+
+class ProviderSelectionSandbox(Sandbox):
+    @property
+    def id(self) -> str:
+        return "selected-sandbox-id"
+
+    @property
+    def name(self) -> str:
+        return "selected-sandbox-name"
+
+    @property
+    def state(self) -> str:
+        return "running"
+
+    async def exec(self, command: str, *, cwd: str | None = None, timeout: float | None = None) -> ExecResult:
+        return ExecResult(exit_code=0, output="")
+
+    def command(
+        self, command: str, *, cwd: str | None = None, timeout: float | None = None
+    ) -> AsyncGenerator[str, None]:
+        if False:
+            yield ""
+
+    async def upload_file(self, remote_path: str, content: bytes) -> None:
+        pass
+
+    async def download_file(self, remote_path: str) -> bytes:
+        return b""
+
+
+class ProviderSelectionProvider(SandboxProvider):
+    async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
+        return ProviderSelectionSandbox()
+
+    async def get_sandbox(self, instance_id: str) -> Sandbox:
+        assert instance_id == "i-1"
+        return ProviderSelectionSandbox()
+
+    async def delete_sandbox(self, instance_id: str) -> None:
+        pass
+
+    def list_sandboxes(self, query: SandboxQuery) -> AsyncGenerator[Sandbox, None]:
+        if False:
+            yield ProviderSelectionSandbox()
 
 
 def test_health(client: TestClient) -> None:
@@ -194,175 +239,51 @@ def test_websocket_evaluate_response_with_eval_resume_state(client: TestClient) 
         }
 
 
-def test_websocket_setup_task_uses_request_sandbox_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Sandbox-backed websocket routes should create providers from the request body.
+@pytest.mark.parametrize(
+    ("sandbox_provider", "headers", "expected_config"),
+    [
+        ({"type": "modal"}, {}, ModalProviderConfig()),
+        (
+            "daytona",
+            {"x-api-key": "key", "x-api-url": "url", "x-target": "target"},
+            DaytonaProviderConfig(api_key="key", api_url="url", target="target"),
+        ),
+    ],
+)
+def test_websocket_setup_task_resolves_sandbox_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_provider: dict[str, str] | str,
+    headers: dict[str, str],
+    expected_config: ModalProviderConfig | DaytonaProviderConfig,
+) -> None:
+    """Setup-task websockets should resolve request-scoped sandbox provider config.
 
     Test cases:
-    - A Modal provider literal selects the request config without provider headers.
-    - The benchmark service only receives the resolved sandbox instance.
+    - A provider config object in the request body creates that provider directly.
+    - A provider name in the request body selects legacy headers for that provider.
     """
+    selected_configs: list[ModalProviderConfig | DaytonaProviderConfig] = []
 
-    class FakeSandbox(Sandbox):
-        @property
-        def id(self) -> str:
-            return "modal-sandbox-id"
-
-        @property
-        def name(self) -> str:
-            return "modal-sandbox-name"
-
-        @property
-        def state(self) -> str:
-            return "running"
-
-        async def exec(self, command: str, *, cwd: str | None = None, timeout: float | None = None) -> ExecResult:
-            return ExecResult(exit_code=0, output="")
-
-        async def upload_file(self, remote_path: str, content: bytes) -> None:
-            pass
-
-        async def download_file(self, remote_path: str) -> bytes:
-            return b""
-
-        async def command(self, command: str, *, cwd: str | None = None, timeout: float | None = None):
-            if False:
-                yield ""
-
-    class FakeProvider(SandboxProvider):
-        async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
-            return FakeSandbox()
-
-        async def get_sandbox(self, instance_id: str) -> Sandbox:
-            assert instance_id == "i-1"
-            return FakeSandbox()
-
-        async def delete_sandbox(self, instance_id: str) -> None:
-            pass
-
-        async def list_sandboxes(self, query: SandboxQuery):
-            if False:
-                yield FakeSandbox()
-
-        async def close(self) -> None:
-            pass
-
-    selected_configs: list[ModalProviderConfig] = []
-    received_sandbox_names: list[str] = []
-
-    def create_provider(config: ModalProviderConfig) -> SandboxProvider:
+    def create_provider(config: ModalProviderConfig | DaytonaProviderConfig) -> SandboxProvider:
         selected_configs.append(config)
-        return FakeProvider()
-
-    class RuntimeBackendBenchmark(StubBenchmark):
-        async def setup_task(self, task_id: str, sandbox: Sandbox, dataset: str | None = None):
-            received_sandbox_names.append(sandbox.name)
-            yield StreamResultChunk(type="result", data={"task_id": task_id, "sandbox_name": sandbox.name})
-
-    monkeypatch.setattr(ModalProviderConfig, "create_provider", create_provider)
-
-    with TestClient(BenchmarkServiceApp(RuntimeBackendBenchmark)) as c:
-        with c.websocket_connect("/ws/setup-task") as ws:
-            ws.send_json(
-                {
-                    "task_id": "task-1",
-                    "instance_id": "i-1",
-                    "sandbox_provider": {"type": "modal"},
-                }
-            )
-            assert ws.receive_json() == {
-                "type": "result",
-                "data": {"task_id": "task-1", "sandbox_name": "modal-sandbox-name"},
-            }
-
-    assert selected_configs == [ModalProviderConfig()]
-    assert received_sandbox_names == ["modal-sandbox-name"]
-
-
-def test_websocket_setup_task_uses_provider_name_to_parse_headers(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Sandbox-backed websocket routes should use provider names to parse secret headers.
-
-    Test cases:
-    - A Daytona provider name in the request body selects Daytona header parsing.
-    - The provider selector does not need to be duplicated in the headers.
-    """
-
-    class FakeSandbox(Sandbox):
-        @property
-        def id(self) -> str:
-            return "daytona-sandbox-id"
-
-        @property
-        def name(self) -> str:
-            return "daytona-sandbox-name"
-
-        @property
-        def state(self) -> str:
-            return "running"
-
-        async def exec(self, command: str, *, cwd: str | None = None, timeout: float | None = None) -> ExecResult:
-            return ExecResult(exit_code=0, output="")
-
-        async def upload_file(self, remote_path: str, content: bytes) -> None:
-            pass
-
-        async def download_file(self, remote_path: str) -> bytes:
-            return b""
-
-        async def command(self, command: str, *, cwd: str | None = None, timeout: float | None = None):
-            if False:
-                yield ""
-
-    class FakeProvider(SandboxProvider):
-        async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
-            return FakeSandbox()
-
-        async def get_sandbox(self, instance_id: str) -> Sandbox:
-            assert instance_id == "i-1"
-            return FakeSandbox()
-
-        async def delete_sandbox(self, instance_id: str) -> None:
-            pass
-
-        async def list_sandboxes(self, query: SandboxQuery):
-            if False:
-                yield FakeSandbox()
-
-        async def close(self) -> None:
-            pass
-
-    selected_configs: list[DaytonaProviderConfig] = []
-
-    def create_provider(config: DaytonaProviderConfig) -> SandboxProvider:
-        selected_configs.append(config)
-        return FakeProvider()
-
-    monkeypatch.setattr(DaytonaProviderConfig, "create_provider", create_provider)
-
-    headers = {
-        "x-api-key": "key",
-        "x-api-url": "url",
-        "x-target": "target",
-    }
+        return ProviderSelectionProvider()
 
     class RuntimeProviderBenchmark(StubBenchmark):
         async def setup_task(self, task_id: str, sandbox: Sandbox, dataset: str | None = None):
             yield StreamResultChunk(type="result", data={"task_id": task_id, "sandbox_name": sandbox.name})
 
+    monkeypatch.setattr(DaytonaProviderConfig, "create_provider", create_provider)
+    monkeypatch.setattr(ModalProviderConfig, "create_provider", create_provider)
+
     with TestClient(BenchmarkServiceApp(RuntimeProviderBenchmark), headers=headers) as c:
         with c.websocket_connect("/ws/setup-task") as ws:
-            ws.send_json(
-                {
-                    "task_id": "task-1",
-                    "instance_id": "i-1",
-                    "sandbox_provider": "daytona",
-                }
-            )
+            ws.send_json({"task_id": "task-1", "instance_id": "i-1", "sandbox_provider": sandbox_provider})
             assert ws.receive_json() == {
                 "type": "result",
-                "data": {"task_id": "task-1", "sandbox_name": "daytona-sandbox-name"},
+                "data": {"task_id": "task-1", "sandbox_name": "selected-sandbox-name"},
             }
 
-    assert selected_configs == [DaytonaProviderConfig(api_key="key", api_url="url", target="target")]
+    assert selected_configs == [expected_config]
 
 
 async def test_send_json_if_connected_handles_disconnect() -> None:

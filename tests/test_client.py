@@ -12,7 +12,7 @@ from benchmark_service.v1_schemas import V1DatasetTasksResponse
 
 BASE_URL = "http://localhost:8000"
 HEADERS = {"Authorization": "Bearer token"}
-DAYTONA_CONFIG = DaytonaProviderConfig(api_key="key", api_url="url", target="target")
+DAYTONA_CONFIG = DaytonaProviderConfig(DAYTONA_API_KEY="key", DAYTONA_API_URL="url", DAYTONA_TARGET="target")
 
 
 def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "error") -> MagicMock:
@@ -248,7 +248,12 @@ async def test_websocket_request_includes_provider_config() -> None:
         assert json.loads(ws.send.call_args.args[0]) == {
             "task_id": "task-1",
             "instance_id": "inst-1",
-            "sandbox_provider": {"type": "daytona", "api_key": "key", "api_url": "url", "target": "target"},
+            "sandbox_provider": {
+                "type": "daytona",
+                "DAYTONA_API_KEY": "key",
+                "DAYTONA_API_URL": "url",
+                "DAYTONA_TARGET": "target",
+            },
             "dataset": None,
         }
 

@@ -29,7 +29,7 @@ from daytona.common.errors import (
     DaytonaTimeoutError,
 )
 from daytona.handle.async_pty_handle import AsyncPtyHandle
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import BaseModel
 from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_exponential, wait_fixed
 
 from benchmark_service.sandbox.types import (
@@ -65,9 +65,9 @@ _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
 
 class DaytonaProviderConfig(BaseModel):
     type: Literal["daytona"] = "daytona"
-    api_key: str = Field(validation_alias=AliasChoices("api_key", "DAYTONA_API_KEY"))
-    api_url: str = Field(validation_alias=AliasChoices("api_url", "DAYTONA_API_URL"))
-    target: str = Field(validation_alias=AliasChoices("target", "DAYTONA_TARGET"))
+    DAYTONA_API_KEY: str
+    DAYTONA_API_URL: str
+    DAYTONA_TARGET: str
 
     @classmethod
     def from_headers(cls, headers: Mapping[str, str]) -> "DaytonaProviderConfig":
@@ -76,7 +76,7 @@ class DaytonaProviderConfig(BaseModel):
         target = _get_config_header(headers, "x-target", "daytona_target")
         if not api_key or not api_url or not target:
             raise MissingSandboxConfigError("Missing required headers: x-api-key, x-api-url, x-target")
-        return cls(api_key=api_key, api_url=api_url, target=target)
+        return cls(DAYTONA_API_KEY=api_key, DAYTONA_API_URL=api_url, DAYTONA_TARGET=target)
 
     def create_provider(self) -> SandboxProvider:
         return DaytonaSandboxProvider(self)
@@ -380,9 +380,9 @@ class DaytonaSandboxProvider(SandboxProvider):
     def __init__(self, config: DaytonaProviderConfig) -> None:
         self._daytona = AsyncDaytona(
             config=DaytonaConfig(
-                api_key=config.api_key,
-                api_url=config.api_url,
-                target=config.target,
+                api_key=config.DAYTONA_API_KEY,
+                api_url=config.DAYTONA_API_URL,
+                target=config.DAYTONA_TARGET,
                 connection_pool_maxsize=None,
             )
         )

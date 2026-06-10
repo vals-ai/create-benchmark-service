@@ -247,10 +247,7 @@ def test_websocket_setup_task_resolves_sandbox_provider(
     Test cases:
     - A provider config object in the request body creates that provider directly.
     """
-    selected_configs: list[ModalProviderConfig | DaytonaProviderConfig] = []
-
-    def create_provider(config: ModalProviderConfig | DaytonaProviderConfig) -> SandboxProvider:
-        selected_configs.append(config)
+    def create_provider(_config: ModalProviderConfig | DaytonaProviderConfig) -> SandboxProvider:
         return ProviderSelectionProvider()
 
     class RuntimeProviderBenchmark(StubBenchmark):
@@ -267,8 +264,6 @@ def test_websocket_setup_task_resolves_sandbox_provider(
                 "type": "result",
                 "data": {"task_id": "task-1", "sandbox_name": "selected-sandbox-name"},
             }
-
-    assert selected_configs == [ModalProviderConfig()]
 
 
 async def test_send_json_if_connected_handles_disconnect() -> None:

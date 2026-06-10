@@ -116,6 +116,29 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 
 Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` config so one hosted service can use different sandbox providers per request. Eval-only retry uses `/ws/evaluate-response` with `{"task_id": "…", "eval_resume_state": {...}, "sandbox_provider": {...}, "dataset": "…"}`. The provider config is optional because many benchmarks resume without a sandbox; include it when the benchmark must create one for evaluation. It is request-only and must not be embedded in persisted `eval_resume_state`.
 
+#### Sandbox providers
+
+`sandbox_provider` is selected per setup/evaluate-instance request:
+
+```json
+{"type": "daytona", "api_key": "...", "api_url": "...", "target": "..."}
+```
+
+or:
+
+```json
+{"type": "modal"}
+```
+
+Hosted benchmark services should normally let the service deployment own `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET`, so the registry/deployment environment controls Modal credentials instead of each Valkyrie request carrying them. If Valkyrie resolves provider config from AWS Secrets Manager, the Modal secret shape can use `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`, and optional `MODAL_ENVIRONMENT`. Only set `environment` when that Modal environment exists; otherwise Modal uses the active/default environment for the token profile.
+
+Provider compatibility notes:
+
+- Modal currently supports `ImageSource` only. `SnapshotSource` is rejected because Daytona snapshots do not have a Modal equivalent.
+- Modal sandboxes do not expose a disk-size parameter; `Resources.disk` is accepted for schema compatibility but not enforced.
+- Docker-in-sandbox is **not** enabled by default. Benchmarks that need nested Docker can set `resources.enable_docker=true` on their `RetrieveTaskResponse`; this only asks the sandbox provider for Docker support. The benchmark service still owns the Docker-capable image, dockerd startup flags, compose workflow, and cleanup.
+- Transient Modal connection errors are retried up to three attempts, matching the Daytona adapter's provider-level retry shape. Non-transient command failures still surface as `SandboxCommandError` with the command exit code.
+
 Benchmark services can send `eval_resume_state` updates to the tracker while evaluation is running. The tracker stores the latest value and sends it back on eval-only retry, so the benchmark service can continue evaluation without recreating the original agent sandbox.
 
 Eval-only retry flow:
@@ -200,9 +223,9 @@ Pydantic models used across requests and responses:
 
 - **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `Resources`
 - **`SandboxSource`** — `ImageSource(type="image", image=...)` or `SnapshotSource(type="snapshot", snapshot=...)`
-- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; currently `DaytonaProviderConfig(type="daytona", api_key, api_url, target)` or `ModalProviderConfig(type="modal")` (adapter not implemented yet)
-- **`Resources`** — `vcpu`, `memory`, `disk`
-- **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, required `sandbox_provider`, `dataset`
+- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; currently `DaytonaProviderConfig(type="daytona", api_key, api_url, target)` or `ModalProviderConfig(type="modal", token_id?, token_secret?, environment?)`
+- **`Resources`** — `vcpu`, `memory`, `disk`, `enable_docker` (default `false`; requests provider-level nested Docker support while benchmark code owns dockerd/image/runtime setup)
+- **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, optional `sandbox_provider` with Daytona header fallback, `dataset`
 - **`EvaluateResponseRequest`** — `task_id`, `response` or `eval_resume_state`, optional `sandbox_provider`, `dataset`
 - **`FinalScoreResult`** / **`FinalScoreResponse`** — `score` (float), `metadata`, `tasks_evaluated`
 - **`TaskFilter`** — `task_ids` list or `slice_str`; `parse_slice()` converts `"start:stop:step"` to a Python `slice`

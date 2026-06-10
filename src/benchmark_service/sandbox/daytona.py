@@ -29,7 +29,7 @@ from daytona.common.errors import (
     DaytonaTimeoutError,
 )
 from daytona.handle.async_pty_handle import AsyncPtyHandle
-from pydantic import BaseModel
+from pydantic import AliasChoices, BaseModel, Field
 from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_exponential, wait_fixed
 
 from benchmark_service.sandbox.types import (
@@ -65,9 +65,9 @@ _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
 
 class DaytonaProviderConfig(BaseModel):
     type: Literal["daytona"] = "daytona"
-    api_key: str
-    api_url: str
-    target: str
+    api_key: str = Field(validation_alias=AliasChoices("api_key", "DAYTONA_API_KEY"))
+    api_url: str = Field(validation_alias=AliasChoices("api_url", "DAYTONA_API_URL"))
+    target: str = Field(validation_alias=AliasChoices("target", "DAYTONA_TARGET"))
 
     @classmethod
     def from_headers(cls, headers: Mapping[str, str]) -> "DaytonaProviderConfig":

@@ -20,7 +20,6 @@ from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import LEGACY_TENANT_SENTINEL, get_auth_settings, get_tenant_config, load_allowlist
 from benchmark_service.base import BenchmarkService
 from benchmark_service.inflight import InflightMiddleware
-from benchmark_service.sandbox import SandboxProviderConfig
 from benchmark_service.schemas import (
     EvaluateInstanceRequest,
     EvaluateResponseRequest,
@@ -92,13 +91,6 @@ _TRIAL_ALLOWED_PATH = re.compile(r"/v1/(?:evaluate|score|datasets/[^/]+/tasks)")
 
 def _trial_tenant_may_access_path(path: str) -> bool:
     return _TRIAL_ALLOWED_PATH.fullmatch(path) is not None
-
-
-def _sandbox_provider_config(
-    request: SetupTaskRequest | EvaluateInstanceRequest,
-) -> SandboxProviderConfig:
-    """Resolve sandbox provider config from the request body."""
-    return request.sandbox_provider
 
 
 def _get_service_metadata(service_cls: type[BenchmarkService]) -> tuple[str | None, str | None]:
@@ -261,7 +253,7 @@ class BenchmarkServiceApp(FastAPI):
                 return
 
             request = SetupTaskRequest(**await websocket.receive_json())
-            sandbox_config = _sandbox_provider_config(request)
+            sandbox_config = request.sandbox_provider
 
             if not await self.service.check_dataset_access(tenant, request.dataset):
                 await websocket.close(code=1008, reason="Dataset not allowed")
@@ -333,7 +325,7 @@ class BenchmarkServiceApp(FastAPI):
                 return
 
             request = EvaluateInstanceRequest(**await websocket.receive_json())
-            sandbox_config = _sandbox_provider_config(request)
+            sandbox_config = request.sandbox_provider
 
             if not await self.service.check_dataset_access(tenant, request.dataset):
                 await websocket.close(code=1008, reason="Dataset not allowed")

@@ -24,6 +24,10 @@ class Resources(BaseModel):
     vcpu: int = Field(description="Logical sandbox CPU count")
     memory: int = Field(description="Sandbox memory")
     disk: int = Field(description="Sandbox ephemeral disk")
+    enable_docker: bool = Field(
+        default=False,
+        description="Request nested Docker support when the sandbox provider supports it",
+    )
 
 
 class SandboxCreateRequest(BaseModel):

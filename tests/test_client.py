@@ -44,6 +44,7 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
             "/retrieve-task/",
             {
                 "source": {"type": "image", "image": "python:3.12"},
+                "docker_image": "python:3.12",
                 "problem_path": "/tmp/problem_statement.txt",
                 "cwd": "/work",
                 "resources": {"vcpu": 2, "memory": 4, "disk": 10},
@@ -95,7 +96,29 @@ async def test_retrieve_task_accepts_legacy_shape(
     result = await client.retrieve_task("task-1")
 
     assert result.source.model_dump() == {"type": "image", "image": "python:3.12"}
+    assert result.model_dump()["docker_image"] == "python:3.12"
     assert result.resources.model_dump() == {"vcpu": 2, "memory": 4, "disk": 10}
+
+
+async def test_retrieve_task_serializes_snapshot_source_for_legacy_clients(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    mock_http.get = AsyncMock(
+        return_value=_mock_response(
+            json_data={
+                "source": {"type": "snapshot", "snapshot": "vcb1-openhands-abc123"},
+                "problem_path": "/tmp/problem_statement.txt",
+                "cwd": "/work",
+                "resources": {"vcpu": 2, "memory": 4, "disk": 10},
+                "agent_timeout": None,
+            }
+        )
+    )
+
+    result = await client.retrieve_task("task-1")
+
+    assert result.model_dump()["docker_image"] == "snapshot:vcb1-openhands-abc123"
 
 
 @pytest.mark.parametrize(

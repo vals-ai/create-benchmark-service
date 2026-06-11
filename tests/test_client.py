@@ -52,6 +52,16 @@ def test_sandbox_config_rejects_unknown_provider(monkeypatch: pytest.MonkeyPatch
             {"status": "ok"},
         ),
         (
+            "version",
+            [],
+            "/version",
+            {
+                "framework_version": "0.7.4",
+                "service_name": "legal-research-benchmark-service",
+                "service_version": "1.2.3",
+            },
+        ),
+        (
             "verify_task_ids",
             [["t1", "t2"], None],
             "/verify-task-ids",
@@ -77,7 +87,7 @@ def test_sandbox_config_rejects_unknown_provider(monkeypatch: pytest.MonkeyPatch
             {"tasks_evaluated": ["t1"], "final_score": 100.0, "metadata": {}},
         ),
     ],
-    ids=["health_check", "verify_task_ids", "retrieve_task", "final_score"],
+    ids=["health_check", "version", "verify_task_ids", "retrieve_task", "final_score"],
 )
 async def test_http_happy_path(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],

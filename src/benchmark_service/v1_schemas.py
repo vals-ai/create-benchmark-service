@@ -98,6 +98,7 @@ class V1Task(BaseModel):
 
 class V1DatasetTasksResponse(BaseModel):
     dataset: str
+    dataset_version: str | None = None
     tasks: list[V1Task]
 
 

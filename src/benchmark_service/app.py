@@ -193,11 +193,15 @@ class BenchmarkServiceApp(FastAPI):
     async def _health_check(self) -> HealthCheckResponse:
         return HealthCheckResponse(status="ok")
 
+    def _current_service_version(self) -> str | None:
+        service_override = self.service.get_service_version()
+        return service_override or self._service_version
+
     async def _version(self) -> VersionResponse:
         return VersionResponse(
             framework_version=_framework_version,
             service_name=self._service_name,
-            service_version=self._service_version,
+            service_version=self._current_service_version(),
         )
 
     async def _authorize_websocket(self, websocket: WebSocket) -> str | None:
@@ -436,7 +440,11 @@ class BenchmarkServiceApp(FastAPI):
             tasks = await self.service.list_tasks(dataset=dataset)
         except NotImplementedError as exc:
             raise HTTPException(status_code=501, detail=str(exc)) from exc
-        response = V1DatasetTasksResponse(dataset=dataset, tasks=tasks)
+        response = V1DatasetTasksResponse(
+            dataset=dataset,
+            dataset_version=self.service.get_dataset_version(dataset),
+            tasks=tasks,
+        )
         if _is_trial_tenant(request.state.tenant):
             return sanitize_v1_dataset_tasks_response(response)
         return response

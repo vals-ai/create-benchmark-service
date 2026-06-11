@@ -94,6 +94,18 @@ class BenchmarkService(ABC):
             return False
         return (dataset or "default") in entry.datasets
 
+    def get_service_version(self) -> str | None:
+        """Return a benchmark-owned service version override, if available.
+
+        The app falls back to the installed Python distribution version when
+        this returns None.
+        """
+        return None
+
+    def get_dataset_version(self, dataset: str | None = None) -> str | None:
+        """Return the version for `dataset`, if this benchmark tracks one."""
+        return None
+
     def get_dataset(self, dataset: str | None = None) -> dict[str, Any]:
         """Get a specific dataset by name. Defaults to 'default'."""
         key = dataset or "default"

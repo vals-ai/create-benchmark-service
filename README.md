@@ -85,6 +85,8 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 - `check_auth(headers)` — legacy boolean auth hook. Override for custom auth that does not need tenant or dataset awareness.
 - `resolve_tenant(headers)` — validate request authorization and return a tenant ID, `"_legacy"` for legacy auth, or `None` to reject.
 - `check_dataset_access(tenant, dataset)` — return whether a resolved tenant may access a dataset.
+- `get_service_version()` — optional benchmark-owned service version override. If it returns `None`, `/version` falls back to the installed benchmark package version.
+- `get_dataset_version(dataset)` — optional dataset release/version hook. The value is returned on the dataset task-list response after auth and dataset access checks.
 
 ### FastAPI application factory (`app.py`)
 
@@ -95,6 +97,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Returns `{"status": "ok"}` |
+| `GET` | `/version` | Returns `{"framework_version": "...", "service_name": "...", "service_version": "..."}` |
 | `GET` | `/verify-task-ids` | Return task IDs filtered by `?task_ids=…` or `?slice=start:stop:step` (optional `?dataset=…`) |
 | `GET` | `/retrieve-task/?task_id=…` | Return task metadata for a given task ID (optional `?dataset=…`) |
 | `POST` | `/evaluate-response/` | Evaluate without a sandbox and return one final response |
@@ -175,6 +178,7 @@ Response:
 ```json
 {
   "dataset": "validation",
+  "dataset_version": "2026-06-10",
   "tasks": [
     {"id": "01-011", "question": "...", "timeout": null},
     {"id": "01-012", "question": "...", "timeout": 600}

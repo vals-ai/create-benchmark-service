@@ -52,6 +52,7 @@ def sanitize_v1_score_response(resp: V1ScoreResponse) -> V1ScoreResponse:
 def sanitize_v1_dataset_tasks_response(resp: V1DatasetTasksResponse) -> V1DatasetTasksResponse:
     return V1DatasetTasksResponse(
         dataset=resp.dataset,
+        dataset_version=resp.dataset_version,
         tasks=[
             V1Task(id=task.id, question=task.question, timeout=task.timeout)
             for task in resp.tasks

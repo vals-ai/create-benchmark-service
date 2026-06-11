@@ -27,7 +27,12 @@ from benchmark_service.v1_schemas import (
 from tests.conftest import StubBenchmark
 
 
-class TaskListingBenchmark(StubBenchmark):
+class DatasetVersionBenchmark(StubBenchmark):
+    def get_dataset_version(self, dataset: str | None = None) -> str | None:
+        return f"{dataset or 'default'}-dataset-2026-06-10"
+
+
+class TaskListingBenchmark(DatasetVersionBenchmark):
     async def list_tasks(self, dataset: str | None = None) -> list[V1Task]:
         return [
             V1Task(id=task_id, question=task["problem"])
@@ -390,6 +395,7 @@ def test_v1_task_allows_benchmark_specific_extras() -> None:
 def test_v1_dataset_tasks_response_round_trip() -> None:
     resp = V1DatasetTasksResponse(
         dataset="validation",
+        dataset_version="validation-2026-06-10",
         tasks=[
             V1Task(id="t1", question="q1"),
             V1Task(id="t2", question="q2", timeout=120),
@@ -398,6 +404,7 @@ def test_v1_dataset_tasks_response_round_trip() -> None:
     raw = resp.model_dump(mode="json")
     rehydrated = V1DatasetTasksResponse.model_validate(raw)
     assert rehydrated == resp
+    assert raw["dataset_version"] == "validation-2026-06-10"
     assert raw["tasks"][1]["timeout"] == 120
 
 
@@ -409,6 +416,7 @@ def test_v1_list_dataset_tasks_returns_full_task_list(task_listing_client: TestC
     assert resp.status_code == 200
     body = resp.json()
     assert body["dataset"] == "default"
+    assert body["dataset_version"] == "default-dataset-2026-06-10"
     assert {t["id"] for t in body["tasks"]} == {"task-1", "task-2", "task-3"}
     assert {t["question"] for t in body["tasks"]} == {"What is 1+1?", "What is 2+2?", "What is 3+3?"}
 

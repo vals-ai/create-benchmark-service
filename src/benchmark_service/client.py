@@ -24,6 +24,7 @@ from benchmark_service.schemas import (
     SetupTaskResponse,
     StreamChunk,
     VerifyTaskIdsResponse,
+    VersionResponse,
 )
 from benchmark_service.v1_schemas import V1DatasetTasksResponse
 
@@ -180,6 +181,21 @@ class BenchmarkServiceClient:
             )
 
         return HealthCheckResponse.model_validate(response.json())
+
+    @_retry_http
+    async def version(self) -> VersionResponse:
+        """Fetch framework and benchmark service version metadata."""
+        response = await self._http_client.get(f"{self._url}/version")
+
+        if response.status_code == 401:
+            raise _unauthenticated_error(response)
+
+        if response.status_code != 200:
+            raise BenchmarkServiceError(
+                f"Version check failed with status code {response.status_code}, response: {response.text}"
+            )
+
+        return VersionResponse.model_validate(response.json())
 
     @_retry_http
     async def verify_task_ids(

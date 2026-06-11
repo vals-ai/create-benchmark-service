@@ -53,6 +53,11 @@ class _FakeService(BenchmarkService):
         raise NotImplementedError
 
 
+class _VersionedService(_FakeService):
+    def get_service_version(self) -> str | None:
+        return "service-hook-1.2.3"
+
+
 def _service_cls_in_module(module_name: str) -> type[BenchmarkService]:
     """Build a throwaway BenchmarkService subclass whose __module__ is `module_name`."""
     return type(_FakeService.__name__, (_FakeService,), {"__module__": module_name})
@@ -86,3 +91,12 @@ def test_version_endpoint_returns_framework_version() -> None:
     assert body["framework_version"] == benchmark_service.__version__
     assert "service_name" in body
     assert "service_version" in body
+
+
+def test_version_endpoint_prefers_service_version_hook() -> None:
+    app = BenchmarkServiceApp(_VersionedService)
+    with TestClient(app) as client:
+        response = client.get("/version")
+
+    assert response.status_code == 200
+    assert response.json()["service_version"] == "service-hook-1.2.3"

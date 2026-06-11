@@ -114,6 +114,9 @@ class _TrialResultBenchmark(StubBenchmark):
             })
         ]
 
+    def get_dataset_version(self, dataset: str | None = None) -> str | None:
+        return f"{dataset or 'default'}-dataset-2026-06-10"
+
     async def evaluate_response(
         self, request: EvaluateResponseRequest, dataset: str | None = None
     ) -> dict[str, object]:
@@ -306,5 +309,7 @@ def test_v1_dataset_tasks_strips_extras_for_trial_tenant(trial_client: TestClien
         headers={"x-descope-api-key": "trial-key"},
     )
     assert resp.status_code == 200
-    task = resp.json()["tasks"][0]
+    body = resp.json()
+    assert body["dataset_version"] == "default-dataset-2026-06-10"
+    task = body["tasks"][0]
     assert task == {"id": "task-1", "question": "What is 1+1?", "timeout": 60.0}

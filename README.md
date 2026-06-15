@@ -114,7 +114,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | `/ws/evaluate-response` | Evaluate without a sandbox; streams progress, checkpoint state, errors, and a final result |
 | `/ws/evaluate-instance` | Evaluate a live sandbox solution; streams progress, errors, and a final result |
 
-Sandbox setup and live sandbox evaluation require sandbox-provider headers. Daytona is the default provider and uses `x-api-key`, `x-api-url`, and `x-target`. Live evaluation accepts `{"task_id": "…", "instance_id": "…", "dataset": "…"}`. Eval-only retry uses `/ws/evaluate-response` with `{"task_id": "…", "eval_resume_state": {...}, "dataset": "…"}` and does not require sandbox-provider headers.
+Sandbox setup and live sandbox evaluation require request-scoped `sandbox_provider` config so one hosted service can use different sandbox providers per request. Eval-only retry uses `/ws/evaluate-response` with `{"task_id": "…", "eval_resume_state": {...}, "dataset": "…"}` and does not require a sandbox provider.
 
 Benchmark services can send `eval_resume_state` updates to the tracker while evaluation is running. The tracker stores the latest value and sends it back on eval-only retry, so the benchmark service can continue evaluation without recreating the original agent sandbox.
 
@@ -198,7 +198,9 @@ Pydantic models used across requests and responses:
 
 - **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `Resources`
 - **`SandboxSource`** — `ImageSource(type="image", image=...)` or `SnapshotSource(type="snapshot", snapshot=...)`
+- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; currently `DaytonaProviderConfig(type="daytona", api_key, api_url, target)` or `ModalProviderConfig(type="modal")` (adapter not implemented yet)
 - **`Resources`** — `vcpu`, `memory`, `disk`
+- **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, required `sandbox_provider`, `dataset`
 - **`EvaluateResponseRequest`** — `task_id`, `response` or `eval_resume_state`, `dataset`
 - **`FinalScoreResult`** / **`FinalScoreResponse`** — `score` (float), `metadata`, `tasks_evaluated`
 - **`TaskFilter`** — `task_ids` list or `slice_str`; `parse_slice()` converts `"start:stop:step"` to a Python `slice`
@@ -211,7 +213,7 @@ Runs a shell command inside a sandbox and yields output in real time. Checks the
 
 ### Authentication
 
-The framework authenticates every HTTP request except `/health`, and every WebSocket route before sandbox-provider headers are used.
+The framework authenticates every HTTP request except `/health`, and every WebSocket route before sandbox provider config is used.
 
 For hosted Valkyrie benchmark services, set `AUTH_REQUIRED=true`, `DESCOPE_PROJECT_ID`, and a tenant + dataset allowlist. Requests must include a valid Descope access key in `X-Descope-Api-Key`. The key must be scoped to exactly one Descope tenant, and that tenant must appear in the service allowlist.
 

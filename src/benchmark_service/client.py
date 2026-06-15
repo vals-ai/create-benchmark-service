@@ -13,7 +13,7 @@ from tenacity import (
     wait_random,
 )
 
-from benchmark_service.sandbox import SandboxProvider, sandbox_config_from_headers
+from benchmark_service.sandbox import SandboxProvider, SandboxProviderConfig
 from benchmark_service.schemas import (
     EvaluateInstanceRequest,
     EvaluateResponseRequest,
@@ -79,7 +79,7 @@ class BenchmarkServiceClient:
     _url: str
     _headers: dict[str, str]
     _timeout: int
-    _sandbox_provider: SandboxProvider | None = None
+    _sandbox_providers: dict[str, SandboxProvider]
 
     def __init__(self, url: str, headers: dict[str, str], timeout: int = 60):
         """Initialize the client.
@@ -92,6 +92,7 @@ class BenchmarkServiceClient:
         self._url = url
         self._headers = headers
         self._timeout = timeout
+        self._sandbox_providers = {}
         self._http_client = httpx.AsyncClient(
             follow_redirects=True,
             timeout=timeout,
@@ -99,16 +100,17 @@ class BenchmarkServiceClient:
             limits=httpx.Limits(max_connections=200),
         )
 
-    def get_sandbox_provider(self) -> SandboxProvider:
-        if self._sandbox_provider is None:
-            self._sandbox_provider = sandbox_config_from_headers(self._headers).create_provider()
-        return self._sandbox_provider
+    def get_sandbox_provider(self, provider: SandboxProviderConfig) -> SandboxProvider:
+        provider_key = provider.model_dump_json()
+        if provider_key not in self._sandbox_providers:
+            self._sandbox_providers[provider_key] = provider.create_provider()
+        return self._sandbox_providers[provider_key]
 
     async def close(self) -> None:
         """Close the HTTP and sandbox provider clients."""
         await self._http_client.aclose()
-        if self._sandbox_provider:
-            await self._sandbox_provider.close()
+        for sandbox_provider in self._sandbox_providers.values():
+            await sandbox_provider.close()
 
     async def __aenter__(self) -> "BenchmarkServiceClient":
         return self
@@ -256,6 +258,7 @@ class BenchmarkServiceClient:
         self,
         task_id: str,
         instance_id: str,
+        sandbox_provider: SandboxProviderConfig | None = None,
         on_message: Callable[[str], None] | None = None,
         dataset: str | None = None,
     ) -> SetupTaskResponse:
@@ -264,9 +267,15 @@ class BenchmarkServiceClient:
         Args:
             task_id: The task to set up.
             instance_id: The instance to set up.
+            sandbox_provider: Sandbox provider config for the task sandbox.
             on_message: Optional callback for intermediate progress messages.
         """
-        request = SetupTaskRequest(task_id=task_id, instance_id=instance_id, dataset=dataset)
+        request = SetupTaskRequest(
+            task_id=task_id,
+            instance_id=instance_id,
+            sandbox_provider=sandbox_provider,
+            dataset=dataset,
+        )
         result = await self._websocket_request("setup-task", request, on_message)
         return SetupTaskResponse.model_validate(result)
 
@@ -319,6 +328,7 @@ class BenchmarkServiceClient:
         self,
         task_id: str,
         instance_id: str,
+        sandbox_provider: SandboxProviderConfig | None = None,
         on_message: Callable[[str], None] | None = None,
         dataset: str | None = None,
         on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
@@ -328,9 +338,15 @@ class BenchmarkServiceClient:
         Args:
             task_id: The task to evaluate.
             instance_id: The instance to evaluate.
+            sandbox_provider: Sandbox provider config for the task sandbox.
             on_message: Optional callback for intermediate progress messages.
         """
-        request = EvaluateInstanceRequest(task_id=task_id, instance_id=instance_id, dataset=dataset)
+        request = EvaluateInstanceRequest(
+            task_id=task_id,
+            instance_id=instance_id,
+            sandbox_provider=sandbox_provider,
+            dataset=dataset,
+        )
         return await self._websocket_request("evaluate-instance", request, on_message, on_eval_resume_state)
 
     @_retry_http

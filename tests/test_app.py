@@ -1,7 +1,7 @@
 """Tests for FastAPI app endpoints."""
 
 import json
-from collections.abc import Generator
+from collections.abc import AsyncGenerator, Generator
 from typing import Any, cast
 from unittest.mock import patch
 
@@ -11,9 +11,63 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from benchmark_service import auth as auth_module
-from benchmark_service.app import BenchmarkServiceApp
-from benchmark_service.app import send_json_if_connected
+from benchmark_service.app import BenchmarkServiceApp, send_json_if_connected
+from benchmark_service.sandbox.daytona import DaytonaProviderConfig
+from benchmark_service.sandbox.modal import ModalProviderConfig
+from benchmark_service.sandbox.types import (
+    ExecResult,
+    Sandbox,
+    SandboxCreateRequest,
+    SandboxProvider,
+    SandboxQuery,
+)
+from benchmark_service.schemas import StreamResultChunk
 from tests.conftest import StubBenchmark
+
+
+class ProviderSelectionSandbox(Sandbox):
+    @property
+    def id(self) -> str:
+        return "selected-sandbox-id"
+
+    @property
+    def name(self) -> str:
+        return "selected-sandbox-name"
+
+    @property
+    def state(self) -> str:
+        return "running"
+
+    async def exec(self, command: str, *, cwd: str | None = None, timeout: float | None = None) -> ExecResult:
+        return ExecResult(exit_code=0, output="")
+
+    def command(
+        self, command: str, *, cwd: str | None = None, timeout: float | None = None
+    ) -> AsyncGenerator[str, None]:
+        if False:
+            yield ""
+
+    async def upload_file(self, remote_path: str, content: bytes) -> None:
+        pass
+
+    async def download_file(self, remote_path: str) -> bytes:
+        return b""
+
+
+class ProviderSelectionProvider(SandboxProvider):
+    async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
+        return ProviderSelectionSandbox()
+
+    async def get_sandbox(self, instance_id: str) -> Sandbox:
+        assert instance_id == "i-1"
+        return ProviderSelectionSandbox()
+
+    async def delete_sandbox(self, instance_id: str) -> None:
+        pass
+
+    def list_sandboxes(self, query: SandboxQuery) -> AsyncGenerator[Sandbox, None]:
+        if False:
+            yield ProviderSelectionSandbox()
 
 
 def test_health(client: TestClient) -> None:
@@ -184,6 +238,66 @@ def test_websocket_evaluate_response_with_eval_resume_state(client: TestClient) 
                 "state": {"artifact_prefix": "s3://bucket/run"},
             },
         }
+
+
+def test_websocket_setup_task_resolves_sandbox_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Setup-task websockets should resolve request-scoped sandbox provider config.
+
+    Test cases:
+    - A provider config object in the request body creates that provider directly.
+    """
+    def create_provider(_config: ModalProviderConfig | DaytonaProviderConfig) -> SandboxProvider:
+        return ProviderSelectionProvider()
+
+    class RuntimeProviderBenchmark(StubBenchmark):
+        async def setup_task(self, task_id: str, sandbox: Sandbox, dataset: str | None = None):
+            yield StreamResultChunk(type="result", data={"task_id": task_id, "sandbox_name": sandbox.name})
+
+    monkeypatch.setattr(DaytonaProviderConfig, "create_provider", create_provider)
+    monkeypatch.setattr(ModalProviderConfig, "create_provider", create_provider)
+
+    with TestClient(BenchmarkServiceApp(RuntimeProviderBenchmark)) as c:
+        with c.websocket_connect("/ws/setup-task") as ws:
+            ws.send_json({"task_id": "task-1", "instance_id": "i-1", "sandbox_provider": {"type": "modal"}})
+            assert ws.receive_json() == {
+                "type": "result",
+                "data": {"task_id": "task-1", "sandbox_name": "selected-sandbox-name"},
+            }
+
+
+def test_websocket_setup_task_falls_back_to_header_provider_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Setup-task websockets should support clients that omit sandbox_provider.
+
+    Test cases:
+    - Daytona headers create the provider when the request body has no provider config.
+    """
+    def create_provider(_config: DaytonaProviderConfig) -> SandboxProvider:
+        return ProviderSelectionProvider()
+
+    class RuntimeProviderBenchmark(StubBenchmark):
+        async def setup_task(self, task_id: str, sandbox: Sandbox, dataset: str | None = None):
+            yield StreamResultChunk(type="result", data={"task_id": task_id, "sandbox_name": sandbox.name})
+
+    monkeypatch.setattr(DaytonaProviderConfig, "create_provider", create_provider)
+
+    with TestClient(BenchmarkServiceApp(RuntimeProviderBenchmark)) as c:
+        with c.websocket_connect(
+            "/ws/setup-task",
+            headers={
+                "DAYTONA_API_KEY": "key",
+                "DAYTONA_API_URL": "url",
+                "DAYTONA_TARGET": "target",
+            },
+        ) as ws:
+            ws.send_json({"task_id": "task-1", "instance_id": "i-1"})
+            assert ws.receive_json() == {
+                "type": "result",
+                "data": {"task_id": "task-1", "sandbox_name": "selected-sandbox-name"},
+            }
 
 
 async def test_send_json_if_connected_handles_disconnect() -> None:
@@ -396,14 +510,11 @@ def test_setup_task_ws_close_for_disallowed_dataset(auth_client: TestClient) -> 
         with pytest.raises(WebSocketDisconnect) as exc_info:
             with auth_client.websocket_connect(
                 "/ws/setup-task",
-                headers={
-                    "x-descope-api-key": "key-acme",
-                    "x-api-key": "daytona-key",
-                    "x-api-url": "http://daytona",
-                    "x-target": "us",
-                },
+                headers={"x-descope-api-key": "key-acme"},
             ) as ws:
-                ws.send_json({"task_id": "task-1", "instance_id": "i-1", "dataset": "alt"})
+                ws.send_json(
+                    {"task_id": "task-1", "instance_id": "i-1", "sandbox_provider": {"type": "modal"}, "dataset": "alt"}
+                )
                 ws.receive_json()
     assert exc_info.value.code == 1008
     assert exc_info.value.reason == "Dataset not allowed"

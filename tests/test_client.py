@@ -8,6 +8,7 @@ import pytest
 
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
+from benchmark_service.sandbox.modal import ModalProviderConfig
 from benchmark_service.v1_schemas import V1DatasetTasksResponse
 
 BASE_URL = "http://localhost:8000"
@@ -279,6 +280,22 @@ async def test_websocket_request_includes_provider_config() -> None:
             },
             "dataset": None,
         }
+
+
+def test_get_sandbox_provider_uses_each_provider_config() -> None:
+    """Provider lookup should not reuse a stale provider for a different config.
+
+    Test cases:
+    - Repeated calls with the same config reuse the cached provider.
+    - A later call with a different provider config creates a separate provider.
+    """
+    client = _make_client()
+    daytona_provider = client.get_sandbox_provider(DAYTONA_CONFIG)
+    same_daytona_provider = client.get_sandbox_provider(DAYTONA_CONFIG)
+    modal_provider = client.get_sandbox_provider(ModalProviderConfig())
+
+    assert same_daytona_provider is daytona_provider
+    assert modal_provider is not daytona_provider
 
 
 async def test_verify_task_ids_no_dataset_omitted(

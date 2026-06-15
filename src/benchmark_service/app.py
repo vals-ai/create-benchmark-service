@@ -33,6 +33,8 @@ from benchmark_service.schemas import (
     VerifyTaskIdsResponse,
     VersionResponse,
 )
+from benchmark_service.sandbox import SandboxProviderConfig
+from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.trial import (
     sanitize_v1_dataset_tasks_response,
     sanitize_v1_eval_response,
@@ -91,6 +93,13 @@ _TRIAL_ALLOWED_PATH = re.compile(r"/v1/(?:evaluate|score|datasets/[^/]+/tasks)")
 
 def _trial_tenant_may_access_path(path: str) -> bool:
     return _TRIAL_ALLOWED_PATH.fullmatch(path) is not None
+
+
+def _request_sandbox_provider_config(
+    request: SetupTaskRequest | EvaluateInstanceRequest,
+    websocket: WebSocket,
+) -> SandboxProviderConfig:
+    return request.sandbox_provider or DaytonaProviderConfig.from_headers(websocket.headers)
 
 
 def _get_service_metadata(service_cls: type[BenchmarkService]) -> tuple[str | None, str | None]:
@@ -253,7 +262,7 @@ class BenchmarkServiceApp(FastAPI):
                 return
 
             request = SetupTaskRequest(**await websocket.receive_json())
-            sandbox_config = request.sandbox_provider
+            sandbox_config = _request_sandbox_provider_config(request, websocket)
 
             if not await self.service.check_dataset_access(tenant, request.dataset):
                 await websocket.close(code=1008, reason="Dataset not allowed")
@@ -325,7 +334,7 @@ class BenchmarkServiceApp(FastAPI):
                 return
 
             request = EvaluateInstanceRequest(**await websocket.receive_json())
-            sandbox_config = request.sandbox_provider
+            sandbox_config = _request_sandbox_provider_config(request, websocket)
 
             if not await self.service.check_dataset_access(tenant, request.dataset):
                 await websocket.close(code=1008, reason="Dataset not allowed")

@@ -267,6 +267,39 @@ def test_websocket_setup_task_resolves_sandbox_provider(
             }
 
 
+def test_websocket_setup_task_falls_back_to_header_provider_config(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Setup-task websockets should support clients that omit sandbox_provider.
+
+    Test cases:
+    - Daytona headers create the provider when the request body has no provider config.
+    """
+    def create_provider(_config: DaytonaProviderConfig) -> SandboxProvider:
+        return ProviderSelectionProvider()
+
+    class RuntimeProviderBenchmark(StubBenchmark):
+        async def setup_task(self, task_id: str, sandbox: Sandbox, dataset: str | None = None):
+            yield StreamResultChunk(type="result", data={"task_id": task_id, "sandbox_name": sandbox.name})
+
+    monkeypatch.setattr(DaytonaProviderConfig, "create_provider", create_provider)
+
+    with TestClient(BenchmarkServiceApp(RuntimeProviderBenchmark)) as c:
+        with c.websocket_connect(
+            "/ws/setup-task",
+            headers={
+                "DAYTONA_API_KEY": "key",
+                "DAYTONA_API_URL": "url",
+                "DAYTONA_TARGET": "target",
+            },
+        ) as ws:
+            ws.send_json({"task_id": "task-1", "instance_id": "i-1"})
+            assert ws.receive_json() == {
+                "type": "result",
+                "data": {"task_id": "task-1", "sandbox_name": "selected-sandbox-name"},
+            }
+
+
 async def test_send_json_if_connected_handles_disconnect() -> None:
     class ClosedWebSocket:
         async def send_json(self, _payload: dict[str, object]) -> None:

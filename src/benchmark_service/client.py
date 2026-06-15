@@ -78,7 +78,7 @@ class BenchmarkServiceClient:
     _url: str
     _headers: dict[str, str]
     _timeout: int
-    _sandbox_provider: SandboxProvider | None = None
+    _sandbox_providers: dict[str, SandboxProvider]
 
     def __init__(self, url: str, headers: dict[str, str], timeout: int = 60):
         """Initialize the client.
@@ -91,6 +91,7 @@ class BenchmarkServiceClient:
         self._url = url
         self._headers = headers
         self._timeout = timeout
+        self._sandbox_providers = {}
         self._http_client = httpx.AsyncClient(
             follow_redirects=True,
             timeout=timeout,
@@ -99,15 +100,16 @@ class BenchmarkServiceClient:
         )
 
     def get_sandbox_provider(self, provider: SandboxProviderConfig) -> SandboxProvider:
-        if self._sandbox_provider is None:
-            self._sandbox_provider = provider.create_provider()
-        return self._sandbox_provider
+        provider_key = provider.model_dump_json()
+        if provider_key not in self._sandbox_providers:
+            self._sandbox_providers[provider_key] = provider.create_provider()
+        return self._sandbox_providers[provider_key]
 
     async def close(self) -> None:
         """Close the HTTP and sandbox provider clients."""
         await self._http_client.aclose()
-        if self._sandbox_provider:
-            await self._sandbox_provider.close()
+        for sandbox_provider in self._sandbox_providers.values():
+            await sandbox_provider.close()
 
     async def __aenter__(self) -> "BenchmarkServiceClient":
         return self
@@ -240,7 +242,7 @@ class BenchmarkServiceClient:
         self,
         task_id: str,
         instance_id: str,
-        sandbox_provider: SandboxProviderConfig,
+        sandbox_provider: SandboxProviderConfig | None = None,
         on_message: Callable[[str], None] | None = None,
         dataset: str | None = None,
     ) -> SetupTaskResponse:
@@ -310,7 +312,7 @@ class BenchmarkServiceClient:
         self,
         task_id: str,
         instance_id: str,
-        sandbox_provider: SandboxProviderConfig,
+        sandbox_provider: SandboxProviderConfig | None = None,
         on_message: Callable[[str], None] | None = None,
         dataset: str | None = None,
         on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,

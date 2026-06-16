@@ -59,6 +59,7 @@ def test_sandbox_config_rejects_unknown_provider(monkeypatch: pytest.MonkeyPatch
                 "framework_version": "0.7.4",
                 "service_name": "legal-research-benchmark-service",
                 "service_version": "1.2.3",
+                "dataset_version": "3.0.0",
             },
         ),
         (

@@ -59,6 +59,8 @@ _KNOWN_THROTTLERS = ("sandbox-create", "sandbox-lifecycle", "authenticated", "an
 _DELETE_CONFLICT_MESSAGES = ("state change in progress", "modified by another operation")
 _REMOVED_SANDBOX_CLIENT_STATUSES = (404, 502)
 _FAILED_EXECUTE_COMMAND_PREFIX = "failed to execute command:"
+# Daytona sometimes flattens a transport failure into a bare DaytonaError message with no chained
+# cause; these substrings recover those cases by text when no typed cause survives to match.
 _TRANSPORT_ERROR_MESSAGES = (
     " is used by transport ",
     "[errno 32] broken pipe",
@@ -122,9 +124,13 @@ def _rate_limit_error(exc: BaseException) -> DaytonaRateLimitError | None:
     return None
 
 
-def _is_delete_conflict(exc: DaytonaConflictError) -> bool:
+def _message_contains(exc: BaseException, messages: tuple[str, ...]) -> bool:
     error = str(exc).lower()
-    return any(message in error for message in _DELETE_CONFLICT_MESSAGES)
+    return any(message in error for message in messages)
+
+
+def _is_delete_conflict(exc: DaytonaConflictError) -> bool:
+    return _message_contains(exc, _DELETE_CONFLICT_MESSAGES)
 
 
 def _is_not_found_error(exc: DaytonaError | ClientResponseError) -> bool:
@@ -152,11 +158,10 @@ def _has_retryable_cause(exc: BaseException) -> bool:
     return False
 
 
-def _is_daytona_transport_error(exc: DaytonaError | ClientResponseError) -> bool:
+def _is_transient_daytona_error(exc: DaytonaError | ClientResponseError) -> bool:
     if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS) or _has_retryable_cause(exc):
         return True
-    error = str(exc).lower()
-    return any(message in error for message in _TRANSPORT_ERROR_MESSAGES)
+    return _message_contains(exc, _TRANSPORT_ERROR_MESSAGES)
 
 
 def _parse_retry_after_seconds(value: object) -> float | None:
@@ -232,7 +237,7 @@ class DaytonaSandbox(Sandbox):
     def _sandbox_error(self, exc: DaytonaError | ClientResponseError) -> SandboxError:
         if _is_not_found_error(exc):
             return self._removed_error()
-        if _is_daytona_transport_error(exc) or _is_failed_execute_command_error(exc):
+        if _is_transient_daytona_error(exc) or _is_failed_execute_command_error(exc):
             return SandboxConnectionError(f"Sandbox connection error for {self._sandbox_ref}: {exc}")
         return SandboxError(f"Sandbox operation failed for {self._sandbox_ref}: {exc}")
 
@@ -415,7 +420,7 @@ class DaytonaSandboxProvider(SandboxProvider):
     def _sandbox_error(self, exc: DaytonaError) -> SandboxError:
         if _is_not_found_error(exc):
             return SandboxNotFoundError(f"Sandbox not found: {exc}")
-        if _is_daytona_transport_error(exc):
+        if _is_transient_daytona_error(exc):
             return SandboxConnectionError(f"Daytona sandbox provider connection error: {exc}")
         return SandboxError(f"Daytona sandbox provider error: {exc}")
 

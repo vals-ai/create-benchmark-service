@@ -8,6 +8,7 @@ major = scores not comparable, minor = additive, patch = non-scoring fixes.
 import hashlib
 import sys
 from pathlib import Path
+from typing import Any, cast
 
 import yaml
 from pydantic import BaseModel
@@ -27,9 +28,18 @@ def compute_checksum(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def load_dataset_versions(versions_file: Path) -> dict[str, DatasetVersionEntry]:
+def _load_versions_mapping(versions_file: Path) -> dict[str, Any]:
+    """Load the versions file as a mapping; an empty or non-mapping file is a clear error."""
     data = yaml.safe_load(versions_file.read_text())
-    return {name: DatasetVersionEntry.model_validate(entry) for name, entry in data.items()}
+    if not isinstance(data, dict):
+        raise DatasetVersionError(
+            f"{versions_file} must be a YAML mapping of dataset name to entry, got {type(data).__name__}"
+        )
+    return cast("dict[str, Any]", data)
+
+
+def load_dataset_versions(versions_file: Path) -> dict[str, DatasetVersionEntry]:
+    return {name: DatasetVersionEntry.model_validate(entry) for name, entry in _load_versions_mapping(versions_file).items()}
 
 
 def load_verified_dataset_versions(versions_file: Path) -> dict[str, DatasetVersionEntry]:
@@ -66,7 +76,7 @@ def main(argv: list[str]) -> int:
             return 1
         print("dataset checksums OK")
         return 0
-    raw = yaml.safe_load(versions_file.read_text())
+    raw = _load_versions_mapping(versions_file)
     for entry in raw.values():
         entry["sha256"] = compute_checksum(versions_file.parent / entry["file"])
     versions_file.write_text(yaml.safe_dump(raw, sort_keys=False))

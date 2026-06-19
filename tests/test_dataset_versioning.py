@@ -8,6 +8,7 @@ import yaml
 from benchmark_service.dataset_versioning import (
     DatasetVersionError,
     compute_checksum,
+    load_dataset_versions,
     load_verified_dataset_versions,
     main,
 )
@@ -44,6 +45,13 @@ def test_load_verified_raises_on_content_mismatch(tmp_path: Path) -> None:
     (tmp_path / "validation.json").write_bytes(b'{"tests": [1]}')
     with pytest.raises(DatasetVersionError, match="validation"):
         load_verified_dataset_versions(versions_file)
+
+
+def test_empty_versions_file_raises_clear_error(tmp_path: Path) -> None:
+    versions_file = tmp_path / "dataset_versions.yaml"
+    versions_file.write_text("# no entries yet\n")
+    with pytest.raises(DatasetVersionError, match="must be a YAML mapping"):
+        load_dataset_versions(versions_file)
 
 
 def test_check_command_fails_on_mismatch_and_update_repairs(tmp_path: Path) -> None:

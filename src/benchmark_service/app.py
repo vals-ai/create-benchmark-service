@@ -17,7 +17,13 @@ from uvicorn.protocols.utils import ClientDisconnected
 from websockets.exceptions import ConnectionClosed
 
 from benchmark_service._version import __version__ as _framework_version
-from benchmark_service.auth import LEGACY_TENANT_SENTINEL, get_auth_settings, get_tenant_config, load_allowlist
+from benchmark_service.auth import (
+    AuthFailure,
+    LEGACY_TENANT_SENTINEL,
+    get_auth_settings,
+    get_tenant_config,
+    load_allowlist,
+)
 from benchmark_service.base import BenchmarkService
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.schemas import (
@@ -52,6 +58,17 @@ from benchmark_service.v1_schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+_AUTH_FAILURE_RESPONSES: dict[AuthFailure, tuple[int, str]] = {
+    AuthFailure.NO_KEY: (401, "Missing x-descope-api-key header"),
+    AuthFailure.INVALID_KEY: (401, "Invalid or expired access key"),
+    AuthFailure.MULTI_TENANT: (401, "Access key must be scoped to exactly one tenant"),
+    AuthFailure.LEGACY_TENANT: (401, "Legacy bearer auth is not accepted on this endpoint"),
+    AuthFailure.NOT_ALLOWLISTED: (
+        403,
+        "Your tenant is authenticated but not allowlisted for this benchmark; ask Vals to allowlist your tenant",
+    ),
+}
 
 
 async def send_json_if_connected(websocket: WebSocket, payload: dict[str, Any]) -> bool:
@@ -144,7 +161,13 @@ class BenchmarkServiceApp(FastAPI):
 
         @asynccontextmanager
         async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
-            if get_auth_settings().auth_required:
+            settings = get_auth_settings()
+            if settings.auth_required:
+                if not settings.descope_project_id:
+                    raise RuntimeError(
+                        "AUTH_REQUIRED is true but DESCOPE_PROJECT_ID is not set; "
+                        "configure DESCOPE_PROJECT_ID before starting the server"
+                    )
                 load_allowlist()
             self.service = await service_cls.create()
             yield
@@ -159,11 +182,12 @@ class BenchmarkServiceApp(FastAPI):
         async def _check_auth(request: Request, call_next):  # type: ignore[no-untyped-def]
             if request.url.path in _PUBLIC_PATHS:
                 return await call_next(request)  # type: ignore[reportUnknownVariableType]
-            tenant = await self.service.resolve_tenant(dict(request.headers))
-            if tenant is None:
-                return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
-            request.state.tenant = tenant
-            if _is_trial_tenant(tenant) and not _trial_tenant_may_access_path(request.url.path):
+            result = await self.service.resolve_tenant(dict(request.headers))
+            if not result.ok:
+                status, detail = _AUTH_FAILURE_RESPONSES.get(result.failure, (401, "Unauthorized")) if result.failure else (401, "Unauthorized")  # type: ignore[arg-type]
+                return JSONResponse(status_code=status, content={"detail": detail})
+            request.state.tenant = result.tenant
+            if _is_trial_tenant(result.tenant) and not _trial_tenant_may_access_path(request.url.path):
                 return JSONResponse(
                     status_code=403,
                     content={"detail": "Trial tenants may only access approved /v1 endpoints (/v1/*)"},
@@ -220,15 +244,16 @@ class BenchmarkServiceApp(FastAPI):
 
     async def _authorize_websocket(self, websocket: WebSocket) -> str | None:
         """Authenticate a WebSocket caller. Returns tenant id, or None after closing 1008."""
-        tenant = await self.service.resolve_tenant(dict(websocket.headers))
-        if tenant is None:
-            await websocket.close(code=1008, reason="Unauthorized")
+        result = await self.service.resolve_tenant(dict(websocket.headers))
+        if not result.ok:
+            _status, detail = _AUTH_FAILURE_RESPONSES.get(result.failure, (401, "Unauthorized")) if result.failure else (401, "Unauthorized")  # type: ignore[arg-type]
+            await websocket.close(code=1008, reason=detail)
             return None
-        if _is_trial_tenant(tenant):
+        if _is_trial_tenant(result.tenant):
             await websocket.close(code=1008, reason="Trial tenants may only access /v1/*")
             return None
-        websocket.state.tenant = tenant
-        return tenant
+        websocket.state.tenant = result.tenant
+        return result.tenant
 
     async def _verify_task_ids(
         self,

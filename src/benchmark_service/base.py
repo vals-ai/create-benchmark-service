@@ -10,6 +10,7 @@ from collections.abc import AsyncGenerator
 from typing import Any, Self
 
 from benchmark_service.auth import (
+    AuthResult,
     LEGACY_TENANT_SENTINEL,
     check_benchmark_service_auth,
     load_allowlist,
@@ -72,16 +73,16 @@ class BenchmarkService(ABC):
         """
         return await check_benchmark_service_auth(headers)
 
-    async def resolve_tenant(self, headers: dict[str, str]) -> str | None:
-        """Authenticate the caller and return their tenant id, or None to reject.
+    async def resolve_tenant(self, headers: dict[str, str]) -> AuthResult:
+        """Authenticate the caller and return an AuthResult.
 
         Subclasses with a legacy `check_auth` override keep their existing boolean
-        behavior. A successful legacy check returns the "_legacy" sentinel, which
-        skips dataset-level allowlist enforcement.
+        behavior: True maps to the "_legacy" sentinel (skips allowlist enforcement);
+        False maps to a generic failure with no specific AuthFailure reason.
         """
         if type(self).check_auth is not BenchmarkService.check_auth:
             ok = await self.check_auth(headers)
-            return LEGACY_TENANT_SENTINEL if ok else None
+            return AuthResult(tenant=LEGACY_TENANT_SENTINEL) if ok else AuthResult()
         return await resolve_caller_tenant(headers)
 
     async def check_dataset_access(self, tenant: str, dataset: str | None) -> bool:

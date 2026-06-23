@@ -196,7 +196,10 @@ class BenchmarkServiceApp(FastAPI):
     async def _exception_handler(self, _request: Request, exc: Exception) -> Response:
         logger.error(f"Error: {exc}")
         logger.error(traceback.format_exc())
-        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Evaluation failed", "errors": [str(exc)]},
+        )
 
     async def _health_check(self) -> HealthCheckResponse:
         return HealthCheckResponse(status="ok")

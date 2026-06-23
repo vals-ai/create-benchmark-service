@@ -155,7 +155,9 @@ def test_evaluate_response_invalid_task() -> None:
     with TestClient(BenchmarkServiceApp(StubBenchmark), raise_server_exceptions=False) as c:
         response = c.post("/evaluate-response/", json={"task_id": "nonexistent", "response": "2"})
     assert response.status_code == 500
-    assert response.json() == {"detail": "Internal server error"}
+    body = response.json()
+    assert body["detail"] == "Evaluation failed"
+    assert body["errors"] and isinstance(body["errors"], list)
 
 
 @pytest.mark.parametrize(

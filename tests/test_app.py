@@ -578,8 +578,9 @@ class TestAuthFailureMessages:
         with self._patch_exchange(["unknown-org"]):
             response = descope_client.get("/verify-task-ids", headers={"x-descope-api-key": "rogue"})
         assert response.status_code == 403
-        assert "allowlist" in response.json()["detail"].lower()
-        assert "Vals" in response.json()["detail"]
+        detail = response.json()["detail"]
+        assert "allowlist" in detail.lower()
+        assert "service operator" in detail
 
     def test_valid_key_returns_200(self, descope_client: TestClient) -> None:
         with self._patch_exchange(["tenant-a"]):

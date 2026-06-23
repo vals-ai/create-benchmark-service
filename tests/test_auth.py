@@ -252,3 +252,12 @@ async def test_check_dataset_access_legacy_sentinel_always_allowed() -> None:
     service = _BareBenchmark()
     assert await service.check_dataset_access("_legacy", "anything") is True
     assert await service.check_dataset_access("_legacy", None) is True
+
+
+def test_auth_types_exported_from_package() -> None:
+    import benchmark_service
+
+    assert hasattr(benchmark_service, "AuthResult")
+    assert hasattr(benchmark_service, "AuthFailure")
+    assert benchmark_service.AuthResult is AuthResult
+    assert benchmark_service.AuthFailure is AuthFailure

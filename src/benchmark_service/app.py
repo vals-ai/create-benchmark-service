@@ -19,6 +19,7 @@ from websockets.exceptions import ConnectionClosed
 from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import (
     AuthFailure,
+    AuthResult,
     LEGACY_TENANT_SENTINEL,
     get_auth_settings,
     get_tenant_config,
@@ -66,9 +67,15 @@ _AUTH_FAILURE_RESPONSES: dict[AuthFailure, tuple[int, str]] = {
     AuthFailure.LEGACY_TENANT: (401, "Legacy bearer auth is not accepted on this endpoint"),
     AuthFailure.NOT_ALLOWLISTED: (
         403,
-        "Your tenant is authenticated but not allowlisted for this benchmark; ask Vals to allowlist your tenant",
+        "Your tenant is authenticated but not allowlisted for this service; contact the service operator to request access",
     ),
 }
+
+
+def _failure_response(result: AuthResult) -> tuple[int, str]:
+    if result.failure is None:
+        return (401, "Unauthorized")
+    return _AUTH_FAILURE_RESPONSES.get(result.failure, (401, "Unauthorized"))
 
 
 async def send_json_if_connected(websocket: WebSocket, payload: dict[str, Any]) -> bool:
@@ -184,7 +191,7 @@ class BenchmarkServiceApp(FastAPI):
                 return await call_next(request)  # type: ignore[reportUnknownVariableType]
             result = await self.service.resolve_tenant(dict(request.headers))
             if not result.ok:
-                status, detail = _AUTH_FAILURE_RESPONSES.get(result.failure, (401, "Unauthorized")) if result.failure else (401, "Unauthorized")  # type: ignore[arg-type]
+                status, detail = _failure_response(result)
                 return JSONResponse(status_code=status, content={"detail": detail})
             request.state.tenant = result.tenant
             if _is_trial_tenant(result.tenant) and not _trial_tenant_may_access_path(request.url.path):
@@ -246,7 +253,7 @@ class BenchmarkServiceApp(FastAPI):
         """Authenticate a WebSocket caller. Returns tenant id, or None after closing 1008."""
         result = await self.service.resolve_tenant(dict(websocket.headers))
         if not result.ok:
-            _status, detail = _AUTH_FAILURE_RESPONSES.get(result.failure, (401, "Unauthorized")) if result.failure else (401, "Unauthorized")  # type: ignore[arg-type]
+            _status, detail = _failure_response(result)
             await websocket.close(code=1008, reason=detail)
             return None
         if _is_trial_tenant(result.tenant):

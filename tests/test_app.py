@@ -6,7 +6,7 @@ from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
-from fastapi import WebSocket
+from fastapi import Request, WebSocket
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -158,6 +158,31 @@ def test_evaluate_response_invalid_task() -> None:
     body = response.json()
     assert body["detail"] == "Evaluation failed"
     assert body["errors"] and isinstance(body["errors"], list)
+
+
+async def test_exception_handler_withholds_errors_when_tenant_unset() -> None:
+    """Fail-closed: request.state.tenant unset must not produce errors[].
+
+    When the exception handler fires and no tenant has been resolved (e.g. on a
+    public path or before auth runs), errors[] must be withheld — the caller is
+    unknown, so internal detail must not leak.
+    """
+    from unittest.mock import MagicMock
+
+    from starlette.datastructures import State
+
+    app = BenchmarkServiceApp(StubBenchmark)
+
+    request = MagicMock(spec=Request)
+    request.state = State()  # no tenant attribute set
+
+    exc = RuntimeError("internal detail that must not leak")
+    response = await app._exception_handler(request, exc)  # type: ignore[attr-defined]
+    body = json.loads(response.body)  # type: ignore[attr-defined]
+
+    assert response.status_code == 500
+    assert body["detail"] == "Evaluation failed"
+    assert "errors" not in body
 
 
 @pytest.mark.parametrize(

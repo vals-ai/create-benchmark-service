@@ -69,13 +69,12 @@ _AUTH_FAILURE_RESPONSES: dict[AuthFailure, tuple[int, str]] = {
         403,
         "Your tenant is authenticated but not allowlisted for this service; contact the service operator to request access",
     ),
+    AuthFailure.REJECTED: (401, "Unauthorized"),
 }
 
 
 def _failure_response(result: AuthResult) -> tuple[int, str]:
-    if result.failure is None:
-        return (401, "Unauthorized")
-    return _AUTH_FAILURE_RESPONSES.get(result.failure, (401, "Unauthorized"))
+    return _AUTH_FAILURE_RESPONSES[result.failure]  # type: ignore[index]
 
 
 async def send_json_if_connected(websocket: WebSocket, payload: dict[str, Any]) -> bool:
@@ -228,10 +227,8 @@ class BenchmarkServiceApp(FastAPI):
         logger.error(f"Error: {exc}")
         logger.error(traceback.format_exc())
         content: dict[str, Any] = {"detail": "Evaluation failed"}
-        # Surface the exception message to full tenants for self-diagnosis, but NOT to
-        # trial tenants — the global handler bypasses the per-handler trial sanitization,
-        # and str(exc) can carry internal paths/detail.
-        if not _is_trial_tenant(getattr(request.state, "tenant", None)):
+        tenant = getattr(request.state, "tenant", None)
+        if tenant is not None and not _is_trial_tenant(tenant):
             content["errors"] = [str(exc)]
         return JSONResponse(status_code=500, content=content)
 

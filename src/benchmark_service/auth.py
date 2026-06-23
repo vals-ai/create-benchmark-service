@@ -33,6 +33,7 @@ class AuthFailure(Enum):
     MULTI_TENANT = "multi_tenant"
     LEGACY_TENANT = "legacy_tenant"
     NOT_ALLOWLISTED = "not_allowlisted"
+    REJECTED = "rejected"
 
 
 @dataclass(frozen=True)
@@ -42,7 +43,7 @@ class AuthResult:
 
     @property
     def ok(self) -> bool:
-        return self.tenant is not None
+        return self.failure is None
 
 
 class TenantConfig(BaseModel):
@@ -254,7 +255,7 @@ async def resolve_caller_tenant(headers: Mapping[str, str]) -> AuthResult:
     return (
         AuthResult(tenant=LEGACY_TENANT_SENTINEL)
         if _check_legacy_benchmark_api_key(headers, settings)
-        else AuthResult(failure=None)
+        else AuthResult(failure=AuthFailure.REJECTED)
     )
 
 

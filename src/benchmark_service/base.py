@@ -10,6 +10,7 @@ from collections.abc import AsyncGenerator
 from typing import Any, Self
 
 from benchmark_service.auth import (
+    AuthFailure,
     AuthResult,
     LEGACY_TENANT_SENTINEL,
     check_benchmark_service_auth,
@@ -82,7 +83,7 @@ class BenchmarkService(ABC):
         """
         if type(self).check_auth is not BenchmarkService.check_auth:
             ok = await self.check_auth(headers)
-            return AuthResult(tenant=LEGACY_TENANT_SENTINEL) if ok else AuthResult()
+            return AuthResult(tenant=LEGACY_TENANT_SENTINEL) if ok else AuthResult(failure=AuthFailure.REJECTED)
         return await resolve_caller_tenant(headers)
 
     async def check_dataset_access(self, tenant: str, dataset: str | None) -> bool:

@@ -193,13 +193,16 @@ class BenchmarkServiceApp(FastAPI):
     async def _value_error_handler(self, _request: Request, exc: Exception) -> Response:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-    async def _exception_handler(self, _request: Request, exc: Exception) -> Response:
+    async def _exception_handler(self, request: Request, exc: Exception) -> Response:
         logger.error(f"Error: {exc}")
         logger.error(traceback.format_exc())
-        return JSONResponse(
-            status_code=500,
-            content={"detail": "Evaluation failed", "errors": [str(exc)]},
-        )
+        content: dict[str, Any] = {"detail": "Evaluation failed"}
+        # Surface the exception message to full tenants for self-diagnosis, but NOT to
+        # trial tenants — the global handler bypasses the per-handler trial sanitization,
+        # and str(exc) can carry internal paths/detail.
+        if not _is_trial_tenant(getattr(request.state, "tenant", None)):
+            content["errors"] = [str(exc)]
+        return JSONResponse(status_code=500, content=content)
 
     async def _health_check(self) -> HealthCheckResponse:
         return HealthCheckResponse(status="ok")

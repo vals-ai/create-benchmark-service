@@ -279,8 +279,9 @@ def test_internal_error_does_not_leak_traceback(trial_client: TestClient) -> Non
         )
     assert resp.status_code == 500
     body = resp.json()
-    assert body["detail"] == "Evaluation failed"
-    assert body["errors"] and isinstance(body["errors"], list)
+    assert body == {"detail": "Evaluation failed"}
+    assert "errors" not in body
+    assert "rubric.py" not in resp.text
     assert "Traceback" not in resp.text
 
 

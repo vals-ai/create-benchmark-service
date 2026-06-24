@@ -7,7 +7,7 @@ from collections.abc import AsyncGenerator
 from benchmark_service.sandbox.types import ComposeSource, ExecResult, Sandbox, SandboxError
 
 
-class HarborComposeSandbox(Sandbox):
+class ComposeSandbox(Sandbox):
     def __init__(self, outer: Sandbox, source: ComposeSource) -> None:
         self._outer = outer
         self._service = source.service

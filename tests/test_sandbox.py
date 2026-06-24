@@ -18,8 +18,8 @@ from yarl import URL
 
 from benchmark_service.sandbox import (
     ComposeSource,
+    ComposeSandbox,
     ExecResult,
-    HarborComposeSandbox,
     ImageSource,
     Resources,
     Sandbox,
@@ -454,7 +454,7 @@ def _request(name: str) -> SandboxCreateRequest:
     )
 
 
-async def test_harbor_compose_sandbox_routes_operations_through_main_service() -> None:
+async def test_compose_sandbox_routes_operations_through_main_service() -> None:
     """Compose sandboxes should proxy sandbox operations through the Harbor main service.
 
     Test cases:
@@ -463,7 +463,7 @@ async def test_harbor_compose_sandbox_routes_operations_through_main_service() -
     """
     source = ComposeSource(outer=ImageSource(image="docker:28.3.3-dind"))
     outer = RecordingSandbox()
-    sandbox = HarborComposeSandbox(outer, source)
+    sandbox = ComposeSandbox(outer, source)
 
     exec_result = await sandbox.exec("pytest -q", cwd="/workspace", timeout=12)
     output = [chunk async for chunk in sandbox.command("echo ok", cwd="/workspace", timeout=12)]

@@ -5,7 +5,7 @@ from typing import Annotated, Any
 
 from pydantic import Field, TypeAdapter
 
-from benchmark_service.sandbox.compose import HarborComposeSandbox
+from benchmark_service.sandbox.compose import ComposeSandbox
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
 from benchmark_service.sandbox.types import (
@@ -37,9 +37,9 @@ def sandbox_provider_config_from_mapping(data: Mapping[str, Any]) -> SandboxProv
 
 __all__ = [
     "ComposeSource",
+    "ComposeSandbox",
     "DaytonaProviderConfig",
     "ExecResult",
-    "HarborComposeSandbox",
     "ImageSource",
     "MissingSandboxConfigError",
     "ModalProviderConfig",

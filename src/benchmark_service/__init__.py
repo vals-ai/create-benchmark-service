@@ -7,9 +7,9 @@ from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceErr
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.sandbox import (
     ComposeSource,
+    ComposeSandbox,
     DaytonaProviderConfig,
     ExecResult,
-    HarborComposeSandbox,
     ImageSource,
     ModalProviderConfig,
     Resources,
@@ -34,9 +34,9 @@ __all__ = [
     "BenchmarkServiceClient",
     "BenchmarkServiceError",
     "ComposeSource",
+    "ComposeSandbox",
     "DaytonaProviderConfig",
     "ExecResult",
-    "HarborComposeSandbox",
     "ImageSource",
     "InflightMiddleware",
     "ModalProviderConfig",

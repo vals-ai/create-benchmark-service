@@ -461,6 +461,8 @@ class DaytonaSandboxProvider(SandboxProvider):
                     network_block_all=False,
                     env_vars=request.env_vars,
                 )
+            case _:
+                raise SandboxError("ComposeSource must be unwrapped before provider.create_sandbox")
 
         try:
             inner = await self._daytona.create(params, timeout=request.create_timeout)

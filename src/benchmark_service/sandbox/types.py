@@ -17,7 +17,16 @@ class SnapshotSource(BaseModel):
     snapshot: str
 
 
-SandboxSource = Annotated[ImageSource | SnapshotSource, Field(discriminator="type")]
+BaseSandboxSource = Annotated[ImageSource | SnapshotSource, Field(discriminator="type")]
+
+
+class ComposeSource(BaseModel):
+    type: Literal["compose"] = "compose"
+    outer: BaseSandboxSource
+    service: str = "main"
+
+
+SandboxSource = Annotated[ImageSource | SnapshotSource | ComposeSource, Field(discriminator="type")]
 
 
 class Resources(BaseModel):

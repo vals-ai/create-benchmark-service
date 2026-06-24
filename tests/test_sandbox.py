@@ -1,4 +1,5 @@
 import asyncio
+from collections.abc import AsyncGenerator
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, cast
 
@@ -16,8 +17,12 @@ from multidict import CIMultiDict, CIMultiDictProxy
 from yarl import URL
 
 from benchmark_service.sandbox import (
+    ComposeSource,
+    ExecResult,
+    HarborComposeSandbox,
     ImageSource,
     Resources,
+    Sandbox,
     SandboxCreateRequest,
     SandboxError,
     SandboxNotFoundError,
@@ -276,6 +281,42 @@ class RemovedSandboxFiles(Files):
         return chunks()
 
 
+class RecordingSandbox(Sandbox):
+    def __init__(self) -> None:
+        self.exec_commands: list[str] = []
+        self.uploads: list[tuple[str, bytes]] = []
+        self.downloads: list[str] = []
+
+    @property
+    def id(self) -> str:
+        return "outer-id"
+
+    @property
+    def name(self) -> str:
+        return "outer-name"
+
+    @property
+    def state(self) -> str:
+        return "started"
+
+    async def exec(self, command: str, *, cwd: str | None = None, timeout: float | None = None) -> ExecResult:
+        self.exec_commands.append(command)
+        return ExecResult(exit_code=0, output="ok")
+
+    async def command(
+        self, command: str, *, cwd: str | None = None, timeout: float | None = None
+    ) -> AsyncGenerator[str, None]:
+        self.exec_commands.append(command)
+        yield "ok"
+
+    async def upload_file(self, remote_path: str, content: bytes) -> None:
+        self.uploads.append((remote_path, content))
+
+    async def download_file(self, remote_path: str) -> bytes:
+        self.downloads.append(remote_path)
+        return b"downloaded"
+
+
 class InnerSandbox:
     id = "sandbox-id"
     name = "sandbox-name"
@@ -411,6 +452,43 @@ def _request(name: str) -> SandboxCreateRequest:
         auto_stop_interval=600,
         create_timeout=360,
     )
+
+
+async def test_harbor_compose_sandbox_routes_operations_through_main_service() -> None:
+    """Compose sandboxes should proxy sandbox operations through the Harbor main service.
+
+    Test cases:
+    - ComposeSource stores the DinD outer source and service name.
+    - exec, command, upload, and download route through docker compose service `main`.
+    """
+    source = ComposeSource(outer=ImageSource(image="docker:28.3.3-dind"))
+    outer = RecordingSandbox()
+    sandbox = HarborComposeSandbox(outer, source)
+
+    exec_result = await sandbox.exec("pytest -q", cwd="/workspace", timeout=12)
+    output = [chunk async for chunk in sandbox.command("echo ok", cwd="/workspace", timeout=12)]
+    await sandbox.upload_file("/workspace/instruction.md", b"solve it")
+    downloaded = await sandbox.download_file("/workspace/reward.json")
+
+    assert source.service == "main"
+    assert isinstance(source.outer, ImageSource)
+    assert source.outer.image == "docker:28.3.3-dind"
+    assert exec_result.output == "ok"
+    assert output == ["ok"]
+    assert outer.exec_commands[0] == (
+        "docker compose exec -T -w /workspace main bash -lc 'pytest -q'"
+    )
+    assert outer.exec_commands[1] == (
+        "docker compose exec -T -w /workspace main bash -lc 'echo ok'"
+    )
+    upload_temp = outer.uploads[0][0]
+    download_temp = outer.downloads[0]
+    assert outer.uploads == [(upload_temp, b"solve it")]
+    assert upload_temp.startswith("/tmp/compose-upload-")
+    assert download_temp.startswith("/tmp/compose-download-")
+    assert f"docker compose cp {upload_temp} main:/workspace/instruction.md" in outer.exec_commands
+    assert f"docker compose cp main:/workspace/reward.json {download_temp}" in outer.exec_commands
+    assert downloaded == b"downloaded"
 
 
 async def test_daytona_command_applies_timeout_inside_cwd() -> None:

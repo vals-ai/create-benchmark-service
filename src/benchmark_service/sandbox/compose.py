@@ -11,6 +11,7 @@ class ComposeSandbox(Sandbox):
     def __init__(self, outer: Sandbox, source: ComposeSource) -> None:
         self._outer = outer
         self._service = source.service
+        self._compose_command_prefix = source.compose_command
 
     @property
     def id(self) -> str:
@@ -25,18 +26,21 @@ class ComposeSandbox(Sandbox):
         return self._outer.state
 
     def _compose_command(self, parts: list[str]) -> str:
-        return shlex.join(["docker", "compose", *parts])
+        return f"{self._compose_command_prefix} {shlex.join(parts)}"
 
     def _exec_command(self, command: str, cwd: str | None) -> str:
         parts = ["exec", "-T"]
         if cwd:
             parts.extend(["-w", cwd])
-        parts.extend([self._service, "bash", "-lc", command])
+        parts.extend([self._service, "sh", "-lc", command])
         return self._compose_command(parts)
+
+    def _container_lookup(self) -> str:
+        return f"container_id=$({self._compose_command(['ps', '-q', self._service])})"
 
     def _temp_path(self, prefix: str, remote_path: str) -> str:
         name = remote_path.rstrip("/").rsplit("/", 1)[-1] or "file"
-        return f"/tmp/{prefix}-{uuid.uuid4().hex}-{name}"
+        return f"/var/tmp/{prefix}-{uuid.uuid4().hex}-{name}"
 
     async def exec(
         self,
@@ -61,24 +65,35 @@ class ComposeSandbox(Sandbox):
         temp = self._temp_path("compose-upload", remote_path)
         try:
             await self._outer.upload_file(temp, content)
+            parent = remote_path.rstrip("/").rsplit("/", 1)[0] or "."
+            make_parent = shlex.quote(f"mkdir -p {shlex.quote(parent)}")
+            write_file = shlex.quote(f"cat > {shlex.quote(remote_path)}")
             result = await self._outer.exec(
-                self._compose_command(["cp", temp, f"{self._service}:{remote_path}"]),
+                (
+                    f"{self._container_lookup()}; "
+                    f"docker exec \"$container_id\" sh -lc {make_parent}; "
+                    f"cat {shlex.quote(temp)} | docker exec -i \"$container_id\" sh -lc {write_file}"
+                ),
                 timeout=60,
             )
             if result.exit_code != 0:
-                raise SandboxError(f"docker compose cp failed: {result.output}")
+                raise SandboxError(f"compose upload failed: {result.output}")
         finally:
             await self._outer.exec(shlex.join(["rm", "-f", temp]), timeout=10)
 
     async def download_file(self, remote_path: str) -> bytes:
         temp = self._temp_path("compose-download", remote_path)
         try:
+            read_file = shlex.quote(f"cat {shlex.quote(remote_path)}")
             result = await self._outer.exec(
-                self._compose_command(["cp", f"{self._service}:{remote_path}", temp]),
+                (
+                    f"{self._container_lookup()}; "
+                    f"docker exec \"$container_id\" sh -lc {read_file} > {shlex.quote(temp)}"
+                ),
                 timeout=60,
             )
             if result.exit_code != 0:
-                raise SandboxError(f"docker compose cp failed: {result.output}")
+                raise SandboxError(f"compose download failed: {result.output}")
             return await self._outer.download_file(temp)
         finally:
             await self._outer.exec(shlex.join(["rm", "-f", temp]), timeout=10)

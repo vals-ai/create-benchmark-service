@@ -24,6 +24,7 @@ class ComposeSource(BaseModel):
     type: Literal["compose"] = "compose"
     outer: BaseSandboxSource
     service: str = "main"
+    compose_command: str = "docker compose"
 
 
 SandboxSource = Annotated[ImageSource | SnapshotSource | ComposeSource, Field(discriminator="type")]

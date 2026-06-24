@@ -461,7 +461,10 @@ async def test_compose_sandbox_routes_operations_through_main_service() -> None:
     - ComposeSource stores the DinD outer source and service name.
     - exec, command, upload, and download route through docker compose service `main`.
     """
-    source = ComposeSource(outer=ImageSource(image="docker:28.3.3-dind"))
+    source = ComposeSource(
+        outer=ImageSource(image="docker:28.3.3-dind"),
+        compose_command="MAIN_IMAGE_NAME=task docker compose -p task -f /harbor/compose.yaml",
+    )
     outer = RecordingSandbox()
     sandbox = ComposeSandbox(outer, source)
 
@@ -476,18 +479,27 @@ async def test_compose_sandbox_routes_operations_through_main_service() -> None:
     assert exec_result.output == "ok"
     assert output == ["ok"]
     assert outer.exec_commands[0] == (
-        "docker compose exec -T -w /workspace main bash -lc 'pytest -q'"
+        "MAIN_IMAGE_NAME=task docker compose -p task -f /harbor/compose.yaml "
+        "exec -T -w /workspace main sh -lc 'pytest -q'"
     )
     assert outer.exec_commands[1] == (
-        "docker compose exec -T -w /workspace main bash -lc 'echo ok'"
+        "MAIN_IMAGE_NAME=task docker compose -p task -f /harbor/compose.yaml "
+        "exec -T -w /workspace main sh -lc 'echo ok'"
     )
     upload_temp = outer.uploads[0][0]
     download_temp = outer.downloads[0]
     assert outer.uploads == [(upload_temp, b"solve it")]
-    assert upload_temp.startswith("/tmp/compose-upload-")
-    assert download_temp.startswith("/tmp/compose-download-")
-    assert f"docker compose cp {upload_temp} main:/workspace/instruction.md" in outer.exec_commands
-    assert f"docker compose cp main:/workspace/reward.json {download_temp}" in outer.exec_commands
+    assert upload_temp.startswith("/var/tmp/compose-upload-")
+    assert download_temp.startswith("/var/tmp/compose-download-")
+    assert (
+        "container_id=$(MAIN_IMAGE_NAME=task docker compose -p task -f /harbor/compose.yaml ps -q main); "
+        "docker exec \"$container_id\" sh -lc 'mkdir -p /workspace'; "
+        f"cat {upload_temp} | docker exec -i \"$container_id\" sh -lc 'cat > /workspace/instruction.md'"
+    ) in outer.exec_commands
+    assert (
+        "container_id=$(MAIN_IMAGE_NAME=task docker compose -p task -f /harbor/compose.yaml ps -q main); "
+        f"docker exec \"$container_id\" sh -lc 'cat /workspace/reward.json' > {download_temp}"
+    ) in outer.exec_commands
     assert downloaded == b"downloaded"
 
 

@@ -24,6 +24,8 @@ from benchmark_service.sandbox.types import (
     SandboxNotFoundError,
     SandboxProvider,
     SandboxQuery,
+    SandboxSource,
+    SnapshotSource,
 )
 
 _APP_NAME = "benchmark-service"
@@ -167,12 +169,21 @@ class ModalSandboxProvider(SandboxProvider):
                 raise _sandbox_error(exc) from exc
         return self._client, self._app
 
+    def _resolve_image(self, source: SandboxSource, client: Client) -> Image:
+        # An ImageSource pulls a registry image; a SnapshotSource restores a
+        # Modal filesystem snapshot (created via Sandbox.snapshot_filesystem),
+        # whose id is the snapshot Image's object_id. This mirrors the Daytona
+        # adapter, which also accepts both an image and a prebuilt snapshot.
+        match source:
+            case ImageSource(image=image):
+                return Image.from_registry(image)  # pyright: ignore[reportUnknownMemberType]
+            case SnapshotSource(snapshot=snapshot):
+                return Image.from_id(snapshot, client=client)
+
     @_PROVIDER_RETRY
     async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
-        if not isinstance(request.source, ImageSource):
-            raise SandboxError(f"Modal sandbox provider does not support source type {request.source.type!r}")
         client, app = await self._connect()
-        image = Image.from_registry(request.source.image)  # pyright: ignore[reportUnknownMemberType]
+        image = self._resolve_image(request.source, client)
         create_kwargs: dict[str, Any] = {
             "app": app,
             "name": request.name,

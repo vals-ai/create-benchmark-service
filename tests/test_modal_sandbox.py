@@ -131,7 +131,7 @@ def _provider(monkeypatch: pytest.MonkeyPatch, sdk_sandbox: Any) -> ModalSandbox
 
     monkeypatch.setattr(modal_module, "Client", SimpleNamespace(from_credentials=_aio(from_credentials)))
     monkeypatch.setattr(modal_module, "App", SimpleNamespace(lookup=_aio(lookup)))
-    monkeypatch.setattr(modal_module, "Image", SimpleNamespace(from_registry=_from_registry))
+    monkeypatch.setattr(modal_module, "Image", SimpleNamespace(from_registry=_from_registry, from_id=_from_id))
     monkeypatch.setattr(modal_module, "ModalSdkSandbox", sdk_sandbox)
     return ModalSandboxProvider(_config())
 
@@ -142,6 +142,10 @@ async def _noop(*args: Any, **kwargs: Any) -> None:
 
 def _from_registry(image: str) -> tuple[str, str]:
     return ("image", image)
+
+
+def _from_id(snapshot: str, **kwargs: Any) -> tuple[str, str]:
+    return ("snapshot", snapshot)
 
 
 def _config() -> ModalProviderConfig:
@@ -307,11 +311,20 @@ async def test_create_sandbox_retries_modal_connection_errors(monkeypatch: pytes
     assert attempts == 2
 
 
-async def test_create_sandbox_rejects_snapshot_source() -> None:
-    provider = ModalSandboxProvider(_config())
+async def test_create_sandbox_restores_snapshot_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    inner = FakeInnerSandbox()
+    captured: dict[str, Any] = {}
 
-    with pytest.raises(SandboxError, match="does not support source type 'snapshot'"):
-        await provider.create_sandbox(_request(source=SnapshotSource(snapshot="snap")))
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return inner
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    sandbox = await provider.create_sandbox(_request(source=SnapshotSource(snapshot="im-123")))
+
+    assert sandbox.id == "sb-123"
+    assert captured["image"] == ("snapshot", "im-123")
 
 
 async def test_get_sandbox_raises_not_found(monkeypatch: pytest.MonkeyPatch) -> None:

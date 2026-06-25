@@ -10,7 +10,7 @@ from modal import Sandbox as ModalSdkSandbox
 from modal.exception import ConnectionError as ModalConnectionError
 from modal.exception import Error as ModalError
 from modal.exception import NotFoundError as ModalNotFoundError
-from pydantic import AliasChoices, BaseModel, Field
+from pydantic import BaseModel
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
 from benchmark_service.sandbox.types import (
@@ -44,12 +44,9 @@ _PROVIDER_RETRY = retry(
 
 class ModalProviderConfig(BaseModel):
     type: Literal["modal"] = "modal"
-    token_id: str | None = Field(default=None, validation_alias=AliasChoices("token_id", "MODAL_TOKEN_ID"))
-    token_secret: str | None = Field(
-        default=None,
-        validation_alias=AliasChoices("token_secret", "MODAL_TOKEN_SECRET"),
-    )
-    environment: str | None = Field(default=None, validation_alias=AliasChoices("environment", "MODAL_ENVIRONMENT"))
+    MODAL_TOKEN_ID: str
+    MODAL_TOKEN_SECRET: str
+    MODAL_ENVIRONMENT: str | None = None
 
     def create_provider(self) -> SandboxProvider:
         return ModalSandboxProvider(self)
@@ -158,20 +155,11 @@ class ModalSandboxProvider(SandboxProvider):
     async def _connect(self) -> tuple[Client, App]:
         if self._client is None or self._app is None:
             try:
-                if self._config.token_id and self._config.token_secret:
-                    client = await Client.from_credentials.aio(self._config.token_id, self._config.token_secret)
-                else:
-                    # No explicit tokens in the provider config, so fall back to
-                    # Modal's ambient credentials: MODAL_TOKEN_ID / MODAL_TOKEN_SECRET
-                    # in the process environment, or ~/.modal.toml. Callers that
-                    # resolve credentials per request (e.g. the Valkyrie tracker
-                    # reading an AWS secret) pass token_id/token_secret above and
-                    # never hit this path.
-                    client = await Client.from_env.aio()  # pyright: ignore[reportUnknownMemberType]
+                client = await Client.from_credentials.aio(self._config.MODAL_TOKEN_ID, self._config.MODAL_TOKEN_SECRET)
                 self._app = await App.lookup.aio(
                     _APP_NAME,
                     client=client,
-                    environment_name=self._config.environment,
+                    environment_name=self._config.MODAL_ENVIRONMENT,
                     create_if_missing=True,
                 )
                 self._client = client

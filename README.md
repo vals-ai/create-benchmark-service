@@ -124,15 +124,13 @@ Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` 
 {"type": "daytona", "api_key": "...", "api_url": "...", "target": "..."}
 ```
 
-or, with explicit credentials:
+or:
 
 ```json
-{"type": "modal", "token_id": "...", "token_secret": "...", "environment": "..."}
+{"type": "modal", "MODAL_TOKEN_ID": "...", "MODAL_TOKEN_SECRET": "...", "MODAL_ENVIRONMENT": "..."}
 ```
 
-Modal credentials are resolved per request, exactly like Daytona's `api_key`: the caller carries them in the `sandbox_provider` config so the process that creates and talks to the sandbox (the Valkyrie tracker, not the hosted benchmark service) has them. The tracker resolves this config from AWS Secrets Manager via `sandbox_provider_secret_name`, so the Modal secret holds `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`, and optional `MODAL_ENVIRONMENT` (the config accepts those keys as aliases for `token_id` / `token_secret` / `environment`).
-
-If `token_id` / `token_secret` are omitted, the provider falls back to Modal's ambient credentials (`MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET` in the environment, or `~/.modal.toml`) — useful for local runs or a standalone deployment that is already Modal-authenticated, but not the tracker path. Only set `environment` when that Modal environment exists; otherwise Modal uses the active/default environment for the token profile.
+Modal credentials are required and resolved per request, exactly like Daytona's `DAYTONA_API_KEY`: the caller carries them in the `sandbox_provider` config so the process that creates and talks to the sandbox (the Valkyrie tracker) has them. The tracker resolves this config from AWS Secrets Manager via `sandbox_provider_secret_name`, so the Modal secret holds `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`, and optional `MODAL_ENVIRONMENT`. Only set `MODAL_ENVIRONMENT` when that Modal environment exists; otherwise Modal uses the active/default environment for the token profile.
 
 Provider compatibility notes:
 
@@ -225,7 +223,7 @@ Pydantic models used across requests and responses:
 
 - **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `Resources`
 - **`SandboxSource`** — `ImageSource(type="image", image=...)` or `SnapshotSource(type="snapshot", snapshot=...)`
-- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; currently `DaytonaProviderConfig(type="daytona", api_key, api_url, target)` or `ModalProviderConfig(type="modal", token_id?, token_secret?, environment?)`
+- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; currently `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET)` or `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET, MODAL_ENVIRONMENT?)`
 - **`Resources`** — `vcpu`, `memory`, `disk`, `enable_docker` (default `false`; requests provider-level nested Docker support while benchmark code owns dockerd/image/runtime setup)
 - **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, optional `sandbox_provider` with Daytona header fallback, `dataset`
 - **`EvaluateResponseRequest`** — `task_id`, `response` or `eval_resume_state`, optional `sandbox_provider`, `dataset`

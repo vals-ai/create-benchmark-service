@@ -122,18 +122,18 @@ def _provider(monkeypatch: pytest.MonkeyPatch, sdk_sandbox: Any) -> ModalSandbox
     client = SimpleNamespace(_close=_aio(_noop))
     app = SimpleNamespace(app_id="ap-1")
 
-    async def from_env() -> Any:
+    async def from_credentials(token_id: str, token_secret: str) -> Any:
         return client
 
     async def lookup(name: str, **kwargs: Any) -> Any:
         assert kwargs["create_if_missing"] is True
         return app
 
-    monkeypatch.setattr(modal_module, "Client", SimpleNamespace(from_env=_aio(from_env)))
+    monkeypatch.setattr(modal_module, "Client", SimpleNamespace(from_credentials=_aio(from_credentials)))
     monkeypatch.setattr(modal_module, "App", SimpleNamespace(lookup=_aio(lookup)))
     monkeypatch.setattr(modal_module, "Image", SimpleNamespace(from_registry=_from_registry))
     monkeypatch.setattr(modal_module, "ModalSdkSandbox", sdk_sandbox)
-    return ModalSandboxProvider(ModalProviderConfig())
+    return ModalSandboxProvider(_config())
 
 
 async def _noop(*args: Any, **kwargs: Any) -> None:
@@ -142,6 +142,10 @@ async def _noop(*args: Any, **kwargs: Any) -> None:
 
 def _from_registry(image: str) -> tuple[str, str]:
     return ("image", image)
+
+
+def _config() -> ModalProviderConfig:
+    return ModalProviderConfig(MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret")
 
 
 def _sandbox(inner: FakeInnerSandbox, name: str | None = None) -> ModalSandbox:
@@ -157,7 +161,7 @@ def test_modal_config_reads_secrets_manager_shape() -> None:
             "MODAL_ENVIRONMENT": "dev",
         }
     )
-    assert config == ModalProviderConfig(token_id="id", token_secret="secret", environment="dev")
+    assert config == ModalProviderConfig(MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret", MODAL_ENVIRONMENT="dev")
 
 
 def test_command_merges_stderr_and_applies_timeout_inside_cwd() -> None:
@@ -304,7 +308,7 @@ async def test_create_sandbox_retries_modal_connection_errors(monkeypatch: pytes
 
 
 async def test_create_sandbox_rejects_snapshot_source() -> None:
-    provider = ModalSandboxProvider(ModalProviderConfig())
+    provider = ModalSandboxProvider(_config())
 
     with pytest.raises(SandboxError, match="does not support source type 'snapshot'"):
         await provider.create_sandbox(_request(source=SnapshotSource(snapshot="snap")))

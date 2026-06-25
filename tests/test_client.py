@@ -323,7 +323,7 @@ def test_get_sandbox_provider_uses_each_provider_config() -> None:
     client = _make_client()
     daytona_provider = client.get_sandbox_provider(DAYTONA_CONFIG)
     same_daytona_provider = client.get_sandbox_provider(DAYTONA_CONFIG)
-    modal_provider = client.get_sandbox_provider(ModalProviderConfig())
+    modal_provider = client.get_sandbox_provider(ModalProviderConfig(MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret"))
 
     assert same_daytona_provider is daytona_provider
     assert modal_provider is not daytona_provider

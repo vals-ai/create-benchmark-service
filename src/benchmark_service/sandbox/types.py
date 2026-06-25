@@ -28,11 +28,9 @@ class Resources(BaseModel):
         default=False,
         description=(
             "Request a sandbox that permits nested Docker (Docker-in-Docker). "
-            "Providers that support it opt the sandbox in to running a Docker "
-            "daemon (Modal maps this to experimental_options={'enable_docker': True}); "
-            "providers without nested-Docker support ignore it. The provider only "
-            "grants the capability -- starting dockerd and running containers is the "
-            "benchmark service's responsibility, not the sandbox layer's."
+            "The provider grants the capability; starting dockerd and running "
+            "containers is the benchmark service's job. Providers without "
+            "nested-Docker support ignore it."
         ),
     )
 

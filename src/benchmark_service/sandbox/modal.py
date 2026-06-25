@@ -161,8 +161,12 @@ class ModalSandboxProvider(SandboxProvider):
                 if self._config.token_id and self._config.token_secret:
                     client = await Client.from_credentials.aio(self._config.token_id, self._config.token_secret)
                 else:
-                    # Modal credentials come from the service deployment env
-                    # (MODAL_TOKEN_ID / MODAL_TOKEN_SECRET), owned by the registry.
+                    # No explicit tokens in the provider config, so fall back to
+                    # Modal's ambient credentials: MODAL_TOKEN_ID / MODAL_TOKEN_SECRET
+                    # in the process environment, or ~/.modal.toml. Callers that
+                    # resolve credentials per request (e.g. the Valkyrie tracker
+                    # reading an AWS secret) pass token_id/token_secret above and
+                    # never hit this path.
                     client = await Client.from_env.aio()  # pyright: ignore[reportUnknownMemberType]
                 self._app = await App.lookup.aio(
                     _APP_NAME,

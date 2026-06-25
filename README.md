@@ -124,13 +124,15 @@ Sandbox setup and live sandbox evaluation require request-scoped `sandbox_provid
 {"type": "daytona", "api_key": "...", "api_url": "...", "target": "..."}
 ```
 
-or:
+or, with explicit credentials:
 
 ```json
-{"type": "modal"}
+{"type": "modal", "token_id": "...", "token_secret": "...", "environment": "..."}
 ```
 
-Hosted benchmark services should normally let the service deployment own `MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET`, so the registry/deployment environment controls Modal credentials instead of each Valkyrie request carrying them. If Valkyrie resolves provider config from AWS Secrets Manager, the Modal secret shape can use `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`, and optional `MODAL_ENVIRONMENT`. Only set `environment` when that Modal environment exists; otherwise Modal uses the active/default environment for the token profile.
+Modal credentials are resolved per request, exactly like Daytona's `api_key`: the caller carries them in the `sandbox_provider` config so the process that creates and talks to the sandbox (the Valkyrie tracker, not the hosted benchmark service) has them. The tracker resolves this config from AWS Secrets Manager via `sandbox_provider_secret_name`, so the Modal secret holds `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`, and optional `MODAL_ENVIRONMENT` (the config accepts those keys as aliases for `token_id` / `token_secret` / `environment`).
+
+If `token_id` / `token_secret` are omitted, the provider falls back to Modal's ambient credentials (`MODAL_TOKEN_ID` / `MODAL_TOKEN_SECRET` in the environment, or `~/.modal.toml`) — useful for local runs or a standalone deployment that is already Modal-authenticated, but not the tracker path. Only set `environment` when that Modal environment exists; otherwise Modal uses the active/default environment for the token profile.
 
 Provider compatibility notes:
 

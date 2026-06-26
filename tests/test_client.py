@@ -6,15 +6,14 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-import benchmark_service.sandbox as sandbox_module
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
-from benchmark_service.sandbox import sandbox_config_from_headers
-from benchmark_service.sandbox.types import DaytonaBackendConfig
+from benchmark_service.sandbox.daytona import DaytonaProviderConfig
+from benchmark_service.sandbox.modal import ModalProviderConfig
 from benchmark_service.v1_schemas import V1DatasetTasksResponse
 
 BASE_URL = "http://localhost:8000"
 HEADERS = {"Authorization": "Bearer token"}
-DAYTONA_HEADERS = {"x-api-key": "key", "x-api-url": "url", "x-target": "target"}
+DAYTONA_CONFIG = DaytonaProviderConfig(DAYTONA_API_KEY="key", DAYTONA_API_URL="url", DAYTONA_TARGET="target")
 
 
 def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "error") -> MagicMock:
@@ -23,23 +22,6 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
     resp.json.return_value = json_data
     resp.text = text
     return resp
-
-
-def test_sandbox_config_from_headers(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sandbox_module, "_PROVIDER", "daytona")
-
-    assert sandbox_config_from_headers(DAYTONA_HEADERS) == DaytonaBackendConfig(
-        api_key="key",
-        api_url="url",
-        target="target",
-    )
-
-
-def test_sandbox_config_rejects_unknown_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(sandbox_module, "_PROVIDER", "modal")
-
-    with pytest.raises(ValueError, match="Unknown sandbox provider: modal"):
-        sandbox_config_from_headers({})
 
 
 @pytest.mark.parametrize(
@@ -281,20 +263,50 @@ async def test_resume_evaluation_with_eval_resume_state(
     on_eval_resume_state.assert_called_once_with(state)
 
 
-async def test_websocket_request_includes_null_optional_fields() -> None:
-    messages = [json.dumps({"type": "result", "data": {"status": "ok"}})]
-    mock_connect = _ws_mock(messages)
+async def test_websocket_request_includes_provider_config() -> None:
+    """Client websocket helpers should include provider config selected by callers.
 
+    Test cases:
+    - setup_task serializes Daytona provider config.
+    - evaluate_instance serializes the same provider config.
+    """
+    sandbox_provider = DAYTONA_CONFIG
+    for method in ("setup_task", "evaluate_instance"):
+        messages = [json.dumps({"type": "result", "data": {"status": "ok"}})]
+        mock_connect = _ws_mock(messages)
+
+        client = _make_client()
+        with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+            await getattr(client, method)("task-1", "inst-1", sandbox_provider)
+
+        ws = mock_connect.__aenter__.return_value
+        assert json.loads(ws.send.call_args.args[0]) == {
+            "task_id": "task-1",
+            "instance_id": "inst-1",
+            "sandbox_provider": {
+                "type": "daytona",
+                "DAYTONA_API_KEY": "key",
+                "DAYTONA_API_URL": "url",
+                "DAYTONA_TARGET": "target",
+            },
+            "dataset": None,
+        }
+
+
+def test_get_sandbox_provider_uses_each_provider_config() -> None:
+    """Provider lookup should not reuse a stale provider for a different config.
+
+    Test cases:
+    - Repeated calls with the same config reuse the cached provider.
+    - A later call with a different provider config creates a separate provider.
+    """
     client = _make_client()
-    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
-        await client.setup_task("task-1", "inst-1")
+    daytona_provider = client.get_sandbox_provider(DAYTONA_CONFIG)
+    same_daytona_provider = client.get_sandbox_provider(DAYTONA_CONFIG)
+    modal_provider = client.get_sandbox_provider(ModalProviderConfig())
 
-    ws = mock_connect.__aenter__.return_value
-    assert json.loads(ws.send.call_args.args[0]) == {
-        "task_id": "task-1",
-        "instance_id": "inst-1",
-        "dataset": None,
-    }
+    assert same_daytona_provider is daytona_provider
+    assert modal_provider is not daytona_provider
 
 
 async def test_verify_task_ids_no_dataset_omitted(
@@ -344,8 +356,11 @@ def _make_client(url: str = BASE_URL) -> BenchmarkServiceClient:
 @pytest.mark.parametrize(
     ("method", "args"),
     [
-        ("setup_task", ["task-1", "inst-1"]),
-        ("evaluate_instance", ["task-1", "inst-1"]),
+        ("setup_task", ["task-1", "inst-1", DAYTONA_CONFIG]),
+        (
+            "evaluate_instance",
+            ["task-1", "inst-1", DAYTONA_CONFIG],
+        ),
     ],
     ids=["setup_task", "evaluate_instance"],
 )
@@ -367,8 +382,11 @@ async def test_ws_result_chunk(method: str, args: list[str]) -> None:
 @pytest.mark.parametrize(
     ("method", "args"),
     [
-        ("setup_task", ["task-1", "inst-1"]),
-        ("evaluate_instance", ["task-1", "inst-1"]),
+        ("setup_task", ["task-1", "inst-1", DAYTONA_CONFIG]),
+        (
+            "evaluate_instance",
+            ["task-1", "inst-1", DAYTONA_CONFIG],
+        ),
     ],
     ids=["setup_task", "evaluate_instance"],
 )
@@ -385,8 +403,11 @@ async def test_ws_error_chunk(method: str, args: list[str]) -> None:
 @pytest.mark.parametrize(
     ("method", "args"),
     [
-        ("setup_task", ["task-1", "inst-1"]),
-        ("evaluate_instance", ["task-1", "inst-1"]),
+        ("setup_task", ["task-1", "inst-1", DAYTONA_CONFIG]),
+        (
+            "evaluate_instance",
+            ["task-1", "inst-1", DAYTONA_CONFIG],
+        ),
     ],
     ids=["setup_task", "evaluate_instance"],
 )
@@ -412,8 +433,11 @@ async def test_ws_message_chunks_with_callback(method: str, args: list[str]) -> 
 @pytest.mark.parametrize(
     ("method", "args"),
     [
-        ("setup_task", ["task-1", "inst-1"]),
-        ("evaluate_instance", ["task-1", "inst-1"]),
+        ("setup_task", ["task-1", "inst-1", DAYTONA_CONFIG]),
+        (
+            "evaluate_instance",
+            ["task-1", "inst-1", DAYTONA_CONFIG],
+        ),
     ],
     ids=["setup_task", "evaluate_instance"],
 )
@@ -438,8 +462,11 @@ async def test_ws_message_chunks_without_callback(method: str, args: list[str]) 
 @pytest.mark.parametrize(
     ("method", "args"),
     [
-        ("setup_task", ["task-1", "inst-1"]),
-        ("evaluate_instance", ["task-1", "inst-1"]),
+        ("setup_task", ["task-1", "inst-1", DAYTONA_CONFIG]),
+        (
+            "evaluate_instance",
+            ["task-1", "inst-1", DAYTONA_CONFIG],
+        ),
     ],
     ids=["setup_task", "evaluate_instance"],
 )

@@ -3,6 +3,11 @@
 A dataset_versions.yaml next to the dataset files maps each dataset name to a
 human-assigned semver and a sha256 of its content file. Version semantics:
 major = scores not comparable, minor = additive, patch = non-scoring fixes.
+
+Verification reads the declared files from disk, so this applies only to
+datasets that exist as repo-local files. A service that loads its data from an
+external source (a database, or a platform fetch) leaves dataset_versions_file
+unset and reports no dataset version through this path.
 """
 
 import hashlib

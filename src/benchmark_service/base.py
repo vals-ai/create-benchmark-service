@@ -16,7 +16,7 @@ from benchmark_service.auth import (
     load_allowlist,
     resolve_caller_tenant,
 )
-from benchmark_service.dataset_versioning import DatasetVersionEntry, load_verified_dataset_versions
+from benchmark_service.dataset_versioning import DatasetVersionEntry, load_dataset_versions
 from benchmark_service.sandbox import Sandbox
 from benchmark_service.schemas import (
     EvaluateResponseRequest,
@@ -38,8 +38,8 @@ class BenchmarkService(ABC):
 
     datasets: dict[str, dict[str, Any]]
 
-    # When set, dataset versions are loaded and content-verified at startup and
-    # served by get_dataset_version(); a checksum mismatch aborts startup.
+    # When set, the declared dataset versions are loaded at startup and served
+    # by get_dataset_version(). Version label only — content is not verified.
     dataset_versions_file: ClassVar[Path | None] = None
     dataset_versions: dict[str, DatasetVersionEntry]
 
@@ -48,7 +48,7 @@ class BenchmarkService(ABC):
         """Factory method to create and initialize a benchmark service."""
         instance = cls.__new__(cls)
         instance.dataset_versions = (
-            load_verified_dataset_versions(cls.dataset_versions_file)
+            load_dataset_versions(cls.dataset_versions_file)
             if cls.dataset_versions_file is not None
             else {}
         )

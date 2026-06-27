@@ -41,3 +41,31 @@ If the CLI was installed from a non-tagged commit, scaffolds fall back to `@main
 ```bash
 uv tool install git+https://github.com/vals-ai/create-benchmark-service.git@vX.Y.Z
 ```
+
+### Dataset versioning
+
+Separate from the framework version above, a service can declare a **version per dataset** — a human semver labelling the dataset's content. It is served by `get_dataset_version(name)` (on `GET /version?dataset=` and the dataset task-list response) and stamped into generated lab manifests. It is a **label only**: it records the declared version and does not read or verify dataset content (a content-integrity guard is a planned follow-up).
+
+To adopt it:
+
+1. Add a `dataset_versions.yaml` mapping each dataset name (the API name a caller passes as `dataset`) to a version. Versions are per dataset, so splits can differ:
+
+   ```yaml
+   validation:
+     version: 1.0.1
+   default:
+     version: 1.0.0
+   ```
+
+2. Point your service at it:
+
+   ```python
+   class MyBenchmark(BenchmarkService):
+       dataset_versions_file: ClassVar[Path] = Path(__file__).parent / "dataset_versions.yaml"
+   ```
+
+That is the whole adoption — no checksum or stamping step. At startup the declared versions load and the base `get_dataset_version()` serves them (you do not need to override it). Leave `dataset_versions_file` unset (the default) to report no dataset version.
+
+Semver semantics match the framework: **major** = scores not comparable, **minor** = additive/comparable, **patch** = non-scoring fixes.
+
+The version source is the YAML, independent of how `load_datasets()` obtains the data — so this works whether the dataset is a repo-local file or fetched from an external source; declare the label either way.

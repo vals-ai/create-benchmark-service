@@ -64,7 +64,7 @@ To adopt it:
        dataset_versions_file: ClassVar[Path] = Path(__file__).parent / "dataset_versions.yaml"
    ```
 
-That is the whole adoption — no checksum or stamping step. At startup the declared versions load and the base `get_dataset_version()` serves them (you do not need to override it). Leave `dataset_versions_file` unset (the default) to report no dataset version.
+At startup the declared versions load and the base `get_dataset_version()` serves them (you do not need to override it). Leave `dataset_versions_file` unset (the default) to report no dataset version.
 
 Semver semantics match the framework: **major** = scores not comparable, **minor** = additive/comparable, **patch** = non-scoring fixes.
 

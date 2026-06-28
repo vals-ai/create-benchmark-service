@@ -327,6 +327,18 @@ class RefreshToErrorSandbox(InnerSandbox):
         self.state = SandboxState.ERROR
 
 
+class BareHtml502RefreshSandbox(InnerSandbox):
+    def __init__(self) -> None:
+        super().__init__()
+        self.refresh_attempts = 0
+
+    async def refresh_data(self) -> None:
+        self.refresh_attempts += 1
+        if self.refresh_attempts == 1:
+            raise DaytonaError("Failed to refresh sandbox data: <html><h1>502 Bad Gateway</h1></html>")
+        await super().refresh_data()
+
+
 class DaytonaClient:
     def __init__(self, sandbox: InnerSandbox) -> None:
         self.sandbox = sandbox
@@ -671,6 +683,16 @@ async def test_daytona_provider_delete_retries_state_conflicts() -> None:
     await _provider(daytona).delete_sandbox(inner.name)
 
     assert inner.autostop_attempts == 2
+    assert daytona.deleted is True
+
+
+async def test_daytona_provider_delete_retries_bare_html_502_refresh_errors() -> None:
+    inner = BareHtml502RefreshSandbox()
+    daytona = DaytonaClient(inner)
+
+    await _provider(daytona).delete_sandbox(inner.name)
+
+    assert inner.refresh_attempts == 2
     assert daytona.deleted is True
 
 

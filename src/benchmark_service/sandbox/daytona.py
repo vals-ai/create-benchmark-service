@@ -65,6 +65,7 @@ _TRANSPORT_ERROR_MESSAGES = (
     " is used by transport ",
     "[errno 32] broken pipe",
     "[errno 9] bad file descriptor",
+    "502 bad gateway",
     "server disconnected",
 )
 _RETRYABLE_DAYTONA_CAUSES = (ClientConnectionError, ConnectionError, TimeoutError)

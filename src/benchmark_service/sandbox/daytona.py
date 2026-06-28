@@ -7,7 +7,7 @@ from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import suppress
 from typing import Any, Literal
 
-from aiohttp import ClientResponseError
+from aiohttp import ClientConnectionError, ClientResponseError
 from daytona import (
     AsyncDaytona,
     AsyncSandbox,
@@ -59,6 +59,16 @@ _KNOWN_THROTTLERS = ("sandbox-create", "sandbox-lifecycle", "authenticated", "an
 _DELETE_CONFLICT_MESSAGES = ("state change in progress", "modified by another operation")
 _REMOVED_SANDBOX_CLIENT_STATUSES = (404, 502)
 _FAILED_EXECUTE_COMMAND_PREFIX = "failed to execute command:"
+# Daytona sometimes flattens a transport failure into a bare DaytonaError message with no chained
+# cause; these substrings recover those cases by text when no typed cause survives to match.
+_TRANSPORT_ERROR_MESSAGES = (
+    " is used by transport ",
+    "[errno 32] broken pipe",
+    "[errno 9] bad file descriptor",
+    "502 bad gateway",
+    "server disconnected",
+)
+_RETRYABLE_DAYTONA_CAUSES = (ClientConnectionError, ConnectionError, TimeoutError)
 _FIXED_PROVIDER_WAIT = wait_fixed(2)
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
 
@@ -115,9 +125,13 @@ def _rate_limit_error(exc: BaseException) -> DaytonaRateLimitError | None:
     return None
 
 
-def _is_delete_conflict(exc: DaytonaConflictError) -> bool:
+def _message_contains(exc: BaseException, messages: tuple[str, ...]) -> bool:
     error = str(exc).lower()
-    return any(message in error for message in _DELETE_CONFLICT_MESSAGES)
+    return any(message in error for message in messages)
+
+
+def _is_delete_conflict(exc: DaytonaConflictError) -> bool:
+    return _message_contains(exc, _DELETE_CONFLICT_MESSAGES)
 
 
 def _is_not_found_error(exc: DaytonaError | ClientResponseError) -> bool:
@@ -132,6 +146,23 @@ def _is_not_found_error(exc: DaytonaError | ClientResponseError) -> bool:
 
 def _is_failed_execute_command_error(exc: DaytonaError | ClientResponseError) -> bool:
     return isinstance(exc, DaytonaError) and str(exc).strip().lower() == _FAILED_EXECUTE_COMMAND_PREFIX
+
+
+def _has_retryable_cause(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    cause = exc.__cause__ or exc.__context__
+    while cause is not None and id(cause) not in seen:
+        if isinstance(cause, _RETRYABLE_DAYTONA_CAUSES):
+            return True
+        seen.add(id(cause))
+        cause = cause.__cause__ or cause.__context__
+    return False
+
+
+def _is_transient_daytona_error(exc: DaytonaError | ClientResponseError) -> bool:
+    if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS) or _has_retryable_cause(exc):
+        return True
+    return _message_contains(exc, _TRANSPORT_ERROR_MESSAGES)
 
 
 def _parse_retry_after_seconds(value: object) -> float | None:
@@ -207,7 +238,7 @@ class DaytonaSandbox(Sandbox):
     def _sandbox_error(self, exc: DaytonaError | ClientResponseError) -> SandboxError:
         if _is_not_found_error(exc):
             return self._removed_error()
-        if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS) or _is_failed_execute_command_error(exc):
+        if _is_transient_daytona_error(exc) or _is_failed_execute_command_error(exc):
             return SandboxConnectionError(f"Sandbox connection error for {self._sandbox_ref}: {exc}")
         return SandboxError(f"Sandbox operation failed for {self._sandbox_ref}: {exc}")
 
@@ -390,7 +421,7 @@ class DaytonaSandboxProvider(SandboxProvider):
     def _sandbox_error(self, exc: DaytonaError) -> SandboxError:
         if _is_not_found_error(exc):
             return SandboxNotFoundError(f"Sandbox not found: {exc}")
-        if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS):
+        if _is_transient_daytona_error(exc):
             return SandboxConnectionError(f"Daytona sandbox provider connection error: {exc}")
         return SandboxError(f"Daytona sandbox provider error: {exc}")
 

@@ -3,7 +3,7 @@ from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, cast
 
 import pytest
-from aiohttp import ClientResponseError, RequestInfo
+from aiohttp import ClientConnectionError, ClientResponseError, RequestInfo
 from daytona import SandboxState
 from daytona.common.errors import (
     DaytonaConflictError,
@@ -81,6 +81,43 @@ class FailedExecuteCommandProcess(Process):
         self.attempts += 1
         if self.attempts == 1:
             raise DaytonaError("Failed to execute command:")
+        return await super().exec(command)
+
+
+def _daytona_error_with_cause(message: str, cause: BaseException) -> DaytonaError:
+    try:
+        raise DaytonaError(message) from cause
+    except DaytonaError as exc:
+        return exc
+
+
+class WrappedConnectionErrorProcess(Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        self.attempts += 1
+        if self.attempts == 1:
+            raise _daytona_error_with_cause(
+                "Failed to execute command: toolbox request failed",
+                ClientConnectionError("tcp reset"),
+            )
+        return await super().exec(command)
+
+
+class MisclassifiedTransportProcess(Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        self.attempts += 1
+        if self.attempts == 1:
+            raise DaytonaError(
+                "Failed to execute command: File descriptor 127 is used by transport "
+                "<TCPTransport closed=False reading=True 0xabc>"
+            )
         return await super().exec(command)
 
 
@@ -290,6 +327,18 @@ class RefreshToErrorSandbox(InnerSandbox):
         self.state = SandboxState.ERROR
 
 
+class BareHtml502RefreshSandbox(InnerSandbox):
+    def __init__(self) -> None:
+        super().__init__()
+        self.refresh_attempts = 0
+
+    async def refresh_data(self) -> None:
+        self.refresh_attempts += 1
+        if self.refresh_attempts == 1:
+            raise DaytonaError("Failed to refresh sandbox data: <html><h1>502 Bad Gateway</h1></html>")
+        await super().refresh_data()
+
+
 class DaytonaClient:
     def __init__(self, sandbox: InnerSandbox) -> None:
         self.sandbox = sandbox
@@ -329,6 +378,21 @@ class CreateFailureDaytonaClient(DaytonaClient):
 class CreateNotFoundDaytonaClient(CreateFailureDaytonaClient):
     async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
         raise DaytonaError("sandbox not found", status_code=404)
+
+
+class ReusableLookupConnectionDaytonaClient(DaytonaClient):
+    def __init__(self, sandbox: InnerSandbox) -> None:
+        super().__init__(sandbox)
+        self.get_attempts = 0
+
+    async def get(self, instance_id: str) -> InnerSandbox:
+        self.get_attempts += 1
+        if self.get_attempts == 1:
+            raise _daytona_error_with_cause(
+                "Failed to get sandbox",
+                ClientConnectionError("tcp reset"),
+            )
+        raise DaytonaNotFoundError("sandbox not found")
 
 
 def _provider(daytona: DaytonaClient) -> DaytonaSandboxProvider:
@@ -402,6 +466,30 @@ async def test_daytona_exec_retries_failed_execute_command_errors() -> None:
     """
     inner = InnerSandbox()
     process = FailedExecuteCommandProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    result = await sandbox.exec("pytest")
+
+    assert result.exit_code == 0
+    assert process.attempts == 2
+
+
+async def test_daytona_exec_retries_wrapped_connection_errors() -> None:
+    inner = InnerSandbox()
+    process = WrappedConnectionErrorProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    result = await sandbox.exec("pytest")
+
+    assert result.exit_code == 0
+    assert process.attempts == 2
+
+
+async def test_daytona_exec_retries_misclassified_transport_errors() -> None:
+    inner = InnerSandbox()
+    process = MisclassifiedTransportProcess()
     inner.process = process
     sandbox = DaytonaSandbox(cast(Any, inner))
 
@@ -596,6 +684,27 @@ async def test_daytona_provider_delete_retries_state_conflicts() -> None:
 
     assert inner.autostop_attempts == 2
     assert daytona.deleted is True
+
+
+async def test_daytona_provider_delete_retries_bare_html_502_refresh_errors() -> None:
+    inner = BareHtml502RefreshSandbox()
+    daytona = DaytonaClient(inner)
+
+    await _provider(daytona).delete_sandbox(inner.name)
+
+    assert inner.refresh_attempts == 2
+    assert daytona.deleted is True
+
+
+async def test_daytona_provider_create_retries_wrapped_lookup_connection_errors() -> None:
+    inner = InnerSandbox()
+    daytona = ReusableLookupConnectionDaytonaClient(inner)
+
+    sandbox = await _provider(daytona).create_sandbox(_request(inner.name))
+
+    assert sandbox.id == inner.id
+    assert daytona.get_attempts == 2
+    assert daytona.created is True
 
 
 async def test_daytona_provider_create_maps_daytona_errors() -> None:

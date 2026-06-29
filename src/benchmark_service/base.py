@@ -7,7 +7,8 @@ a FastAPI app with your implementation.
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
-from typing import Any, Self
+from pathlib import Path
+from typing import Any, ClassVar, Self
 
 from benchmark_service.auth import (
     LEGACY_TENANT_SENTINEL,
@@ -15,6 +16,7 @@ from benchmark_service.auth import (
     load_allowlist,
     resolve_caller_tenant,
 )
+from benchmark_service.dataset_versioning import DatasetVersionEntry, load_dataset_versions
 from benchmark_service.sandbox import Sandbox
 from benchmark_service.schemas import (
     EvaluateResponseRequest,
@@ -36,10 +38,20 @@ class BenchmarkService(ABC):
 
     datasets: dict[str, dict[str, Any]]
 
+    # When set, the declared dataset versions are loaded at startup and served
+    # by get_dataset_version(). Version label only — content is not verified.
+    dataset_versions_file: ClassVar[Path | None] = None
+    dataset_versions: dict[str, DatasetVersionEntry]
+
     @classmethod
     async def create(cls) -> Self:
         """Factory method to create and initialize a benchmark service."""
         instance = cls.__new__(cls)
+        instance.dataset_versions = (
+            load_dataset_versions(cls.dataset_versions_file)
+            if cls.dataset_versions_file is not None
+            else {}
+        )
         instance.datasets = await instance.load_datasets()
         return instance
 
@@ -104,7 +116,8 @@ class BenchmarkService(ABC):
 
     def get_dataset_version(self, dataset: str | None = None) -> str | None:
         """Return the version for `dataset`, if this benchmark tracks one."""
-        return None
+        entry = self.dataset_versions.get(dataset or "default")
+        return entry.version if entry is not None else None
 
     def get_dataset(self, dataset: str | None = None) -> dict[str, Any]:
         """Get a specific dataset by name. Defaults to 'default'."""

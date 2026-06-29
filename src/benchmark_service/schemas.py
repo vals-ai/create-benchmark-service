@@ -170,6 +170,7 @@ class VersionResponse(BaseModel):
     framework_version: str
     service_name: str | None = None
     service_version: str | None = None
+    dataset_version: str | None = None
 
 
 class StreamMessageChunk(BaseModel):

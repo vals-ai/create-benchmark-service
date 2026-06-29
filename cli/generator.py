@@ -169,11 +169,7 @@ def generate_project(
     shutil.copytree(
         root / ".github",
         output_dir / ".github",
-        ignore=shutil.ignore_patterns(
-            "auto-tag-release.yaml",
-            "check-pr-title.yaml",
-            "cli-integration.yaml",
-        ),
+        ignore=shutil.ignore_patterns("cli-integration.yaml"),
     )
 
     # Create empty tests directory

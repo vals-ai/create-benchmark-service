@@ -205,11 +205,12 @@ class BenchmarkServiceApp(FastAPI):
         service_override = self.service.get_service_version()
         return service_override or self._service_version
 
-    async def _version(self) -> VersionResponse:
+    async def _version(self, dataset: str | None = None) -> VersionResponse:
         return VersionResponse(
             framework_version=_framework_version,
             service_name=self._service_name,
             service_version=self._current_service_version(),
+            dataset_version=self.service.get_dataset_version(dataset),
         )
 
     async def _authorize_websocket(self, websocket: WebSocket) -> str | None:

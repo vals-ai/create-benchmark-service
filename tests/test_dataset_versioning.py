@@ -28,6 +28,13 @@ def test_non_mapping_versions_file_raises_clear_error(tmp_path: Path) -> None:
         load_dataset_versions(versions_file)
 
 
+def test_unknown_key_in_entry_raises_clear_error(tmp_path: Path) -> None:
+    versions_file = tmp_path / "dataset_versions.yaml"
+    versions_file.write_text(yaml.safe_dump({"validation": {"version": "1.0.0", "verison": "typo"}}))
+    with pytest.raises(DatasetVersionError):
+        load_dataset_versions(versions_file)
+
+
 async def test_service_serves_declared_dataset_version(tmp_path: Path) -> None:
     versions_file = _write_fixture(tmp_path)
 

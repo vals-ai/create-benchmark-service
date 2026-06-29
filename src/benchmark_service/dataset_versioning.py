@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import yaml
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, ValidationError
 
 
 class DatasetVersionError(Exception):
@@ -19,6 +19,8 @@ class DatasetVersionError(Exception):
 
 
 class DatasetVersionEntry(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     version: str
 
 
@@ -29,7 +31,10 @@ def load_dataset_versions(versions_file: Path) -> dict[str, DatasetVersionEntry]
         raise DatasetVersionError(
             f"{versions_file} must be a YAML mapping of dataset name to entry, got {type(data).__name__}"
         )
-    return {
-        name: DatasetVersionEntry.model_validate(entry)
-        for name, entry in cast("dict[str, Any]", data).items()
-    }
+    try:
+        return {
+            name: DatasetVersionEntry.model_validate(entry)
+            for name, entry in cast("dict[str, Any]", data).items()
+        }
+    except ValidationError as exc:
+        raise DatasetVersionError(f"{versions_file}: invalid dataset version entry — {exc}") from exc

@@ -787,7 +787,7 @@ async def test_daytona_updates_egress_rules() -> None:
     Test cases:
     - Allowed addresses disable block-all and become Daytona's comma-separated allow-list value.
     - An empty address is rejected before updating provider rules.
-    - Clearing egress rules restores unrestricted outbound network access.
+    - Calling sandbox.clear_egress_rules restores unrestricted outbound network access.
     """
     inner = InnerSandbox()
     sandbox = DaytonaSandbox(cast(Any, inner))
@@ -797,7 +797,7 @@ async def test_daytona_updates_egress_rules() -> None:
     assert inner.network_block_all is False
     assert inner.network_allow_list == "203.0.113.10/32,198.51.100.20/32"
 
-    with pytest.raises(ValueError, match="allowed_addresses cannot be empty"):
+    with pytest.raises(ValueError, match="allowed addresses cannot be empty"):
         await sandbox.modify_egress_rules([" "])
 
     await sandbox.clear_egress_rules()

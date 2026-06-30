@@ -306,7 +306,7 @@ class DaytonaSandbox(Sandbox):
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
         allow_list = [address.strip() for address in allowed_addresses]
         if not allow_list or any(not address for address in allow_list):
-            raise ValueError("allowed_addresses cannot be empty")
+            raise ValueError("allowed addresses cannot be empty")
         try:
             await self._sandbox.update_network_settings(
                 network_block_all=False,

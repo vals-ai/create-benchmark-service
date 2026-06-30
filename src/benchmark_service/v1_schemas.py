@@ -54,6 +54,18 @@ class V1EvalResponse(BaseModel):
     errors: list[str] = Field(default_factory=list)
 
 
+class V1UploadUrlRequest(BaseModel):
+    run_id: str
+    task_id: str
+    filename: str
+
+
+class V1UploadUrlResponse(BaseModel):
+    key: str
+    url: str
+    expires_in: int
+
+
 class V1ScoreItem(BaseModel):
     status: V1EvalStatus
     result: Any | None = None
@@ -113,5 +125,7 @@ __all__ = [
     "V1ScoreRequest",
     "V1ScoreResponse",
     "V1Task",
+    "V1UploadUrlRequest",
+    "V1UploadUrlResponse",
     "V1Versions",
 ]

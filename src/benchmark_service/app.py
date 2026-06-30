@@ -40,6 +40,7 @@ from benchmark_service.trial import (
     sanitize_v1_eval_response,
     sanitize_v1_score_response,
 )
+from benchmark_service import lab_artifacts
 from benchmark_service.v1_schemas import (
     V1DatasetTasksResponse,
     V1EvalRequest,
@@ -49,6 +50,8 @@ from benchmark_service.v1_schemas import (
     V1ScoreItem,
     V1ScoreRequest,
     V1ScoreResponse,
+    V1UploadUrlRequest,
+    V1UploadUrlResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -183,6 +186,12 @@ class BenchmarkServiceApp(FastAPI):
         self.add_api_route("/final-score/", self._final_score, methods=["POST"])
         self.add_api_route("/v1/evaluate", self._v1_evaluate, methods=["POST"], response_model=V1EvalResponse)
         self.add_api_route("/v1/score", self._v1_score, methods=["POST"], response_model=V1ScoreResponse)
+        self.add_api_route(
+            "/v1/submissions/upload-url",
+            self._v1_submission_upload_url,
+            methods=["POST"],
+            response_model=V1UploadUrlResponse,
+        )
         self.add_api_route(
             "/v1/datasets/{dataset}/tasks",
             self._v1_list_dataset_tasks,
@@ -403,6 +412,17 @@ class BenchmarkServiceApp(FastAPI):
         if _is_trial_tenant(request.state.tenant):
             return sanitize_v1_eval_response(response, self.service.project_trial_result)
         return response
+
+    async def _v1_submission_upload_url(
+        self, request: Request, body: V1UploadUrlRequest
+    ) -> V1UploadUrlResponse:
+        _require_descope_tenant(request.state.tenant)
+        key = lab_artifacts.submission_key(body.run_id, body.task_id, body.filename)
+        return V1UploadUrlResponse(
+            key=key,
+            url=lab_artifacts.presigned_put_url(key),
+            expires_in=lab_artifacts.DEFAULT_UPLOAD_EXPIRY_S,
+        )
 
     async def _v1_score(self, request: Request, body: V1ScoreRequest) -> V1ScoreResponse:
         _require_descope_tenant(request.state.tenant)

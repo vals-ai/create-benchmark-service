@@ -236,6 +236,14 @@ class BenchmarkService(ABC):
         """
         return []
 
+    def task_input_path(self, task_id: str, filename: str, dataset: str | None = None) -> Path:
+        """Local filesystem path for a file declared by `list_task_inputs`.
+
+        Override alongside `list_task_inputs` so the framework can serve declared
+        files. An undeclared filename must raise KeyError.
+        """
+        raise KeyError(filename)
+
     @abstractmethod
     def setup_task(
         self, task_id: str, sandbox: Sandbox, dataset: str | None = None

@@ -12,6 +12,8 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from benchmark_service.schemas import TaskInput
+
 
 class V1PayloadType(StrEnum):
     TEXT = "text"
@@ -102,6 +104,10 @@ class V1DatasetTasksResponse(BaseModel):
     tasks: list[V1Task]
 
 
+class V1TaskInputsResponse(BaseModel):
+    inputs: list[TaskInput]
+
+
 __all__ = [
     "V1DatasetTasksResponse",
     "V1EvalRequest",
@@ -113,5 +119,6 @@ __all__ = [
     "V1ScoreRequest",
     "V1ScoreResponse",
     "V1Task",
+    "V1TaskInputsResponse",
     "V1Versions",
 ]

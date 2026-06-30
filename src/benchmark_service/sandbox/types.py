@@ -109,6 +109,12 @@ class Sandbox(ABC):
     @abstractmethod
     async def download_file(self, remote_path: str) -> bytes: ...
 
+    async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
+        raise SandboxError("Sandbox provider does not support modifying egress rules")
+
+    async def clear_egress_rules(self) -> None:
+        raise SandboxError("Sandbox provider does not support modifying egress rules")
+
 
 class SandboxProvider(ABC):
     @abstractmethod

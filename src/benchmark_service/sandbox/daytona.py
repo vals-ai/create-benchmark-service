@@ -302,6 +302,29 @@ class DaytonaSandbox(Sandbox):
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
 
+    @_PROVIDER_RETRY
+    async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
+        allow_list = [address.strip() for address in allowed_addresses]
+        if not allow_list or any(not address for address in allow_list):
+            raise ValueError("allowed_addresses cannot be empty")
+        try:
+            await self._sandbox.update_network_settings(
+                network_block_all=False,
+                network_allow_list=",".join(allow_list),
+            )
+        except _SANDBOX_OPERATION_ERRORS as exc:
+            raise self._sandbox_error(exc) from exc
+
+    @_PROVIDER_RETRY
+    async def clear_egress_rules(self) -> None:
+        try:
+            await self._sandbox.update_network_settings(
+                network_block_all=False,
+                network_allow_list=None,
+            )
+        except _SANDBOX_OPERATION_ERRORS as exc:
+            raise self._sandbox_error(exc) from exc
+
     async def _exec_pty(self, command: str, output: asyncio.Queue[str]) -> ExecResult:
         session_id = f"{self.id}:exec-{uuid.uuid4().hex}"
         status_path = f"{_STATUS_DIR}/{uuid.uuid4().hex}.status"

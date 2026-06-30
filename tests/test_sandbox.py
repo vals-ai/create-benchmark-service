@@ -285,10 +285,16 @@ class InnerSandbox:
         self.process = Process()
         self.fs = Files()
         self.autostop_interval: int | None = None
+        self.network_block_all: bool | None = None
+        self.network_allow_list: str | None = None
         self.refresh_count = 0
 
     async def set_autostop_interval(self, interval: int) -> None:
         self.autostop_interval = interval
+
+    async def update_network_settings(self, *, network_block_all: bool, network_allow_list: str | None) -> None:
+        self.network_block_all = network_block_all
+        self.network_allow_list = network_allow_list
 
     async def wait_for_sandbox_start(self, timeout: int) -> None:
         assert timeout == 0
@@ -773,3 +779,28 @@ async def test_daytona_provider_lists_sandboxes_with_query() -> None:
     assert daytona.listed_query is not None
     assert daytona.listed_query.labels == {"Benchmark": "vcb"}
     assert daytona.listed_query.limit == 10
+
+
+async def test_daytona_updates_egress_rules() -> None:
+    """Runtime egress changes should map to Daytona's sandbox network settings.
+
+    Test cases:
+    - Allowed addresses disable block-all and become Daytona's comma-separated allow-list value.
+    - An empty address is rejected before updating provider rules.
+    - Clearing egress rules restores unrestricted outbound network access.
+    """
+    inner = InnerSandbox()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    await sandbox.modify_egress_rules(["203.0.113.10/32", "198.51.100.20/32"])
+
+    assert inner.network_block_all is False
+    assert inner.network_allow_list == "203.0.113.10/32,198.51.100.20/32"
+
+    with pytest.raises(ValueError, match="allowed_addresses cannot be empty"):
+        await sandbox.modify_egress_rules([" "])
+
+    await sandbox.clear_egress_rules()
+
+    assert inner.network_block_all is False
+    assert inner.network_allow_list is None

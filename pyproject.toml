@@ -17,6 +17,7 @@ dependencies = [
     "cachetools>=5.5.0",
     "pyyaml>=6.0.2",
     "starlette>=1.0.1",
+    "boto3>=1.34",
 ]
 
 [project.scripts]

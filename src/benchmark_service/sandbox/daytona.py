@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import shlex
+import socket
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import suppress
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 from aiohttp import ClientConnectionError, ClientResponseError
 from daytona import (
@@ -71,6 +74,46 @@ _TRANSPORT_ERROR_MESSAGES = (
 _RETRYABLE_DAYTONA_CAUSES = (ClientConnectionError, ConnectionError, TimeoutError)
 _FIXED_PROVIDER_WAIT = wait_fixed(2)
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
+
+
+def _resolve_daytona_allowed_addresses(allowed_addresses: list[str]) -> tuple[list[str], dict[str, str]]:
+    values = [address.strip() for address in allowed_addresses]
+    if not values or any(not value for value in values):
+        raise ValueError("allowed addresses cannot be empty; use sandbox.clear_egress_rules to clear egress rules")
+
+    cidrs: list[str] = []
+    host_pins: dict[str, str] = {}
+
+    for value in values:
+        try:
+            network = ipaddress.ip_network(value, strict=False)
+            if network.version == 4:
+                cidrs.append(str(network))
+            continue
+        except ValueError:
+            pass
+
+        parsed = urlparse(value if "://" in value else f"//{value}")
+        if not parsed.hostname:
+            raise ValueError(f"allowed address is not a valid URL, host, or CIDR: {value}")
+
+        try:
+            address_infos = socket.getaddrinfo(parsed.hostname, 443, family=socket.AF_INET, type=socket.SOCK_STREAM)
+        except socket.gaierror as exc:
+            raise ValueError(f"allowed address host did not resolve: {value}") from exc
+
+        resolved_addresses = sorted(
+            {address_info[4][0] for address_info in address_infos if isinstance(address_info[4][0], str)}
+        )
+        cidrs.extend(f"{address}/32" for address in resolved_addresses)
+        if resolved_addresses:
+            host_pins[parsed.hostname] = resolved_addresses[0]
+
+    cidrs = list(dict.fromkeys(cidrs))
+    if not cidrs:
+        raise ValueError("allowed addresses did not resolve to Daytona-compatible CIDR rules")
+
+    return cidrs, host_pins
 
 
 class DaytonaProviderConfig(BaseModel):
@@ -304,9 +347,13 @@ class DaytonaSandbox(Sandbox):
 
     @_PROVIDER_RETRY
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
-        allow_list = [address.strip() for address in allowed_addresses]
-        if not allow_list or any(not address for address in allow_list):
-            raise ValueError("allowed addresses cannot be empty; use sandbox.clear_egress_rules to clear egress rules")
+        allow_list, host_pins = _resolve_daytona_allowed_addresses(allowed_addresses)
+
+        if host_pins:
+            hosts = "".join(f"{address} {host}\n" for host, address in sorted(host_pins.items()))
+            result = await self.exec(f"printf %s {shlex.quote(hosts)} >> /etc/hosts")
+            if result.exit_code != 0:
+                raise SandboxError("failed to pin egress allowlist hosts")
 
         try:
             await self._sandbox.update_network_settings(

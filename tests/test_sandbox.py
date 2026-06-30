@@ -23,6 +23,7 @@ from benchmark_service.sandbox import (
     SandboxNotFoundError,
     SandboxQuery,
 )
+from benchmark_service.sandbox import daytona as daytona_module
 from benchmark_service.sandbox.daytona import DaytonaSandbox, DaytonaSandboxProvider, daytona_retry_after_seconds
 
 
@@ -781,21 +782,33 @@ async def test_daytona_provider_lists_sandboxes_with_query() -> None:
     assert daytona.listed_query.limit == 10
 
 
-async def test_daytona_updates_egress_rules() -> None:
+async def test_daytona_updates_egress_rules(monkeypatch: pytest.MonkeyPatch) -> None:
     """Runtime egress changes should map to Daytona's sandbox network settings.
 
     Test cases:
-    - Allowed addresses disable block-all and become Daytona's comma-separated allow-list value.
+    - URL hosts resolve to Daytona CIDR rules and are pinned in /etc/hosts.
+    - Explicit CIDR addresses pass through to the comma-separated allow-list value.
     - An empty address is rejected before updating provider rules.
     - Calling sandbox.clear_egress_rules restores unrestricted outbound network access.
     """
     inner = InnerSandbox()
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    await sandbox.modify_egress_rules(["203.0.113.10/32", "198.51.100.20/32"])
+    def getaddrinfo(
+        host: str, *_args: object, **_kwargs: object
+    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
+        assert host == "api.openai.com"
+
+        return [(object(), object(), object(), object(), ("203.0.113.10", 443))]
+
+    monkeypatch.setattr(daytona_module.socket, "getaddrinfo", getaddrinfo)
+
+    await sandbox.modify_egress_rules(["https://api.openai.com/v1", "198.51.100.20/32"])
 
     assert inner.network_block_all is False
     assert inner.network_allow_list == "203.0.113.10/32,198.51.100.20/32"
+    assert inner.process.command is not None
+    assert "203.0.113.10 api.openai.com" in inner.process.command
 
     with pytest.raises(
         ValueError,

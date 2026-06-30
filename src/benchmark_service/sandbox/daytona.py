@@ -77,6 +77,7 @@ _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
 
 
 def _resolve_daytona_allowed_addresses(allowed_addresses: list[str]) -> tuple[list[str], dict[str, str]]:
+    # Normalize entries first so empty allowlists and blank values fail before reaching Daytona.
     values = [address.strip() for address in allowed_addresses]
     if not values or any(not value for value in values):
         raise ValueError("allowed addresses cannot be empty; use sandbox.clear_egress_rules to clear egress rules")
@@ -85,6 +86,7 @@ def _resolve_daytona_allowed_addresses(allowed_addresses: list[str]) -> tuple[li
     host_pins: dict[str, str] = {}
 
     for value in values:
+        # Pass IPv4 CIDR inputs through directly because Daytona network rules are CIDR based.
         try:
             network = ipaddress.ip_network(value, strict=False)
             if network.version == 4:
@@ -93,10 +95,12 @@ def _resolve_daytona_allowed_addresses(allowed_addresses: list[str]) -> tuple[li
         except ValueError:
             pass
 
+        # Treat non-CIDR values as URLs or hosts and reject anything without a hostname.
         parsed = urlparse(value if "://" in value else f"//{value}")
         if not parsed.hostname:
             raise ValueError(f"allowed address is not a valid URL, host, or CIDR: {value}")
 
+        # Resolve hosts to IPv4 addresses so URL entries become Daytona-compatible CIDR rules.
         try:
             address_infos = socket.getaddrinfo(parsed.hostname, 443, family=socket.AF_INET, type=socket.SOCK_STREAM)
         except socket.gaierror as exc:
@@ -106,9 +110,12 @@ def _resolve_daytona_allowed_addresses(allowed_addresses: list[str]) -> tuple[li
             {address_info[4][0] for address_info in address_infos if isinstance(address_info[4][0], str)}
         )
         cidrs.extend(f"{address}/32" for address in resolved_addresses)
+
+        # Pin the hostname to an allowed IPv4 address so DNS is not needed after egress narrows.
         if resolved_addresses:
             host_pins[parsed.hostname] = resolved_addresses[0]
 
+    # Deduplicate CIDRs while preserving order before returning rules to Daytona.
     cidrs = list(dict.fromkeys(cidrs))
     if not cidrs:
         raise ValueError("allowed addresses did not resolve to Daytona-compatible CIDR rules")

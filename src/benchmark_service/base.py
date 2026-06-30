@@ -25,6 +25,7 @@ from benchmark_service.schemas import (
     StreamChunk,
     StreamResultChunk,
     TaskFilter,
+    TaskInput,
 )
 from benchmark_service.v1_schemas import V1Task
 
@@ -225,6 +226,15 @@ class BenchmarkService(ABC):
             RetrieveTaskResponse with task metadata
         """
         ...
+
+    async def list_task_inputs(self, task_id: str, dataset: str | None = None) -> list[TaskInput]:
+        """Per-task input files this benchmark delivers into the generation environment.
+
+        Override for benchmarks whose tasks ship files beyond the prompt (a template
+        workbook, supporting data). The default returns none, so prompt-only
+        benchmarks need no change. These are inputs, not gold.
+        """
+        return []
 
     @abstractmethod
     def setup_task(

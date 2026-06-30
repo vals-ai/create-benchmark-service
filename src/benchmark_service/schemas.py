@@ -95,6 +95,13 @@ class SetupTaskResponse(BaseModel):
     status: str = Field(description="Status of setup operation ('ok' or error message)")
 
 
+class TaskInput(BaseModel):
+    """A per-task input file the framework delivers into the generation environment."""
+
+    filename: str = Field(description="File name as served by the benchmark service")
+    dest: str = Field(description="Absolute path in the generation sandbox where the file is placed")
+
+
 class EvaluateResponseRequest(BaseModel):
     """
     Request to evaluate without a live sandbox.

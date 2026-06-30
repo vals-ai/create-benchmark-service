@@ -8,14 +8,12 @@ WORKDIR /app
 # Install uv for faster package management
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
-# Copy dependency files
-COPY pyproject.toml README.md ./
-
-# Install dependencies
-RUN uv sync
-
-# Copy application code
+# Copy the full source, including .git — hatch-vcs reads it at build to resolve
+# the service version. Copy before `uv sync` or the version is the 0.0.0 fallback.
 COPY . .
+
+# Install dependencies and the service
+RUN uv sync
 
 # Expose port
 EXPOSE 8001

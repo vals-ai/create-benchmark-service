@@ -89,6 +89,11 @@ def test_template_rendering(
         readme_content = (output_dir / "README.md").read_text()
         assert expected_readme_title in readme_content
 
+        # hatch-vcs (dynamic version) reads .git at build, so the image must not
+        # exclude it — otherwise the deployed service_version is the 0.0.0 fallback.
+        dockerignore = (output_dir / ".dockerignore").read_text()
+        assert ".git/" not in dockerignore
+
 
 def test_generated_pyproject_pins_to_tag_for_clean_version(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

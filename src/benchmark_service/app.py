@@ -49,6 +49,7 @@ from benchmark_service.v1_schemas import (
     V1ScoreItem,
     V1ScoreRequest,
     V1ScoreResponse,
+    V1TaskInputsResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -188,6 +189,17 @@ class BenchmarkServiceApp(FastAPI):
             self._v1_list_dataset_tasks,
             methods=["GET"],
             response_model=V1DatasetTasksResponse,
+        )
+        self.add_api_route(
+            "/v1/datasets/{dataset}/tasks/{task_id}/inputs",
+            self._v1_task_inputs,
+            methods=["GET"],
+            response_model=V1TaskInputsResponse,
+        )
+        self.add_api_route(
+            "/v1/datasets/{dataset}/tasks/{task_id}/inputs/{filename}",
+            self._v1_download_task_input,
+            methods=["GET"],
         )
 
     async def _value_error_handler(self, _request: Request, exc: Exception) -> Response:
@@ -444,6 +456,24 @@ class BenchmarkServiceApp(FastAPI):
         if _is_trial_tenant(request.state.tenant):
             return sanitize_v1_dataset_tasks_response(response)
         return response
+
+    async def _v1_task_inputs(self, request: Request, dataset: str, task_id: str) -> V1TaskInputsResponse:
+        _require_descope_tenant(request.state.tenant)
+        if not await self.service.check_dataset_access(request.state.tenant, dataset):
+            raise HTTPException(status_code=403, detail=f"Dataset={dataset} access not allowed")
+        return V1TaskInputsResponse(inputs=await self.service.list_task_inputs(task_id, dataset=dataset))
+
+    async def _v1_download_task_input(
+        self, request: Request, dataset: str, task_id: str, filename: str
+    ) -> Response:
+        _require_descope_tenant(request.state.tenant)
+        if not await self.service.check_dataset_access(request.state.tenant, dataset):
+            raise HTTPException(status_code=403, detail=f"Dataset={dataset} access not allowed")
+        declared = {item.filename for item in await self.service.list_task_inputs(task_id, dataset=dataset)}
+        if filename not in declared:
+            raise HTTPException(status_code=404, detail=f"No such task input: {filename}")
+        path = self.service.task_input_path(task_id, filename, dataset=dataset)
+        return Response(content=path.read_bytes(), media_type="application/octet-stream")
 
     async def _final_score(self, request: Request, body: FinalScoreRequest) -> FinalScoreResponse:
         if not await self.service.check_dataset_access(request.state.tenant, body.dataset):

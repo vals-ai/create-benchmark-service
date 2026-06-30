@@ -8,11 +8,17 @@ WORKDIR /app
 # Install uv for faster package management
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 
-# Copy the full source, including .git — hatch-vcs reads it at build to resolve
-# the service version. Copy before `uv sync` or the version is the 0.0.0 fallback.
-COPY . .
+# Install dependencies first so this layer caches unless pyproject changes;
+# --no-install-project skips the service itself, which needs no version yet.
+COPY pyproject.toml README.md ./
+RUN uv sync --no-install-project
 
-# Install dependencies and the service
+# Version is injected at build (CI passes the git tag); hatch-vcs reads
+# SETUPTOOLS_SCM_PRETEND_VERSION rather than .git, so the image needs no .git.
+ARG SERVICE_VERSION=0.0.0
+ENV SETUPTOOLS_SCM_PRETEND_VERSION=${SERVICE_VERSION}
+
+COPY . .
 RUN uv sync
 
 # Expose port

@@ -12,8 +12,9 @@ __pycache__/
 # Tests
 tests/
 
-# .git is intentionally NOT excluded — hatch-vcs reads it at build to resolve
-# the service version (excluding it makes the version the 0.0.0 fallback).
+# Git
+.git/
+.gitignore
 
 # CI/CD
 .github/

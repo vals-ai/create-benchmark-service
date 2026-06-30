@@ -89,10 +89,13 @@ def test_template_rendering(
         readme_content = (output_dir / "README.md").read_text()
         assert expected_readme_title in readme_content
 
-        # hatch-vcs (dynamic version) reads .git at build, so the image must not
-        # exclude it — otherwise the deployed service_version is the 0.0.0 fallback.
+        # The version is injected via SETUPTOOLS_SCM_PRETEND_VERSION (a build-arg),
+        # set before the project is built; .git is excluded since hatch-vcs no longer reads it.
+        dockerfile = (output_dir / "Dockerfile").read_text()
+        assert "ARG SERVICE_VERSION" in dockerfile
+        assert dockerfile.index("SETUPTOOLS_SCM_PRETEND_VERSION") < dockerfile.index("COPY . .")
         dockerignore = (output_dir / ".dockerignore").read_text()
-        assert ".git/" not in dockerignore
+        assert ".git/" in dockerignore
 
 
 def test_generated_pyproject_pins_to_tag_for_clean_version(

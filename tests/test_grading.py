@@ -1,19 +1,23 @@
 """Tests for sandbox-graded /v1/evaluate (eval_mode == SANDBOX)."""
 
+import asyncio
 from collections.abc import AsyncGenerator
 from typing import Any
 
 import pytest
 
-from benchmark_service import Sandbox
+from benchmark_service import ImageSource, Resources, Sandbox
+from benchmark_service.grading import grade_instance
 from benchmark_service.sandbox import SandboxCreateRequest, SandboxProvider
 from benchmark_service.sandbox.types import ExecResult
 from benchmark_service.schemas import (
     EvalMode,
     EvaluateResponseRequest,
     StreamChunk,
+    StreamErrorChunk,
     StreamResultChunk,
 )
+from benchmark_service.v1_schemas import V1EvalStatus
 from tests.conftest import StubBenchmark
 
 
@@ -120,3 +124,94 @@ async def test_prepare_grading_sandbox_default_raises_not_implemented() -> None:
     req = EvaluateResponseRequest(task_id="task-1", response="2", dataset="default")
     with pytest.raises(NotImplementedError, match="prepare_grading_sandbox"):
         await service.prepare_grading_sandbox(FakeSandbox(), req, dataset="default")
+
+
+class ErrorChunkStub(SandboxStub):
+    async def evaluate_instance(  # type: ignore[override]
+        self, task_id: str, sandbox: Sandbox, dataset: str | None = None
+    ) -> AsyncGenerator[StreamChunk, None]:
+        yield StreamErrorChunk(type="error", data="grader blew up")
+
+
+class RaisingStub(SandboxStub):
+    async def evaluate_instance(  # type: ignore[override]
+        self, task_id: str, sandbox: Sandbox, dataset: str | None = None
+    ) -> AsyncGenerator[StreamChunk, None]:
+        raise RuntimeError("boom")
+        yield  # pragma: no cover
+
+
+class SlowStub(SandboxStub):
+    async def evaluate_instance(  # type: ignore[override]
+        self, task_id: str, sandbox: Sandbox, dataset: str | None = None
+    ) -> AsyncGenerator[StreamChunk, None]:
+        await asyncio.sleep(10)
+        yield StreamResultChunk(type="result", data={"resolved": True})
+
+
+def _req() -> EvaluateResponseRequest:
+    return EvaluateResponseRequest(task_id="task-1", response="2", dataset="default")
+
+
+async def _grade(service: StubBenchmark, provider: FakeProvider, **overrides: Any) -> Any:
+    kwargs: dict[str, Any] = {
+        "service": service,
+        "run_id": "run-1",
+        "request": _req(),
+        "sandbox_config": FakeProviderConfig(provider),
+        "evaluator_version": "stub-1.0",
+        "dataset": "default",
+    }
+    kwargs.update(overrides)
+    return await grade_instance(**kwargs)
+
+
+async def test_grade_instance_returns_evaluated_with_passthrough_result() -> None:
+    service = await SandboxStub.create()
+    provider = FakeProvider(FakeSandbox())
+    resp = await _grade(service, provider)
+    assert resp.status == V1EvalStatus.EVALUATED
+    assert resp.run_id == "run-1"
+    assert resp.task_id == "task-1"
+    assert resp.evaluator_version == "stub-1.0"
+    assert resp.result == {"resolved": True, "weighted_pass_percentage": 100.0}
+
+
+async def test_grade_instance_creates_isolated_sandbox_from_task_source_and_deletes_it() -> None:
+    service = await SandboxStub.create()
+    provider = FakeProvider(FakeSandbox())
+    await _grade(service, provider)
+    assert len(provider.created) == 1
+    create = provider.created[0]
+    assert create.source == ImageSource(image="python:3.12-slim")
+    assert create.resources == Resources(vcpu=2, memory=4, disk=10)
+    assert create.network_block_all is True
+    assert create.env_vars == {}
+    assert provider.deleted == ["fake-sandbox"]
+
+
+async def test_grade_instance_maps_error_chunk_to_error_status() -> None:
+    service = await ErrorChunkStub.create()
+    provider = FakeProvider(FakeSandbox())
+    resp = await _grade(service, provider)
+    assert resp.status == V1EvalStatus.ERROR
+    assert resp.errors == ["grader blew up"]
+    assert provider.deleted == ["fake-sandbox"]
+
+
+async def test_grade_instance_maps_exception_to_error_and_still_deletes_sandbox() -> None:
+    service = await RaisingStub.create()
+    provider = FakeProvider(FakeSandbox())
+    resp = await _grade(service, provider)
+    assert resp.status == V1EvalStatus.ERROR
+    assert any("boom" in e for e in resp.errors)
+    assert provider.deleted == ["fake-sandbox"]
+
+
+async def test_grade_instance_times_out_and_still_deletes_sandbox() -> None:
+    service = await SlowStub.create()
+    provider = FakeProvider(FakeSandbox())
+    resp = await _grade(service, provider, timeout_s=0.05)
+    assert resp.status == V1EvalStatus.ERROR
+    assert any("timeout" in e.lower() for e in resp.errors)
+    assert provider.deleted == ["fake-sandbox"]

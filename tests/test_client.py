@@ -42,6 +42,7 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
                 "service_name": "legal-research-benchmark-service",
                 "service_version": "1.2.3",
                 "dataset_version": "3.0.0",
+                "eval_mode": "text",
             },
         ),
         (

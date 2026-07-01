@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shlex
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
@@ -108,6 +109,28 @@ class DaytonaProviderConfig(BaseModel):
         if not api_key or not api_url or not target:
             raise MissingSandboxConfigError("Missing required headers: x-api-key, x-api-url, x-target")
         return cls(DAYTONA_API_KEY=api_key, DAYTONA_API_URL=api_url, DAYTONA_TARGET=target)
+
+    @classmethod
+    def from_env(cls) -> "DaytonaProviderConfig":
+        """Build config from server-side environment (Vals-hosted /v1 grading path).
+
+        The lab never supplies sandbox creds; they live only in the service env.
+        """
+        api_key = os.environ.get("DAYTONA_API_KEY")
+        api_url = os.environ.get("DAYTONA_API_URL")
+        target = os.environ.get("DAYTONA_TARGET")
+        missing = [
+            name
+            for name, value in (
+                ("DAYTONA_API_KEY", api_key),
+                ("DAYTONA_API_URL", api_url),
+                ("DAYTONA_TARGET", target),
+            )
+            if not value
+        ]
+        if missing:
+            raise MissingSandboxConfigError(f"Missing required environment variables: {', '.join(missing)}")
+        return cls(DAYTONA_API_KEY=api_key, DAYTONA_API_URL=api_url, DAYTONA_TARGET=target)  # type: ignore[arg-type]
 
     def create_provider(self) -> SandboxProvider:
         return DaytonaSandboxProvider(self)

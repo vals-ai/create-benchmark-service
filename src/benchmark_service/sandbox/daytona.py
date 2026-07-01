@@ -92,10 +92,7 @@ class DaytonaProviderConfig(BaseModel):
 
     @classmethod
     def from_env(cls) -> "DaytonaProviderConfig":
-        """Build config from server-side environment (Vals-hosted /v1 grading path).
-
-        The lab never supplies sandbox creds; they live only in the service env.
-        """
+        """Build config from the DAYTONA_* environment variables; callers never supply creds."""
         api_key = os.environ.get("DAYTONA_API_KEY")
         api_url = os.environ.get("DAYTONA_API_URL")
         target = os.environ.get("DAYTONA_TARGET")
@@ -187,6 +184,10 @@ def _is_transient_daytona_error(exc: DaytonaError | ClientResponseError) -> bool
     if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS) or _has_retryable_cause(exc):
         return True
     return _message_contains(exc, _TRANSPORT_ERROR_MESSAGES)
+
+
+def _is_name_conflict_error(exc: DaytonaError) -> bool:
+    return isinstance(exc, DaytonaConflictError) or exc.status_code == 409 or _message_contains(exc, ("already exists",))
 
 
 def _parse_retry_after_seconds(value: object) -> float | None:
@@ -489,6 +490,15 @@ class DaytonaSandboxProvider(SandboxProvider):
         try:
             inner = await self._daytona.create(params, timeout=request.create_timeout)
         except DaytonaError as exc:
+            # A name conflict means an earlier attempt of this same request
+            # created the sandbox but the response was lost (transport retry),
+            # or a concurrent duplicate won the race. Recover it by name so the
+            # retry doesn't strand an orphan and fail the request on the
+            # conflict — this must hold even when request.reuse is False.
+            if _is_name_conflict_error(exc):
+                existing = await self._find_reusable_sandbox(request.name)
+                if existing is not None:
+                    return DaytonaSandbox(existing)
             raise self._sandbox_error(exc) from exc
 
         return DaytonaSandbox(inner)

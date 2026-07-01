@@ -53,6 +53,13 @@ async def _prepare_and_grade(
             return _error_response(run_id, request.task_id, evaluator_version, chunk.data)
         if isinstance(chunk, StreamResultChunk):
             result = chunk.data
+    if result is None:
+        return _error_response(
+            run_id,
+            request.task_id,
+            evaluator_version,
+            "evaluate_instance completed without a result chunk",
+        )
     return V1EvalResponse(
         run_id=run_id,
         task_id=request.task_id,

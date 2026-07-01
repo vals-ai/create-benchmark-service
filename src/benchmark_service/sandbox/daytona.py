@@ -66,6 +66,7 @@ _TRANSPORT_ERROR_MESSAGES = (
     "[errno 32] broken pipe",
     "[errno 9] bad file descriptor",
     "502 bad gateway",
+    "failed to create sandbox: an unexpected error occurred.",
     "server disconnected",
 )
 _RETRYABLE_DAYTONA_CAUSES = (ClientConnectionError, ConnectionError, TimeoutError)

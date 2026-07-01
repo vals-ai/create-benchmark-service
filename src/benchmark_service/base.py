@@ -317,6 +317,21 @@ class BenchmarkService(ABC):
         """
         ...
 
+    async def prepare_grading_sandbox(
+        self, sandbox: Sandbox, request: EvaluateResponseRequest, dataset: str | None = None
+    ) -> None:
+        """Materialize the submitted artifact into a fresh grading sandbox.
+
+        Called only on the decoupled /v1/evaluate sandbox path (eval_mode() ==
+        SANDBOX), where the sandbox is freshly created and empty. Write
+        request.response to wherever evaluate_instance expects it, e.g.
+        await sandbox.upload_file("/workspace/proof.lean", request.response.encode()).
+        The default raises because a SANDBOX benchmark must implement it.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__}.prepare_grading_sandbox must be implemented for eval_mode() == SANDBOX"
+        )
+
     @abstractmethod
     async def calculate_final_score(
         self, evaluation_results: dict[str, Any], dataset: str | None = None

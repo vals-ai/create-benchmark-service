@@ -26,6 +26,7 @@ from benchmark_service.sandbox import (
     SnapshotSource,
     sandbox_provider_config_from_mapping,
 )
+from benchmark_service.schemas import EvalMode
 
 __all__ = [
     "BenchmarkServiceApp",
@@ -36,6 +37,7 @@ __all__ = [
     "ComposeSource",
     "ComposeSandbox",
     "DaytonaProviderConfig",
+    "EvalMode",
     "ExecResult",
     "ImageSource",
     "InflightMiddleware",

@@ -59,6 +59,7 @@ class SandboxCreateRequest(BaseModel):
     env_vars: dict[str, str]
     auto_stop_interval: int
     create_timeout: int
+    network_block_all: bool = False
 
 
 class SandboxQuery(BaseModel):

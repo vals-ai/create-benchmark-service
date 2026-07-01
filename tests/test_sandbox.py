@@ -1253,3 +1253,28 @@ async def test_daytona_updates_egress_rules() -> None:
         "network_allow_list": "",
         "domain_allow_list": "",
     }
+
+
+class CapturingCreateClient(DaytonaClient):
+    """Forces the create path (get raises NotFound) and captures the params."""
+
+    def __init__(self, sandbox: InnerSandbox) -> None:
+        super().__init__(sandbox)
+        self.create_params: Any = None
+
+    async def get(self, instance_id: str) -> InnerSandbox:
+        raise DaytonaNotFoundError("sandbox not found")
+
+    async def create(self, *args: object, **_kwargs: object) -> InnerSandbox:
+        self.create_params = args[0]
+        self.created = True
+        return self.sandbox
+
+
+async def test_daytona_create_forwards_network_block_all() -> None:
+    daytona = CapturingCreateClient(InnerSandbox())
+    request = _request("grade-sb").model_copy(update={"network_block_all": True})
+
+    await _provider(daytona).create_sandbox(request)
+
+    assert daytona.create_params.network_block_all is True

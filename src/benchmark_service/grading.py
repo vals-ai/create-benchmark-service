@@ -93,7 +93,10 @@ async def grade_instance(
                     timeout_s,
                 )
             finally:
-                await provider.delete_sandbox(sandbox.id)
+                try:
+                    await provider.delete_sandbox(sandbox.id)
+                except Exception:
+                    logger.exception("failed to delete grading sandbox run_id=%s task_id=%s", run_id, request.task_id)
     except TimeoutError:
         logger.warning("grade_instance timed out run_id=%s task_id=%s", run_id, request.task_id)
         return _error_response(run_id, request.task_id, evaluator_version, f"grading exceeded {timeout_s}s timeout")

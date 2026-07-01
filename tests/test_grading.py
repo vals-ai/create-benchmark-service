@@ -215,3 +215,24 @@ async def test_grade_instance_times_out_and_still_deletes_sandbox() -> None:
     assert resp.status == V1EvalStatus.ERROR
     assert any("timeout" in e.lower() for e in resp.errors)
     assert provider.deleted == ["fake-sandbox"]
+
+
+class FailingDeleteProvider(FakeProvider):
+    async def delete_sandbox(self, instance_id: str) -> None:
+        raise RuntimeError("delete failed")
+
+
+async def test_grade_instance_preserves_successful_result_when_delete_fails() -> None:
+    service = await SandboxStub.create()
+    provider = FailingDeleteProvider(FakeSandbox())
+    resp = await _grade(service, provider)
+    assert resp.status == V1EvalStatus.EVALUATED
+    assert resp.result == {"resolved": True, "weighted_pass_percentage": 100.0}
+
+
+async def test_grade_instance_reports_grading_error_when_delete_also_fails() -> None:
+    service = await RaisingStub.create()
+    provider = FailingDeleteProvider(FakeSandbox())
+    resp = await _grade(service, provider)
+    assert resp.status == V1EvalStatus.ERROR
+    assert any("boom" in e for e in resp.errors)

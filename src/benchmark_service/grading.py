@@ -38,6 +38,12 @@ def _error_response(run_id: str, task_id: str, evaluator_version: str | None, me
     )
 
 
+def _missing_grading_hook_message(service: BenchmarkService) -> str | None:
+    if type(service).prepare_grading_sandbox is not BenchmarkService.prepare_grading_sandbox:
+        return None
+    return f"{type(service).__name__}.prepare_grading_sandbox must be implemented for eval_mode() == SANDBOX"
+
+
 async def _prepare_and_grade(
     service: BenchmarkService,
     sandbox: Any,
@@ -81,6 +87,9 @@ async def grade_instance(
     timeout_s: float = DEFAULT_GRADE_TIMEOUT_S,
 ) -> V1EvalResponse:
     try:
+        missing_hook_message = _missing_grading_hook_message(service)
+        if missing_hook_message is not None:
+            return _error_response(run_id, request.task_id, evaluator_version, missing_hook_message)
         task = await service.retrieve_task(request.task_id, dataset=dataset)
         create_request = SandboxCreateRequest(
             source=task.source,

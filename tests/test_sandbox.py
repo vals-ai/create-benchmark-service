@@ -1105,6 +1105,26 @@ async def test_daytona_provider_skips_reuse_when_requested() -> None:
     assert daytona.created is True
 
 
+async def test_daytona_provider_recovers_existing_sandbox_on_create_conflict() -> None:
+    """A lost create response followed by a retry (or a concurrent duplicate)
+    hits a name conflict; the provider must recover the existing sandbox by
+    name — even with reuse=False — instead of failing and orphaning it."""
+    inner = InnerSandbox()
+
+    class ConflictingCreateClient(DaytonaClient):
+        async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
+            self.created = True
+            raise DaytonaError(f"Sandbox with name {inner.name} already exists")
+
+    daytona = ConflictingCreateClient(inner)
+    request = _request(inner.name).model_copy(update={"reuse": False})
+
+    sandbox = await _provider(daytona).create_sandbox(request)
+
+    assert daytona.created is True
+    assert sandbox.id == inner.id
+
+
 async def test_daytona_provider_delete_sets_autostop_before_delete() -> None:
     inner = InnerSandbox()
     daytona = DaytonaClient(inner)

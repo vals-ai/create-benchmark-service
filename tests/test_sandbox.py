@@ -672,6 +672,16 @@ async def test_daytona_provider_reuses_started_sandbox() -> None:
     assert daytona.created is False
 
 
+async def test_daytona_provider_skips_reuse_when_requested() -> None:
+    inner = InnerSandbox()
+    daytona = DaytonaClient(inner)
+    request = _request(inner.name).model_copy(update={"reuse": False})
+
+    await _provider(daytona).create_sandbox(request)
+
+    assert daytona.created is True
+
+
 async def test_daytona_provider_delete_sets_autostop_before_delete() -> None:
     inner = InnerSandbox()
     daytona = DaytonaClient(inner)

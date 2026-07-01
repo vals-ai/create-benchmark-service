@@ -18,8 +18,13 @@ SUBMISSION_ARTIFACT_KEY_PREFIX = "submission-artifacts"
 _KEY_SEGMENT_RE = re.compile(KEY_SEGMENT_PATTERN)
 
 
+class _StreamingBody(Protocol):
+    def read(self) -> bytes: ...
+
+
 class _S3Client(Protocol):
     def generate_presigned_url(self, op: str, *, Params: dict[str, str], ExpiresIn: int) -> str: ...
+    def get_object(self, *, Bucket: str, Key: str) -> dict[str, object]: ...
 
 
 def is_configured() -> bool:
@@ -82,3 +87,16 @@ def presigned_put_url(key: str, *, expires_in: int = DEFAULT_UPLOAD_EXPIRY_S) ->
         ExpiresIn=expires_in,
     )
     return url
+
+
+def download(key: str) -> bytes:
+    """Fetch an uploaded artifact's bytes for server-side grading.
+
+    A direct authenticated read; unlike the upload side, no presigning is
+    needed since the service itself (not a lab's agent process) performs
+    this call.
+    """
+    bucket = _artifact_bucket()
+    response = _s3_client().get_object(Bucket=bucket, Key=key)
+    body = cast(_StreamingBody, response["Body"])
+    return body.read()

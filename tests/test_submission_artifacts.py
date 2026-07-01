@@ -87,3 +87,40 @@ def test_require_configured_allows_fully_unset(monkeypatch: pytest.MonkeyPatch) 
     monkeypatch.delenv("SUBMISSION_ARTIFACT_BUCKET", raising=False)
     monkeypatch.delenv("AWS_REGION", raising=False)
     submission_artifacts.require_configured()
+
+
+def test_download_returns_object_bytes(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SUBMISSION_ARTIFACT_BUCKET", "vals-submission-artifacts")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    submission_artifacts._s3_client.cache_clear()  # pyright: ignore[reportPrivateUsage]
+    captured: dict[str, object] = {}
+
+    class _FakeBody:
+        def read(self) -> bytes:
+            return b"artifact-bytes"
+
+    class _FakeS3:
+        def get_object(self, *, Bucket: str, Key: str) -> dict[str, object]:
+            captured.update(Bucket=Bucket, Key=Key)
+            return {"Body": _FakeBody()}
+
+    def fake_client(service: str, **kwargs: object) -> _FakeS3:
+        assert service == "s3"
+        return _FakeS3()
+
+    monkeypatch.setattr(submission_artifacts.boto3, "client", fake_client)
+    try:
+        body = submission_artifacts.download("submission-artifacts/run-1/task-9/submission.xlsx")
+    finally:
+        submission_artifacts._s3_client.cache_clear()  # pyright: ignore[reportPrivateUsage]
+    assert body == b"artifact-bytes"
+    assert captured == {
+        "Bucket": "vals-submission-artifacts",
+        "Key": "submission-artifacts/run-1/task-9/submission.xlsx",
+    }
+
+
+def test_download_requires_bucket(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("SUBMISSION_ARTIFACT_BUCKET", raising=False)
+    with pytest.raises(RuntimeError, match="SUBMISSION_ARTIFACT_BUCKET"):
+        submission_artifacts.download("k")

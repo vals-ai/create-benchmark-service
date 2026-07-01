@@ -19,8 +19,10 @@ from websockets.exceptions import ConnectionClosed
 from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import LEGACY_TENANT_SENTINEL, get_auth_settings, get_tenant_config, load_allowlist
 from benchmark_service.base import BenchmarkService
+from benchmark_service.grading import grade_instance
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.schemas import (
+    EvalMode,
     EvaluateInstanceRequest,
     EvaluateResponseRequest,
     FinalScoreRequest,
@@ -106,6 +108,15 @@ def _request_sandbox_provider_config(
     websocket: WebSocket,
 ) -> SandboxProviderConfig:
     return request.sandbox_provider or DaytonaProviderConfig.from_headers(websocket.headers)
+
+
+def _grading_sandbox_config() -> SandboxProviderConfig:
+    """Server-side sandbox creds for the /v1/evaluate SANDBOX path.
+
+    Resolved from the service environment, never from caller-supplied headers or
+    request body — the lab must not control the grading sandbox target.
+    """
+    return DaytonaProviderConfig.from_env()
 
 
 def _get_service_metadata(service_cls: type[BenchmarkService]) -> tuple[str | None, str | None]:
@@ -399,26 +410,36 @@ class BenchmarkServiceApp(FastAPI):
             response=body.payload.data,
             dataset=body.dataset,
         )
-        try:
-            raw_result = await self.service.evaluate_response(internal_req, dataset=body.dataset)
-        except Exception as exc:  # noqa: BLE001
-            logger.exception("v1/evaluate failed for run_id=%s task_id=%s", body.run_id, body.task_id)
-            response = V1EvalResponse(
+        if self.service.eval_mode() == EvalMode.SANDBOX:
+            response = await grade_instance(
+                service=self.service,
                 run_id=body.run_id,
-                task_id=body.task_id,
-                status=V1EvalStatus.ERROR,
+                request=internal_req,
+                sandbox_config=_grading_sandbox_config(),
                 evaluator_version=self._service_version,
-                errors=[str(exc)],
+                dataset=body.dataset,
             )
         else:
-            response = V1EvalResponse(
-                run_id=body.run_id,
-                task_id=body.task_id,
-                status=V1EvalStatus.EVALUATED,
-                evaluator_version=self._service_version,
-                result=jsonable_encoder(raw_result),
-                errors=[],
-            )
+            try:
+                raw_result = await self.service.evaluate_response(internal_req, dataset=body.dataset)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("v1/evaluate failed for run_id=%s task_id=%s", body.run_id, body.task_id)
+                response = V1EvalResponse(
+                    run_id=body.run_id,
+                    task_id=body.task_id,
+                    status=V1EvalStatus.ERROR,
+                    evaluator_version=self._service_version,
+                    errors=[str(exc)],
+                )
+            else:
+                response = V1EvalResponse(
+                    run_id=body.run_id,
+                    task_id=body.task_id,
+                    status=V1EvalStatus.EVALUATED,
+                    evaluator_version=self._service_version,
+                    result=jsonable_encoder(raw_result),
+                    errors=[],
+                )
         if _is_trial_tenant(request.state.tenant):
             return sanitize_v1_eval_response(response, self.service.project_trial_result)
         return response

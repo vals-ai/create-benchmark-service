@@ -1,12 +1,18 @@
 """Tests for sandbox-graded /v1/evaluate (eval_mode == SANDBOX)."""
 
 import asyncio
-from collections.abc import AsyncGenerator
+import json
+from collections.abc import AsyncGenerator, Generator
 from typing import Any
+from unittest.mock import patch
 
 import pytest
+from fastapi.testclient import TestClient
 
 from benchmark_service import ImageSource, Resources, Sandbox
+from benchmark_service import auth as auth_module
+from benchmark_service.app import BenchmarkServiceApp
+from benchmark_service.auth import clear_allowlist_cache, clear_auth_cache
 from benchmark_service.grading import grade_instance
 from benchmark_service.sandbox import SandboxCreateRequest, SandboxProvider
 from benchmark_service.sandbox.types import ExecResult
@@ -236,3 +242,48 @@ async def test_grade_instance_reports_grading_error_when_delete_also_fails() -> 
     resp = await _grade(service, provider)
     assert resp.status == V1EvalStatus.ERROR
     assert any("boom" in e for e in resp.errors)
+
+
+@pytest.fixture
+def sandbox_descope_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
+    clear_allowlist_cache()
+    clear_auth_cache()
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
+    monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
+    monkeypatch.setenv(
+        "DESCOPE_TENANT_ALLOWLIST_JSON",
+        json.dumps({"tenants": {"acme": {"datasets": ["default"]}}}),
+    )
+    app = BenchmarkServiceApp(SandboxStub)
+    app._service_version = "stub-service-1.0"  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(
+        "benchmark_service.app._grading_sandbox_config",
+        lambda: FakeProviderConfig(FakeProvider(FakeSandbox())),
+    )
+
+    async def _stub_exchange(_project_id: str, _access_key: str) -> dict[str, dict[str, dict[str, str]]]:
+        return {"tenants": {"acme": {}}}
+
+    with patch.object(auth_module, "_exchange_descope_access_key", _stub_exchange):
+        with TestClient(app) as client:
+            yield client
+
+
+def test_v1_evaluate_dispatches_sandbox_mode_to_grade_instance(sandbox_descope_client: TestClient) -> None:
+    resp = sandbox_descope_client.post(
+        "/v1/evaluate",
+        json={
+            "run_id": "external-run-1",
+            "task_id": "task-1",
+            "dataset": "default",
+            "payload": {"type": "text", "schema": "stub.text.v1", "data": "2"},
+        },
+        headers={"x-descope-api-key": "key-acme"},
+    )
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["status"] == "evaluated"
+    # weighted_pass_percentage is produced only by the SANDBOX path's evaluate_instance,
+    # so its presence proves dispatch routed to grade_instance (not evaluate_response).
+    assert body["result"] == {"resolved": True, "weighted_pass_percentage": 100.0}
+    assert body["evaluator_version"] == "stub-service-1.0"

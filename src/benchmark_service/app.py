@@ -7,7 +7,7 @@ import re
 import traceback
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
-from typing import Any
+from typing import Any, cast
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.encoders import jsonable_encoder
@@ -91,7 +91,7 @@ def _is_trial_tenant(tenant: str | None) -> bool:
 
 # Lab-facing /v1 endpoints a trial tenant may reach. Deny-by-default: add new
 # trial-accessible endpoints here so they don't silently auto-expose.
-_TRIAL_ALLOWED_PATH = re.compile(r"/v1/(?:evaluate|score|datasets/[^/]+/tasks)")
+_TRIAL_ALLOWED_PATH = re.compile(r"/v1/(?:evaluate|score|submissions/upload-url|datasets/[^/]+/tasks)")
 
 
 def _trial_tenant_may_access_path(path: str) -> bool:
@@ -416,8 +416,17 @@ class BenchmarkServiceApp(FastAPI):
     async def _v1_submission_upload_url(
         self, request: Request, body: V1UploadUrlRequest
     ) -> V1UploadUrlResponse:
-        _require_descope_tenant(request.state.tenant)
-        key = lab_artifacts.submission_key(body.run_id, body.task_id, body.filename)
+        tenant = cast(str, request.state.tenant)
+        _require_descope_tenant(tenant)
+        if not await self.service.check_dataset_access(tenant, body.dataset):
+            raise HTTPException(status_code=403, detail="Dataset not allowed")
+        key = lab_artifacts.submission_key(
+            tenant=tenant,
+            dataset=body.dataset or "default",
+            run_id=body.run_id,
+            task_id=body.task_id,
+            filename=body.filename,
+        )
         return V1UploadUrlResponse(
             key=key,
             url=lab_artifacts.presigned_put_url(key),

@@ -57,6 +57,7 @@ class V1EvalResponse(BaseModel):
 class V1UploadUrlRequest(BaseModel):
     run_id: str
     task_id: str
+    dataset: str | None = None
     filename: str
 
 

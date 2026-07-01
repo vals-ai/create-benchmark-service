@@ -57,7 +57,6 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
             "/retrieve-task/",
             {
                 "source": {"type": "image", "image": "python:3.12"},
-                "generation_image": None,
                 "docker_image": "python:3.12",
                 "problem_path": "/tmp/problem_statement.txt",
                 "cwd": "/work",

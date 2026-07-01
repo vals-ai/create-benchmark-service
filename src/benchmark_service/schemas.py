@@ -6,7 +6,7 @@ from typing import Any, Literal, cast
 from pydantic import BaseModel, Field, computed_field, model_validator
 
 from benchmark_service.sandbox import SandboxProviderConfig
-from benchmark_service.sandbox.types import ImageSource, Resources, SandboxSource, SnapshotSource
+from benchmark_service.sandbox.types import Resources, SandboxSource, SnapshotSource
 
 
 class TaskFilter(BaseModel):
@@ -50,9 +50,6 @@ class RetrieveTaskResponse(BaseModel):
     """
 
     source: SandboxSource = Field(description="Sandbox source image or snapshot")
-    generation_image: ImageSource | None = Field(
-        default=None, description="Lab-facing per-task image for manifest generation, distinct from source"
-    )
     problem_path: str = Field(
         description="Path inside the sandbox where the problem statement file will be written during setup"
     )

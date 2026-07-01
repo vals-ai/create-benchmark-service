@@ -1,5 +1,6 @@
 """Request and response models for the benchmark service API."""
 
+from enum import StrEnum
 from typing import Any, Literal, cast
 
 from pydantic import BaseModel, Field, computed_field, model_validator
@@ -164,6 +165,19 @@ class HealthCheckResponse(BaseModel):
     status: str = Field(description="Status of the service ('ok' if running)")
 
 
+class EvalMode(StrEnum):
+    """How a benchmark is evaluated on /v1/evaluate.
+
+    TEXT: the endpoint calls evaluate_response in-process.
+    SANDBOX: the endpoint provisions a fresh grading sandbox, calls
+    prepare_grading_sandbox to inject the submitted artifact, then runs
+    evaluate_instance. Informational on /version; the server dispatches.
+    """
+
+    TEXT = "text"
+    SANDBOX = "sandbox"
+
+
 class VersionResponse(BaseModel):
     """Response for GET /version reporting framework + deployed-service version."""
 
@@ -171,6 +185,7 @@ class VersionResponse(BaseModel):
     service_name: str | None = None
     service_version: str | None = None
     dataset_version: str | None = None
+    eval_mode: EvalMode = EvalMode.TEXT
 
 
 class StreamMessageChunk(BaseModel):

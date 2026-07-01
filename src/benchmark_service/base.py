@@ -19,6 +19,7 @@ from benchmark_service.auth import (
 from benchmark_service.dataset_versioning import DatasetVersionEntry, load_dataset_versions
 from benchmark_service.sandbox import Sandbox
 from benchmark_service.schemas import (
+    EvalMode,
     EvaluateResponseRequest,
     FinalScoreResult,
     RetrieveTaskResponse,
@@ -113,6 +114,15 @@ class BenchmarkService(ABC):
         this returns None.
         """
         return None
+
+    def eval_mode(self) -> EvalMode:
+        """Declare how this benchmark is evaluated on /v1/evaluate.
+
+        Override to return EvalMode.SANDBOX for benchmarks that must execute the
+        submitted artifact in a sandbox (and implement prepare_grading_sandbox).
+        Defaults to EvalMode.TEXT.
+        """
+        return EvalMode.TEXT
 
     def get_dataset_version(self, dataset: str | None = None) -> str | None:
         """Return the version for `dataset`, if this benchmark tracks one."""

@@ -13,6 +13,7 @@ from benchmark_service import Sandbox
 from benchmark_service.app import BenchmarkServiceApp, _get_service_metadata  # pyright: ignore[reportPrivateUsage]
 from benchmark_service.base import BenchmarkService
 from benchmark_service.schemas import (
+    EvalMode,
     EvaluateResponseRequest,
     FinalScoreResult,
     RetrieveTaskResponse,
@@ -126,3 +127,24 @@ def test_version_endpoint_reports_tracked_dataset_version(tmp_path: Path) -> Non
 
     assert response.status_code == 200
     assert response.json()["dataset_version"] == "1.0.0"
+
+
+class _SandboxModeService(_FakeService):
+    def eval_mode(self) -> EvalMode:
+        return EvalMode.SANDBOX
+
+
+def test_version_reports_text_eval_mode_by_default() -> None:
+    app = BenchmarkServiceApp(_FakeService)
+    with TestClient(app) as client:
+        response = client.get("/version")
+    assert response.status_code == 200
+    assert response.json()["eval_mode"] == "text"
+
+
+def test_version_reports_sandbox_eval_mode_when_overridden() -> None:
+    app = BenchmarkServiceApp(_SandboxModeService)
+    with TestClient(app) as client:
+        response = client.get("/version")
+    assert response.status_code == 200
+    assert response.json()["eval_mode"] == "sandbox"

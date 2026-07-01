@@ -7,7 +7,7 @@ import re
 import traceback
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager, suppress
-from typing import Any
+from typing import Any, cast
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.encoders import jsonable_encoder
@@ -42,6 +42,7 @@ from benchmark_service.trial import (
     sanitize_v1_eval_response,
     sanitize_v1_score_response,
 )
+from benchmark_service import submission_artifacts
 from benchmark_service.v1_schemas import (
     V1DatasetTasksResponse,
     V1EvalRequest,
@@ -51,6 +52,8 @@ from benchmark_service.v1_schemas import (
     V1ScoreItem,
     V1ScoreRequest,
     V1ScoreResponse,
+    V1UploadUrlRequest,
+    V1UploadUrlResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -90,6 +93,9 @@ def _is_trial_tenant(tenant: str | None) -> bool:
 
 # Lab-facing /v1 endpoints a trial tenant may reach. Deny-by-default: add new
 # trial-accessible endpoints here so they don't silently auto-expose.
+# submissions/upload-url is deliberately absent: minting is unmetered and a
+# presigned PUT can't cap object size or upload count, so trial tenants don't
+# get it until quota/one-shot semantics exist.
 _TRIAL_ALLOWED_PATH = re.compile(r"/v1/(?:evaluate|score|datasets/[^/]+/tasks)")
 
 
@@ -157,6 +163,12 @@ class BenchmarkServiceApp(FastAPI):
         async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
             if get_auth_settings().auth_required:
                 load_allowlist()
+            submission_artifacts.require_configured()
+            if not submission_artifacts.is_configured():
+                logger.warning(
+                    f"{submission_artifacts.SUBMISSION_ARTIFACT_BUCKET_ENV} is not set; "
+                    "POST /v1/submissions/upload-url will return 503"
+                )
             self.service = await service_cls.create()
             yield
 
@@ -194,6 +206,12 @@ class BenchmarkServiceApp(FastAPI):
         self.add_api_route("/final-score/", self._final_score, methods=["POST"])
         self.add_api_route("/v1/evaluate", self._v1_evaluate, methods=["POST"], response_model=V1EvalResponse)
         self.add_api_route("/v1/score", self._v1_score, methods=["POST"], response_model=V1ScoreResponse)
+        self.add_api_route(
+            "/v1/submissions/upload-url",
+            self._v1_submission_upload_url,
+            methods=["POST"],
+            response_model=V1UploadUrlResponse,
+        )
         self.add_api_route(
             "/v1/datasets/{dataset}/tasks",
             self._v1_list_dataset_tasks,
@@ -437,6 +455,36 @@ class BenchmarkServiceApp(FastAPI):
         if _is_trial_tenant(request.state.tenant):
             return sanitize_v1_eval_response(response, self.service.project_trial_result)
         return response
+
+    async def _v1_submission_upload_url(
+        self, request: Request, body: V1UploadUrlRequest
+    ) -> V1UploadUrlResponse:
+        tenant = cast(str, request.state.tenant)
+        _require_descope_tenant(tenant)
+        if not submission_artifacts.is_configured():
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Submission uploads are not configured on this deployment; "
+                    f"set {submission_artifacts.SUBMISSION_ARTIFACT_BUCKET_ENV} and "
+                    f"{submission_artifacts.SUBMISSION_ARTIFACT_REGION_ENV}"
+                ),
+            )
+        if not await self.service.check_dataset_access(tenant, body.dataset):
+            raise HTTPException(status_code=403, detail="Dataset not allowed")
+        await self.service.validate_task_ids([body.task_id], dataset=body.dataset)
+        key = submission_artifacts.submission_key(
+            tenant=tenant,
+            dataset=body.dataset or "default",
+            run_id=body.run_id,
+            task_id=body.task_id,
+            filename=body.filename,
+        )
+        return V1UploadUrlResponse(
+            key=key,
+            url=submission_artifacts.presigned_put_url(key),
+            expires_in=submission_artifacts.DEFAULT_UPLOAD_EXPIRY_S,
+        )
 
     async def _v1_score(self, request: Request, body: V1ScoreRequest) -> V1ScoreResponse:
         _require_descope_tenant(request.state.tenant)

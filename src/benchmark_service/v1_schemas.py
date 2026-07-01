@@ -8,9 +8,15 @@ fields. Both surfaces share scoring handlers in `app.py`.
 """
 
 from enum import StrEnum
-from typing import Any
+from typing import Annotated, Any
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints
+
+# One rule for every value that becomes an S3 object-key segment: rules out
+# separators, `.`/`..`, empties, and unbounded length (S3 keys cap at 1024
+# bytes) at the schema boundary instead of inside key construction.
+KEY_SEGMENT_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+KeySegment = Annotated[str, StringConstraints(pattern=KEY_SEGMENT_PATTERN)]
 
 
 class V1PayloadType(StrEnum):
@@ -52,6 +58,19 @@ class V1EvalResponse(BaseModel):
     evaluator_version: str | None = None
     result: Any | None = None
     errors: list[str] = Field(default_factory=list)
+
+
+class V1UploadUrlRequest(BaseModel):
+    run_id: KeySegment
+    task_id: KeySegment
+    dataset: KeySegment | None = None
+    filename: KeySegment
+
+
+class V1UploadUrlResponse(BaseModel):
+    key: str
+    url: str
+    expires_in: int
 
 
 class V1ScoreItem(BaseModel):
@@ -113,5 +132,7 @@ __all__ = [
     "V1ScoreRequest",
     "V1ScoreResponse",
     "V1Task",
+    "V1UploadUrlRequest",
+    "V1UploadUrlResponse",
     "V1Versions",
 ]

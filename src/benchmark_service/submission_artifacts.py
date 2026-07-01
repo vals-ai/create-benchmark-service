@@ -1,4 +1,4 @@
-"""Lab artifact object-storage helpers (presigned uploads for decoupled eval)."""
+"""Submission artifact object-storage helpers."""
 
 import os
 from pathlib import PurePosixPath
@@ -17,7 +17,7 @@ class _S3Client(Protocol):
 def _artifact_bucket() -> str:
     bucket = os.environ.get("LAB_ARTIFACT_BUCKET")
     if not bucket:
-        raise RuntimeError("LAB_ARTIFACT_BUCKET is not set; the deployment must configure the lab artifact bucket")
+        raise RuntimeError("LAB_ARTIFACT_BUCKET is not set; the deployment must configure the submission artifact bucket")
     return bucket
 
 

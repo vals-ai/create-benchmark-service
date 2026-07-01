@@ -40,7 +40,7 @@ from benchmark_service.trial import (
     sanitize_v1_eval_response,
     sanitize_v1_score_response,
 )
-from benchmark_service import lab_artifacts
+from benchmark_service import submission_artifacts
 from benchmark_service.v1_schemas import (
     V1DatasetTasksResponse,
     V1EvalRequest,
@@ -420,7 +420,7 @@ class BenchmarkServiceApp(FastAPI):
         _require_descope_tenant(tenant)
         if not await self.service.check_dataset_access(tenant, body.dataset):
             raise HTTPException(status_code=403, detail="Dataset not allowed")
-        key = lab_artifacts.submission_key(
+        key = submission_artifacts.submission_key(
             tenant=tenant,
             dataset=body.dataset or "default",
             run_id=body.run_id,
@@ -429,8 +429,8 @@ class BenchmarkServiceApp(FastAPI):
         )
         return V1UploadUrlResponse(
             key=key,
-            url=lab_artifacts.presigned_put_url(key),
-            expires_in=lab_artifacts.DEFAULT_UPLOAD_EXPIRY_S,
+            url=submission_artifacts.presigned_put_url(key),
+            expires_in=submission_artifacts.DEFAULT_UPLOAD_EXPIRY_S,
         )
 
     async def _v1_score(self, request: Request, body: V1ScoreRequest) -> V1ScoreResponse:

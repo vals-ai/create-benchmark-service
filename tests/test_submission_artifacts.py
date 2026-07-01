@@ -1,10 +1,10 @@
 import pytest
 
-from benchmark_service import lab_artifacts
+from benchmark_service import submission_artifacts
 
 
 def test_submission_key_is_namespaced_by_tenant_dataset_run_and_task() -> None:
-    key = lab_artifacts.submission_key(
+    key = submission_artifacts.submission_key(
         tenant="acme",
         dataset="default",
         run_id="run-1",
@@ -15,7 +15,7 @@ def test_submission_key_is_namespaced_by_tenant_dataset_run_and_task() -> None:
 
 
 def test_submission_key_encodes_non_separator_segments() -> None:
-    key = lab_artifacts.submission_key(
+    key = submission_artifacts.submission_key(
         tenant="acme corp",
         dataset="default",
         run_id="run 1",
@@ -27,7 +27,7 @@ def test_submission_key_encodes_non_separator_segments() -> None:
 
 def test_submission_key_rejects_path_like_filename() -> None:
     with pytest.raises(ValueError, match="filename"):
-        lab_artifacts.submission_key(
+        submission_artifacts.submission_key(
             tenant="acme",
             dataset="default",
             run_id="run-1",
@@ -49,8 +49,8 @@ def test_presigned_put_url_uses_configured_bucket_and_key(monkeypatch: pytest.Mo
         assert service == "s3"
         return _FakeS3()
 
-    monkeypatch.setattr(lab_artifacts.boto3, "client", fake_client)
-    url = lab_artifacts.presigned_put_url("lab-submissions/run-1/task-9/submission.xlsx")
+    monkeypatch.setattr(submission_artifacts.boto3, "client", fake_client)
+    url = submission_artifacts.presigned_put_url("lab-submissions/run-1/task-9/submission.xlsx")
     assert url == "https://signed.example/put"
     assert captured["op"] == "put_object"
     assert captured["Params"] == {
@@ -62,4 +62,4 @@ def test_presigned_put_url_uses_configured_bucket_and_key(monkeypatch: pytest.Mo
 def test_presigned_put_url_requires_bucket(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("LAB_ARTIFACT_BUCKET", raising=False)
     with pytest.raises(RuntimeError, match="LAB_ARTIFACT_BUCKET"):
-        lab_artifacts.presigned_put_url("k")
+        submission_artifacts.presigned_put_url("k")

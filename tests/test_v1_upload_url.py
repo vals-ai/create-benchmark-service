@@ -8,7 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from benchmark_service import auth as auth_module
-from benchmark_service import lab_artifacts
+from benchmark_service import submission_artifacts
 from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.auth import clear_allowlist_cache, clear_auth_cache
 from tests.conftest import StubBenchmark
@@ -18,11 +18,11 @@ def _install_signed_url_stub(monkeypatch: pytest.MonkeyPatch) -> None:
     def fake_presigned_put_url(
         key: str,
         *,
-        expires_in: int = lab_artifacts.DEFAULT_UPLOAD_EXPIRY_S,
+        expires_in: int = submission_artifacts.DEFAULT_UPLOAD_EXPIRY_S,
     ) -> str:
         return f"https://signed.example/{key}?expires={expires_in}"
 
-    monkeypatch.setattr(lab_artifacts, "presigned_put_url", fake_presigned_put_url)
+    monkeypatch.setattr(submission_artifacts, "presigned_put_url", fake_presigned_put_url)
 
 
 def _descope_client(
@@ -78,7 +78,7 @@ def test_upload_url_returns_namespaced_key_and_signed_url(descope_client: TestCl
     body = resp.json()
     assert body["key"] == "lab-submissions/acme/default/run-1/task-9/submission.xlsx"
     assert body["url"] == "https://signed.example/lab-submissions/acme/default/run-1/task-9/submission.xlsx?expires=3600"
-    assert body["expires_in"] == lab_artifacts.DEFAULT_UPLOAD_EXPIRY_S
+    assert body["expires_in"] == submission_artifacts.DEFAULT_UPLOAD_EXPIRY_S
 
 
 def test_upload_url_rejects_unauthorized_dataset(descope_client: TestClient) -> None:

@@ -6,7 +6,7 @@ from typing import Any, Literal, cast
 from pydantic import BaseModel, Field, computed_field, model_validator
 
 from benchmark_service.sandbox import SandboxProviderConfig
-from benchmark_service.sandbox.types import ImageSource, Resources, SandboxSource, SnapshotSource
+from benchmark_service.sandbox.types import Resources, SandboxSource, SnapshotSource
 
 _COMPOSE_LEGACY_DOCKER_IMAGE = "compose+source-required"
 

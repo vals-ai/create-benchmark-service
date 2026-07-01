@@ -35,7 +35,7 @@ from benchmark_service.schemas import (
     VerifyTaskIdsResponse,
     VersionResponse,
 )
-from benchmark_service.sandbox import SandboxProviderConfig
+from benchmark_service.sandbox import MissingSandboxConfigError, SandboxProviderConfig
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.trial import (
     sanitize_v1_dataset_tasks_response,
@@ -393,11 +393,23 @@ class BenchmarkServiceApp(FastAPI):
             dataset=body.dataset,
         )
         if self.service.eval_mode() == EvalMode.SANDBOX:
+            try:
+                sandbox_config = _grading_sandbox_config()
+            except MissingSandboxConfigError as exc:
+                logger.exception(
+                    "v1/evaluate sandbox grading config missing run_id=%s task_id=%s",
+                    body.run_id,
+                    body.task_id,
+                )
+                raise HTTPException(
+                    status_code=503,
+                    detail="Grading sandbox is not configured; contact the benchmark service owner.",
+                ) from exc
             response = await grade_instance(
                 service=self.service,
                 run_id=body.run_id,
                 request=internal_req,
-                sandbox_config=_grading_sandbox_config(),
+                sandbox_config=sandbox_config,
                 evaluator_version=self._service_version,
                 dataset=body.dataset,
             )

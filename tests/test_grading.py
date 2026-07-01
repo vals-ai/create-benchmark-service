@@ -155,6 +155,14 @@ class SlowStub(SandboxStub):
         yield StreamResultChunk(type="result", data={"resolved": True})
 
 
+class NoResultStub(SandboxStub):
+    async def evaluate_instance(  # type: ignore[override]
+        self, task_id: str, sandbox: Sandbox, dataset: str | None = None
+    ) -> AsyncGenerator[StreamChunk, None]:
+        return
+        yield  # pragma: no cover
+
+
 def _req() -> EvaluateResponseRequest:
     return EvaluateResponseRequest(task_id="task-1", response="2", dataset="default")
 
@@ -224,6 +232,16 @@ async def test_grade_instance_times_out_and_still_deletes_sandbox() -> None:
     assert provider.deleted == ["fake-sandbox"]
 
 
+async def test_grade_instance_maps_missing_result_chunk_to_error() -> None:
+    service = await NoResultStub.create()
+    provider = FakeProvider(FakeSandbox())
+    resp = await _grade(service, provider)
+    assert resp.status == V1EvalStatus.ERROR
+    assert resp.result is None
+    assert resp.errors == ["evaluate_instance completed without a result chunk"]
+    assert provider.deleted == ["fake-sandbox"]
+
+
 class FailingDeleteProvider(FakeProvider):
     async def delete_sandbox(self, instance_id: str) -> None:
         raise RuntimeError("delete failed")
@@ -288,3 +306,39 @@ def test_v1_evaluate_dispatches_sandbox_mode_to_grade_instance(sandbox_descope_c
     # so its presence proves dispatch routed to grade_instance (not evaluate_response).
     assert body["result"] == {"resolved": True, "weighted_pass_percentage": 100.0}
     assert body["evaluator_version"] == "stub-service-1.0"
+
+
+def test_v1_evaluate_sandbox_mode_missing_server_sandbox_env_returns_503(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clear_allowlist_cache()
+    clear_auth_cache()
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
+    monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
+    monkeypatch.setenv(
+        "DESCOPE_TENANT_ALLOWLIST_JSON",
+        json.dumps({"tenants": {"acme": {"datasets": ["default"]}}}),
+    )
+    monkeypatch.delenv("DAYTONA_API_KEY", raising=False)
+    monkeypatch.delenv("DAYTONA_API_URL", raising=False)
+    monkeypatch.delenv("DAYTONA_TARGET", raising=False)
+    app = BenchmarkServiceApp(SandboxStub)
+
+    async def _stub_exchange(_project_id: str, _access_key: str) -> dict[str, dict[str, dict[str, str]]]:
+        return {"tenants": {"acme": {}}}
+
+    with patch.object(auth_module, "_exchange_descope_access_key", _stub_exchange):
+        with TestClient(app) as client:
+            resp = client.post(
+                "/v1/evaluate",
+                json={
+                    "run_id": "external-run-1",
+                    "task_id": "task-1",
+                    "dataset": "default",
+                    "payload": {"type": "text", "schema": "stub.text.v1", "data": "2"},
+                },
+                headers={"x-descope-api-key": "key-acme"},
+            )
+
+    assert resp.status_code == 503
+    assert resp.json() == {"detail": "Grading sandbox is not configured; contact the benchmark service owner."}

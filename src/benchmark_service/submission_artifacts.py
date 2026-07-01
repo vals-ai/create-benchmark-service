@@ -8,6 +8,8 @@ from urllib.parse import quote
 import boto3
 
 DEFAULT_UPLOAD_EXPIRY_S = 3600
+SUBMISSION_ARTIFACT_BUCKET_ENV = "SUBMISSION_ARTIFACT_BUCKET"
+SUBMISSION_ARTIFACT_KEY_PREFIX = "submission-artifacts"
 
 
 class _S3Client(Protocol):
@@ -15,9 +17,11 @@ class _S3Client(Protocol):
 
 
 def _artifact_bucket() -> str:
-    bucket = os.environ.get("LAB_ARTIFACT_BUCKET")
+    bucket = os.environ.get(SUBMISSION_ARTIFACT_BUCKET_ENV)
     if not bucket:
-        raise RuntimeError("LAB_ARTIFACT_BUCKET is not set; the deployment must configure the submission artifact bucket")
+        raise RuntimeError(
+            f"{SUBMISSION_ARTIFACT_BUCKET_ENV} is not set; the deployment must configure the submission artifact bucket"
+        )
     return bucket
 
 
@@ -41,7 +45,7 @@ def submission_key(*, tenant: str, dataset: str, run_id: str, task_id: str, file
     """Object key for a submitted artifact."""
     return "/".join(
         [
-            "lab-submissions",
+            SUBMISSION_ARTIFACT_KEY_PREFIX,
             _key_segment(tenant, "tenant"),
             _key_segment(dataset, "dataset"),
             _key_segment(run_id, "run_id"),

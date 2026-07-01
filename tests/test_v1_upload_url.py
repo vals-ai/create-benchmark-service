@@ -76,8 +76,8 @@ def test_upload_url_returns_namespaced_key_and_signed_url(descope_client: TestCl
     )
     assert resp.status_code == 200
     body = resp.json()
-    assert body["key"] == "lab-submissions/acme/default/run-1/task-9/submission.xlsx"
-    assert body["url"] == "https://signed.example/lab-submissions/acme/default/run-1/task-9/submission.xlsx?expires=3600"
+    assert body["key"] == "submission-artifacts/acme/default/run-1/task-9/submission.xlsx"
+    assert body["url"] == "https://signed.example/submission-artifacts/acme/default/run-1/task-9/submission.xlsx?expires=3600"
     assert body["expires_in"] == submission_artifacts.DEFAULT_UPLOAD_EXPIRY_S
 
 
@@ -97,7 +97,7 @@ def test_trial_tenant_can_request_upload_url(trial_client: TestClient) -> None:
         headers={"x-descope-api-key": "trial-key"},
     )
     assert resp.status_code == 200
-    assert resp.json()["key"] == "lab-submissions/trial/default/run-1/task-9/submission.xlsx"
+    assert resp.json()["key"] == "submission-artifacts/trial/default/run-1/task-9/submission.xlsx"
 
 
 def test_upload_url_requires_auth(descope_client: TestClient) -> None:

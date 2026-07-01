@@ -11,7 +11,7 @@ def test_submission_key_is_namespaced_by_tenant_dataset_run_and_task() -> None:
         task_id="task-9",
         filename="submission.xlsx",
     )
-    assert key == "lab-submissions/acme/default/run-1/task-9/submission.xlsx"
+    assert key == "submission-artifacts/acme/default/run-1/task-9/submission.xlsx"
 
 
 def test_submission_key_encodes_non_separator_segments() -> None:
@@ -22,7 +22,7 @@ def test_submission_key_encodes_non_separator_segments() -> None:
         task_id="task/9",
         filename="submission #1.xlsx",
     )
-    assert key == "lab-submissions/acme%20corp/default/run%201/task%2F9/submission%20%231.xlsx"
+    assert key == "submission-artifacts/acme%20corp/default/run%201/task%2F9/submission%20%231.xlsx"
 
 
 def test_submission_key_rejects_path_like_filename() -> None:
@@ -37,7 +37,7 @@ def test_submission_key_rejects_path_like_filename() -> None:
 
 
 def test_presigned_put_url_uses_configured_bucket_and_key(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("LAB_ARTIFACT_BUCKET", "vals-lab-artifacts")
+    monkeypatch.setenv("SUBMISSION_ARTIFACT_BUCKET", "vals-submission-artifacts")
     captured: dict[str, object] = {}
 
     class _FakeS3:
@@ -50,16 +50,16 @@ def test_presigned_put_url_uses_configured_bucket_and_key(monkeypatch: pytest.Mo
         return _FakeS3()
 
     monkeypatch.setattr(submission_artifacts.boto3, "client", fake_client)
-    url = submission_artifacts.presigned_put_url("lab-submissions/run-1/task-9/submission.xlsx")
+    url = submission_artifacts.presigned_put_url("submission-artifacts/run-1/task-9/submission.xlsx")
     assert url == "https://signed.example/put"
     assert captured["op"] == "put_object"
     assert captured["Params"] == {
-        "Bucket": "vals-lab-artifacts",
-        "Key": "lab-submissions/run-1/task-9/submission.xlsx",
+        "Bucket": "vals-submission-artifacts",
+        "Key": "submission-artifacts/run-1/task-9/submission.xlsx",
     }
 
 
 def test_presigned_put_url_requires_bucket(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv("LAB_ARTIFACT_BUCKET", raising=False)
-    with pytest.raises(RuntimeError, match="LAB_ARTIFACT_BUCKET"):
+    monkeypatch.delenv("SUBMISSION_ARTIFACT_BUCKET", raising=False)
+    with pytest.raises(RuntimeError, match="SUBMISSION_ARTIFACT_BUCKET"):
         submission_artifacts.presigned_put_url("k")

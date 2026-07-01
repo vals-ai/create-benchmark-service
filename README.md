@@ -158,6 +158,21 @@ Yield these from your generator methods; the framework serialises and forwards t
 
 `/v1/evaluate` and `/v1/score` are the lab-facing surface. They share scoring handlers with the internal `/evaluate-response/` and `/final-score/` endpoints — a benchmark implements `evaluate_response` and `calculate_final_score` once and inherits both surfaces.
 
+### Sandbox-based evaluation (`eval_mode = SANDBOX`)
+
+Benchmarks that must execute the submitted artifact to grade it (run a test
+suite, compile a proof) override `eval_mode()` to return `EvalMode.SANDBOX` and
+implement `prepare_grading_sandbox(sandbox, request)`. On `POST /v1/evaluate`
+the service then provisions a fresh, network-isolated sandbox from
+`retrieve_task().source`, injects the artifact, runs `evaluate_instance`, and
+deletes the sandbox. Text benchmarks (`eval_mode() == TEXT`, the default) are
+unaffected.
+
+The grading sandbox uses **server-side** Daytona credentials — set
+`DAYTONA_API_KEY`, `DAYTONA_API_URL`, and `DAYTONA_TARGET` in the service
+environment. Callers never supply sandbox credentials. Grading is bounded by a
+wall-clock timeout and the sandbox is created with network egress blocked.
+
 **`POST /v1/evaluate`** — grade one task. Request:
 
 ```json

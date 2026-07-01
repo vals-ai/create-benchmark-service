@@ -3,7 +3,7 @@
 from collections.abc import AsyncGenerator
 from typing import Any
 
-from benchmark_service import BenchmarkService, ImageSource, Resources, Sandbox
+from benchmark_service import BenchmarkService, EvalMode, ImageSource, Resources, Sandbox
 from benchmark_service.schemas import (
     EvaluateResponseRequest,
     FinalScoreResult,
@@ -68,6 +68,19 @@ class ExampleBenchmark(BenchmarkService):
 
         yield StreamMessageChunk(type="message", data="Problem statement written to sandbox")
         yield StreamResultChunk(type="result", data={"status": "ok"})
+
+    # Override to run sandbox-based grading on /v1/evaluate. When this returns
+    # EvalMode.SANDBOX, the endpoint provisions a fresh, network-isolated sandbox
+    # from retrieve_task().source, calls prepare_grading_sandbox to inject the
+    # submitted artifact, then runs evaluate_instance.
+    #
+    # def eval_mode(self) -> EvalMode:
+    #     return EvalMode.SANDBOX
+    #
+    # async def prepare_grading_sandbox(
+    #     self, sandbox: Sandbox, request: EvaluateResponseRequest, dataset: str | None = None
+    # ) -> None:
+    #     await sandbox.upload_file("/workspace/answer.txt", (request.response or "").encode())
 
     async def evaluate_response(self, request: EvaluateResponseRequest, dataset: str | None = None) -> Any:
         """Evaluate a text response."""

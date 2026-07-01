@@ -17,13 +17,19 @@ from yarl import URL
 
 from benchmark_service.sandbox import (
     ImageSource,
+    MissingSandboxConfigError,
     Resources,
     SandboxCreateRequest,
     SandboxError,
     SandboxNotFoundError,
     SandboxQuery,
 )
-from benchmark_service.sandbox.daytona import DaytonaSandbox, DaytonaSandboxProvider, daytona_retry_after_seconds
+from benchmark_service.sandbox.daytona import (
+    DaytonaProviderConfig,
+    DaytonaSandbox,
+    DaytonaSandboxProvider,
+    daytona_retry_after_seconds,
+)
 
 
 def _client_response_error(status: int, message: str) -> ClientResponseError:
@@ -798,3 +804,21 @@ async def test_daytona_create_forwards_network_block_all() -> None:
     await _provider(daytona).create_sandbox(request)
 
     assert daytona.create_params.network_block_all is True
+
+
+def test_daytona_config_from_env_reads_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DAYTONA_API_KEY", "key-1")
+    monkeypatch.setenv("DAYTONA_API_URL", "https://daytona.example")
+    monkeypatch.setenv("DAYTONA_TARGET", "us")
+    config = DaytonaProviderConfig.from_env()
+    assert config.DAYTONA_API_KEY == "key-1"
+    assert config.DAYTONA_API_URL == "https://daytona.example"
+    assert config.DAYTONA_TARGET == "us"
+
+
+def test_daytona_config_from_env_raises_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("DAYTONA_API_KEY", raising=False)
+    monkeypatch.setenv("DAYTONA_API_URL", "https://daytona.example")
+    monkeypatch.setenv("DAYTONA_TARGET", "us")
+    with pytest.raises(MissingSandboxConfigError, match="DAYTONA_API_KEY"):
+        DaytonaProviderConfig.from_env()

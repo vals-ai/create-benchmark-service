@@ -69,13 +69,12 @@ class ExampleBenchmark(BenchmarkService):
         yield StreamMessageChunk(type="message", data="Problem statement written to sandbox")
         yield StreamResultChunk(type="result", data={"status": "ok"})
 
-    # Override to run sandbox-based grading on /v1/evaluate. When this returns
-    # EvalMode.SANDBOX, the endpoint provisions a fresh, network-isolated sandbox
-    # from retrieve_task().source, calls prepare_grading_sandbox to inject the
-    # submitted artifact, then runs evaluate_instance.
-    #
-    # def eval_mode(self) -> EvalMode:
-    #     return EvalMode.SANDBOX
+    def eval_mode(self) -> EvalMode:
+        """Text benchmarks grade in-process; return EvalMode.SANDBOX to grade in a fresh sandbox instead."""
+        return EvalMode.TEXT
+
+    # To grade in a fresh, network-isolated sandbox instead: return EvalMode.SANDBOX above, then
+    # implement prepare_grading_sandbox to inject the submitted artifact before evaluate_instance runs.
     #
     # async def prepare_grading_sandbox(
     #     self, sandbox: Sandbox, request: EvaluateResponseRequest, dataset: str | None = None

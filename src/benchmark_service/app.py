@@ -1,12 +1,14 @@
 """FastAPI application for benchmark services."""
 
+import asyncio
 import importlib.metadata
 import logging
 import os
 import re
 import traceback
+import uuid
 from collections.abc import AsyncGenerator
-from contextlib import asynccontextmanager, suppress
+from contextlib import aclosing, asynccontextmanager, suppress
 from typing import Any, cast
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
@@ -19,7 +21,7 @@ from websockets.exceptions import ConnectionClosed
 from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import LEGACY_TENANT_SENTINEL, get_auth_settings, get_tenant_config, load_allowlist
 from benchmark_service.base import BenchmarkService
-from benchmark_service.grading import grade_instance
+from benchmark_service.grading import grade_instance, grade_instance_stream
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.schemas import (
     EvalMode,
@@ -35,7 +37,7 @@ from benchmark_service.schemas import (
     VerifyTaskIdsResponse,
     VersionResponse,
 )
-from benchmark_service.sandbox import MissingSandboxConfigError, SandboxProviderConfig
+from benchmark_service.sandbox import SandboxProvider, SandboxProviderConfig
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.trial import (
     sanitize_v1_dataset_tasks_response,
@@ -110,13 +112,8 @@ def _request_sandbox_provider_config(
     return request.sandbox_provider or DaytonaProviderConfig.from_headers(websocket.headers)
 
 
-def _grading_sandbox_config() -> SandboxProviderConfig:
-    """Server-side sandbox creds for the /v1/evaluate SANDBOX path.
-
-    Resolved from the service environment, never from caller-supplied headers or
-    request body — the lab must not control the grading sandbox target.
-    """
-    return DaytonaProviderConfig.from_env()
+def _grading_max_concurrency() -> int:
+    return int(os.environ.get("GRADING_MAX_CONCURRENCY") or 4)
 
 
 def _get_service_metadata(service_cls: type[BenchmarkService]) -> tuple[str | None, str | None]:
@@ -170,9 +167,26 @@ class BenchmarkServiceApp(FastAPI):
                     "POST /v1/submissions/upload-url will return 503"
                 )
             self.service = await service_cls.create()
+            if self.service.eval_mode() == EvalMode.SANDBOX:
+                # Sandbox grading needs both the grading-sandbox credentials and
+                # artifact storage; a deployment missing either must fail at
+                # boot, not per evaluation after provisioning a sandbox.
+                if not submission_artifacts.is_configured():
+                    raise RuntimeError(
+                        "eval_mode() == SANDBOX requires submission-artifact storage; set "
+                        f"{submission_artifacts.SUBMISSION_ARTIFACT_BUCKET_ENV} and "
+                        f"{submission_artifacts.SUBMISSION_ARTIFACT_REGION_ENV}"
+                    )
+                async with DaytonaProviderConfig.from_env().create_provider() as provider:
+                    self._grading_provider = provider
+                    yield
+                    return
             yield
 
         super().__init__(title=service_cls.__name__, lifespan=lifespan)
+        self._grading_provider: SandboxProvider | None = None
+        self._grading_semaphore = asyncio.Semaphore(_grading_max_concurrency())
+        self._grading_in_flight: set[tuple[str, str, str]] = set()
         service_name = os.getenv("SERVICE_NAME", service_cls.__name__)
         self.add_middleware(InflightMiddleware, service_name=service_name)
         self._register_routes()
@@ -343,6 +357,30 @@ class BenchmarkServiceApp(FastAPI):
                 await websocket.close(code=1008, reason="Dataset not allowed")
                 return
 
+            if (
+                self.service.eval_mode() == EvalMode.SANDBOX
+                and request.response is not None
+                and self._grading_provider is not None
+            ):
+                # SANDBOX benchmarks grade in a fresh sandbox on this path too;
+                # resume requests (eval_resume_state) keep the service-owned
+                # path below. The random run segment keeps concurrent regrades
+                # of the same task from colliding on the sandbox name.
+                stream = grade_instance_stream(
+                    service=self.service,
+                    run_id=f"ws-{uuid.uuid4().hex[:8]}",
+                    tenant=tenant,
+                    request=request,
+                    provider=self._grading_provider,
+                    dataset=request.dataset,
+                )
+                async with aclosing(stream) as chunks:
+                    async for chunk in chunks:
+                        if not await send_json_if_connected(websocket, chunk.model_dump()):
+                            logger.warning("evaluate-response websocket disconnected before benchmark service completed")
+                            return
+                return
+
             async for message in self.service.stream_evaluate_response(request, dataset=request.dataset):
                 if not await send_json_if_connected(websocket, message.model_dump()):
                     logger.warning("evaluate-response websocket disconnected before benchmark service completed")
@@ -396,14 +434,35 @@ class BenchmarkServiceApp(FastAPI):
                 await websocket.close()
 
     async def _v1_evaluate(self, request: Request, body: V1EvalRequest) -> V1EvalResponse:
-        _require_descope_tenant(request.state.tenant)
-        if body.payload.type != V1PayloadType.TEXT:
+        tenant = cast(str, request.state.tenant)
+        _require_descope_tenant(tenant)
+        if body.payload.type not in (V1PayloadType.TEXT, V1PayloadType.ARTIFACT):
             raise HTTPException(
                 status_code=400,
-                detail=f"payload.type={body.payload.type.value} not supported; only 'text' is implemented in v1",
+                detail=f"payload.type={body.payload.type.value} not supported",
             )
-        if not await self.service.check_dataset_access(request.state.tenant, body.dataset):
+        if not await self.service.check_dataset_access(tenant, body.dataset):
             raise HTTPException(status_code=403, detail="Dataset not allowed")
+
+        artifact_key: str | None = None
+        if body.payload.type == V1PayloadType.ARTIFACT:
+            if self.service.eval_mode() != EvalMode.SANDBOX:
+                raise HTTPException(
+                    status_code=400,
+                    detail="artifact payloads require a sandbox-grading benchmark (eval_mode() == SANDBOX)",
+                )
+            if not body.payload.data:
+                raise HTTPException(
+                    status_code=400,
+                    detail="artifact payloads must carry the submission's object key in payload.data",
+                )
+            artifact_key = body.payload.data
+            try:
+                await submission_artifacts.stat(artifact_key, tenant=tenant)
+            except submission_artifacts.SubmissionArtifactNotFound as exc:
+                raise HTTPException(status_code=404, detail=str(exc)) from exc
+            except submission_artifacts.SubmissionArtifactTooLarge as exc:
+                raise HTTPException(status_code=413, detail=str(exc)) from exc
 
         internal_req = EvaluateResponseRequest(
             task_id=body.task_id,
@@ -411,26 +470,33 @@ class BenchmarkServiceApp(FastAPI):
             dataset=body.dataset,
         )
         if self.service.eval_mode() == EvalMode.SANDBOX:
-            try:
-                sandbox_config = _grading_sandbox_config()
-            except MissingSandboxConfigError as exc:
-                logger.exception(
-                    "v1/evaluate sandbox grading config missing run_id=%s task_id=%s",
-                    body.run_id,
-                    body.task_id,
-                )
+            provider = self._grading_provider
+            if provider is None:
                 raise HTTPException(
                     status_code=503,
                     detail="Grading sandbox is not configured; contact the benchmark service owner.",
-                ) from exc
-            response = await grade_instance(
-                service=self.service,
-                run_id=body.run_id,
-                request=internal_req,
-                sandbox_config=sandbox_config,
-                evaluator_version=self._service_version,
-                dataset=body.dataset,
-            )
+                )
+            in_flight_key = (tenant, body.run_id, body.task_id)
+            if in_flight_key in self._grading_in_flight:
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"an evaluation for run {body.run_id} task {body.task_id} is already in progress",
+                )
+            self._grading_in_flight.add(in_flight_key)
+            try:
+                async with self._grading_semaphore:
+                    response = await grade_instance(
+                        service=self.service,
+                        run_id=body.run_id,
+                        tenant=tenant,
+                        request=internal_req,
+                        provider=provider,
+                        evaluator_version=self._service_version,
+                        dataset=body.dataset,
+                        artifact_key=artifact_key,
+                    )
+            finally:
+                self._grading_in_flight.discard(in_flight_key)
         else:
             try:
                 raw_result = await self.service.evaluate_response(internal_req, dataset=body.dataset)

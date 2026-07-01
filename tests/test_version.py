@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 import benchmark_service
@@ -142,7 +143,13 @@ def test_version_reports_text_eval_mode_by_default() -> None:
     assert response.json()["eval_mode"] == "text"
 
 
-def test_version_reports_sandbox_eval_mode_when_overridden() -> None:
+def test_version_reports_sandbox_eval_mode_when_overridden(monkeypatch: pytest.MonkeyPatch) -> None:
+    # SANDBOX mode requires grading + artifact config at boot.
+    monkeypatch.setenv("SUBMISSION_ARTIFACT_BUCKET", "vals-submission-artifacts")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.setenv("DAYTONA_API_KEY", "k")
+    monkeypatch.setenv("DAYTONA_API_URL", "https://daytona.example")
+    monkeypatch.setenv("DAYTONA_TARGET", "us")
     app = BenchmarkServiceApp(_SandboxModeService)
     with TestClient(app) as client:
         response = client.get("/version")

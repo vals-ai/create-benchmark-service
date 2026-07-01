@@ -211,6 +211,7 @@ class BenchmarkServiceApp(FastAPI):
             service_name=self._service_name,
             service_version=self._current_service_version(),
             dataset_version=self.service.get_dataset_version(dataset),
+            eval_mode=self.service.eval_mode(),
         )
 
     async def _authorize_websocket(self, websocket: WebSocket) -> str | None:

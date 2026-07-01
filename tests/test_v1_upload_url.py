@@ -15,6 +15,9 @@ from tests.conftest import StubBenchmark
 
 
 def _install_signed_url_stub(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SUBMISSION_ARTIFACT_BUCKET", "vals-submission-artifacts")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+
     def fake_presigned_put_url(
         key: str,
         *,
@@ -71,38 +74,70 @@ def trial_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None,
 def test_upload_url_returns_namespaced_key_and_signed_url(descope_client: TestClient) -> None:
     resp = descope_client.post(
         "/v1/submissions/upload-url",
-        json={"run_id": "run-1", "task_id": "task-9", "dataset": "default", "filename": "submission.xlsx"},
+        json={"run_id": "run-1", "task_id": "task-1", "dataset": "default", "filename": "submission.xlsx"},
         headers={"x-descope-api-key": "key-acme"},
     )
     assert resp.status_code == 200
     body = resp.json()
-    assert body["key"] == "submission-artifacts/acme/default/run-1/task-9/submission.xlsx"
-    assert body["url"] == "https://signed.example/submission-artifacts/acme/default/run-1/task-9/submission.xlsx?expires=3600"
+    assert body["key"] == "submission-artifacts/acme/default/run-1/task-1/submission.xlsx"
+    assert body["url"] == "https://signed.example/submission-artifacts/acme/default/run-1/task-1/submission.xlsx?expires=3600"
     assert body["expires_in"] == submission_artifacts.DEFAULT_UPLOAD_EXPIRY_S
 
 
 def test_upload_url_rejects_unauthorized_dataset(descope_client: TestClient) -> None:
     resp = descope_client.post(
         "/v1/submissions/upload-url",
-        json={"run_id": "run-1", "task_id": "task-9", "dataset": "alt", "filename": "submission.xlsx"},
+        json={"run_id": "run-1", "task_id": "task-1", "dataset": "alt", "filename": "submission.xlsx"},
         headers={"x-descope-api-key": "key-acme"},
     )
     assert resp.status_code == 403
 
 
-def test_trial_tenant_can_request_upload_url(trial_client: TestClient) -> None:
+def test_trial_tenant_cannot_request_upload_url(trial_client: TestClient) -> None:
+    """URL minting is unmetered and presigned PUTs can't cap size or count, so
+    the endpoint stays off the trial allowlist until abuse controls exist."""
     resp = trial_client.post(
         "/v1/submissions/upload-url",
-        json={"run_id": "run-1", "task_id": "task-9", "dataset": "default", "filename": "submission.xlsx"},
+        json={"run_id": "run-1", "task_id": "task-1", "dataset": "default", "filename": "submission.xlsx"},
         headers={"x-descope-api-key": "trial-key"},
     )
-    assert resp.status_code == 200
-    assert resp.json()["key"] == "submission-artifacts/trial/default/run-1/task-9/submission.xlsx"
+    assert resp.status_code == 403
+
+
+def test_upload_url_rejects_unknown_task_id(descope_client: TestClient) -> None:
+    resp = descope_client.post(
+        "/v1/submissions/upload-url",
+        json={"run_id": "run-1", "task_id": "task-nope", "dataset": "default", "filename": "submission.xlsx"},
+        headers={"x-descope-api-key": "key-acme"},
+    )
+    assert resp.status_code == 400
+
+
+def test_upload_url_rejects_path_like_filename_at_schema_boundary(descope_client: TestClient) -> None:
+    resp = descope_client.post(
+        "/v1/submissions/upload-url",
+        json={"run_id": "run-1", "task_id": "task-1", "dataset": "default", "filename": "../escape.xlsx"},
+        headers={"x-descope-api-key": "key-acme"},
+    )
+    assert resp.status_code == 422
+
+
+def test_upload_url_returns_503_when_bucket_unconfigured(
+    descope_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("SUBMISSION_ARTIFACT_BUCKET", raising=False)
+    resp = descope_client.post(
+        "/v1/submissions/upload-url",
+        json={"run_id": "run-1", "task_id": "task-1", "dataset": "default", "filename": "submission.xlsx"},
+        headers={"x-descope-api-key": "key-acme"},
+    )
+    assert resp.status_code == 503
+    assert "SUBMISSION_ARTIFACT_BUCKET" in resp.json()["detail"]
 
 
 def test_upload_url_requires_auth(descope_client: TestClient) -> None:
     resp = descope_client.post(
         "/v1/submissions/upload-url",
-        json={"run_id": "run-1", "task_id": "task-9", "dataset": "default", "filename": "submission.xlsx"},
+        json={"run_id": "run-1", "task_id": "task-1", "dataset": "default", "filename": "submission.xlsx"},
     )
     assert resp.status_code in (401, 403)

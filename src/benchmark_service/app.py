@@ -91,7 +91,10 @@ def _is_trial_tenant(tenant: str | None) -> bool:
 
 # Lab-facing /v1 endpoints a trial tenant may reach. Deny-by-default: add new
 # trial-accessible endpoints here so they don't silently auto-expose.
-_TRIAL_ALLOWED_PATH = re.compile(r"/v1/(?:evaluate|score|submissions/upload-url|datasets/[^/]+/tasks)")
+# submissions/upload-url is deliberately absent: minting is unmetered and a
+# presigned PUT can't cap object size or upload count, so trial tenants don't
+# get it until quota/one-shot semantics exist.
+_TRIAL_ALLOWED_PATH = re.compile(r"/v1/(?:evaluate|score|datasets/[^/]+/tasks)")
 
 
 def _trial_tenant_may_access_path(path: str) -> bool:
@@ -149,6 +152,12 @@ class BenchmarkServiceApp(FastAPI):
         async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
             if get_auth_settings().auth_required:
                 load_allowlist()
+            submission_artifacts.require_configured()
+            if not submission_artifacts.is_configured():
+                logger.warning(
+                    f"{submission_artifacts.SUBMISSION_ARTIFACT_BUCKET_ENV} is not set; "
+                    "POST /v1/submissions/upload-url will return 503"
+                )
             self.service = await service_cls.create()
             yield
 
@@ -418,8 +427,18 @@ class BenchmarkServiceApp(FastAPI):
     ) -> V1UploadUrlResponse:
         tenant = cast(str, request.state.tenant)
         _require_descope_tenant(tenant)
+        if not submission_artifacts.is_configured():
+            raise HTTPException(
+                status_code=503,
+                detail=(
+                    "Submission uploads are not configured on this deployment; "
+                    f"set {submission_artifacts.SUBMISSION_ARTIFACT_BUCKET_ENV} and "
+                    f"{submission_artifacts.SUBMISSION_ARTIFACT_REGION_ENV}"
+                ),
+            )
         if not await self.service.check_dataset_access(tenant, body.dataset):
             raise HTTPException(status_code=403, detail="Dataset not allowed")
+        await self.service.validate_task_ids([body.task_id], dataset=body.dataset)
         key = submission_artifacts.submission_key(
             tenant=tenant,
             dataset=body.dataset or "default",

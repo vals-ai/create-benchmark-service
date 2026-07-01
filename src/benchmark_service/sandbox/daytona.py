@@ -514,9 +514,10 @@ class DaytonaSandboxProvider(SandboxProvider):
 
     @_PROVIDER_RETRY
     async def create_sandbox(self, request: SandboxCreateRequest) -> DaytonaSandbox:
-        existing = await self._find_reusable_sandbox(request.name)
-        if existing is not None:
-            return DaytonaSandbox(existing)
+        if request.reuse:
+            existing = await self._find_reusable_sandbox(request.name)
+            if existing is not None:
+                return DaytonaSandbox(existing)
 
         resources = DaytonaResources(
             cpu=request.resources.vcpu,

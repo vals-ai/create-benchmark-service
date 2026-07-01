@@ -193,6 +193,7 @@ async def test_grade_instance_creates_isolated_sandbox_from_task_source_and_dele
     assert create.resources == Resources(vcpu=2, memory=4, disk=10)
     assert create.network_block_all is True
     assert create.env_vars == {}
+    assert create.reuse is False
     assert provider.deleted == ["fake-sandbox"]
 
 

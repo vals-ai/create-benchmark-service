@@ -60,6 +60,7 @@ class SandboxCreateRequest(BaseModel):
     auto_stop_interval: int
     create_timeout: int
     network_block_all: bool = False
+    reuse: bool = True
 
 
 class SandboxQuery(BaseModel):

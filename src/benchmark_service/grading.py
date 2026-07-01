@@ -84,6 +84,7 @@ async def grade_instance(
             auto_stop_interval=_GRADING_AUTO_STOP_MINUTES,
             create_timeout=_GRADING_CREATE_TIMEOUT_S,
             network_block_all=True,
+            reuse=False,
         )
         async with sandbox_config.create_provider() as provider:
             sandbox = await provider.create_sandbox(create_request)

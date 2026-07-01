@@ -163,15 +163,29 @@ Yield these from your generator methods; the framework serialises and forwards t
 Benchmarks that must execute the submitted artifact to grade it (run a test
 suite, compile a proof) override `eval_mode()` to return `EvalMode.SANDBOX` and
 implement `prepare_grading_sandbox(sandbox, request)`. On `POST /v1/evaluate`
-the service then provisions a fresh, network-isolated sandbox from
-`retrieve_task().source`, injects the artifact, runs `evaluate_instance`, and
-deletes the sandbox. Text benchmarks (`eval_mode() == TEXT`, the default) are
-unaffected.
+(and on `/ws/evaluate-response` for non-resume requests) the service then
+provisions a fresh, network-isolated sandbox, materializes the submission, runs
+`evaluate_instance`, and deletes the sandbox. Text benchmarks
+(`eval_mode() == TEXT`, the default) are unaffected.
 
-The grading sandbox uses **server-side** Daytona credentials — set
-`DAYTONA_API_KEY`, `DAYTONA_API_URL`, and `DAYTONA_TARGET` in the service
-environment. Callers never supply sandbox credentials. Grading is bounded by a
-wall-clock timeout and the sandbox is created with network egress blocked.
+Submissions arrive either inline (`payload.type == "text"`) or by reference
+(`payload.type == "artifact"`, where `payload.data` is the object key returned
+by `/v1/submissions/upload-url`). For artifact submissions the endpoint
+verifies the key's existence, tenant namespace, and size before any sandbox is
+provisioned, then downloads the object and uploads it into the sandbox at
+`grading.SUBMISSION_ARTIFACT_SANDBOX_PATH`; `prepare_grading_sandbox` performs
+only the benchmark-specific move/unpack from there.
+
+A `SANDBOX` deployment must set `DAYTONA_API_KEY`, `DAYTONA_API_URL`,
+`DAYTONA_TARGET` (**server-side** grading credentials — callers never supply
+them) plus `SUBMISSION_ARTIFACT_BUCKET` and `AWS_REGION`; missing config fails
+at startup, not on the first evaluation. The task's `eval_sandbox` spec on
+`RetrieveTaskResponse` can override the grading image, resources, timeout,
+network policy, and env; by default the sandbox uses the generation values with
+network egress blocked. The whole operation — sandbox create included — is
+bounded by a wall-clock timeout, concurrent evaluations are capped
+(`GRADING_MAX_CONCURRENCY`, default 4), and duplicate in-flight
+`(run_id, task_id)` requests are rejected with 409.
 
 **`POST /v1/evaluate`** — grade one task. Request:
 
@@ -198,7 +212,7 @@ Response:
 }
 ```
 
-`status` is one of `evaluated`, `did_not_complete`, `generation_error`, `error`. `result` is the benchmark-specific JSON-compatible value your `evaluate_response` returns, passed through. Only `payload.type == "text"` is implemented today; artifact rehydration is a follow-on.
+`status` is one of `evaluated`, `did_not_complete`, `generation_error`, `error`. `result` is the benchmark-specific JSON-compatible value your `evaluate_response` returns, passed through. `payload.type` is `"text"` for inline submissions; `"artifact"` (sandbox-grading benchmarks only) carries the uploaded submission's object key in `data`.
 
 **`POST /v1/score`** — aggregate across a run. Request `{run_id, dataset, evaluation_results: {task_id: {"status": "evaluated", "result": {...}} | {"status": "did_not_complete"} | null}}`. Before calling `calculate_final_score`, the framework converts every non-null item to the same eval-result envelope shape used by the runner and internal `/final-score/` path: `{"task_id": task_id, "status": status, "result": result}` plus `error` when the v1 item carries errors. Multiple v1 errors are collapsed into that single `error` string; callers should leave `errors` empty for successful `evaluated` items. `null` still represents a missing task and is passed through as `null`. Response `{run_id, tasks_evaluated, final_score, metadata}`.
 

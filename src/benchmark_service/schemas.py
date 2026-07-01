@@ -52,6 +52,20 @@ def legacy_docker_image(source: SandboxSource) -> str:
     return _COMPOSE_LEGACY_DOCKER_IMAGE
 
 
+class EvalSandboxSpec(BaseModel):
+    """Benchmark-declared grading-sandbox overrides for eval_mode() == SANDBOX.
+
+    Unset fields fall back to the task's generation values; network access is
+    blocked unless the benchmark explicitly opens it.
+    """
+
+    source: SandboxSource | None = Field(default=None, description="Grading sandbox image or snapshot")
+    resources: Resources | None = Field(default=None, description="Grading sandbox resources")
+    timeout_s: float | None = Field(default=None, description="Wall-clock bound for the grading step in seconds")
+    network_block_all: bool = Field(default=True, description="Block all network egress from the grading sandbox")
+    env_vars: dict[str, str] = Field(default_factory=dict, description="Environment for the grading sandbox")
+
+
 class RetrieveTaskResponse(BaseModel):
     """
     Response containing task metadata and setup requirements.
@@ -68,6 +82,9 @@ class RetrieveTaskResponse(BaseModel):
         default=None, description="Agent execution max time in seconds (None for no timeout)"
     )
     resources: Resources = Field(description="Computational resources needed")
+    eval_sandbox: EvalSandboxSpec | None = Field(
+        default=None, description="Grading-sandbox overrides for eval_mode() == SANDBOX; None uses generation values"
+    )
 
     @computed_field(description="Legacy sandbox image field for older Valkyrie clients")
     @property

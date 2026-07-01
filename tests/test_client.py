@@ -62,6 +62,7 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
                 "cwd": "/work",
                 "resources": {"vcpu": 2, "memory": 4, "disk": 10},
                 "agent_timeout": None,
+                "eval_sandbox": None,
             },
         ),
         (

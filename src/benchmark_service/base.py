@@ -320,11 +320,16 @@ class BenchmarkService(ABC):
     async def prepare_grading_sandbox(
         self, sandbox: Sandbox, request: EvaluateResponseRequest, dataset: str | None = None
     ) -> None:
-        """Materialize the submitted artifact into a fresh grading sandbox.
+        """Place the submission where evaluate_instance expects it, in a fresh grading sandbox.
 
-        Called only on the decoupled /v1/evaluate sandbox path (eval_mode() ==
-        SANDBOX), where the sandbox is freshly created and empty. Write
-        request.response to wherever evaluate_instance expects it, e.g.
+        Called only on the decoupled sandbox-grading path (eval_mode() ==
+        SANDBOX); request.response is always set there (text submissions carry
+        the text, artifact submissions the object key) and eval_resume_state
+        never reaches this hook. For artifact submissions the framework has
+        already downloaded the object and uploaded it into the sandbox at
+        grading.SUBMISSION_ARTIFACT_SANDBOX_PATH — implement only the
+        benchmark-specific move/unpack from there. For text submissions, write
+        request.response yourself, e.g.
         await sandbox.upload_file("/workspace/proof.lean", request.response.encode()).
         The default raises because a SANDBOX benchmark must implement it.
         """

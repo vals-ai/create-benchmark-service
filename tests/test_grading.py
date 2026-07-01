@@ -163,6 +163,11 @@ class NoResultStub(SandboxStub):
         yield  # pragma: no cover
 
 
+class MissingHookSandboxStub(StubBenchmark):
+    def eval_mode(self) -> EvalMode:
+        return EvalMode.SANDBOX
+
+
 def _req() -> EvaluateResponseRequest:
     return EvaluateResponseRequest(task_id="task-1", response="2", dataset="default")
 
@@ -240,6 +245,16 @@ async def test_grade_instance_maps_missing_result_chunk_to_error() -> None:
     assert resp.result is None
     assert resp.errors == ["evaluate_instance completed without a result chunk"]
     assert provider.deleted == ["fake-sandbox"]
+
+
+async def test_grade_instance_fails_fast_when_sandbox_hook_missing() -> None:
+    service = await MissingHookSandboxStub.create()
+    provider = FakeProvider(FakeSandbox())
+    resp = await _grade(service, provider)
+    assert resp.status == V1EvalStatus.ERROR
+    assert any("prepare_grading_sandbox" in error for error in resp.errors)
+    assert provider.created == []
+    assert provider.deleted == []
 
 
 class FailingDeleteProvider(FakeProvider):

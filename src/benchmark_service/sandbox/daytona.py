@@ -446,7 +446,7 @@ class DaytonaSandboxProvider(SandboxProvider):
                     name=request.name,
                     labels=request.labels,
                     image=image,
-                    network_block_all=False,
+                    network_block_all=request.network_block_all,
                     resources=resources,
                     env_vars=request.env_vars,
                 )
@@ -458,7 +458,7 @@ class DaytonaSandboxProvider(SandboxProvider):
                     labels=request.labels,
                     snapshot=snapshot,
                     language="python",
-                    network_block_all=False,
+                    network_block_all=request.network_block_all,
                     env_vars=request.env_vars,
                 )
 

@@ -563,7 +563,7 @@ async def test_daytona_command_applies_timeout_inside_cwd() -> None:
 
     await sandbox.exec("pytest", cwd="/workspace", timeout=60)
 
-    assert inner.process.command == "cd /workspace && timeout 60 sh -lc pytest"
+    assert inner.process.command == "cd /workspace && timeout 60 sh -c pytest"
 
 
 async def test_daytona_command_preserves_fractional_timeout() -> None:
@@ -572,7 +572,7 @@ async def test_daytona_command_preserves_fractional_timeout() -> None:
 
     await sandbox.exec("pytest", timeout=0.5)
 
-    assert inner.process.command == "timeout 0.5 sh -lc pytest"
+    assert inner.process.command == "timeout 0.5 sh -c pytest"
 
 
 async def test_daytona_command_wraps_shell_pipelines_when_timeout_is_set() -> None:
@@ -587,7 +587,7 @@ async def test_daytona_command_wraps_shell_pipelines_when_timeout_is_set() -> No
     await sandbox.exec("container_id=$(docker compose ps -q main); cat /tmp/file | docker exec -i \"$container_id\" cat", timeout=60)
 
     assert inner.process.command == (
-        "timeout 60 sh -lc "
+        "timeout 60 sh -c "
         "'container_id=$(docker compose ps -q main); cat /tmp/file | docker exec -i \"$container_id\" cat'"
     )
 

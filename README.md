@@ -134,9 +134,9 @@ Modal credentials are required and resolved per request, exactly like Daytona's 
 
 Provider compatibility notes:
 
-- Modal currently supports `ImageSource` only. `SnapshotSource` is rejected because Daytona snapshots do not have a Modal equivalent.
+- Modal supports both `ImageSource` (registry pull) and `SnapshotSource` (a Modal filesystem snapshot created via `Sandbox.snapshot_filesystem()`, restored by image id).
 - Modal sandboxes do not expose a disk-size parameter; `Resources.disk` is accepted for schema compatibility but not enforced.
-- Docker-in-sandbox is **not** enabled by default. Benchmarks that need nested Docker can set `resources.enable_docker=true` on their `RetrieveTaskResponse`; this only asks the sandbox provider for Docker support. The benchmark service still owns the Docker-capable image, dockerd startup flags, compose workflow, and cleanup.
+- Nested Docker (Docker-in-Docker) capability is granted on every sandbox for both providers — Daytona supports it natively and the Modal adapter requests it unconditionally — so benchmarks never configure it. The benchmark service still owns the Docker-capable image, dockerd startup flags, compose workflow, and cleanup.
 - Transient Modal connection errors are retried up to three attempts, matching the Daytona adapter's provider-level retry shape. Non-transient command failures still surface as `SandboxCommandError` with the command exit code.
 
 Benchmark services can send `eval_resume_state` updates to the tracker while evaluation is running. The tracker stores the latest value and sends it back on eval-only retry, so the benchmark service can continue evaluation without recreating the original agent sandbox.
@@ -224,7 +224,7 @@ Pydantic models used across requests and responses:
 - **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `Resources`
 - **`SandboxSource`** — `ImageSource(type="image", image=...)` or `SnapshotSource(type="snapshot", snapshot=...)`
 - **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; currently `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET)` or `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET, MODAL_ENVIRONMENT?)`
-- **`Resources`** — `vcpu`, `memory`, `disk`, `enable_docker` (default `false`; requests provider-level nested Docker support while benchmark code owns dockerd/image/runtime setup)
+- **`Resources`** — `vcpu`, `memory`, `disk`
 - **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, optional `sandbox_provider` with Daytona header fallback, `dataset`
 - **`EvaluateResponseRequest`** — `task_id`, `response` or `eval_resume_state`, optional `sandbox_provider`, `dataset`
 - **`FinalScoreResult`** / **`FinalScoreResponse`** — `score` (float), `metadata`, `tasks_evaluated`

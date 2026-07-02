@@ -131,6 +131,21 @@ class DetailedFailedExecuteCommandProcess(Process):
         raise DaytonaError("Failed to execute command: permission denied")
 
 
+class ContainerIpFailedExecuteCommandProcess(Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        self.attempts += 1
+        if self.attempts == 1:
+            raise DaytonaError(
+                "Failed to execute command: bad request: failed to resolve container IP "
+                "after 3 attempts: no IP address found. Is the Sandbox started?"
+            )
+        return await super().exec(command)
+
+
 class RemovedSandboxProcess(Process):
     async def exec(self, command: str) -> SimpleNamespace:
         raise DaytonaNotFoundError("sandbox not found")
@@ -515,6 +530,25 @@ async def test_daytona_exec_does_not_retry_detailed_execute_command_errors() -> 
         await sandbox.exec("pytest")
 
     assert process.attempts == 1
+
+
+async def test_daytona_exec_retries_container_ip_resolution_errors() -> None:
+    """Transient container-IP-resolution failures should be retried, not surfaced.
+
+    Test cases:
+    - A detailed "Failed to execute command: ...failed to resolve container IP..." error
+      is treated as a connection error and retried (unlike "permission denied").
+    - The retry returns the successful exec result instead of surfacing SandboxError.
+    """
+    inner = InnerSandbox()
+    process = ContainerIpFailedExecuteCommandProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    result = await sandbox.exec("pytest")
+
+    assert result.exit_code == 0
+    assert process.attempts == 2
 
 
 async def test_daytona_exec_raises_sandbox_not_found_when_removed() -> None:

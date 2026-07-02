@@ -59,6 +59,14 @@ _KNOWN_THROTTLERS = ("sandbox-create", "sandbox-lifecycle", "authenticated", "an
 _DELETE_CONFLICT_MESSAGES = ("state change in progress", "modified by another operation")
 _REMOVED_SANDBOX_CLIENT_STATUSES = (404, 502)
 _FAILED_EXECUTE_COMMAND_PREFIX = "failed to execute command:"
+# Transient Daytona infra signals that arrive appended to the failed-execute prefix.
+# These are sandbox network/provisioning hiccups (not command-level failures) and
+# recover on retry.
+_TRANSIENT_EXECUTE_MARKERS = (
+    "failed to resolve container ip",
+    "no ip address found",
+    "is the sandbox started",
+)
 # Daytona sometimes flattens a transport failure into a bare DaytonaError message with no chained
 # cause; these substrings recover those cases by text when no typed cause survives to match.
 _TRANSPORT_ERROR_MESSAGES = (
@@ -146,7 +154,20 @@ def _is_not_found_error(exc: DaytonaError | ClientResponseError) -> bool:
 
 
 def _is_failed_execute_command_error(exc: DaytonaError | ClientResponseError) -> bool:
-    return isinstance(exc, DaytonaError) and str(exc).strip().lower() == _FAILED_EXECUTE_COMMAND_PREFIX
+    if not isinstance(exc, DaytonaError):
+        return False
+    message = str(exc).strip().lower()
+    if message == _FAILED_EXECUTE_COMMAND_PREFIX:
+        return True
+    # Daytona also surfaces transient sandbox network/provisioning failures under the
+    # "failed to execute command:" prefix -- e.g. "...bad request: failed to resolve
+    # container IP after 3 attempts: no IP address found. Is the Sandbox started?".
+    # Unlike command-level failures (e.g. "permission denied"), these are infra hiccups
+    # that recover on retry, so treat them as connection errors rather than surfacing a
+    # terminal SandboxError on the first occurrence.
+    return message.startswith(_FAILED_EXECUTE_COMMAND_PREFIX) and any(
+        marker in message for marker in _TRANSIENT_EXECUTE_MARKERS
+    )
 
 
 def _has_retryable_cause(exc: BaseException) -> bool:

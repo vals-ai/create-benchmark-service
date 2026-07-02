@@ -566,3 +566,13 @@ def test_ws_evaluate_response_dispatches_sandbox_grading(monkeypatch: pytest.Mon
     assert msg == {"type": "result", "data": {"resolved": True, "weighted_pass_percentage": 100.0}}
     assert len(_FakeDaytonaConfig.provider.created) == 1
     assert _FakeDaytonaConfig.provider.deleted == ["fake-sandbox"]
+
+
+def test_sandbox_mode_missing_hook_fails_at_boot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A SANDBOX service without prepare_grading_sandbox is a broken deployment
+    on every grading path (v1 and ws) — refuse to boot."""
+    app = _sandbox_app(monkeypatch, MissingHookSandboxStub)
+
+    with pytest.raises(RuntimeError, match="prepare_grading_sandbox"):
+        with TestClient(app):
+            pass

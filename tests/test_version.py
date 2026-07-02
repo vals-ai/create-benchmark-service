@@ -134,6 +134,11 @@ class _SandboxModeService(_FakeService):
     def eval_mode(self) -> EvalMode:
         return EvalMode.SANDBOX
 
+    async def prepare_grading_sandbox(
+        self, sandbox: Sandbox, request: EvaluateResponseRequest, dataset: str | None = None
+    ) -> None:
+        raise NotImplementedError
+
 
 def test_version_reports_text_eval_mode_by_default() -> None:
     app = BenchmarkServiceApp(_FakeService)

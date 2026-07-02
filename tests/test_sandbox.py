@@ -509,7 +509,7 @@ async def test_daytona_command_applies_timeout_inside_cwd() -> None:
 
     await sandbox.exec("pytest", cwd="/workspace", timeout=60)
 
-    assert inner.process.command == "cd /workspace && timeout 60 pytest"
+    assert inner.process.command == "cd /workspace && timeout 60 sh -lc pytest"
 
 
 async def test_daytona_command_preserves_fractional_timeout() -> None:
@@ -518,7 +518,24 @@ async def test_daytona_command_preserves_fractional_timeout() -> None:
 
     await sandbox.exec("pytest", timeout=0.5)
 
-    assert inner.process.command == "timeout 0.5 pytest"
+    assert inner.process.command == "timeout 0.5 sh -lc pytest"
+
+
+async def test_daytona_command_wraps_shell_pipelines_when_timeout_is_set() -> None:
+    """Timeout should preserve shell syntax instead of treating assignments as executables.
+
+    Test cases:
+    - A shell assignment and pipeline stay inside one shell command when timeout is set.
+    """
+    inner = InnerSandbox()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    await sandbox.exec("container_id=$(docker compose ps -q main); cat /tmp/file | docker exec -i \"$container_id\" cat", timeout=60)
+
+    assert inner.process.command == (
+        "timeout 60 sh -lc "
+        "'container_id=$(docker compose ps -q main); cat /tmp/file | docker exec -i \"$container_id\" cat'"
+    )
 
 
 def test_daytona_retry_after_uses_specific_header_first() -> None:

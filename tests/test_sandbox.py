@@ -789,6 +789,7 @@ async def test_daytona_updates_egress_rules(monkeypatch: pytest.MonkeyPatch) -> 
     - URL hosts resolve to Daytona CIDR rules and are pinned in /etc/hosts.
     - Explicit CIDR addresses pass through to the comma-separated allow-list value.
     - An empty address is rejected before updating provider rules.
+    - IPv6 CIDRs are rejected because Daytona network rules use IPv4 CIDRs.
     - Calling sandbox.clear_egress_rules restores unrestricted outbound network access.
     """
     inner = InnerSandbox()
@@ -815,6 +816,9 @@ async def test_daytona_updates_egress_rules(monkeypatch: pytest.MonkeyPatch) -> 
         match=("allowed addresses cannot be empty; use sandbox\\.clear_egress_rules to clear egress rules"),
     ):
         await sandbox.modify_egress_rules([" "])
+
+    with pytest.raises(ValueError, match="allowed address is an IPv6 CIDR which is not supported"):
+        await sandbox.modify_egress_rules(["2001:db8::/32"])
 
     await sandbox.clear_egress_rules()
 

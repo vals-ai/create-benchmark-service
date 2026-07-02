@@ -89,11 +89,14 @@ def _resolve_daytona_allowed_addresses(allowed_addresses: list[str]) -> tuple[li
         # Pass IPv4 CIDR inputs through directly because Daytona network rules are CIDR based.
         try:
             network = ipaddress.ip_network(value, strict=False)
-            if network.version == 4:
-                cidrs.append(str(network))
-            continue
         except ValueError:
             pass
+        else:
+            if network.version == 4:
+                cidrs.append(str(network))
+            else:
+                raise ValueError(f"allowed address is an IPv6 CIDR which is not supported: {value}")
+            continue
 
         # Treat non-CIDR values as URLs or hosts and reject anything without a hostname.
         parsed = urlparse(value if "://" in value else f"//{value}")
@@ -354,7 +357,7 @@ class DaytonaSandbox(Sandbox):
 
     @_PROVIDER_RETRY
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
-        allow_list, host_pins = _resolve_daytona_allowed_addresses(allowed_addresses)
+        allow_list, host_pins = await asyncio.to_thread(_resolve_daytona_allowed_addresses, allowed_addresses)
 
         if host_pins:
             hosts = "".join(f"{address} {host}\n" for host, address in sorted(host_pins.items()))

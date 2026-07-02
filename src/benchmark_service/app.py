@@ -21,7 +21,7 @@ from websockets.exceptions import ConnectionClosed
 from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import LEGACY_TENANT_SENTINEL, get_auth_settings, get_tenant_config, load_allowlist
 from benchmark_service.base import BenchmarkService
-from benchmark_service.grading import grade_instance, grade_instance_stream
+from benchmark_service.grading import grade_instance, grade_instance_stream, grading_hook_missing_message
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.schemas import (
     EvalMode,
@@ -177,6 +177,9 @@ class BenchmarkServiceApp(FastAPI):
                         f"{submission_artifacts.SUBMISSION_ARTIFACT_BUCKET_ENV} and "
                         f"{submission_artifacts.SUBMISSION_ARTIFACT_REGION_ENV}"
                     )
+                missing_hook = grading_hook_missing_message(self.service)
+                if missing_hook is not None:
+                    raise RuntimeError(missing_hook)
                 async with DaytonaProviderConfig.from_env().create_provider() as provider:
                     self._grading_provider = provider
                     yield
@@ -374,11 +377,16 @@ class BenchmarkServiceApp(FastAPI):
                     provider=self._grading_provider,
                     dataset=request.dataset,
                 )
-                async with aclosing(stream) as chunks:
-                    async for chunk in chunks:
-                        if not await send_json_if_connected(websocket, chunk.model_dump()):
-                            logger.warning("evaluate-response websocket disconnected before benchmark service completed")
-                            return
+                # The semaphore protects grading-sandbox capacity, so both
+                # entry points (v1 and ws) must acquire it.
+                async with self._grading_semaphore:
+                    async with aclosing(stream) as chunks:
+                        async for chunk in chunks:
+                            if not await send_json_if_connected(websocket, chunk.model_dump()):
+                                logger.warning(
+                                    "evaluate-response websocket disconnected before benchmark service completed"
+                                )
+                                return
                 return
 
             async for message in self.service.stream_evaluate_response(request, dataset=request.dataset):

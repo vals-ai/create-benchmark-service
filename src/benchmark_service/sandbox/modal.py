@@ -220,9 +220,12 @@ class ModalSandboxProvider(SandboxProvider):
             "idle_timeout": request.auto_stop_interval * 60 if request.auto_stop_interval else None,
             "timeout": _MAX_LIFETIME_SECONDS,
             "client": client,
+            # Daytona sandboxes support nested Docker unconditionally; request the
+            # same capability on every Modal sandbox so benchmarks never need a
+            # provider-specific knob. Starting dockerd and running containers
+            # remains the benchmark service's job.
+            "experimental_options": {"enable_docker": True},
         }
-        if request.resources.enable_docker:
-            create_kwargs["experimental_options"] = {"enable_docker": True}
 
         try:
             # Modal sandboxes have no disk parameter; request.resources.disk is

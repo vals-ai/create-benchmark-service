@@ -277,23 +277,8 @@ async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> N
     assert captured["memory"] == 8192
     assert captured["idle_timeout"] == 1800
     assert captured["timeout"] == 86400
-    assert "experimental_options" not in captured
-
-
-async def test_create_sandbox_enables_docker_from_generic_resources(monkeypatch: pytest.MonkeyPatch) -> None:
-    inner = FakeInnerSandbox()
-    captured: dict[str, Any] = {}
-
-    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
-        captured.update(kwargs)
-        return inner
-
-    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
-    request = _request()
-    request.resources.enable_docker = True
-
-    await provider.create_sandbox(request)
-
+    # Nested-Docker capability is requested unconditionally, matching Daytona
+    # sandboxes which always support it.
     assert captured["experimental_options"] == {"enable_docker": True}
 
 

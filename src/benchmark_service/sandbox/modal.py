@@ -180,9 +180,34 @@ class ModalSandboxProvider(SandboxProvider):
             case SnapshotSource(snapshot=snapshot):
                 return Image.from_id(snapshot, client=client)
 
+    async def _find_reusable_sandbox(self, name: str, client: Client) -> ModalSdkSandbox | None:
+        # Mirrors the Daytona adapter: create_sandbox reuses a still-running
+        # sandbox with the same name (task retry/resume). Modal enforces name
+        # uniqueness within an app, so creating without this check would raise
+        # instead of reusing.
+        try:
+            inner = await ModalSdkSandbox.from_name.aio(
+                _APP_NAME,
+                name,
+                environment_name=self._config.MODAL_ENVIRONMENT,
+                client=client,
+            )
+        except ModalNotFoundError:
+            return None
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
+        try:
+            still_running = await inner.poll.aio() is None
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
+        return inner if still_running else None
+
     @_PROVIDER_RETRY
     async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
         client, app = await self._connect()
+        existing = await self._find_reusable_sandbox(request.name, client)
+        if existing is not None:
+            return ModalSandbox(existing, name=request.name)
         image = self._resolve_image(request.source, client)
         create_kwargs: dict[str, Any] = {
             "app": app,

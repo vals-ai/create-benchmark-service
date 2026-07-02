@@ -132,6 +132,12 @@ def _provider(monkeypatch: pytest.MonkeyPatch, sdk_sandbox: Any) -> ModalSandbox
     monkeypatch.setattr(modal_module, "Client", SimpleNamespace(from_credentials=_aio(from_credentials)))
     monkeypatch.setattr(modal_module, "App", SimpleNamespace(lookup=_aio(lookup)))
     monkeypatch.setattr(modal_module, "Image", SimpleNamespace(from_registry=_from_registry, from_id=_from_id))
+    if not hasattr(sdk_sandbox, "from_name"):
+        # Default: no existing sandbox holds the requested name.
+        async def _no_named_sandbox(*args: Any, **kwargs: Any) -> Any:
+            raise ModalNotFoundError("no sandbox with that name")
+
+        sdk_sandbox.from_name = _aio(_no_named_sandbox)
     monkeypatch.setattr(modal_module, "ModalSdkSandbox", sdk_sandbox)
     return ModalSandboxProvider(_config())
 
@@ -379,3 +385,46 @@ async def test_list_sandboxes_filters_by_labels(monkeypatch: pytest.MonkeyPatch)
     assert [sandbox.id for sandbox in sandboxes] == ["sb-123"]
     assert captured["app_id"] == "ap-1"
     assert captured["tags"] == {"run_id": "r1"}
+
+
+async def test_create_sandbox_reuses_running_sandbox_with_same_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    running = FakeInnerSandbox(object_id="sb-existing")
+    running.poll = _aio(_noop)  # poll() -> None means still running
+    created: list[str] = []
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        created.append(kwargs["name"])
+        return FakeInnerSandbox(object_id="sb-new")
+
+    async def from_name(app_name: str, name: str, **kwargs: Any) -> FakeInnerSandbox:
+        assert (app_name, name) == (modal_module._APP_NAME, "task-1")
+        return running
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create), from_name=_aio(from_name)))
+
+    sandbox = await provider.create_sandbox(_request())
+
+    assert sandbox.id == "sb-existing"
+    assert sandbox.name == "task-1"
+    assert created == []
+
+
+async def test_create_sandbox_ignores_finished_sandbox_with_same_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    finished = FakeInnerSandbox(object_id="sb-finished")
+
+    async def poll(*args: Any, **kwargs: Any) -> int:
+        return 0  # non-None poll() means the sandbox already exited
+
+    finished.poll = _aio(poll)
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        return FakeInnerSandbox(object_id="sb-new")
+
+    async def from_name(app_name: str, name: str, **kwargs: Any) -> FakeInnerSandbox:
+        return finished
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create), from_name=_aio(from_name)))
+
+    sandbox = await provider.create_sandbox(_request())
+
+    assert sandbox.id == "sb-new"

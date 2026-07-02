@@ -282,10 +282,11 @@ class RemovedSandboxFiles(Files):
 
 
 class RecordingSandbox(Sandbox):
-    def __init__(self) -> None:
+    def __init__(self, exec_results: list[ExecResult] | None = None) -> None:
         self.exec_commands: list[str] = []
         self.uploads: list[tuple[str, bytes]] = []
         self.downloads: list[str] = []
+        self.exec_results = exec_results or []
 
     @property
     def id(self) -> str:
@@ -301,6 +302,8 @@ class RecordingSandbox(Sandbox):
 
     async def exec(self, command: str, *, cwd: str | None = None, timeout: float | None = None) -> ExecResult:
         self.exec_commands.append(command)
+        if self.exec_results:
+            return self.exec_results.pop(0)
         return ExecResult(exit_code=0, output="ok")
 
     async def command(
@@ -476,6 +479,9 @@ async def test_compose_sandbox_routes_operations_through_main_service() -> None:
     assert source.service == "main"
     assert isinstance(source.outer, ImageSource)
     assert source.outer.image == "docker:28.3.3-dind"
+    assert sandbox.id == "outer-id"
+    assert sandbox.name == "outer-name"
+    assert sandbox.state == "started"
     assert exec_result.output == "ok"
     assert output == ["ok"]
     assert outer.exec_commands[0] == (
@@ -501,6 +507,54 @@ async def test_compose_sandbox_routes_operations_through_main_service() -> None:
         f"docker exec \"$container_id\" sh -lc 'cat /workspace/reward.json' > {download_temp}"
     ) in outer.exec_commands
     assert downloaded == b"downloaded"
+
+
+async def test_compose_sandbox_cleans_temp_files_when_copy_operations_fail() -> None:
+    """Compose copy failures should raise while still deleting temporary outer files.
+
+    Test cases:
+    - Upload failure raises SandboxError and runs temp-file cleanup.
+    - Download failure raises SandboxError and runs temp-file cleanup.
+    """
+    source = ComposeSource(
+        outer=ImageSource(image="docker:28.3.3-dind"),
+        compose_command="docker compose -f /harbor/compose.yaml",
+    )
+    upload_outer = RecordingSandbox([ExecResult(exit_code=1, output="upload failed")])
+    download_outer = RecordingSandbox([ExecResult(exit_code=1, output="download failed")])
+
+    with pytest.raises(SandboxError, match="compose upload failed: upload failed"):
+        await ComposeSandbox(upload_outer, source).upload_file("/workspace/instruction.md", b"solve it")
+
+    with pytest.raises(SandboxError, match="compose download failed: download failed"):
+        await ComposeSandbox(download_outer, source).download_file("/workspace/reward.json")
+
+    assert upload_outer.exec_commands[-1].startswith("rm -f /var/tmp/compose-upload-")
+    assert download_outer.exec_commands[-1].startswith("rm -f /var/tmp/compose-download-")
+
+
+async def test_daytona_provider_rejects_compose_source_before_create() -> None:
+    """Daytona provider should only receive the outer source for compose-backed tasks.
+
+    Test cases:
+    - A ComposeSource passed directly to provider creation raises SandboxError.
+    """
+    provider = _provider(CreateFailureDaytonaClient(InnerSandbox()))
+    request = SandboxCreateRequest(
+        source=ComposeSource(
+            outer=ImageSource(image="docker:28.3.3-dind"),
+            compose_command="docker compose -f /harbor/compose.yaml",
+        ),
+        resources=Resources(vcpu=2, memory=4, disk=10),
+        name="compose-task",
+        labels={},
+        env_vars={},
+        auto_stop_interval=600,
+        create_timeout=360,
+    )
+
+    with pytest.raises(SandboxError, match="ComposeSource must be unwrapped"):
+        await provider.create_sandbox(request)
 
 
 async def test_daytona_command_applies_timeout_inside_cwd() -> None:

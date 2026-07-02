@@ -5,7 +5,7 @@ from typing import Any, Literal, cast
 from pydantic import BaseModel, Field, computed_field, model_validator
 
 from benchmark_service.sandbox import SandboxProviderConfig
-from benchmark_service.sandbox.types import Resources, SandboxSource, SnapshotSource
+from benchmark_service.sandbox.types import ImageSource, Resources, SandboxSource, SnapshotSource
 
 
 class TaskFilter(BaseModel):
@@ -41,6 +41,14 @@ class VerifyTaskIdsResponse(BaseModel):
     task_ids: list[str] = Field(description="List of verified task IDs that exist in the benchmark")
 
 
+def legacy_docker_image(source: SandboxSource) -> str:
+    if isinstance(source, ImageSource):
+        return source.image
+    if isinstance(source, SnapshotSource):
+        return f"snapshot:{source.snapshot}"
+    return legacy_docker_image(source.outer)
+
+
 class RetrieveTaskResponse(BaseModel):
     """
     Response containing task metadata and setup requirements.
@@ -61,9 +69,7 @@ class RetrieveTaskResponse(BaseModel):
     @computed_field(description="Legacy sandbox image field for older Valkyrie clients")
     @property
     def docker_image(self) -> str:
-        if isinstance(self.source, SnapshotSource):
-            return f"snapshot:{self.source.snapshot}"
-        return self.source.image
+        return legacy_docker_image(self.source)
 
     @model_validator(mode="before")
     @classmethod

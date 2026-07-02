@@ -133,6 +133,39 @@ async def test_retrieve_task_serializes_snapshot_source_for_legacy_clients(
     assert result.model_dump()["docker_image"] == "snapshot:vcb1-openhands-abc123"
 
 
+async def test_retrieve_task_serializes_compose_outer_source_for_legacy_clients(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    """Compose-backed tasks should still expose a legacy docker_image for older clients.
+
+    Test cases:
+    - Compose source backed by an image reports the outer image.
+    - Compose source metadata is preserved.
+    """
+    client, mock_http = benchmark_client
+    mock_http.get = AsyncMock(
+        return_value=_mock_response(
+            json_data={
+                "source": {
+                    "type": "compose",
+                    "outer": {"type": "image", "image": "docker:28.3.3-dind"},
+                    "service": "main",
+                    "compose_command": "docker compose -f /harbor/compose.yaml",
+                },
+                "problem_path": "/tmp/problem_statement.txt",
+                "cwd": "/work",
+                "resources": {"vcpu": 2, "memory": 4, "disk": 10},
+                "agent_timeout": None,
+            }
+        )
+    )
+
+    result = await client.retrieve_task("task-1")
+
+    assert result.model_dump()["docker_image"] == "docker:28.3.3-dind"
+    assert result.source.model_dump()["type"] == "compose"
+
+
 @pytest.mark.parametrize(
     ("method", "args"),
     [

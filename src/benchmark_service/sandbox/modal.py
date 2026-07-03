@@ -28,11 +28,9 @@ from benchmark_service.sandbox.types import (
     SnapshotSource,
 )
 
+# Modal sandboxes must belong to an app; all benchmark sandboxes share one.
 _APP_NAME = "benchmark-service"
-# Modal terminates a sandbox when its entrypoint exits, so keep a long-lived
-# entrypoint and run task commands through exec.
-_KEEPALIVE = ("/bin/sh", "-lc", "while true; do sleep 3600; done")
-# Adapter-owned max sandbox lifetime; Modal defaults to 5 minutes otherwise.
+# Modal's default sandbox timeout is 5 minutes; benchmark tasks run for hours.
 _MAX_LIFETIME_SECONDS = 24 * 60 * 60
 
 
@@ -63,9 +61,7 @@ def _sandbox_error(exc: ModalError) -> SandboxError:
 
 
 def _command(command: str, cwd: str | None, timeout: float | None) -> str:
-    # Mirrors the Daytona adapter: a timed-out command exits with code 124
-    # instead of raising, and cwd wraps the timeout prefix. stderr is merged
-    # into stdout to match the combined PTY output of the Daytona adapter.
+    # Match Daytona semantics: timeout exits 124, stderr merges into stdout.
     if timeout is not None:
         command = f"timeout {timeout:g} {command}"
     if cwd:
@@ -170,10 +166,7 @@ class ModalSandboxProvider(SandboxProvider):
         return self._client, self._app
 
     def _resolve_image(self, source: SandboxSource, client: Client) -> Image:
-        # An ImageSource pulls a registry image; a SnapshotSource restores a
-        # Modal filesystem snapshot (created via Sandbox.snapshot_filesystem),
-        # whose id is the snapshot Image's object_id. This mirrors the Daytona
-        # adapter, which also accepts both an image and a prebuilt snapshot.
+        # A snapshot is a Modal filesystem snapshot, referenced by its Image id.
         match source:
             case ImageSource(image=image):
                 return Image.from_registry(image)  # pyright: ignore[reportUnknownMemberType]
@@ -181,10 +174,8 @@ class ModalSandboxProvider(SandboxProvider):
                 return Image.from_id(snapshot, client=client)
 
     async def _find_reusable_sandbox(self, name: str, client: Client) -> ModalSdkSandbox | None:
-        # Mirrors the Daytona adapter: create_sandbox reuses a still-running
-        # sandbox with the same name (task retry/resume). Modal enforces name
-        # uniqueness within an app, so creating without this check would raise
-        # instead of reusing.
+        # Match Daytona: task retry/resume reuses a still-running sandbox by
+        # name (Modal names are unique per app, so a blind create would raise).
         try:
             inner = await ModalSdkSandbox.from_name.aio(
                 _APP_NAME,
@@ -220,21 +211,14 @@ class ModalSandboxProvider(SandboxProvider):
             "idle_timeout": request.auto_stop_interval * 60 if request.auto_stop_interval else None,
             "timeout": _MAX_LIFETIME_SECONDS,
             "client": client,
-            # Daytona sandboxes support nested Docker unconditionally; request the
-            # same capability on every Modal sandbox so benchmarks never need a
-            # provider-specific knob. Starting dockerd and running containers
-            # remains the benchmark service's job.
+            # Nested Docker always on, matching Daytona; no disk parameter exists.
             "experimental_options": {"enable_docker": True},
         }
 
         try:
-            # Modal sandboxes have no disk parameter; request.resources.disk is
-            # accepted but not enforced. memory is MiB, cpu is fractional cores.
+            # No entrypoint args: an argless Modal sandbox idles until timeout.
             inner = await asyncio.wait_for(
-                ModalSdkSandbox.create.aio(  # pyright: ignore[reportUnknownMemberType]
-                    *_KEEPALIVE,
-                    **create_kwargs,
-                ),
+                ModalSdkSandbox.create.aio(**create_kwargs),  # pyright: ignore[reportUnknownMemberType]
                 timeout=request.create_timeout,
             )
         except TimeoutError as exc:

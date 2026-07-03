@@ -118,19 +118,14 @@ Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` 
 
 #### Sandbox providers
 
-`sandbox_provider` is selected per setup/evaluate-instance request:
+`sandbox_provider` is selected per setup/evaluate-instance request and carries the provider credentials. The tracker resolves it from AWS Secrets Manager (`sandbox_provider_secret_name`); the secret's keys are the config fields:
 
 ```json
 {"type": "daytona", "api_key": "...", "api_url": "...", "target": "..."}
-```
-
-or:
-
-```json
 {"type": "modal", "MODAL_TOKEN_ID": "...", "MODAL_TOKEN_SECRET": "...", "MODAL_ENVIRONMENT": "..."}
 ```
 
-Modal credentials are required and resolved per request, exactly like Daytona's `DAYTONA_API_KEY`: the caller carries them in the `sandbox_provider` config so the process that creates and talks to the sandbox (the Valkyrie tracker) has them. The tracker resolves this config from AWS Secrets Manager via `sandbox_provider_secret_name`, so the Modal secret holds `MODAL_TOKEN_ID`, `MODAL_TOKEN_SECRET`, and optional `MODAL_ENVIRONMENT`. Only set `MODAL_ENVIRONMENT` when that Modal environment exists; otherwise Modal uses the active/default environment for the token profile.
+`MODAL_ENVIRONMENT` is optional — omit it to use the token's default environment.
 
 Provider compatibility notes:
 

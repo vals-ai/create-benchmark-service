@@ -269,7 +269,8 @@ async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> N
 
     assert sandbox.id == "sb-123"
     assert sandbox.name == "task-1"
-    assert captured["entrypoint"] == modal_module._KEEPALIVE
+    # No entrypoint args: an argless Modal sandbox idles until timeout.
+    assert captured["entrypoint"] == ()
     assert captured["image"] == ("image", "python:3.12")
     assert captured["env"] == {"FOO": "bar"}
     assert captured["tags"] == {"run_id": "r1"}

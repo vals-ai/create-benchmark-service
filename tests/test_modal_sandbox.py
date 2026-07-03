@@ -74,15 +74,18 @@ class FakeInnerSandbox:
         file_content: bytes = b"",
         exec_error: ModalError | None = None,
         file_error: ModalError | None = None,
+        poll_result: int | None = None,
     ) -> None:
         self.object_id = object_id
         self.commands: list[tuple[str, ...]] = []
         self.terminated = False
         self._process = process or FakeProcess([], 0)
         self._exec_error = exec_error
+        self._poll_result = poll_result
         self.filesystem = FakeFilesystem(file_content, file_error)
         self.exec = _aio(self._exec)
         self.terminate = _aio(self._terminate)
+        self.poll = _aio(self._poll)
 
     async def _exec(self, *args: str, text: bool = True) -> FakeProcess:
         if self._exec_error is not None:
@@ -92,6 +95,10 @@ class FakeInnerSandbox:
 
     async def _terminate(self) -> None:
         self.terminated = True
+
+    async def _poll(self) -> int | None:
+        # None means still running, mirroring modal.Sandbox.poll().
+        return self._poll_result
 
 
 class FlakyExecSandbox(FakeInnerSandbox):
@@ -374,8 +381,7 @@ async def test_list_sandboxes_filters_by_labels(monkeypatch: pytest.MonkeyPatch)
 
 
 async def test_create_sandbox_reuses_running_sandbox_with_same_name(monkeypatch: pytest.MonkeyPatch) -> None:
-    running = FakeInnerSandbox(object_id="sb-existing")
-    running.poll = _aio(_noop)  # poll() -> None means still running
+    running = FakeInnerSandbox(object_id="sb-existing")  # poll_result=None: still running
     created: list[str] = []
 
     async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
@@ -396,12 +402,7 @@ async def test_create_sandbox_reuses_running_sandbox_with_same_name(monkeypatch:
 
 
 async def test_create_sandbox_ignores_finished_sandbox_with_same_name(monkeypatch: pytest.MonkeyPatch) -> None:
-    finished = FakeInnerSandbox(object_id="sb-finished")
-
-    async def poll(*args: Any, **kwargs: Any) -> int:
-        return 0  # non-None poll() means the sandbox already exited
-
-    finished.poll = _aio(poll)
+    finished = FakeInnerSandbox(object_id="sb-finished", poll_result=0)  # exited
 
     async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
         return FakeInnerSandbox(object_id="sb-new")

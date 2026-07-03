@@ -46,7 +46,6 @@ class ModalProviderConfig(BaseModel):
     type: Literal["modal"] = "modal"
     MODAL_TOKEN_ID: str
     MODAL_TOKEN_SECRET: str
-    MODAL_ENVIRONMENT: str | None = None
 
     def create_provider(self) -> SandboxProvider:
         return ModalSandboxProvider(self)
@@ -157,7 +156,6 @@ class ModalSandboxProvider(SandboxProvider):
                 self._app = await App.lookup.aio(
                     _APP_NAME,
                     client=client,
-                    environment_name=self._config.MODAL_ENVIRONMENT,
                     create_if_missing=True,
                 )
                 self._client = client
@@ -180,7 +178,6 @@ class ModalSandboxProvider(SandboxProvider):
             inner = await ModalSdkSandbox.from_name.aio(
                 _APP_NAME,
                 name,
-                environment_name=self._config.MODAL_ENVIRONMENT,
                 client=client,
             )
         except ModalNotFoundError:

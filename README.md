@@ -122,10 +122,8 @@ Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` 
 
 ```json
 {"type": "daytona", "api_key": "...", "api_url": "...", "target": "..."}
-{"type": "modal", "MODAL_TOKEN_ID": "...", "MODAL_TOKEN_SECRET": "...", "MODAL_ENVIRONMENT": "..."}
+{"type": "modal", "MODAL_TOKEN_ID": "...", "MODAL_TOKEN_SECRET": "..."}
 ```
-
-`MODAL_ENVIRONMENT` is optional — omit it to use the token's default environment.
 
 Provider compatibility notes:
 
@@ -218,7 +216,7 @@ Pydantic models used across requests and responses:
 
 - **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `Resources`
 - **`SandboxSource`** — `ImageSource(type="image", image=...)` or `SnapshotSource(type="snapshot", snapshot=...)`
-- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; currently `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET)` or `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET, MODAL_ENVIRONMENT?)`
+- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; currently `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET)` or `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)`
 - **`Resources`** — `vcpu`, `memory`, `disk`
 - **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, optional `sandbox_provider` with Daytona header fallback, `dataset`
 - **`EvaluateResponseRequest`** — `task_id`, `response` or `eval_resume_state`, optional `sandbox_provider`, `dataset`

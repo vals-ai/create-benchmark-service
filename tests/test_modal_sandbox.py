@@ -168,10 +168,10 @@ def test_modal_config_reads_secrets_manager_shape() -> None:
             "type": "modal",
             "MODAL_TOKEN_ID": "id",
             "MODAL_TOKEN_SECRET": "secret",
-            "MODAL_ENVIRONMENT": "dev",
+            "MODAL_ENVIRONMENT": "legacy-ignored",
         }
     )
-    assert config == ModalProviderConfig(MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret", MODAL_ENVIRONMENT="dev")
+    assert config == ModalProviderConfig(MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret")
 
 
 def test_command_merges_stderr_and_applies_timeout_inside_cwd() -> None:

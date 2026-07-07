@@ -131,8 +131,7 @@ def test_version_endpoint_reports_tracked_dataset_version(tmp_path: Path) -> Non
 
 
 class _SandboxModeService(_FakeService):
-    def eval_mode(self) -> EvalMode:
-        return EvalMode.SANDBOX
+    eval_mode = EvalMode.SANDBOX
 
     async def prepare_grading_sandbox(
         self, sandbox: Sandbox, request: EvaluateResponseRequest, dataset: str | None = None

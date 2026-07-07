@@ -161,12 +161,13 @@ Yield these from your generator methods; the framework serialises and forwards t
 ### Sandbox-based evaluation (`eval_mode = SANDBOX`)
 
 Benchmarks that must execute the submitted artifact to grade it (run a test
-suite, compile a proof) override `eval_mode()` to return `EvalMode.SANDBOX` and
-implement `prepare_grading_sandbox(sandbox, request)`. On `POST /v1/evaluate`
-(and on `/ws/evaluate-response` for non-resume requests) the service then
-provisions a fresh, network-isolated sandbox, materializes the submission, runs
-`evaluate_instance`, and deletes the sandbox. Text benchmarks
-(`eval_mode() == TEXT`, the default) are unaffected.
+suite, compile a proof) declare `eval_mode = EvalMode.SANDBOX` on the service
+class and implement `prepare_grading_sandbox(sandbox, request)`. On
+`POST /v1/evaluate` the service then provisions a fresh, network-isolated
+sandbox, materializes the submission, runs `evaluate_instance`, and deletes
+the sandbox. Text benchmarks (`eval_mode == TEXT`, the default) are
+unaffected, and the websocket endpoints (including `/ws/evaluate-response`
+resume) keep their sandbox-less service-owned paths.
 
 Submissions arrive either inline (`payload.type == "text"`) or by reference
 (`payload.type == "artifact"`, where `payload.data` is the object key returned
@@ -182,8 +183,10 @@ them) plus `SUBMISSION_ARTIFACT_BUCKET` and `AWS_REGION`; missing config fails
 at startup, not on the first evaluation. The task's `eval_sandbox` spec on
 `RetrieveTaskResponse` can override the grading image, resources, timeout,
 network policy, and env; by default the sandbox uses the generation values with
-network egress blocked. The whole operation — sandbox create included — is
-bounded by a wall-clock timeout, concurrent evaluations are capped
+network egress blocked. The whole operation — sandbox create included — runs
+under one deadline derived from the task's `eval_sandbox.timeout_s` (or the
+1800s default) plus a provisioning allowance; sandbox teardown runs outside
+that deadline under its own bound. Concurrent evaluations are capped
 (`GRADING_MAX_CONCURRENCY`, default 4), and duplicate in-flight
 `(run_id, task_id)` requests are rejected with 409.
 

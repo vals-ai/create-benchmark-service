@@ -1,23 +1,27 @@
-"""Decoupled sandbox grading for eval_mode() == SANDBOX benchmarks.
+"""Decoupled sandbox grading for eval_mode == SANDBOX benchmarks.
 
-The module is organized around one request's worth of context (_GradeRun):
+Chunk grammar, enforced by the engine once:
 
-    grade_instance         never-raises boundary: hook guard, outer timeout,
-                           exception→ERROR mapping (the /v1 path)
-    grade_instance_stream  the same lifecycle as a chunk stream (the ws path)
-    _graded                retrieve task → resolve spec → sandbox → collapse
-    _GradeRun.sandbox      provision + bounded best-effort delete
-    _GradeRun.chunks       materialize artifact → hook → evaluate_instance
-    _collapse              fold the chunk stream into one V1EvalResponse
+    (message | eval_resume_state)*  (result | error)   — exactly one terminal, then end
+
+grade_instance_stream is the only sandbox-grading lifecycle: retrieve task →
+resolve spec → provision → materialize artifact → hook → evaluate_instance.
+It never raises, always ends with exactly one terminal chunk, bounds
+everything under one spec-derived deadline, and tears the sandbox down
+outside that deadline under its own bound. collapse_stream folds any chunk
+stream — sandbox or in-process text — into one V1EvalResponse, so every
+consumer shares identical terminal semantics. An async-job wrapper can later
+reuse both.
 """
 
 import asyncio
-import hashlib
 import logging
 import math
 import re
+import time
+import uuid
 from collections.abc import AsyncGenerator
-from contextlib import aclosing, asynccontextmanager
+from contextlib import aclosing
 from dataclasses import dataclass
 from typing import Any
 
@@ -43,30 +47,27 @@ DEFAULT_GRADE_TIMEOUT_S = 1800.0
 # grading sandbox before the benchmark's prepare_grading_sandbox hook runs.
 SUBMISSION_ARTIFACT_SANDBOX_PATH = "/tmp/submission-artifact"
 _GRADING_CREATE_TIMEOUT_S = 600
+# Extra deadline allowance for provisioning and artifact materialization, so
+# the task's grade timeout budgets the grade itself, not sandbox startup.
+_PROVISIONING_ALLOWANCE_S = 600.0
 _TEARDOWN_TIMEOUT_S = 120.0
 
 
-def _auto_stop_minutes(timeout_s: float) -> int:
-    """Backstop that must exceed the grade timeout so it never stops a sandbox
-    mid-grade; the explicit delete in _GradeRun.sandbox is the real teardown,
-    and stopped sandboxes auto-delete (auto_delete_interval=0)."""
-    return math.ceil(timeout_s / 60) + 10
+def _auto_stop_minutes(budget_s: float) -> int:
+    """Backstop derived from the grading deadline so it never stops a sandbox
+    mid-grade; the explicit delete in grade_instance_stream is the real
+    teardown, and stopped sandboxes auto-delete (auto_delete_interval=0)."""
+    return math.ceil(budget_s / 60) + 10
 
 
 def _sandbox_name(run_id: str, task_id: str) -> str:
-    """Deterministic per (run_id, task_id) so a create retry after a lost
-    response reconciles by name instead of colliding. run_id is caller-supplied
-    and sandbox names have a restricted charset, so slug + hash rather than raw
-    interpolation."""
-    digest = hashlib.sha256(f"{run_id}/{task_id}".encode()).hexdigest()[:10]
+    """Unique per grading request: the create-conflict recovery adopts by name,
+    so a reused name could hand this request another tenant's live sandbox or
+    a dirty one that survived a failed delete. run_id/task_id appear only as a
+    sanitized slug for operators; attribution lives in the labels."""
     slug = re.sub(r"[^A-Za-z0-9-]+", "-", f"{run_id}-{task_id}").strip("-").lower()[:40]
-    return f"grade-{slug}-{digest}" if slug else f"grade-{digest}"
-
-
-def grading_hook_missing_message(service: BenchmarkService) -> str | None:
-    if type(service).prepare_grading_sandbox is not BenchmarkService.prepare_grading_sandbox:
-        return None
-    return f"{type(service).__name__}.prepare_grading_sandbox must be implemented for eval_mode() == SANDBOX"
+    suffix = uuid.uuid4().hex[:10]
+    return f"grade-{slug}-{suffix}" if slug else f"grade-{suffix}"
 
 
 @dataclass(frozen=True)
@@ -77,19 +78,19 @@ class _ResolvedSpec:
     resources: Any
     network_block_all: bool
     env_vars: dict[str, str]
-    grade_timeout: float | None
+    grade_timeout: float
 
 
 def _resolve_grading_spec(task: RetrieveTaskResponse) -> _ResolvedSpec:
     spec = task.eval_sandbox
     if spec is None:
-        return _ResolvedSpec(task.source, task.resources, True, {}, None)
+        return _ResolvedSpec(task.source, task.resources, True, {}, DEFAULT_GRADE_TIMEOUT_S)
     return _ResolvedSpec(
         source=spec.source if spec.source is not None else task.source,
         resources=spec.resources if spec.resources is not None else task.resources,
         network_block_all=spec.network_block_all,
         env_vars=dict(spec.env_vars),
-        grade_timeout=spec.timeout_s,
+        grade_timeout=spec.timeout_s if spec.timeout_s is not None else DEFAULT_GRADE_TIMEOUT_S,
     )
 
 
@@ -110,35 +111,14 @@ class _GradeRun:
     request: EvaluateResponseRequest
     provider: SandboxProvider
     dataset: str | None
-    evaluator_version: str | None = None
     artifact_key: str | None = None
-    timeout_s: float = DEFAULT_GRADE_TIMEOUT_S
     labels: dict[str, str] | None = None
 
     @property
     def task_id(self) -> str:
         return self.request.task_id
 
-    def error(self, message: str) -> V1EvalResponse:
-        return V1EvalResponse(
-            run_id=self.run_id,
-            task_id=self.task_id,
-            status=V1EvalStatus.ERROR,
-            evaluator_version=self.evaluator_version,
-            errors=[message],
-        )
-
-    def evaluated(self, result: dict[str, Any]) -> V1EvalResponse:
-        return V1EvalResponse(
-            run_id=self.run_id,
-            task_id=self.task_id,
-            status=V1EvalStatus.EVALUATED,
-            evaluator_version=self.evaluator_version,
-            result=jsonable_encoder(result),
-            errors=[],
-        )
-
-    def create_request(self, spec: _ResolvedSpec) -> SandboxCreateRequest:
+    def create_request(self, spec: _ResolvedSpec, budget_s: float) -> SandboxCreateRequest:
         return SandboxCreateRequest(
             source=spec.source,
             resources=spec.resources,
@@ -152,31 +132,10 @@ class _GradeRun:
                 **(self.labels or {}),
             },
             env_vars=spec.env_vars,
-            auto_stop_interval=_auto_stop_minutes(self.timeout_s),
+            auto_stop_interval=_auto_stop_minutes(budget_s),
             create_timeout=_GRADING_CREATE_TIMEOUT_S,
             network_block_all=spec.network_block_all,
-            reuse=False,
         )
-
-    @asynccontextmanager
-    async def sandbox(self, spec: _ResolvedSpec) -> AsyncGenerator[Sandbox, None]:
-        """Provision the grading sandbox; always attempt a bounded delete.
-
-        The delete runs on success, on error, and while unwinding an outer
-        wait_for cancellation (asyncio delivers cancellation once, then awaits
-        in finally blocks complete normally). It must catch Exception, not
-        BaseException, so a propagating CancelledError is never swallowed.
-        """
-        sandbox = await self.provider.create_sandbox(self.create_request(spec))
-        try:
-            yield sandbox
-        finally:
-            try:
-                await asyncio.wait_for(self.provider.delete_sandbox(sandbox.id), _TEARDOWN_TIMEOUT_S)
-            except Exception:
-                logger.exception(
-                    "failed to delete grading sandbox run_id=%s task_id=%s", self.run_id, self.task_id
-                )
 
     async def chunks(self, sandbox: Sandbox) -> AsyncGenerator[StreamChunk, None]:
         """The in-sandbox phase: materialize the submission, run the hook, then
@@ -188,35 +147,148 @@ class _GradeRun:
             async for chunk in chunks:
                 yield chunk
 
-
-async def _collapse(run: _GradeRun, sandbox: Sandbox) -> V1EvalResponse:
-    """Fold the chunk stream into a single V1EvalResponse."""
-    result: dict[str, Any] | None = None
-    async with aclosing(run.chunks(sandbox)) as chunks:
-        async for chunk in chunks:
-            if isinstance(chunk, StreamErrorChunk):
-                return run.error(chunk.data)
-            if isinstance(chunk, StreamResultChunk):
-                result = chunk.data
-            elif isinstance(chunk, StreamMessageChunk):
-                logger.info("grading run_id=%s task_id=%s: %s", run.run_id, run.task_id, chunk.data)
-            # eval-resume-state checkpoints serve the ws resume path; the
-            # synchronous v1 path has no resume to feed them into.
-    if result is None:
-        return run.error("evaluate_instance completed without a result chunk")
-    return run.evaluated(result)
+    async def delete_sandbox(self, sandbox: Sandbox) -> None:
+        """Best-effort bounded teardown; the auto-stop backstop reclaims what
+        this misses."""
+        try:
+            await asyncio.wait_for(self.provider.delete_sandbox(sandbox.id), _TEARDOWN_TIMEOUT_S)
+        except Exception:
+            logger.exception(
+                "failed to delete grading sandbox run_id=%s task_id=%s", self.run_id, self.task_id
+            )
 
 
-async def _graded(run: _GradeRun) -> V1EvalResponse:
-    task = await run.service.retrieve_task(run.task_id, dataset=run.dataset)
-    spec = _resolve_grading_spec(task)
-    async with run.sandbox(spec) as sandbox:
-        if spec.grade_timeout:
-            try:
-                return await asyncio.wait_for(_collapse(run, sandbox), spec.grade_timeout)
-            except TimeoutError:
-                return run.error(f"grading exceeded the task's {spec.grade_timeout}s eval-sandbox timeout")
-        return await _collapse(run, sandbox)
+async def grade_instance_stream(
+    *,
+    service: BenchmarkService,
+    run_id: str,
+    tenant: str,
+    request: EvaluateResponseRequest,
+    provider: SandboxProvider,
+    dataset: str | None,
+    artifact_key: str | None = None,
+    labels: dict[str, str] | None = None,
+) -> AsyncGenerator[StreamChunk, None]:
+    """The only sandbox-grading lifecycle. Never raises; yields exactly one
+    terminal (result | error) chunk and nothing after it.
+
+    Provisioning, materialization, the hook, and the grade all run under one
+    deadline derived from the task's eval-sandbox spec (timeout_s or the
+    default, plus a provisioning allowance). Teardown runs outside the
+    deadline under its own bound, so a grade that completes near the deadline
+    keeps its result and its delete.
+    """
+    run = _GradeRun(
+        service=service,
+        run_id=run_id,
+        tenant=tenant,
+        request=request,
+        provider=provider,
+        dataset=dataset,
+        artifact_key=artifact_key,
+        labels=labels,
+    )
+    try:
+        task = await run.service.retrieve_task(run.task_id, dataset=run.dataset)
+        spec = _resolve_grading_spec(task)
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("grading failed to resolve task run_id=%s task_id=%s", run_id, run.task_id)
+        yield StreamErrorChunk(type="error", data=str(exc))
+        return
+
+    budget_s = spec.grade_timeout + _PROVISIONING_ALLOWANCE_S
+    deadline = time.monotonic() + budget_s
+    timeout_message = (
+        f"grading exceeded the {spec.grade_timeout}s grade timeout "
+        f"(+{_PROVISIONING_ALLOWANCE_S}s provisioning allowance)"
+    )
+
+    try:
+        sandbox = await asyncio.wait_for(
+            run.provider.create_sandbox(run.create_request(spec, budget_s)),
+            deadline - time.monotonic(),
+        )
+    except TimeoutError:
+        logger.warning("grading sandbox create timed out run_id=%s task_id=%s", run_id, run.task_id)
+        yield StreamErrorChunk(type="error", data=timeout_message)
+        return
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("grading sandbox create failed run_id=%s task_id=%s", run_id, run.task_id)
+        yield StreamErrorChunk(type="error", data=str(exc))
+        return
+
+    try:
+        async with aclosing(run.chunks(sandbox)) as chunks:
+            while True:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    yield StreamErrorChunk(type="error", data=timeout_message)
+                    return
+                try:
+                    chunk = await asyncio.wait_for(anext(chunks), remaining)
+                except StopAsyncIteration:
+                    yield StreamErrorChunk(
+                        type="error", data="evaluate_instance completed without a result chunk"
+                    )
+                    return
+                except TimeoutError:
+                    logger.warning("grading timed out run_id=%s task_id=%s", run_id, run.task_id)
+                    yield StreamErrorChunk(type="error", data=timeout_message)
+                    return
+                except Exception as exc:  # noqa: BLE001
+                    logger.exception("grading failed run_id=%s task_id=%s", run_id, run.task_id)
+                    yield StreamErrorChunk(type="error", data=str(exc))
+                    return
+                yield chunk
+                if isinstance(chunk, StreamResultChunk | StreamErrorChunk):
+                    return
+    finally:
+        # Runs on completion, on consumer abandonment (GeneratorExit), and on
+        # outer cancellation — and never inside the grading deadline.
+        await run.delete_sandbox(sandbox)
+
+
+async def collapse_stream(
+    stream: AsyncGenerator[StreamChunk, None],
+    *,
+    run_id: str,
+    task_id: str,
+    evaluator_version: str | None,
+) -> V1EvalResponse:
+    """Fold a chunk stream into one V1EvalResponse: the first terminal chunk
+    (result | error) wins and the stream is closed. Never raises."""
+
+    def error(message: str) -> V1EvalResponse:
+        return V1EvalResponse(
+            run_id=run_id,
+            task_id=task_id,
+            status=V1EvalStatus.ERROR,
+            evaluator_version=evaluator_version,
+            errors=[message],
+        )
+
+    try:
+        async with aclosing(stream) as chunks:
+            async for chunk in chunks:
+                if isinstance(chunk, StreamErrorChunk):
+                    return error(chunk.data)
+                if isinstance(chunk, StreamResultChunk):
+                    return V1EvalResponse(
+                        run_id=run_id,
+                        task_id=task_id,
+                        status=V1EvalStatus.EVALUATED,
+                        evaluator_version=evaluator_version,
+                        result=jsonable_encoder(chunk.data),
+                        errors=[],
+                    )
+                if isinstance(chunk, StreamMessageChunk):
+                    logger.info("evaluation run_id=%s task_id=%s: %s", run_id, task_id, chunk.data)
+                # eval_resume_state checkpoints need a store to be useful; a
+                # synchronous collapse has none, so they are skipped.
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("evaluation failed run_id=%s task_id=%s", run_id, task_id)
+        return error(str(exc))
+    return error("evaluation completed without a result chunk")
 
 
 async def grade_instance(
@@ -229,74 +301,21 @@ async def grade_instance(
     evaluator_version: str | None,
     dataset: str | None,
     artifact_key: str | None = None,
-    timeout_s: float = DEFAULT_GRADE_TIMEOUT_S,
     labels: dict[str, str] | None = None,
 ) -> V1EvalResponse:
-    """Grade one submission in a fresh sandbox; never raises.
-
-    The whole operation — retrieve_task, sandbox create (and its retries),
-    artifact materialization, hook, grade — runs inside the timeout; sandbox
-    deletion is bounded separately inside _GradeRun.sandbox.
-    """
-    run = _GradeRun(
-        service=service,
+    """Grade one submission in a fresh sandbox and fold the stream; never raises."""
+    return await collapse_stream(
+        grade_instance_stream(
+            service=service,
+            run_id=run_id,
+            tenant=tenant,
+            request=request,
+            provider=provider,
+            dataset=dataset,
+            artifact_key=artifact_key,
+            labels=labels,
+        ),
         run_id=run_id,
-        tenant=tenant,
-        request=request,
-        provider=provider,
-        dataset=dataset,
+        task_id=request.task_id,
         evaluator_version=evaluator_version,
-        artifact_key=artifact_key,
-        timeout_s=timeout_s,
-        labels=labels,
     )
-    missing_hook = grading_hook_missing_message(service)
-    if missing_hook is not None:
-        return run.error(missing_hook)
-    try:
-        return await asyncio.wait_for(_graded(run), timeout_s)
-    except TimeoutError:
-        logger.warning("grade_instance timed out run_id=%s task_id=%s", run_id, request.task_id)
-        return run.error(f"grading exceeded {timeout_s}s timeout")
-    except (submission_artifacts.SubmissionArtifactNotFound, submission_artifacts.SubmissionArtifactTooLarge) as exc:
-        return run.error(str(exc))
-    except Exception as exc:  # noqa: BLE001
-        logger.exception("grade_instance failed run_id=%s task_id=%s", run_id, request.task_id)
-        return run.error(str(exc))
-
-
-async def grade_instance_stream(
-    *,
-    service: BenchmarkService,
-    run_id: str,
-    tenant: str,
-    request: EvaluateResponseRequest,
-    provider: SandboxProvider,
-    dataset: str | None,
-    artifact_key: str | None = None,
-    timeout_s: float = DEFAULT_GRADE_TIMEOUT_S,
-    labels: dict[str, str] | None = None,
-) -> AsyncGenerator[StreamChunk, None]:
-    """Sandbox-grading lifecycle as a chunk stream (websocket path).
-
-    No wall-clock bound is applied here — the ws consumer owns pacing, and an
-    abandoned stream is reclaimed by the sandbox's auto-stop backstop. The
-    task's eval-spec grade timeout is likewise not enforced on this path.
-    """
-    run = _GradeRun(
-        service=service,
-        run_id=run_id,
-        tenant=tenant,
-        request=request,
-        provider=provider,
-        dataset=dataset,
-        artifact_key=artifact_key,
-        timeout_s=timeout_s,
-        labels=labels,
-    )
-    task = await run.service.retrieve_task(run.task_id, dataset=run.dataset)
-    spec = _resolve_grading_spec(task)
-    async with run.sandbox(spec) as sandbox:
-        async with aclosing(run.chunks(sandbox)) as chunks:
-            async for chunk in chunks:
-                yield chunk

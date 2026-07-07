@@ -3,7 +3,7 @@
 from collections.abc import AsyncGenerator
 from typing import Any
 
-from benchmark_service import BenchmarkService, EvalMode, ImageSource, Resources, Sandbox
+from benchmark_service import BenchmarkService, ImageSource, Resources, Sandbox
 from benchmark_service.schemas import (
     EvaluateResponseRequest,
     FinalScoreResult,
@@ -69,12 +69,13 @@ class ExampleBenchmark(BenchmarkService):
         yield StreamMessageChunk(type="message", data="Problem statement written to sandbox")
         yield StreamResultChunk(type="result", data={"status": "ok"})
 
-    def eval_mode(self) -> EvalMode:
-        """Text benchmarks grade in-process; return EvalMode.SANDBOX to grade in a fresh sandbox instead."""
-        return EvalMode.TEXT
-
-    # To grade in a fresh, network-isolated sandbox instead: return EvalMode.SANDBOX above, then
-    # implement prepare_grading_sandbox to inject the submitted artifact before evaluate_instance runs.
+    # Text benchmarks grade in-process (the default). To grade in a fresh,
+    # network-isolated sandbox instead: declare eval_mode = EvalMode.SANDBOX on the
+    # class (from benchmark_service import EvalMode), then implement
+    # prepare_grading_sandbox to inject the submitted artifact before
+    # evaluate_instance runs.
+    #
+    # eval_mode = EvalMode.SANDBOX
     #
     # async def prepare_grading_sandbox(
     #     self, sandbox: Sandbox, request: EvaluateResponseRequest, dataset: str | None = None

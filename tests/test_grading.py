@@ -101,8 +101,7 @@ class FakeProviderConfig:
 class SandboxStub(StubBenchmark):
     """A SANDBOX-mode benchmark: inject the answer, then grade by reading it back."""
 
-    def eval_mode(self) -> EvalMode:
-        return EvalMode.SANDBOX
+    eval_mode = EvalMode.SANDBOX
 
     async def prepare_grading_sandbox(
         self, sandbox: Sandbox, request: EvaluateResponseRequest, dataset: str | None = None
@@ -167,11 +166,6 @@ class NoResultStub(SandboxStub):
         yield  # pragma: no cover
 
 
-class MissingHookSandboxStub(StubBenchmark):
-    def eval_mode(self) -> EvalMode:
-        return EvalMode.SANDBOX
-
-
 def _req() -> EvaluateResponseRequest:
     return EvaluateResponseRequest(task_id="task-1", response="2", dataset="default")
 
@@ -211,10 +205,9 @@ async def test_grade_instance_creates_isolated_sandbox_from_task_source_and_dele
     assert create.resources == Resources(vcpu=2, memory=4, disk=10)
     assert create.network_block_all is True
     assert create.env_vars == {}
-    assert create.reuse is False
-    # run_id is caller-supplied: the sandbox name must be a sanitized slug with
-    # a deterministic digest, and the labels must carry the tracker vocabulary
-    # plus lab attribution so leaked sandboxes are findable.
+    # run_id is caller-supplied: the sandbox name must be a sanitized slug plus
+    # a unique suffix, and the labels must carry the tracker vocabulary plus
+    # lab attribution so leaked sandboxes are findable.
     assert re.fullmatch(r"grade-run-1-task-1-[0-9a-f]{10}", create.name)
     assert create.labels["Benchmark"] == "SandboxStub"
     assert create.labels["Task"] == "task-1"
@@ -311,12 +304,66 @@ async def test_grade_instance_maps_exception_to_error_and_still_deletes_sandbox(
     assert provider.deleted == ["fake-sandbox"]
 
 
-async def test_grade_instance_times_out_and_still_deletes_sandbox() -> None:
-    service = await SlowStub.create()
+class SlowSpecStub(SlowStub):
+    """A slow grade under a task-declared sub-second eval timeout."""
+
+    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> Any:
+        task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
+        return task.model_copy(update={"eval_sandbox": EvalSandboxSpec(timeout_s=0.05)})
+
+
+async def test_grade_instance_times_out_on_the_tasks_eval_timeout_and_still_deletes_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The deadline derives from the task's eval-sandbox spec — the timeout the
+    author declared, not a fixed server default — and the auto-stop backstop
+    derives from the same value."""
+    monkeypatch.setattr(grading, "_PROVISIONING_ALLOWANCE_S", 0.0)
+    service = await SlowSpecStub.create()
     provider = FakeProvider(FakeSandbox())
-    resp = await _grade(service, provider, timeout_s=0.05)
+    resp = await _grade(service, provider)
     assert resp.status == V1EvalStatus.ERROR
-    assert any("timeout" in e.lower() for e in resp.errors)
+    assert any("0.05" in e and "grade timeout" in e for e in resp.errors)
+    assert provider.deleted == ["fake-sandbox"]
+    assert provider.created[0].auto_stop_interval == 11  # ceil(0.05/60) + 10
+
+
+async def test_grade_instance_uses_a_unique_sandbox_name_per_request() -> None:
+    """Create-conflict recovery adopts by name, so a reused name could hand one
+    request another tenant's live sandbox; names must be unique per request."""
+    service = await SandboxStub.create()
+    provider = FakeProvider(FakeSandbox())
+    await _grade(service, provider)
+    await _grade(service, provider)
+    assert len({create.name for create in provider.created}) == 2
+
+
+class SlowDeleteProvider(FakeProvider):
+    async def delete_sandbox(self, instance_id: str) -> None:
+        await asyncio.sleep(0.3)
+        await super().delete_sandbox(instance_id)
+
+
+class FastSpecStub(SandboxStub):
+    """An instant grade under a task-declared sub-second eval timeout."""
+
+    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> Any:
+        task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
+        return task.model_copy(update={"eval_sandbox": EvalSandboxSpec(timeout_s=0.2)})
+
+
+async def test_grade_completing_near_deadline_keeps_result_and_delete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Teardown runs outside the grading deadline: a grade that finishes just
+    before the deadline must not lose its computed result — or its delete — to
+    a teardown that outlives the deadline."""
+    monkeypatch.setattr(grading, "_PROVISIONING_ALLOWANCE_S", 0.0)
+    service = await FastSpecStub.create()
+    provider = SlowDeleteProvider(FakeSandbox())
+    resp = await _grade(service, provider)
+    assert resp.status == V1EvalStatus.EVALUATED
+    assert resp.result == {"resolved": True, "weighted_pass_percentage": 100.0}
     assert provider.deleted == ["fake-sandbox"]
 
 
@@ -330,14 +377,13 @@ async def test_grade_instance_maps_missing_result_chunk_to_error() -> None:
     assert provider.deleted == ["fake-sandbox"]
 
 
-async def test_grade_instance_fails_fast_when_sandbox_hook_missing() -> None:
-    service = await MissingHookSandboxStub.create()
-    provider = FakeProvider(FakeSandbox())
-    resp = await _grade(service, provider)
-    assert resp.status == V1EvalStatus.ERROR
-    assert any("prepare_grading_sandbox" in error for error in resp.errors)
-    assert provider.created == []
-    assert provider.deleted == []
+def test_sandbox_mode_without_hook_fails_at_class_definition() -> None:
+    """A SANDBOX service without prepare_grading_sandbox is broken on every
+    grading path; the subclass hook rejects it before it can be deployed."""
+    with pytest.raises(TypeError, match="prepare_grading_sandbox"):
+
+        class _MissingHook(StubBenchmark):  # pyright: ignore[reportUnusedClass]
+            eval_mode = EvalMode.SANDBOX
 
 
 class FailingDeleteProvider(FakeProvider):
@@ -546,9 +592,10 @@ def test_v1_evaluate_duplicate_in_flight_returns_409(sandbox_descope_client: Tes
     assert resp.status_code == 409
 
 
-def test_ws_evaluate_response_dispatches_sandbox_grading(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A SANDBOX benchmark grades in a fresh sandbox on the ws path too; only
-    resume requests keep the service-owned stream_evaluate_response."""
+def test_ws_evaluate_response_stays_sandboxless_for_sandbox_benchmarks(monkeypatch: pytest.MonkeyPatch) -> None:
+    """/ws/evaluate-response's real traffic is Valkyrie eval-resume; sandbox
+    dispatch lives on /v1/evaluate only, so the ws path must keep the
+    service-owned in-process evaluation and never provision sandboxes."""
     clear_allowlist_cache()
     clear_auth_cache()
     monkeypatch.delenv("AUTH_REQUIRED", raising=False)
@@ -563,16 +610,13 @@ def test_ws_evaluate_response_dispatches_sandbox_grading(monkeypatch: pytest.Mon
             ws.send_json({"task_id": "task-1", "response": "2", "dataset": "default"})
             msg = ws.receive_json()
 
-    assert msg == {"type": "result", "data": {"resolved": True, "weighted_pass_percentage": 100.0}}
-    assert len(_FakeDaytonaConfig.provider.created) == 1
-    assert _FakeDaytonaConfig.provider.deleted == ["fake-sandbox"]
+    assert msg == {"type": "result", "data": {"resolved": True}}
+    assert _FakeDaytonaConfig.provider.created == []
 
 
-def test_sandbox_mode_missing_hook_fails_at_boot(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A SANDBOX service without prepare_grading_sandbox is a broken deployment
-    on every grading path (v1 and ws) — refuse to boot."""
-    app = _sandbox_app(monkeypatch, MissingHookSandboxStub)
-
-    with pytest.raises(RuntimeError, match="prepare_grading_sandbox"):
-        with TestClient(app):
-            pass
+def test_grading_max_concurrency_of_zero_fails_at_boot(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Semaphore(0) has no permits and none are ever released; every sandbox
+    evaluation would hang forever with no error or log."""
+    monkeypatch.setenv("GRADING_MAX_CONCURRENCY", "0")
+    with pytest.raises(ValueError, match="GRADING_MAX_CONCURRENCY"):
+        BenchmarkServiceApp(StubBenchmark)

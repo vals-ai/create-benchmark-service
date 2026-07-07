@@ -6,7 +6,6 @@ import logging
 import os
 import re
 import traceback
-import uuid
 from collections.abc import AsyncGenerator
 from contextlib import aclosing, asynccontextmanager, suppress
 from typing import Any, cast
@@ -21,7 +20,7 @@ from websockets.exceptions import ConnectionClosed
 from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import LEGACY_TENANT_SENTINEL, get_auth_settings, get_tenant_config, load_allowlist
 from benchmark_service.base import BenchmarkService
-from benchmark_service.grading import grade_instance, grade_instance_stream, grading_hook_missing_message
+from benchmark_service.grading import collapse_stream, grade_instance_stream
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.schemas import (
     EvalMode,
@@ -32,12 +31,13 @@ from benchmark_service.schemas import (
     HealthCheckResponse,
     RetrieveTaskResponse,
     SetupTaskRequest,
+    StreamChunk,
     StreamErrorChunk,
     TaskFilter,
     VerifyTaskIdsResponse,
     VersionResponse,
 )
-from benchmark_service.sandbox import SandboxProvider, SandboxProviderConfig
+from benchmark_service.sandbox import SandboxProvider, SandboxProviderConfig, sandbox_provider_config_from_mapping
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.trial import (
     sanitize_v1_dataset_tasks_response,
@@ -49,7 +49,6 @@ from benchmark_service.v1_schemas import (
     V1DatasetTasksResponse,
     V1EvalRequest,
     V1EvalResponse,
-    V1EvalStatus,
     V1PayloadType,
     V1ScoreItem,
     V1ScoreRequest,
@@ -67,6 +66,21 @@ async def send_json_if_connected(websocket: WebSocket, payload: dict[str, Any]) 
         return True
     except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed, RuntimeError):
         return False
+
+
+async def _forward_stream(
+    websocket: WebSocket,
+    stream: AsyncGenerator[StreamChunk, None],
+    *,
+    endpoint: str,
+) -> None:
+    """Forward a chunk stream to a websocket, closing the stream if the client
+    disconnects mid-way."""
+    async with aclosing(stream) as chunks:
+        async for chunk in chunks:
+            if not await send_json_if_connected(websocket, chunk.model_dump()):
+                logger.warning("%s websocket disconnected before benchmark service completed", endpoint)
+                return
 
 
 _PUBLIC_PATHS = frozenset({"/health", "/version"})
@@ -112,8 +126,30 @@ def _request_sandbox_provider_config(
     return request.sandbox_provider or DaytonaProviderConfig.from_headers(websocket.headers)
 
 
+GRADING_SANDBOX_PROVIDER_ENV = "GRADING_SANDBOX_PROVIDER"
+
+
+def _grading_provider_config() -> SandboxProviderConfig:
+    """Resolve the boot-time grading provider from the environment.
+
+    GRADING_SANDBOX_PROVIDER selects the provider type (default "daytona");
+    Daytona credentials come from the DAYTONA_* variables. Non-Daytona types
+    resolve through the provider-config union so grading is not Daytona-only
+    by construction.
+    """
+    provider_type = os.environ.get(GRADING_SANDBOX_PROVIDER_ENV) or "daytona"
+    if provider_type == "daytona":
+        return DaytonaProviderConfig.from_env()
+    return sandbox_provider_config_from_mapping({"type": provider_type})
+
+
 def _grading_max_concurrency() -> int:
-    return int(os.environ.get("GRADING_MAX_CONCURRENCY") or 4)
+    limit = int(os.environ.get("GRADING_MAX_CONCURRENCY") or 4)
+    if limit < 1:
+        # Semaphore(0) has no permits and none are ever released, so every
+        # sandbox evaluation would hang forever with no error or log.
+        raise ValueError("GRADING_MAX_CONCURRENCY must be >= 1")
+    return limit
 
 
 def _get_service_metadata(service_cls: type[BenchmarkService]) -> tuple[str | None, str | None]:
@@ -167,20 +203,17 @@ class BenchmarkServiceApp(FastAPI):
                     "POST /v1/submissions/upload-url will return 503"
                 )
             self.service = await service_cls.create()
-            if self.service.eval_mode() == EvalMode.SANDBOX:
+            if self.service.eval_mode == EvalMode.SANDBOX:
                 # Sandbox grading needs both the grading-sandbox credentials and
                 # artifact storage; a deployment missing either must fail at
                 # boot, not per evaluation after provisioning a sandbox.
                 if not submission_artifacts.is_configured():
                     raise RuntimeError(
-                        "eval_mode() == SANDBOX requires submission-artifact storage; set "
+                        "eval_mode == EvalMode.SANDBOX requires submission-artifact storage; set "
                         f"{submission_artifacts.SUBMISSION_ARTIFACT_BUCKET_ENV} and "
                         f"{submission_artifacts.SUBMISSION_ARTIFACT_REGION_ENV}"
                     )
-                missing_hook = grading_hook_missing_message(self.service)
-                if missing_hook is not None:
-                    raise RuntimeError(missing_hook)
-                async with DaytonaProviderConfig.from_env().create_provider() as provider:
+                async with _grading_provider_config().create_provider() as provider:
                     self._grading_provider = provider
                     yield
                     return
@@ -257,7 +290,7 @@ class BenchmarkServiceApp(FastAPI):
             service_name=self._service_name,
             service_version=self._current_service_version(),
             dataset_version=self.service.get_dataset_version(dataset),
-            eval_mode=self.service.eval_mode(),
+            eval_mode=self.service.eval_mode,
         )
 
     async def _authorize_websocket(self, websocket: WebSocket) -> str | None:
@@ -323,10 +356,11 @@ class BenchmarkServiceApp(FastAPI):
             async with sandbox_config.create_provider() as provider:
                 sandbox = await provider.get_sandbox(request.instance_id)
 
-                async for message in self.service.setup_task(request.task_id, sandbox, dataset=request.dataset):
-                    if not await send_json_if_connected(websocket, message.model_dump()):
-                        logger.warning("setup-task websocket disconnected before benchmark service completed")
-                        return
+                await _forward_stream(
+                    websocket,
+                    self.service.setup_task(request.task_id, sandbox, dataset=request.dataset),
+                    endpoint="setup-task",
+                )
 
         except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
             logger.warning("setup-task websocket disconnected")
@@ -360,39 +394,11 @@ class BenchmarkServiceApp(FastAPI):
                 await websocket.close(code=1008, reason="Dataset not allowed")
                 return
 
-            if (
-                self.service.eval_mode() == EvalMode.SANDBOX
-                and request.response is not None
-                and self._grading_provider is not None
-            ):
-                # SANDBOX benchmarks grade in a fresh sandbox on this path too;
-                # resume requests (eval_resume_state) keep the service-owned
-                # path below. The random run segment keeps concurrent regrades
-                # of the same task from colliding on the sandbox name.
-                stream = grade_instance_stream(
-                    service=self.service,
-                    run_id=f"ws-{uuid.uuid4().hex[:8]}",
-                    tenant=tenant,
-                    request=request,
-                    provider=self._grading_provider,
-                    dataset=request.dataset,
-                )
-                # The semaphore protects grading-sandbox capacity, so both
-                # entry points (v1 and ws) must acquire it.
-                async with self._grading_semaphore:
-                    async with aclosing(stream) as chunks:
-                        async for chunk in chunks:
-                            if not await send_json_if_connected(websocket, chunk.model_dump()):
-                                logger.warning(
-                                    "evaluate-response websocket disconnected before benchmark service completed"
-                                )
-                                return
-                return
-
-            async for message in self.service.stream_evaluate_response(request, dataset=request.dataset):
-                if not await send_json_if_connected(websocket, message.model_dump()):
-                    logger.warning("evaluate-response websocket disconnected before benchmark service completed")
-                    return
+            await _forward_stream(
+                websocket,
+                self.service.stream_evaluate_response(request, dataset=request.dataset),
+                endpoint="evaluate-response",
+            )
 
         except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
             logger.warning("evaluate-response websocket disconnected")
@@ -424,10 +430,11 @@ class BenchmarkServiceApp(FastAPI):
             async with sandbox_config.create_provider() as provider:
                 sandbox = await provider.get_sandbox(request.instance_id)
 
-                async for message in self.service.evaluate_instance(request.task_id, sandbox, dataset=request.dataset):
-                    if not await send_json_if_connected(websocket, message.model_dump()):
-                        logger.warning("evaluate-instance websocket disconnected before benchmark service completed")
-                        return
+                await _forward_stream(
+                    websocket,
+                    self.service.evaluate_instance(request.task_id, sandbox, dataset=request.dataset),
+                    endpoint="evaluate-instance",
+                )
 
         except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
             logger.warning("evaluate-instance websocket disconnected")
@@ -454,10 +461,10 @@ class BenchmarkServiceApp(FastAPI):
 
         artifact_key: str | None = None
         if body.payload.type == V1PayloadType.ARTIFACT:
-            if self.service.eval_mode() != EvalMode.SANDBOX:
+            if self.service.eval_mode != EvalMode.SANDBOX:
                 raise HTTPException(
                     status_code=400,
-                    detail="artifact payloads require a sandbox-grading benchmark (eval_mode() == SANDBOX)",
+                    detail="artifact payloads require a sandbox-grading benchmark (eval_mode == SANDBOX)",
                 )
             if not body.payload.data:
                 raise HTTPException(
@@ -477,7 +484,7 @@ class BenchmarkServiceApp(FastAPI):
             response=body.payload.data,
             dataset=body.dataset,
         )
-        if self.service.eval_mode() == EvalMode.SANDBOX:
+        if self.service.eval_mode == EvalMode.SANDBOX:
             provider = self._grading_provider
             if provider is None:
                 raise HTTPException(
@@ -493,39 +500,29 @@ class BenchmarkServiceApp(FastAPI):
             self._grading_in_flight.add(in_flight_key)
             try:
                 async with self._grading_semaphore:
-                    response = await grade_instance(
-                        service=self.service,
+                    response = await collapse_stream(
+                        grade_instance_stream(
+                            service=self.service,
+                            run_id=body.run_id,
+                            tenant=tenant,
+                            request=internal_req,
+                            provider=provider,
+                            dataset=body.dataset,
+                            artifact_key=artifact_key,
+                        ),
                         run_id=body.run_id,
-                        tenant=tenant,
-                        request=internal_req,
-                        provider=provider,
+                        task_id=body.task_id,
                         evaluator_version=self._service_version,
-                        dataset=body.dataset,
-                        artifact_key=artifact_key,
                     )
             finally:
                 self._grading_in_flight.discard(in_flight_key)
         else:
-            try:
-                raw_result = await self.service.evaluate_response(internal_req, dataset=body.dataset)
-            except Exception as exc:  # noqa: BLE001
-                logger.exception("v1/evaluate failed for run_id=%s task_id=%s", body.run_id, body.task_id)
-                response = V1EvalResponse(
-                    run_id=body.run_id,
-                    task_id=body.task_id,
-                    status=V1EvalStatus.ERROR,
-                    evaluator_version=self._service_version,
-                    errors=[str(exc)],
-                )
-            else:
-                response = V1EvalResponse(
-                    run_id=body.run_id,
-                    task_id=body.task_id,
-                    status=V1EvalStatus.EVALUATED,
-                    evaluator_version=self._service_version,
-                    result=jsonable_encoder(raw_result),
-                    errors=[],
-                )
+            response = await collapse_stream(
+                self.service.stream_evaluate_response(internal_req, dataset=body.dataset),
+                run_id=body.run_id,
+                task_id=body.task_id,
+                evaluator_version=self._service_version,
+            )
         if _is_trial_tenant(request.state.tenant):
             return sanitize_v1_eval_response(response, self.service.project_trial_result)
         return response

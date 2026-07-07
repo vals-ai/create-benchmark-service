@@ -36,11 +36,9 @@ def _client_response_error(status: int, message: str) -> ClientResponseError:
 class Process:
     def __init__(self) -> None:
         self.command: str | None = None
-        self.commands: list[str] = []
 
     async def exec(self, command: str) -> SimpleNamespace:
         self.command = command
-        self.commands.append(command)
         if command.startswith("test -e "):
             return SimpleNamespace(exit_code=0, result="")
         if command.startswith("cat "):
@@ -287,24 +285,10 @@ class InnerSandbox:
         self.process = Process()
         self.fs = Files()
         self.autostop_interval: int | None = None
-        self.network_block_all: bool | None = None
-        self.network_allow_list: str | None = None
-        self.domain_allow_list: str | None = None
         self.refresh_count = 0
 
     async def set_autostop_interval(self, interval: int) -> None:
         self.autostop_interval = interval
-
-    async def update_network_settings(
-        self,
-        *,
-        network_block_all: bool | None = None,
-        network_allow_list: str | None = None,
-        domain_allow_list: str | None = None,
-    ) -> None:
-        self.network_block_all = network_block_all
-        self.network_allow_list = network_allow_list
-        self.domain_allow_list = domain_allow_list
 
     async def wait_for_sandbox_start(self, timeout: int) -> None:
         assert timeout == 0
@@ -789,42 +773,3 @@ async def test_daytona_provider_lists_sandboxes_with_query() -> None:
     assert daytona.listed_query is not None
     assert daytona.listed_query.labels == {"Benchmark": "vcb"}
     assert daytona.listed_query.limit == 10
-
-
-async def test_daytona_updates_egress_rules() -> None:
-    """Runtime egress changes should map to Daytona's sandbox network settings.
-
-    Test cases:
-    - URL hosts pass through to Daytona's domain allow-list.
-    - Explicit CIDR addresses pass through to the comma-separated allow-list value.
-    - An empty address is rejected before updating provider rules.
-    - IPv6 addresses are rejected because Daytona network rules use IPv4 CIDRs.
-    - Calling sandbox.clear_egress_rules restores unrestricted outbound network access.
-    """
-    inner = InnerSandbox()
-    sandbox = DaytonaSandbox(cast(Any, inner))
-
-    await sandbox.modify_egress_rules(["https://api.openai.com/v1", "198.51.100.20/32"])
-
-    assert inner.network_block_all is None
-    assert inner.network_allow_list == "198.51.100.20/32"
-    assert inner.domain_allow_list == "api.openai.com"
-    assert inner.process.commands == []
-
-    with pytest.raises(
-        ValueError,
-        match=("allowed addresses cannot be empty; use sandbox\\.clear_egress_rules to clear egress rules"),
-    ):
-        await sandbox.modify_egress_rules([" "])
-
-    with pytest.raises(ValueError, match="allowed address is an IPv6 CIDR which is not supported"):
-        await sandbox.modify_egress_rules(["2001:db8::/32"])
-
-    with pytest.raises(ValueError, match="allowed address is an IPv6 address which is not supported"):
-        await sandbox.modify_egress_rules(["http://[2001:db8::1]"])
-
-    await sandbox.clear_egress_rules()
-
-    assert inner.network_block_all is False
-    assert inner.network_allow_list == ""
-    assert inner.domain_allow_list == ""

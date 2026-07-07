@@ -23,7 +23,6 @@ from benchmark_service.sandbox import (
     SandboxNotFoundError,
     SandboxQuery,
 )
-from benchmark_service.sandbox import daytona as daytona_module
 from benchmark_service.sandbox.daytona import DaytonaSandbox, DaytonaSandboxProvider, daytona_retry_after_seconds
 
 
@@ -290,14 +289,22 @@ class InnerSandbox:
         self.autostop_interval: int | None = None
         self.network_block_all: bool | None = None
         self.network_allow_list: str | None = None
+        self.domain_allow_list: str | None = None
         self.refresh_count = 0
 
     async def set_autostop_interval(self, interval: int) -> None:
         self.autostop_interval = interval
 
-    async def update_network_settings(self, *, network_block_all: bool, network_allow_list: str | None) -> None:
+    async def update_network_settings(
+        self,
+        *,
+        network_block_all: bool | None = None,
+        network_allow_list: str | None = None,
+        domain_allow_list: str | None = None,
+    ) -> None:
         self.network_block_all = network_block_all
         self.network_allow_list = network_allow_list
+        self.domain_allow_list = domain_allow_list
 
     async def wait_for_sandbox_start(self, timeout: int) -> None:
         assert timeout == 0
@@ -784,38 +791,25 @@ async def test_daytona_provider_lists_sandboxes_with_query() -> None:
     assert daytona.listed_query.limit == 10
 
 
-async def test_daytona_updates_egress_rules(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_daytona_updates_egress_rules() -> None:
     """Runtime egress changes should map to Daytona's sandbox network settings.
 
     Test cases:
-    - URL hosts resolve to Daytona CIDR rules and are pinned idempotently in /etc/hosts.
+    - URL hosts pass through to Daytona's domain allow-list.
     - Explicit CIDR addresses pass through to the comma-separated allow-list value.
     - An empty address is rejected before updating provider rules.
-    - IPv6 CIDRs are rejected because Daytona network rules use IPv4 CIDRs.
-    - Calling sandbox.clear_egress_rules removes host pins and restores unrestricted outbound network access.
+    - IPv6 addresses are rejected because Daytona network rules use IPv4 CIDRs.
+    - Calling sandbox.clear_egress_rules restores unrestricted outbound network access.
     """
     inner = InnerSandbox()
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    def getaddrinfo(
-        host: str, *_args: object, **_kwargs: object
-    ) -> list[tuple[object, object, object, object, tuple[str, int]]]:
-        assert host == "api.openai.com"
-
-        return [(object(), object(), object(), object(), ("203.0.113.10", 443))]
-
-    monkeypatch.setattr(daytona_module.socket, "getaddrinfo", getaddrinfo)
-
     await sandbox.modify_egress_rules(["https://api.openai.com/v1", "198.51.100.20/32"])
 
-    assert inner.network_block_all is False
-    assert inner.network_allow_list == "203.0.113.10/32,198.51.100.20/32"
-    assert inner.process.command is not None
-    assert "203.0.113.10 api.openai.com" in inner.process.command
-    assert "# benchmark-service egress allowlist begin" in inner.process.command
-    assert "sed '/^# benchmark-service egress allowlist begin$/,/^# benchmark-service egress allowlist end$/d'" in (
-        inner.process.command
-    )
+    assert inner.network_block_all is None
+    assert inner.network_allow_list == "198.51.100.20/32"
+    assert inner.domain_allow_list == "api.openai.com"
+    assert inner.process.commands == []
 
     with pytest.raises(
         ValueError,
@@ -826,13 +820,11 @@ async def test_daytona_updates_egress_rules(monkeypatch: pytest.MonkeyPatch) -> 
     with pytest.raises(ValueError, match="allowed address is an IPv6 CIDR which is not supported"):
         await sandbox.modify_egress_rules(["2001:db8::/32"])
 
+    with pytest.raises(ValueError, match="allowed address is an IPv6 address which is not supported"):
+        await sandbox.modify_egress_rules(["http://[2001:db8::1]"])
+
     await sandbox.clear_egress_rules()
 
     assert inner.network_block_all is False
-    assert inner.network_allow_list is None
-    assert inner.process.commands[-1] == (
-        "sed '/^# benchmark-service egress allowlist begin$/,/^# benchmark-service egress allowlist end$/d' "
-        "/etc/hosts > /tmp/.benchmark-service-egress-hosts"
-        " && cat /tmp/.benchmark-service-egress-hosts > /etc/hosts"
-        " && rm -f /tmp/.benchmark-service-egress-hosts"
-    )
+    assert inner.network_allow_list == ""
+    assert inner.domain_allow_list == ""

@@ -37,9 +37,11 @@ def _client_response_error(status: int, message: str) -> ClientResponseError:
 class Process:
     def __init__(self) -> None:
         self.command: str | None = None
+        self.commands: list[str] = []
 
     async def exec(self, command: str) -> SimpleNamespace:
         self.command = command
+        self.commands.append(command)
         if command.startswith("test -e "):
             return SimpleNamespace(exit_code=0, result="")
         if command.startswith("cat "):
@@ -786,11 +788,11 @@ async def test_daytona_updates_egress_rules(monkeypatch: pytest.MonkeyPatch) -> 
     """Runtime egress changes should map to Daytona's sandbox network settings.
 
     Test cases:
-    - URL hosts resolve to Daytona CIDR rules and are pinned in /etc/hosts.
+    - URL hosts resolve to Daytona CIDR rules and are pinned idempotently in /etc/hosts.
     - Explicit CIDR addresses pass through to the comma-separated allow-list value.
     - An empty address is rejected before updating provider rules.
     - IPv6 CIDRs are rejected because Daytona network rules use IPv4 CIDRs.
-    - Calling sandbox.clear_egress_rules restores unrestricted outbound network access.
+    - Calling sandbox.clear_egress_rules removes host pins and restores unrestricted outbound network access.
     """
     inner = InnerSandbox()
     sandbox = DaytonaSandbox(cast(Any, inner))
@@ -810,6 +812,10 @@ async def test_daytona_updates_egress_rules(monkeypatch: pytest.MonkeyPatch) -> 
     assert inner.network_allow_list == "203.0.113.10/32,198.51.100.20/32"
     assert inner.process.command is not None
     assert "203.0.113.10 api.openai.com" in inner.process.command
+    assert "# benchmark-service egress allowlist begin" in inner.process.command
+    assert "sed '/^# benchmark-service egress allowlist begin$/,/^# benchmark-service egress allowlist end$/d'" in (
+        inner.process.command
+    )
 
     with pytest.raises(
         ValueError,
@@ -824,3 +830,9 @@ async def test_daytona_updates_egress_rules(monkeypatch: pytest.MonkeyPatch) -> 
 
     assert inner.network_block_all is False
     assert inner.network_allow_list is None
+    assert inner.process.commands[-1] == (
+        "sed '/^# benchmark-service egress allowlist begin$/,/^# benchmark-service egress allowlist end$/d' "
+        "/etc/hosts > /tmp/.benchmark-service-egress-hosts"
+        " && cat /tmp/.benchmark-service-egress-hosts > /etc/hosts"
+        " && rm -f /tmp/.benchmark-service-egress-hosts"
+    )

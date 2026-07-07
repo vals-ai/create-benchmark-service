@@ -62,6 +62,9 @@ _KNOWN_THROTTLERS = ("sandbox-create", "sandbox-lifecycle", "authenticated", "an
 _DELETE_CONFLICT_MESSAGES = ("state change in progress", "modified by another operation")
 _REMOVED_SANDBOX_CLIENT_STATUSES = (404, 502)
 _FAILED_EXECUTE_COMMAND_PREFIX = "failed to execute command:"
+_EGRESS_HOSTS_BEGIN = "# benchmark-service egress allowlist begin"
+_EGRESS_HOSTS_END = "# benchmark-service egress allowlist end"
+_EGRESS_HOSTS_TEMP_PATH = "/tmp/.benchmark-service-egress-hosts"
 # Daytona sometimes flattens a transport failure into a bare DaytonaError message with no chained
 # cause; these substrings recover those cases by text when no typed cause survives to match.
 _TRANSPORT_ERROR_MESSAGES = (
@@ -76,6 +79,36 @@ _FIXED_PROVIDER_WAIT = wait_fixed(2)
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
 
 
+def _parse_daytona_ipv4_network(value: str) -> ipaddress.IPv4Network | None:
+    try:
+        network = ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        return None
+
+    if isinstance(network, ipaddress.IPv4Network):
+        return network
+
+    raise ValueError(f"allowed address is an IPv6 CIDR which is not supported: {value}")
+
+
+def _clear_egress_host_pins_command() -> str:
+    sed_script = f"/^{_EGRESS_HOSTS_BEGIN}$/,/^{_EGRESS_HOSTS_END}$/d"
+    return (
+        f"sed {shlex.quote(sed_script)} /etc/hosts > {shlex.quote(_EGRESS_HOSTS_TEMP_PATH)}"
+        f" && cat {shlex.quote(_EGRESS_HOSTS_TEMP_PATH)} > /etc/hosts"
+        f" && rm -f {shlex.quote(_EGRESS_HOSTS_TEMP_PATH)}"
+    )
+
+
+def _replace_egress_host_pins_command(host_pins: dict[str, str]) -> str:
+    if not host_pins:
+        return _clear_egress_host_pins_command()
+
+    hosts = "".join(f"{address} {host}\n" for host, address in sorted(host_pins.items()))
+    block = f"{_EGRESS_HOSTS_BEGIN}\n{hosts}{_EGRESS_HOSTS_END}\n"
+    return f"{_clear_egress_host_pins_command()} && printf %s {shlex.quote(block)} >> /etc/hosts"
+
+
 def _resolve_daytona_allowed_addresses(allowed_addresses: list[str]) -> tuple[list[str], dict[str, str]]:
     # Normalize entries first so empty allowlists and blank values fail before reaching Daytona.
     values = [address.strip() for address in allowed_addresses]
@@ -87,15 +120,9 @@ def _resolve_daytona_allowed_addresses(allowed_addresses: list[str]) -> tuple[li
 
     for value in values:
         # Pass IPv4 CIDR inputs through directly because Daytona network rules are CIDR based.
-        try:
-            network = ipaddress.ip_network(value, strict=False)
-        except ValueError:
-            pass
-        else:
-            if network.version == 4:
-                cidrs.append(str(network))
-            else:
-                raise ValueError(f"allowed address is an IPv6 CIDR which is not supported: {value}")
+        network = _parse_daytona_ipv4_network(value)
+        if network is not None:
+            cidrs.append(str(network))
             continue
 
         # Treat non-CIDR values as URLs or hosts and reject anything without a hostname.
@@ -358,12 +385,7 @@ class DaytonaSandbox(Sandbox):
     @_PROVIDER_RETRY
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
         allow_list, host_pins = await asyncio.to_thread(_resolve_daytona_allowed_addresses, allowed_addresses)
-
-        if host_pins:
-            hosts = "".join(f"{address} {host}\n" for host, address in sorted(host_pins.items()))
-            result = await self.exec(f"printf %s {shlex.quote(hosts)} >> /etc/hosts")
-            if result.exit_code != 0:
-                raise SandboxError("failed to pin egress allowlist hosts")
+        await self._replace_egress_host_pins(host_pins)
 
         try:
             await self._sandbox.update_network_settings(
@@ -375,6 +397,8 @@ class DaytonaSandbox(Sandbox):
 
     @_PROVIDER_RETRY
     async def clear_egress_rules(self) -> None:
+        await self._replace_egress_host_pins({})
+
         try:
             await self._sandbox.update_network_settings(
                 network_block_all=False,
@@ -382,6 +406,11 @@ class DaytonaSandbox(Sandbox):
             )
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
+
+    async def _replace_egress_host_pins(self, host_pins: dict[str, str]) -> None:
+        result = await self.exec(_replace_egress_host_pins_command(host_pins))
+        if result.exit_code != 0:
+            raise SandboxError("failed to update egress allowlist hosts")
 
     async def _exec_pty(self, command: str, output: asyncio.Queue[str]) -> ExecResult:
         session_id = f"{self.id}:exec-{uuid.uuid4().hex}"

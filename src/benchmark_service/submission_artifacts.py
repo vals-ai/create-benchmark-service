@@ -17,9 +17,11 @@ SUBMISSION_ARTIFACT_BUCKET_ENV = "SUBMISSION_ARTIFACT_BUCKET"
 SUBMISSION_ARTIFACT_REGION_ENV = "AWS_REGION"
 SUBMISSION_ARTIFACT_KEY_PREFIX = "submission-artifacts"
 # Presigned PUTs cannot bound object size, so the read side must: refuse
-# anything larger than this before it enters service memory.
+# anything larger than this before it enters service memory. Downloads are
+# buffered fully in RAM and up to GRADING_MAX_CONCURRENCY can be in flight,
+# so the cap bounds worst-case memory at cap × concurrency.
 MAX_DOWNLOAD_BYTES_ENV = "SUBMISSION_ARTIFACT_MAX_DOWNLOAD_BYTES"
-DEFAULT_MAX_DOWNLOAD_BYTES = 2 * 1024**3
+DEFAULT_MAX_DOWNLOAD_BYTES = 256 * 1024**2
 
 _KEY_SEGMENT_RE = re.compile(KEY_SEGMENT_PATTERN)
 

@@ -10,6 +10,8 @@ from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any, ClassVar, Self
 
+from fastapi.encoders import jsonable_encoder
+
 from benchmark_service.auth import (
     LEGACY_TENANT_SENTINEL,
     check_benchmark_service_auth,
@@ -43,6 +45,22 @@ class BenchmarkService(ABC):
     # by get_dataset_version(). Version label only — content is not verified.
     dataset_versions_file: ClassVar[Path | None] = None
     dataset_versions: dict[str, DatasetVersionEntry]
+
+    # How /v1/evaluate grades this benchmark. Declare EvalMode.SANDBOX for
+    # benchmarks that must execute the submitted artifact in a sandbox; the
+    # framework reads this at boot and per dispatch, so it is class state, not
+    # a per-instance value.
+    eval_mode: ClassVar[EvalMode] = EvalMode.TEXT
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        if (
+            cls.eval_mode == EvalMode.SANDBOX
+            and cls.prepare_grading_sandbox is BenchmarkService.prepare_grading_sandbox
+        ):
+            raise TypeError(
+                f"{cls.__name__} declares eval_mode = EvalMode.SANDBOX and must implement prepare_grading_sandbox"
+            )
 
     @classmethod
     async def create(cls) -> Self:
@@ -114,15 +132,6 @@ class BenchmarkService(ABC):
         this returns None.
         """
         return None
-
-    def eval_mode(self) -> EvalMode:
-        """Declare how this benchmark is evaluated on /v1/evaluate.
-
-        Override to return EvalMode.SANDBOX for benchmarks that must execute the
-        submitted artifact in a sandbox (and implement prepare_grading_sandbox).
-        Defaults to EvalMode.TEXT.
-        """
-        return EvalMode.TEXT
 
     def get_dataset_version(self, dataset: str | None = None) -> str | None:
         """Return the version for `dataset`, if this benchmark tracks one."""
@@ -287,9 +296,13 @@ class BenchmarkService(ABC):
     async def stream_evaluate_response(
         self, request: EvaluateResponseRequest, dataset: str | None = None
     ) -> AsyncGenerator[StreamChunk, None]:
-        """Evaluate without a sandbox and stream the result."""
+        """Evaluate without a sandbox and stream the result.
+
+        evaluate_response may return any dict-encodable object (Pydantic
+        model, dataclass, dict); the chunk carries its JSON form.
+        """
         result = await self.evaluate_response(request, dataset=dataset)
-        yield StreamResultChunk(type="result", data=result)
+        yield StreamResultChunk(type="result", data=jsonable_encoder(result))
 
     @abstractmethod
     def evaluate_instance(
@@ -322,7 +335,7 @@ class BenchmarkService(ABC):
     ) -> None:
         """Place the submission where evaluate_instance expects it, in a fresh grading sandbox.
 
-        Called only on the decoupled sandbox-grading path (eval_mode() ==
+        Called only on the decoupled sandbox-grading path (eval_mode ==
         SANDBOX); request.response is always set there (text submissions carry
         the text, artifact submissions the object key) and eval_resume_state
         never reaches this hook. For artifact submissions the framework has
@@ -331,10 +344,10 @@ class BenchmarkService(ABC):
         benchmark-specific move/unpack from there. For text submissions, write
         request.response yourself, e.g.
         await sandbox.upload_file("/workspace/proof.lean", request.response.encode()).
-        The default raises because a SANDBOX benchmark must implement it.
+        SANDBOX subclasses must override this; __init_subclass__ enforces it.
         """
         raise NotImplementedError(
-            f"{type(self).__name__}.prepare_grading_sandbox must be implemented for eval_mode() == SANDBOX"
+            f"{type(self).__name__}.prepare_grading_sandbox must be implemented for eval_mode == EvalMode.SANDBOX"
         )
 
     @abstractmethod

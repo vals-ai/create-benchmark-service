@@ -452,11 +452,6 @@ class DaytonaSandboxProvider(SandboxProvider):
 
     @_PROVIDER_RETRY
     async def create_sandbox(self, request: SandboxCreateRequest) -> DaytonaSandbox:
-        if request.reuse:
-            existing = await self._find_reusable_sandbox(request.name)
-            if existing is not None:
-                return DaytonaSandbox(existing)
-
         resources = DaytonaResources(
             cpu=request.resources.vcpu,
             memory=request.resources.memory,
@@ -491,19 +486,18 @@ class DaytonaSandboxProvider(SandboxProvider):
             inner = await self._daytona.create(params, timeout=request.create_timeout)
         except DaytonaError as exc:
             # A name conflict means an earlier attempt of this same request
-            # created the sandbox but the response was lost (transport retry),
-            # or a concurrent duplicate won the race. Recover it by name so the
-            # retry doesn't strand an orphan and fail the request on the
-            # conflict — this must hold even when request.reuse is False.
+            # created the sandbox but the response was lost (transport retry).
+            # Recover it by name so the retry doesn't strand an orphan and fail
+            # the request on the conflict.
             if _is_name_conflict_error(exc):
-                existing = await self._find_reusable_sandbox(request.name)
+                existing = await self._find_existing_sandbox(request.name)
                 if existing is not None:
                     return DaytonaSandbox(existing)
             raise self._sandbox_error(exc) from exc
 
         return DaytonaSandbox(inner)
 
-    async def _find_reusable_sandbox(self, name: str) -> AsyncSandbox | None:
+    async def _find_existing_sandbox(self, name: str) -> AsyncSandbox | None:
         try:
             sandbox = await self._daytona.get(name)
         except DaytonaNotFoundError:

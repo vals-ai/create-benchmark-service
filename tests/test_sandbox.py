@@ -386,10 +386,16 @@ class CreateNotFoundDaytonaClient(CreateFailureDaytonaClient):
         raise DaytonaError("sandbox not found", status_code=404)
 
 
-class ReusableLookupConnectionDaytonaClient(DaytonaClient):
+class ConflictThenFlakyLookupDaytonaClient(DaytonaClient):
+    """create always name-conflicts; the recovery lookup fails transiently once."""
+
     def __init__(self, sandbox: InnerSandbox) -> None:
         super().__init__(sandbox)
         self.get_attempts = 0
+
+    async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
+        self.created = True
+        raise DaytonaError(f"Sandbox with name {self.sandbox.name} already exists")
 
     async def get(self, instance_id: str) -> InnerSandbox:
         self.get_attempts += 1
@@ -398,7 +404,7 @@ class ReusableLookupConnectionDaytonaClient(DaytonaClient):
                 "Failed to get sandbox",
                 ClientConnectionError("tcp reset"),
             )
-        raise DaytonaNotFoundError("sandbox not found")
+        return await super().get(instance_id)
 
 
 def _provider(daytona: DaytonaClient) -> DaytonaSandboxProvider:
@@ -662,30 +668,20 @@ async def test_daytona_command_cleans_up_when_consumer_stops() -> None:
     assert process.killed_session_id is not None
 
 
-async def test_daytona_provider_reuses_started_sandbox() -> None:
+async def test_daytona_provider_creates_fresh_sandbox() -> None:
     inner = InnerSandbox()
     daytona = DaytonaClient(inner)
 
     sandbox = await _provider(daytona).create_sandbox(_request(inner.name))
 
     assert sandbox.id == inner.id
-    assert daytona.created is False
-
-
-async def test_daytona_provider_skips_reuse_when_requested() -> None:
-    inner = InnerSandbox()
-    daytona = DaytonaClient(inner)
-    request = _request(inner.name).model_copy(update={"reuse": False})
-
-    await _provider(daytona).create_sandbox(request)
-
     assert daytona.created is True
 
 
 async def test_daytona_provider_recovers_existing_sandbox_on_create_conflict() -> None:
-    """A lost create response followed by a retry (or a concurrent duplicate)
-    hits a name conflict; the provider must recover the existing sandbox by
-    name — even with reuse=False — instead of failing and orphaning it."""
+    """A lost create response followed by a retry hits a name conflict; the
+    provider must recover the existing sandbox by name instead of failing and
+    orphaning it."""
     inner = InnerSandbox()
 
     class ConflictingCreateClient(DaytonaClient):
@@ -694,9 +690,8 @@ async def test_daytona_provider_recovers_existing_sandbox_on_create_conflict() -
             raise DaytonaError(f"Sandbox with name {inner.name} already exists")
 
     daytona = ConflictingCreateClient(inner)
-    request = _request(inner.name).model_copy(update={"reuse": False})
 
-    sandbox = await _provider(daytona).create_sandbox(request)
+    sandbox = await _provider(daytona).create_sandbox(_request(inner.name))
 
     assert daytona.created is True
     assert sandbox.id == inner.id
@@ -732,9 +727,11 @@ async def test_daytona_provider_delete_retries_bare_html_502_refresh_errors() ->
     assert daytona.deleted is True
 
 
-async def test_daytona_provider_create_retries_wrapped_lookup_connection_errors() -> None:
+async def test_daytona_provider_create_retries_transient_conflict_lookup_errors() -> None:
+    """A transient connection error during the conflict-recovery lookup must be
+    retried, not fail the create."""
     inner = InnerSandbox()
-    daytona = ReusableLookupConnectionDaytonaClient(inner)
+    daytona = ConflictThenFlakyLookupDaytonaClient(inner)
 
     sandbox = await _provider(daytona).create_sandbox(_request(inner.name))
 

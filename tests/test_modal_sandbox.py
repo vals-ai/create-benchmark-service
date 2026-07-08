@@ -113,6 +113,11 @@ class FlakyExecSandbox(FakeInnerSandbox):
         return await super()._exec(*args, text=text)
 
 
+class DisappearingSandbox(FakeInnerSandbox):
+    async def _poll(self) -> int | None:
+        raise ModalNotFoundError("sandbox disappeared")
+
+
 def _request(source: ImageSource | SnapshotSource | None = None) -> SandboxCreateRequest:
     return SandboxCreateRequest(
         source=source or ImageSource(image="python:3.12"),
@@ -409,6 +414,20 @@ async def test_create_sandbox_ignores_finished_sandbox_with_same_name(monkeypatc
 
     async def from_name(app_name: str, name: str, **kwargs: Any) -> FakeInnerSandbox:
         return finished
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create), from_name=_aio(from_name)))
+
+    sandbox = await provider.create_sandbox(_request())
+
+    assert sandbox.id == "sb-new"
+
+
+async def test_create_sandbox_replaces_disappeared_sandbox_with_same_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        return FakeInnerSandbox(object_id="sb-new")
+
+    async def from_name(app_name: str, name: str, **kwargs: Any) -> FakeInnerSandbox:
+        return DisappearingSandbox(object_id="sb-disappeared")
 
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create), from_name=_aio(from_name)))
 

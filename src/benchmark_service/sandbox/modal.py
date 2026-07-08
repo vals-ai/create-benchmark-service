@@ -180,12 +180,9 @@ class ModalSandboxProvider(SandboxProvider):
                 name,
                 client=client,
             )
+            still_running = await inner.poll.aio() is None
         except ModalNotFoundError:
             return None
-        except ModalError as exc:
-            raise _sandbox_error(exc) from exc
-        try:
-            still_running = await inner.poll.aio() is None
         except ModalError as exc:
             raise _sandbox_error(exc) from exc
         return inner if still_running else None

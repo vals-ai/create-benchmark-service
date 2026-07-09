@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import shlex
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import suppress
 from typing import Any, Literal
+from urllib.parse import urlparse
 
 from aiohttp import ClientConnectionError, ClientResponseError
 from daytona import (
@@ -72,6 +74,61 @@ _TRANSPORT_ERROR_MESSAGES = (
 _RETRYABLE_DAYTONA_CAUSES = (ClientConnectionError, ConnectionError, TimeoutError)
 _FIXED_PROVIDER_WAIT = wait_fixed(2)
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
+
+
+def _parse_daytona_ipv4_network(value: str) -> ipaddress.IPv4Network | None:
+    try:
+        network = ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        return None
+
+    if isinstance(network, ipaddress.IPv4Network):
+        return network
+
+    raise ValueError(f"allowed address is an IPv6 CIDR which is not supported: {value}")
+
+
+def _resolve_daytona_allowed_addresses(allowed_addresses: list[str]) -> tuple[list[str], list[str]]:
+    # Normalize entries first so empty allowlists and blank values fail before reaching Daytona.
+    values = [address.strip() for address in allowed_addresses]
+    if not values or any(not value for value in values):
+        raise ValueError("allowed addresses cannot be empty; use sandbox.clear_egress_rules to clear egress rules")
+
+    cidrs: list[str] = []
+    domains: list[str] = []
+
+    for value in values:
+        # Pass IPv4 CIDR inputs through directly because Daytona network rules are CIDR based.
+        network = _parse_daytona_ipv4_network(value)
+        if network is not None:
+            cidrs.append(str(network))
+            continue
+
+        # Treat non-CIDR values as URLs or hosts and reject anything without a hostname.
+        parsed = urlparse(value if "://" in value else f"//{value}")
+        if not parsed.hostname:
+            raise ValueError(f"allowed address is not a valid URL, host, or CIDR: {value}")
+
+        try:
+            address = ipaddress.ip_address(parsed.hostname)
+        except ValueError:
+            domains.append(parsed.hostname)
+            continue
+
+        if isinstance(address, ipaddress.IPv4Address):
+            cidrs.append(f"{address}/32")
+        else:
+            raise ValueError(f"allowed address is an IPv6 address which is not supported: {value}")
+
+    # Deduplicate values while preserving order before returning rules to Daytona.
+    cidrs = list(dict.fromkeys(cidrs))
+    domains = list(dict.fromkeys(domains))
+    if not cidrs and not domains:
+        raise ValueError("allowed addresses did not resolve to Daytona-compatible rules")
+    if cidrs and domains:
+        raise ValueError("allowed addresses cannot mix domains and CIDRs")
+
+    return cidrs, domains
 
 
 class DaytonaProviderConfig(BaseModel):
@@ -300,6 +357,29 @@ class DaytonaSandbox(Sandbox):
         try:
             stream = await self._sandbox.fs.download_file_stream(remote_path)
             return b"".join([chunk async for chunk in stream])
+        except _SANDBOX_OPERATION_ERRORS as exc:
+            raise self._sandbox_error(exc) from exc
+
+    @_PROVIDER_RETRY
+    async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
+        network_allow_list, domain_allow_list = _resolve_daytona_allowed_addresses(allowed_addresses)
+
+        try:
+            await self._sandbox.update_network_settings(
+                network_allow_list=",".join(network_allow_list),
+                domain_allow_list=",".join(domain_allow_list),
+            )
+        except _SANDBOX_OPERATION_ERRORS as exc:
+            raise self._sandbox_error(exc) from exc
+
+    @_PROVIDER_RETRY
+    async def clear_egress_rules(self) -> None:
+        try:
+            await self._sandbox.update_network_settings(
+                network_block_all=False,
+                network_allow_list="",
+                domain_allow_list="",
+            )
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
 

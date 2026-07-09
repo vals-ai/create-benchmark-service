@@ -329,10 +329,26 @@ class InnerSandbox:
         self.process = Process()
         self.fs = Files()
         self.autostop_interval: int | None = None
+        self.network_settings: list[dict[str, str | bool | None]] = []
         self.refresh_count = 0
 
     async def set_autostop_interval(self, interval: int) -> None:
         self.autostop_interval = interval
+
+    async def update_network_settings(
+        self,
+        *,
+        network_block_all: bool | None = None,
+        network_allow_list: str | None = None,
+        domain_allow_list: str | None = None,
+    ) -> None:
+        self.network_settings.append(
+            {
+                "network_block_all": network_block_all,
+                "network_allow_list": network_allow_list,
+                "domain_allow_list": domain_allow_list,
+            }
+        )
 
     async def wait_for_sandbox_start(self, timeout: int) -> None:
         assert timeout == 0
@@ -934,3 +950,46 @@ async def test_daytona_provider_lists_sandboxes_with_query() -> None:
     assert daytona.listed_query is not None
     assert daytona.listed_query.labels == {"Benchmark": "vcb"}
     assert daytona.listed_query.limit == 10
+
+
+async def test_daytona_updates_egress_rules() -> None:
+    """Verify Daytona receives only one allowlist type per egress update.
+
+    Test cases:
+    - Domain entries use Daytona's domain allowlist.
+    - CIDR and IPv4 entries use Daytona's network allowlist.
+    - Mixed domain and CIDR entries fail before the provider request.
+    - Clearing egress rules clears both allowlist fields.
+    """
+    inner = InnerSandbox()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    await sandbox.modify_egress_rules(["https://api.openai.com/v1", "github.com"])
+
+    assert inner.network_settings[-1] == {
+        "network_block_all": None,
+        "network_allow_list": "",
+        "domain_allow_list": "api.openai.com,github.com",
+    }
+
+    await sandbox.modify_egress_rules(["198.51.100.20/32", "203.0.113.10"])
+
+    assert inner.network_settings[-1] == {
+        "network_block_all": None,
+        "network_allow_list": "198.51.100.20/32,203.0.113.10/32",
+        "domain_allow_list": "",
+    }
+
+    request_count = len(inner.network_settings)
+    with pytest.raises(ValueError, match="allowed addresses cannot mix domains and CIDRs"):
+        await sandbox.modify_egress_rules(["https://api.openai.com/v1", "198.51.100.20/32"])
+
+    assert len(inner.network_settings) == request_count
+
+    await sandbox.clear_egress_rules()
+
+    assert inner.network_settings[-1] == {
+        "network_block_all": False,
+        "network_allow_list": "",
+        "domain_allow_list": "",
+    }

@@ -124,6 +124,8 @@ def _resolve_daytona_allowed_addresses(allowed_addresses: list[str]) -> tuple[li
     domains = list(dict.fromkeys(domains))
     if not cidrs and not domains:
         raise ValueError("allowed addresses did not resolve to Daytona-compatible rules")
+    if cidrs and domains:
+        raise ValueError("allowed addresses cannot mix domains and CIDRs")
 
     return cidrs, domains
 

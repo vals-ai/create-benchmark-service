@@ -1,4 +1,8 @@
-"""Decoupled sandbox grading for eval_mode == SANDBOX benchmarks.
+"""Submission evaluation for /v1: sandbox grading and the text fold.
+
+evaluate_submission is the one-call entry point: pick the stream for the
+benchmark's eval mode (the sandbox engine for SANDBOX, the in-process
+evaluate_response adapter for TEXT), fold it into one V1EvalResponse.
 
 Chunk grammar, enforced by the engine once:
 
@@ -11,7 +15,7 @@ everything under one spec-derived deadline, and tears the sandbox down
 outside that deadline under its own bound. collapse_stream folds any chunk
 stream — sandbox or in-process text — into one V1EvalResponse, so every
 consumer shares identical terminal semantics. An async-job wrapper can later
-reuse both.
+reuse all of these.
 """
 
 import asyncio
@@ -31,6 +35,7 @@ from benchmark_service import submission_artifacts
 from benchmark_service.base import BenchmarkService
 from benchmark_service.sandbox import Sandbox, SandboxCreateRequest, SandboxProvider
 from benchmark_service.schemas import (
+    EvalMode,
     EvaluateResponseRequest,
     RetrieveTaskResponse,
     StreamChunk,
@@ -289,3 +294,42 @@ async def collapse_stream(
         logger.exception("evaluation failed run_id=%s task_id=%s", run_id, task_id)
         return error(str(exc))
     return error("evaluation completed without a result chunk")
+
+
+async def evaluate_submission(
+    *,
+    service: BenchmarkService,
+    run_id: str,
+    tenant: str,
+    request: EvaluateResponseRequest,
+    provider: SandboxProvider | None,
+    evaluator_version: str | None,
+    dataset: str | None,
+    artifact_key: str | None = None,
+    labels: dict[str, str] | None = None,
+) -> V1EvalResponse:
+    """Evaluate one submission per the benchmark's eval mode; never raises
+    during evaluation. A SANDBOX service without a provider is a deployment
+    error and raises before any work starts.
+    """
+    if service.eval_mode == EvalMode.SANDBOX:
+        if provider is None:
+            raise ValueError("eval_mode == EvalMode.SANDBOX requires a sandbox provider")
+        stream = grade_instance_stream(
+            service=service,
+            run_id=run_id,
+            tenant=tenant,
+            request=request,
+            provider=provider,
+            dataset=dataset,
+            artifact_key=artifact_key,
+            labels=labels,
+        )
+    else:
+        stream = service.stream_evaluate_response(request, dataset=dataset)
+    return await collapse_stream(
+        stream,
+        run_id=run_id,
+        task_id=request.task_id,
+        evaluator_version=evaluator_version,
+    )

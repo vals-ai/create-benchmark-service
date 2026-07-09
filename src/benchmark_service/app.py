@@ -20,7 +20,7 @@ from websockets.exceptions import ConnectionClosed
 from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import LEGACY_TENANT_SENTINEL, get_auth_settings, get_tenant_config, load_allowlist
 from benchmark_service.base import BenchmarkService
-from benchmark_service.grading import collapse_stream, grade_instance_stream
+from benchmark_service.grading import evaluate_submission
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.schemas import (
     EvalMode,
@@ -500,28 +500,27 @@ class BenchmarkServiceApp(FastAPI):
             self._grading_in_flight.add(in_flight_key)
             try:
                 async with self._grading_semaphore:
-                    response = await collapse_stream(
-                        grade_instance_stream(
-                            service=self.service,
-                            run_id=body.run_id,
-                            tenant=tenant,
-                            request=internal_req,
-                            provider=provider,
-                            dataset=body.dataset,
-                            artifact_key=artifact_key,
-                        ),
+                    response = await evaluate_submission(
+                        service=self.service,
                         run_id=body.run_id,
-                        task_id=body.task_id,
+                        tenant=tenant,
+                        request=internal_req,
+                        provider=provider,
                         evaluator_version=self._service_version,
+                        dataset=body.dataset,
+                        artifact_key=artifact_key,
                     )
             finally:
                 self._grading_in_flight.discard(in_flight_key)
         else:
-            response = await collapse_stream(
-                self.service.stream_evaluate_response(internal_req, dataset=body.dataset),
+            response = await evaluate_submission(
+                service=self.service,
                 run_id=body.run_id,
-                task_id=body.task_id,
+                tenant=tenant,
+                request=internal_req,
+                provider=None,
                 evaluator_version=self._service_version,
+                dataset=body.dataset,
             )
         if _is_trial_tenant(request.state.tenant):
             return sanitize_v1_eval_response(response, self.service.project_trial_result)

@@ -541,6 +541,8 @@ class DaytonaSandboxProvider(SandboxProvider):
                     network_block_all=False,
                     env_vars=request.env_vars,
                 )
+            case _:
+                raise SandboxError("ComposeSource must be unwrapped before provider.create_sandbox")
 
         try:
             inner = await self._daytona.create(params, timeout=request.create_timeout)
@@ -614,6 +616,7 @@ class DaytonaSandboxProvider(SandboxProvider):
 
 
 def _command(command: str, cwd: str | None, timeout: float | None) -> str:
+    command = f"sh -c {shlex.quote(command)}"
     if timeout is not None:
         command = f"timeout {timeout:g} {command}"
     if cwd:

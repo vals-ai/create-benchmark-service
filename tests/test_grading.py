@@ -15,7 +15,7 @@ from benchmark_service import auth as auth_module
 from benchmark_service import grading
 from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.auth import clear_allowlist_cache, clear_auth_cache
-from benchmark_service.grading import SUBMISSION_ARTIFACT_SANDBOX_PATH, grade_instance
+from benchmark_service.grading import SUBMISSION_ARTIFACT_SANDBOX_PATH, collapse_stream, grade_instance_stream
 from benchmark_service.sandbox import MissingSandboxConfigError, SandboxCreateRequest, SandboxProvider
 from benchmark_service.sandbox.types import ExecResult
 from benchmark_service.schemas import (
@@ -171,17 +171,22 @@ def _req() -> EvaluateResponseRequest:
 
 
 async def _grade(service: StubBenchmark, provider: FakeProvider, **overrides: Any) -> Any:
+    """Grade one submission the way _v1_evaluate does: stream the engine, fold it."""
     kwargs: dict[str, Any] = {
         "service": service,
         "run_id": "run-1",
         "tenant": "acme",
         "request": _req(),
         "provider": provider,
-        "evaluator_version": "stub-1.0",
         "dataset": "default",
     }
     kwargs.update(overrides)
-    return await grade_instance(**kwargs)
+    return await collapse_stream(
+        grade_instance_stream(**kwargs),
+        run_id=kwargs["run_id"],
+        task_id=kwargs["request"].task_id,
+        evaluator_version="stub-1.0",
+    )
 
 
 async def test_grade_instance_returns_evaluated_with_passthrough_result() -> None:
@@ -447,7 +452,7 @@ def sandbox_descope_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestCli
             yield client
 
 
-def test_v1_evaluate_dispatches_sandbox_mode_to_grade_instance(sandbox_descope_client: TestClient) -> None:
+def test_v1_evaluate_dispatches_sandbox_mode_to_the_grading_engine(sandbox_descope_client: TestClient) -> None:
     resp = sandbox_descope_client.post(
         "/v1/evaluate",
         json={
@@ -462,7 +467,7 @@ def test_v1_evaluate_dispatches_sandbox_mode_to_grade_instance(sandbox_descope_c
     body = resp.json()
     assert body["status"] == "evaluated"
     # weighted_pass_percentage is produced only by the SANDBOX path's evaluate_instance,
-    # so its presence proves dispatch routed to grade_instance (not evaluate_response).
+    # so its presence proves dispatch routed to the sandbox engine (not evaluate_response).
     assert body["result"] == {"resolved": True, "weighted_pass_percentage": 100.0}
     assert body["evaluator_version"] == "stub-service-1.0"
 

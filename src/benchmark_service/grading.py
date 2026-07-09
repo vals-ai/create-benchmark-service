@@ -289,33 +289,3 @@ async def collapse_stream(
         logger.exception("evaluation failed run_id=%s task_id=%s", run_id, task_id)
         return error(str(exc))
     return error("evaluation completed without a result chunk")
-
-
-async def grade_instance(
-    *,
-    service: BenchmarkService,
-    run_id: str,
-    tenant: str,
-    request: EvaluateResponseRequest,
-    provider: SandboxProvider,
-    evaluator_version: str | None,
-    dataset: str | None,
-    artifact_key: str | None = None,
-    labels: dict[str, str] | None = None,
-) -> V1EvalResponse:
-    """Grade one submission in a fresh sandbox and fold the stream; never raises."""
-    return await collapse_stream(
-        grade_instance_stream(
-            service=service,
-            run_id=run_id,
-            tenant=tenant,
-            request=request,
-            provider=provider,
-            dataset=dataset,
-            artifact_key=artifact_key,
-            labels=labels,
-        ),
-        run_id=run_id,
-        task_id=request.task_id,
-        evaluator_version=evaluator_version,
-    )

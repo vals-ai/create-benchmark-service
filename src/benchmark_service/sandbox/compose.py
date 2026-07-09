@@ -6,6 +6,8 @@ from collections.abc import AsyncGenerator
 
 from benchmark_service.sandbox.types import ComposeSource, ExecResult, Sandbox, SandboxError
 
+_COMPOSE_EXEC_ENV_ARGS = r"$(env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/-e \1/p')"
+
 
 class ComposeSandbox(Sandbox):
     def __init__(self, outer: Sandbox, source: ComposeSource) -> None:
@@ -28,12 +30,15 @@ class ComposeSandbox(Sandbox):
     def _compose_command(self, parts: list[str]) -> str:
         return f"{self._compose_command_prefix} {shlex.join(parts)}"
 
+    def _compose_exec_command(self, parts: list[str]) -> str:
+        return f"{self._compose_command_prefix} exec {_COMPOSE_EXEC_ENV_ARGS} {shlex.join(parts)}"
+
     def _exec_command(self, command: str, cwd: str | None) -> str:
-        parts = ["exec", "-T"]
+        parts = ["-T"]
         if cwd:
             parts.extend(["-w", cwd])
         parts.extend([self._service, "sh", "-lc", command])
-        return self._compose_command(parts)
+        return self._compose_exec_command(parts)
 
     def _container_lookup(self) -> str:
         return f"container_id=$({self._compose_command(['ps', '-q', self._service])})"
@@ -97,3 +102,9 @@ class ComposeSandbox(Sandbox):
             return await self._outer.download_file(temp)
         finally:
             await self._outer.exec(shlex.join(["rm", "-f", temp]), timeout=10)
+
+    async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
+        await self._outer.modify_egress_rules(allowed_addresses)
+
+    async def clear_egress_rules(self) -> None:
+        await self._outer.clear_egress_rules()

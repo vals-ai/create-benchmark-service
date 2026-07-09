@@ -7,6 +7,8 @@ from pydantic import BaseModel, Field, computed_field, model_validator
 from benchmark_service.sandbox import SandboxProviderConfig
 from benchmark_service.sandbox.types import ImageSource, Resources, SandboxSource, SnapshotSource
 
+_COMPOSE_LEGACY_DOCKER_IMAGE = "compose+source-required"
+
 
 class TaskFilter(BaseModel):
     """Filter for selecting tasks from your benchmark dataset."""
@@ -46,7 +48,7 @@ def legacy_docker_image(source: SandboxSource) -> str:
         return source.image
     if isinstance(source, SnapshotSource):
         return f"snapshot:{source.snapshot}"
-    return legacy_docker_image(source.outer)
+    return _COMPOSE_LEGACY_DOCKER_IMAGE
 
 
 class RetrieveTaskResponse(BaseModel):

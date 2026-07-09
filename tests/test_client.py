@@ -133,13 +133,13 @@ async def test_retrieve_task_serializes_snapshot_source_for_legacy_clients(
     assert result.model_dump()["docker_image"] == "snapshot:vcb1-openhands-abc123"
 
 
-async def test_retrieve_task_serializes_compose_outer_source_for_legacy_clients(
+async def test_retrieve_task_serializes_compose_source_as_invalid_legacy_image(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
-    """Compose-backed tasks should still expose a legacy docker_image for older clients.
+    """Compose-backed tasks should not advertise the outer image to older clients.
 
     Test cases:
-    - Compose source backed by an image reports the outer image.
+    - Compose source reports an intentionally invalid legacy image.
     - Compose source metadata is preserved.
     """
     client, mock_http = benchmark_client
@@ -162,7 +162,7 @@ async def test_retrieve_task_serializes_compose_outer_source_for_legacy_clients(
 
     result = await client.retrieve_task("task-1")
 
-    assert result.model_dump()["docker_image"] == "docker:28.3.3-dind"
+    assert result.model_dump()["docker_image"] == "compose+source-required"
     assert result.source.model_dump()["type"] == "compose"
 
 

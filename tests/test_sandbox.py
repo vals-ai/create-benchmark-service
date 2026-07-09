@@ -1,4 +1,5 @@
 import asyncio
+import shlex
 from collections.abc import AsyncGenerator
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, cast
@@ -38,15 +39,22 @@ def _client_response_error(status: int, message: str) -> ClientResponseError:
     return ClientResponseError(request_info, (), status=status, message=message)
 
 
+def _unwrap_shell_command(command: str) -> str:
+    if command.startswith("sh -c "):
+        return shlex.split(command)[2]
+    return command
+
+
 class Process:
     def __init__(self) -> None:
         self.command: str | None = None
 
     async def exec(self, command: str) -> SimpleNamespace:
         self.command = command
-        if command.startswith("test -e "):
+        evaluated_command = _unwrap_shell_command(command)
+        if evaluated_command.startswith("test -e "):
             return SimpleNamespace(exit_code=0, result="")
-        if command.startswith("cat "):
+        if evaluated_command.startswith("cat "):
             return SimpleNamespace(exit_code=0, result="0")
         return SimpleNamespace(exit_code=0, result="")
 
@@ -171,7 +179,7 @@ class ReconnectingProcess(Process):
         self.connected_session_id: str | None = None
 
     async def exec(self, command: str) -> SimpleNamespace:
-        if command.startswith("test -e "):
+        if _unwrap_shell_command(command).startswith("test -e "):
             return SimpleNamespace(exit_code=0 if self.connected_session_id else 1, result="")
         return await super().exec(command)
 
@@ -286,6 +294,8 @@ class RecordingSandbox(Sandbox):
         self.exec_commands: list[str] = []
         self.uploads: list[tuple[str, bytes]] = []
         self.downloads: list[str] = []
+        self.allowed_addresses: list[str] | None = None
+        self.egress_cleared = False
         self.exec_results = exec_results or []
 
     @property
@@ -318,6 +328,12 @@ class RecordingSandbox(Sandbox):
     async def download_file(self, remote_path: str) -> bytes:
         self.downloads.append(remote_path)
         return b"downloaded"
+
+    async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
+        self.allowed_addresses = allowed_addresses
+
+    async def clear_egress_rules(self) -> None:
+        self.egress_cleared = True
 
 
 class InnerSandbox:
@@ -491,6 +507,8 @@ async def test_compose_sandbox_routes_operations_through_main_service() -> None:
     output = [chunk async for chunk in sandbox.command("echo ok", cwd="/workspace", timeout=12)]
     await sandbox.upload_file("/workspace/instruction.md", b"solve it")
     downloaded = await sandbox.download_file("/workspace/reward.json")
+    await sandbox.modify_egress_rules(["api.openai.com"])
+    await sandbox.clear_egress_rules()
 
     assert source.service == "main"
     assert isinstance(source.outer, ImageSource)
@@ -502,12 +520,18 @@ async def test_compose_sandbox_routes_operations_through_main_service() -> None:
     assert output == ["ok"]
     assert outer.exec_commands[0] == (
         "MAIN_IMAGE_NAME=task docker compose -p task -f /harbor/compose.yaml "
-        "exec -T -w /workspace main sh -lc 'pytest -q'"
+        "exec "
+        "$(env | sed -n 's/^\\([A-Za-z_][A-Za-z0-9_]*\\)=.*/-e \\1/p') "
+        "-T -w /workspace main sh -lc 'pytest -q'"
     )
     assert outer.exec_commands[1] == (
         "MAIN_IMAGE_NAME=task docker compose -p task -f /harbor/compose.yaml "
-        "exec -T -w /workspace main sh -lc 'echo ok'"
+        "exec "
+        "$(env | sed -n 's/^\\([A-Za-z_][A-Za-z0-9_]*\\)=.*/-e \\1/p') "
+        "-T -w /workspace main sh -lc 'echo ok'"
     )
+    assert outer.allowed_addresses == ["api.openai.com"]
+    assert outer.egress_cleared
     upload_temp = outer.uploads[0][0]
     download_temp = outer.downloads[0]
     assert outer.uploads == [(upload_temp, b"solve it")]

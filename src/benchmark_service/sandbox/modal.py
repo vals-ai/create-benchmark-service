@@ -14,6 +14,7 @@ from pydantic import BaseModel
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
 from benchmark_service.sandbox.types import (
+    ComposeSource,
     ExecResult,
     ImageSource,
     Sandbox,
@@ -170,6 +171,8 @@ class ModalSandboxProvider(SandboxProvider):
                 return Image.from_registry(image)  # pyright: ignore[reportUnknownMemberType]
             case SnapshotSource(snapshot=snapshot):
                 return Image.from_id(snapshot, client=client)
+            case ComposeSource():
+                raise SandboxError("ComposeSource must be unwrapped before provider.create_sandbox")
 
     async def _find_reusable_sandbox(self, name: str, client: Client) -> ModalSdkSandbox | None:
         # Match Daytona: task retry/resume reuses a still-running sandbox by

@@ -16,6 +16,7 @@ import benchmark_service.sandbox.modal as modal_module
 from benchmark_service.sandbox import sandbox_provider_config_from_mapping
 from benchmark_service.sandbox.modal import ModalProviderConfig, ModalSandbox, ModalSandboxProvider
 from benchmark_service.sandbox.types import (
+    ComposeSource,
     ImageSource,
     Resources,
     SandboxCommandError,
@@ -23,6 +24,7 @@ from benchmark_service.sandbox.types import (
     SandboxError,
     SandboxNotFoundError,
     SandboxQuery,
+    SandboxSource,
     SnapshotSource,
 )
 
@@ -118,7 +120,7 @@ class DisappearingSandbox(FakeInnerSandbox):
         raise ModalNotFoundError("sandbox disappeared")
 
 
-def _request(source: ImageSource | SnapshotSource | None = None) -> SandboxCreateRequest:
+def _request(source: SandboxSource | None = None) -> SandboxCreateRequest:
     return SandboxCreateRequest(
         source=source or ImageSource(image="python:3.12"),
         resources=Resources(vcpu=4, memory=8, disk=30),
@@ -329,6 +331,14 @@ async def test_create_sandbox_restores_snapshot_source(monkeypatch: pytest.Monke
 
     assert sandbox.id == "sb-123"
     assert captured["image"] == ("snapshot", "im-123")
+
+
+async def test_create_sandbox_rejects_compose_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(_noop)))
+    request = _request(ComposeSource(outer=ImageSource(image="docker:28-dind")))
+
+    with pytest.raises(SandboxError, match="ComposeSource must be unwrapped"):
+        await provider.create_sandbox(request)
 
 
 async def test_get_sandbox_raises_not_found(monkeypatch: pytest.MonkeyPatch) -> None:

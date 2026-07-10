@@ -14,6 +14,7 @@ from benchmark_service.v1_schemas import V1DatasetTasksResponse
 BASE_URL = "http://localhost:8000"
 HEADERS = {"Authorization": "Bearer token"}
 DAYTONA_CONFIG = DaytonaProviderConfig(DAYTONA_API_KEY="key", DAYTONA_API_URL="url", DAYTONA_TARGET="target")
+MODAL_CONFIG = ModalProviderConfig(MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret")
 
 
 def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "error") -> MagicMock:
@@ -338,7 +339,7 @@ async def test_evaluate_response_includes_optional_provider_config(
         "task-1",
         "answer",
         dataset="mydata",
-        sandbox_provider=ModalProviderConfig(),
+        sandbox_provider=MODAL_CONFIG,
     )
 
     assert result == {"score": 1.0}
@@ -347,7 +348,11 @@ async def test_evaluate_response_includes_optional_provider_config(
         json={
             "task_id": "task-1",
             "response": "answer",
-            "sandbox_provider": {"type": "modal"},
+            "sandbox_provider": {
+                "type": "modal",
+                "MODAL_TOKEN_ID": "id",
+                "MODAL_TOKEN_SECRET": "secret",
+            },
             "dataset": "mydata",
         },
         timeout=10,
@@ -409,7 +414,7 @@ def test_get_sandbox_provider_uses_each_provider_config() -> None:
     client = _make_client()
     daytona_provider = client.get_sandbox_provider(DAYTONA_CONFIG)
     same_daytona_provider = client.get_sandbox_provider(DAYTONA_CONFIG)
-    modal_provider = client.get_sandbox_provider(ModalProviderConfig(MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret"))
+    modal_provider = client.get_sandbox_provider(MODAL_CONFIG)
 
     assert same_daytona_provider is daytona_provider
     assert modal_provider is not daytona_provider

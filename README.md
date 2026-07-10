@@ -121,7 +121,7 @@ Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` 
 `sandbox_provider` is selected per setup/evaluate-instance request and carries the provider credentials. The tracker resolves it from AWS Secrets Manager (`sandbox_provider_secret_name`); the secret's keys are the config fields:
 
 ```json
-{"type": "daytona", "api_key": "...", "api_url": "...", "target": "..."}
+{"type": "daytona", "DAYTONA_API_KEY": "...", "DAYTONA_API_URL": "...", "DAYTONA_TARGET": "..."}
 {"type": "modal", "MODAL_TOKEN_ID": "...", "MODAL_TOKEN_SECRET": "..."}
 ```
 
@@ -129,6 +129,7 @@ Provider compatibility notes:
 
 - Modal supports both `ImageSource` (registry pull) and `SnapshotSource` (a Modal filesystem snapshot created via `Sandbox.snapshot_filesystem()`, restored by image id).
 - Modal sandboxes do not expose a disk-size parameter; `Resources.disk` is accepted for schema compatibility but not enforced.
+- Modal does not support changing egress rules after sandbox creation; agent contracts with an `egress_allowlist` are unsupported.
 - Nested Docker (Docker-in-Docker) capability is granted on every sandbox for both providers — Daytona supports it natively and the Modal adapter requests it unconditionally — so benchmarks never configure it. The benchmark service still owns the Docker-capable image, dockerd startup flags, compose workflow, and cleanup.
 - Transient Modal connection errors are retried up to three attempts, matching the Daytona adapter's provider-level retry shape. Non-transient command failures still surface as `SandboxCommandError` with the command exit code.
 
@@ -215,7 +216,7 @@ Status codes: 403 if the tenant isn't allowed the dataset *or* if the caller use
 Pydantic models used across requests and responses:
 
 - **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `Resources`
-- **`SandboxSource`** — `ImageSource(type="image", image=...)` or `SnapshotSource(type="snapshot", snapshot=...)`
+- **`SandboxSource`** — `ImageSource`, `SnapshotSource`, or `ComposeSource` wrapping either base source
 - **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; currently `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET)` or `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)`
 - **`Resources`** — `vcpu`, `memory`, `disk`
 - **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, optional `sandbox_provider` with Daytona header fallback, `dataset`

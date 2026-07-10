@@ -5,7 +5,7 @@ from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, cast
 
 import pytest
-from aiohttp import ClientConnectionError, ClientResponseError, RequestInfo
+from aiohttp import ClientConnectionError, ClientPayloadError, ClientResponseError, RequestInfo, ServerTimeoutError
 from daytona import SandboxState
 from daytona.common.errors import (
     DaytonaConflictError,
@@ -15,6 +15,7 @@ from daytona.common.errors import (
     DaytonaRateLimitError,
 )
 from multidict import CIMultiDict, CIMultiDictProxy
+from tenacity import wait_fixed
 from yarl import URL
 
 from benchmark_service.sandbox import (
@@ -29,7 +30,9 @@ from benchmark_service.sandbox import (
     SandboxNotFoundError,
     SandboxQuery,
 )
+import benchmark_service.sandbox.daytona as daytona_module
 from benchmark_service.sandbox.daytona import DaytonaSandbox, DaytonaSandboxProvider, daytona_retry_after_seconds
+from benchmark_service.sandbox.types import SandboxConnectionError
 
 
 def _client_response_error(status: int, message: str) -> ClientResponseError:
@@ -43,6 +46,10 @@ def _unwrap_shell_command(command: str) -> str:
     if command.startswith("sh -c "):
         return shlex.split(command)[2]
     return command
+
+
+async def _collect_command(sandbox: DaytonaSandbox, command: str) -> list[str]:
+    return [chunk async for chunk in sandbox.command(command)]
 
 
 class Process:
@@ -152,6 +159,7 @@ class RemovedSandboxProcess(Process):
 class PtyHandle:
     def __init__(self, on_data: Callable[[bytes], None | Awaitable[None]]) -> None:
         self._on_data = on_data
+        self.disconnected = False
 
     async def send_input(self, data: str) -> None:
         if data.startswith("stty"):
@@ -164,7 +172,7 @@ class PtyHandle:
         pass
 
     async def disconnect(self) -> None:
-        pass
+        self.disconnected = True
 
 
 class DisconnectedPtyHandle(PtyHandle):
@@ -177,6 +185,8 @@ class ReconnectingProcess(Process):
         super().__init__()
         self.checked_session_id: str | None = None
         self.connected_session_id: str | None = None
+        self.initial_handle: DisconnectedPtyHandle | None = None
+        self.connected_handle: PtyHandle | None = None
 
     async def exec(self, command: str) -> SimpleNamespace:
         if _unwrap_shell_command(command).startswith("test -e "):
@@ -192,7 +202,8 @@ class ReconnectingProcess(Process):
     ) -> DisconnectedPtyHandle:
         assert id
         assert envs == {"TERM": "dumb", "LANG": "C.UTF-8"}
-        return DisconnectedPtyHandle(on_data)
+        self.initial_handle = DisconnectedPtyHandle(on_data)
+        return self.initial_handle
 
     async def get_pty_session_info(self, session_id: str) -> SimpleNamespace:
         assert self.connected_session_id is None
@@ -206,7 +217,8 @@ class ReconnectingProcess(Process):
     ) -> PtyHandle:
         assert self.checked_session_id == session_id
         self.connected_session_id = session_id
-        return PtyHandle(on_data)
+        self.connected_handle = PtyHandle(on_data)
+        return self.connected_handle
 
 
 class CreatePtyFailureProcess(Process):
@@ -262,13 +274,103 @@ class BlockingProcess(Process):
         self.killed_session_id = session_id
 
 
+class StalledSendPtyHandle(PtyHandle):
+    def __init__(self, on_data: Callable[[bytes], None | Awaitable[None]]) -> None:
+        super().__init__(on_data)
+        self.send_started = False
+
+    async def send_input(self, data: str) -> None:
+        self.send_started = True
+        await asyncio.Event().wait()
+
+
+class StalledSendProcess(Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.handle: StalledSendPtyHandle | None = None
+        self.killed_session_id: str | None = None
+
+    async def create_pty_session(
+        self,
+        *,
+        id: str,
+        on_data: Callable[[bytes], None | Awaitable[None]],
+        envs: dict[str, str],
+    ) -> StalledSendPtyHandle:
+        self.handle = StalledSendPtyHandle(on_data)
+        return self.handle
+
+    async def kill_pty_session(self, session_id: str) -> None:
+        self.killed_session_id = session_id
+
+
+class StalledDisconnectPtyHandle(PtyHandle):
+    def __init__(self, on_data: Callable[[bytes], None | Awaitable[None]]) -> None:
+        super().__init__(on_data)
+        self.disconnect_started = False
+
+    async def disconnect(self) -> None:
+        self.disconnect_started = True
+        await asyncio.Event().wait()
+
+
+class StalledDisconnectProcess(Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.handle: StalledDisconnectPtyHandle | None = None
+        self.killed_session_id: str | None = None
+
+    async def create_pty_session(
+        self,
+        *,
+        id: str,
+        on_data: Callable[[bytes], None | Awaitable[None]],
+        envs: dict[str, str],
+    ) -> StalledDisconnectPtyHandle:
+        self.handle = StalledDisconnectPtyHandle(on_data)
+        return self.handle
+
+    async def kill_pty_session(self, session_id: str) -> None:
+        self.killed_session_id = session_id
+
+
+class ReconnectThenStalledStatusProcess(ReconnectingProcess):
+    def __init__(self) -> None:
+        super().__init__()
+        self.status_attempts = 0
+        self.killed_session_id: str | None = None
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        if _unwrap_shell_command(command).startswith("test -e "):
+            if self.connected_session_id is None:
+                return SimpleNamespace(exit_code=1, result="")
+            self.status_attempts += 1
+            await asyncio.Event().wait()
+        return await Process.exec(self, command)
+
+    async def connect_pty_session(
+        self,
+        session_id: str,
+        on_data: Callable[[bytes], None | Awaitable[None]],
+    ) -> BlockingPtyHandle:
+        assert self.checked_session_id == session_id
+        self.connected_session_id = session_id
+        self.connected_handle = BlockingPtyHandle(on_data)
+        return self.connected_handle
+
+    async def kill_pty_session(self, session_id: str) -> None:
+        self.killed_session_id = session_id
+
+
 class Files:
-    async def upload_file(self, content: bytes, remote_path: str) -> None:
+    async def upload_file(self, content: bytes, remote_path: str, timeout: int = 30 * 60) -> None:
         assert content == b"hello world"
         assert remote_path == "/tmp/result.txt"
+        assert timeout == 300
 
-    async def download_file_stream(self, remote_path: str) -> Any:
+    async def download_file_stream(self, remote_path: str, timeout: int = 30 * 60) -> Any:
         assert remote_path == "/tmp/result.txt"
+        assert timeout == 300
 
         async def chunks() -> Any:
             yield b"hello"
@@ -278,10 +380,10 @@ class Files:
 
 
 class RemovedSandboxFiles(Files):
-    async def upload_file(self, content: bytes, remote_path: str) -> None:
+    async def upload_file(self, content: bytes, remote_path: str, timeout: int = 30 * 60) -> None:
         raise _client_response_error(status=404, message="Not Found")
 
-    async def download_file_stream(self, remote_path: str) -> Any:
+    async def download_file_stream(self, remote_path: str, timeout: int = 30 * 60) -> Any:
         async def chunks() -> Any:
             raise _client_response_error(status=502, message="Bad Gateway")
             yield b""
@@ -624,7 +726,9 @@ async def test_daytona_command_wraps_shell_pipelines_when_timeout_is_set() -> No
     inner = InnerSandbox()
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    await sandbox.exec("container_id=$(docker compose ps -q main); cat /tmp/file | docker exec -i \"$container_id\" cat", timeout=60)
+    await sandbox.exec(
+        'container_id=$(docker compose ps -q main); cat /tmp/file | docker exec -i "$container_id" cat', timeout=60
+    )
 
     assert inner.process.command == (
         "timeout 60 sh -c "
@@ -789,6 +893,10 @@ async def test_daytona_command_checks_pty_before_reconnecting() -> None:
     assert output == ["hello"]
     assert process.checked_session_id is not None
     assert process.connected_session_id == process.checked_session_id
+    assert process.initial_handle is not None
+    assert process.initial_handle.disconnected is True
+    assert process.connected_handle is not None
+    assert process.connected_handle.disconnected is True
 
 
 async def test_daytona_command_checks_sandbox_health_before_reconnecting() -> None:
@@ -1017,3 +1125,258 @@ async def test_daytona_updates_egress_rules() -> None:
         "network_allow_list": "",
         "domain_allow_list": "",
     }
+
+
+class StalledProcess(Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        self.attempts += 1
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+class RecordingBoundedDaytonaSandbox(DaytonaSandbox):
+    def __init__(self, sandbox: Any) -> None:
+        super().__init__(sandbox)
+        self.request_timeouts: list[float | None] = []
+
+    async def _bounded[T](self, awaitable: Awaitable[T], *, timeout: float | None = None) -> T:
+        self.request_timeouts.append(timeout)
+        return await awaitable
+
+
+class StalledStatusProcess(BlockingProcess):
+    def __init__(self) -> None:
+        super().__init__()
+        self.exec_attempts = 0
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        self.exec_attempts += 1
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+class SlowStreamingFiles(Files):
+    def __init__(self) -> None:
+        self.timeout: float | None = None
+
+    async def download_file_stream(self, remote_path: str, timeout: int = 30 * 60) -> Any:
+        assert remote_path == "/tmp/result.txt"
+        self.timeout = timeout
+
+        async def chunks() -> Any:
+            for chunk in (b"hello", b" ", b"world"):
+                await asyncio.sleep(0.008)
+                yield chunk
+
+        return chunks()
+
+
+class StalledUploadFiles(Files):
+    def __init__(self) -> None:
+        self.attempts = 0
+        self.request_timeouts: list[int] = []
+
+    async def upload_file(self, content: bytes, remote_path: str, timeout: int = 30 * 60) -> None:
+        assert content == b"hello world"
+        assert remote_path == "/tmp/result.txt"
+        self.attempts += 1
+        self.request_timeouts.append(timeout)
+        await asyncio.Event().wait()
+
+
+class FlakyStreamingFiles(Files):
+    def __init__(self, error: Exception) -> None:
+        self.attempts = 0
+        self.error = error
+
+    async def download_file_stream(self, remote_path: str, timeout: int = 30 * 60) -> Any:
+        assert remote_path == "/tmp/result.txt"
+        assert timeout == 300
+        self.attempts += 1
+        attempt = self.attempts
+
+        async def chunks() -> Any:
+            if attempt < 3:
+                yield b"partial"
+                raise self.error
+            yield b"hello world"
+
+        return chunks()
+
+
+async def test_daytona_exec_times_out_stalled_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A toolbox request that never responds should raise a retryable connection error.
+
+    Test cases:
+    - exec raises SandboxConnectionError after the request timeout instead of hanging.
+    - the provider retry policy retries the timed-out request.
+    """
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_REQUEST_TIMEOUT", 0.01)
+    monkeypatch.setattr(daytona_module, "_FIXED_PROVIDER_WAIT", wait_fixed(0))
+    inner = InnerSandbox()
+    process = StalledProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxConnectionError, match="timed out"):
+        await asyncio.wait_for(sandbox.exec("echo hello"), timeout=1)
+
+    assert process.attempts == 3
+
+
+async def test_daytona_exec_uses_explicit_command_timeout_plus_grace(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Explicit command deadlines use their own timeout plus transport grace."""
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_REQUEST_TIMEOUT", 300)
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_COMMAND_TIMEOUT_GRACE_SECONDS", 30)
+    inner = InnerSandbox()
+    sandbox = RecordingBoundedDaytonaSandbox(cast(Any, inner))
+
+    assert (await sandbox.exec("sleep briefly", timeout=10)).exit_code == 0
+    assert (await sandbox.exec("no command deadline", timeout=0)).exit_code == 0
+
+    assert sandbox.request_timeouts == [40, 300]
+
+
+async def test_daytona_upload_times_out_stalled_writes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A blocked upload body must have an overall bound and use provider retries."""
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_UPLOAD_TOTAL_TIMEOUT", 0.01)
+    monkeypatch.setattr(daytona_module, "_FIXED_PROVIDER_WAIT", wait_fixed(0))
+    inner = InnerSandbox()
+    files = StalledUploadFiles()
+    inner.fs = files
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxConnectionError, match="timed out"):
+        await asyncio.wait_for(sandbox.upload_file("/tmp/result.txt", b"hello world"), timeout=1)
+
+    assert files.attempts == 3
+    assert files.request_timeouts == [300, 300, 300]
+
+
+async def test_daytona_download_uses_inactivity_timeout(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A progressing download may exceed the per-read timeout in total wall-clock time."""
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_REQUEST_TIMEOUT", 0.01)
+    inner = InnerSandbox()
+    files = SlowStreamingFiles()
+    inner.fs = files
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    assert await sandbox.download_file("/tmp/result.txt") == b"hello world"
+    assert files.timeout == 0.01
+
+
+@pytest.mark.parametrize(
+    "stream_error",
+    [
+        ServerTimeoutError("stream stalled"),
+        ConnectionResetError("connection reset"),
+        ClientPayloadError("response truncated"),
+    ],
+)
+async def test_daytona_download_retries_stream_errors(monkeypatch: pytest.MonkeyPatch, stream_error: Exception) -> None:
+    """Transport errors raised while consuming a stream must be normalized and retried."""
+    monkeypatch.setattr(daytona_module, "_FIXED_PROVIDER_WAIT", wait_fixed(0))
+    inner = InnerSandbox()
+    files = FlakyStreamingFiles(stream_error)
+    inner.fs = files
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    assert await asyncio.wait_for(sandbox.download_file("/tmp/result.txt"), timeout=1) == b"hello world"
+    assert files.attempts == 3
+
+
+async def test_daytona_command_fails_when_pty_wait_and_status_poll_stall(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead PTY plus unavailable status polling must fail instead of looping forever."""
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_REQUEST_TIMEOUT", 0.01)
+    monkeypatch.setattr(daytona_module, "_PTY_EXIT_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(daytona_module, "_FIXED_PROVIDER_WAIT", wait_fixed(0))
+    inner = InnerSandbox()
+    process = StalledStatusProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxConnectionError, match="timed out"):
+        await asyncio.wait_for(_collect_command(sandbox, "printf hello"), timeout=1)
+
+    assert process.exec_attempts >= 3
+    assert process.handle is not None
+    assert process.handle.disconnected is True
+    assert process.killed_session_id is not None
+
+
+async def test_daytona_command_cleans_up_when_pty_send_stalls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A blocked websocket write must fail while still disconnecting and killing the PTY."""
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_REQUEST_TIMEOUT", 0.01)
+    inner = InnerSandbox()
+    process = StalledSendProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxConnectionError, match="timed out"):
+        await asyncio.wait_for(_collect_command(sandbox, "printf hello"), timeout=1)
+
+    assert process.handle is not None
+    assert process.handle.send_started is True
+    assert process.handle.disconnected is True
+    assert process.killed_session_id is not None
+
+
+async def test_daytona_command_continues_cleanup_when_disconnect_stalls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A blocked websocket close must not prevent PTY kill or command completion."""
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_REQUEST_TIMEOUT", 0.01)
+    inner = InnerSandbox()
+    process = StalledDisconnectProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    assert await asyncio.wait_for(_collect_command(sandbox, "printf hello"), timeout=1) == ["hello"]
+    assert process.handle is not None
+    assert process.handle.disconnect_started is True
+    assert process.killed_session_id is not None
+
+
+async def test_daytona_command_cleans_up_failed_reconnect(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A replacement websocket remains owned and is closed when status polling fails."""
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_REQUEST_TIMEOUT", 0.01)
+    monkeypatch.setattr(daytona_module, "_PTY_EXIT_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(daytona_module, "_FIXED_PROVIDER_WAIT", wait_fixed(0))
+    inner = InnerSandbox()
+    process = ReconnectThenStalledStatusProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxConnectionError, match="timed out"):
+        await asyncio.wait_for(_collect_command(sandbox, "printf hello"), timeout=1)
+
+    assert process.status_attempts == 3
+    assert process.initial_handle is not None
+    assert process.initial_handle.disconnected is True
+    assert process.connected_handle is not None
+    assert process.connected_handle.disconnected is True
+    assert process.killed_session_id is not None
+
+
+async def test_daytona_command_completes_when_pty_wait_hangs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A silently dead PTY websocket should not block command completion.
+
+    Test cases:
+    - handle.wait() never returns, but the status-file poll detects the exit and the
+      command finishes.
+    """
+    monkeypatch.setattr(daytona_module, "_PTY_EXIT_POLL_SECONDS", 0.01)
+    inner = InnerSandbox()
+    process = BlockingProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    chunks = await asyncio.wait_for(_collect_command(sandbox, "printf hello"), timeout=1)
+
+    assert chunks == ["hello"]
+    assert process.handle is not None
+    assert process.handle.disconnected is True

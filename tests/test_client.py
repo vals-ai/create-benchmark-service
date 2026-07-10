@@ -304,23 +304,6 @@ async def test_resume_evaluation_with_eval_resume_state(
     on_eval_resume_state.assert_called_once_with(state)
 
 
-async def test_resume_evaluation_omits_unspecified_provider_config() -> None:
-    state = {"artifact_prefix": "s3://bucket/run"}
-    mock_connect = _ws_mock([json.dumps({"type": "result", "data": {"score": 1.0}})])
-    client = _make_client()
-
-    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
-        await client.resume_evaluation("task-1", eval_resume_state=state)
-
-    ws = mock_connect.__aenter__.return_value
-    assert json.loads(ws.send.call_args.args[0]) == {
-        "task_id": "task-1",
-        "response": None,
-        "eval_resume_state": state,
-        "dataset": None,
-    }
-
-
 async def test_evaluate_response_includes_optional_provider_config(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:

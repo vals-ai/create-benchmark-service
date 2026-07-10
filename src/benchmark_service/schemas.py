@@ -118,7 +118,6 @@ class EvaluateResponseRequest(BaseModel):
     )
     sandbox_provider: SandboxProviderConfig | None = Field(
         default=None,
-        exclude_if=lambda value: value is None,
         description="Request-scoped sandbox provider config for evaluation work that creates a sandbox",
     )
     dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")

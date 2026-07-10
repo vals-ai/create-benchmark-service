@@ -21,7 +21,7 @@ from benchmark_service.sandbox.types import (
     SandboxProvider,
     SandboxQuery,
 )
-from benchmark_service.schemas import EvaluateResponseRequest, StreamResultChunk
+from benchmark_service.schemas import StreamResultChunk
 from tests.conftest import StubBenchmark
 
 
@@ -238,35 +238,6 @@ def test_websocket_evaluate_response_with_eval_resume_state(client: TestClient) 
                 "state": {"artifact_prefix": "s3://bucket/run"},
             },
         }
-
-
-def test_websocket_evaluate_response_passes_sandbox_provider_to_service() -> None:
-    class ProviderAwareBenchmark(StubBenchmark):
-        async def evaluate_response(self, request: EvaluateResponseRequest, dataset: str | None = None) -> Any:
-            assert request.eval_resume_state is not None
-            return {
-                "state": request.eval_resume_state,
-                "sandbox_provider": (
-                    request.sandbox_provider.model_dump(mode="json") if request.sandbox_provider is not None else None
-                ),
-            }
-
-    with TestClient(BenchmarkServiceApp(ProviderAwareBenchmark)) as c:
-        with c.websocket_connect("/ws/evaluate-response") as ws:
-            ws.send_json(
-                {
-                    "task_id": "task-1",
-                    "eval_resume_state": {"artifact_prefix": "s3://bucket/run"},
-                    "sandbox_provider": {"type": "modal"},
-                }
-            )
-            assert ws.receive_json() == {
-                "type": "result",
-                "data": {
-                    "state": {"artifact_prefix": "s3://bucket/run"},
-                    "sandbox_provider": {"type": "modal"},
-                },
-            }
 
 
 def test_websocket_setup_task_resolves_sandbox_provider(

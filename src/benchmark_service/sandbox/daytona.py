@@ -56,9 +56,9 @@ _FAILED_SANDBOX_STATES = (SandboxState.ERROR, SandboxState.BUILD_FAILED)
 _DEAD_SANDBOX_STATES = (
     *_REMOVED_SANDBOX_STATES,
     SandboxState.STOPPED,
-    SandboxState.ARCHIVED,
     *_FAILED_SANDBOX_STATES,
 )
+_DELETE_WITHOUT_START_STATES = (*_DEAD_SANDBOX_STATES, SandboxState.ARCHIVED)
 _SANDBOX_OPERATION_ERRORS = (DaytonaError, ClientResponseError)
 _TRANSIENT_DAYTONA_ERRORS = (DaytonaConnectionError, DaytonaRateLimitError, DaytonaTimeoutError)
 _RETRY_AFTER_PREFIX = "retry-after-"
@@ -585,12 +585,12 @@ class DaytonaSandboxProvider(SandboxProvider):
     async def delete_sandbox(self, instance_id: str) -> None:
         try:
             sandbox = await self._daytona.get(instance_id)
-            if sandbox.state not in _DEAD_SANDBOX_STATES:
+            if sandbox.state not in _DELETE_WITHOUT_START_STATES:
                 await sandbox.wait_for_sandbox_start(timeout=0)
                 await sandbox.refresh_data()
             if sandbox.state in _REMOVED_SANDBOX_STATES:
                 return
-            if sandbox.state not in _DEAD_SANDBOX_STATES:
+            if sandbox.state not in _DELETE_WITHOUT_START_STATES:
                 await sandbox.set_autostop_interval(interval=1)
             await self._daytona.delete(sandbox)
         except DaytonaNotFoundError:

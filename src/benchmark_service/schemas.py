@@ -116,6 +116,11 @@ class EvaluateResponseRequest(BaseModel):
     eval_resume_state: dict[str, Any] | None = Field(
         default=None, description="Benchmark-specific evaluation progress state"
     )
+    sandbox_provider: SandboxProviderConfig | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="Request-scoped sandbox provider config for evaluation work that creates a sandbox",
+    )
     dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
 
     @model_validator(mode="after")

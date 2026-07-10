@@ -15,6 +15,7 @@ from daytona.common.errors import (
     DaytonaRateLimitError,
 )
 from multidict import CIMultiDict, CIMultiDictProxy
+from tenacity import wait_fixed
 from yarl import URL
 
 from benchmark_service.sandbox import (
@@ -29,7 +30,9 @@ from benchmark_service.sandbox import (
     SandboxNotFoundError,
     SandboxQuery,
 )
+import benchmark_service.sandbox.daytona as daytona_module
 from benchmark_service.sandbox.daytona import DaytonaSandbox, DaytonaSandboxProvider, daytona_retry_after_seconds
+from benchmark_service.sandbox.types import SandboxConnectionError
 
 
 def _client_response_error(status: int, message: str) -> ClientResponseError:
@@ -1017,3 +1020,54 @@ async def test_daytona_updates_egress_rules() -> None:
         "network_allow_list": "",
         "domain_allow_list": "",
     }
+
+
+class StalledProcess(Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        self.attempts += 1
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+async def test_daytona_exec_times_out_stalled_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A toolbox request that never responds should raise a retryable connection error.
+
+    Test cases:
+    - exec raises SandboxConnectionError after the request timeout instead of hanging.
+    - the provider retry policy retries the timed-out request.
+    """
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_REQUEST_TIMEOUT", 0.01)
+    monkeypatch.setattr(daytona_module, "_FIXED_PROVIDER_WAIT", wait_fixed(0))
+    inner = InnerSandbox()
+    process = StalledProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxConnectionError, match="timed out"):
+        await sandbox.exec("echo hello")
+
+    assert process.attempts == 3
+
+
+async def test_daytona_command_completes_when_pty_wait_hangs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A silently dead PTY websocket should not block command completion.
+
+    Test cases:
+    - handle.wait() never returns, but the status-file poll detects the exit and the
+      command finishes.
+    """
+    monkeypatch.setattr(daytona_module, "_PTY_EXIT_POLL_SECONDS", 0.01)
+    inner = InnerSandbox()
+    process = BlockingProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    chunks = [chunk async for chunk in sandbox.command("printf hello")]
+
+    assert chunks == ["hello"]
+    assert process.handle is not None
+    assert process.handle.disconnected is True

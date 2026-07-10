@@ -51,6 +51,10 @@ from benchmark_service.sandbox.types import (
 
 _PTY_STATUS_CHECK_ATTEMPTS = 30
 _STATUS_DIR = "/tmp/.sandbox-provider"
+# The Daytona SDK issues toolbox HTTP calls with `timeout=None`, which disables aiohttp's
+# timeout entirely; a stalled connection would otherwise block the caller forever.
+_TOOLBOX_REQUEST_TIMEOUT = 300.0
+_PTY_EXIT_POLL_SECONDS = 60.0
 _REMOVED_SANDBOX_STATES = (SandboxState.DESTROYING, SandboxState.DESTROYED)
 _FAILED_SANDBOX_STATES = (SandboxState.ERROR, SandboxState.BUILD_FAILED)
 _DEAD_SANDBOX_STATES = (*_REMOVED_SANDBOX_STATES, SandboxState.STOPPED, *_FAILED_SANDBOX_STATES)
@@ -300,6 +304,16 @@ class DaytonaSandbox(Sandbox):
             return SandboxConnectionError(f"Sandbox connection error for {self._sandbox_ref}: {exc}")
         return SandboxError(f"Sandbox operation failed for {self._sandbox_ref}: {exc}")
 
+    async def _bounded[T](self, awaitable: Awaitable[T]) -> T:
+        """Bound a toolbox request so a stalled connection raises a retryable error."""
+        try:
+            async with asyncio.timeout(_TOOLBOX_REQUEST_TIMEOUT):
+                return await awaitable
+        except TimeoutError as exc:
+            raise SandboxConnectionError(
+                f"Daytona request timed out after {_TOOLBOX_REQUEST_TIMEOUT}s for {self._sandbox_ref}"
+            ) from exc
+
     @_PROVIDER_RETRY
     async def exec(
         self,
@@ -310,7 +324,7 @@ class DaytonaSandbox(Sandbox):
     ) -> ExecResult:
         full_command = _command(command, cwd, timeout)
         try:
-            result = await self._sandbox.process.exec(full_command)
+            result = await self._bounded(self._sandbox.process.exec(full_command))
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
 
@@ -348,15 +362,18 @@ class DaytonaSandbox(Sandbox):
     @_PROVIDER_RETRY
     async def upload_file(self, remote_path: str, content: bytes) -> None:
         try:
-            await self._sandbox.fs.upload_file(content, remote_path)
+            await self._bounded(self._sandbox.fs.upload_file(content, remote_path))
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
 
     @_PROVIDER_RETRY
     async def download_file(self, remote_path: str) -> bytes:
-        try:
+        async def _download() -> bytes:
             stream = await self._sandbox.fs.download_file_stream(remote_path)
             return b"".join([chunk async for chunk in stream])
+
+        try:
+            return await self._bounded(_download())
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
 
@@ -365,9 +382,11 @@ class DaytonaSandbox(Sandbox):
         network_allow_list, domain_allow_list = _resolve_daytona_allowed_addresses(allowed_addresses)
 
         try:
-            await self._sandbox.update_network_settings(
-                network_allow_list=",".join(network_allow_list),
-                domain_allow_list=",".join(domain_allow_list),
+            await self._bounded(
+                self._sandbox.update_network_settings(
+                    network_allow_list=",".join(network_allow_list),
+                    domain_allow_list=",".join(domain_allow_list),
+                )
             )
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
@@ -375,10 +394,12 @@ class DaytonaSandbox(Sandbox):
     @_PROVIDER_RETRY
     async def clear_egress_rules(self) -> None:
         try:
-            await self._sandbox.update_network_settings(
-                network_block_all=False,
-                network_allow_list="",
-                domain_allow_list="",
+            await self._bounded(
+                self._sandbox.update_network_settings(
+                    network_block_all=False,
+                    network_allow_list="",
+                    domain_allow_list="",
+                )
             )
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
@@ -400,15 +421,14 @@ class DaytonaSandbox(Sandbox):
             await handle.send_input(
                 f"mkdir -p {shlex.quote(_STATUS_DIR)}; {command}; echo $? > {shlex.quote(status_path)}; exit\n"
             )
-            with suppress(Exception):
-                await handle.wait()
+            await self._wait_pty_exit(handle, status_path)
 
             for _ in range(_PTY_STATUS_CHECK_ATTEMPTS):
                 await self._check_sandbox_alive()
                 result = await self.exec(f"test -e {shlex.quote(status_path)}")
                 if result.exit_code == 0:
                     break
-                handle = await self._reconnect_pty(session_id, on_data)
+                handle = await self._reconnect_pty(session_id, on_data, status_path)
                 await asyncio.sleep(1)
             else:
                 raise SandboxConnectionError(
@@ -428,9 +448,33 @@ class DaytonaSandbox(Sandbox):
                 with suppress(Exception):
                     await handle.disconnect()
             with suppress(Exception):
-                await self._sandbox.process.kill_pty_session(session_id)
+                await self._bounded(self._sandbox.process.kill_pty_session(session_id))
             with suppress(Exception):
                 await self.exec(f"rm -f {shlex.quote(status_path)}")
+
+    async def _wait_pty_exit(self, handle: AsyncPtyHandle, status_path: str) -> None:
+        """Wait for the PTY command to exit, polling the status file so a silently dead
+        websocket cannot block forever."""
+
+        async def _wait() -> None:
+            with suppress(Exception):
+                await handle.wait()
+
+        wait_task = asyncio.create_task(_wait())
+        try:
+            while not wait_task.done():
+                await asyncio.wait({wait_task}, timeout=_PTY_EXIT_POLL_SECONDS)
+                if wait_task.done():
+                    return
+                with suppress(SandboxError):
+                    result = await self.exec(f"test -e {shlex.quote(status_path)}")
+                    if result.exit_code == 0:
+                        return
+        finally:
+            if not wait_task.done():
+                wait_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await wait_task
 
     @_PROVIDER_RETRY
     async def _create_pty_session(
@@ -439,10 +483,12 @@ class DaytonaSandbox(Sandbox):
         on_data: Callable[[bytes], Awaitable[None]],
     ) -> AsyncPtyHandle:
         try:
-            return await self._sandbox.process.create_pty_session(
-                id=session_id,
-                on_data=on_data,
-                envs={"TERM": "dumb", "LANG": "C.UTF-8"},
+            return await self._bounded(
+                self._sandbox.process.create_pty_session(
+                    id=session_id,
+                    on_data=on_data,
+                    envs={"TERM": "dumb", "LANG": "C.UTF-8"},
+                )
             )
         except _SANDBOX_OPERATION_ERRORS as exc:
             await self._check_sandbox_alive()
@@ -453,12 +499,12 @@ class DaytonaSandbox(Sandbox):
         self,
         session_id: str,
         on_data: Callable[[bytes], Awaitable[None]],
+        status_path: str,
     ) -> AsyncPtyHandle:
         try:
-            await self._sandbox.process.get_pty_session_info(session_id)
-            handle = await self._sandbox.process.connect_pty_session(session_id, on_data)
-            with suppress(Exception):
-                await handle.wait()
+            await self._bounded(self._sandbox.process.get_pty_session_info(session_id))
+            handle = await self._bounded(self._sandbox.process.connect_pty_session(session_id, on_data))
+            await self._wait_pty_exit(handle, status_path)
             return handle
         except DaytonaNotFoundError as exc:
             raise SandboxError(
@@ -478,7 +524,7 @@ class DaytonaSandbox(Sandbox):
     @_PROVIDER_RETRY
     async def _check_sandbox_alive(self) -> None:
         try:
-            await self._sandbox.refresh_data()
+            await self._bounded(self._sandbox.refresh_data())
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
 

@@ -136,11 +136,6 @@ class SandboxProvider(ABC):
     @abstractmethod
     async def delete_sandbox(self, instance_id: str) -> None: ...
 
-    async def force_delete_sandbox(self, instance_id: str) -> bool:
-        """Delete without graceful preparation, returning whether deletion was requested."""
-        await self.delete_sandbox(instance_id)
-        return True
-
     @abstractmethod
     def list_sandboxes(self, query: SandboxQuery) -> AsyncGenerator[Sandbox, None]: ...
 

@@ -53,7 +53,12 @@ _PTY_STATUS_CHECK_ATTEMPTS = 30
 _STATUS_DIR = "/tmp/.sandbox-provider"
 _REMOVED_SANDBOX_STATES = (SandboxState.DESTROYING, SandboxState.DESTROYED)
 _FAILED_SANDBOX_STATES = (SandboxState.ERROR, SandboxState.BUILD_FAILED)
-_DEAD_SANDBOX_STATES = (*_REMOVED_SANDBOX_STATES, SandboxState.STOPPED, *_FAILED_SANDBOX_STATES)
+_DEAD_SANDBOX_STATES = (
+    *_REMOVED_SANDBOX_STATES,
+    SandboxState.STOPPED,
+    SandboxState.ARCHIVED,
+    *_FAILED_SANDBOX_STATES,
+)
 _SANDBOX_OPERATION_ERRORS = (DaytonaError, ClientResponseError)
 _TRANSIENT_DAYTONA_ERRORS = (DaytonaConnectionError, DaytonaRateLimitError, DaytonaTimeoutError)
 _RETRY_AFTER_PREFIX = "retry-after-"
@@ -219,8 +224,6 @@ def _has_retryable_cause(exc: BaseException) -> bool:
 
 def _is_transient_daytona_error(exc: DaytonaError | ClientResponseError) -> bool:
     if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS) or _has_retryable_cause(exc):
-        return True
-    if isinstance(exc, DaytonaError) and exc.status_code is not None and exc.status_code >= 500:
         return True
     return _message_contains(exc, _TRANSPORT_ERROR_MESSAGES)
 
@@ -580,33 +583,23 @@ class DaytonaSandboxProvider(SandboxProvider):
 
     @_PROVIDER_RETRY
     async def delete_sandbox(self, instance_id: str) -> None:
-        _ = await self._delete_sandbox(instance_id, force=False)
-
-    @_PROVIDER_RETRY
-    async def force_delete_sandbox(self, instance_id: str) -> bool:
-        return await self._delete_sandbox(instance_id, force=True)
-
-    async def _delete_sandbox(self, instance_id: str, *, force: bool) -> bool:
         try:
             sandbox = await self._daytona.get(instance_id)
-            if not force and sandbox.state not in (*_REMOVED_SANDBOX_STATES, *_FAILED_SANDBOX_STATES):
+            if sandbox.state not in _DEAD_SANDBOX_STATES:
                 await sandbox.wait_for_sandbox_start(timeout=0)
                 await sandbox.refresh_data()
             if sandbox.state in _REMOVED_SANDBOX_STATES:
-                return False
-            if not force and sandbox.state not in _FAILED_SANDBOX_STATES:
+                return
+            if sandbox.state not in _DEAD_SANDBOX_STATES:
                 await sandbox.set_autostop_interval(interval=1)
             await self._daytona.delete(sandbox)
-            return True
         except DaytonaNotFoundError:
-            return False
+            return
         except DaytonaConflictError as exc:
             if _is_delete_conflict(exc):
                 raise SandboxConnectionError(str(exc)) from exc
             raise self._sandbox_error(exc) from exc
         except DaytonaError as exc:
-            if force and _is_not_found_error(exc):
-                return False
             raise self._sandbox_error(exc) from exc
 
     async def list_sandboxes(self, query: SandboxQuery) -> AsyncGenerator[DaytonaSandbox, None]:

@@ -397,6 +397,19 @@ class ErrorStateSandbox(InnerSandbox):
         raise DaytonaError("sandbox failed to start")
 
 
+class StoppedSandbox(InnerSandbox):
+    state = SandboxState.STOPPED
+
+    async def wait_for_sandbox_start(self, timeout: int) -> None:
+        raise AssertionError("force delete must not wait for startup")
+
+    async def refresh_data(self) -> None:
+        raise AssertionError("force delete must not refresh before deletion")
+
+    async def set_autostop_interval(self, interval: int) -> None:
+        raise AssertionError("force delete must not update autostop")
+
+
 class RefreshToErrorSandbox(InnerSandbox):
     async def refresh_data(self) -> None:
         await super().refresh_data()
@@ -469,6 +482,35 @@ class ReusableLookupConnectionDaytonaClient(DaytonaClient):
                 ClientConnectionError("tcp reset"),
             )
         raise DaytonaNotFoundError("sandbox not found")
+
+
+class DeleteConflictDaytonaClient(DaytonaClient):
+    def __init__(self, sandbox: InnerSandbox) -> None:
+        super().__init__(sandbox)
+        self.delete_attempts = 0
+
+    async def delete(self, sandbox: InnerSandbox) -> None:
+        self.delete_attempts += 1
+        if self.delete_attempts == 1:
+            raise DaytonaConflictError("Sandbox was modified by another operation")
+        await super().delete(sandbox)
+
+
+class DeleteNotFoundDaytonaClient(DaytonaClient):
+    async def delete(self, sandbox: InnerSandbox) -> None:
+        raise DaytonaError("sandbox not found", status_code=404)
+
+
+class DeleteServerErrorDaytonaClient(DaytonaClient):
+    def __init__(self, sandbox: InnerSandbox) -> None:
+        super().__init__(sandbox)
+        self.delete_attempts = 0
+
+    async def delete(self, sandbox: InnerSandbox) -> None:
+        self.delete_attempts += 1
+        if self.delete_attempts == 1:
+            raise DaytonaError("service unavailable", status_code=503)
+        await super().delete(sandbox)
 
 
 def _provider(daytona: DaytonaClient) -> DaytonaSandboxProvider:
@@ -960,6 +1002,38 @@ async def test_daytona_provider_delete_removes_sandbox_that_fails_after_refresh(
     assert inner.refresh_count == 1
     assert inner.autostop_interval is None
     assert daytona.deleted is True
+
+
+async def test_daytona_provider_force_delete_skips_startup_preparation() -> None:
+    inner = StoppedSandbox()
+    daytona = DaytonaClient(inner)
+
+    deletion_requested = await _provider(daytona).force_delete_sandbox(inner.name)
+
+    assert deletion_requested is True
+    assert daytona.deleted is True
+
+
+async def test_daytona_provider_force_delete_treats_missing_sandbox_as_success() -> None:
+    daytona = CreateFailureDaytonaClient(InnerSandbox())
+
+    deletion_requested = await _provider(daytona).force_delete_sandbox("sandbox-name")
+
+    assert deletion_requested is False
+    assert daytona.deleted is False
+
+
+async def test_daytona_provider_force_delete_handles_delete_races_conflicts_and_server_errors() -> None:
+    inner = StoppedSandbox()
+    conflict_client = DeleteConflictDaytonaClient(inner)
+    missing_client = DeleteNotFoundDaytonaClient(inner)
+    server_error_client = DeleteServerErrorDaytonaClient(inner)
+
+    assert await _provider(conflict_client).force_delete_sandbox(inner.name) is True
+    assert conflict_client.delete_attempts == 2
+    assert await _provider(missing_client).force_delete_sandbox(inner.name) is False
+    assert await _provider(server_error_client).force_delete_sandbox(inner.name) is True
+    assert server_error_client.delete_attempts == 2
 
 
 async def test_daytona_provider_lists_sandboxes_with_query() -> None:

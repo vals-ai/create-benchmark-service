@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import re
 import shlex
 from collections.abc import AsyncGenerator, Awaitable
 from typing import Any, Literal, cast
@@ -36,6 +38,9 @@ _APP_NAME = "benchmark-service"
 _MAX_LIFETIME_SECONDS = 24 * 60 * 60
 _ALLOW_ALL_CIDRS = ("0.0.0.0/0",)
 _ALLOW_ALL_DOMAINS = ("*",)
+_MAX_NAME_LENGTH = 64
+_INVALID_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_.-]")
+_APP_ID_PATTERN = re.compile(r"^ap-[a-zA-Z0-9]{22}$")
 
 
 _PROVIDER_RETRY = retry(
@@ -70,6 +75,24 @@ def _command(command: str, cwd: str | None, timeout: float | None) -> str:
     if cwd:
         command = f"cd {shlex.quote(cwd)} && {command}"
     return f"{{ {command} ; }} 2>&1"
+
+
+def _modal_sandbox_name(name: str) -> str:
+    """Return the deterministic Modal SDK name for a requested sandbox name.
+
+    Arguments
+    - name: Requested sandbox name from the benchmark task.
+
+    Returns
+    A Modal-safe name for SDK lookup/create calls; callers should keep the original name on Sandbox.
+    """
+    modal_name = _INVALID_NAME_CHARS.sub("_", name) or "sandbox"
+    if _APP_ID_PATTERN.fullmatch(modal_name):
+        modal_name = f"sandbox-{modal_name}"
+    if len(modal_name) <= _MAX_NAME_LENGTH:
+        return modal_name
+    digest = hashlib.sha1(name.encode()).hexdigest()[:8]
+    return f"{modal_name[:55]}-{digest}"
 
 
 class ModalSandbox(Sandbox):
@@ -260,13 +283,14 @@ class ModalSandboxProvider(SandboxProvider):
     @_PROVIDER_RETRY
     async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
         client, app = await self._connect()
-        existing = await self._find_reusable_sandbox(request.name, client)
+        modal_name = _modal_sandbox_name(request.name)
+        existing = await self._find_reusable_sandbox(modal_name, client)
         if existing is not None:
             return ModalSandbox(existing, name=request.name)
         image = self._resolve_image(request.source, client)
         create_kwargs: dict[str, Any] = {
             "app": app,
-            "name": request.name,
+            "name": modal_name,
             "image": image,
             "env": dict(request.env_vars),
             "tags": request.labels,

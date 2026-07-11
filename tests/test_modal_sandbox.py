@@ -362,6 +362,55 @@ async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> N
     assert captured["experimental_options"] == {"enable_docker": True}
 
 
+async def test_create_sandbox_uses_modal_safe_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify Modal receives a safe name while callers keep the requested sandbox name.
+
+    Test cases:
+    - Unsafe and long task names are normalized before Modal lookup and creation.
+    - The returned sandbox name remains the original benchmark task name.
+    """
+    inner = FakeInnerSandbox()
+    captured: dict[str, Any] = {"lookups": []}
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return inner
+
+    async def from_name(app_name: str, name: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured["lookups"].append(name)
+        raise ModalNotFoundError("no sandbox with that name")
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create), from_name=_aio(from_name)))
+    request = SandboxCreateRequest(
+        source=ImageSource(image="python:3.12"),
+        resources=Resources(vcpu=4, memory=8, disk=30),
+        name=f"dataset/task:with/slashes-{'x' * 80}",
+        labels={"run_id": "r1"},
+        env_vars={"FOO": "bar"},
+        auto_stop_interval=30,
+        create_timeout=120,
+    )
+
+    sandbox = await provider.create_sandbox(request)
+
+    assert sandbox.name == request.name
+    assert captured["lookups"] == [captured["name"]]
+    assert "/" not in captured["name"]
+    assert ":" not in captured["name"]
+    assert len(captured["name"]) <= 64
+
+
+def test_modal_sandbox_name_avoids_app_id_shape() -> None:
+    """Verify names shaped like Modal app IDs are not passed through unchanged.
+
+    Test cases:
+    - A task name matching Modal's app-id shape is prefixed before SDK use.
+    """
+    modal_app_id_name = "ap-" + ("a" * 22)
+
+    assert modal_module._modal_sandbox_name(modal_app_id_name) == f"sandbox-{modal_app_id_name}"
+
+
 async def test_create_sandbox_retries_modal_connection_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(cast(Any, modal_module.ModalSandboxProvider.create_sandbox).retry, "sleep", _noop)
     inner = FakeInnerSandbox()

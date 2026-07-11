@@ -105,10 +105,13 @@ class ModalSandbox(Sandbox):
         # Modal does not expose a cached lifecycle state on the sandbox handle.
         return "unknown"
 
-    async def _raise_if_finished(self) -> None:
+    async def _raise_if_finished(self, *, attempts: int = 1, wait_seconds: float = 0) -> None:
         try:
-            if await self._sandbox.poll.aio() is not None:
-                raise SandboxNotFoundError(f"Sandbox not found: id={self.id}.")
+            for attempt in range(attempts):
+                if await self._sandbox.poll.aio() is not None:
+                    raise SandboxNotFoundError(f"Sandbox not found: id={self.id}.")
+                if attempt < attempts - 1:
+                    await asyncio.sleep(wait_seconds)
         except ModalError as exc:
             raise _sandbox_error(exc) from exc
 
@@ -127,7 +130,7 @@ class ModalSandbox(Sandbox):
         except ModalError as exc:
             raise _sandbox_error(exc) from exc
         if exit_code != 0:
-            await self._raise_if_finished()
+            await self._raise_if_finished(attempts=6, wait_seconds=0.5)
         return ExecResult(exit_code=exit_code, output=output)
 
     @_PROVIDER_RETRY
@@ -155,7 +158,7 @@ class ModalSandbox(Sandbox):
             raise _sandbox_error(exc) from exc
 
         if exit_code != 0:
-            await self._raise_if_finished()
+            await self._raise_if_finished(attempts=6, wait_seconds=0.5)
             raise SandboxCommandError(exit_code)
 
     @_PROVIDER_RETRY

@@ -266,7 +266,7 @@ async def test_command_streams_output_and_raises_on_failure() -> None:
 
 
 async def test_command_maps_terminated_sandbox_to_not_found() -> None:
-    inner = FakeInnerSandbox(process=FakeProcess(["line1\n"], 137), poll_results=[None, 137])
+    inner = FakeInnerSandbox(process=FakeProcess(["line1\n"], 137), poll_results=[None, None, 137])
     sandbox = _sandbox(inner)
     chunks: list[str] = []
 

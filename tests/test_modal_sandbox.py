@@ -78,6 +78,7 @@ class FakeInnerSandbox:
         exec_error: ModalError | None = None,
         file_error: ModalError | None = None,
         poll_result: int | None = None,
+        poll_results: list[int | None] | None = None,
     ) -> None:
         self.object_id = object_id
         self.commands: list[tuple[str, ...]] = []
@@ -85,6 +86,7 @@ class FakeInnerSandbox:
         self._process = process or FakeProcess([], 0)
         self._exec_error = exec_error
         self._poll_result = poll_result
+        self._poll_results = poll_results or []
         self.filesystem = FakeFilesystem(file_content, file_error)
         self.outbound_policies: list[dict[str, list[str] | None]] = []
         self.exec = _aio(self._exec)
@@ -103,6 +105,8 @@ class FakeInnerSandbox:
 
     async def _poll(self) -> int | None:
         # None means still running, mirroring modal.Sandbox.poll().
+        if self._poll_results:
+            return self._poll_results.pop(0)
         return self._poll_result
 
     async def _set_outbound_network_policy(
@@ -261,6 +265,18 @@ async def test_command_streams_output_and_raises_on_failure() -> None:
     assert exc.value.exit_code == 7
 
 
+async def test_command_maps_terminated_sandbox_to_not_found() -> None:
+    inner = FakeInnerSandbox(process=FakeProcess(["line1\n"], 137), poll_results=[None, 137])
+    sandbox = _sandbox(inner)
+    chunks: list[str] = []
+
+    with pytest.raises(SandboxNotFoundError):
+        async for chunk in sandbox.command("run"):
+            chunks.append(chunk)
+
+    assert chunks == ["line1\n"]
+
+
 async def test_upload_file_uses_modal_filesystem() -> None:
     inner = FakeInnerSandbox()
     sandbox = _sandbox(inner)
@@ -269,6 +285,16 @@ async def test_upload_file_uses_modal_filesystem() -> None:
 
     assert inner.filesystem.writes == [(b"hello", "/tmp/nested/problem.txt")]
     assert inner.filesystem.content == b"hello"
+
+
+async def test_file_operations_raise_not_found_when_sandbox_finished() -> None:
+    sandbox = _sandbox(FakeInnerSandbox(poll_result=137))
+
+    with pytest.raises(SandboxNotFoundError):
+        await sandbox.upload_file("/tmp/result.txt", b"hello")
+
+    with pytest.raises(SandboxNotFoundError):
+        await sandbox.download_file("/tmp/result.txt")
 
 
 async def test_download_file_returns_bytes() -> None:
@@ -418,6 +444,16 @@ async def test_get_sandbox_maps_invalid_id_to_not_found(monkeypatch: pytest.Monk
         await provider.get_sandbox("sandbox-name")
 
 
+async def test_get_sandbox_raises_not_found_for_finished_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def from_id(instance_id: str, **kwargs: Any) -> Any:
+        return FakeInnerSandbox(object_id=instance_id, poll_result=137)
+
+    provider = _provider(monkeypatch, SimpleNamespace(from_id=_aio(from_id)))
+
+    with pytest.raises(SandboxNotFoundError, match="id=sb-finished"):
+        await provider.get_sandbox("sb-finished")
+
+
 async def test_delete_sandbox_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:
     async def from_id(instance_id: str, **kwargs: Any) -> Any:
         raise ModalNotFoundError(f"missing {instance_id}")
@@ -443,6 +479,7 @@ async def test_delete_sandbox_terminates(monkeypatch: pytest.MonkeyPatch) -> Non
 
 async def test_list_sandboxes_filters_by_labels(monkeypatch: pytest.MonkeyPatch) -> None:
     inner = FakeInnerSandbox()
+    finished = FakeInnerSandbox(object_id="sb-finished", poll_result=137)
     captured: dict[str, Any] = {}
 
     def list_sandboxes(**kwargs: Any) -> AsyncGenerator[FakeInnerSandbox, None]:
@@ -450,6 +487,7 @@ async def test_list_sandboxes_filters_by_labels(monkeypatch: pytest.MonkeyPatch)
 
         async def iterate() -> AsyncGenerator[FakeInnerSandbox, None]:
             yield inner
+            yield finished
 
         return iterate()
 

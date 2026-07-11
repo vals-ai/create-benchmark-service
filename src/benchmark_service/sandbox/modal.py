@@ -105,6 +105,13 @@ class ModalSandbox(Sandbox):
         # Modal does not expose a cached lifecycle state on the sandbox handle.
         return "unknown"
 
+    async def _raise_if_finished(self) -> None:
+        try:
+            if await self._sandbox.poll.aio() is not None:
+                raise SandboxNotFoundError(f"Sandbox not found: id={self.id}.")
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
+
     async def exec(
         self,
         command: str,
@@ -112,12 +119,15 @@ class ModalSandbox(Sandbox):
         cwd: str | None = None,
         timeout: float | None = None,
     ) -> ExecResult:
+        await self._raise_if_finished()
         process = await self._start_process(command, cwd=cwd, timeout=timeout)
         try:
             output = "".join([str(chunk) async for chunk in process.stdout])
             exit_code = await process.wait.aio()
         except ModalError as exc:
             raise _sandbox_error(exc) from exc
+        if exit_code != 0:
+            await self._raise_if_finished()
         return ExecResult(exit_code=exit_code, output=output)
 
     @_PROVIDER_RETRY
@@ -134,6 +144,7 @@ class ModalSandbox(Sandbox):
         cwd: str | None = None,
         timeout: float | None = None,
     ) -> AsyncGenerator[str, None]:
+        await self._raise_if_finished()
         process = await self._start_process(command, cwd=cwd, timeout=timeout)
 
         try:
@@ -144,10 +155,12 @@ class ModalSandbox(Sandbox):
             raise _sandbox_error(exc) from exc
 
         if exit_code != 0:
+            await self._raise_if_finished()
             raise SandboxCommandError(exit_code)
 
     @_PROVIDER_RETRY
     async def upload_file(self, remote_path: str, content: bytes) -> None:
+        await self._raise_if_finished()
         try:
             await cast(Awaitable[None], self._sandbox.filesystem.write_bytes(content, remote_path))
         except ModalError as exc:
@@ -155,6 +168,7 @@ class ModalSandbox(Sandbox):
 
     @_PROVIDER_RETRY
     async def download_file(self, remote_path: str) -> bytes:
+        await self._raise_if_finished()
         try:
             content = await cast(Awaitable[bytes], self._sandbox.filesystem.read_bytes(remote_path))
         except ModalError as exc:
@@ -298,6 +312,8 @@ class ModalSandboxProvider(SandboxProvider):
         client, _ = await self._connect()
         try:
             inner = await ModalSdkSandbox.from_id.aio(instance_id, client=client)
+            if await inner.poll.aio() is not None:
+                raise SandboxNotFoundError(f"Sandbox not found: id={instance_id}.")
         except ModalInvalidError as exc:
             raise SandboxNotFoundError(f"Sandbox not found: id={instance_id}.") from exc
         except ModalError as exc:
@@ -323,10 +339,11 @@ class ModalSandboxProvider(SandboxProvider):
     async def _list_sandboxes(self, query: SandboxQuery) -> list[ModalSdkSandbox]:
         client, app = await self._connect()
         try:
-            return [
-                inner
-                async for inner in ModalSdkSandbox.list.aio(app_id=app.app_id, tags=query.labels or None, client=client)
-            ]
+            sandboxes: list[ModalSdkSandbox] = []
+            async for inner in ModalSdkSandbox.list.aio(app_id=app.app_id, tags=query.labels or None, client=client):
+                if await inner.poll.aio() is None:
+                    sandboxes.append(inner)
+            return sandboxes
         except ModalError as exc:
             raise _sandbox_error(exc) from exc
 

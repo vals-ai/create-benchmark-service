@@ -338,7 +338,7 @@ async def test_evaluate_response_includes_optional_provider_config(
         "task-1",
         "answer",
         dataset="mydata",
-        sandbox_provider=ModalProviderConfig(),
+        sandbox_provider=ModalProviderConfig(MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret"),
     )
 
     assert result == {"score": 1.0}
@@ -347,7 +347,7 @@ async def test_evaluate_response_includes_optional_provider_config(
         json={
             "task_id": "task-1",
             "response": "answer",
-            "sandbox_provider": {"type": "modal"},
+            "sandbox_provider": {"type": "modal", "MODAL_TOKEN_ID": "id", "MODAL_TOKEN_SECRET": "secret"},
             "dataset": "mydata",
         },
         timeout=10,

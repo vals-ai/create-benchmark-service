@@ -286,13 +286,13 @@ async def test_egress_rule_updates_replace_outbound_policy() -> None:
     - URLs, domains, and IPv4 addresses are split into Modal domain and CIDR allowlists.
     - Clearing egress rules restores Modal's open outbound policy.
     """
-    inner = FakeInnerSandbox()
+    inner = FakeInnerSandbox(process=FakeProcess(["198.51.100.8\n198.51.100.9\n"], 0))
     sandbox = _sandbox(inner)
 
     await sandbox.modify_egress_rules(["https://api.openai.com/v1", "github.com", "203.0.113.10"])
 
     assert inner.outbound_policies[-1] == {
-        "outbound_cidr_allowlist": ["203.0.113.10/32"],
+        "outbound_cidr_allowlist": ["203.0.113.10/32", "198.51.100.8/32", "198.51.100.9/32"],
         "outbound_domain_allowlist": ["api.openai.com", "github.com"],
     }
 

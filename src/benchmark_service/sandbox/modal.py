@@ -174,8 +174,32 @@ class ModalSandbox(Sandbox):
         except ModalError as exc:
             raise _sandbox_error(exc) from exc
 
+    async def _resolve_domain_cidrs(self, domains: list[str]) -> list[str]:
+        domains_to_resolve = [domain for domain in domains if domain != "*" and not domain.startswith("*.")]
+        if not domains_to_resolve:
+            return []
+
+        script = f"""
+import socket
+
+for domain in {domains_to_resolve!r}:
+    try:
+        infos = socket.getaddrinfo(domain, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
+    except OSError:
+        continue
+    for info in infos:
+        print(info[4][0])
+"""
+        result = await self.exec(f"python -c {shlex.quote(script)}")
+        if result.exit_code != 0:
+            return []
+
+        addresses = [f"{line.strip()}/32" for line in result.stdout.splitlines() if line.strip()]
+        return list(dict.fromkeys(addresses))
+
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
         cidrs, domains = resolve_allowed_addresses(allowed_addresses)
+        cidrs = list(dict.fromkeys([*cidrs, *await self._resolve_domain_cidrs(domains)]))
         await self._set_outbound_network_policy(cidrs, domains)
 
     async def clear_egress_rules(self) -> None:

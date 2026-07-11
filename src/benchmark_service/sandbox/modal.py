@@ -39,6 +39,8 @@ _MAX_LIFETIME_SECONDS = 24 * 60 * 60
 _MAX_NAME_LENGTH = 64
 _INVALID_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_.-]")
 _APP_ID_PATTERN = re.compile(r"^ap-[a-zA-Z0-9]{22}$")
+_ALLOW_ALL_CIDRS = ("0.0.0.0/0",)
+_ALLOW_ALL_DOMAINS = ("*",)
 
 
 _PROVIDER_RETRY = retry(
@@ -159,12 +161,12 @@ class ModalSandbox(Sandbox):
             raise _sandbox_error(exc) from exc
         return bytes(content)
 
-    async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
-        cidrs, domains = resolve_allowed_addresses(allowed_addresses)
+    async def _set_outbound_network_policy(self, cidrs: list[str], domains: list[str]) -> None:
         try:
+            set_policy = cast(Any, self._sandbox)._experimental_set_outbound_network_policy
             await cast(
                 Awaitable[None],
-                self._sandbox._experimental_set_outbound_network_policy(  # pyright: ignore[reportPrivateUsage]
+                set_policy.aio(
                     outbound_cidr_allowlist=cidrs,
                     outbound_domain_allowlist=domains,
                 ),
@@ -172,17 +174,12 @@ class ModalSandbox(Sandbox):
         except ModalError as exc:
             raise _sandbox_error(exc) from exc
 
+    async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
+        cidrs, domains = resolve_allowed_addresses(allowed_addresses)
+        await self._set_outbound_network_policy(cidrs, domains)
+
     async def clear_egress_rules(self) -> None:
-        try:
-            await cast(
-                Awaitable[None],
-                self._sandbox._experimental_set_outbound_network_policy(  # pyright: ignore[reportPrivateUsage]
-                    outbound_cidr_allowlist=None,
-                    outbound_domain_allowlist=None,
-                ),
-            )
-        except ModalError as exc:
-            raise _sandbox_error(exc) from exc
+        await self._set_outbound_network_policy(list(_ALLOW_ALL_CIDRS), list(_ALLOW_ALL_DOMAINS))
 
 
 class ModalSandboxProvider(SandboxProvider):
@@ -253,6 +250,8 @@ class ModalSandboxProvider(SandboxProvider):
             "idle_timeout": request.auto_stop_interval * 60 if request.auto_stop_interval else None,
             "timeout": _MAX_LIFETIME_SECONDS,
             "block_network": False,
+            "outbound_cidr_allowlist": list(_ALLOW_ALL_CIDRS),
+            "outbound_domain_allowlist": list(_ALLOW_ALL_DOMAINS),
             "client": client,
             # Nested Docker always on, matching Daytona; no disk parameter exists.
             "experimental_options": {"enable_docker": True},

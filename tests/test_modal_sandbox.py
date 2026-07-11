@@ -90,6 +90,7 @@ class FakeInnerSandbox:
         self.exec = _aio(self._exec)
         self.terminate = _aio(self._terminate)
         self.poll = _aio(self._poll)
+        self._experimental_set_outbound_network_policy = _aio(self._set_outbound_network_policy)
 
     async def _exec(self, *args: str, text: bool = True) -> FakeProcess:
         if self._exec_error is not None:
@@ -104,7 +105,7 @@ class FakeInnerSandbox:
         # None means still running, mirroring modal.Sandbox.poll().
         return self._poll_result
 
-    async def _experimental_set_outbound_network_policy(
+    async def _set_outbound_network_policy(
         self,
         *,
         outbound_cidr_allowlist: list[str] | None = None,
@@ -298,8 +299,8 @@ async def test_egress_rule_updates_replace_outbound_policy() -> None:
     await sandbox.clear_egress_rules()
 
     assert inner.outbound_policies[-1] == {
-        "outbound_cidr_allowlist": None,
-        "outbound_domain_allowlist": None,
+        "outbound_cidr_allowlist": ["0.0.0.0/0"],
+        "outbound_domain_allowlist": ["*"],
     }
 
 
@@ -328,6 +329,8 @@ async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> N
     assert captured["idle_timeout"] == 1800
     assert captured["timeout"] == 86400
     assert captured["block_network"] is False
+    assert captured["outbound_cidr_allowlist"] == ["0.0.0.0/0"]
+    assert captured["outbound_domain_allowlist"] == ["*"]
     # Nested-Docker capability is requested unconditionally, matching Daytona
     # sandboxes which always support it.
     assert captured["experimental_options"] == {"enable_docker": True}

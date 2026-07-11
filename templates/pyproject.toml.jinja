@@ -1,6 +1,6 @@
 [project]
 name = "{{ benchmark_name }}-benchmark-service"
-version = "0.1.0"
+dynamic = ["version"]
 readme = "README.md"
 requires-python = ">=3.12"
 
@@ -17,8 +17,14 @@ dev = [
 ]
 
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling", "hatch-vcs"]
 build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+# A freshly scaffolded project has no git tags (or no repo yet); fall back so it
+# still builds. Real versions come from tags once the repo is set up.
+fallback-version = "0.0.0"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/{{ benchmark_package }}"]

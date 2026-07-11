@@ -89,6 +89,14 @@ def test_template_rendering(
         readme_content = (output_dir / "README.md").read_text()
         assert expected_readme_title in readme_content
 
+        # The version is injected via SETUPTOOLS_SCM_PRETEND_VERSION (a build-arg),
+        # set before the project is built; .git is excluded since hatch-vcs no longer reads it.
+        dockerfile = (output_dir / "Dockerfile").read_text()
+        assert "ARG SERVICE_VERSION" in dockerfile
+        assert dockerfile.index("SETUPTOOLS_SCM_PRETEND_VERSION") < dockerfile.index("COPY . .")
+        dockerignore = (output_dir / ".dockerignore").read_text()
+        assert ".git/" in dockerignore
+
 
 def test_generated_pyproject_pins_to_tag_for_clean_version(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -131,7 +139,7 @@ def test_generates_project_structure() -> None:
         assert (output_dir / ".github" / "workflows").is_dir()
 
 
-def test_generated_project_excludes_framework_versioning_workflows(tmp_path: Path) -> None:
+def test_generated_project_includes_release_workflows_but_not_cli_integration(tmp_path: Path) -> None:
     output_dir = tmp_path / "swebench-benchmark-service"
     generate_project("swebench", output_dir)
 
@@ -139,9 +147,9 @@ def test_generated_project_excludes_framework_versioning_workflows(tmp_path: Pat
     assert (workflows_dir / "test.yaml").exists()
     assert (workflows_dir / "style.yaml").exists()
     assert (workflows_dir / "typecheck.yaml").exists()
+    assert (workflows_dir / "auto-tag-release.yaml").exists()
+    assert (workflows_dir / "check-pr-title.yaml").exists()
     assert not (workflows_dir / "cli-integration.yaml").exists()
-    assert not (workflows_dir / "auto-tag-release.yaml").exists()
-    assert not (workflows_dir / "check-pr-title.yaml").exists()
 
 
 def test_generated_benchmark_service_implements_task_listing(tmp_path: Path) -> None:

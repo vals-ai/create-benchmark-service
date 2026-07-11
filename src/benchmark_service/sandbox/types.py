@@ -17,7 +17,17 @@ class SnapshotSource(BaseModel):
     snapshot: str
 
 
-SandboxSource = Annotated[ImageSource | SnapshotSource, Field(discriminator="type")]
+BaseSandboxSource = Annotated[ImageSource | SnapshotSource, Field(discriminator="type")]
+
+
+class ComposeSource(BaseModel):
+    type: Literal["compose"] = "compose"
+    outer: BaseSandboxSource
+    service: str = "main"
+    compose_command: str = "docker compose"
+
+
+SandboxSource = Annotated[ImageSource | SnapshotSource | ComposeSource, Field(discriminator="type")]
 
 
 class Resources(BaseModel):
@@ -108,6 +118,12 @@ class Sandbox(ABC):
 
     @abstractmethod
     async def download_file(self, remote_path: str) -> bytes: ...
+
+    async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
+        raise SandboxError("Sandbox provider does not support modifying egress rules")
+
+    async def clear_egress_rules(self) -> None:
+        raise SandboxError("Sandbox provider does not support modifying egress rules")
 
 
 class SandboxProvider(ABC):

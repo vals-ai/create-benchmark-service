@@ -1,9 +1,11 @@
 import asyncio
+import shlex
+from collections.abc import AsyncGenerator
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, cast
 
 import pytest
-from aiohttp import ClientResponseError, RequestInfo
+from aiohttp import ClientConnectionError, ClientResponseError, RequestInfo
 from daytona import SandboxState
 from daytona.common.errors import (
     DaytonaConflictError,
@@ -16,8 +18,12 @@ from multidict import CIMultiDict, CIMultiDictProxy
 from yarl import URL
 
 from benchmark_service.sandbox import (
+    ComposeSource,
+    ComposeSandbox,
+    ExecResult,
     ImageSource,
     Resources,
+    Sandbox,
     SandboxCreateRequest,
     SandboxError,
     SandboxNotFoundError,
@@ -33,15 +39,22 @@ def _client_response_error(status: int, message: str) -> ClientResponseError:
     return ClientResponseError(request_info, (), status=status, message=message)
 
 
+def _unwrap_shell_command(command: str) -> str:
+    if command.startswith("sh -c "):
+        return shlex.split(command)[2]
+    return command
+
+
 class Process:
     def __init__(self) -> None:
         self.command: str | None = None
 
     async def exec(self, command: str) -> SimpleNamespace:
         self.command = command
-        if command.startswith("test -e "):
+        evaluated_command = _unwrap_shell_command(command)
+        if evaluated_command.startswith("test -e "):
             return SimpleNamespace(exit_code=0, result="")
-        if command.startswith("cat "):
+        if evaluated_command.startswith("cat "):
             return SimpleNamespace(exit_code=0, result="0")
         return SimpleNamespace(exit_code=0, result="")
 
@@ -81,6 +94,43 @@ class FailedExecuteCommandProcess(Process):
         self.attempts += 1
         if self.attempts == 1:
             raise DaytonaError("Failed to execute command:")
+        return await super().exec(command)
+
+
+def _daytona_error_with_cause(message: str, cause: BaseException) -> DaytonaError:
+    try:
+        raise DaytonaError(message) from cause
+    except DaytonaError as exc:
+        return exc
+
+
+class WrappedConnectionErrorProcess(Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        self.attempts += 1
+        if self.attempts == 1:
+            raise _daytona_error_with_cause(
+                "Failed to execute command: toolbox request failed",
+                ClientConnectionError("tcp reset"),
+            )
+        return await super().exec(command)
+
+
+class MisclassifiedTransportProcess(Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        self.attempts += 1
+        if self.attempts == 1:
+            raise DaytonaError(
+                "Failed to execute command: File descriptor 127 is used by transport "
+                "<TCPTransport closed=False reading=True 0xabc>"
+            )
         return await super().exec(command)
 
 
@@ -129,7 +179,7 @@ class ReconnectingProcess(Process):
         self.connected_session_id: str | None = None
 
     async def exec(self, command: str) -> SimpleNamespace:
-        if command.startswith("test -e "):
+        if _unwrap_shell_command(command).startswith("test -e "):
             return SimpleNamespace(exit_code=0 if self.connected_session_id else 1, result="")
         return await super().exec(command)
 
@@ -239,6 +289,53 @@ class RemovedSandboxFiles(Files):
         return chunks()
 
 
+class RecordingSandbox(Sandbox):
+    def __init__(self, exec_results: list[ExecResult] | None = None) -> None:
+        self.exec_commands: list[str] = []
+        self.uploads: list[tuple[str, bytes]] = []
+        self.downloads: list[str] = []
+        self.allowed_addresses: list[str] | None = None
+        self.egress_cleared = False
+        self.exec_results = exec_results or []
+
+    @property
+    def id(self) -> str:
+        return "outer-id"
+
+    @property
+    def name(self) -> str:
+        return "outer-name"
+
+    @property
+    def state(self) -> str:
+        return "started"
+
+    async def exec(self, command: str, *, cwd: str | None = None, timeout: float | None = None) -> ExecResult:
+        self.exec_commands.append(command)
+        if self.exec_results:
+            return self.exec_results.pop(0)
+        return ExecResult(exit_code=0, output="ok")
+
+    async def command(
+        self, command: str, *, cwd: str | None = None, timeout: float | None = None
+    ) -> AsyncGenerator[str, None]:
+        self.exec_commands.append(command)
+        yield "ok"
+
+    async def upload_file(self, remote_path: str, content: bytes) -> None:
+        self.uploads.append((remote_path, content))
+
+    async def download_file(self, remote_path: str) -> bytes:
+        self.downloads.append(remote_path)
+        return b"downloaded"
+
+    async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
+        self.allowed_addresses = allowed_addresses
+
+    async def clear_egress_rules(self) -> None:
+        self.egress_cleared = True
+
+
 class InnerSandbox:
     id = "sandbox-id"
     name = "sandbox-name"
@@ -248,10 +345,26 @@ class InnerSandbox:
         self.process = Process()
         self.fs = Files()
         self.autostop_interval: int | None = None
+        self.network_settings: list[dict[str, str | bool | None]] = []
         self.refresh_count = 0
 
     async def set_autostop_interval(self, interval: int) -> None:
         self.autostop_interval = interval
+
+    async def update_network_settings(
+        self,
+        *,
+        network_block_all: bool | None = None,
+        network_allow_list: str | None = None,
+        domain_allow_list: str | None = None,
+    ) -> None:
+        self.network_settings.append(
+            {
+                "network_block_all": network_block_all,
+                "network_allow_list": network_allow_list,
+                "domain_allow_list": domain_allow_list,
+            }
+        )
 
     async def wait_for_sandbox_start(self, timeout: int) -> None:
         assert timeout == 0
@@ -288,6 +401,18 @@ class RefreshToErrorSandbox(InnerSandbox):
     async def refresh_data(self) -> None:
         await super().refresh_data()
         self.state = SandboxState.ERROR
+
+
+class BareHtml502RefreshSandbox(InnerSandbox):
+    def __init__(self) -> None:
+        super().__init__()
+        self.refresh_attempts = 0
+
+    async def refresh_data(self) -> None:
+        self.refresh_attempts += 1
+        if self.refresh_attempts == 1:
+            raise DaytonaError("Failed to refresh sandbox data: <html><h1>502 Bad Gateway</h1></html>")
+        await super().refresh_data()
 
 
 class DaytonaClient:
@@ -331,6 +456,21 @@ class CreateNotFoundDaytonaClient(CreateFailureDaytonaClient):
         raise DaytonaError("sandbox not found", status_code=404)
 
 
+class ReusableLookupConnectionDaytonaClient(DaytonaClient):
+    def __init__(self, sandbox: InnerSandbox) -> None:
+        super().__init__(sandbox)
+        self.get_attempts = 0
+
+    async def get(self, instance_id: str) -> InnerSandbox:
+        self.get_attempts += 1
+        if self.get_attempts == 1:
+            raise _daytona_error_with_cause(
+                "Failed to get sandbox",
+                ClientConnectionError("tcp reset"),
+            )
+        raise DaytonaNotFoundError("sandbox not found")
+
+
 def _provider(daytona: DaytonaClient) -> DaytonaSandboxProvider:
     provider = DaytonaSandboxProvider.__new__(DaytonaSandboxProvider)
     provider._daytona = cast(Any, daytona)  # pyright: ignore[reportPrivateUsage]
@@ -349,13 +489,121 @@ def _request(name: str) -> SandboxCreateRequest:
     )
 
 
+async def test_compose_sandbox_routes_operations_through_main_service() -> None:
+    """Compose sandboxes should proxy sandbox operations through the Harbor main service.
+
+    Test cases:
+    - ComposeSource stores the DinD outer source and service name.
+    - exec, command, upload, and download route through docker compose service `main`.
+    """
+    source = ComposeSource(
+        outer=ImageSource(image="docker:28.3.3-dind"),
+        compose_command="MAIN_IMAGE_NAME=task docker compose -p task -f /harbor/compose.yaml",
+    )
+    outer = RecordingSandbox()
+    sandbox = ComposeSandbox(outer, source)
+
+    exec_result = await sandbox.exec("pytest -q", cwd="/workspace", timeout=12)
+    output = [chunk async for chunk in sandbox.command("echo ok", cwd="/workspace", timeout=12)]
+    await sandbox.upload_file("/workspace/instruction.md", b"solve it")
+    downloaded = await sandbox.download_file("/workspace/reward.json")
+    await sandbox.modify_egress_rules(["api.openai.com"])
+    await sandbox.clear_egress_rules()
+
+    assert source.service == "main"
+    assert isinstance(source.outer, ImageSource)
+    assert source.outer.image == "docker:28.3.3-dind"
+    assert sandbox.id == "outer-id"
+    assert sandbox.name == "outer-name"
+    assert sandbox.state == "started"
+    assert exec_result.output == "ok"
+    assert output == ["ok"]
+    assert outer.exec_commands[0] == (
+        "MAIN_IMAGE_NAME=task docker compose -p task -f /harbor/compose.yaml "
+        "exec "
+        "$(env | sed -n 's/^\\([A-Za-z_][A-Za-z0-9_]*\\)=.*/-e \\1/p') "
+        "-T -w /workspace main sh -lc 'pytest -q'"
+    )
+    assert outer.exec_commands[1] == (
+        "MAIN_IMAGE_NAME=task docker compose -p task -f /harbor/compose.yaml "
+        "exec "
+        "$(env | sed -n 's/^\\([A-Za-z_][A-Za-z0-9_]*\\)=.*/-e \\1/p') "
+        "-T -w /workspace main sh -lc 'echo ok'"
+    )
+    assert outer.allowed_addresses == ["api.openai.com"]
+    assert outer.egress_cleared
+    upload_temp = outer.uploads[0][0]
+    download_temp = outer.downloads[0]
+    assert outer.uploads == [(upload_temp, b"solve it")]
+    assert upload_temp.startswith("/var/tmp/compose-upload-")
+    assert download_temp.startswith("/var/tmp/compose-download-")
+    assert (
+        "container_id=$(MAIN_IMAGE_NAME=task docker compose -p task -f /harbor/compose.yaml ps -q main); "
+        "docker exec \"$container_id\" sh -lc 'mkdir -p /workspace'; "
+        f"cat {upload_temp} | docker exec -i \"$container_id\" sh -lc 'cat > /workspace/instruction.md'"
+    ) in outer.exec_commands
+    assert (
+        "container_id=$(MAIN_IMAGE_NAME=task docker compose -p task -f /harbor/compose.yaml ps -q main); "
+        f"docker exec \"$container_id\" sh -lc 'cat /workspace/reward.json' > {download_temp}"
+    ) in outer.exec_commands
+    assert downloaded == b"downloaded"
+
+
+async def test_compose_sandbox_cleans_temp_files_when_copy_operations_fail() -> None:
+    """Compose copy failures should raise while still deleting temporary outer files.
+
+    Test cases:
+    - Upload failure raises SandboxError and runs temp-file cleanup.
+    - Download failure raises SandboxError and runs temp-file cleanup.
+    """
+    source = ComposeSource(
+        outer=ImageSource(image="docker:28.3.3-dind"),
+        compose_command="docker compose -f /harbor/compose.yaml",
+    )
+    upload_outer = RecordingSandbox([ExecResult(exit_code=1, output="upload failed")])
+    download_outer = RecordingSandbox([ExecResult(exit_code=1, output="download failed")])
+
+    with pytest.raises(SandboxError, match="compose upload failed: upload failed"):
+        await ComposeSandbox(upload_outer, source).upload_file("/workspace/instruction.md", b"solve it")
+
+    with pytest.raises(SandboxError, match="compose download failed: download failed"):
+        await ComposeSandbox(download_outer, source).download_file("/workspace/reward.json")
+
+    assert upload_outer.exec_commands[-1].startswith("rm -f /var/tmp/compose-upload-")
+    assert download_outer.exec_commands[-1].startswith("rm -f /var/tmp/compose-download-")
+
+
+async def test_daytona_provider_rejects_compose_source_before_create() -> None:
+    """Daytona provider should only receive the outer source for compose-backed tasks.
+
+    Test cases:
+    - A ComposeSource passed directly to provider creation raises SandboxError.
+    """
+    provider = _provider(CreateFailureDaytonaClient(InnerSandbox()))
+    request = SandboxCreateRequest(
+        source=ComposeSource(
+            outer=ImageSource(image="docker:28.3.3-dind"),
+            compose_command="docker compose -f /harbor/compose.yaml",
+        ),
+        resources=Resources(vcpu=2, memory=4, disk=10),
+        name="compose-task",
+        labels={},
+        env_vars={},
+        auto_stop_interval=600,
+        create_timeout=360,
+    )
+
+    with pytest.raises(SandboxError, match="ComposeSource must be unwrapped"):
+        await provider.create_sandbox(request)
+
+
 async def test_daytona_command_applies_timeout_inside_cwd() -> None:
     inner = InnerSandbox()
     sandbox = DaytonaSandbox(cast(Any, inner))
 
     await sandbox.exec("pytest", cwd="/workspace", timeout=60)
 
-    assert inner.process.command == "cd /workspace && timeout 60 pytest"
+    assert inner.process.command == "cd /workspace && timeout 60 sh -c pytest"
 
 
 async def test_daytona_command_preserves_fractional_timeout() -> None:
@@ -364,7 +612,24 @@ async def test_daytona_command_preserves_fractional_timeout() -> None:
 
     await sandbox.exec("pytest", timeout=0.5)
 
-    assert inner.process.command == "timeout 0.5 pytest"
+    assert inner.process.command == "timeout 0.5 sh -c pytest"
+
+
+async def test_daytona_command_wraps_shell_pipelines_when_timeout_is_set() -> None:
+    """Timeout should preserve shell syntax instead of treating assignments as executables.
+
+    Test cases:
+    - A shell assignment and pipeline stay inside one shell command when timeout is set.
+    """
+    inner = InnerSandbox()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    await sandbox.exec("container_id=$(docker compose ps -q main); cat /tmp/file | docker exec -i \"$container_id\" cat", timeout=60)
+
+    assert inner.process.command == (
+        "timeout 60 sh -c "
+        "'container_id=$(docker compose ps -q main); cat /tmp/file | docker exec -i \"$container_id\" cat'"
+    )
 
 
 def test_daytona_retry_after_uses_specific_header_first() -> None:
@@ -402,6 +667,30 @@ async def test_daytona_exec_retries_failed_execute_command_errors() -> None:
     """
     inner = InnerSandbox()
     process = FailedExecuteCommandProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    result = await sandbox.exec("pytest")
+
+    assert result.exit_code == 0
+    assert process.attempts == 2
+
+
+async def test_daytona_exec_retries_wrapped_connection_errors() -> None:
+    inner = InnerSandbox()
+    process = WrappedConnectionErrorProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    result = await sandbox.exec("pytest")
+
+    assert result.exit_code == 0
+    assert process.attempts == 2
+
+
+async def test_daytona_exec_retries_misclassified_transport_errors() -> None:
+    inner = InnerSandbox()
+    process = MisclassifiedTransportProcess()
     inner.process = process
     sandbox = DaytonaSandbox(cast(Any, inner))
 
@@ -487,6 +776,22 @@ async def test_daytona_command_streams_output() -> None:
     output = [chunk async for chunk in sandbox.command("printf hello")]
 
     assert output == ["hello"]
+
+
+async def test_daytona_command_finishes_when_pty_close_never_arrives(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("benchmark_service.sandbox.daytona._PTY_STATUS_POLL_SECONDS", 0)
+    inner = InnerSandbox()
+    process = BlockingProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    async with asyncio.timeout(1):
+        output = [chunk async for chunk in sandbox.command("printf hello")]
+
+    assert output == ["hello"]
+    assert process.handle is not None
+    assert process.handle.disconnected is True
+    assert process.killed_session_id is not None
 
 
 async def test_daytona_command_checks_pty_before_reconnecting() -> None:
@@ -598,6 +903,27 @@ async def test_daytona_provider_delete_retries_state_conflicts() -> None:
     assert daytona.deleted is True
 
 
+async def test_daytona_provider_delete_retries_bare_html_502_refresh_errors() -> None:
+    inner = BareHtml502RefreshSandbox()
+    daytona = DaytonaClient(inner)
+
+    await _provider(daytona).delete_sandbox(inner.name)
+
+    assert inner.refresh_attempts == 2
+    assert daytona.deleted is True
+
+
+async def test_daytona_provider_create_retries_wrapped_lookup_connection_errors() -> None:
+    inner = InnerSandbox()
+    daytona = ReusableLookupConnectionDaytonaClient(inner)
+
+    sandbox = await _provider(daytona).create_sandbox(_request(inner.name))
+
+    assert sandbox.id == inner.id
+    assert daytona.get_attempts == 2
+    assert daytona.created is True
+
+
 async def test_daytona_provider_create_maps_daytona_errors() -> None:
     """Create failures from Daytona should use the provider sandbox error type.
 
@@ -664,3 +990,46 @@ async def test_daytona_provider_lists_sandboxes_with_query() -> None:
     assert daytona.listed_query is not None
     assert daytona.listed_query.labels == {"Benchmark": "vcb"}
     assert daytona.listed_query.limit == 10
+
+
+async def test_daytona_updates_egress_rules() -> None:
+    """Verify Daytona receives only one allowlist type per egress update.
+
+    Test cases:
+    - Domain entries use Daytona's domain allowlist.
+    - CIDR and IPv4 entries use Daytona's network allowlist.
+    - Mixed domain and CIDR entries fail before the provider request.
+    - Clearing egress rules clears both allowlist fields.
+    """
+    inner = InnerSandbox()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    await sandbox.modify_egress_rules(["https://api.openai.com/v1", "github.com"])
+
+    assert inner.network_settings[-1] == {
+        "network_block_all": None,
+        "network_allow_list": "",
+        "domain_allow_list": "api.openai.com,github.com",
+    }
+
+    await sandbox.modify_egress_rules(["198.51.100.20/32", "203.0.113.10"])
+
+    assert inner.network_settings[-1] == {
+        "network_block_all": None,
+        "network_allow_list": "198.51.100.20/32,203.0.113.10/32",
+        "domain_allow_list": "",
+    }
+
+    request_count = len(inner.network_settings)
+    with pytest.raises(ValueError, match="allowed addresses cannot mix domains and CIDRs"):
+        await sandbox.modify_egress_rules(["https://api.openai.com/v1", "198.51.100.20/32"])
+
+    assert len(inner.network_settings) == request_count
+
+    await sandbox.clear_egress_rules()
+
+    assert inner.network_settings[-1] == {
+        "network_block_all": False,
+        "network_allow_list": "",
+        "domain_allow_list": "",
+    }

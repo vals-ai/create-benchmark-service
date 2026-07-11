@@ -2,6 +2,7 @@
 
 import re
 from collections.abc import AsyncGenerator
+from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
@@ -17,6 +18,8 @@ from benchmark_service.schemas import (
     RetrieveTaskResponse,
     StreamChunk,
 )
+
+from tests.test_dataset_versioning import _write_fixture  # pyright: ignore[reportPrivateUsage]
 
 
 def test_version_is_importable_and_well_formed() -> None:
@@ -100,3 +103,26 @@ def test_version_endpoint_prefers_service_version_hook() -> None:
 
     assert response.status_code == 200
     assert response.json()["service_version"] == "service-hook-1.2.3"
+
+
+def test_version_endpoint_reports_dataset_version_key() -> None:
+    app = BenchmarkServiceApp(_FakeService)
+    with TestClient(app) as client:
+        response = client.get("/version", params={"dataset": "default"})
+
+    assert response.status_code == 200
+    assert "dataset_version" in response.json()
+
+
+def test_version_endpoint_reports_tracked_dataset_version(tmp_path: Path) -> None:
+    versions_file = _write_fixture(tmp_path)
+
+    class _DatasetVersionedService(_FakeService):
+        dataset_versions_file = versions_file
+
+    app = BenchmarkServiceApp(_DatasetVersionedService)
+    with TestClient(app) as client:
+        response = client.get("/version", params={"dataset": "validation"})
+
+    assert response.status_code == 200
+    assert response.json()["dataset_version"] == "1.0.0"

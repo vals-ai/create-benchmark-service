@@ -6,6 +6,8 @@ from benchmark_service.base import BenchmarkService
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError, BenchmarkServiceUnauthenticatedError
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.sandbox import (
+    ComposeSource,
+    ComposeSandbox,
     DaytonaProviderConfig,
     ExecResult,
     ImageSource,
@@ -31,6 +33,8 @@ __all__ = [
     "BenchmarkServiceUnauthenticatedError",
     "BenchmarkServiceClient",
     "BenchmarkServiceError",
+    "ComposeSource",
+    "ComposeSandbox",
     "DaytonaProviderConfig",
     "ExecResult",
     "ImageSource",

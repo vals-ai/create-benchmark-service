@@ -114,7 +114,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | `/ws/evaluate-response` | Evaluate without a sandbox; streams progress, checkpoint state, errors, and a final result |
 | `/ws/evaluate-instance` | Evaluate a live sandbox solution; streams progress, errors, and a final result |
 
-Sandbox setup and live sandbox evaluation require request-scoped `sandbox_provider` config so one hosted service can use different sandbox providers per request. Eval-only retry uses `/ws/evaluate-response` with `{"task_id": "…", "eval_resume_state": {...}, "dataset": "…"}` and does not require a sandbox provider.
+Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` config so one hosted service can use different sandbox providers per request. Eval-only retry uses `/ws/evaluate-response` with `{"task_id": "…", "eval_resume_state": {...}, "sandbox_provider": {...}, "dataset": "…"}`. The provider config is optional because many benchmarks resume without a sandbox; include it when the benchmark must create one for evaluation. It is request-only and must not be embedded in persisted `eval_resume_state`.
 
 #### Sandbox providers
 
@@ -138,7 +138,7 @@ Eval-only retry flow:
 
 1. A benchmark service yields `StreamEvalResumeStateChunk` before starting failure-prone evaluation work.
 2. The tracker stores the latest `eval_resume_state` on the task row.
-3. If evaluation fails after that point, retry calls `/ws/evaluate-response` with the saved state.
+3. If evaluation fails after that point, retry calls `/ws/evaluate-response` with the saved state and, when needed, the request-scoped sandbox provider config.
 4. The benchmark service decides what the state means and streams a new result, plus any newer checkpoint state.
 
 ### Streaming protocol
@@ -187,6 +187,8 @@ Response:
 
 **`POST /v1/score`** — aggregate across a run. Request `{run_id, dataset, evaluation_results: {task_id: {"status": "evaluated", "result": {...}} | {"status": "did_not_complete"} | null}}`. Before calling `calculate_final_score`, the framework converts every non-null item to the same eval-result envelope shape used by the runner and internal `/final-score/` path: `{"task_id": task_id, "status": status, "result": result}` plus `error` when the v1 item carries errors. Multiple v1 errors are collapsed into that single `error` string; callers should leave `errors` empty for successful `evaluated` items. `null` still represents a missing task and is passed through as `null`. Response `{run_id, tasks_evaluated, final_score, metadata}`.
 
+**`POST /v1/submissions/upload-url`** — mint a presigned S3 PUT URL for a submission artifact (e.g. an agent workspace tarball the eval side later rehydrates). Request `{run_id, task_id, dataset?, filename}`; every field must be a plain key segment (`[A-Za-z0-9][A-Za-z0-9._-]{0,127}`) and `task_id` must exist in the dataset. Response `{key, url, expires_in}`: the caller PUTs the artifact bytes to `url`, then reports `key` as the task's generation output. Deployments serving uploads must set `SUBMISSION_ARTIFACT_BUCKET` (the receiving S3 bucket) and `AWS_REGION` (the bucket's region — presigned URLs are signed per region). Without the bucket the endpoint returns 503; a bucket without a region fails at startup. Not available to trial tenants.
+
 **Auth.** `/v1/*` is Descope-only. Callers using the legacy `BENCHMARK_API_KEY` bearer (i.e. those that resolve to the `_legacy` tenant sentinel) get 403. Migrate the deploy to Descope (`AUTH_REQUIRED=true` + `DESCOPE_PROJECT_ID` + allowlist) before opening `/v1/` to external traffic.
 
 **`GET /v1/datasets/{dataset}/tasks`** — return the dataset's task list. Same Descope-only auth + tenant/dataset allowlist gate as the rest of `/v1/*`. Response:
@@ -217,7 +219,7 @@ Pydantic models used across requests and responses:
 - **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; currently `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET)` or `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)`
 - **`Resources`** — `vcpu`, `memory`, `disk`
 - **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, optional `sandbox_provider` with Daytona header fallback, `dataset`
-- **`EvaluateResponseRequest`** — `task_id`, `response` or `eval_resume_state`, `dataset`
+- **`EvaluateResponseRequest`** — `task_id`, `response` or `eval_resume_state`, optional `sandbox_provider`, `dataset`
 - **`FinalScoreResult`** / **`FinalScoreResponse`** — `score` (float), `metadata`, `tasks_evaluated`
 - **`TaskFilter`** — `task_ids` list or `slice_str`; `parse_slice()` converts `"start:stop:step"` to a Python `slice`
 

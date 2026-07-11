@@ -23,3 +23,12 @@ make dev       # run local server
 make test      # run tests
 make help      # list all commands
 ```
+
+## Releasing
+
+Versions come from git tags (hatch-vcs). To enable the release flow in this repo:
+
+- Add a **`GH_PAT`** repository secret — a personal access token with permission to push tags (`contents: write`). `auto-tag-release` uses it to push the version tag on merge to `main`; the workflow fails without it.
+- Every PR title must include **`#patch`**, **`#minor`**, or **`#major`** — `check-pr-title` enforces this and the tag is bumped accordingly on merge.
+
+Until the first tag exists, the package builds at version `0.0.0`.

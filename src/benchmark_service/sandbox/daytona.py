@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import shlex
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import suppress
 from typing import Any, Literal
+from urllib.parse import urlparse
 
-from aiohttp import ClientResponseError
+from aiohttp import ClientConnectionError, ClientResponseError
 from daytona import (
     AsyncDaytona,
     AsyncSandbox,
@@ -48,6 +50,7 @@ from benchmark_service.sandbox.types import (
 )
 
 _PTY_STATUS_CHECK_ATTEMPTS = 30
+_PTY_STATUS_POLL_SECONDS = 5
 _STATUS_DIR = "/tmp/.sandbox-provider"
 _REMOVED_SANDBOX_STATES = (SandboxState.DESTROYING, SandboxState.DESTROYED)
 _FAILED_SANDBOX_STATES = (SandboxState.ERROR, SandboxState.BUILD_FAILED)
@@ -59,8 +62,74 @@ _KNOWN_THROTTLERS = ("sandbox-create", "sandbox-lifecycle", "authenticated", "an
 _DELETE_CONFLICT_MESSAGES = ("state change in progress", "modified by another operation")
 _REMOVED_SANDBOX_CLIENT_STATUSES = (404, 502)
 _FAILED_EXECUTE_COMMAND_PREFIX = "failed to execute command:"
+# Daytona sometimes flattens a transport failure into a bare DaytonaError message with no chained
+# cause; these substrings recover those cases by text when no typed cause survives to match.
+_TRANSPORT_ERROR_MESSAGES = (
+    " is used by transport ",
+    "[errno 32] broken pipe",
+    "[errno 9] bad file descriptor",
+    "502 bad gateway",
+    "failed to create sandbox: an unexpected error occurred.",
+    "server disconnected",
+)
+_RETRYABLE_DAYTONA_CAUSES = (ClientConnectionError, ConnectionError, TimeoutError)
 _FIXED_PROVIDER_WAIT = wait_fixed(2)
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
+
+
+def _parse_daytona_ipv4_network(value: str) -> ipaddress.IPv4Network | None:
+    try:
+        network = ipaddress.ip_network(value, strict=False)
+    except ValueError:
+        return None
+
+    if isinstance(network, ipaddress.IPv4Network):
+        return network
+
+    raise ValueError(f"allowed address is an IPv6 CIDR which is not supported: {value}")
+
+
+def _resolve_daytona_allowed_addresses(allowed_addresses: list[str]) -> tuple[list[str], list[str]]:
+    # Normalize entries first so empty allowlists and blank values fail before reaching Daytona.
+    values = [address.strip() for address in allowed_addresses]
+    if not values or any(not value for value in values):
+        raise ValueError("allowed addresses cannot be empty; use sandbox.clear_egress_rules to clear egress rules")
+
+    cidrs: list[str] = []
+    domains: list[str] = []
+
+    for value in values:
+        # Pass IPv4 CIDR inputs through directly because Daytona network rules are CIDR based.
+        network = _parse_daytona_ipv4_network(value)
+        if network is not None:
+            cidrs.append(str(network))
+            continue
+
+        # Treat non-CIDR values as URLs or hosts and reject anything without a hostname.
+        parsed = urlparse(value if "://" in value else f"//{value}")
+        if not parsed.hostname:
+            raise ValueError(f"allowed address is not a valid URL, host, or CIDR: {value}")
+
+        try:
+            address = ipaddress.ip_address(parsed.hostname)
+        except ValueError:
+            domains.append(parsed.hostname)
+            continue
+
+        if isinstance(address, ipaddress.IPv4Address):
+            cidrs.append(f"{address}/32")
+        else:
+            raise ValueError(f"allowed address is an IPv6 address which is not supported: {value}")
+
+    # Deduplicate values while preserving order before returning rules to Daytona.
+    cidrs = list(dict.fromkeys(cidrs))
+    domains = list(dict.fromkeys(domains))
+    if not cidrs and not domains:
+        raise ValueError("allowed addresses did not resolve to Daytona-compatible rules")
+    if cidrs and domains:
+        raise ValueError("allowed addresses cannot mix domains and CIDRs")
+
+    return cidrs, domains
 
 
 class DaytonaProviderConfig(BaseModel):
@@ -115,9 +184,13 @@ def _rate_limit_error(exc: BaseException) -> DaytonaRateLimitError | None:
     return None
 
 
-def _is_delete_conflict(exc: DaytonaConflictError) -> bool:
+def _message_contains(exc: BaseException, messages: tuple[str, ...]) -> bool:
     error = str(exc).lower()
-    return any(message in error for message in _DELETE_CONFLICT_MESSAGES)
+    return any(message in error for message in messages)
+
+
+def _is_delete_conflict(exc: DaytonaConflictError) -> bool:
+    return _message_contains(exc, _DELETE_CONFLICT_MESSAGES)
 
 
 def _is_not_found_error(exc: DaytonaError | ClientResponseError) -> bool:
@@ -132,6 +205,23 @@ def _is_not_found_error(exc: DaytonaError | ClientResponseError) -> bool:
 
 def _is_failed_execute_command_error(exc: DaytonaError | ClientResponseError) -> bool:
     return isinstance(exc, DaytonaError) and str(exc).strip().lower() == _FAILED_EXECUTE_COMMAND_PREFIX
+
+
+def _has_retryable_cause(exc: BaseException) -> bool:
+    seen: set[int] = set()
+    cause = exc.__cause__ or exc.__context__
+    while cause is not None and id(cause) not in seen:
+        if isinstance(cause, _RETRYABLE_DAYTONA_CAUSES):
+            return True
+        seen.add(id(cause))
+        cause = cause.__cause__ or cause.__context__
+    return False
+
+
+def _is_transient_daytona_error(exc: DaytonaError | ClientResponseError) -> bool:
+    if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS) or _has_retryable_cause(exc):
+        return True
+    return _message_contains(exc, _TRANSPORT_ERROR_MESSAGES)
 
 
 def _parse_retry_after_seconds(value: object) -> float | None:
@@ -207,7 +297,7 @@ class DaytonaSandbox(Sandbox):
     def _sandbox_error(self, exc: DaytonaError | ClientResponseError) -> SandboxError:
         if _is_not_found_error(exc):
             return self._removed_error()
-        if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS) or _is_failed_execute_command_error(exc):
+        if _is_transient_daytona_error(exc) or _is_failed_execute_command_error(exc):
             return SandboxConnectionError(f"Sandbox connection error for {self._sandbox_ref}: {exc}")
         return SandboxError(f"Sandbox operation failed for {self._sandbox_ref}: {exc}")
 
@@ -271,11 +361,35 @@ class DaytonaSandbox(Sandbox):
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
 
+    @_PROVIDER_RETRY
+    async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
+        network_allow_list, domain_allow_list = _resolve_daytona_allowed_addresses(allowed_addresses)
+
+        try:
+            await self._sandbox.update_network_settings(
+                network_allow_list=",".join(network_allow_list),
+                domain_allow_list=",".join(domain_allow_list),
+            )
+        except _SANDBOX_OPERATION_ERRORS as exc:
+            raise self._sandbox_error(exc) from exc
+
+    @_PROVIDER_RETRY
+    async def clear_egress_rules(self) -> None:
+        try:
+            await self._sandbox.update_network_settings(
+                network_block_all=False,
+                network_allow_list="",
+                domain_allow_list="",
+            )
+        except _SANDBOX_OPERATION_ERRORS as exc:
+            raise self._sandbox_error(exc) from exc
+
     async def _exec_pty(self, command: str, output: asyncio.Queue[str]) -> ExecResult:
         session_id = f"{self.id}:exec-{uuid.uuid4().hex}"
         status_path = f"{_STATUS_DIR}/{uuid.uuid4().hex}.status"
         stdout: list[str] = []
         handle: AsyncPtyHandle | None = None
+        wait_task: asyncio.Task[Any] | None = None
 
         async def on_data(data: bytes) -> None:
             text = data.decode("utf-8", errors="replace")
@@ -288,20 +402,31 @@ class DaytonaSandbox(Sandbox):
             await handle.send_input(
                 f"mkdir -p {shlex.quote(_STATUS_DIR)}; {command}; echo $? > {shlex.quote(status_path)}; exit\n"
             )
-            with suppress(Exception):
-                await handle.wait()
+            wait_task = asyncio.create_task(handle.wait())
 
-            for _ in range(_PTY_STATUS_CHECK_ATTEMPTS):
+            reconnect_attempts = 0
+            while True:
+                done, _ = await asyncio.wait({wait_task}, timeout=_PTY_STATUS_POLL_SECONDS)
                 await self._check_sandbox_alive()
                 result = await self.exec(f"test -e {shlex.quote(status_path)}")
                 if result.exit_code == 0:
                     break
+
+                if not done:
+                    continue
+
+                reconnect_attempts += 1
+                if reconnect_attempts == _PTY_STATUS_CHECK_ATTEMPTS:
+                    raise SandboxConnectionError(
+                        f"Daytona PTY command did not write an exit code for {self._sandbox_ref}: "
+                        f"session_id={session_id}"
+                    )
+
+                with suppress(Exception):
+                    await wait_task
+                await handle.disconnect()
                 handle = await self._reconnect_pty(session_id, on_data)
-                await asyncio.sleep(1)
-            else:
-                raise SandboxConnectionError(
-                    f"Daytona PTY command did not write an exit code for {self._sandbox_ref}: session_id={session_id}"
-                )
+                wait_task = asyncio.create_task(handle.wait())
 
             result = await self.exec(f"cat {shlex.quote(status_path)}")
             if result.exit_code != 0 or not result.output:
@@ -312,6 +437,10 @@ class DaytonaSandbox(Sandbox):
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
         finally:
+            if wait_task:
+                wait_task.cancel()
+                with suppress(Exception, asyncio.CancelledError):
+                    await wait_task
             if handle:
                 with suppress(Exception):
                     await handle.disconnect()
@@ -344,10 +473,7 @@ class DaytonaSandbox(Sandbox):
     ) -> AsyncPtyHandle:
         try:
             await self._sandbox.process.get_pty_session_info(session_id)
-            handle = await self._sandbox.process.connect_pty_session(session_id, on_data)
-            with suppress(Exception):
-                await handle.wait()
-            return handle
+            return await self._sandbox.process.connect_pty_session(session_id, on_data)
         except DaytonaNotFoundError as exc:
             raise SandboxError(
                 f"Daytona PTY session no longer exists for {self._sandbox_ref}: session_id={session_id}"
@@ -390,7 +516,7 @@ class DaytonaSandboxProvider(SandboxProvider):
     def _sandbox_error(self, exc: DaytonaError) -> SandboxError:
         if _is_not_found_error(exc):
             return SandboxNotFoundError(f"Sandbox not found: {exc}")
-        if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS):
+        if _is_transient_daytona_error(exc):
             return SandboxConnectionError(f"Daytona sandbox provider connection error: {exc}")
         return SandboxError(f"Daytona sandbox provider error: {exc}")
 
@@ -429,6 +555,8 @@ class DaytonaSandboxProvider(SandboxProvider):
                     network_block_all=False,
                     env_vars=request.env_vars,
                 )
+            case _:
+                raise SandboxError("ComposeSource must be unwrapped before provider.create_sandbox")
 
         try:
             inner = await self._daytona.create(params, timeout=request.create_timeout)
@@ -502,6 +630,7 @@ class DaytonaSandboxProvider(SandboxProvider):
 
 
 def _command(command: str, cwd: str | None, timeout: float | None) -> str:
+    command = f"sh -c {shlex.quote(command)}"
     if timeout is not None:
         command = f"timeout {timeout:g} {command}"
     if cwd:

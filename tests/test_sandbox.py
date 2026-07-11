@@ -778,6 +778,22 @@ async def test_daytona_command_streams_output() -> None:
     assert output == ["hello"]
 
 
+async def test_daytona_command_finishes_when_pty_close_never_arrives(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("benchmark_service.sandbox.daytona._PTY_STATUS_POLL_SECONDS", 0)
+    inner = InnerSandbox()
+    process = BlockingProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    async with asyncio.timeout(1):
+        output = [chunk async for chunk in sandbox.command("printf hello")]
+
+    assert output == ["hello"]
+    assert process.handle is not None
+    assert process.handle.disconnected is True
+    assert process.killed_session_id is not None
+
+
 async def test_daytona_command_checks_pty_before_reconnecting() -> None:
     inner = InnerSandbox()
     process = ReconnectingProcess()

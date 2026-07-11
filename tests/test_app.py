@@ -260,7 +260,13 @@ def test_websocket_setup_task_resolves_sandbox_provider(
 
     with TestClient(BenchmarkServiceApp(RuntimeProviderBenchmark)) as c:
         with c.websocket_connect("/ws/setup-task") as ws:
-            ws.send_json({"task_id": "task-1", "instance_id": "i-1", "sandbox_provider": {"type": "modal"}})
+            ws.send_json(
+                {
+                    "task_id": "task-1",
+                    "instance_id": "i-1",
+                    "sandbox_provider": {"type": "modal", "MODAL_TOKEN_ID": "id", "MODAL_TOKEN_SECRET": "secret"},
+                }
+            )
             assert ws.receive_json() == {
                 "type": "result",
                 "data": {"task_id": "task-1", "sandbox_name": "selected-sandbox-name"},
@@ -513,7 +519,12 @@ def test_setup_task_ws_close_for_disallowed_dataset(auth_client: TestClient) -> 
                 headers={"x-descope-api-key": "key-acme"},
             ) as ws:
                 ws.send_json(
-                    {"task_id": "task-1", "instance_id": "i-1", "sandbox_provider": {"type": "modal"}, "dataset": "alt"}
+                    {
+                        "task_id": "task-1",
+                        "instance_id": "i-1",
+                        "sandbox_provider": {"type": "modal", "MODAL_TOKEN_ID": "id", "MODAL_TOKEN_SECRET": "secret"},
+                        "dataset": "alt",
+                    }
                 )
                 ws.receive_json()
     assert exc_info.value.code == 1008

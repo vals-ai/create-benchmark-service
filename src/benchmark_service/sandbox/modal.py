@@ -1,46 +1,291 @@
 from __future__ import annotations
 
-from collections.abc import AsyncGenerator, Mapping
-from typing import Literal
+import asyncio
+import hashlib
+import re
+import shlex
+from collections.abc import AsyncGenerator, Awaitable
+from typing import Any, Literal, cast
 
+from modal import App, Client, Image
+from modal import Sandbox as ModalSdkSandbox
+from modal.exception import ConnectionError as ModalConnectionError
+from modal.exception import Error as ModalError
+from modal.exception import NotFoundError as ModalNotFoundError
 from pydantic import BaseModel
+from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
 from benchmark_service.sandbox.types import (
+    ExecResult,
+    ImageSource,
     Sandbox,
+    SandboxCommandError,
+    SandboxConnectionError,
     SandboxCreateRequest,
     SandboxError,
+    SandboxNotFoundError,
     SandboxProvider,
     SandboxQuery,
+    SandboxSource,
+    SnapshotSource,
+)
+
+# Modal sandboxes must belong to an app; all benchmark sandboxes share one.
+_APP_NAME = "benchmark-service"
+# Modal's default sandbox timeout is 5 minutes; benchmark tasks run for hours.
+_MAX_LIFETIME_SECONDS = 24 * 60 * 60
+_MAX_NAME_LENGTH = 64
+_INVALID_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_.-]")
+_APP_ID_PATTERN = re.compile(r"^ap-[a-zA-Z0-9]{22}$")
+
+
+_PROVIDER_RETRY = retry(
+    retry=retry_if_exception_type(SandboxConnectionError),
+    stop=stop_after_attempt(3),
+    wait=wait_fixed(2),
+    reraise=True,
 )
 
 
 class ModalProviderConfig(BaseModel):
     type: Literal["modal"] = "modal"
-
-    @classmethod
-    def from_headers(cls, headers: Mapping[str, str]) -> "ModalProviderConfig":
-        return cls()
+    MODAL_TOKEN_ID: str
+    MODAL_TOKEN_SECRET: str
 
     def create_provider(self) -> SandboxProvider:
         return ModalSandboxProvider(self)
 
 
+def _sandbox_error(exc: ModalError) -> SandboxError:
+    if isinstance(exc, ModalNotFoundError):
+        return SandboxNotFoundError(str(exc))
+    if isinstance(exc, ModalConnectionError):
+        return SandboxConnectionError(str(exc))
+    return SandboxError(str(exc))
+
+
+def _command(command: str, cwd: str | None, timeout: float | None) -> str:
+    # Match Daytona semantics: timeout exits 124, stderr merges into stdout.
+    if timeout is not None:
+        command = f"timeout {timeout:g} {command}"
+    if cwd:
+        command = f"cd {shlex.quote(cwd)} && {command}"
+    return f"{{ {command} ; }} 2>&1"
+
+
+def _modal_sandbox_name(name: str) -> str:
+    modal_name = _INVALID_NAME_CHARS.sub("_", name) or "sandbox"
+    if _APP_ID_PATTERN.fullmatch(modal_name):
+        modal_name = f"sandbox-{modal_name}"
+    if len(modal_name) <= _MAX_NAME_LENGTH:
+        return modal_name
+    digest = hashlib.sha1(name.encode()).hexdigest()[:8]
+    return f"{modal_name[:55]}-{digest}"
+
+
+class ModalSandbox(Sandbox):
+    def __init__(self, sandbox: ModalSdkSandbox, name: str | None = None) -> None:
+        self._sandbox = sandbox
+        self._name = name
+
+    @property
+    def id(self) -> str:
+        return self._sandbox.object_id
+
+    @property
+    def name(self) -> str:
+        return self._name or self._sandbox.object_id
+
+    @property
+    def state(self) -> str:
+        # Modal does not expose a cached lifecycle state on the sandbox handle.
+        return "unknown"
+
+    async def exec(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        timeout: float | None = None,
+    ) -> ExecResult:
+        process = await self._start_process(command, cwd=cwd, timeout=timeout)
+        try:
+            output = "".join([str(chunk) async for chunk in process.stdout])
+            exit_code = await process.wait.aio()
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
+        return ExecResult(exit_code=exit_code, output=output)
+
+    @_PROVIDER_RETRY
+    async def _start_process(self, command: str, *, cwd: str | None, timeout: float | None) -> Any:
+        try:
+            return await self._sandbox.exec.aio("/bin/sh", "-lc", _command(command, cwd, timeout), text=True)
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
+
+    async def command(
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        timeout: float | None = None,
+    ) -> AsyncGenerator[str, None]:
+        process = await self._start_process(command, cwd=cwd, timeout=timeout)
+
+        try:
+            async for chunk in process.stdout:
+                yield str(chunk)
+            exit_code = await process.wait.aio()
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
+
+        if exit_code != 0:
+            raise SandboxCommandError(exit_code)
+
+    @_PROVIDER_RETRY
+    async def upload_file(self, remote_path: str, content: bytes) -> None:
+        try:
+            await cast(Awaitable[None], self._sandbox.filesystem.write_bytes(content, remote_path))
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
+
+    @_PROVIDER_RETRY
+    async def download_file(self, remote_path: str) -> bytes:
+        try:
+            content = await cast(Awaitable[bytes], self._sandbox.filesystem.read_bytes(remote_path))
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
+        return bytes(content)
+
+    async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
+        raise SandboxError("Modal sandbox provider does not support changing egress rules after creation")
+
+    async def clear_egress_rules(self) -> None:
+        raise SandboxError("Modal sandbox provider does not support changing egress rules after creation")
+
+
 class ModalSandboxProvider(SandboxProvider):
     def __init__(self, config: ModalProviderConfig) -> None:
         self._config = config
+        self._client: Client | None = None
+        self._app: App | None = None
 
+    async def _connect(self) -> tuple[Client, App]:
+        if self._client is None or self._app is None:
+            try:
+                client = await Client.from_credentials.aio(self._config.MODAL_TOKEN_ID, self._config.MODAL_TOKEN_SECRET)
+                self._app = await App.lookup.aio(
+                    _APP_NAME,
+                    client=client,
+                    create_if_missing=True,
+                )
+                self._client = client
+            except ModalError as exc:
+                raise _sandbox_error(exc) from exc
+        return self._client, self._app
+
+    def _resolve_image(self, source: SandboxSource, client: Client) -> Image:
+        # A snapshot is a Modal filesystem snapshot, referenced by its Image id.
+        match source:
+            case ImageSource(image=image):
+                return Image.from_registry(image)  # pyright: ignore[reportUnknownMemberType]
+            case SnapshotSource(snapshot=snapshot):
+                return Image.from_id(snapshot, client=client)
+            case _:
+                raise SandboxError("ComposeSource must be unwrapped before provider.create_sandbox")
+
+    async def _find_reusable_sandbox(self, name: str, client: Client) -> ModalSdkSandbox | None:
+        # Match Daytona: task retry/resume reuses a still-running sandbox by
+        # name (Modal names are unique per app, so a blind create would raise).
+        try:
+            inner = await ModalSdkSandbox.from_name.aio(
+                _APP_NAME,
+                name,
+                client=client,
+            )
+        except ModalNotFoundError:
+            return None
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
+        try:
+            still_running = await inner.poll.aio() is None
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
+        return inner if still_running else None
+
+    @_PROVIDER_RETRY
     async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
-        raise SandboxError("Modal sandbox provider is not implemented")
+        client, app = await self._connect()
+        modal_name = _modal_sandbox_name(request.name)
+        existing = await self._find_reusable_sandbox(modal_name, client)
+        if existing is not None:
+            return ModalSandbox(existing, name=request.name)
+        image = self._resolve_image(request.source, client)
+        create_kwargs: dict[str, Any] = {
+            "app": app,
+            "name": modal_name,
+            "image": image,
+            "env": dict(request.env_vars),
+            "tags": request.labels,
+            "cpu": float(request.resources.vcpu),
+            "memory": request.resources.memory * 1024,
+            "idle_timeout": request.auto_stop_interval * 60 if request.auto_stop_interval else None,
+            "timeout": _MAX_LIFETIME_SECONDS,
+            "block_network": False,
+            "client": client,
+            # Nested Docker always on, matching Daytona; no disk parameter exists.
+            "experimental_options": {"enable_docker": True},
+        }
 
+        try:
+            # No entrypoint args: an argless Modal sandbox idles until timeout.
+            inner = await asyncio.wait_for(
+                ModalSdkSandbox.create.aio(**create_kwargs),  # pyright: ignore[reportUnknownMemberType]
+                timeout=request.create_timeout,
+            )
+        except TimeoutError as exc:
+            raise SandboxError(f"Failed to create Modal sandbox within {request.create_timeout}s") from exc
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
+        return ModalSandbox(inner, name=request.name)
+
+    @_PROVIDER_RETRY
     async def get_sandbox(self, instance_id: str) -> Sandbox:
-        raise SandboxError("Modal sandbox provider is not implemented")
+        client, _ = await self._connect()
+        try:
+            inner = await ModalSdkSandbox.from_id.aio(instance_id, client=client)
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
+        return ModalSandbox(inner)
 
+    @_PROVIDER_RETRY
     async def delete_sandbox(self, instance_id: str) -> None:
-        raise SandboxError("Modal sandbox provider is not implemented")
+        client, _ = await self._connect()
+        try:
+            inner = await ModalSdkSandbox.from_id.aio(instance_id, client=client)
+            await inner.terminate.aio()
+        except ModalNotFoundError:
+            return
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
 
     async def list_sandboxes(self, query: SandboxQuery) -> AsyncGenerator[Sandbox, None]:
-        raise SandboxError("Modal sandbox provider is not implemented")
-        yield
+        for inner in await self._list_sandboxes(query):
+            yield ModalSandbox(inner)
+
+    @_PROVIDER_RETRY
+    async def _list_sandboxes(self, query: SandboxQuery) -> list[ModalSdkSandbox]:
+        client, app = await self._connect()
+        try:
+            return [
+                inner
+                async for inner in ModalSdkSandbox.list.aio(app_id=app.app_id, tags=query.labels or None, client=client)
+            ]
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
 
     async def close(self) -> None:
-        pass
+        if self._client is not None:
+            await self._client._close.aio()  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType]
+            self._client = None
+            self._app = None

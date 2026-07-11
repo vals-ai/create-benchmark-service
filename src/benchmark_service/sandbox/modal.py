@@ -165,7 +165,7 @@ class ModalSandbox(Sandbox):
     async def upload_file(self, remote_path: str, content: bytes) -> None:
         await self._raise_if_finished()
         try:
-            await cast(Awaitable[None], self._sandbox.filesystem.write_bytes(content, remote_path))
+            await cast(Awaitable[None], self._sandbox.filesystem.write_bytes.aio(content, remote_path))
         except ModalError as exc:
             raise _sandbox_error(exc) from exc
 
@@ -173,7 +173,7 @@ class ModalSandbox(Sandbox):
     async def download_file(self, remote_path: str) -> bytes:
         await self._raise_if_finished()
         try:
-            content = await cast(Awaitable[bytes], self._sandbox.filesystem.read_bytes(remote_path))
+            content = await cast(Awaitable[bytes], self._sandbox.filesystem.read_bytes.aio(remote_path))
         except ModalError as exc:
             raise _sandbox_error(exc) from exc
         return bytes(content)

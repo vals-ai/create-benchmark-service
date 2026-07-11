@@ -55,14 +55,16 @@ class FakeFilesystem:
         self.error = error
         self.writes: list[tuple[bytes, str]] = []
         self.reads: list[str] = []
+        self.write_bytes = _aio(self._write_bytes)
+        self.read_bytes = _aio(self._read_bytes)
 
-    async def write_bytes(self, content: bytes, remote_path: str) -> None:
+    async def _write_bytes(self, content: bytes, remote_path: str) -> None:
         if self.error is not None:
             raise self.error
         self.writes.append((content, remote_path))
         self.content = content
 
-    async def read_bytes(self, remote_path: str) -> bytes:
+    async def _read_bytes(self, remote_path: str) -> bytes:
         if self.error is not None:
             raise self.error
         self.reads.append(remote_path)

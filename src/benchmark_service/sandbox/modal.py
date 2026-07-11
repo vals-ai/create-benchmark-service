@@ -116,8 +116,9 @@ class ModalSandbox(Sandbox):
     async def _raise_if_finished(self, *, attempts: int = 1, wait_seconds: float = 0) -> None:
         try:
             for attempt in range(attempts):
-                if await self._sandbox.poll.aio() is not None:
-                    raise SandboxNotFoundError(f"Sandbox not found: id={self.id}.")
+                poll_result = await self._sandbox.poll.aio()
+                if poll_result is not None:
+                    raise SandboxNotFoundError(f"Sandbox not found: id={self.id}, poll_result={poll_result}.")
                 if attempt < attempts - 1:
                     await asyncio.sleep(wait_seconds)
         except ModalError as exc:

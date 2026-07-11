@@ -277,6 +277,19 @@ async def test_command_maps_terminated_sandbox_to_not_found() -> None:
     assert chunks == ["line1\n"]
 
 
+async def test_command_reports_modal_poll_result_when_sandbox_finished() -> None:
+    """Verify finished Modal sandboxes include their poll result in the surfaced error.
+
+    Test cases:
+    - A terminated sandbox poll result is included in the SandboxNotFoundError message.
+    """
+    sandbox = _sandbox(FakeInnerSandbox(process=FakeProcess([], 137), poll_results=[None, 137]))
+
+    with pytest.raises(SandboxNotFoundError, match="poll_result=137"):
+        async for _ in sandbox.command("run"):
+            pass
+
+
 async def test_upload_file_uses_modal_filesystem() -> None:
     inner = FakeInnerSandbox()
     sandbox = _sandbox(inner)

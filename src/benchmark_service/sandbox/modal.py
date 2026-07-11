@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import shlex
-from collections.abc import AsyncGenerator
-from typing import Any, Literal
+from collections.abc import AsyncGenerator, Awaitable
+from typing import Any, Literal, cast
 
 from modal import App, Client, Image
 from modal import Sandbox as ModalSdkSandbox
@@ -13,6 +13,7 @@ from modal.exception import NotFoundError as ModalNotFoundError
 from pydantic import BaseModel
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
+from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
     ExecResult,
     ImageSource,
@@ -32,6 +33,8 @@ from benchmark_service.sandbox.types import (
 _APP_NAME = "benchmark-service"
 # Modal's default sandbox timeout is 5 minutes; benchmark tasks run for hours.
 _MAX_LIFETIME_SECONDS = 24 * 60 * 60
+_ALLOW_ALL_CIDRS = ("0.0.0.0/0",)
+_ALLOW_ALL_DOMAINS = ("*",)
 
 
 _PROVIDER_RETRY = retry(
@@ -142,6 +145,50 @@ class ModalSandbox(Sandbox):
             raise _sandbox_error(exc) from exc
         return bytes(content)
 
+    async def _set_outbound_network_policy(self, cidrs: list[str], domains: list[str]) -> None:
+        try:
+            set_policy = cast(Any, self._sandbox)._experimental_set_outbound_network_policy
+            await cast(
+                Awaitable[None],
+                set_policy.aio(
+                    outbound_cidr_allowlist=cidrs,
+                    outbound_domain_allowlist=domains,
+                ),
+            )
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
+
+    async def _resolve_domain_cidrs(self, domains: list[str]) -> list[str]:
+        domains_to_resolve = [domain for domain in domains if domain != "*" and not domain.startswith("*.")]
+        if not domains_to_resolve:
+            return []
+
+        script = f"""
+import socket
+
+for domain in {domains_to_resolve!r}:
+    try:
+        infos = socket.getaddrinfo(domain, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
+    except OSError:
+        continue
+    for info in infos:
+        print(info[4][0])
+"""
+        result = await self.exec(f"python -c {shlex.quote(script)}")
+        if result.exit_code != 0:
+            return []
+
+        addresses = [f"{line.strip()}/32" for line in result.stdout.splitlines() if line.strip()]
+        return list(dict.fromkeys(addresses))
+
+    async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
+        cidrs, domains = resolve_allowed_addresses(allowed_addresses)
+        cidrs = list(dict.fromkeys([*cidrs, *await self._resolve_domain_cidrs(domains)]))
+        await self._set_outbound_network_policy(cidrs, domains)
+
+    async def clear_egress_rules(self) -> None:
+        await self._set_outbound_network_policy(list(_ALLOW_ALL_CIDRS), list(_ALLOW_ALL_DOMAINS))
+
 
 class ModalSandboxProvider(SandboxProvider):
     def __init__(self, config: ModalProviderConfig) -> None:
@@ -207,6 +254,9 @@ class ModalSandboxProvider(SandboxProvider):
             "memory": request.resources.memory * 1024,
             "idle_timeout": request.auto_stop_interval * 60 if request.auto_stop_interval else None,
             "timeout": _MAX_LIFETIME_SECONDS,
+            "block_network": False,
+            "outbound_cidr_allowlist": list(_ALLOW_ALL_CIDRS),
+            "outbound_domain_allowlist": list(_ALLOW_ALL_DOMAINS),
             "client": client,
             # Nested Docker always on, matching Daytona; no disk parameter exists.
             "experimental_options": {"enable_docker": True},

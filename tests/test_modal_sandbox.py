@@ -83,9 +83,11 @@ class FakeInnerSandbox:
         self._exec_error = exec_error
         self._poll_result = poll_result
         self.filesystem = FakeFilesystem(file_content, file_error)
+        self.outbound_policies: list[dict[str, list[str] | None]] = []
         self.exec = _aio(self._exec)
         self.terminate = _aio(self._terminate)
         self.poll = _aio(self._poll)
+        self._experimental_set_outbound_network_policy = _aio(self._set_outbound_network_policy)
 
     async def _exec(self, *args: str, text: bool = True) -> FakeProcess:
         if self._exec_error is not None:
@@ -99,6 +101,19 @@ class FakeInnerSandbox:
     async def _poll(self) -> int | None:
         # None means still running, mirroring modal.Sandbox.poll().
         return self._poll_result
+
+    async def _set_outbound_network_policy(
+        self,
+        *,
+        outbound_cidr_allowlist: list[str] | None = None,
+        outbound_domain_allowlist: list[str] | None = None,
+    ) -> None:
+        self.outbound_policies.append(
+            {
+                "outbound_cidr_allowlist": outbound_cidr_allowlist,
+                "outbound_domain_allowlist": outbound_domain_allowlist,
+            }
+        )
 
 
 class FlakyExecSandbox(FakeInnerSandbox):
@@ -261,6 +276,31 @@ async def test_download_file_returns_bytes() -> None:
     assert inner.filesystem.reads == ["/tmp/out.bin"]
 
 
+async def test_egress_rule_updates_replace_outbound_policy() -> None:
+    """Verify Modal egress updates call the SDK outbound policy API.
+
+    Test cases:
+    - URLs, domains, and IPv4 addresses are split into Modal domain and CIDR allowlists.
+    - Clearing egress rules restores Modal's open outbound policy.
+    """
+    inner = FakeInnerSandbox(process=FakeProcess(["198.51.100.8\n198.51.100.9\n"], 0))
+    sandbox = _sandbox(inner)
+
+    await sandbox.modify_egress_rules(["https://api.openai.com/v1", "github.com", "203.0.113.10"])
+
+    assert inner.outbound_policies[-1] == {
+        "outbound_cidr_allowlist": ["203.0.113.10/32", "198.51.100.8/32", "198.51.100.9/32"],
+        "outbound_domain_allowlist": ["api.openai.com", "github.com"],
+    }
+
+    await sandbox.clear_egress_rules()
+
+    assert inner.outbound_policies[-1] == {
+        "outbound_cidr_allowlist": ["0.0.0.0/0"],
+        "outbound_domain_allowlist": ["*"],
+    }
+
+
 async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> None:
     inner = FakeInnerSandbox()
     captured: dict[str, Any] = {}
@@ -285,6 +325,9 @@ async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> N
     assert captured["memory"] == 8192
     assert captured["idle_timeout"] == 1800
     assert captured["timeout"] == 86400
+    assert captured["block_network"] is False
+    assert captured["outbound_cidr_allowlist"] == ["0.0.0.0/0"]
+    assert captured["outbound_domain_allowlist"] == ["*"]
     # Nested-Docker capability is requested unconditionally, matching Daytona
     # sandboxes which always support it.
     assert captured["experimental_options"] == {"enable_docker": True}

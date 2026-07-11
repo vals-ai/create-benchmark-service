@@ -16,6 +16,7 @@ from modal.exception import NotFoundError as ModalNotFoundError
 from pydantic import BaseModel
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
+from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
     ExecResult,
     ImageSource,
@@ -159,10 +160,29 @@ class ModalSandbox(Sandbox):
         return bytes(content)
 
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
-        raise SandboxError("Modal sandbox provider does not support changing egress rules after creation")
+        cidrs, domains = resolve_allowed_addresses(allowed_addresses)
+        try:
+            await cast(
+                Awaitable[None],
+                self._sandbox._experimental_set_outbound_network_policy(  # pyright: ignore[reportPrivateUsage]
+                    outbound_cidr_allowlist=cidrs,
+                    outbound_domain_allowlist=domains,
+                ),
+            )
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
 
     async def clear_egress_rules(self) -> None:
-        raise SandboxError("Modal sandbox provider does not support changing egress rules after creation")
+        try:
+            await cast(
+                Awaitable[None],
+                self._sandbox._experimental_set_outbound_network_policy(  # pyright: ignore[reportPrivateUsage]
+                    outbound_cidr_allowlist=None,
+                    outbound_domain_allowlist=None,
+                ),
+            )
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
 
 
 class ModalSandboxProvider(SandboxProvider):

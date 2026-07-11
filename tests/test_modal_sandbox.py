@@ -86,6 +86,7 @@ class FakeInnerSandbox:
         self._exec_error = exec_error
         self._poll_result = poll_result
         self.filesystem = FakeFilesystem(file_content, file_error)
+        self.outbound_policies: list[dict[str, list[str] | None]] = []
         self.exec = _aio(self._exec)
         self.terminate = _aio(self._terminate)
         self.poll = _aio(self._poll)
@@ -102,6 +103,19 @@ class FakeInnerSandbox:
     async def _poll(self) -> int | None:
         # None means still running, mirroring modal.Sandbox.poll().
         return self._poll_result
+
+    async def _experimental_set_outbound_network_policy(
+        self,
+        *,
+        outbound_cidr_allowlist: list[str] | None = None,
+        outbound_domain_allowlist: list[str] | None = None,
+    ) -> None:
+        self.outbound_policies.append(
+            {
+                "outbound_cidr_allowlist": outbound_cidr_allowlist,
+                "outbound_domain_allowlist": outbound_domain_allowlist,
+            }
+        )
 
 
 class FlakyExecSandbox(FakeInnerSandbox):
@@ -264,14 +278,29 @@ async def test_download_file_returns_bytes() -> None:
     assert inner.filesystem.reads == ["/tmp/out.bin"]
 
 
-async def test_egress_rule_updates_are_not_supported_after_create() -> None:
-    sandbox = _sandbox(FakeInnerSandbox())
+async def test_egress_rule_updates_replace_outbound_policy() -> None:
+    """Verify Modal egress updates call the SDK outbound policy API.
 
-    with pytest.raises(SandboxError, match="does not support changing egress rules after creation"):
-        await sandbox.modify_egress_rules(["api.openai.com"])
+    Test cases:
+    - URLs, domains, and IPv4 addresses are split into Modal domain and CIDR allowlists.
+    - Clearing egress rules restores Modal's open outbound policy.
+    """
+    inner = FakeInnerSandbox()
+    sandbox = _sandbox(inner)
 
-    with pytest.raises(SandboxError, match="does not support changing egress rules after creation"):
-        await sandbox.clear_egress_rules()
+    await sandbox.modify_egress_rules(["https://api.openai.com/v1", "github.com", "203.0.113.10"])
+
+    assert inner.outbound_policies[-1] == {
+        "outbound_cidr_allowlist": ["203.0.113.10/32"],
+        "outbound_domain_allowlist": ["api.openai.com", "github.com"],
+    }
+
+    await sandbox.clear_egress_rules()
+
+    assert inner.outbound_policies[-1] == {
+        "outbound_cidr_allowlist": None,
+        "outbound_domain_allowlist": None,
+    }
 
 
 async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> None:

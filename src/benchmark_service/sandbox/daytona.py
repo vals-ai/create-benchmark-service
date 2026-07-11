@@ -50,6 +50,7 @@ from benchmark_service.sandbox.types import (
 )
 
 _PTY_STATUS_CHECK_ATTEMPTS = 30
+_PTY_STATUS_POLL_SECONDS = 5
 _STATUS_DIR = "/tmp/.sandbox-provider"
 _REMOVED_SANDBOX_STATES = (SandboxState.DESTROYING, SandboxState.DESTROYED)
 _FAILED_SANDBOX_STATES = (SandboxState.ERROR, SandboxState.BUILD_FAILED)
@@ -388,6 +389,7 @@ class DaytonaSandbox(Sandbox):
         status_path = f"{_STATUS_DIR}/{uuid.uuid4().hex}.status"
         stdout: list[str] = []
         handle: AsyncPtyHandle | None = None
+        wait_task: asyncio.Task[Any] | None = None
 
         async def on_data(data: bytes) -> None:
             text = data.decode("utf-8", errors="replace")
@@ -400,20 +402,31 @@ class DaytonaSandbox(Sandbox):
             await handle.send_input(
                 f"mkdir -p {shlex.quote(_STATUS_DIR)}; {command}; echo $? > {shlex.quote(status_path)}; exit\n"
             )
-            with suppress(Exception):
-                await handle.wait()
+            wait_task = asyncio.create_task(handle.wait())
 
-            for _ in range(_PTY_STATUS_CHECK_ATTEMPTS):
+            reconnect_attempts = 0
+            while True:
+                done, _ = await asyncio.wait({wait_task}, timeout=_PTY_STATUS_POLL_SECONDS)
                 await self._check_sandbox_alive()
                 result = await self.exec(f"test -e {shlex.quote(status_path)}")
                 if result.exit_code == 0:
                     break
+
+                if not done:
+                    continue
+
+                reconnect_attempts += 1
+                if reconnect_attempts == _PTY_STATUS_CHECK_ATTEMPTS:
+                    raise SandboxConnectionError(
+                        f"Daytona PTY command did not write an exit code for {self._sandbox_ref}: "
+                        f"session_id={session_id}"
+                    )
+
+                with suppress(Exception):
+                    await wait_task
+                await handle.disconnect()
                 handle = await self._reconnect_pty(session_id, on_data)
-                await asyncio.sleep(1)
-            else:
-                raise SandboxConnectionError(
-                    f"Daytona PTY command did not write an exit code for {self._sandbox_ref}: session_id={session_id}"
-                )
+                wait_task = asyncio.create_task(handle.wait())
 
             result = await self.exec(f"cat {shlex.quote(status_path)}")
             if result.exit_code != 0 or not result.output:
@@ -424,6 +437,10 @@ class DaytonaSandbox(Sandbox):
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
         finally:
+            if wait_task:
+                wait_task.cancel()
+                with suppress(Exception, asyncio.CancelledError):
+                    await wait_task
             if handle:
                 with suppress(Exception):
                     await handle.disconnect()
@@ -456,10 +473,7 @@ class DaytonaSandbox(Sandbox):
     ) -> AsyncPtyHandle:
         try:
             await self._sandbox.process.get_pty_session_info(session_id)
-            handle = await self._sandbox.process.connect_pty_session(session_id, on_data)
-            with suppress(Exception):
-                await handle.wait()
-            return handle
+            return await self._sandbox.process.connect_pty_session(session_id, on_data)
         except DaytonaNotFoundError as exc:
             raise SandboxError(
                 f"Daytona PTY session no longer exists for {self._sandbox_ref}: session_id={session_id}"

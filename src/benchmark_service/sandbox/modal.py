@@ -11,6 +11,7 @@ from modal import App, Client, Image
 from modal import Sandbox as ModalSdkSandbox
 from modal.exception import ConnectionError as ModalConnectionError
 from modal.exception import Error as ModalError
+from modal.exception import InvalidError as ModalInvalidError
 from modal.exception import NotFoundError as ModalNotFoundError
 from pydantic import BaseModel
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
@@ -254,6 +255,8 @@ class ModalSandboxProvider(SandboxProvider):
         client, _ = await self._connect()
         try:
             inner = await ModalSdkSandbox.from_id.aio(instance_id, client=client)
+        except ModalInvalidError as exc:
+            raise SandboxNotFoundError(f"Sandbox not found: id={instance_id}.") from exc
         except ModalError as exc:
             raise _sandbox_error(exc) from exc
         return ModalSandbox(inner)

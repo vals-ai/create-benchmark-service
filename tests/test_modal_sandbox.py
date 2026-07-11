@@ -10,6 +10,7 @@ import pytest
 from modal import Sandbox as ModalSdkSandbox
 from modal.exception import ConnectionError as ModalConnectionError
 from modal.exception import Error as ModalError
+from modal.exception import InvalidError as ModalInvalidError
 from modal.exception import NotFoundError as ModalNotFoundError
 
 import benchmark_service.sandbox.modal as modal_module
@@ -373,6 +374,16 @@ async def test_get_sandbox_raises_not_found(monkeypatch: pytest.MonkeyPatch) -> 
 
     with pytest.raises(SandboxNotFoundError):
         await provider.get_sandbox("sb-missing")
+
+
+async def test_get_sandbox_maps_invalid_id_to_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def from_id(instance_id: str, **kwargs: Any) -> Any:
+        raise ModalInvalidError(f"Invalid Sandbox ID: {instance_id!r}")
+
+    provider = _provider(monkeypatch, SimpleNamespace(from_id=_aio(from_id)))
+
+    with pytest.raises(SandboxNotFoundError, match="id=sandbox-name"):
+        await provider.get_sandbox("sandbox-name")
 
 
 async def test_delete_sandbox_is_idempotent(monkeypatch: pytest.MonkeyPatch) -> None:

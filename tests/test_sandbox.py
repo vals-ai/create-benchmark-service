@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, cast
 
@@ -24,6 +25,12 @@ from benchmark_service.sandbox import (
     SandboxQuery,
 )
 from benchmark_service.sandbox.daytona import DaytonaSandbox, DaytonaSandboxProvider, daytona_retry_after_seconds
+
+
+def _log_record(records: list[logging.LogRecord], message: str) -> logging.LogRecord:
+    matches = [record for record in records if record.getMessage() == message]
+    assert len(matches) == 1
+    return matches[0]
 
 
 def _client_response_error(status: int, message: str) -> ClientResponseError:
@@ -446,15 +453,31 @@ def test_daytona_retry_after_uses_any_retry_after_header() -> None:
     assert daytona_retry_after_seconds(exc) == 5
 
 
-async def test_daytona_exec_retries_rate_limits() -> None:
+async def test_daytona_exec_retries_rate_limits(caplog: pytest.LogCaptureFixture) -> None:
     inner = InnerSandbox()
     process = RateLimitedProcess()
     inner.process = process
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    await sandbox.exec("pytest")
+    with caplog.at_level(logging.WARNING, logger="benchmark_service.sandbox.daytona"):
+        await sandbox.exec("pytest")
 
     assert process.attempts == 2
+
+    retry_log = _log_record(caplog.records, "daytona.retry_before_sleep")
+    assert getattr(retry_log, "op") == "sandbox.exec"
+    assert getattr(retry_log, "fn") == "exec"
+    assert getattr(retry_log, "attempt") == 1
+    assert getattr(retry_log, "sleep_seconds") == 0
+    assert getattr(retry_log, "error_class") == "SandboxConnectionError"
+    assert getattr(retry_log, "cause_error_class") == "DaytonaRateLimitError"
+    assert getattr(retry_log, "root_cause_error_class") == "DaytonaRateLimitError"
+
+    rate_limit_log = _log_record(caplog.records, "daytona.rate_limit_retry")
+    assert getattr(rate_limit_log, "op") == "sandbox.exec"
+    assert getattr(rate_limit_log, "throttler") == "sandbox-create"
+    assert getattr(rate_limit_log, "attempt") == 1
+    assert getattr(rate_limit_log, "sleep_seconds") == 0
 
 
 async def test_daytona_exec_retries_failed_execute_command_errors() -> None:
@@ -475,16 +498,25 @@ async def test_daytona_exec_retries_failed_execute_command_errors() -> None:
     assert process.attempts == 2
 
 
-async def test_daytona_exec_retries_wrapped_connection_errors() -> None:
+async def test_daytona_exec_retries_wrapped_connection_errors(caplog: pytest.LogCaptureFixture) -> None:
     inner = InnerSandbox()
     process = WrappedConnectionErrorProcess()
     inner.process = process
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    result = await sandbox.exec("pytest")
+    with caplog.at_level(logging.WARNING, logger="benchmark_service.sandbox.daytona"):
+        result = await sandbox.exec("pytest")
 
     assert result.exit_code == 0
     assert process.attempts == 2
+
+    retry_log = _log_record(caplog.records, "daytona.retry_before_sleep")
+    assert getattr(retry_log, "op") == "sandbox.exec"
+    assert getattr(retry_log, "attempt") == 1
+    assert getattr(retry_log, "sleep_seconds") == 2
+    assert getattr(retry_log, "error_class") == "SandboxConnectionError"
+    assert getattr(retry_log, "cause_error_class") == "DaytonaError"
+    assert getattr(retry_log, "root_cause_error_class") == "ClientConnectionError"
 
 
 async def test_daytona_exec_retries_misclassified_transport_errors() -> None:

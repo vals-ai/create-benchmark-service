@@ -88,11 +88,9 @@ class FakeInnerSandbox:
         self._poll_result = poll_result
         self._poll_results = poll_results or []
         self.filesystem = FakeFilesystem(file_content, file_error)
-        self.outbound_policies: list[dict[str, list[str] | None]] = []
         self.exec = _aio(self._exec)
         self.terminate = _aio(self._terminate)
         self.poll = _aio(self._poll)
-        self._experimental_set_outbound_network_policy = _aio(self._set_outbound_network_policy)
 
     async def _exec(self, *args: str, text: bool = True) -> FakeProcess:
         if self._exec_error is not None:
@@ -109,20 +107,6 @@ class FakeInnerSandbox:
             return self._poll_results.pop(0)
         return self._poll_result
 
-    async def _set_outbound_network_policy(
-        self,
-        *,
-        outbound_cidr_allowlist: list[str] | None = None,
-        outbound_domain_allowlist: list[str] | None = None,
-    ) -> None:
-        self.outbound_policies.append(
-            {
-                "outbound_cidr_allowlist": outbound_cidr_allowlist,
-                "outbound_domain_allowlist": outbound_domain_allowlist,
-            }
-        )
-
-
 class FlakyExecSandbox(FakeInnerSandbox):
     def __init__(self) -> None:
         super().__init__(process=FakeProcess(["ok"], 0))
@@ -133,6 +117,11 @@ class FlakyExecSandbox(FakeInnerSandbox):
         if self.exec_attempts == 1:
             raise ModalConnectionError("modal exec temporarily unavailable")
         return await super()._exec(*args, text=text)
+
+
+class DisappearingSandbox(FakeInnerSandbox):
+    async def _poll(self) -> int | None:
+        raise ModalNotFoundError("sandbox disappeared")
 
 
 def _request(source: ImageSource | SnapshotSource | None = None) -> SandboxCreateRequest:
@@ -205,7 +194,11 @@ def test_modal_config_reads_secrets_manager_shape() -> None:
 
 def test_command_merges_stderr_and_applies_timeout_inside_cwd() -> None:
     command = modal_module._command("echo hi", "/workspace", 60)
-    assert command == "{ cd /workspace && timeout 60 echo hi ; } 2>&1"
+    assert command == "{ cd /workspace && timeout 60 /bin/sh -c 'echo hi'\n} 2>&1"
+
+
+def test_command_supports_background_processes() -> None:
+    assert modal_module._command("true &", None, 10) == "{ timeout 10 /bin/sh -c 'true &'\n} 2>&1"
 
 
 def test_command_preserves_fractional_timeout() -> None:
@@ -220,7 +213,7 @@ async def test_exec_returns_combined_output() -> None:
 
     assert result.exit_code == 3
     assert result.stdout == "outerr"
-    assert inner.commands == [("/bin/sh", "-lc", "{ timeout 10 boom ; } 2>&1")]
+    assert inner.commands == [("/bin/sh", "-lc", "{ timeout 10 /bin/sh -c boom\n} 2>&1")]
 
 
 async def test_exec_wraps_modal_errors() -> None:
@@ -318,29 +311,13 @@ async def test_download_file_returns_bytes() -> None:
     assert inner.filesystem.reads == ["/tmp/out.bin"]
 
 
-async def test_egress_rule_updates_replace_outbound_policy() -> None:
-    """Verify Modal egress updates call the SDK outbound policy API.
+async def test_runtime_egress_rule_updates_fail_closed() -> None:
+    sandbox = _sandbox(FakeInnerSandbox())
 
-    Test cases:
-    - URLs, domains, and IPv4 addresses are split into Modal domain and CIDR allowlists.
-    - Clearing egress rules restores Modal's open outbound policy.
-    """
-    inner = FakeInnerSandbox(process=FakeProcess(["198.51.100.8\n198.51.100.9\n"], 0))
-    sandbox = _sandbox(inner)
-
-    await sandbox.modify_egress_rules(["https://api.openai.com/v1", "github.com", "203.0.113.10"])
-
-    assert inner.outbound_policies[-1] == {
-        "outbound_cidr_allowlist": ["203.0.113.10/32", "198.51.100.8/32", "198.51.100.9/32"],
-        "outbound_domain_allowlist": ["api.openai.com", "github.com"],
-    }
+    with pytest.raises(SandboxError, match="does not support changing egress rules"):
+        await sandbox.modify_egress_rules(["api.openai.com"])
 
     await sandbox.clear_egress_rules()
-
-    assert inner.outbound_policies[-1] == {
-        "outbound_cidr_allowlist": ["0.0.0.0/0"],
-        "outbound_domain_allowlist": ["*"],
-    }
 
 
 async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -372,7 +349,7 @@ async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> N
     assert captured["outbound_domain_allowlist"] == ["*"]
     # Nested-Docker capability is requested unconditionally, matching Daytona
     # sandboxes which always support it.
-    assert captured["experimental_options"] == {"enable_docker": True}
+    assert captured["experimental_options"] == {"vm_runtime": True}
 
 
 async def test_create_sandbox_uses_modal_safe_name(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -413,15 +390,20 @@ async def test_create_sandbox_uses_modal_safe_name(monkeypatch: pytest.MonkeyPat
     assert len(captured["name"]) <= 64
 
 
-def test_modal_sandbox_name_avoids_app_id_shape() -> None:
-    """Verify names shaped like Modal app IDs are not passed through unchanged.
-
-    Test cases:
-    - A task name matching Modal's app-id shape is prefixed before SDK use.
-    """
+def test_modal_sandbox_names_remain_distinct_after_normalization() -> None:
     modal_app_id_name = "ap-" + ("a" * 22)
+    requested_names = [
+        "dataset/task",
+        "dataset:task",
+        "dataset task",
+        "dataset_task",
+        modal_app_id_name,
+        f"sandbox-{modal_app_id_name}",
+    ]
 
-    assert modal_module._modal_sandbox_name(modal_app_id_name) == f"sandbox-{modal_app_id_name}"
+    modal_names = {modal_module._modal_sandbox_name(name) for name in requested_names}
+
+    assert len(modal_names) == len(requested_names)
 
 
 async def test_create_sandbox_retries_modal_connection_errors(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -536,6 +518,21 @@ async def test_list_sandboxes_filters_by_labels(monkeypatch: pytest.MonkeyPatch)
     assert captured["tags"] == {"run_id": "r1"}
 
 
+async def test_list_sandboxes_skips_disappeared_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
+    def list_sandboxes(**kwargs: Any) -> AsyncGenerator[FakeInnerSandbox, None]:
+        async def iterate() -> AsyncGenerator[FakeInnerSandbox, None]:
+            yield DisappearingSandbox(object_id="sb-disappeared")
+            yield FakeInnerSandbox(object_id="sb-running")
+
+        return iterate()
+
+    provider = _provider(monkeypatch, SimpleNamespace(list=_aio(list_sandboxes)))
+
+    sandboxes = [sandbox async for sandbox in provider.list_sandboxes(SandboxQuery(labels={}))]
+
+    assert [sandbox.id for sandbox in sandboxes] == ["sb-running"]
+
+
 async def test_create_sandbox_reuses_running_sandbox_with_same_name(monkeypatch: pytest.MonkeyPatch) -> None:
     running = FakeInnerSandbox(object_id="sb-existing")  # poll_result=None: still running
     created: list[str] = []
@@ -565,6 +562,20 @@ async def test_create_sandbox_ignores_finished_sandbox_with_same_name(monkeypatc
 
     async def from_name(app_name: str, name: str, **kwargs: Any) -> FakeInnerSandbox:
         return finished
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create), from_name=_aio(from_name)))
+
+    sandbox = await provider.create_sandbox(_request())
+
+    assert sandbox.id == "sb-new"
+
+
+async def test_create_sandbox_replaces_disappeared_sandbox_with_same_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        return FakeInnerSandbox(object_id="sb-new")
+
+    async def from_name(app_name: str, name: str, **kwargs: Any) -> FakeInnerSandbox:
+        return DisappearingSandbox(object_id="sb-disappeared")
 
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create), from_name=_aio(from_name)))
 

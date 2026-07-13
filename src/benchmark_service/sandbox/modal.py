@@ -16,7 +16,6 @@ from modal.exception import NotFoundError as ModalNotFoundError
 from pydantic import BaseModel
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
-from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
     ExecResult,
     ImageSource,
@@ -71,10 +70,10 @@ def _sandbox_error(exc: ModalError) -> SandboxError:
 def _command(command: str, cwd: str | None, timeout: float | None) -> str:
     # Match Daytona semantics: timeout exits 124, stderr merges into stdout.
     if timeout is not None:
-        command = f"timeout {timeout:g} {command}"
+        command = f"timeout {timeout:g} /bin/sh -c {shlex.quote(command)}"
     if cwd:
         command = f"cd {shlex.quote(cwd)} && {command}"
-    return f"{{ {command} ; }} 2>&1"
+    return f"{{ {command}\n}} 2>&1"
 
 
 def _modal_sandbox_name(name: str) -> str:
@@ -87,10 +86,11 @@ def _modal_sandbox_name(name: str) -> str:
     A Modal-safe name for SDK lookup/create calls; callers should keep the original name on Sandbox.
     """
     modal_name = _INVALID_NAME_CHARS.sub("_", name) or "sandbox"
-    if _APP_ID_PATTERN.fullmatch(modal_name):
-        modal_name = f"sandbox-{modal_name}"
-    if len(modal_name) <= _MAX_NAME_LENGTH:
+    is_app_id = _APP_ID_PATTERN.fullmatch(modal_name) is not None
+    if modal_name == name and not is_app_id and len(modal_name) <= _MAX_NAME_LENGTH:
         return modal_name
+    if is_app_id:
+        modal_name = f"sandbox-{modal_name}"
     digest = hashlib.sha1(name.encode()).hexdigest()[:8]
     return f"{modal_name[:55]}-{digest}"
 
@@ -187,49 +187,11 @@ class ModalSandbox(Sandbox):
             raise _sandbox_error(exc) from exc
         return bytes(content)
 
-    async def _set_outbound_network_policy(self, cidrs: list[str], domains: list[str]) -> None:
-        try:
-            set_policy = cast(Any, self._sandbox)._experimental_set_outbound_network_policy
-            await cast(
-                Awaitable[None],
-                set_policy.aio(
-                    outbound_cidr_allowlist=cidrs,
-                    outbound_domain_allowlist=domains,
-                ),
-            )
-        except ModalError as exc:
-            raise _sandbox_error(exc) from exc
-
-    async def _resolve_domain_cidrs(self, domains: list[str]) -> list[str]:
-        domains_to_resolve = [domain for domain in domains if domain != "*" and not domain.startswith("*.")]
-        if not domains_to_resolve:
-            return []
-
-        script = f"""
-import socket
-
-for domain in {domains_to_resolve!r}:
-    try:
-        infos = socket.getaddrinfo(domain, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
-    except OSError:
-        continue
-    for info in infos:
-        print(info[4][0])
-"""
-        result = await self.exec(f"python -c {shlex.quote(script)}")
-        if result.exit_code != 0:
-            return []
-
-        addresses = [f"{line.strip()}/32" for line in result.stdout.splitlines() if line.strip()]
-        return list(dict.fromkeys(addresses))
-
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
-        cidrs, domains = resolve_allowed_addresses(allowed_addresses)
-        cidrs = list(dict.fromkeys([*cidrs, *await self._resolve_domain_cidrs(domains)]))
-        await self._set_outbound_network_policy(cidrs, domains)
+        raise SandboxError("Modal does not support changing egress rules on a running sandbox.")
 
     async def clear_egress_rules(self) -> None:
-        await self._set_outbound_network_policy(list(_ALLOW_ALL_CIDRS), list(_ALLOW_ALL_DOMAINS))
+        pass
 
 
 class ModalSandboxProvider(SandboxProvider):
@@ -271,12 +233,9 @@ class ModalSandboxProvider(SandboxProvider):
                 name,
                 client=client,
             )
+            still_running = await inner.poll.aio() is None
         except ModalNotFoundError:
             return None
-        except ModalError as exc:
-            raise _sandbox_error(exc) from exc
-        try:
-            still_running = await inner.poll.aio() is None
         except ModalError as exc:
             raise _sandbox_error(exc) from exc
         return inner if still_running else None
@@ -303,8 +262,8 @@ class ModalSandboxProvider(SandboxProvider):
             "outbound_cidr_allowlist": list(_ALLOW_ALL_CIDRS),
             "outbound_domain_allowlist": list(_ALLOW_ALL_DOMAINS),
             "client": client,
-            # Nested Docker always on, matching Daytona; no disk parameter exists.
-            "experimental_options": {"enable_docker": True},
+            # VM sandboxes support nested Docker, matching Daytona.
+            "experimental_options": {"vm_runtime": True},
         }
 
         try:
@@ -353,8 +312,11 @@ class ModalSandboxProvider(SandboxProvider):
         try:
             sandboxes: list[ModalSdkSandbox] = []
             async for inner in ModalSdkSandbox.list.aio(app_id=app.app_id, tags=query.labels or None, client=client):
-                if await inner.poll.aio() is None:
-                    sandboxes.append(inner)
+                try:
+                    if await inner.poll.aio() is None:
+                        sandboxes.append(inner)
+                except ModalNotFoundError:
+                    continue
             return sandboxes
         except ModalError as exc:
             raise _sandbox_error(exc) from exc

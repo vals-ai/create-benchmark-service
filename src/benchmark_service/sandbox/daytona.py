@@ -28,6 +28,7 @@ from daytona.common.errors import (
     DaytonaRateLimitError,
     DaytonaTimeoutError,
 )
+from daytona.common.pty import PtyResult
 from daytona.handle.async_pty_handle import AsyncPtyHandle
 from pydantic import BaseModel
 from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_exponential, wait_fixed
@@ -74,6 +75,13 @@ _TRANSPORT_ERROR_MESSAGES = (
 _RETRYABLE_DAYTONA_CAUSES = (ClientConnectionError, ConnectionError, TimeoutError)
 _FIXED_PROVIDER_WAIT = wait_fixed(2)
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
+
+
+def _pty_result_summary(result: PtyResult | None) -> str:
+    if result is None:
+        return "unavailable"
+    error = result.error[:200] if result.error else None
+    return f"exit_code={result.exit_code}, error={error!r}"
 
 
 def _resolve_daytona_allowed_addresses(allowed_addresses: list[str]) -> tuple[list[str], list[str]]:
@@ -341,7 +349,7 @@ class DaytonaSandbox(Sandbox):
         status_path = f"{_STATUS_DIR}/{uuid.uuid4().hex}.status"
         stdout: list[str] = []
         handle: AsyncPtyHandle | None = None
-        wait_task: asyncio.Task[Any] | None = None
+        wait_task: asyncio.Task[PtyResult] | None = None
 
         async def on_data(data: bytes) -> None:
             text = data.decode("utf-8", errors="replace")
@@ -374,10 +382,16 @@ class DaytonaSandbox(Sandbox):
                         f"session_id={session_id}"
                     )
 
+                wait_result: PtyResult | None = None
                 with suppress(Exception):
-                    await wait_task
+                    wait_result = await wait_task
+                if wait_result is not None and wait_result.exit_code not in (None, 0):
+                    raise SandboxError(
+                        f"Daytona PTY exited before writing command status for {self._sandbox_ref}: "
+                        f"session_id={session_id}, {_pty_result_summary(wait_result)}"
+                    )
                 await handle.disconnect()
-                handle = await self._reconnect_pty(session_id, on_data)
+                handle = await self._reconnect_pty(session_id, on_data, wait_result)
                 wait_task = asyncio.create_task(handle.wait())
 
             result = await self.exec(f"cat {shlex.quote(status_path)}")
@@ -422,19 +436,17 @@ class DaytonaSandbox(Sandbox):
         self,
         session_id: str,
         on_data: Callable[[bytes], Awaitable[None]],
+        wait_result: PtyResult | None,
     ) -> AsyncPtyHandle:
         try:
             await self._sandbox.process.get_pty_session_info(session_id)
             return await self._sandbox.process.connect_pty_session(session_id, on_data)
-        except DaytonaNotFoundError as exc:
-            raise SandboxError(
-                f"Daytona PTY session no longer exists for {self._sandbox_ref}: session_id={session_id}"
-            ) from exc
-        except DaytonaConnectionError as exc:
+        except (DaytonaNotFoundError, DaytonaConnectionError) as exc:
             await self._check_sandbox_alive()
-            if "not found" in str(exc).lower():
+            if isinstance(exc, DaytonaNotFoundError) or "not found" in str(exc).lower():
                 raise SandboxError(
-                    f"Daytona PTY session no longer exists for {self._sandbox_ref}: session_id={session_id}"
+                    f"Daytona PTY session disappeared before command status was written for {self._sandbox_ref}: "
+                    f"session_id={session_id}, wait_result=({_pty_result_summary(wait_result)}), state={self.state}"
                 ) from exc
             raise self._sandbox_error(exc) from exc
         except _SANDBOX_OPERATION_ERRORS as exc:

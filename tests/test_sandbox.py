@@ -14,6 +14,7 @@ from daytona.common.errors import (
     DaytonaNotFoundError,
     DaytonaRateLimitError,
 )
+from daytona.common.pty import PtyResult
 from multidict import CIMultiDict, CIMultiDictProxy
 from yarl import URL
 
@@ -160,7 +161,7 @@ class PtyHandle:
         if result is not None:
             await result
 
-    async def wait(self) -> None:
+    async def wait(self) -> PtyResult | None:
         pass
 
     async def disconnect(self) -> None:
@@ -189,7 +190,7 @@ class ReconnectingProcess(Process):
         id: str,
         on_data: Callable[[bytes], None | Awaitable[None]],
         envs: dict[str, str],
-    ) -> DisconnectedPtyHandle:
+    ) -> PtyHandle:
         assert id
         assert envs == {"TERM": "dumb", "LANG": "C.UTF-8"}
         return DisconnectedPtyHandle(on_data)
@@ -207,6 +208,37 @@ class ReconnectingProcess(Process):
         assert self.checked_session_id == session_id
         self.connected_session_id = session_id
         return PtyHandle(on_data)
+
+
+class FinishedPtyHandle(PtyHandle):
+    def __init__(self, on_data: Callable[[bytes], None | Awaitable[None]], result: PtyResult) -> None:
+        super().__init__(on_data)
+        self._result = result
+
+    async def wait(self) -> PtyResult:
+        return self._result
+
+
+class LostPtyProcess(ReconnectingProcess):
+    def __init__(self, result: PtyResult, reconnect_error: DaytonaError) -> None:
+        super().__init__()
+        self._result = result
+        self._reconnect_error = reconnect_error
+
+    async def create_pty_session(
+        self,
+        *,
+        id: str,
+        on_data: Callable[[bytes], None | Awaitable[None]],
+        envs: dict[str, str],
+    ) -> FinishedPtyHandle:
+        assert id
+        assert envs == {"TERM": "dumb", "LANG": "C.UTF-8"}
+        return FinishedPtyHandle(on_data, self._result)
+
+    async def get_pty_session_info(self, session_id: str) -> SimpleNamespace:
+        self.checked_session_id = session_id
+        raise self._reconnect_error
 
 
 class CreatePtyFailureProcess(Process):
@@ -805,6 +837,61 @@ async def test_daytona_command_checks_pty_before_reconnecting() -> None:
     assert output == ["hello"]
     assert process.checked_session_id is not None
     assert process.connected_session_id == process.checked_session_id
+
+
+async def test_daytona_command_prefers_status_over_pty_exit() -> None:
+    inner = InnerSandbox()
+    process = LostPtyProcess(
+        PtyResult(exit_code=137, error="SIGKILL"),
+        DaytonaNotFoundError("PTY session not found"),
+    )
+    process.connected_session_id = "status-written"
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    assert [chunk async for chunk in sandbox.command("printf hello")] == ["hello"]
+    assert process.checked_session_id is None
+
+
+async def test_daytona_command_reports_pty_exit_before_status() -> None:
+    inner = InnerSandbox()
+    process = LostPtyProcess(
+        PtyResult(exit_code=137, error="SIGKILL"),
+        DaytonaNotFoundError("PTY session not found"),
+    )
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxError, match="PTY exited before writing command status.*exit_code=137, error='SIGKILL'"):
+        _ = [chunk async for chunk in sandbox.command("printf hello")]
+
+    assert process.checked_session_id is None
+
+
+@pytest.mark.parametrize(
+    "reconnect_error",
+    [
+        DaytonaNotFoundError("PTY session not found"),
+        DaytonaConnectionError("PTY session not found"),
+    ],
+)
+async def test_daytona_command_reports_missing_pty_context(reconnect_error: DaytonaError) -> None:
+    inner = InnerSandbox()
+    process = LostPtyProcess(
+        PtyResult(exit_code=0),
+        reconnect_error,
+    )
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxError) as exc_info:
+        _ = [chunk async for chunk in sandbox.command("printf hello")]
+
+    message = str(exc_info.value)
+    assert "PTY session disappeared before command status was written" in message
+    assert "wait_result=(exit_code=0, error=None)" in message
+    assert "state=SandboxState.STARTED" in message
+    assert inner.refresh_count == 2
 
 
 async def test_daytona_command_checks_sandbox_health_before_reconnecting() -> None:

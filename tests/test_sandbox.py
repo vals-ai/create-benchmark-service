@@ -397,6 +397,10 @@ class ErrorStateSandbox(InnerSandbox):
         raise DaytonaError("sandbox failed to start")
 
 
+class RecreatedInnerSandbox(InnerSandbox):
+    id = "recreated-sandbox-id"
+
+
 class RefreshToErrorSandbox(InnerSandbox):
     async def refresh_data(self) -> None:
         await super().refresh_data()
@@ -444,16 +448,58 @@ class DaytonaClient:
 
 
 class CreateFailureDaytonaClient(DaytonaClient):
+    def __init__(self, sandbox: InnerSandbox) -> None:
+        super().__init__(sandbox)
+        self.create_attempts = 0
+
     async def get(self, instance_id: str) -> InnerSandbox:
         raise DaytonaNotFoundError("sandbox not found")
 
     async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
-        raise DaytonaError("sandbox failed to start")
+        self.create_attempts += 1
+        raise DaytonaError("OCI runtime create failed: invalid mount configuration")
 
 
 class CreateNotFoundDaytonaClient(CreateFailureDaytonaClient):
     async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
         raise DaytonaError("sandbox not found", status_code=404)
+
+
+class SysboxRunnerFaultDaytonaClient(DaytonaClient):
+    def __init__(self) -> None:
+        self.failed_sandbox = ErrorStateSandbox()
+        super().__init__(self.failed_sandbox)
+        self.sandbox_exists = False
+        self.create_attempts = 0
+        self.delete_attempts = 0
+        self.deleted_sandboxes: list[InnerSandbox] = []
+
+    async def get(self, instance_id: str) -> InnerSandbox:
+        assert instance_id in (self.sandbox.id, self.sandbox.name)
+        if not self.sandbox_exists:
+            raise DaytonaNotFoundError("sandbox not found")
+        return self.sandbox
+
+    async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
+        self.create_attempts += 1
+        if self.create_attempts == 1:
+            self.sandbox_exists = True
+            raise DaytonaError(
+                "failed to create sandbox: OCI runtime create failed: failed to register with sysbox-mgr: unavailable"
+            )
+        assert not self.sandbox_exists
+        self.sandbox = RecreatedInnerSandbox()
+        self.sandbox_exists = True
+        return self.sandbox
+
+    async def delete(self, sandbox: InnerSandbox) -> None:
+        assert sandbox is self.sandbox
+        self.delete_attempts += 1
+        if self.delete_attempts == 1:
+            raise DaytonaConflictError("Sandbox was modified by another operation")
+        self.deleted_sandboxes.append(sandbox)
+        self.deleted = True
+        self.sandbox_exists = False
 
 
 class ReusableLookupConnectionDaytonaClient(DaytonaClient):
@@ -924,16 +970,30 @@ async def test_daytona_provider_create_retries_wrapped_lookup_connection_errors(
     assert daytona.created is True
 
 
+async def test_daytona_provider_create_recovers_from_sysbox_runner_fault() -> None:
+    daytona = SysboxRunnerFaultDaytonaClient()
+
+    sandbox = await _provider(daytona).create_sandbox(_request(daytona.sandbox.name))
+
+    assert sandbox.id == RecreatedInnerSandbox.id
+    assert daytona.create_attempts == 2
+    assert daytona.delete_attempts == 2
+    assert daytona.deleted_sandboxes == [daytona.failed_sandbox]
+
+
 async def test_daytona_provider_create_maps_daytona_errors() -> None:
-    """Create failures from Daytona should use the provider sandbox error type.
+    """Unrelated create failures should remain non-retryable provider errors.
 
     Test cases:
-    - A Daytona create failure raises SandboxError instead of leaking DaytonaError.
+    - An unrelated OCI runtime failure raises exactly SandboxError and is attempted once.
     """
     daytona = CreateFailureDaytonaClient(InnerSandbox())
 
-    with pytest.raises(SandboxError, match="sandbox failed to start"):
+    with pytest.raises(SandboxError, match="invalid mount configuration") as exc_info:
         await _provider(daytona).create_sandbox(_request("sandbox-name"))
+
+    assert type(exc_info.value) is SandboxError
+    assert daytona.create_attempts == 1
 
 
 async def test_daytona_provider_create_maps_not_found_errors() -> None:

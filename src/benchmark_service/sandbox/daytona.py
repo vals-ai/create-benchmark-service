@@ -69,6 +69,7 @@ _TRANSPORT_ERROR_MESSAGES = (
     "[errno 9] bad file descriptor",
     "502 bad gateway",
     "failed to create sandbox: an unexpected error occurred.",
+    "failed to register with sysbox-mgr",
     "server disconnected",
 )
 _RETRYABLE_DAYTONA_CAUSES = (ClientConnectionError, ConnectionError, TimeoutError)
@@ -526,6 +527,9 @@ class DaytonaSandboxProvider(SandboxProvider):
             raise self._sandbox_error(exc) from exc
 
         try:
+            if sandbox.state in _FAILED_SANDBOX_STATES:
+                await self.delete_sandbox(sandbox.id)
+                return None
             if sandbox.state in (SandboxState.DESTROYING, SandboxState.DESTROYED, SandboxState.STOPPED):
                 return None
             await sandbox.wait_for_sandbox_start(timeout=0)

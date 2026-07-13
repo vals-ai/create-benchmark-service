@@ -116,6 +116,20 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 
 Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` config so one hosted service can use different sandbox providers per request. Eval-only retry uses `/ws/evaluate-response` with `{"task_id": "…", "eval_resume_state": {...}, "sandbox_provider": {...}, "dataset": "…"}`. The provider config is optional because many benchmarks resume without a sandbox; include it when the benchmark must create one for evaluation. It is request-only and must not be embedded in persisted `eval_resume_state`.
 
+#### Sandbox providers
+
+Callers resolve provider credentials before sending the request; the framework does not read or store the backing secret. Modal requests use:
+
+```json
+{"type": "modal", "MODAL_TOKEN_ID": "...", "MODAL_TOKEN_SECRET": "..."}
+```
+
+Modal compatibility notes:
+
+- `ImageSource` selects a registry image and `SnapshotSource` selects a Modal Image ID. `Resources.disk` is accepted for schema compatibility but Modal does not enforce the requested disk size.
+- Every Modal sandbox uses the VM runtime. Direct workloads run in the selected image; Docker-in-Docker workloads must provide Docker in the outer image and manage the daemon and Compose lifecycle inside the sandbox.
+- Sandboxes start with unrestricted outbound access. Calls that do not change egress run normally, but `modify_egress_rules(...)` fails closed because Modal cannot reliably change the policy of a running sandbox. `clear_egress_rules()` preserves the initial unrestricted policy.
+
 Benchmark services can send `eval_resume_state` updates to the tracker while evaluation is running. The tracker stores the latest value and sends it back on eval-only retry, so the benchmark service can continue evaluation without recreating the original agent sandbox.
 
 Eval-only retry flow:

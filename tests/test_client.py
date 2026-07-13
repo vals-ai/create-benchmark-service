@@ -112,6 +112,30 @@ async def test_retrieve_task_accepts_legacy_shape(
     assert result.resources.model_dump() == {"vcpu": 2, "memory": 4, "disk": 10}
 
 
+async def test_retrieve_task_tolerates_legacy_enable_docker_field(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    # Older benchmark services still send `enable_docker`; the field was removed
+    # (providers grant nested-Docker capability unconditionally) and must be
+    # ignored rather than rejected.
+    client, mock_http = benchmark_client
+    mock_http.get = AsyncMock(
+        return_value=_mock_response(
+            json_data={
+                "source": {"type": "image", "image": "docker:27-dind"},
+                "problem_path": "/tmp/problem_statement.txt",
+                "cwd": "/work",
+                "resources": {"vcpu": 2, "memory": 4, "disk": 10, "enable_docker": True},
+                "agent_timeout": None,
+            }
+        )
+    )
+
+    result = await client.retrieve_task("task-1")
+
+    assert result.resources.model_dump() == {"vcpu": 2, "memory": 4, "disk": 10}
+
+
 async def test_retrieve_task_serializes_snapshot_source_for_legacy_clients(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
@@ -270,6 +294,7 @@ async def test_resume_evaluation_with_eval_resume_state(
 ) -> None:
     client, _mock_http = benchmark_client
     state = {"artifact_prefix": "s3://bucket/run"}
+    sandbox_provider = DAYTONA_CONFIG
     messages = [
         json.dumps({"type": "eval_resume_state", "data": state}),
         json.dumps({"type": "result", "data": {"score": 1.0}}),
@@ -283,6 +308,7 @@ async def test_resume_evaluation_with_eval_resume_state(
             eval_resume_state=state,
             dataset="mydata",
             on_eval_resume_state=on_eval_resume_state,
+            sandbox_provider=sandbox_provider,
         )
 
     ws = mock_connect.__aenter__.return_value
@@ -290,10 +316,57 @@ async def test_resume_evaluation_with_eval_resume_state(
         "task_id": "task-1",
         "response": None,
         "eval_resume_state": state,
+        "sandbox_provider": {
+            "type": "daytona",
+            "DAYTONA_API_KEY": "key",
+            "DAYTONA_API_URL": "url",
+            "DAYTONA_TARGET": "target",
+        },
         "dataset": "mydata",
     }
     assert result == {"score": 1.0}
     on_eval_resume_state.assert_called_once_with(state)
+
+
+async def test_evaluate_response_includes_optional_provider_config(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    mock_http.post = AsyncMock(return_value=_mock_response(json_data={"score": 1.0}))
+
+    result = await client.evaluate_response(
+        "task-1",
+        "answer",
+        dataset="mydata",
+        sandbox_provider=ModalProviderConfig(MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret"),
+    )
+
+    assert result == {"score": 1.0}
+    mock_http.post.assert_called_once_with(
+        f"{BASE_URL}/evaluate-response/",
+        json={
+            "task_id": "task-1",
+            "response": "answer",
+            "sandbox_provider": {"type": "modal", "MODAL_TOKEN_ID": "id", "MODAL_TOKEN_SECRET": "secret"},
+            "dataset": "mydata",
+        },
+        timeout=10,
+    )
+
+
+async def test_evaluate_response_omits_unspecified_provider_config(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    mock_http.post = AsyncMock(return_value=_mock_response(json_data={"score": 1.0}))
+
+    await client.evaluate_response("task-1", "answer")
+
+    mock_http.post.assert_called_once_with(
+        f"{BASE_URL}/evaluate-response/",
+        json={"task_id": "task-1", "response": "answer"},
+        timeout=10,
+    )
 
 
 async def test_websocket_request_includes_provider_config() -> None:
@@ -336,7 +409,7 @@ def test_get_sandbox_provider_uses_each_provider_config() -> None:
     client = _make_client()
     daytona_provider = client.get_sandbox_provider(DAYTONA_CONFIG)
     same_daytona_provider = client.get_sandbox_provider(DAYTONA_CONFIG)
-    modal_provider = client.get_sandbox_provider(ModalProviderConfig())
+    modal_provider = client.get_sandbox_provider(ModalProviderConfig(MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret"))
 
     assert same_daytona_provider is daytona_provider
     assert modal_provider is not daytona_provider

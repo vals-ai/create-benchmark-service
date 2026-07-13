@@ -116,6 +116,22 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 
 Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` config so one hosted service can use different sandbox providers per request. Eval-only retry uses `/ws/evaluate-response` with `{"task_id": "…", "eval_resume_state": {...}, "sandbox_provider": {...}, "dataset": "…"}`. The provider config is optional because many benchmarks resume without a sandbox; include it when the benchmark must create one for evaluation. It is request-only and must not be embedded in persisted `eval_resume_state`.
 
+#### Sandbox providers
+
+`sandbox_provider` is selected per setup/evaluate-instance request and carries the provider credentials. The tracker resolves it from AWS Secrets Manager (`sandbox_provider_secret_name`); the secret's keys are the config fields:
+
+```json
+{"type": "daytona", "api_key": "...", "api_url": "...", "target": "..."}
+{"type": "modal", "MODAL_TOKEN_ID": "...", "MODAL_TOKEN_SECRET": "..."}
+```
+
+Provider compatibility notes:
+
+- Modal supports both `ImageSource` (registry pull) and `SnapshotSource` (a Modal filesystem snapshot created via `Sandbox.snapshot_filesystem()`, restored by image id).
+- Modal sandboxes do not expose a disk-size parameter; `Resources.disk` is accepted for schema compatibility but not enforced.
+- Nested Docker (Docker-in-Docker) capability is granted on every sandbox for both providers — Daytona supports it natively and the Modal adapter requests it unconditionally — so benchmarks never configure it. The benchmark service still owns the Docker-capable image, dockerd startup flags, compose workflow, and cleanup.
+- Transient Modal connection errors are retried up to three attempts, matching the Daytona adapter's provider-level retry shape. Non-transient command failures still surface as `SandboxCommandError` with the command exit code.
+
 Benchmark services can send `eval_resume_state` updates to the tracker while evaluation is running. The tracker stores the latest value and sends it back on eval-only retry, so the benchmark service can continue evaluation without recreating the original agent sandbox.
 
 Eval-only retry flow:
@@ -200,9 +216,9 @@ Pydantic models used across requests and responses:
 
 - **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `Resources`
 - **`SandboxSource`** — `ImageSource(type="image", image=...)` or `SnapshotSource(type="snapshot", snapshot=...)`
-- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; currently `DaytonaProviderConfig(type="daytona", api_key, api_url, target)` or `ModalProviderConfig(type="modal")` (adapter not implemented yet)
+- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; currently `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET)` or `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)`
 - **`Resources`** — `vcpu`, `memory`, `disk`
-- **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, required `sandbox_provider`, `dataset`
+- **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, optional `sandbox_provider` with Daytona header fallback, `dataset`
 - **`EvaluateResponseRequest`** — `task_id`, `response` or `eval_resume_state`, optional `sandbox_provider`, `dataset`
 - **`FinalScoreResult`** / **`FinalScoreResponse`** — `score` (float), `metadata`, `tasks_evaluated`
 - **`TaskFilter`** — `task_ids` list or `slice_str`; `parse_slice()` converts `"start:stop:step"` to a Python `slice`

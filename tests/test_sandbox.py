@@ -456,6 +456,25 @@ class CreateNotFoundDaytonaClient(CreateFailureDaytonaClient):
         raise DaytonaError("sandbox not found", status_code=404)
 
 
+class SysboxFaultDaytonaClient(DaytonaClient):
+    def __init__(self, sandbox: InnerSandbox) -> None:
+        super().__init__(sandbox)
+        self.create_attempts = 0
+
+    async def get(self, instance_id: str) -> InnerSandbox:
+        raise DaytonaNotFoundError("sandbox not found")
+
+    async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
+        self.create_attempts += 1
+        if self.create_attempts == 1:
+            raise DaytonaError(
+                "Failed to create sandbox: Sandbox failed to start: Error response from daemon: "
+                "failed to create task for container: failed to create shim task: OCI runtime create failed: "
+                "failed to register with sysbox-mgr: failed to invoke Register via grpc"
+            )
+        return self.sandbox
+
+
 class ReusableLookupConnectionDaytonaClient(DaytonaClient):
     def __init__(self, sandbox: InnerSandbox) -> None:
         super().__init__(sandbox)
@@ -934,6 +953,36 @@ async def test_daytona_provider_create_maps_daytona_errors() -> None:
 
     with pytest.raises(SandboxError, match="sandbox failed to start"):
         await _provider(daytona).create_sandbox(_request("sandbox-name"))
+
+
+async def test_daytona_provider_create_retries_runner_faults() -> None:
+    """Sysbox runner faults should be retried because rescheduling usually succeeds.
+
+    Test cases:
+    - A sysbox-mgr registration failure is retried and the second create attempt succeeds.
+    """
+    inner = InnerSandbox()
+    daytona = SysboxFaultDaytonaClient(inner)
+
+    sandbox = await _provider(daytona).create_sandbox(_request(inner.name))
+
+    assert sandbox.id == inner.id
+    assert daytona.create_attempts == 2
+
+
+async def test_daytona_provider_create_deletes_failed_sandbox_instead_of_reusing() -> None:
+    """Failed-state sandboxes should be removed so create retries get a fresh sandbox.
+
+    Test cases:
+    - An existing sandbox in SandboxState.ERROR is deleted and a new sandbox is created.
+    """
+    inner = ErrorStateSandbox()
+    daytona = DaytonaClient(inner)
+
+    await _provider(daytona).create_sandbox(_request(inner.name))
+
+    assert daytona.deleted is True
+    assert daytona.created is True
 
 
 async def test_daytona_provider_create_maps_not_found_errors() -> None:

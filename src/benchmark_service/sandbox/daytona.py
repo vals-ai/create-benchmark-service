@@ -73,6 +73,9 @@ _TRANSPORT_ERROR_MESSAGES = (
     "server disconnected",
 )
 _RETRYABLE_DAYTONA_CAUSES = (ClientConnectionError, ConnectionError, TimeoutError)
+# Runner-node faults (e.g. sysbox-mgr down on the node a sandbox was scheduled to) fail the
+# sandbox start but usually succeed once rescheduled, so treat them as retryable.
+_RUNNER_FAULT_MESSAGES = ("failed to register with sysbox-mgr",)
 _FIXED_PROVIDER_WAIT = wait_fixed(2)
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
 
@@ -221,7 +224,7 @@ def _has_retryable_cause(exc: BaseException) -> bool:
 def _is_transient_daytona_error(exc: DaytonaError | ClientResponseError) -> bool:
     if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS) or _has_retryable_cause(exc):
         return True
-    return _message_contains(exc, _TRANSPORT_ERROR_MESSAGES)
+    return _message_contains(exc, _TRANSPORT_ERROR_MESSAGES + _RUNNER_FAULT_MESSAGES)
 
 
 def _parse_retry_after_seconds(value: object) -> float | None:
@@ -572,6 +575,15 @@ class DaytonaSandboxProvider(SandboxProvider):
             return None
         except DaytonaError as exc:
             raise self._sandbox_error(exc) from exc
+
+        if sandbox.state in _FAILED_SANDBOX_STATES:
+            try:
+                await self._daytona.delete(sandbox)
+            except DaytonaNotFoundError:
+                pass
+            except DaytonaError as exc:
+                raise self._sandbox_error(exc) from exc
+            return None
 
         try:
             if sandbox.state in (SandboxState.DESTROYING, SandboxState.DESTROYED, SandboxState.STOPPED):

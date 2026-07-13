@@ -2,12 +2,13 @@
 
 import tomllib
 from pathlib import Path
+from typing import cast
 
 _ROOT = Path(__file__).parent.parent
 
 
-def _project(path: str) -> dict:
-    return tomllib.loads((_ROOT / path).read_text())["project"]
+def _project(path: str) -> dict[str, object]:
+    return cast(dict[str, object], tomllib.loads((_ROOT / path).read_text())["project"])
 
 
 def test_client_wheel_dependencies_match_root():

@@ -1,5 +1,7 @@
 """HTTP/WebSocket client for communicating with a benchmark service."""
 
+import asyncio
+
 from collections.abc import Callable
 from typing import Any
 
@@ -31,6 +33,8 @@ from benchmark_service.schemas import (
 from benchmark_service.v1_schemas import V1DatasetTasksResponse
 
 _stream_chunk_adapter: TypeAdapter[StreamChunk] = TypeAdapter(StreamChunk)
+_ABORT_TASK_ATTEMPTS = 3
+_ABORT_TASK_TIMEOUT_SECONDS = 10_800
 
 _retry_http = retry(
     retry=retry_if_exception_type(
@@ -149,7 +153,7 @@ class BenchmarkServiceClient:
             f"{self._ws_url}/ws/{path}",
             additional_headers=self._headers,
             open_timeout=60,
-            ping_timeout=None,
+            ping_timeout=60,
             max_size=10 * 1024 * 1024,  # 10MB
         ) as websocket:
             await websocket.send(request.model_dump_json())
@@ -295,8 +299,16 @@ class BenchmarkServiceClient:
             instance_id=instance_id,
             dataset=dataset,
         )
-        result = await self._websocket_request("abort-task", request)
-        return AbortTaskResponse.model_validate(result)
+        async with asyncio.timeout(_ABORT_TASK_TIMEOUT_SECONDS):
+            for attempt in range(_ABORT_TASK_ATTEMPTS):
+                try:
+                    result = await self._websocket_request("abort-task", request)
+                    return AbortTaskResponse.model_validate(result)
+                except (BenchmarkServiceError, OSError, websockets.WebSocketException):
+                    if attempt == _ABORT_TASK_ATTEMPTS - 1:
+                        raise
+                    await asyncio.sleep(2**attempt)
+        raise AssertionError("abort-task retry loop did not return")
 
     @_retry_http
     async def evaluate_response(

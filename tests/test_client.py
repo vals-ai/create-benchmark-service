@@ -1,11 +1,13 @@
 """Tests for BenchmarkServiceClient."""
 
+import asyncio
 import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import benchmark_service.client as client_module
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
@@ -527,10 +529,11 @@ async def test_abort_task_serializes_identity() -> None:
     mock_connect = _ws_mock([json.dumps({"type": "result", "data": {"status": "ok"}})])
     client = _make_client()
 
-    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect) as connect:
         result = await client.abort_task("task-1", "run-1", "inst-1", dataset="validation")
 
     assert result.status == "ok"
+    assert connect.call_args.kwargs["ping_timeout"] == 60
     ws = mock_connect.__aenter__.return_value
     assert json.loads(ws.send.call_args.args[0]) == {
         "task_id": "task-1",
@@ -538,6 +541,38 @@ async def test_abort_task_serializes_identity() -> None:
         "instance_id": "inst-1",
         "dataset": "validation",
     }
+
+
+async def test_abort_task_retries_a_lost_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _make_client()
+    request = AsyncMock(
+        side_effect=[
+            BenchmarkServiceError("response lost"),
+            {"status": "ok"},
+        ]
+    )
+    monkeypatch.setattr(client, "_websocket_request", request)
+    monkeypatch.setattr(client_module.asyncio, "sleep", AsyncMock())
+
+    result = await client.abort_task("task-1", "run-1", "inst-1")
+
+    assert result.status == "ok"
+    assert request.await_count == 2
+
+
+async def test_abort_task_has_an_overall_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _make_client()
+
+    async def hang(*_args: Any) -> dict[str, Any]:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    request = AsyncMock(side_effect=hang)
+    monkeypatch.setattr(client, "_websocket_request", request)
+    monkeypatch.setattr(client_module, "_ABORT_TASK_TIMEOUT_SECONDS", 0.01)
+
+    with pytest.raises(TimeoutError):
+        await client.abort_task("task-1", "run-1", "inst-1")
 
 
 @pytest.mark.parametrize(

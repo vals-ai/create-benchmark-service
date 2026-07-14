@@ -31,6 +31,7 @@ class ComposeSource(BaseModel):
 SandboxSource = Annotated[ImageSource | SnapshotSource | ComposeSource, Field(discriminator="type")]
 
 _ENV_VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_RESERVED_COMMAND_ENV_NAMES = frozenset({"LANG", "TERM"})
 
 
 def validate_command_env(env_vars: Mapping[str, str] | None) -> dict[str, str]:
@@ -38,6 +39,9 @@ def validate_command_env(env_vars: Mapping[str, str] | None) -> dict[str, str]:
     invalid_names = [name for name in env if _ENV_VAR_NAME.fullmatch(name) is None]
     if invalid_names:
         raise ValueError(f"Invalid environment variable names: {', '.join(invalid_names)}")
+    reserved_names = sorted(env.keys() & _RESERVED_COMMAND_ENV_NAMES)
+    if reserved_names:
+        raise ValueError(f"Reserved command environment variable names: {', '.join(reserved_names)}")
     return env
 
 

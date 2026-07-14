@@ -909,12 +909,22 @@ async def test_daytona_command_uses_native_process_environment() -> None:
     assert all(secret not in data for data in inner.process.pty_handle.inputs)
 
 
-async def test_daytona_command_rejects_invalid_environment_names_before_provider_call() -> None:
+@pytest.mark.parametrize(
+    ("env_vars", "message"),
+    [
+        ({"BAD-NAME": "secret"}, "Invalid environment variable names: BAD-NAME"),
+        ({"TERM": "xterm"}, "Reserved command environment variable names: TERM"),
+    ],
+)
+async def test_daytona_command_rejects_invalid_environment_before_provider_call(
+    env_vars: dict[str, str],
+    message: str,
+) -> None:
     inner = InnerSandbox()
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    with pytest.raises(ValueError, match="BAD-NAME"):
-        _ = [chunk async for chunk in sandbox.command("true", env_vars={"BAD-NAME": "secret"})]
+    with pytest.raises(ValueError, match=message):
+        _ = [chunk async for chunk in sandbox.command("true", env_vars=env_vars)]
 
     assert inner.process.pty_envs is None
 

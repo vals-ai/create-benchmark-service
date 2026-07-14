@@ -6,6 +6,7 @@ import logging
 import os
 import re
 import traceback
+from collections import Counter
 from collections.abc import AsyncGenerator
 from contextlib import aclosing, asynccontextmanager, suppress
 from typing import Any, cast
@@ -20,9 +21,10 @@ from websockets.exceptions import ConnectionClosed
 from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import LEGACY_TENANT_SENTINEL, get_auth_settings, get_tenant_config, load_allowlist
 from benchmark_service.base import BenchmarkService
-from benchmark_service.grading import evaluate_submission
+from benchmark_service.grading import SUBMISSION_ARTIFACT_SANDBOX_PATH, evaluate_submission
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.schemas import (
+    ArtifactGradingSubmission,
     EvalMode,
     EvaluateInstanceRequest,
     EvaluateResponseRequest,
@@ -34,10 +36,16 @@ from benchmark_service.schemas import (
     StreamChunk,
     StreamErrorChunk,
     TaskFilter,
+    TextGradingSubmission,
     VerifyTaskIdsResponse,
     VersionResponse,
 )
-from benchmark_service.sandbox import SandboxProvider, SandboxProviderConfig, sandbox_provider_config_from_mapping
+from benchmark_service.sandbox import (
+    ModalProviderConfig,
+    SandboxProvider,
+    SandboxProviderConfig,
+    sandbox_provider_config_from_mapping,
+)
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.trial import (
     sanitize_v1_dataset_tasks_response,
@@ -140,6 +148,8 @@ def _grading_provider_config() -> SandboxProviderConfig:
     provider_type = os.environ.get(GRADING_SANDBOX_PROVIDER_ENV) or "daytona"
     if provider_type == "daytona":
         return DaytonaProviderConfig.from_env()
+    if provider_type == "modal":
+        return ModalProviderConfig.from_env()
     return sandbox_provider_config_from_mapping({"type": provider_type})
 
 
@@ -150,6 +160,96 @@ def _grading_max_concurrency() -> int:
         # sandbox evaluation would hang forever with no error or log.
         raise ValueError("GRADING_MAX_CONCURRENCY must be >= 1")
     return limit
+
+
+def _grading_nonnegative_int(name: str, default: int) -> int:
+    value = int(os.environ.get(name) or default)
+    if value < 0:
+        raise ValueError(f"{name} must be >= 0")
+    return value
+
+
+def _grading_positive_float(name: str, default: float) -> float:
+    value = float(os.environ.get(name) or default)
+    if value <= 0:
+        raise ValueError(f"{name} must be > 0")
+    return value
+
+
+class _DuplicateGradingRequest(Exception):
+    pass
+
+
+class _GradingCapacityExceeded(Exception):
+    pass
+
+
+class _GradingAdmission:
+    """Bound active and queued sandbox grades for one service process."""
+
+    def __init__(
+        self,
+        *,
+        max_concurrency: int,
+        max_queued: int,
+        max_admitted_per_tenant: int,
+        queue_timeout_s: float,
+    ) -> None:
+        if max_admitted_per_tenant < 1:
+            raise ValueError("GRADING_MAX_ADMITTED_PER_TENANT must be >= 1")
+        self._active = asyncio.Semaphore(max_concurrency)
+        self._max_admitted = max_concurrency + max_queued
+        self._max_admitted_per_tenant = max_admitted_per_tenant
+        self._queue_timeout_s = queue_timeout_s
+        self._admitted: set[tuple[str, str, str]] = set()
+        self._admitted_by_tenant: Counter[str] = Counter()
+
+    @classmethod
+    def from_env(cls) -> "_GradingAdmission":
+        max_concurrency = _grading_max_concurrency()
+        return cls(
+            max_concurrency=max_concurrency,
+            max_queued=_grading_nonnegative_int("GRADING_MAX_QUEUED", max_concurrency),
+            max_admitted_per_tenant=_grading_nonnegative_int(
+                "GRADING_MAX_ADMITTED_PER_TENANT", max_concurrency
+            ),
+            queue_timeout_s=_grading_positive_float("GRADING_QUEUE_TIMEOUT_S", 30.0),
+        )
+
+    @asynccontextmanager
+    async def acquire(self, key: tuple[str, str, str]) -> AsyncGenerator[None, None]:
+        tenant, run_id, task_id = key
+        if key in self._admitted:
+            raise _DuplicateGradingRequest(
+                f"an evaluation for run {run_id} task {task_id} is already in progress"
+            )
+        if (
+            len(self._admitted) >= self._max_admitted
+            or self._admitted_by_tenant[tenant] >= self._max_admitted_per_tenant
+        ):
+            raise _GradingCapacityExceeded(
+                "The benchmark service is at grading capacity; retry this evaluation later."
+            )
+
+        self._admitted.add(key)
+        self._admitted_by_tenant[tenant] += 1
+        acquired = False
+        try:
+            try:
+                await asyncio.wait_for(self._active.acquire(), self._queue_timeout_s)
+            except TimeoutError as exc:
+                raise _GradingCapacityExceeded(
+                    "The benchmark service could not start grading in time; retry this evaluation later."
+                ) from exc
+            acquired = True
+            yield
+        finally:
+            if acquired:
+                self._active.release()
+            self._admitted.discard(key)
+            self._admitted_by_tenant[tenant] -= 1
+            if self._admitted_by_tenant[tenant] == 0:
+                del self._admitted_by_tenant[tenant]
 
 
 def _get_service_metadata(service_cls: type[BenchmarkService]) -> tuple[str | None, str | None]:
@@ -204,12 +304,12 @@ class BenchmarkServiceApp(FastAPI):
                 )
             self.service = await service_cls.create()
             if self.service.eval_mode == EvalMode.SANDBOX:
-                # Sandbox grading needs both the grading-sandbox credentials and
-                # artifact storage; a deployment missing either must fail at
-                # boot, not per evaluation after provisioning a sandbox.
-                if not submission_artifacts.is_configured():
+                if (
+                    self.service.accepted_submission_schemas.get(V1PayloadType.ARTIFACT)
+                    and not submission_artifacts.is_configured()
+                ):
                     raise RuntimeError(
-                        "eval_mode == EvalMode.SANDBOX requires submission-artifact storage; set "
+                        "artifact sandbox grading requires submission-artifact storage; set "
                         f"{submission_artifacts.SUBMISSION_ARTIFACT_BUCKET_ENV} and "
                         f"{submission_artifacts.SUBMISSION_ARTIFACT_REGION_ENV}"
                     )
@@ -221,8 +321,7 @@ class BenchmarkServiceApp(FastAPI):
 
         super().__init__(title=service_cls.__name__, lifespan=lifespan)
         self._grading_provider: SandboxProvider | None = None
-        self._grading_semaphore = asyncio.Semaphore(_grading_max_concurrency())
-        self._grading_in_flight: set[tuple[str, str, str]] = set()
+        self._grading_admission = _GradingAdmission.from_env()
         service_name = os.getenv("SERVICE_NAME", service_cls.__name__)
         self.add_middleware(InflightMiddleware, service_name=service_name)
         self._register_routes()
@@ -451,78 +550,93 @@ class BenchmarkServiceApp(FastAPI):
     async def _v1_evaluate(self, request: Request, body: V1EvalRequest) -> V1EvalResponse:
         tenant = cast(str, request.state.tenant)
         _require_descope_tenant(tenant)
-        if body.payload.type not in (V1PayloadType.TEXT, V1PayloadType.ARTIFACT):
-            raise HTTPException(
-                status_code=400,
-                detail=f"payload.type={body.payload.type.value} not supported",
-            )
         if not await self.service.check_dataset_access(tenant, body.dataset):
             raise HTTPException(status_code=403, detail="Dataset not allowed")
 
-        artifact_key: str | None = None
-        if body.payload.type == V1PayloadType.ARTIFACT:
-            if self.service.eval_mode != EvalMode.SANDBOX:
-                raise HTTPException(
-                    status_code=400,
-                    detail="artifact payloads require a sandbox-grading benchmark (eval_mode == SANDBOX)",
-                )
-            if not body.payload.data:
-                raise HTTPException(
-                    status_code=400,
-                    detail="artifact payloads must carry the submission's object key in payload.data",
-                )
-            artifact_key = body.payload.data
-            try:
-                await submission_artifacts.stat(artifact_key, tenant=tenant)
-            except submission_artifacts.SubmissionArtifactNotFound as exc:
-                raise HTTPException(status_code=404, detail=str(exc)) from exc
-            except submission_artifacts.SubmissionArtifactTooLarge as exc:
-                raise HTTPException(status_code=413, detail=str(exc)) from exc
-
-        internal_req = EvaluateResponseRequest(
-            task_id=body.task_id,
-            response=body.payload.data,
-            dataset=body.dataset,
-        )
         if self.service.eval_mode == EvalMode.SANDBOX:
+            accepted_schemas = self.service.accepted_submission_schemas.get(body.payload.type)
+            if not accepted_schemas:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"This benchmark does not accept {body.payload.type.value} submissions.",
+                )
+            if body.payload.schema_id not in accepted_schemas:
+                choices = ", ".join(sorted(accepted_schemas))
+                raise HTTPException(
+                    status_code=400,
+                    detail=(
+                        f"This benchmark does not accept {body.payload.type.value} schema "
+                        f"{body.payload.schema_id}. Use one of: {choices}."
+                    ),
+                )
+
+            if body.payload.type == V1PayloadType.ARTIFACT:
+                if not body.payload.data:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Artifact submissions must include the uploaded object's key in payload.data.",
+                    )
+                submission = ArtifactGradingSubmission(
+                    task_id=body.task_id,
+                    schema_id=body.payload.schema_id,
+                    object_key=body.payload.data,
+                    sandbox_path=SUBMISSION_ARTIFACT_SANDBOX_PATH,
+                )
+                try:
+                    await submission_artifacts.stat(submission.object_key, tenant=tenant)
+                except submission_artifacts.SubmissionArtifactNotFound as exc:
+                    raise HTTPException(status_code=404, detail=str(exc)) from exc
+                except submission_artifacts.SubmissionArtifactTooLarge as exc:
+                    raise HTTPException(status_code=413, detail=str(exc)) from exc
+            else:
+                submission = TextGradingSubmission(
+                    task_id=body.task_id,
+                    schema_id=body.payload.schema_id,
+                    text=body.payload.data,
+                )
+
             provider = self._grading_provider
             if provider is None:
                 raise HTTPException(
                     status_code=503,
                     detail="Grading sandbox is not configured; contact the benchmark service owner.",
                 )
-            in_flight_key = (tenant, body.run_id, body.task_id)
-            if in_flight_key in self._grading_in_flight:
-                raise HTTPException(
-                    status_code=409,
-                    detail=f"an evaluation for run {body.run_id} task {body.task_id} is already in progress",
-                )
-            self._grading_in_flight.add(in_flight_key)
             try:
-                async with self._grading_semaphore:
+                async with self._grading_admission.acquire((tenant, body.run_id, body.task_id)):
                     response = await evaluate_submission(
                         service=self.service,
                         run_id=body.run_id,
                         tenant=tenant,
-                        request=internal_req,
+                        submission=submission,
                         provider=provider,
                         evaluator_version=self._service_version,
                         dataset=body.dataset,
-                        artifact_key=artifact_key,
                     )
-            finally:
-                self._grading_in_flight.discard(in_flight_key)
+            except _DuplicateGradingRequest as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+            except _GradingCapacityExceeded as exc:
+                raise HTTPException(status_code=429, detail=str(exc)) from exc
         else:
+            if body.payload.type == V1PayloadType.ARTIFACT:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Artifact submissions require a sandbox-grading benchmark.",
+                )
+            submission = TextGradingSubmission(
+                task_id=body.task_id,
+                schema_id=body.payload.schema_id,
+                text=body.payload.data,
+            )
             response = await evaluate_submission(
                 service=self.service,
                 run_id=body.run_id,
                 tenant=tenant,
-                request=internal_req,
+                submission=submission,
                 provider=None,
                 evaluator_version=self._service_version,
                 dataset=body.dataset,
             )
-        if _is_trial_tenant(request.state.tenant):
+        if _is_trial_tenant(tenant):
             return sanitize_v1_eval_response(response, self.service.project_trial_result)
         return response
 

@@ -1,14 +1,16 @@
 """Request and response models for the benchmark service API."""
 
 from enum import StrEnum
-from typing import Any, Literal, cast
+from typing import Annotated, Any, Literal, cast
 
-from pydantic import BaseModel, Field, computed_field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 from benchmark_service.sandbox import SandboxProviderConfig
-from benchmark_service.sandbox.types import Resources, SandboxSource, SnapshotSource
+from benchmark_service.sandbox.types import ImageSource, Resources, SandboxSource, SnapshotSource
 
 _COMPOSE_LEGACY_DOCKER_IMAGE = "compose+source-required"
+
+type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 
 
 class TaskFilter(BaseModel):
@@ -59,11 +61,40 @@ class EvalSandboxSpec(BaseModel):
     blocked unless the benchmark explicitly opens it.
     """
 
+    model_config = ConfigDict(extra="forbid")
+
     source: SandboxSource | None = Field(default=None, description="Grading sandbox image or snapshot")
-    resources: Resources | None = Field(default=None, description="Grading sandbox resources")
+    resources: Resources | None = Field(
+        default=None,
+        description="Grading sandbox resources; snapshot-backed sandboxes do not support overrides",
+    )
     timeout_s: float | None = Field(default=None, gt=0, description="Wall-clock bound for the grading step in seconds")
     network_block_all: bool = Field(default=True, description="Block all network egress from the grading sandbox")
-    env_vars: dict[str, str] = Field(default_factory=dict, description="Environment for the grading sandbox")
+
+
+class TextGradingSubmission(BaseModel):
+    """Inline text submitted for sandbox grading."""
+
+    type: Literal["text"] = "text"
+    task_id: str
+    schema_id: str
+    text: str
+
+
+class ArtifactGradingSubmission(BaseModel):
+    """Uploaded artifact submitted for sandbox grading."""
+
+    type: Literal["artifact"] = "artifact"
+    task_id: str
+    schema_id: str
+    object_key: str
+    sandbox_path: str
+
+
+GradingSubmission = Annotated[
+    TextGradingSubmission | ArtifactGradingSubmission,
+    Field(discriminator="type"),
+]
 
 
 class RetrieveTaskResponse(BaseModel):
@@ -199,7 +230,7 @@ class EvalMode(StrEnum):
 
     TEXT: the endpoint calls evaluate_response in-process.
     SANDBOX: the endpoint provisions a fresh grading sandbox, calls
-    prepare_grading_sandbox to inject the submitted artifact, then runs
+    prepare_grading_sandbox with a typed submission, then runs
     evaluate_instance. Clients never branch on this value — the server picks
     the grading path itself; /version reports it for visibility.
     """
@@ -229,7 +260,7 @@ class StreamResultChunk(BaseModel):
     """Streaming chunk for final results."""
 
     type: Literal["result"] = Field(description="Chunk type identifier")
-    data: dict[str, Any] = Field(description="Final result data (benchmark-specific structure)")
+    data: JsonValue = Field(description="Final JSON-compatible result data")
 
 
 class StreamErrorChunk(BaseModel):

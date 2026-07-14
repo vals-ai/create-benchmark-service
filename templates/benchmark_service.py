@@ -70,17 +70,23 @@ class ExampleBenchmark(BenchmarkService):
         yield StreamResultChunk(type="result", data={"status": "ok"})
 
     # Text benchmarks grade in-process (the default). To grade in a fresh,
-    # network-isolated sandbox instead: declare eval_mode = EvalMode.SANDBOX on the
-    # class (from benchmark_service import EvalMode), then implement
-    # prepare_grading_sandbox to inject the submitted artifact before
-    # evaluate_instance runs.
+    # network-isolated sandbox instead: add these imports, declare the mode and
+    # accepted payload schemas on the class, then implement the hook.
+    #
+    # from benchmark_service import ArtifactGradingSubmission, EvalMode, GradingSubmission
+    # from benchmark_service.v1_schemas import V1PayloadType
     #
     # eval_mode = EvalMode.SANDBOX
+    # accepted_submission_schemas = {
+    #     V1PayloadType.ARTIFACT: frozenset({"benchmark.artifact.v1"}),
+    # }
     #
     # async def prepare_grading_sandbox(
-    #     self, sandbox: Sandbox, request: EvaluateResponseRequest, dataset: str | None = None
+    #     self, sandbox: Sandbox, submission: GradingSubmission, dataset: str | None = None
     # ) -> None:
-    #     await sandbox.upload_file("/workspace/answer.txt", (request.response or "").encode())
+    #     if not isinstance(submission, ArtifactGradingSubmission):
+    #         raise ValueError("This benchmark requires an artifact submission")
+    #     await sandbox.exec(f"tar -xf {submission.sandbox_path} -C /workspace")
 
     async def evaluate_response(self, request: EvaluateResponseRequest, dataset: str | None = None) -> Any:
         """Evaluate a text response."""

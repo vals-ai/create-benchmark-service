@@ -558,9 +558,22 @@ class DaytonaSandboxProvider(SandboxProvider):
                 existing = await self._find_existing_sandbox(request.name)
                 if existing is not None:
                     return DaytonaSandbox(existing)
+            elif _is_transient_daytona_error(exc):
+                await self._delete_failed_sandbox(request.name)
             raise self._sandbox_error(exc) from exc
 
         return DaytonaSandbox(inner)
+
+    async def _delete_failed_sandbox(self, name: str) -> None:
+        try:
+            sandbox = await self._daytona.get(name)
+        except DaytonaNotFoundError:
+            return
+        except DaytonaError as exc:
+            raise self._sandbox_error(exc) from exc
+
+        if sandbox.state in _FAILED_SANDBOX_STATES:
+            await self.delete_sandbox(sandbox.id)
 
     async def _find_existing_sandbox(self, name: str) -> AsyncSandbox | None:
         try:

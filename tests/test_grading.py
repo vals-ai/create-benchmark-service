@@ -1,33 +1,56 @@
+# pyright: reportPrivateUsage=false
+
 """Tests for sandbox-graded /v1/evaluate (eval_mode == SANDBOX)."""
 
 import asyncio
 import json
 import re
 from collections.abc import AsyncGenerator, Generator
-from typing import Any, cast
+from typing import Any
 from unittest.mock import patch
 
 import pytest
 from fastapi.testclient import TestClient
+from pydantic import ValidationError
 
-from benchmark_service import ImageSource, Resources, Sandbox
+from benchmark_service import (
+    ComposeSandbox,
+    ComposeSource,
+    ImageSource,
+    ModalProviderConfig,
+    Resources,
+    Sandbox,
+    SnapshotSource,
+)
 from benchmark_service import auth as auth_module
 from benchmark_service import grading
-from benchmark_service.app import BenchmarkServiceApp
+from benchmark_service.app import (
+    BenchmarkServiceApp,
+    _DuplicateGradingRequest,
+    _GradingAdmission,
+    _GradingCapacityExceeded,
+    _grading_provider_config,
+)
 from benchmark_service.auth import clear_allowlist_cache, clear_auth_cache
-from benchmark_service.grading import SUBMISSION_ARTIFACT_SANDBOX_PATH, evaluate_submission
+from benchmark_service.grading import (
+    SUBMISSION_ARTIFACT_SANDBOX_PATH,
+    collapse_stream,
+    evaluate_submission,
+)
 from benchmark_service.sandbox import MissingSandboxConfigError, SandboxCreateRequest, SandboxProvider
 from benchmark_service.sandbox.types import ExecResult
 from benchmark_service.schemas import (
+    ArtifactGradingSubmission,
     EvalMode,
     EvalSandboxSpec,
-    EvaluateResponseRequest,
+    GradingSubmission,
     StreamChunk,
     StreamErrorChunk,
     StreamResultChunk,
+    TextGradingSubmission,
 )
 from benchmark_service.submission_artifacts import SubmissionArtifactNotFound
-from benchmark_service.v1_schemas import V1EvalStatus
+from benchmark_service.v1_schemas import V1EvalStatus, V1PayloadType
 from tests.conftest import StubBenchmark
 
 
@@ -88,6 +111,16 @@ class FakeProvider(SandboxProvider):
         yield
 
 
+class SignalingProvider(FakeProvider):
+    def __init__(self, sandbox: FakeSandbox) -> None:
+        super().__init__(sandbox)
+        self.deleted_event = asyncio.Event()
+
+    async def delete_sandbox(self, instance_id: str) -> None:
+        await super().delete_sandbox(instance_id)
+        self.deleted_event.set()
+
+
 class FakeProviderConfig:
     """Duck-typed stand-in for SandboxProviderConfig: only create_provider is used."""
 
@@ -102,11 +135,18 @@ class SandboxStub(StubBenchmark):
     """A SANDBOX-mode benchmark: inject the answer, then grade by reading it back."""
 
     eval_mode = EvalMode.SANDBOX
+    accepted_submission_schemas = {
+        V1PayloadType.TEXT: frozenset({"stub.text.v1"}),
+    }
 
     async def prepare_grading_sandbox(
-        self, sandbox: Sandbox, request: EvaluateResponseRequest, dataset: str | None = None
+        self,
+        sandbox: Sandbox,
+        submission: GradingSubmission,
+        dataset: str | None = None,
     ) -> None:
-        await sandbox.upload_file("/workspace/answer.txt", (request.response or "").encode())
+        assert isinstance(submission, TextGradingSubmission)
+        await sandbox.upload_file("/workspace/answer.txt", submission.text.encode())
 
     async def evaluate_instance(  # type: ignore[override]
         self, task_id: str, sandbox: Sandbox, dataset: str | None = None
@@ -120,19 +160,19 @@ class SandboxStub(StubBenchmark):
         )
 
 
-async def test_prepare_grading_sandbox_injects_artifact_into_sandbox() -> None:
+async def test_prepare_grading_sandbox_receives_typed_text_submission() -> None:
     service = await SandboxStub.create()
     sandbox = FakeSandbox()
-    req = EvaluateResponseRequest(task_id="task-1", response="2", dataset="default")
-    await service.prepare_grading_sandbox(sandbox, req, dataset="default")
+    submission = TextGradingSubmission(task_id="task-1", schema_id="stub.text.v1", text="2")
+    await service.prepare_grading_sandbox(sandbox, submission, dataset="default")
     assert sandbox.files["/workspace/answer.txt"] == b"2"
 
 
 async def test_prepare_grading_sandbox_default_raises_not_implemented() -> None:
     service = await StubBenchmark.create()
-    req = EvaluateResponseRequest(task_id="task-1", response="2", dataset="default")
+    submission = TextGradingSubmission(task_id="task-1", schema_id="stub.text.v1", text="2")
     with pytest.raises(NotImplementedError, match="prepare_grading_sandbox"):
-        await service.prepare_grading_sandbox(FakeSandbox(), req, dataset="default")
+        await service.prepare_grading_sandbox(FakeSandbox(), submission, dataset="default")
 
 
 class ErrorChunkStub(SandboxStub):
@@ -154,7 +194,7 @@ class SlowStub(SandboxStub):
     async def evaluate_instance(  # type: ignore[override]
         self, task_id: str, sandbox: Sandbox, dataset: str | None = None
     ) -> AsyncGenerator[StreamChunk, None]:
-        await asyncio.sleep(10)
+        await asyncio.sleep(0.1)
         yield StreamResultChunk(type="result", data={"resolved": True})
 
 
@@ -166,8 +206,8 @@ class NoResultStub(SandboxStub):
         yield  # pragma: no cover
 
 
-def _req() -> EvaluateResponseRequest:
-    return EvaluateResponseRequest(task_id="task-1", response="2", dataset="default")
+def _submission() -> TextGradingSubmission:
+    return TextGradingSubmission(task_id="task-1", schema_id="stub.text.v1", text="2")
 
 
 async def _grade(service: StubBenchmark, provider: FakeProvider, **overrides: Any) -> Any:
@@ -175,7 +215,7 @@ async def _grade(service: StubBenchmark, provider: FakeProvider, **overrides: An
         "service": service,
         "run_id": "run-1",
         "tenant": "acme",
-        "request": _req(),
+        "submission": _submission(),
         "provider": provider,
         "evaluator_version": "stub-1.0",
         "dataset": "default",
@@ -227,10 +267,14 @@ class SpecStub(SandboxStub):
                     source=ImageSource(image="grader:1.0"),
                     resources=Resources(vcpu=8, memory=16, disk=50),
                     network_block_all=False,
-                    env_vars={"GRADER_MODE": "strict"},
                 )
             }
         )
+
+
+def test_eval_sandbox_spec_rejects_secret_bearing_environment_values() -> None:
+    with pytest.raises(ValidationError, match="env_vars"):
+        EvalSandboxSpec.model_validate({"env_vars": {"GRADER_API_KEY": "secret"}})
 
 
 async def test_grade_instance_applies_benchmark_declared_eval_sandbox_spec() -> None:
@@ -241,16 +285,97 @@ async def test_grade_instance_applies_benchmark_declared_eval_sandbox_spec() -> 
     assert create.source == ImageSource(image="grader:1.0")
     assert create.resources == Resources(vcpu=8, memory=16, disk=50)
     assert create.network_block_all is False
-    assert create.env_vars == {"GRADER_MODE": "strict"}
+    assert create.env_vars == {}
+
+
+class ComposeSpecStub(SandboxStub):
+    saw_compose_sandbox = False
+
+    async def retrieve_task(
+        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+    ) -> Any:
+        task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
+        return task.model_copy(
+            update={
+                "eval_sandbox": EvalSandboxSpec(
+                    source=ComposeSource(
+                        outer=ImageSource(image="docker:28-dind"),
+                        service="grader",
+                    )
+                )
+            }
+        )
+
+    async def prepare_grading_sandbox(
+        self,
+        sandbox: Sandbox,
+        submission: GradingSubmission,
+        dataset: str | None = None,
+    ) -> None:
+        assert isinstance(sandbox, ComposeSandbox)
+        self.saw_compose_sandbox = True
+
+    async def evaluate_instance(  # type: ignore[override]
+        self, task_id: str, sandbox: Sandbox, dataset: str | None = None
+    ) -> AsyncGenerator[StreamChunk, None]:
+        assert isinstance(sandbox, ComposeSandbox)
+        yield StreamResultChunk(type="result", data={"resolved": True})
+
+
+async def test_grade_instance_unwraps_and_rewraps_compose_source() -> None:
+    service = await ComposeSpecStub.create()
+    provider = FakeProvider(FakeSandbox())
+
+    resp = await _grade(service, provider)
+
+    assert resp.status == V1EvalStatus.EVALUATED
+    assert service.saw_compose_sandbox is True
+    assert provider.created[0].source == ImageSource(image="docker:28-dind")
+
+
+class SnapshotResourceSpecStub(SandboxStub):
+    async def retrieve_task(
+        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+    ) -> Any:
+        task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
+        return task.model_copy(
+            update={
+                "eval_sandbox": EvalSandboxSpec(
+                    source=SnapshotSource(snapshot="grader-snapshot"),
+                    resources=Resources(vcpu=8, memory=16, disk=50),
+                )
+            }
+        )
+
+
+async def test_grade_instance_rejects_snapshot_resource_override_before_create() -> None:
+    service = await SnapshotResourceSpecStub.create()
+    provider = FakeProvider(FakeSandbox())
+
+    resp = await _grade(service, provider)
+
+    assert resp.status == V1EvalStatus.ERROR
+    assert "cannot override a snapshot-backed sandbox" in resp.errors[0]
+    assert provider.created == []
 
 
 class ArtifactSandboxStub(SandboxStub):
     """Grades from the artifact the framework materialized in the sandbox."""
 
+    accepted_submission_schemas = {
+        V1PayloadType.ARTIFACT: frozenset({"stub.artifact.v1"}),
+    }
+
     async def prepare_grading_sandbox(
-        self, sandbox: Sandbox, request: EvaluateResponseRequest, dataset: str | None = None
+        self,
+        sandbox: Sandbox,
+        submission: GradingSubmission,
+        dataset: str | None = None,
     ) -> None:
-        tarball = await sandbox.download_file(SUBMISSION_ARTIFACT_SANDBOX_PATH)
+        assert isinstance(submission, ArtifactGradingSubmission)
+        assert submission.schema_id == "stub.artifact.v1"
+        assert submission.object_key.startswith("submission-artifacts/acme/")
+        tarball = await sandbox.download_file(submission.sandbox_path)
         await sandbox.upload_file("/workspace/answer.txt", tarball)
 
 
@@ -267,7 +392,12 @@ async def test_grade_instance_materializes_artifact_before_the_hook(monkeypatch:
     resp = await _grade(
         service,
         provider,
-        artifact_key="submission-artifacts/acme/default/run-1/task-1/answer.bin",
+        submission=ArtifactGradingSubmission(
+            task_id="task-1",
+            schema_id="stub.artifact.v1",
+            object_key="submission-artifacts/acme/default/run-1/task-1/answer.bin",
+            sandbox_path=SUBMISSION_ARTIFACT_SANDBOX_PATH,
+        ),
     )
     assert resp.status == V1EvalStatus.EVALUATED
     assert sandbox.files[SUBMISSION_ARTIFACT_SANDBOX_PATH] == b"2"
@@ -280,7 +410,16 @@ async def test_grade_instance_maps_missing_artifact_to_error(monkeypatch: pytest
     monkeypatch.setattr(grading.submission_artifacts, "download", missing_download)
     service = await ArtifactSandboxStub.create()
     provider = FakeProvider(FakeSandbox())
-    resp = await _grade(service, provider, artifact_key="submission-artifacts/acme/default/run-1/task-1/a.bin")
+    resp = await _grade(
+        service,
+        provider,
+        submission=ArtifactGradingSubmission(
+            task_id="task-1",
+            schema_id="stub.artifact.v1",
+            object_key="submission-artifacts/acme/default/run-1/task-1/a.bin",
+            sandbox_path=SUBMISSION_ARTIFACT_SANDBOX_PATH,
+        ),
+    )
     assert resp.status == V1EvalStatus.ERROR
     assert any("no artifact was uploaded" in e for e in resp.errors)
     assert provider.deleted == ["fake-sandbox"]
@@ -312,20 +451,172 @@ class SlowSpecStub(SlowStub):
         return task.model_copy(update={"eval_sandbox": EvalSandboxSpec(timeout_s=0.05)})
 
 
-async def test_grade_instance_times_out_on_the_tasks_eval_timeout_and_still_deletes_sandbox(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The deadline derives from the task's eval-sandbox spec — the timeout the
-    author declared, not a fixed server default — and the auto-stop backstop
-    derives from the same value."""
-    monkeypatch.setattr(grading, "_PROVISIONING_ALLOWANCE_S", 0.0)
+async def test_grade_instance_starts_a_fresh_task_timeout_after_preparation() -> None:
     service = await SlowSpecStub.create()
     provider = FakeProvider(FakeSandbox())
     resp = await _grade(service, provider)
     assert resp.status == V1EvalStatus.ERROR
     assert any("0.05" in e and "grade timeout" in e for e in resp.errors)
     assert provider.deleted == ["fake-sandbox"]
-    assert provider.created[0].auto_stop_interval == 11  # ceil(0.05/60) + 10
+    assert provider.created[0].auto_stop_interval == 21
+
+
+class BlockingCleanupStub(SandboxStub):
+    cleanup_started: asyncio.Event
+    cleanup_finished: asyncio.Event
+    release_cleanup: asyncio.Event
+
+    async def retrieve_task(
+        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+    ) -> Any:
+        task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
+        return task.model_copy(update={"eval_sandbox": EvalSandboxSpec(timeout_s=0.01)})
+
+    async def block_cleanup(self) -> None:
+        self.cleanup_started.set()
+        try:
+            await self.release_cleanup.wait()
+        finally:
+            self.cleanup_finished.set()
+
+
+class StuckEvaluationStub(BlockingCleanupStub):
+    async def evaluate_instance(  # type: ignore[override]
+        self, task_id: str, sandbox: Sandbox, dataset: str | None = None
+    ) -> AsyncGenerator[StreamChunk, None]:
+        try:
+            await asyncio.Event().wait()
+            yield StreamResultChunk(type="result", data={"resolved": True})
+        finally:
+            await self.block_cleanup()
+
+
+class StuckFinalizerStub(BlockingCleanupStub):
+    async def evaluate_instance(  # type: ignore[override]
+        self, task_id: str, sandbox: Sandbox, dataset: str | None = None
+    ) -> AsyncGenerator[StreamChunk, None]:
+        try:
+            yield StreamResultChunk(type="result", data={"resolved": True})
+        finally:
+            await self.block_cleanup()
+
+
+def _initialize_cleanup_events(service: BlockingCleanupStub) -> None:
+    service.cleanup_started = asyncio.Event()
+    service.cleanup_finished = asyncio.Event()
+    service.release_cleanup = asyncio.Event()
+
+
+async def _release_cleanup(service: BlockingCleanupStub) -> None:
+    service.release_cleanup.set()
+    finished = asyncio.create_task(service.cleanup_finished.wait())
+    done, _ = await asyncio.wait({finished}, timeout=1)
+    if finished not in done:
+        finished.cancel()
+
+
+async def _event_set(event: asyncio.Event, timeout: float = 0.2) -> bool:
+    if event.is_set():
+        return True
+    waiter = asyncio.create_task(event.wait())
+    done, _ = await asyncio.wait({waiter}, timeout=timeout)
+    if waiter not in done:
+        waiter.cancel()
+        return False
+    return True
+
+
+async def test_grade_timeout_does_not_wait_for_slow_evaluator_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(grading, "_STREAM_CLOSE_TIMEOUT_S", 0.01)
+    service = await StuckEvaluationStub.create()
+    _initialize_cleanup_events(service)
+    provider = FakeProvider(FakeSandbox())
+    grade_task = asyncio.create_task(_grade(service, provider))
+
+    try:
+        done, _ = await asyncio.wait({grade_task}, timeout=0.2)
+        assert grade_task in done
+        response = grade_task.result()
+        assert response.status == V1EvalStatus.ERROR
+        assert response.errors == ["grading exceeded the 0.01s grade timeout"]
+        assert provider.deleted == ["fake-sandbox"]
+        assert service.cleanup_started.is_set()
+        assert await _event_set(service.cleanup_finished)
+    finally:
+        await _release_cleanup(service)
+
+
+async def test_terminal_result_survives_slow_finalizer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(grading, "_STREAM_CLOSE_TIMEOUT_S", 0.01)
+    service = await StuckFinalizerStub.create()
+    _initialize_cleanup_events(service)
+    provider = FakeProvider(FakeSandbox())
+    grade_task = asyncio.create_task(_grade(service, provider))
+
+    try:
+        done, _ = await asyncio.wait({grade_task}, timeout=0.2)
+        assert grade_task in done
+        response = grade_task.result()
+        assert response.status == V1EvalStatus.EVALUATED
+        assert response.result == {"resolved": True}
+        assert provider.deleted == ["fake-sandbox"]
+        assert service.cleanup_started.is_set()
+        assert await _event_set(service.cleanup_finished)
+    finally:
+        await _release_cleanup(service)
+
+
+async def test_request_cancellation_does_not_interrupt_sandbox_deletion() -> None:
+    service = await StuckFinalizerStub.create()
+    _initialize_cleanup_events(service)
+    provider = SignalingProvider(FakeSandbox())
+    grade_task = asyncio.create_task(_grade(service, provider))
+    cleanup_started = asyncio.create_task(service.cleanup_started.wait())
+
+    try:
+        done, _ = await asyncio.wait({cleanup_started}, timeout=0.2)
+        assert cleanup_started in done
+        grade_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await grade_task
+
+        service.release_cleanup.set()
+        deleted, _ = await asyncio.wait(
+            {asyncio.create_task(provider.deleted_event.wait())},
+            timeout=0.2,
+        )
+        assert deleted
+        assert provider.deleted == ["fake-sandbox"]
+    finally:
+        service.release_cleanup.set()
+        if not grade_task.done():
+            grade_task.cancel()
+
+
+class SlowRetrieveStub(SandboxStub):
+    async def retrieve_task(
+        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+    ) -> Any:
+        await asyncio.sleep(0.1)
+        return await super().retrieve_task(task_id, skip_validation, dataset=dataset)
+
+
+async def test_grade_instance_bounds_task_retrieval_as_preparation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(grading, "_PREPARATION_TIMEOUT_S", 0.05)
+    service = await SlowRetrieveStub.create()
+    provider = FakeProvider(FakeSandbox())
+
+    resp = await _grade(service, provider)
+
+    assert resp.status == V1EvalStatus.ERROR
+    assert resp.errors == ["grading preparation exceeded 0.05s"]
+    assert provider.created == []
 
 
 async def test_grade_instance_uses_a_unique_sandbox_name_per_request() -> None:
@@ -352,13 +643,10 @@ class FastSpecStub(SandboxStub):
         return task.model_copy(update={"eval_sandbox": EvalSandboxSpec(timeout_s=0.2)})
 
 
-async def test_grade_completing_near_deadline_keeps_result_and_delete(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_grade_completing_near_deadline_keeps_result_and_delete() -> None:
     """Teardown runs outside the grading deadline: a grade that finishes just
     before the deadline must not lose its computed result — or its delete — to
     a teardown that outlives the deadline."""
-    monkeypatch.setattr(grading, "_PROVISIONING_ALLOWANCE_S", 0.0)
     service = await FastSpecStub.create()
     provider = SlowDeleteProvider(FakeSandbox())
     resp = await _grade(service, provider)
@@ -377,6 +665,67 @@ async def test_grade_instance_maps_missing_result_chunk_to_error() -> None:
     assert provider.deleted == ["fake-sandbox"]
 
 
+async def test_collapse_stream_preserves_terminal_result_when_cleanup_fails(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    async def stream() -> AsyncGenerator[StreamChunk, None]:
+        try:
+            yield StreamResultChunk(type="result", data={"score": 1})
+        finally:
+            raise RuntimeError("cleanup failed")
+
+    resp = await collapse_stream(
+        stream(),
+        run_id="run-1",
+        task_id="task-1",
+        evaluator_version="stub-1.0",
+    )
+
+    assert resp.status == V1EvalStatus.EVALUATED
+    assert resp.result == {"score": 1}
+    assert "cleanup failed" in caplog.text
+
+
+async def test_collapse_stream_bounds_slow_cleanup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(grading, "_COLLAPSE_CLOSE_TIMEOUT_S", 0.01)
+    cleanup_started = asyncio.Event()
+    cleanup_finished = asyncio.Event()
+    release_cleanup = asyncio.Event()
+
+    async def stream() -> AsyncGenerator[StreamChunk, None]:
+        try:
+            yield StreamResultChunk(type="result", data={"score": 1})
+        finally:
+            cleanup_started.set()
+            try:
+                await release_cleanup.wait()
+            finally:
+                cleanup_finished.set()
+
+    collapse_task = asyncio.create_task(
+        collapse_stream(
+            stream(),
+            run_id="run-1",
+            task_id="task-1",
+            evaluator_version="stub-1.0",
+        )
+    )
+    try:
+        done, _ = await asyncio.wait({collapse_task}, timeout=0.2)
+        assert collapse_task in done
+        response = collapse_task.result()
+        assert response.status == V1EvalStatus.EVALUATED
+        assert response.result == {"score": 1}
+        assert cleanup_started.is_set()
+        assert await _event_set(cleanup_finished)
+    finally:
+        release_cleanup.set()
+        finished = asyncio.create_task(cleanup_finished.wait())
+        await asyncio.wait({finished}, timeout=1)
+
+
 def test_sandbox_mode_without_hook_fails_at_class_definition() -> None:
     """A SANDBOX service without prepare_grading_sandbox is broken on every
     grading path; the subclass hook rejects it before it can be deployed."""
@@ -384,6 +733,21 @@ def test_sandbox_mode_without_hook_fails_at_class_definition() -> None:
 
         class _MissingHook(StubBenchmark):  # pyright: ignore[reportUnusedClass]
             eval_mode = EvalMode.SANDBOX
+
+
+def test_sandbox_mode_without_accepted_schemas_fails_at_class_definition() -> None:
+    with pytest.raises(TypeError, match="accepted_submission_schemas"):
+
+        class _MissingSchemas(StubBenchmark):  # pyright: ignore[reportUnusedClass]
+            eval_mode = EvalMode.SANDBOX
+
+            async def prepare_grading_sandbox(
+                self,
+                sandbox: Sandbox,
+                submission: GradingSubmission,
+                dataset: str | None = None,
+            ) -> None:
+                pass
 
 
 class FailingDeleteProvider(FakeProvider):
@@ -415,6 +779,35 @@ class _FakeDaytonaConfig:
     @classmethod
     def from_env(cls) -> "FakeProviderConfig":
         return FakeProviderConfig(cls.provider)
+
+
+def test_grading_provider_config_reads_modal_credentials_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GRADING_SANDBOX_PROVIDER", "modal")
+    monkeypatch.setenv("MODAL_TOKEN_ID", "modal-id")
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "modal-secret")
+
+    config = _grading_provider_config()
+
+    assert config == ModalProviderConfig(
+        MODAL_TOKEN_ID="modal-id",
+        MODAL_TOKEN_SECRET="modal-secret",
+    )
+
+
+def test_grading_provider_config_does_not_render_present_modal_secret(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("GRADING_SANDBOX_PROVIDER", "modal")
+    monkeypatch.delenv("MODAL_TOKEN_ID", raising=False)
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "must-not-appear")
+
+    with pytest.raises(MissingSandboxConfigError) as exc_info:
+        _grading_provider_config()
+
+    assert "MODAL_TOKEN_ID" in str(exc_info.value)
+    assert "must-not-appear" not in str(exc_info.value)
 
 
 def _sandbox_app(monkeypatch: pytest.MonkeyPatch, service_cls: type[StubBenchmark] = SandboxStub) -> BenchmarkServiceApp:
@@ -467,6 +860,28 @@ def test_v1_evaluate_dispatches_sandbox_mode_to_the_grading_engine(sandbox_desco
     assert body["evaluator_version"] == "stub-service-1.0"
 
 
+@pytest.mark.parametrize(
+    ("payload", "detail"),
+    [
+        ({"type": "text", "schema": "other.text.v1", "data": "2"}, "Use one of: stub.text.v1"),
+        (
+            {"type": "artifact", "schema": "stub.artifact.v1", "data": "untrusted-key"},
+            "does not accept artifact submissions",
+        ),
+    ],
+)
+def test_v1_evaluate_rejects_undeclared_submission_before_storage_or_sandbox(
+    sandbox_descope_client: TestClient,
+    payload: dict[str, str],
+    detail: str,
+) -> None:
+    resp = _post_eval(sandbox_descope_client, payload)
+
+    assert resp.status_code == 400
+    assert detail in resp.json()["detail"]
+    assert _FakeDaytonaConfig.provider.created == []
+
+
 def test_sandbox_mode_missing_server_sandbox_env_fails_at_boot(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -497,7 +912,7 @@ def test_sandbox_mode_missing_artifact_storage_fails_at_boot(
 ) -> None:
     """A SANDBOX deployment needs artifact storage for rehydration; fully-unset
     storage is legal for TEXT services but a boot error here."""
-    app = _sandbox_app(monkeypatch)
+    app = _sandbox_app(monkeypatch, ArtifactSandboxStub)
     monkeypatch.delenv("SUBMISSION_ARTIFACT_BUCKET", raising=False)
 
     with pytest.raises(RuntimeError, match="SUBMISSION_ARTIFACT_BUCKET"):
@@ -581,15 +996,43 @@ def test_v1_evaluate_artifact_payload_on_text_benchmark_returns_400(monkeypatch:
     assert "sandbox-grading" in resp.json()["detail"]
 
 
-def test_v1_evaluate_duplicate_in_flight_returns_409(sandbox_descope_client: TestClient) -> None:
-    app = cast(BenchmarkServiceApp, sandbox_descope_client.app)
-    app._grading_in_flight.add(("acme", "external-run-1", "task-1"))  # pyright: ignore[reportPrivateUsage]
-    try:
-        resp = _post_eval(sandbox_descope_client, {"type": "text", "schema": "stub.text.v1", "data": "2"})
-    finally:
-        app._grading_in_flight.discard(("acme", "external-run-1", "task-1"))  # pyright: ignore[reportPrivateUsage]
+async def test_grading_admission_rejects_duplicate_and_excess_work_while_held() -> None:
+    admission = _GradingAdmission(
+        max_concurrency=1,
+        max_queued=0,
+        max_admitted_per_tenant=1,
+        queue_timeout_s=0.01,
+    )
+    key = ("acme", "run-1", "task-1")
 
-    assert resp.status_code == 409
+    async with admission.acquire(key):
+        with pytest.raises(_DuplicateGradingRequest):
+            async with admission.acquire(key):
+                pass
+        with pytest.raises(_GradingCapacityExceeded):
+            async with admission.acquire(("other", "run-2", "task-2")):
+                pass
+
+
+async def test_grading_admission_bounds_each_tenant_and_queue_wait() -> None:
+    admission = _GradingAdmission(
+        max_concurrency=1,
+        max_queued=1,
+        max_admitted_per_tenant=1,
+        queue_timeout_s=0.01,
+    )
+    queued_key = ("other", "run-2", "task-2")
+
+    async with admission.acquire(("acme", "run-1", "task-1")):
+        with pytest.raises(_GradingCapacityExceeded):
+            async with admission.acquire(("acme", "run-2", "task-2")):
+                pass
+        with pytest.raises(_GradingCapacityExceeded):
+            async with admission.acquire(queued_key):
+                pass
+
+    async with admission.acquire(queued_key):
+        pass
 
 
 def test_ws_evaluate_response_stays_sandboxless_for_sandbox_benchmarks(monkeypatch: pytest.MonkeyPatch) -> None:

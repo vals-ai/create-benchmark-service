@@ -17,9 +17,11 @@ from benchmark_service.schemas import (
     EvalMode,
     EvaluateResponseRequest,
     FinalScoreResult,
+    GradingSubmission,
     RetrieveTaskResponse,
     StreamChunk,
 )
+from benchmark_service.v1_schemas import V1PayloadType
 
 from tests.test_dataset_versioning import _write_fixture  # pyright: ignore[reportPrivateUsage]
 
@@ -132,9 +134,15 @@ def test_version_endpoint_reports_tracked_dataset_version(tmp_path: Path) -> Non
 
 class _SandboxModeService(_FakeService):
     eval_mode = EvalMode.SANDBOX
+    accepted_submission_schemas = {
+        V1PayloadType.TEXT: frozenset({"fake.text.v1"}),
+    }
 
     async def prepare_grading_sandbox(
-        self, sandbox: Sandbox, request: EvaluateResponseRequest, dataset: str | None = None
+        self,
+        sandbox: Sandbox,
+        submission: GradingSubmission,
+        dataset: str | None = None,
     ) -> None:
         raise NotImplementedError
 
@@ -148,9 +156,6 @@ def test_version_reports_text_eval_mode_by_default() -> None:
 
 
 def test_version_reports_sandbox_eval_mode_when_overridden(monkeypatch: pytest.MonkeyPatch) -> None:
-    # SANDBOX mode requires grading + artifact config at boot.
-    monkeypatch.setenv("SUBMISSION_ARTIFACT_BUCKET", "vals-submission-artifacts")
-    monkeypatch.setenv("AWS_REGION", "us-east-1")
     monkeypatch.setenv("DAYTONA_API_KEY", "k")
     monkeypatch.setenv("DAYTONA_API_URL", "https://daytona.example")
     monkeypatch.setenv("DAYTONA_TARGET", "us")

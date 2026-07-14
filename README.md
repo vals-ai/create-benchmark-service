@@ -97,7 +97,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Returns `{"status": "ok"}` |
-| `GET` | `/version` | Returns `{"framework_version": "...", "service_name": "...", "service_version": "..."}` |
+| `GET` | `/version` | Returns framework, service, and dataset versions plus the benchmark's `eval_mode` |
 | `GET` | `/verify-task-ids` | Return task IDs filtered by `?task_ids=…` or `?slice=start:stop:step` (optional `?dataset=…`) |
 | `GET` | `/retrieve-task/?task_id=…` | Return task metadata for a given task ID (optional `?dataset=…`) |
 | `POST` | `/evaluate-response/` | Evaluate without a sandbox and return one final response |
@@ -156,13 +156,14 @@ Yield these from your generator methods; the framework serialises and forwards t
 
 ### v1 Eval API (lab-facing)
 
-`/v1/evaluate` and `/v1/score` are the lab-facing surface. They share scoring handlers with the internal `/evaluate-response/` and `/final-score/` endpoints — a benchmark implements `evaluate_response` and `calculate_final_score` once and inherits both surfaces.
+`/v1/evaluate` and `/v1/score` are the lab-facing surface. Text-mode evaluation reuses `evaluate_response`, while sandbox-mode evaluation runs `evaluate_instance`; scoring reuses `calculate_final_score` for both modes.
 
 ### Sandbox-based evaluation (`eval_mode = SANDBOX`)
 
 Benchmarks that must execute the submitted artifact to grade it (run a test
 suite, compile a proof) declare `eval_mode = EvalMode.SANDBOX` on the service
-class and implement `prepare_grading_sandbox(sandbox, request)`. On
+class, declare the exact payload schemas they accept, and implement
+`prepare_grading_sandbox(sandbox, submission)`. On
 `POST /v1/evaluate` the service then provisions a fresh, network-isolated
 sandbox, materializes the submission, runs `evaluate_instance`, and deletes
 the sandbox. Text benchmarks (`eval_mode == TEXT`, the default) are
@@ -173,22 +174,33 @@ Submissions arrive either inline (`payload.type == "text"`) or by reference
 (`payload.type == "artifact"`, where `payload.data` is the object key returned
 by `/v1/submissions/upload-url`). For artifact submissions the endpoint
 verifies the key's existence, tenant namespace, and size before any sandbox is
-provisioned, then downloads the object and uploads it into the sandbox at
-`grading.SUBMISSION_ARTIFACT_SANDBOX_PATH`; `prepare_grading_sandbox` performs
-only the benchmark-specific move/unpack from there.
+provisioned, then downloads the object to `submission.sandbox_path` before
+calling the hook. The hook receives `TextGradingSubmission` or
+`ArtifactGradingSubmission`, including the payload schema and semantic
+`text`/`object_key` field, so it never has to infer the submission type.
 
-A `SANDBOX` deployment must set `DAYTONA_API_KEY`, `DAYTONA_API_URL`,
-`DAYTONA_TARGET` (**server-side** grading credentials — callers never supply
-them) plus `SUBMISSION_ARTIFACT_BUCKET` and `AWS_REGION`; missing config fails
-at startup, not on the first evaluation. The task's `eval_sandbox` spec on
-`RetrieveTaskResponse` can override the grading image, resources, timeout,
-network policy, and env; by default the sandbox uses the generation values with
-network egress blocked. The whole operation — sandbox create included — runs
-under one deadline derived from the task's `eval_sandbox.timeout_s` (or the
-1800s default) plus a provisioning allowance; sandbox teardown runs outside
-that deadline under its own bound. Concurrent evaluations are capped
-(`GRADING_MAX_CONCURRENCY`, default 4), and duplicate in-flight
-`(run_id, task_id)` requests are rejected with 409.
+Daytona is the default grading provider and reads `DAYTONA_API_KEY`,
+`DAYTONA_API_URL`, and `DAYTONA_TARGET`. Set
+`GRADING_SANDBOX_PROVIDER=modal` to use Modal with `MODAL_TOKEN_ID` and
+`MODAL_TOKEN_SECRET`. Artifact-capable benchmarks also require
+`SUBMISSION_ARTIFACT_BUCKET` and `AWS_REGION`; missing server configuration
+fails at startup. The task's `eval_sandbox` spec can override the grading
+source, image-backed resources, timeout, and network policy. Evaluator secrets
+must stay in private deployment configuration or benchmark-owned server code;
+they are never returned in `RetrieveTaskResponse` or persisted with a
+submission.
+
+Task retrieval, sandbox creation, submission materialization, and the setup
+hook share a 600-second preparation bound. `eval_sandbox.timeout_s` (1800
+seconds by default) starts fresh immediately before `evaluate_instance`, and
+sandbox teardown has its own bound. Benchmark-owned generator cleanup must not
+catch and suppress `asyncio.CancelledError`; Python cannot forcibly stop
+in-process code that ignores cancellation. Each service process caps active grades
+with `GRADING_MAX_CONCURRENCY` (default 4), queued grades with
+`GRADING_MAX_QUEUED` (default equal to concurrency), and admitted work per
+tenant with `GRADING_MAX_ADMITTED_PER_TENANT` (also default equal to
+concurrency). Queue waits longer than `GRADING_QUEUE_TIMEOUT_S` (default 30)
+return 429; duplicate `(tenant, run_id, task_id)` requests return 409.
 
 **`POST /v1/evaluate`** — grade one task. Request:
 
@@ -215,7 +227,7 @@ Response:
 }
 ```
 
-`status` is one of `evaluated`, `did_not_complete`, `generation_error`, `error`. `result` is the benchmark-specific JSON-compatible value your `evaluate_response` returns, passed through. `payload.type` is `"text"` for inline submissions; `"artifact"` (sandbox-grading benchmarks only) carries the uploaded submission's object key in `data`.
+`status` is one of `evaluated`, `did_not_complete`, `generation_error`, `error`. `result` is the benchmark-specific JSON-compatible value returned by `evaluate_response` in text mode or by the terminal result chunk from `evaluate_instance` in sandbox mode. `payload.type` is `"text"` for inline submissions; `"artifact"` (sandbox-grading benchmarks only) carries the uploaded submission's object key in `data`.
 
 **`POST /v1/score`** — aggregate across a run. Request `{run_id, dataset, evaluation_results: {task_id: {"status": "evaluated", "result": {...}} | {"status": "did_not_complete"} | null}}`. Before calling `calculate_final_score`, the framework converts every non-null item to the same eval-result envelope shape used by the runner and internal `/final-score/` path: `{"task_id": task_id, "status": status, "result": result}` plus `error` when the v1 item carries errors. Multiple v1 errors are collapsed into that single `error` string; callers should leave `errors` empty for successful `evaluated` items. `null` still represents a missing task and is passed through as `null`. Response `{run_id, tasks_evaluated, final_score, metadata}`.
 
@@ -242,14 +254,15 @@ Status codes: 403 if the tenant isn't allowed the dataset *or* if the caller use
 
 **Trial mode.** A tenant with `trial_mode: true` in its allowlist entry receives score-only responses on `/v1/evaluate` and `/v1/score`. Benchmarks enabling trial mode must implement `project_trial_result(result)` to return the audited per-task fields trial callers may see and resubmit to `/v1/score`; include any field `calculate_final_score` needs for aggregation. The framework still removes `evaluator_version` and error text from `/v1/evaluate` (the error *count* survives as generic `"error"` entries), and `/v1/score` `metadata` is emptied while `final_score` and `tasks_evaluated` remain. The sanitizer builds fresh response objects from allowlisted fields, so fields added later do not leak to trial callers by default. Unhandled server errors return a generic `{"detail": "Internal server error"}` 500 (no traceback) for every caller, not just trial tenants. Trial tenants may access only `/v1/evaluate`, `/v1/score`, and `GET /v1/datasets/{dataset}/tasks`; other `/v1/*`, internal `/evaluate-response/`, `/final-score/`, and `/ws/*` endpoints are denied (403). For trial tenants, the dataset task list is projected to `id`, `question`, and `timeout` even if the benchmark's normal `V1Task` includes extras.
 
-**Deferred to follow-on plans.** `GET /v1/schema`, `GET /v1/tasks/{task_id}` (single-task lookup), `/ws/v1/evaluate` (streamed judges), artifact payloads, async/`poll_url` response shape, idempotency on `(run_id, task_id)`.
+**Deferred to follow-on plans.** `GET /v1/schema`, `GET /v1/tasks/{task_id}` (single-task lookup), `/ws/v1/evaluate` (streamed judges), async/`poll_url` response shape, idempotency on `(run_id, task_id)`.
 
 ### Schemas (`schemas.py`)
 
 Pydantic models used across requests and responses:
 
-- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `Resources`
-- **`SandboxSource`** — `ImageSource(type="image", image=...)` or `SnapshotSource(type="snapshot", snapshot=...)`
+- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `resources`, optional non-secret `eval_sandbox`
+- **`SandboxSource`** — `ImageSource`, `SnapshotSource`, or `ComposeSource` with an outer image/snapshot
+- **`GradingSubmission`** — typed `TextGradingSubmission` or `ArtifactGradingSubmission` passed only to the sandbox-grading hook
 - **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; currently `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET)` or `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)`
 - **`Resources`** — `vcpu`, `memory`, `disk`
 - **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, optional `sandbox_provider` with Daytona header fallback, `dataset`

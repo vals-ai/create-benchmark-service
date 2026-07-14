@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import re
 import shlex
 from collections.abc import AsyncGenerator, Awaitable, Mapping
@@ -20,6 +21,7 @@ from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
     ExecResult,
     ImageSource,
+    MissingSandboxConfigError,
     Sandbox,
     SandboxCommandError,
     SandboxConnectionError,
@@ -56,6 +58,22 @@ class ModalProviderConfig(BaseModel):
     type: Literal["modal"] = "modal"
     MODAL_TOKEN_ID: str
     MODAL_TOKEN_SECRET: str
+
+    @classmethod
+    def from_env(cls) -> "ModalProviderConfig":
+        token_id = os.environ.get("MODAL_TOKEN_ID")
+        token_secret = os.environ.get("MODAL_TOKEN_SECRET")
+        missing = [
+            name
+            for name, value in (
+                ("MODAL_TOKEN_ID", token_id),
+                ("MODAL_TOKEN_SECRET", token_secret),
+            )
+            if not value
+        ]
+        if missing:
+            raise MissingSandboxConfigError(f"Missing required environment variables: {', '.join(missing)}")
+        return cls(MODAL_TOKEN_ID=token_id, MODAL_TOKEN_SECRET=token_secret)  # type: ignore[arg-type]
 
     def create_provider(self) -> SandboxProvider:
         return ModalSandboxProvider(self)
@@ -308,6 +326,7 @@ class ModalSandboxProvider(SandboxProvider):
         if existing is not None:
             return ModalSandbox(existing, name=request.name)
         image = self._resolve_image(request.source, client)
+        allow_all_egress = not request.network_block_all
         create_kwargs: dict[str, Any] = {
             "app": app,
             "name": modal_name,
@@ -318,9 +337,9 @@ class ModalSandboxProvider(SandboxProvider):
             "memory": request.resources.memory * 1024,
             "idle_timeout": request.auto_stop_interval * 60 if request.auto_stop_interval else None,
             "timeout": _MAX_LIFETIME_SECONDS,
-            "block_network": False,
-            "outbound_cidr_allowlist": list(_ALLOW_ALL_CIDRS),
-            "outbound_domain_allowlist": list(_ALLOW_ALL_DOMAINS),
+            "block_network": request.network_block_all,
+            "outbound_cidr_allowlist": list(_ALLOW_ALL_CIDRS) if allow_all_egress else None,
+            "outbound_domain_allowlist": list(_ALLOW_ALL_DOMAINS) if allow_all_egress else None,
             "client": client,
             # Nested Docker always on, matching Daytona; no disk parameter exists.
             "experimental_options": {"enable_docker": True},

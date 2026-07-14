@@ -21,6 +21,7 @@ from benchmark_service.auth import (
 from benchmark_service.dataset_versioning import DatasetVersionEntry, load_dataset_versions
 from benchmark_service.sandbox import Sandbox
 from benchmark_service.schemas import (
+    GradingSubmission,
     EvalMode,
     EvaluateResponseRequest,
     FinalScoreResult,
@@ -29,7 +30,7 @@ from benchmark_service.schemas import (
     StreamResultChunk,
     TaskFilter,
 )
-from benchmark_service.v1_schemas import V1Task
+from benchmark_service.v1_schemas import V1PayloadType, V1Task
 
 
 class BenchmarkService(ABC):
@@ -51,6 +52,7 @@ class BenchmarkService(ABC):
     # framework reads this at boot and per dispatch, so it is class state, not
     # a per-instance value.
     eval_mode: ClassVar[EvalMode] = EvalMode.TEXT
+    accepted_submission_schemas: ClassVar[dict[V1PayloadType, frozenset[str]]] = {}
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -60,6 +62,10 @@ class BenchmarkService(ABC):
         ):
             raise TypeError(
                 f"{cls.__name__} declares eval_mode = EvalMode.SANDBOX and must implement prepare_grading_sandbox"
+            )
+        if cls.eval_mode == EvalMode.SANDBOX and not cls.accepted_submission_schemas:
+            raise TypeError(
+                f"{cls.__name__} declares eval_mode = EvalMode.SANDBOX and must declare accepted_submission_schemas"
             )
 
     @classmethod
@@ -298,8 +304,8 @@ class BenchmarkService(ABC):
     ) -> AsyncGenerator[StreamChunk, None]:
         """Evaluate without a sandbox and stream the result.
 
-        evaluate_response may return any dict-encodable object (Pydantic
-        model, dataclass, dict); the chunk carries its JSON form.
+        evaluate_response may return any JSON-encodable object; the chunk
+        carries its JSON form.
         """
         result = await self.evaluate_response(request, dataset=dataset)
         yield StreamResultChunk(type="result", data=jsonable_encoder(result))
@@ -320,6 +326,9 @@ class BenchmarkService(ABC):
         4. Yield error messages: yield StreamErrorChunk(type="error", data="error message")
         5. Yield final result: yield StreamResultChunk(type="result", data=evaluation_result)
 
+        Generator cleanup must remain cancellation-cooperative. Finalizers must
+        not catch and suppress asyncio.CancelledError indefinitely.
+
         Args:
             task_id: The task identifier
             sandbox: Connected sandbox instance
@@ -331,20 +340,16 @@ class BenchmarkService(ABC):
         ...
 
     async def prepare_grading_sandbox(
-        self, sandbox: Sandbox, request: EvaluateResponseRequest, dataset: str | None = None
+        self,
+        sandbox: Sandbox,
+        submission: GradingSubmission,
+        dataset: str | None = None,
     ) -> None:
-        """Place the submission where evaluate_instance expects it, in a fresh grading sandbox.
+        """Place a typed submission where evaluate_instance expects it.
 
-        Called only on the decoupled sandbox-grading path (eval_mode ==
-        SANDBOX); request.response is always set there (text submissions carry
-        the text, artifact submissions the object key) and eval_resume_state
-        never reaches this hook. For artifact submissions the framework has
-        already downloaded the object and uploaded it into the sandbox at
-        grading.SUBMISSION_ARTIFACT_SANDBOX_PATH — implement only the
-        benchmark-specific move/unpack from there. For text submissions, write
-        request.response yourself, e.g.
-        await sandbox.upload_file("/workspace/proof.lean", request.response.encode()).
-        SANDBOX subclasses must override this; __init_subclass__ enforces it.
+        Artifact submissions have already been downloaded to
+        submission.sandbox_path. Evaluator secrets must come from private
+        deployment config or server-side benchmark code, never task metadata.
         """
         raise NotImplementedError(
             f"{type(self).__name__}.prepare_grading_sandbox must be implemented for eval_mode == EvalMode.SANDBOX"

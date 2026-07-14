@@ -229,6 +229,8 @@ Pydantic models used across requests and responses:
 
 Runs a shell command inside a sandbox and yields output in real time. Checks the exit code after the command finishes. Use it inside `setup_task` and `evaluate_instance` to run commands and forward output as `StreamMessageChunk`s.
 
+For process-scoped credentials, call `sandbox.command(..., env_vars={...})`. Providers pass these values through their native process environment channel; Compose forwards only variable names in its command line, so values are not shell-interpolated.
+
 ### Authentication
 
 The framework authenticates every HTTP request except `/health`, and every WebSocket route before sandbox provider config is used.

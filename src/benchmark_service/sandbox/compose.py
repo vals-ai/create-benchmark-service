@@ -2,9 +2,15 @@ from __future__ import annotations
 
 import shlex
 import uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 
-from benchmark_service.sandbox.types import ComposeSource, ExecResult, Sandbox, SandboxError
+from benchmark_service.sandbox.types import (
+    ComposeSource,
+    ExecResult,
+    Sandbox,
+    SandboxError,
+    validate_command_env,
+)
 
 _COMPOSE_EXEC_ENV_ARGS = r"$(env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/-e \1/p')"
 
@@ -62,8 +68,10 @@ class ComposeSandbox(Sandbox):
         *,
         cwd: str | None = None,
         timeout: float | None = None,
+        env_vars: Mapping[str, str] | None = None,
     ) -> AsyncGenerator[str, None]:
-        async for chunk in self._outer.command(self._exec_command(command, cwd), timeout=timeout):
+        env = validate_command_env(env_vars) if env_vars is not None else None
+        async for chunk in self._outer.command(self._exec_command(command, cwd), timeout=timeout, env_vars=env):
             yield chunk
 
     async def upload_file(self, remote_path: str, content: bytes) -> None:

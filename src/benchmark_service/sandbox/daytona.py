@@ -47,6 +47,7 @@ from benchmark_service.sandbox.types import (
     SandboxProvider,
     SandboxQuery,
     SnapshotSource,
+    validate_command_env,
 )
 
 _PTY_STATUS_CHECK_ATTEMPTS = 30
@@ -284,9 +285,11 @@ class DaytonaSandbox(Sandbox):
         *,
         cwd: str | None = None,
         timeout: float | None = None,
+        env_vars: Mapping[str, str] | None = None,
     ) -> AsyncGenerator[str, None]:
+        env = validate_command_env(env_vars)
         output: asyncio.Queue[str] = asyncio.Queue()
-        exec_task = asyncio.create_task(self._exec_pty(_command(command, cwd, timeout), output))
+        exec_task = asyncio.create_task(self._exec_pty(_command(command, cwd, timeout), output, env))
 
         try:
             while not exec_task.done():
@@ -345,7 +348,7 @@ class DaytonaSandbox(Sandbox):
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
 
-    async def _exec_pty(self, command: str, output: asyncio.Queue[str]) -> ExecResult:
+    async def _exec_pty(self, command: str, output: asyncio.Queue[str], env_vars: dict[str, str]) -> ExecResult:
         session_id = f"{self.id}:exec-{uuid.uuid4().hex}"
         status_path = f"{_STATUS_DIR}/{uuid.uuid4().hex}.status"
         stdout: list[str] = []
@@ -358,7 +361,7 @@ class DaytonaSandbox(Sandbox):
             output.put_nowait(text)
 
         try:
-            handle = await self._create_pty_session(session_id, on_data)
+            handle = await self._create_pty_session(session_id, on_data, env_vars)
             await handle.send_input("stty -echo\n")
             await handle.send_input(
                 f"mkdir -p {shlex.quote(_STATUS_DIR)}; {command}; echo $? > {shlex.quote(status_path)}; exit\n"
@@ -421,12 +424,13 @@ class DaytonaSandbox(Sandbox):
         self,
         session_id: str,
         on_data: Callable[[bytes], Awaitable[None]],
+        env_vars: dict[str, str],
     ) -> AsyncPtyHandle:
         try:
             return await self._sandbox.process.create_pty_session(
                 id=session_id,
                 on_data=on_data,
-                envs={"TERM": "dumb", "LANG": "C.UTF-8"},
+                envs={"TERM": "dumb", "LANG": "C.UTF-8", **env_vars},
             )
         except _SANDBOX_OPERATION_ERRORS as exc:
             await self._check_sandbox_alive()

@@ -82,6 +82,7 @@ class FakeInnerSandbox:
     ) -> None:
         self.object_id = object_id
         self.commands: list[tuple[str, ...]] = []
+        self.command_envs: list[dict[str, str | None] | None] = []
         self.terminated = False
         self._process = process or FakeProcess([], 0)
         self._exec_error = exec_error
@@ -94,10 +95,16 @@ class FakeInnerSandbox:
         self.poll = _aio(self._poll)
         self._experimental_set_outbound_network_policy = _aio(self._set_outbound_network_policy)
 
-    async def _exec(self, *args: str, text: bool = True) -> FakeProcess:
+    async def _exec(
+        self,
+        *args: str,
+        text: bool = True,
+        env: dict[str, str | None] | None = None,
+    ) -> FakeProcess:
         if self._exec_error is not None:
             raise self._exec_error
         self.commands.append(args)
+        self.command_envs.append(env)
         return self._process
 
     async def _terminate(self) -> None:
@@ -128,11 +135,16 @@ class FlakyExecSandbox(FakeInnerSandbox):
         super().__init__(process=FakeProcess(["ok"], 0))
         self.exec_attempts = 0
 
-    async def _exec(self, *args: str, text: bool = True) -> FakeProcess:
+    async def _exec(
+        self,
+        *args: str,
+        text: bool = True,
+        env: dict[str, str | None] | None = None,
+    ) -> FakeProcess:
         self.exec_attempts += 1
         if self.exec_attempts == 1:
             raise ModalConnectionError("modal exec temporarily unavailable")
-        return await super()._exec(*args, text=text)
+        return await super()._exec(*args, text=text, env=env)
 
 
 def _request(source: ImageSource | SnapshotSource | None = None) -> SandboxCreateRequest:
@@ -263,6 +275,28 @@ async def test_command_streams_output_and_raises_on_failure() -> None:
 
     assert chunks == ["line1\n", "line2\n"]
     assert exc.value.exit_code == 7
+
+
+async def test_command_uses_native_process_environment() -> None:
+    secret = "value with spaces; $(touch /tmp/leaked)"
+    inner = FakeInnerSandbox(process=FakeProcess(["ok"], 0))
+    sandbox = _sandbox(inner)
+
+    chunks = [chunk async for chunk in sandbox.command("run", env_vars={"AGENT_SECRET": secret})]
+
+    assert chunks == ["ok"]
+    assert inner.command_envs == [{"AGENT_SECRET": secret}]
+    assert all(secret not in part for command in inner.commands for part in command)
+
+
+async def test_command_rejects_invalid_environment_names_before_provider_call() -> None:
+    inner = FakeInnerSandbox()
+    sandbox = _sandbox(inner)
+
+    with pytest.raises(ValueError, match="BAD-NAME"):
+        _ = [chunk async for chunk in sandbox.command("run", env_vars={"BAD-NAME": "secret"})]
+
+    assert inner.commands == []
 
 
 async def test_command_maps_terminated_sandbox_to_not_found() -> None:

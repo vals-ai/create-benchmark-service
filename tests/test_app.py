@@ -1,7 +1,7 @@
 """Tests for FastAPI app endpoints."""
 
 import json
-from collections.abc import AsyncGenerator, Generator
+from collections.abc import AsyncGenerator, Generator, Mapping
 from typing import Any, cast
 from unittest.mock import patch
 
@@ -42,7 +42,12 @@ class ProviderSelectionSandbox(Sandbox):
         return ExecResult(exit_code=0, output="")
 
     def command(
-        self, command: str, *, cwd: str | None = None, timeout: float | None = None
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        timeout: float | None = None,
+        env_vars: Mapping[str, str] | None = None,
     ) -> AsyncGenerator[str, None]:
         if False:
             yield ""

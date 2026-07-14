@@ -390,7 +390,6 @@ class InnerSandbox:
         self.fs = Files()
         self.autostop_interval: int | None = None
         self.network_settings: list[dict[str, str | bool | None]] = []
-        self.network_events: list[str] = []
         self.refresh_count = 0
 
     async def set_autostop_interval(self, interval: int) -> None:
@@ -403,7 +402,6 @@ class InnerSandbox:
         network_allow_list: str | None = None,
         domain_allow_list: str | None = None,
     ) -> None:
-        self.network_events.append("update")
         self.network_settings.append(
             {
                 "network_block_all": network_block_all,
@@ -411,12 +409,6 @@ class InnerSandbox:
                 "domain_allow_list": domain_allow_list,
             }
         )
-
-    async def stop(self) -> None:
-        self.network_events.append("stop")
-
-    async def start(self) -> None:
-        self.network_events.append("start")
 
     async def wait_for_sandbox_start(self, timeout: int) -> None:
         assert timeout == 0
@@ -746,9 +738,7 @@ async def test_daytona_command_wraps_shell_pipelines_when_timeout_is_set() -> No
     inner = InnerSandbox()
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    await sandbox.exec(
-        'container_id=$(docker compose ps -q main); cat /tmp/file | docker exec -i "$container_id" cat', timeout=60
-    )
+    await sandbox.exec("container_id=$(docker compose ps -q main); cat /tmp/file | docker exec -i \"$container_id\" cat", timeout=60)
 
     assert inner.process.command == (
         "timeout 60 sh -c "
@@ -1241,7 +1231,6 @@ async def test_daytona_updates_egress_rules() -> None:
         "network_allow_list": "",
         "domain_allow_list": "api.openai.com,github.com",
     }
-    assert inner.network_events == ["update", "stop", "start"]
 
     await sandbox.modify_egress_rules(["198.51.100.20/32", "203.0.113.10"])
 
@@ -1250,7 +1239,6 @@ async def test_daytona_updates_egress_rules() -> None:
         "network_allow_list": "198.51.100.20/32,203.0.113.10/32",
         "domain_allow_list": "",
     }
-    assert inner.network_events == ["update", "stop", "start"] * 2
 
     request_count = len(inner.network_settings)
     with pytest.raises(ValueError, match="allowed addresses cannot mix domains and CIDRs"):
@@ -1265,4 +1253,3 @@ async def test_daytona_updates_egress_rules() -> None:
         "network_allow_list": "",
         "domain_allow_list": "",
     }
-    assert inner.network_events == ["update", "stop", "start"] * 3

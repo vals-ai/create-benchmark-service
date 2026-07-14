@@ -334,8 +334,6 @@ class DaytonaSandbox(Sandbox):
                 network_allow_list=",".join(network_allow_list),
                 domain_allow_list=",".join(domain_allow_list),
             )
-            await self._sandbox.stop()
-            await self._sandbox.start()
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
 
@@ -347,8 +345,6 @@ class DaytonaSandbox(Sandbox):
                 network_allow_list="",
                 domain_allow_list="",
             )
-            await self._sandbox.stop()
-            await self._sandbox.start()
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
 

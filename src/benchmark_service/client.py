@@ -134,6 +134,8 @@ class BenchmarkServiceClient:
         request: BaseModel,
         on_message: Callable[[str], None] | None = None,
         on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
+        *,
+        ping_timeout: float | None = None,
     ) -> dict[str, Any]:
         """Send a request over WebSocket and stream the response.
 
@@ -153,7 +155,7 @@ class BenchmarkServiceClient:
             f"{self._ws_url}/ws/{path}",
             additional_headers=self._headers,
             open_timeout=60,
-            ping_timeout=60,
+            ping_timeout=ping_timeout,
             max_size=10 * 1024 * 1024,  # 10MB
         ) as websocket:
             await websocket.send(request.model_dump_json())
@@ -302,7 +304,7 @@ class BenchmarkServiceClient:
         async with asyncio.timeout(_ABORT_TASK_TIMEOUT_SECONDS):
             for attempt in range(_ABORT_TASK_ATTEMPTS):
                 try:
-                    result = await self._websocket_request("abort-task", request)
+                    result = await self._websocket_request("abort-task", request, ping_timeout=60)
                     return AbortTaskResponse.model_validate(result)
                 except (BenchmarkServiceError, OSError, websockets.WebSocketException):
                     if attempt == _ABORT_TASK_ATTEMPTS - 1:

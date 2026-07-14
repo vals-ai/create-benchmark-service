@@ -505,9 +505,10 @@ async def test_ws_result_chunk(method: str, args: list[str]) -> None:
     mock_connect = _ws_mock(messages)
 
     client = _make_client()
-    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect) as connect:
         result = await getattr(client, method)(*args)
 
+    assert connect.call_args.kwargs["ping_timeout"] is None
     if method == "setup_task":
         assert result.status == "ok"
         assert result.egress_allowlist == ["https://task-gateway.example"]
@@ -563,7 +564,7 @@ async def test_abort_task_retries_a_lost_response(monkeypatch: pytest.MonkeyPatc
 async def test_abort_task_has_an_overall_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
     client = _make_client()
 
-    async def hang(*_args: Any) -> dict[str, Any]:
+    async def hang(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
         await asyncio.Event().wait()
         raise AssertionError("unreachable")
 

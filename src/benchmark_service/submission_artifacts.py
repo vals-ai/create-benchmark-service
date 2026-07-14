@@ -3,6 +3,7 @@
 import asyncio
 import os
 import re
+from dataclasses import dataclass
 from functools import lru_cache
 from typing import Protocol, cast
 
@@ -16,29 +17,44 @@ DEFAULT_UPLOAD_EXPIRY_S = 3600
 SUBMISSION_ARTIFACT_BUCKET_ENV = "SUBMISSION_ARTIFACT_BUCKET"
 SUBMISSION_ARTIFACT_REGION_ENV = "AWS_REGION"
 SUBMISSION_ARTIFACT_KEY_PREFIX = "submission-artifacts"
-# Presigned PUTs cannot bound object size, so the read side must: refuse
-# anything larger than this before it enters service memory.
 MAX_DOWNLOAD_BYTES_ENV = "SUBMISSION_ARTIFACT_MAX_DOWNLOAD_BYTES"
-DEFAULT_MAX_DOWNLOAD_BYTES = 2 * 1024**3
+DEFAULT_MAX_DOWNLOAD_BYTES = 64 * 1024**2
 
 _KEY_SEGMENT_RE = re.compile(KEY_SEGMENT_PATTERN)
 
 
 class SubmissionArtifactNotFound(Exception):
-    """The submission key has no uploaded object behind it."""
+    """The submission key has no uploaded object behind it.
+
+    S3 can identify this case only when the service role has s3:ListBucket.
+    """
+
+
+class SubmissionArtifactChanged(Exception):
+    """The uploaded object changed after admission."""
 
 
 class SubmissionArtifactTooLarge(Exception):
     """The uploaded object exceeds the configured download size limit."""
 
 
+@dataclass(frozen=True, slots=True)
+class SubmissionArtifactReference:
+    """Immutable identity captured when a submission artifact is admitted."""
+
+    key: str
+    size_bytes: int
+    etag: str
+
+
 class _StreamingBody(Protocol):
     def read(self) -> bytes: ...
+    def close(self) -> None: ...
 
 
 class _S3Client(Protocol):
     def generate_presigned_url(self, op: str, *, Params: dict[str, str], ExpiresIn: int) -> str: ...
-    def get_object(self, *, Bucket: str, Key: str) -> dict[str, object]: ...
+    def get_object(self, *, Bucket: str, Key: str, IfMatch: str) -> dict[str, object]: ...
     def head_object(self, *, Bucket: str, Key: str) -> dict[str, object]: ...
 
 
@@ -47,14 +63,15 @@ def is_configured() -> bool:
 
 
 def require_configured() -> None:
-    """Fail fast on a half-configured deployment: presigning is pure local
-    signing, so a bucket without a region mints URLs that only fail at the
-    caller's PUT (SigV2 / wrong-region 400s), never at mint time."""
-    if is_configured() and not os.environ.get(SUBMISSION_ARTIFACT_REGION_ENV):
+    """Validate submission-artifact settings at service startup."""
+    if not is_configured():
+        return
+    if not os.environ.get(SUBMISSION_ARTIFACT_REGION_ENV):
         raise RuntimeError(
             f"{SUBMISSION_ARTIFACT_BUCKET_ENV} is set but {SUBMISSION_ARTIFACT_REGION_ENV} is not; "
-            "presigned upload URLs must be signed for the bucket's region"
+            "configure the submission artifact bucket's region before starting the service"
         )
+    _max_download_bytes()
 
 
 def _artifact_bucket() -> str:
@@ -129,61 +146,87 @@ def _require_tenant_key(key: str, tenant: str) -> None:
 
 
 def _max_download_bytes() -> int:
-    return int(os.environ.get(MAX_DOWNLOAD_BYTES_ENV) or DEFAULT_MAX_DOWNLOAD_BYTES)
+    raw_limit = os.environ.get(MAX_DOWNLOAD_BYTES_ENV)
+    if raw_limit is None:
+        return DEFAULT_MAX_DOWNLOAD_BYTES
+    try:
+        limit = int(raw_limit)
+    except ValueError as exc:
+        raise RuntimeError(f"{MAX_DOWNLOAD_BYTES_ENV} must be a positive integer number of bytes") from exc
+    if limit <= 0:
+        raise RuntimeError(f"{MAX_DOWNLOAD_BYTES_ENV} must be a positive integer number of bytes")
+    return limit
 
 
-def _require_size_within_limit(size: object, key: str) -> None:
-    limit = _max_download_bytes()
-    if isinstance(size, int) and size > limit:
+def _require_size_within_limit(size: object, key: str, limit: int) -> int:
+    if not isinstance(size, int) or isinstance(size, bool) or size < 0:
+        raise RuntimeError(f"S3 returned an invalid size for artifact {key}")
+    if size > limit:
         raise SubmissionArtifactTooLarge(
             f"artifact {key} is {size} bytes, over the {limit}-byte download limit"
         )
+    return size
 
 
-def _raise_if_missing_object(exc: ClientError, key: str) -> None:
+def _require_etag(etag: object, key: str) -> str:
+    if not isinstance(etag, str) or not etag:
+        raise RuntimeError(f"S3 did not return an ETag for artifact {key}")
+    return etag
+
+
+def _raise_for_artifact_error(exc: ClientError, key: str) -> None:
     error = cast(dict[str, str], exc.response.get("Error") or {})  # pyright: ignore[reportUnknownMemberType, reportUnknownArgumentType]
     code = error.get("Code", "")
     if code in {"404", "NoSuchKey", "NotFound"}:
         raise SubmissionArtifactNotFound(
             f"no artifact was uploaded for key {key}; upload it via /v1/submissions/upload-url first"
         ) from exc
+    if code in {"412", "PreconditionFailed"}:
+        raise SubmissionArtifactChanged(
+            f"artifact {key} changed after it was accepted; submit it again before grading"
+        ) from exc
 
 
-def _stat_sync(key: str, tenant: str) -> int:
+def _stat_sync(key: str, tenant: str) -> SubmissionArtifactReference:
     _require_tenant_key(key, tenant)
     bucket = _artifact_bucket()
     try:
         response = _s3_client().head_object(Bucket=bucket, Key=key)
     except ClientError as exc:
-        _raise_if_missing_object(exc, key)
+        _raise_for_artifact_error(exc, key)
         raise
-    size = response.get("ContentLength")
-    _require_size_within_limit(size, key)
-    return size if isinstance(size, int) else 0
+    size_bytes = _require_size_within_limit(response.get("ContentLength"), key, _max_download_bytes())
+    etag = _require_etag(response.get("ETag"), key)
+    return SubmissionArtifactReference(key=key, size_bytes=size_bytes, etag=etag)
 
 
-def _download_sync(key: str, tenant: str) -> bytes:
-    _require_tenant_key(key, tenant)
+def _download_sync(reference: SubmissionArtifactReference, tenant: str) -> bytes:
+    _require_tenant_key(reference.key, tenant)
+    limit = _max_download_bytes()
+    _require_size_within_limit(reference.size_bytes, reference.key, limit)
+    _require_etag(reference.etag, reference.key)
     bucket = _artifact_bucket()
     try:
-        response = _s3_client().get_object(Bucket=bucket, Key=key)
+        response = _s3_client().get_object(Bucket=bucket, Key=reference.key, IfMatch=reference.etag)
     except ClientError as exc:
-        _raise_if_missing_object(exc, key)
+        _raise_for_artifact_error(exc, reference.key)
         raise
-    _require_size_within_limit(response.get("ContentLength"), key)
     body = cast(_StreamingBody, response["Body"])
-    return body.read()
+    try:
+        _require_size_within_limit(response.get("ContentLength"), reference.key, limit)
+        return body.read()
+    finally:
+        body.close()
 
 
-async def stat(key: str, *, tenant: str) -> int:
-    """Return the artifact's size in bytes without fetching it.
+async def stat(key: str, *, tenant: str) -> SubmissionArtifactReference:
+    """Capture the artifact's immutable identity without fetching it.
 
-    Cheap existence/size check for request admission, before any expensive
-    grading work is provisioned.
+    This admission check runs before any expensive grading work is provisioned.
     """
     return await asyncio.to_thread(_stat_sync, key, tenant)
 
 
-async def download(key: str, *, tenant: str) -> bytes:
-    """Fetch an uploaded artifact's bytes for server-side grading."""
-    return await asyncio.to_thread(_download_sync, key, tenant)
+async def download(reference: SubmissionArtifactReference, *, tenant: str) -> bytes:
+    """Fetch the admitted artifact version for server-side grading."""
+    return await asyncio.to_thread(_download_sync, reference, tenant)

@@ -101,6 +101,10 @@ class SetupTaskResponse(BaseModel):
     """Response after task setup completion."""
 
     status: str = Field(description="Status of setup operation ('ok' or error message)")
+    egress_allowlist: list[str] = Field(
+        default_factory=list,
+        description="Task-specific addresses the agent must be able to reach after setup",
+    )
 
 
 class EvaluateResponseRequest(BaseModel):

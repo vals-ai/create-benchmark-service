@@ -471,7 +471,11 @@ def _make_client(url: str = BASE_URL) -> BenchmarkServiceClient:
     ids=["setup_task", "evaluate_instance"],
 )
 async def test_ws_result_chunk(method: str, args: list[str]) -> None:
-    result_data = {"status": "ok"} if method == "setup_task" else {"score": 1.0}
+    result_data = (
+        {"status": "ok", "egress_allowlist": ["https://task-gateway.example"]}
+        if method == "setup_task"
+        else {"score": 1.0}
+    )
     messages = [json.dumps({"type": "result", "data": result_data})]
     mock_connect = _ws_mock(messages)
 
@@ -481,8 +485,19 @@ async def test_ws_result_chunk(method: str, args: list[str]) -> None:
 
     if method == "setup_task":
         assert result.status == "ok"
+        assert result.egress_allowlist == ["https://task-gateway.example"]
     else:
         assert result == {"score": 1.0}
+
+
+async def test_setup_task_defaults_to_no_dynamic_egress() -> None:
+    mock_connect = _ws_mock([json.dumps({"type": "result", "data": {"status": "ok"}})])
+
+    client = _make_client()
+    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+        result = await client.setup_task("task-1", "inst-1", DAYTONA_CONFIG)
+
+    assert result.egress_allowlist == []
 
 
 @pytest.mark.parametrize(

@@ -259,7 +259,14 @@ def test_websocket_setup_task_resolves_sandbox_provider(
 
     class RuntimeProviderBenchmark(StubBenchmark):
         async def setup_task(self, task_id: str, sandbox: Sandbox, dataset: str | None = None):
-            yield StreamResultChunk(type="result", data={"task_id": task_id, "sandbox_name": sandbox.name})
+            yield StreamResultChunk(
+                type="result",
+                data={
+                    "task_id": task_id,
+                    "sandbox_name": sandbox.name,
+                    "egress_allowlist": ["https://task-gateway.example"],
+                },
+            )
 
     monkeypatch.setattr(DaytonaProviderConfig, "create_provider", create_provider)
     monkeypatch.setattr(ModalProviderConfig, "create_provider", create_provider)
@@ -279,7 +286,11 @@ def test_websocket_setup_task_resolves_sandbox_provider(
             )
             assert ws.receive_json() == {
                 "type": "result",
-                "data": {"task_id": "task-1", "sandbox_name": "selected-sandbox-name"},
+                "data": {
+                    "task_id": "task-1",
+                    "sandbox_name": "selected-sandbox-name",
+                    "egress_allowlist": ["https://task-gateway.example"],
+                },
             }
 
 

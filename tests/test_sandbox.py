@@ -1,6 +1,6 @@
 import asyncio
 import shlex
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, cast
 
@@ -49,6 +49,8 @@ def _unwrap_shell_command(command: str) -> str:
 class Process:
     def __init__(self) -> None:
         self.command: str | None = None
+        self.pty_envs: dict[str, str] | None = None
+        self.pty_handle: PtyHandle | None = None
 
     async def exec(self, command: str) -> SimpleNamespace:
         self.command = command
@@ -67,8 +69,9 @@ class Process:
         envs: dict[str, str],
     ) -> "PtyHandle":
         assert id
-        assert envs == {"TERM": "dumb", "LANG": "C.UTF-8"}
-        return PtyHandle(on_data)
+        self.pty_envs = envs
+        self.pty_handle = PtyHandle(on_data)
+        return self.pty_handle
 
     async def kill_pty_session(self, session_id: str) -> None:
         assert session_id
@@ -153,8 +156,10 @@ class RemovedSandboxProcess(Process):
 class PtyHandle:
     def __init__(self, on_data: Callable[[bytes], None | Awaitable[None]]) -> None:
         self._on_data = on_data
+        self.inputs: list[str] = []
 
     async def send_input(self, data: str) -> None:
+        self.inputs.append(data)
         if data.startswith("stty"):
             return
         result = self._on_data(b"hello")
@@ -324,6 +329,7 @@ class RemovedSandboxFiles(Files):
 class RecordingSandbox(Sandbox):
     def __init__(self, exec_results: list[ExecResult] | None = None) -> None:
         self.exec_commands: list[str] = []
+        self.command_env_vars: list[dict[str, str]] = []
         self.uploads: list[tuple[str, bytes]] = []
         self.downloads: list[str] = []
         self.allowed_addresses: list[str] | None = None
@@ -349,9 +355,15 @@ class RecordingSandbox(Sandbox):
         return ExecResult(exit_code=0, output="ok")
 
     async def command(
-        self, command: str, *, cwd: str | None = None, timeout: float | None = None
+        self,
+        command: str,
+        *,
+        cwd: str | None = None,
+        timeout: float | None = None,
+        env_vars: Mapping[str, str] | None = None,
     ) -> AsyncGenerator[str, None]:
         self.exec_commands.append(command)
+        self.command_env_vars.append(dict(env_vars or {}))
         yield "ok"
 
     async def upload_file(self, remote_path: str, content: bytes) -> None:
@@ -582,7 +594,16 @@ async def test_compose_sandbox_routes_operations_through_main_service() -> None:
     sandbox = ComposeSandbox(outer, source)
 
     exec_result = await sandbox.exec("pytest -q", cwd="/workspace", timeout=12)
-    output = [chunk async for chunk in sandbox.command("echo ok", cwd="/workspace", timeout=12)]
+    secret = "value with spaces; $(touch /tmp/leaked)"
+    output = [
+        chunk
+        async for chunk in sandbox.command(
+            "echo ok",
+            cwd="/workspace",
+            timeout=12,
+            env_vars={"AGENT_SECRET": secret},
+        )
+    ]
     await sandbox.upload_file("/workspace/instruction.md", b"solve it")
     downloaded = await sandbox.download_file("/workspace/reward.json")
     await sandbox.modify_egress_rules(["api.openai.com"])
@@ -608,6 +629,8 @@ async def test_compose_sandbox_routes_operations_through_main_service() -> None:
         "$(env | sed -n 's/^\\([A-Za-z_][A-Za-z0-9_]*\\)=.*/-e \\1/p') "
         "-T -w /workspace main sh -lc 'echo ok'"
     )
+    assert outer.command_env_vars == [{"AGENT_SECRET": secret}]
+    assert secret not in outer.exec_commands[1]
     assert outer.allowed_addresses == ["api.openai.com"]
     assert outer.egress_cleared
     upload_temp = outer.uploads[0][0]
@@ -625,6 +648,19 @@ async def test_compose_sandbox_routes_operations_through_main_service() -> None:
         f"docker exec \"$container_id\" sh -lc 'cat /workspace/reward.json' > {download_temp}"
     ) in outer.exec_commands
     assert downloaded == b"downloaded"
+
+
+async def test_compose_command_rejects_invalid_environment_names_before_outer_call() -> None:
+    outer = RecordingSandbox()
+    sandbox = ComposeSandbox(
+        outer,
+        ComposeSource(outer=ImageSource(image="docker:28.3.3-dind")),
+    )
+
+    with pytest.raises(ValueError, match="BAD-NAME"):
+        _ = [chunk async for chunk in sandbox.command("true", env_vars={"BAD-NAME": "secret"})]
+
+    assert outer.exec_commands == []
 
 
 async def test_compose_sandbox_cleans_temp_files_when_copy_operations_fail() -> None:
@@ -854,6 +890,33 @@ async def test_daytona_command_streams_output() -> None:
     output = [chunk async for chunk in sandbox.command("printf hello")]
 
     assert output == ["hello"]
+
+
+async def test_daytona_command_uses_native_process_environment() -> None:
+    secret = "value with spaces; $(touch /tmp/leaked)"
+    inner = InnerSandbox()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    output = [chunk async for chunk in sandbox.command("printf hello", env_vars={"AGENT_SECRET": secret})]
+
+    assert output == ["hello"]
+    assert inner.process.pty_envs == {
+        "TERM": "dumb",
+        "LANG": "C.UTF-8",
+        "AGENT_SECRET": secret,
+    }
+    assert inner.process.pty_handle is not None
+    assert all(secret not in data for data in inner.process.pty_handle.inputs)
+
+
+async def test_daytona_command_rejects_invalid_environment_names_before_provider_call() -> None:
+    inner = InnerSandbox()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(ValueError, match="BAD-NAME"):
+        _ = [chunk async for chunk in sandbox.command("true", env_vars={"BAD-NAME": "secret"})]
+
+    assert inner.process.pty_envs is None
 
 
 async def test_daytona_command_finishes_when_pty_close_never_arrives(monkeypatch: pytest.MonkeyPatch) -> None:

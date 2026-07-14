@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from typing import Annotated, Literal, Self
 
 from pydantic import BaseModel, Field
@@ -28,6 +29,16 @@ class ComposeSource(BaseModel):
 
 
 SandboxSource = Annotated[ImageSource | SnapshotSource | ComposeSource, Field(discriminator="type")]
+
+_ENV_VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+
+def validate_command_env(env_vars: Mapping[str, str] | None) -> dict[str, str]:
+    env = dict(env_vars or {})
+    invalid_names = [name for name in env if _ENV_VAR_NAME.fullmatch(name) is None]
+    if invalid_names:
+        raise ValueError(f"Invalid environment variable names: {', '.join(invalid_names)}")
+    return env
 
 
 class Resources(BaseModel):
@@ -111,6 +122,7 @@ class Sandbox(ABC):
         *,
         cwd: str | None = None,
         timeout: float | None = None,
+        env_vars: Mapping[str, str] | None = None,
     ) -> AsyncGenerator[str, None]: ...
 
     @abstractmethod

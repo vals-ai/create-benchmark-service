@@ -4,7 +4,7 @@ import asyncio
 import hashlib
 import re
 import shlex
-from collections.abc import AsyncGenerator, Awaitable
+from collections.abc import AsyncGenerator, Awaitable, Mapping
 from typing import Any, Literal, cast
 
 from modal import App, Client, Image
@@ -30,6 +30,7 @@ from benchmark_service.sandbox.types import (
     SandboxQuery,
     SandboxSource,
     SnapshotSource,
+    validate_command_env,
 )
 
 # Modal sandboxes must belong to an app; all benchmark sandboxes share one.
@@ -143,9 +144,25 @@ class ModalSandbox(Sandbox):
         return ExecResult(exit_code=exit_code, output=output)
 
     @_PROVIDER_RETRY
-    async def _start_process(self, command: str, *, cwd: str | None, timeout: float | None) -> Any:
+    async def _start_process(
+        self,
+        command: str,
+        *,
+        cwd: str | None,
+        timeout: float | None,
+        env_vars: dict[str, str] | None = None,
+    ) -> Any:
+        modal_env: dict[str, str | None] | None = None
+        if env_vars is not None:
+            modal_env = {name: value for name, value in env_vars.items()}
         try:
-            return await self._sandbox.exec.aio("/bin/sh", "-lc", _command(command, cwd, timeout), text=True)
+            return await self._sandbox.exec.aio(
+                "/bin/sh",
+                "-lc",
+                _command(command, cwd, timeout),
+                env=modal_env,
+                text=True,
+            )
         except ModalError as exc:
             raise _sandbox_error(exc) from exc
 
@@ -155,9 +172,11 @@ class ModalSandbox(Sandbox):
         *,
         cwd: str | None = None,
         timeout: float | None = None,
+        env_vars: Mapping[str, str] | None = None,
     ) -> AsyncGenerator[str, None]:
+        env = validate_command_env(env_vars) if env_vars is not None else None
         await self._raise_if_finished()
-        process = await self._start_process(command, cwd=cwd, timeout=timeout)
+        process = await self._start_process(command, cwd=cwd, timeout=timeout, env_vars=env)
 
         try:
             async for chunk in process.stdout:

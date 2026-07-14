@@ -28,6 +28,7 @@ from daytona.common.errors import (
     DaytonaRateLimitError,
     DaytonaTimeoutError,
 )
+from daytona.common.pty import PtyResult
 from daytona.handle.async_pty_handle import AsyncPtyHandle
 from pydantic import BaseModel
 from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_exponential, wait_fixed
@@ -46,6 +47,7 @@ from benchmark_service.sandbox.types import (
     SandboxProvider,
     SandboxQuery,
     SnapshotSource,
+    validate_command_env,
 )
 
 _PTY_STATUS_CHECK_ATTEMPTS = 30
@@ -74,11 +76,19 @@ _TRANSPORT_ERROR_MESSAGES = (
     "[errno 9] bad file descriptor",
     "502 bad gateway",
     "failed to create sandbox: an unexpected error occurred.",
+    "failed to register with sysbox-mgr",
     "server disconnected",
 )
 _RETRYABLE_DAYTONA_CAUSES = (ClientConnectionError, ConnectionError, TimeoutError)
 _FIXED_PROVIDER_WAIT = wait_fixed(2)
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
+
+
+def _pty_result_summary(result: PtyResult | None) -> str:
+    if result is None:
+        return "unavailable"
+    error = result.error[:200] if result.error else None
+    return f"exit_code={result.exit_code}, error={error!r}"
 
 
 def _resolve_daytona_allowed_addresses(allowed_addresses: list[str]) -> tuple[list[str], list[str]]:
@@ -280,9 +290,11 @@ class DaytonaSandbox(Sandbox):
         *,
         cwd: str | None = None,
         timeout: float | None = None,
+        env_vars: Mapping[str, str] | None = None,
     ) -> AsyncGenerator[str, None]:
+        env = validate_command_env(env_vars)
         output: asyncio.Queue[str] = asyncio.Queue()
-        exec_task = asyncio.create_task(self._exec_pty(_command(command, cwd, timeout), output))
+        exec_task = asyncio.create_task(self._exec_pty(_command(command, cwd, timeout), output, env))
 
         try:
             while not exec_task.done():
@@ -341,12 +353,12 @@ class DaytonaSandbox(Sandbox):
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
 
-    async def _exec_pty(self, command: str, output: asyncio.Queue[str]) -> ExecResult:
+    async def _exec_pty(self, command: str, output: asyncio.Queue[str], env_vars: dict[str, str]) -> ExecResult:
         session_id = f"{self.id}:exec-{uuid.uuid4().hex}"
         status_path = f"{_STATUS_DIR}/{uuid.uuid4().hex}.status"
         stdout: list[str] = []
         handle: AsyncPtyHandle | None = None
-        wait_task: asyncio.Task[Any] | None = None
+        wait_task: asyncio.Task[PtyResult] | None = None
 
         async def on_data(data: bytes) -> None:
             text = data.decode("utf-8", errors="replace")
@@ -354,7 +366,7 @@ class DaytonaSandbox(Sandbox):
             output.put_nowait(text)
 
         try:
-            handle = await self._create_pty_session(session_id, on_data)
+            handle = await self._create_pty_session(session_id, on_data, env_vars)
             await handle.send_input("stty -echo\n")
             await handle.send_input(
                 f"mkdir -p {shlex.quote(_STATUS_DIR)}; {command}; echo $? > {shlex.quote(status_path)}; exit\n"
@@ -379,10 +391,16 @@ class DaytonaSandbox(Sandbox):
                         f"session_id={session_id}"
                     )
 
+                wait_result: PtyResult | None = None
                 with suppress(Exception):
-                    await wait_task
+                    wait_result = await wait_task
+                if wait_result is not None and wait_result.exit_code not in (None, 0):
+                    raise SandboxError(
+                        f"Daytona PTY exited before writing command status for {self._sandbox_ref}: "
+                        f"session_id={session_id}, {_pty_result_summary(wait_result)}"
+                    )
                 await handle.disconnect()
-                handle = await self._reconnect_pty(session_id, on_data)
+                handle = await self._reconnect_pty(session_id, on_data, wait_result)
                 wait_task = asyncio.create_task(handle.wait())
 
             result = await self.exec(f"cat {shlex.quote(status_path)}")
@@ -411,12 +429,13 @@ class DaytonaSandbox(Sandbox):
         self,
         session_id: str,
         on_data: Callable[[bytes], Awaitable[None]],
+        env_vars: dict[str, str],
     ) -> AsyncPtyHandle:
         try:
             return await self._sandbox.process.create_pty_session(
                 id=session_id,
                 on_data=on_data,
-                envs={"TERM": "dumb", "LANG": "C.UTF-8"},
+                envs={"TERM": "dumb", "LANG": "C.UTF-8", **env_vars},
             )
         except _SANDBOX_OPERATION_ERRORS as exc:
             await self._check_sandbox_alive()
@@ -427,19 +446,17 @@ class DaytonaSandbox(Sandbox):
         self,
         session_id: str,
         on_data: Callable[[bytes], Awaitable[None]],
+        wait_result: PtyResult | None,
     ) -> AsyncPtyHandle:
         try:
             await self._sandbox.process.get_pty_session_info(session_id)
             return await self._sandbox.process.connect_pty_session(session_id, on_data)
-        except DaytonaNotFoundError as exc:
-            raise SandboxError(
-                f"Daytona PTY session no longer exists for {self._sandbox_ref}: session_id={session_id}"
-            ) from exc
-        except DaytonaConnectionError as exc:
+        except (DaytonaNotFoundError, DaytonaConnectionError) as exc:
             await self._check_sandbox_alive()
-            if "not found" in str(exc).lower():
+            if isinstance(exc, DaytonaNotFoundError) or "not found" in str(exc).lower():
                 raise SandboxError(
-                    f"Daytona PTY session no longer exists for {self._sandbox_ref}: session_id={session_id}"
+                    f"Daytona PTY session disappeared before command status was written for {self._sandbox_ref}: "
+                    f"session_id={session_id}, wait_result=({_pty_result_summary(wait_result)}), state={self.state}"
                 ) from exc
             raise self._sandbox_error(exc) from exc
         except _SANDBOX_OPERATION_ERRORS as exc:
@@ -531,6 +548,9 @@ class DaytonaSandboxProvider(SandboxProvider):
             raise self._sandbox_error(exc) from exc
 
         try:
+            if sandbox.state in _FAILED_SANDBOX_STATES:
+                await self.delete_sandbox(sandbox.id)
+                return None
             if sandbox.state in (SandboxState.DESTROYING, SandboxState.DESTROYED, SandboxState.STOPPED):
                 return None
             await sandbox.wait_for_sandbox_start(timeout=0)

@@ -2,7 +2,7 @@
 
 import pytest
 
-from benchmark_service.schemas import TaskFilter
+from benchmark_service.schemas import AbortableSetupLifecycle, AbortTaskRequest, RetrieveTaskResponse, TaskFilter
 from tests.conftest import StubBenchmark
 
 
@@ -93,3 +93,22 @@ async def test_list_tasks_default_requires_explicit_public_projection() -> None:
     service = await StubBenchmark.create()
     with pytest.raises(NotImplementedError, match="list_tasks"):
         await service.list_tasks(dataset="default")
+
+
+async def test_abortable_setup_without_cleanup_override_fails_closed() -> None:
+    class MissingAbortHookBenchmark(StubBenchmark):
+        async def retrieve_task(
+            self,
+            task_id: str,
+            skip_validation: bool = False,
+            dataset: str | None = None,
+        ) -> RetrieveTaskResponse:
+            response = await super().retrieve_task(task_id, skip_validation, dataset)
+            return response.model_copy(update={"setup_lifecycle": AbortableSetupLifecycle()})
+
+    service = await MissingAbortHookBenchmark.create()
+    task = await service.retrieve_task("task-1")
+
+    assert task.setup_lifecycle.type == "abortable"
+    with pytest.raises(NotImplementedError, match="abort_task"):
+        await service.abort_task(AbortTaskRequest(task_id="task-1", run_id="run-1", instance_id="instance-1"))

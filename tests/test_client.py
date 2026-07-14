@@ -61,6 +61,7 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
                 "cwd": "/work",
                 "resources": {"vcpu": 2, "memory": 4, "disk": 10},
                 "agent_timeout": None,
+                "setup_lifecycle": {"type": "standard"},
             },
         ),
         (
@@ -110,6 +111,28 @@ async def test_retrieve_task_accepts_legacy_shape(
     assert result.source.model_dump() == {"type": "image", "image": "python:3.12"}
     assert result.model_dump()["docker_image"] == "python:3.12"
     assert result.resources.model_dump() == {"vcpu": 2, "memory": 4, "disk": 10}
+    assert result.setup_lifecycle.type == "standard"
+
+
+async def test_retrieve_task_accepts_abortable_setup_lifecycle(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    mock_http.get = AsyncMock(
+        return_value=_mock_response(
+            json_data={
+                "source": {"type": "image", "image": "python:3.12"},
+                "problem_path": "/tmp/problem_statement.txt",
+                "cwd": "/work",
+                "resources": {"vcpu": 2, "memory": 4, "disk": 10},
+                "setup_lifecycle": {"type": "abortable"},
+            }
+        )
+    )
+
+    result = await client.retrieve_task("task-1")
+
+    assert result.setup_lifecycle.type == "abortable"
 
 
 async def test_retrieve_task_tolerates_legacy_enable_docker_field(
@@ -498,6 +521,23 @@ async def test_setup_task_defaults_to_no_dynamic_egress() -> None:
         result = await client.setup_task("task-1", "inst-1", DAYTONA_CONFIG)
 
     assert result.egress_allowlist == []
+
+
+async def test_abort_task_serializes_identity() -> None:
+    mock_connect = _ws_mock([json.dumps({"type": "result", "data": {"status": "ok"}})])
+    client = _make_client()
+
+    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+        result = await client.abort_task("task-1", "run-1", "inst-1", dataset="validation")
+
+    assert result.status == "ok"
+    ws = mock_connect.__aenter__.return_value
+    assert json.loads(ws.send.call_args.args[0]) == {
+        "task_id": "task-1",
+        "run_id": "run-1",
+        "instance_id": "inst-1",
+        "dataset": "validation",
+    }
 
 
 @pytest.mark.parametrize(

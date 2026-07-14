@@ -43,6 +43,21 @@ class VerifyTaskIdsResponse(BaseModel):
     task_ids: list[str] = Field(description="List of verified task IDs that exist in the benchmark")
 
 
+class StandardSetupLifecycle(BaseModel):
+    """Setup requires no benchmark-owned cleanup when Tracker stops early."""
+
+    type: Literal["standard"] = "standard"
+
+
+class AbortableSetupLifecycle(BaseModel):
+    """Tracker must call abort-task when setup starts but evaluation does not."""
+
+    type: Literal["abortable"] = "abortable"
+
+
+SetupLifecycle = StandardSetupLifecycle | AbortableSetupLifecycle
+
+
 def legacy_docker_image(source: SandboxSource) -> str:
     if isinstance(source, ImageSource):
         return source.image
@@ -67,6 +82,11 @@ class RetrieveTaskResponse(BaseModel):
         default=None, description="Agent execution max time in seconds (None for no timeout)"
     )
     resources: Resources = Field(description="Computational resources needed")
+    setup_lifecycle: SetupLifecycle = Field(
+        default_factory=StandardSetupLifecycle,
+        discriminator="type",
+        description="Cleanup required when task execution stops after setup starts",
+    )
 
     @computed_field(description="Legacy sandbox image field for older Valkyrie clients")
     @property
@@ -105,6 +125,21 @@ class SetupTaskResponse(BaseModel):
         default_factory=list,
         description="Task-specific addresses the agent must be able to reach after setup",
     )
+
+
+class AbortTaskRequest(BaseModel):
+    """Request to clean up benchmark-owned resources after setup starts."""
+
+    task_id: str = Field(description="Unique identifier for the task")
+    run_id: str = Field(description="Unique identifier for the benchmark run")
+    instance_id: str = Field(description="Unique identifier for the agent sandbox instance")
+    dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
+
+
+class AbortTaskResponse(BaseModel):
+    """Response after idempotent benchmark-owned cleanup completes."""
+
+    status: Literal["ok"] = "ok"
 
 
 class EvaluateResponseRequest(BaseModel):

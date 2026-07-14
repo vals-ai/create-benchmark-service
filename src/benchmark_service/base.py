@@ -19,6 +19,8 @@ from benchmark_service.auth import (
 from benchmark_service.dataset_versioning import DatasetVersionEntry, load_dataset_versions
 from benchmark_service.sandbox import Sandbox
 from benchmark_service.schemas import (
+    AbortTaskRequest,
+    AbortTaskResponse,
     EvaluateResponseRequest,
     FinalScoreResult,
     RetrieveTaskResponse,
@@ -251,6 +253,15 @@ class BenchmarkService(ABC):
             StreamChunk - one of StreamMessageChunk, StreamResultChunk, or StreamErrorChunk
         """
         ...
+
+    async def abort_task(self, request: AbortTaskRequest) -> AbortTaskResponse:
+        """Clean up benchmark-owned resources after setup starts but evaluation does not.
+
+        Services whose retrieval response declares the abortable setup lifecycle
+        must override this hook. Implementations must be idempotent because a
+        caller may retry after losing the first response.
+        """
+        raise NotImplementedError(f"{type(self).__name__}.abort_task must implement abortable setup cleanup")
 
     @abstractmethod
     async def evaluate_response(self, request: EvaluateResponseRequest, dataset: str | None = None) -> Any:

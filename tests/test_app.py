@@ -3,7 +3,7 @@
 import json
 from collections.abc import AsyncGenerator, Generator, Mapping
 from typing import Any, cast
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi import WebSocket
@@ -21,7 +21,7 @@ from benchmark_service.sandbox.types import (
     SandboxProvider,
     SandboxQuery,
 )
-from benchmark_service.schemas import StreamResultChunk
+from benchmark_service.schemas import AbortTaskRequest, AbortTaskResponse, StreamResultChunk
 from tests.conftest import StubBenchmark
 
 
@@ -122,6 +122,7 @@ def test_retrieve_task(client: TestClient) -> None:
     assert data["problem_path"] == "/tmp/problem_statement.txt"
     assert data["source"] == {"type": "image", "image": "python:3.12-slim"}
     assert data["docker_image"] == "python:3.12-slim"
+    assert data["setup_lifecycle"] == {"type": "standard"}
 
 
 def test_retrieve_task_invalid(client: TestClient) -> None:
@@ -243,6 +244,36 @@ def test_websocket_evaluate_response_with_eval_resume_state(client: TestClient) 
                 "state": {"artifact_prefix": "s3://bucket/run"},
             },
         }
+
+
+def test_websocket_abort_task_invokes_cleanup() -> None:
+    requests: list[AbortTaskRequest] = []
+
+    class AbortableBenchmark(StubBenchmark):
+        async def abort_task(self, request: AbortTaskRequest) -> AbortTaskResponse:
+            requests.append(request)
+            return AbortTaskResponse()
+
+    with TestClient(BenchmarkServiceApp(AbortableBenchmark)) as c:
+        with c.websocket_connect("/ws/abort-task") as ws:
+            ws.send_json(
+                {
+                    "task_id": "alt-task-1",
+                    "run_id": "run-1",
+                    "instance_id": "instance-1",
+                    "dataset": "alt",
+                }
+            )
+            assert ws.receive_json() == {"type": "result", "data": {"status": "ok"}}
+
+    assert [request.model_dump() for request in requests] == [
+        {
+            "task_id": "alt-task-1",
+            "run_id": "run-1",
+            "instance_id": "instance-1",
+            "dataset": "alt",
+        }
+    ]
 
 
 def test_websocket_setup_task_resolves_sandbox_provider(
@@ -368,7 +399,10 @@ class TestAuthMiddleware:
         response = auth_client.get("/health")
         assert response.status_code == 200
 
-    @pytest.mark.parametrize("path", ["/ws/setup-task", "/ws/evaluate-response", "/ws/evaluate-instance"])
+    @pytest.mark.parametrize(
+        "path",
+        ["/ws/setup-task", "/ws/abort-task", "/ws/evaluate-response", "/ws/evaluate-instance"],
+    )
     def test_websocket_auth_failure_closes_1008(self, auth_client: TestClient, path: str) -> None:
         with auth_client.websocket_connect(path) as ws:
             with pytest.raises(WebSocketDisconnect) as exc_info:
@@ -555,3 +589,32 @@ def test_setup_task_ws_close_for_disallowed_dataset(auth_client: TestClient) -> 
                 ws.receive_json()
     assert exc_info.value.code == 1008
     assert exc_info.value.reason == "Dataset not allowed"
+
+
+def test_abort_task_ws_close_for_disallowed_dataset_without_cleanup(
+    auth_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    abort_task = AsyncMock(return_value=AbortTaskResponse())
+    app = cast(BenchmarkServiceApp, auth_client.app)
+    monkeypatch.setattr(app.service, "abort_task", abort_task)
+
+    with _patch_descope(["acme-corp"]):
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with auth_client.websocket_connect(
+                "/ws/abort-task",
+                headers={"x-descope-api-key": "key-acme"},
+            ) as ws:
+                ws.send_json(
+                    {
+                        "task_id": "alt-task-1",
+                        "run_id": "run-1",
+                        "instance_id": "instance-1",
+                        "dataset": "alt",
+                    }
+                )
+                ws.receive_json()
+
+    assert exc_info.value.code == 1008
+    assert exc_info.value.reason == "Dataset not allowed"
+    abort_task.assert_not_awaited()

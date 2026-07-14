@@ -15,6 +15,8 @@ from tenacity import (
 
 from benchmark_service.sandbox import SandboxProvider, SandboxProviderConfig
 from benchmark_service.schemas import (
+    AbortTaskRequest,
+    AbortTaskResponse,
     EvaluateInstanceRequest,
     EvaluateResponseRequest,
     FinalScoreResponse,
@@ -278,6 +280,23 @@ class BenchmarkServiceClient:
         )
         result = await self._websocket_request("setup-task", request, on_message)
         return SetupTaskResponse.model_validate(result)
+
+    async def abort_task(
+        self,
+        task_id: str,
+        run_id: str,
+        instance_id: str,
+        dataset: str | None = None,
+    ) -> AbortTaskResponse:
+        """Idempotently clean up benchmark-owned resources after setup starts."""
+        request = AbortTaskRequest(
+            task_id=task_id,
+            run_id=run_id,
+            instance_id=instance_id,
+            dataset=dataset,
+        )
+        result = await self._websocket_request("abort-task", request)
+        return AbortTaskResponse.model_validate(result)
 
     @_retry_http
     async def evaluate_response(

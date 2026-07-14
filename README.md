@@ -87,6 +87,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 - `check_dataset_access(tenant, dataset)` — return whether a resolved tenant may access a dataset.
 - `get_service_version()` — optional benchmark-owned service version override. If it returns `None`, `/version` falls back to the installed benchmark package version.
 - `get_dataset_version(dataset)` — optional dataset release/version hook. The value is returned on the dataset task-list response after auth and dataset access checks.
+- `abort_task(request)` — idempotently clean up benchmark-owned resources when an `abortable` setup starts but evaluation does not. The default fails closed; services declaring that lifecycle must override it.
 
 ### FastAPI application factory (`app.py`)
 
@@ -111,6 +112,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | Path | Description |
 |------|-------------|
 | `/ws/setup-task` | Set up a task in a sandbox; streams progress, errors, and a final result |
+| `/ws/abort-task` | Idempotently clean up benchmark-owned resources for a task/run/instance identity |
 | `/ws/evaluate-response` | Evaluate without a sandbox; streams progress, checkpoint state, errors, and a final result |
 | `/ws/evaluate-instance` | Evaluate a live sandbox solution; streams progress, errors, and a final result |
 
@@ -214,11 +216,12 @@ Status codes: 403 if the tenant isn't allowed the dataset *or* if the caller use
 
 Pydantic models used across requests and responses:
 
-- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `Resources`
+- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `Resources`, and a `setup_lifecycle` discriminated as `standard` (default) or `abortable`
 - **`SandboxSource`** — `ImageSource(type="image", image=...)` or `SnapshotSource(type="snapshot", snapshot=...)`
 - **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; currently `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET)` or `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)`
 - **`Resources`** — `vcpu`, `memory`, `disk`
 - **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, optional `sandbox_provider` with Daytona header fallback, `dataset`
+- **`AbortTaskRequest`** / **`AbortTaskResponse`** — required `task_id`, `run_id`, and `instance_id`, optional `dataset`, and final status `ok`
 - **`EvaluateResponseRequest`** — `task_id`, `response` or `eval_resume_state`, optional `sandbox_provider`, `dataset`
 - **`FinalScoreResult`** / **`FinalScoreResponse`** — `score` (float), `metadata`, `tasks_evaluated`
 - **`TaskFilter`** — `task_ids` list or `slice_str`; `parse_slice()` converts `"start:stop:step"` to a Python `slice`

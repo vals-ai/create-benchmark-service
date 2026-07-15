@@ -173,11 +173,13 @@ resume) keep their sandbox-less service-owned paths.
 Submissions arrive either inline (`payload.type == "text"`) or by reference
 (`payload.type == "artifact"`, where `payload.data` is the object key returned
 by `/v1/submissions/upload-url`). For artifact submissions the endpoint
-verifies the key's existence, tenant namespace, and size before any sandbox is
-provisioned, then downloads the object to `submission.sandbox_path` before
-calling the hook. The hook receives `TextGradingSubmission` or
+reserves grading capacity, then captures an immutable `artifact_reference`
+containing the key, size, and ETag before any sandbox is provisioned. The same
+reference binds the download to that admitted object version, which is placed
+at `submission.sandbox_path` before the hook runs. Admission remains held
+through bounded sandbox cleanup. The hook receives `TextGradingSubmission` or
 `ArtifactGradingSubmission`, including the payload schema and semantic
-`text`/`object_key` field, so it never has to infer the submission type.
+`text`/`artifact_reference` field, so it never has to infer the submission type.
 
 Daytona is the default grading provider and reads `DAYTONA_API_KEY`,
 `DAYTONA_API_URL`, and `DAYTONA_TARGET`. Set

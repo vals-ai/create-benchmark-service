@@ -348,8 +348,10 @@ class BenchmarkService(ABC):
         """Place a typed submission where evaluate_instance expects it.
 
         Artifact submissions have already been downloaded to
-        submission.sandbox_path. Evaluator secrets must come from private
-        deployment config or server-side benchmark code, never task metadata.
+        submission.sandbox_path. Their artifact_reference is the immutable
+        key, size, and ETag captured during preflight and used for that exact
+        download. Evaluator secrets must come from private deployment config
+        or server-side benchmark code, never task metadata.
         """
         raise NotImplementedError(
             f"{type(self).__name__}.prepare_grading_sandbox must be implemented for eval_mode == EvalMode.SANDBOX"

@@ -7,6 +7,7 @@ from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validat
 
 from benchmark_service.sandbox import SandboxProviderConfig
 from benchmark_service.sandbox.types import ImageSource, Resources, SandboxSource, SnapshotSource
+from benchmark_service.submission_artifacts import SubmissionArtifactReference
 
 _COMPOSE_LEGACY_DOCKER_IMAGE = "compose+source-required"
 
@@ -87,7 +88,7 @@ class ArtifactGradingSubmission(BaseModel):
     type: Literal["artifact"] = "artifact"
     task_id: str
     schema_id: str
-    object_key: str
+    artifact_reference: SubmissionArtifactReference
     sandbox_path: str
 
 

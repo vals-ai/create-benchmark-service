@@ -212,7 +212,7 @@ async def _materialize_artifact(
 ) -> None:
     """Download + upload in one frame so the artifact bytes (up to the download
     cap) are released as soon as they land in the sandbox."""
-    tarball = await submission_artifacts.download(submission.object_key, tenant=tenant)
+    tarball = await submission_artifacts.download(submission.artifact_reference, tenant=tenant)
     await sandbox.upload_file(submission.sandbox_path, tarball)
 
 
@@ -310,13 +310,25 @@ async def _finish_grade_cleanup(
     evaluation_task: asyncio.Task[StreamChunk] | None,
 ) -> None:
     cleanup_task = asyncio.create_task(_cleanup_grade_run(run, sandbox, evaluation, evaluation_task))
+    cancellation: asyncio.CancelledError | None = None
+    while not cleanup_task.done():
+        try:
+            await asyncio.shield(cleanup_task)
+        except asyncio.CancelledError as exc:
+            if cancellation is None:
+                cancellation = exc
+        except Exception:  # noqa: BLE001
+            break
+
     try:
-        await asyncio.shield(cleanup_task)
+        cleanup_task.result()
     except asyncio.CancelledError:
-        cleanup_task.add_done_callback(_discard_future_result)
-        raise
+        if cancellation is None:
+            raise
     except Exception:  # noqa: BLE001
         logger.exception("grading cleanup failed run_id=%s task_id=%s", run.run_id, run.task_id)
+    if cancellation is not None:
+        raise cancellation
 
 
 async def grade_instance_stream(

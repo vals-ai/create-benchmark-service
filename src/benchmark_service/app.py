@@ -30,6 +30,7 @@ from benchmark_service.schemas import (
     EvaluateResponseRequest,
     FinalScoreRequest,
     FinalScoreResponse,
+    GradingSubmission,
     HealthCheckResponse,
     RetrieveTaskResponse,
     SetupTaskRequest,
@@ -570,29 +571,10 @@ class BenchmarkServiceApp(FastAPI):
                     ),
                 )
 
-            if body.payload.type == V1PayloadType.ARTIFACT:
-                if not body.payload.data:
-                    raise HTTPException(
-                        status_code=400,
-                        detail="Artifact submissions must include the uploaded object's key in payload.data.",
-                    )
-                submission = ArtifactGradingSubmission(
-                    task_id=body.task_id,
-                    schema_id=body.payload.schema_id,
-                    object_key=body.payload.data,
-                    sandbox_path=SUBMISSION_ARTIFACT_SANDBOX_PATH,
-                )
-                try:
-                    await submission_artifacts.stat(submission.object_key, tenant=tenant)
-                except submission_artifacts.SubmissionArtifactNotFound as exc:
-                    raise HTTPException(status_code=404, detail=str(exc)) from exc
-                except submission_artifacts.SubmissionArtifactTooLarge as exc:
-                    raise HTTPException(status_code=413, detail=str(exc)) from exc
-            else:
-                submission = TextGradingSubmission(
-                    task_id=body.task_id,
-                    schema_id=body.payload.schema_id,
-                    text=body.payload.data,
+            if body.payload.type == V1PayloadType.ARTIFACT and not body.payload.data:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Artifact submissions must include the uploaded object's key in payload.data.",
                 )
 
             provider = self._grading_provider
@@ -603,6 +585,26 @@ class BenchmarkServiceApp(FastAPI):
                 )
             try:
                 async with self._grading_admission.acquire((tenant, body.run_id, body.task_id)):
+                    submission: GradingSubmission
+                    if body.payload.type == V1PayloadType.ARTIFACT:
+                        try:
+                            artifact_reference = await submission_artifacts.stat(body.payload.data, tenant=tenant)
+                        except submission_artifacts.SubmissionArtifactNotFound as exc:
+                            raise HTTPException(status_code=404, detail=str(exc)) from exc
+                        except submission_artifacts.SubmissionArtifactTooLarge as exc:
+                            raise HTTPException(status_code=413, detail=str(exc)) from exc
+                        submission = ArtifactGradingSubmission(
+                            task_id=body.task_id,
+                            schema_id=body.payload.schema_id,
+                            artifact_reference=artifact_reference,
+                            sandbox_path=SUBMISSION_ARTIFACT_SANDBOX_PATH,
+                        )
+                    else:
+                        submission = TextGradingSubmission(
+                            task_id=body.task_id,
+                            schema_id=body.payload.schema_id,
+                            text=body.payload.data,
+                        )
                     response = await evaluate_submission(
                         service=self.service,
                         run_id=body.run_id,

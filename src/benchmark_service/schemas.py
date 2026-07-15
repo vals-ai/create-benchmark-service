@@ -6,7 +6,7 @@ from typing import Annotated, Any, Literal, cast
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 from benchmark_service.sandbox import SandboxProviderConfig
-from benchmark_service.sandbox.types import ImageSource, Resources, SandboxSource, SnapshotSource
+from benchmark_service.sandbox.types import BaseSandboxSource, ImageSource, Resources, SandboxSource, SnapshotSource
 from benchmark_service.submission_artifacts import SubmissionArtifactReference
 
 _COMPOSE_LEGACY_DOCKER_IMAGE = "compose+source-required"
@@ -64,7 +64,10 @@ class EvalSandboxSpec(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    source: SandboxSource | None = Field(default=None, description="Grading sandbox image or snapshot")
+    source: BaseSandboxSource | None = Field(
+        default=None,
+        description="Grading sandbox image or snapshot; ComposeSource is not supported for grading",
+    )
     resources: Resources | None = Field(
         default=None,
         description="Grading sandbox resources; snapshot-backed sandboxes do not support overrides",

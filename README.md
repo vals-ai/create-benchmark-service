@@ -192,6 +192,11 @@ must stay in private deployment configuration or benchmark-owned server code;
 they are never returned in `RetrieveTaskResponse` or persisted with a
 submission.
 
+Grading sandboxes can use an image or snapshot, not `ComposeSource`. A task
+whose generation environment uses `ComposeSource` must set
+`eval_sandbox.source` to an image or snapshot because the grading service does
+not start Docker and Compose services in a fresh outer sandbox.
+
 Task retrieval, sandbox creation, submission materialization, and the setup
 hook share a 600-second preparation bound. `eval_sandbox.timeout_s` (1800
 seconds by default) starts fresh immediately before `evaluate_instance`, and
@@ -264,6 +269,7 @@ Pydantic models used across requests and responses:
 
 - **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `resources`, optional non-secret `eval_sandbox`
 - **`SandboxSource`** — `ImageSource`, `SnapshotSource`, or `ComposeSource` with an outer image/snapshot
+- **`EvalSandboxSpec`** — grading overrides whose optional `source` is an image or snapshot, never `ComposeSource`
 - **`GradingSubmission`** — typed `TextGradingSubmission` or `ArtifactGradingSubmission` passed only to the sandbox-grading hook
 - **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; currently `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET)` or `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)`
 - **`Resources`** — `vcpu`, `memory`, `disk`

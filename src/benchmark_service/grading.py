@@ -32,15 +32,14 @@ from fastapi.encoders import jsonable_encoder
 from benchmark_service import submission_artifacts
 from benchmark_service.base import BenchmarkService
 from benchmark_service.sandbox import (
-    ComposeSandbox,
     ComposeSource,
     Resources,
     Sandbox,
     SandboxCreateRequest,
     SandboxProvider,
-    SandboxSource,
     SnapshotSource,
 )
+from benchmark_service.sandbox.types import BaseSandboxSource
 from benchmark_service.schemas import (
     ArtifactGradingSubmission,
     EvalMode,
@@ -175,7 +174,7 @@ def _sandbox_name(run_id: str, task_id: str) -> str:
 class _ResolvedSpec:
     """The task's eval-sandbox spec with generation-value fallbacks applied."""
 
-    source: SandboxSource
+    source: BaseSandboxSource
     resources: Resources
     network_block_all: bool
     grade_timeout: float
@@ -183,11 +182,15 @@ class _ResolvedSpec:
 
 def _resolve_grading_spec(task: RetrieveTaskResponse) -> _ResolvedSpec:
     spec = task.eval_sandbox
+    source = spec.source if spec is not None and spec.source is not None else task.source
+    if isinstance(source, ComposeSource):
+        raise ValueError(
+            "sandbox grading does not support ComposeSource; set eval_sandbox.source to an image or snapshot"
+        )
     if spec is None:
-        return _ResolvedSpec(task.source, task.resources, True, DEFAULT_GRADE_TIMEOUT_S)
+        return _ResolvedSpec(source, task.resources, True, DEFAULT_GRADE_TIMEOUT_S)
 
-    source = spec.source if spec.source is not None else task.source
-    if spec.resources is not None and _is_snapshot_backed(source):
+    if spec.resources is not None and isinstance(source, SnapshotSource):
         raise ValueError(
             "eval_sandbox.resources cannot override a snapshot-backed sandbox; use an image source with explicit resources"
         )
@@ -197,12 +200,6 @@ def _resolve_grading_spec(task: RetrieveTaskResponse) -> _ResolvedSpec:
         network_block_all=spec.network_block_all,
         grade_timeout=spec.timeout_s if spec.timeout_s is not None else DEFAULT_GRADE_TIMEOUT_S,
     )
-
-
-def _is_snapshot_backed(source: SandboxSource) -> bool:
-    if isinstance(source, SnapshotSource):
-        return True
-    return isinstance(source, ComposeSource) and isinstance(source.outer, SnapshotSource)
 
 
 async def _materialize_artifact(
@@ -252,12 +249,7 @@ class _GradeRun:
         )
 
     async def create_sandbox(self, spec: _ResolvedSpec, budget_s: float) -> Sandbox:
-        request = self.create_request(spec, budget_s)
-        compose_source = spec.source if isinstance(spec.source, ComposeSource) else None
-        if compose_source is not None:
-            request = request.model_copy(update={"source": compose_source.outer})
-        sandbox = await self.provider.create_sandbox(request)
-        return ComposeSandbox(sandbox, compose_source) if compose_source is not None else sandbox
+        return await self.provider.create_sandbox(self.create_request(spec, budget_s))
 
     async def prepare_sandbox(self, sandbox: Sandbox) -> None:
         if isinstance(self.submission, ArtifactGradingSubmission):

@@ -6,6 +6,7 @@ import asyncio
 import json
 import re
 from collections.abc import AsyncGenerator, Generator, Mapping
+from threading import Event
 from typing import Any
 from unittest.mock import patch
 
@@ -15,7 +16,6 @@ from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
 from benchmark_service import (
-    ComposeSandbox,
     ComposeSource,
     ImageSource,
     ModalProviderConfig,
@@ -294,9 +294,22 @@ async def test_grade_instance_applies_benchmark_declared_eval_sandbox_spec() -> 
     assert create.env_vars == {}
 
 
-class ComposeSpecStub(SandboxStub):
-    saw_compose_sandbox = False
+class ComposeGenerationSourceStub(SandboxStub):
+    async def retrieve_task(
+        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+    ) -> Any:
+        task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
+        return task.model_copy(
+            update={
+                "source": ComposeSource(
+                    outer=ImageSource(image="docker:28-dind"),
+                    service="main",
+                )
+            }
+        )
 
+
+class ComposeGenerationWithEvalOverrideStub(ComposeGenerationSourceStub):
     async def retrieve_task(
         self, task_id: str, skip_validation: bool = False, dataset: str | None = None
     ) -> Any:
@@ -304,39 +317,33 @@ class ComposeSpecStub(SandboxStub):
         return task.model_copy(
             update={
                 "eval_sandbox": EvalSandboxSpec(
-                    source=ComposeSource(
-                        outer=ImageSource(image="docker:28-dind"),
-                        service="grader",
-                    )
+                    source=ImageSource(image="grader:1.0"),
                 )
             }
         )
 
-    async def prepare_grading_sandbox(
-        self,
-        sandbox: Sandbox,
-        submission: GradingSubmission,
-        dataset: str | None = None,
-    ) -> None:
-        assert isinstance(sandbox, ComposeSandbox)
-        self.saw_compose_sandbox = True
 
-    async def evaluate_instance(  # type: ignore[override]
-        self, task_id: str, sandbox: Sandbox, dataset: str | None = None
-    ) -> AsyncGenerator[StreamChunk, None]:
-        assert isinstance(sandbox, ComposeSandbox)
-        yield StreamResultChunk(type="result", data={"resolved": True})
-
-
-async def test_grade_instance_unwraps_and_rewraps_compose_source() -> None:
-    service = await ComposeSpecStub.create()
+async def test_grade_instance_uses_eval_override_for_compose_generation_source() -> None:
+    service = await ComposeGenerationWithEvalOverrideStub.create()
     provider = FakeProvider(FakeSandbox())
 
     resp = await _grade(service, provider)
 
     assert resp.status == V1EvalStatus.EVALUATED
-    assert service.saw_compose_sandbox is True
-    assert provider.created[0].source == ImageSource(image="docker:28-dind")
+    assert provider.created[0].source == ImageSource(image="grader:1.0")
+
+
+async def test_grade_instance_rejects_compose_generation_source_without_eval_override() -> None:
+    service = await ComposeGenerationSourceStub.create()
+    provider = FakeProvider(FakeSandbox())
+
+    resp = await _grade(service, provider)
+
+    assert resp.status == V1EvalStatus.ERROR
+    assert resp.errors == [
+        "sandbox grading does not support ComposeSource; set eval_sandbox.source to an image or snapshot"
+    ]
+    assert provider.created == []
 
 
 class SnapshotResourceSpecStub(SandboxStub):
@@ -511,6 +518,16 @@ async def _event_set(event: asyncio.Event, timeout: float = 0.2) -> bool:
     if waiter not in done:
         waiter.cancel()
         return False
+    return True
+
+
+async def _thread_event_set(event: Event, timeout: float = 0.2) -> bool:
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while not event.is_set():
+        if loop.time() >= deadline:
+            return False
+        await asyncio.sleep(0.001)
     return True
 
 
@@ -1032,6 +1049,82 @@ async def test_v1_evaluate_bounds_artifact_preflight_with_grading_admission(
         first_response = await first_evaluation
     assert first_response.status == V1EvalStatus.EVALUATED
     assert first_response.result == {"resolved": True, "weighted_pass_percentage": 100.0}
+
+
+@pytest.mark.parametrize("operation", ["stat", "download"])
+async def test_canceled_artifact_storage_worker_keeps_grading_admission(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+) -> None:
+    key = "submission-artifacts/acme/default/external-run-1/task-1/answer.bin"
+    reference = SubmissionArtifactReference(key=key, size_bytes=1, etag='"etag-1"')
+    worker_started = Event()
+    release_worker = Event()
+
+    def wait_for_release() -> None:
+        worker_started.set()
+        if not release_worker.wait(timeout=1):
+            raise RuntimeError("test did not release artifact storage worker")
+
+    def blocking_stat(k: str, tenant: str) -> SubmissionArtifactReference:
+        assert (k, tenant) == (key, "acme")
+        wait_for_release()
+        return reference
+
+    def blocking_download(
+        artifact_reference: SubmissionArtifactReference,
+        tenant: str,
+    ) -> bytes:
+        assert artifact_reference is reference
+        assert tenant == "acme"
+        wait_for_release()
+        raise RuntimeError("late artifact storage failure")
+
+    if operation == "stat":
+        monkeypatch.setattr(grading.submission_artifacts, "_stat_sync", blocking_stat)
+    else:
+        monkeypatch.setattr(grading.submission_artifacts, "_download_sync", blocking_download)
+
+    async def run_storage_operation() -> None:
+        if operation == "stat":
+            await grading.submission_artifacts.stat(key, tenant="acme")
+        else:
+            await grading.submission_artifacts.download(reference, tenant="acme")
+
+    admission = _GradingAdmission(
+        max_concurrency=1,
+        max_queued=0,
+        max_admitted_per_tenant=1,
+        queue_timeout_s=0.01,
+    )
+
+    async def admitted_storage_operation() -> None:
+        async with admission.acquire(("acme", "run-1", "task-1")):
+            await run_storage_operation()
+
+    storage_task = asyncio.create_task(admitted_storage_operation())
+    try:
+        assert await _thread_event_set(worker_started)
+        storage_task.cancel()
+        await asyncio.sleep(0)
+        storage_task.cancel()
+        await asyncio.sleep(0)
+
+        assert not storage_task.done()
+        with pytest.raises(_GradingCapacityExceeded):
+            async with admission.acquire(("other", "run-2", "task-2")):
+                pass
+
+        release_worker.set()
+        with pytest.raises(asyncio.CancelledError):
+            await storage_task
+        async with admission.acquire(("acme", "run-1", "task-1")):
+            pass
+    finally:
+        release_worker.set()
+        if not storage_task.done():
+            storage_task.cancel()
+        await asyncio.gather(storage_task, return_exceptions=True)
 
 
 def test_v1_evaluate_artifact_missing_returns_404_before_any_sandbox(

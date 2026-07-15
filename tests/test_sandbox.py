@@ -1226,7 +1226,7 @@ async def test_daytona_provider_delete_removes_sandbox_that_fails_after_refresh(
     assert daytona.deleted is True
 
 
-@pytest.mark.parametrize("state", [SandboxState.STOPPED, SandboxState.ARCHIVED])
+@pytest.mark.parametrize("state", [SandboxState.STOPPED, SandboxState.ARCHIVED, SandboxState.PAUSED])
 async def test_daytona_provider_delete_removes_inactive_sandbox_without_starting(state: SandboxState) -> None:
     inner = InactiveSandbox(state)
     daytona = DaytonaClient(inner)

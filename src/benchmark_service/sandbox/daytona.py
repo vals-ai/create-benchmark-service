@@ -19,6 +19,9 @@ from daytona import (
     SandboxState,
 )
 from daytona import (
+    GpuType,
+)
+from daytona import (
     Resources as DaytonaResources,
 )
 from daytona.common.errors import (
@@ -111,6 +114,19 @@ class DaytonaProviderConfig(BaseModel):
 
     def create_provider(self) -> SandboxProvider:
         return DaytonaSandboxProvider(self)
+
+
+def _daytona_gpu_type(gpu_type: str | None) -> GpuType | None:
+    if gpu_type is None:
+        return None
+    try:
+        member = GpuType(gpu_type)
+    except ValueError:
+        member = GpuType.UNKNOWN_DEFAULT_OPEN_API
+    if member is GpuType.UNKNOWN_DEFAULT_OPEN_API:
+        supported = ", ".join(t.value for t in GpuType if t is not GpuType.UNKNOWN_DEFAULT_OPEN_API)
+        raise SandboxError(f"Unsupported Daytona GPU type: {gpu_type}. Supported types: {supported}")
+    return member
 
 
 def _get_config_header(headers: Mapping[str, str], *names: str) -> str | None:
@@ -499,6 +515,8 @@ class DaytonaSandboxProvider(SandboxProvider):
             cpu=request.resources.vcpu,
             memory=request.resources.memory,
             disk=request.resources.disk,
+            gpu=request.resources.gpu or None,
+            gpu_type=_daytona_gpu_type(request.resources.gpu_type),
         )
 
         match request.source:
@@ -514,6 +532,8 @@ class DaytonaSandboxProvider(SandboxProvider):
                     env_vars=request.env_vars,
                 )
             case SnapshotSource(snapshot=snapshot):
+                if request.resources.gpu:
+                    raise SandboxError("Daytona snapshot sandboxes use the snapshot's resources; GPUs cannot be requested")
                 params = CreateSandboxFromSnapshotParams(
                     auto_stop_interval=request.auto_stop_interval,
                     auto_delete_interval=0,

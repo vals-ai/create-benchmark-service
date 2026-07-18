@@ -147,10 +147,13 @@ class FlakyExecSandbox(FakeInnerSandbox):
         return await super()._exec(*args, text=text, env=env)
 
 
-def _request(source: ImageSource | SnapshotSource | None = None) -> SandboxCreateRequest:
+def _request(
+    source: ImageSource | SnapshotSource | None = None,
+    resources: Resources | None = None,
+) -> SandboxCreateRequest:
     return SandboxCreateRequest(
         source=source or ImageSource(image="python:3.12"),
-        resources=Resources(vcpu=4, memory=8, disk=30),
+        resources=resources or Resources(vcpu=4, memory=8, disk=30),
         name="task-1",
         labels={"run_id": "r1"},
         env_vars={"FOO": "bar"},
@@ -407,6 +410,32 @@ async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> N
     # Nested-Docker capability is requested unconditionally, matching Daytona
     # sandboxes which always support it.
     assert captured["experimental_options"] == {"enable_docker": True}
+    assert captured["gpu"] is None
+
+
+async def test_create_sandbox_maps_gpu_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    inner = FakeInnerSandbox()
+    captured: dict[str, Any] = {}
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return inner
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    await provider.create_sandbox(_request(resources=Resources(vcpu=4, memory=8, disk=30, gpu=2, gpu_type="H100")))
+
+    assert captured["gpu"] == "H100:2"
+
+
+async def test_create_sandbox_requires_gpu_type_for_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        raise AssertionError("create should not be called")
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    with pytest.raises(SandboxError, match="requires gpu_type"):
+        await provider.create_sandbox(_request(resources=Resources(vcpu=4, memory=8, disk=30, gpu=1)))
 
 
 async def test_create_sandbox_uses_modal_safe_name(monkeypatch: pytest.MonkeyPatch) -> None:

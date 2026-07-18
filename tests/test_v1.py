@@ -208,7 +208,10 @@ def test_v1_evaluate_evaluator_version_honors_service_override(
 ) -> None:
     """evaluator_version must reflect BenchmarkService.get_service_version(), the
     same override /version honors, not just the installed distribution version."""
-    monkeypatch.setattr(StubBenchmark, "get_service_version", lambda self: "git-sha-abc123")
+    def stub_version(self: object) -> str:
+        return "git-sha-abc123"
+
+    monkeypatch.setattr(StubBenchmark, "get_service_version", stub_version)
 
     resp = descope_client.post(
         "/v1/evaluate",

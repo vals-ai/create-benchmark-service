@@ -203,6 +203,27 @@ def test_v1_evaluate_returns_evaluated_envelope_for_text_payload(descope_client:
     assert body["result"] == {"resolved": True}
 
 
+def test_v1_evaluate_evaluator_version_honors_service_override(
+    descope_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """evaluator_version must reflect BenchmarkService.get_service_version(), the
+    same override /version honors, not just the installed distribution version."""
+    monkeypatch.setattr(StubBenchmark, "get_service_version", lambda self: "git-sha-abc123")
+
+    resp = descope_client.post(
+        "/v1/evaluate",
+        json={
+            "run_id": "r-override",
+            "task_id": "task-1",
+            "dataset": "default",
+            "payload": {"type": "text", "schema": "stub.text.v1", "data": "2"},
+        },
+        headers={"x-descope-api-key": "key-acme"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["evaluator_version"] == "git-sha-abc123"
+
+
 def test_v1_evaluate_serializes_pydantic_result(
     descope_client: TestClient, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

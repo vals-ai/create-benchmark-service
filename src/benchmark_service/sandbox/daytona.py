@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import shlex
 import uuid
+from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import suppress
 from typing import Any, Literal
@@ -52,6 +53,7 @@ from benchmark_service.sandbox.types import (
 
 _PTY_STATUS_CHECK_ATTEMPTS = 30
 _PTY_STATUS_POLL_SECONDS = 5
+_PTY_STDOUT_TAIL_MAX_BYTES = 64 * 1024
 _STATUS_DIR = "/tmp/.sandbox-provider"
 _REMOVED_SANDBOX_STATES = (SandboxState.DESTROYING, SandboxState.DESTROYED)
 _FAILED_SANDBOX_STATES = (SandboxState.ERROR, SandboxState.BUILD_FAILED)
@@ -325,6 +327,14 @@ class DaytonaSandbox(Sandbox):
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
 
+    async def stream_download(self, remote_path: str) -> AsyncGenerator[bytes, None]:
+        try:
+            stream = await self._sandbox.fs.download_file_stream(remote_path)
+            async for chunk in stream:
+                yield chunk
+        except _SANDBOX_OPERATION_ERRORS as exc:
+            raise self._sandbox_error(exc) from exc
+
     @_PROVIDER_RETRY
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
         network_allow_list, domain_allow_list = _resolve_daytona_allowed_addresses(allowed_addresses)
@@ -351,13 +361,21 @@ class DaytonaSandbox(Sandbox):
     async def _exec_pty(self, command: str, output: asyncio.Queue[str], env_vars: dict[str, str]) -> ExecResult:
         session_id = f"{self.id}:exec-{uuid.uuid4().hex}"
         status_path = f"{_STATUS_DIR}/{uuid.uuid4().hex}.status"
-        stdout: list[str] = []
+        # Keep only a bounded tail of the output for the ExecResult; the full stream is
+        # forwarded through the queue, so retaining it all would grow without limit on
+        # long-running, chatty commands.
+        stdout: deque[str] = deque()
+        stdout_bytes = 0
         handle: AsyncPtyHandle | None = None
         wait_task: asyncio.Task[PtyResult] | None = None
 
         async def on_data(data: bytes) -> None:
+            nonlocal stdout_bytes
             text = data.decode("utf-8", errors="replace")
             stdout.append(text)
+            stdout_bytes += len(text)
+            while stdout_bytes > _PTY_STDOUT_TAIL_MAX_BYTES and len(stdout) > 1:
+                stdout_bytes -= len(stdout.popleft())
             output.put_nowait(text)
 
         try:

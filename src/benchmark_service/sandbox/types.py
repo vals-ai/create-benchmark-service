@@ -135,6 +135,14 @@ class Sandbox(ABC):
     @abstractmethod
     async def download_file(self, remote_path: str) -> bytes: ...
 
+    async def stream_download(self, remote_path: str) -> AsyncGenerator[bytes, None]:
+        """Stream a file's content in chunks without buffering the whole file in memory.
+
+        Providers that support chunked reads should override this; the default falls back
+        to a full in-memory download.
+        """
+        yield await self.download_file(remote_path)
+
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
         raise SandboxError("Sandbox provider does not support modifying egress rules")
 

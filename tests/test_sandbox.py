@@ -30,7 +30,12 @@ from benchmark_service.sandbox import (
     SandboxNotFoundError,
     SandboxQuery,
 )
-from benchmark_service.sandbox.daytona import DaytonaSandbox, DaytonaSandboxProvider, daytona_retry_after_seconds
+from benchmark_service.sandbox.daytona import (
+    _PTY_STDOUT_TAIL_MAX_BYTES,  # pyright: ignore[reportPrivateUsage]
+    DaytonaSandbox,
+    DaytonaSandboxProvider,
+    daytona_retry_after_seconds,
+)
 
 
 def _client_response_error(status: int, message: str) -> ClientResponseError:
@@ -265,6 +270,31 @@ class CrashingReconnectProcess(ReconnectingProcess):
     async def get_pty_session_info(self, session_id: str) -> SimpleNamespace:
         self._sandbox.state = SandboxState.DESTROYED
         raise DaytonaConnectionError("toolbox unreachable")
+
+
+class FloodingPtyHandle(PtyHandle):
+    async def send_input(self, data: str) -> None:
+        self.inputs.append(data)
+        if data.startswith("stty"):
+            return
+        for index in range(200):
+            result = self._on_data(f"chunk-{index:04d}-".encode() + b"x" * 1024)
+            if result is not None:
+                await result
+
+
+class FloodingProcess(Process):
+    async def create_pty_session(
+        self,
+        *,
+        id: str,
+        on_data: Callable[[bytes], None | Awaitable[None]],
+        envs: dict[str, str],
+    ) -> PtyHandle:
+        assert id
+        self.pty_envs = envs
+        self.pty_handle = FloodingPtyHandle(on_data)
+        return self.pty_handle
 
 
 class BlockingPtyHandle(PtyHandle):
@@ -650,6 +680,19 @@ async def test_compose_sandbox_routes_operations_through_main_service() -> None:
     assert downloaded == b"downloaded"
 
 
+async def test_compose_stream_download_streams_from_outer_and_cleans_temp() -> None:
+    outer = RecordingSandbox()
+    source = ComposeSource(outer=ImageSource(image="img"), service="main")
+    sandbox = ComposeSandbox(outer, source)
+
+    chunks = [chunk async for chunk in sandbox.stream_download("/workspace/reward.json")]
+
+    assert chunks == [b"downloaded"]
+    download_temp = outer.downloads[0]
+    assert download_temp.startswith("/var/tmp/compose-download-")
+    assert outer.exec_commands[-1] == f"rm -f {download_temp}"
+
+
 async def test_compose_command_rejects_invalid_environment_names_before_outer_call() -> None:
     outer = RecordingSandbox()
     sandbox = ComposeSandbox(
@@ -882,6 +925,47 @@ async def test_daytona_download_file_streams_content() -> None:
     sandbox = DaytonaSandbox(cast(Any, InnerSandbox()))
 
     assert await sandbox.download_file("/tmp/result.txt") == b"hello world"
+
+
+async def test_daytona_stream_download_yields_chunks() -> None:
+    sandbox = DaytonaSandbox(cast(Any, InnerSandbox()))
+
+    chunks = [chunk async for chunk in sandbox.stream_download("/tmp/result.txt")]
+
+    assert chunks == [b"hello", b" world"]
+
+
+async def test_daytona_stream_download_raises_sandbox_not_found_when_removed() -> None:
+    inner = InnerSandbox()
+    inner.fs = RemovedSandboxFiles()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxNotFoundError, match="Sandbox not found: name=sandbox-name, id=sandbox-id\\."):
+        _ = [chunk async for chunk in sandbox.stream_download("/tmp/result.txt")]
+
+
+async def test_daytona_pty_caps_result_output_without_dropping_streamed_chunks() -> None:
+    """The PTY exec result should retain only a bounded output tail.
+
+    Test cases:
+    - Every chunk is still forwarded to the streaming queue.
+    - ExecResult.output is capped near the tail limit and keeps the newest output.
+    """
+    inner = InnerSandbox()
+    inner.process = FloodingProcess()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+    queue: asyncio.Queue[str] = asyncio.Queue()
+
+    result = await sandbox._exec_pty("noisy", queue, {})  # pyright: ignore[reportPrivateUsage]
+
+    chunk_length = 1024 + len("chunk-0000-")
+    total_streamed = 0
+    while not queue.empty():
+        total_streamed += len(queue.get_nowait())
+    assert total_streamed == 200 * chunk_length
+    assert len(result.output) <= _PTY_STDOUT_TAIL_MAX_BYTES + chunk_length
+    assert "chunk-0199-" in result.output
+    assert "chunk-0000-" not in result.output
 
 
 async def test_daytona_command_streams_output() -> None:

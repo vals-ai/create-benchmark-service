@@ -25,11 +25,13 @@ from benchmark_service.sandbox import (
     ImageSource,
     Resources,
     Sandbox,
+    SandboxConnectionError,
     SandboxCreateRequest,
     SandboxError,
     SandboxNotFoundError,
     SandboxQuery,
 )
+from tenacity import wait_fixed
 from benchmark_service.sandbox.daytona import DaytonaSandbox, DaytonaSandboxProvider, daytona_retry_after_seconds
 
 
@@ -138,6 +140,20 @@ class MisclassifiedTransportProcess(Process):
         return await super().exec(command)
 
 
+class ContainerIpProcess(Process):
+    """First exec fails with Daytona's 'failed to resolve container IP' runner race, then succeeds."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        self.attempts += 1
+        if self.attempts == 1:
+            raise DaytonaError("Failed to execute command: failed to resolve container IP after 3 attempts")
+        return await super().exec(command)
+
+
 class DetailedFailedExecuteCommandProcess(Process):
     def __init__(self) -> None:
         super().__init__()
@@ -151,6 +167,23 @@ class DetailedFailedExecuteCommandProcess(Process):
 class RemovedSandboxProcess(Process):
     async def exec(self, command: str) -> SimpleNamespace:
         raise DaytonaNotFoundError("sandbox not found")
+
+
+class HangingProcess(Process):
+    """Simulates a stalled Daytona toolbox connection: ``exec`` never completes.
+
+    Mirrors the production failure where the daytona SDK forwards ``_request_timeout=None`` and
+    aiohttp then disables the timeout entirely, so a stalled connection hangs the coroutine forever.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        self.attempts += 1
+        await asyncio.Event().wait()  # never resolves
+        raise AssertionError("unreachable")
 
 
 class PtyHandle:
@@ -793,6 +826,42 @@ async def test_daytona_exec_retries_failed_execute_command_errors() -> None:
 async def test_daytona_exec_retries_wrapped_connection_errors() -> None:
     inner = InnerSandbox()
     process = WrappedConnectionErrorProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    result = await sandbox.exec("pytest")
+
+    assert result.exit_code == 0
+    assert process.attempts == 2
+
+
+async def test_daytona_exec_bounds_hanging_toolbox_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stalled toolbox call must be bounded, converted to a retryable error, and retried.
+
+    Without the per-call timeout bound this coroutine would hang forever (the production stall).
+    The outer ``asyncio.wait_for`` guards the test itself so a regression fails fast instead of
+    hanging the suite.
+    """
+    import benchmark_service.sandbox.daytona as daytona_module
+
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(daytona_module, "_FIXED_PROVIDER_WAIT", wait_fixed(0))
+
+    inner = InnerSandbox()
+    process = HangingProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxConnectionError, match="timed out"):
+        await asyncio.wait_for(sandbox.exec("pytest"), timeout=5)
+
+    assert process.attempts == 3  # _PROVIDER_RETRY retried the bounded call before reraising
+
+
+async def test_daytona_exec_retries_container_ip_resolution_failures() -> None:
+    """Daytona 'failed to resolve container IP' runner races are transient and must be retried."""
+    inner = InnerSandbox()
+    process = ContainerIpProcess()
     inner.process = process
     sandbox = DaytonaSandbox(cast(Any, inner))
 

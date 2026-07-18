@@ -3,9 +3,9 @@ from __future__ import annotations
 import asyncio
 import shlex
 import uuid
-from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import suppress
-from typing import Any, Literal
+from typing import Any, Literal, TypeVar
 
 from aiohttp import ClientConnectionError, ClientResponseError
 from daytona import (
@@ -73,10 +73,86 @@ _TRANSPORT_ERROR_MESSAGES = (
     "failed to create sandbox: an unexpected error occurred.",
     "failed to register with sysbox-mgr",
     "server disconnected",
+    # The runner could not route to the sandbox container yet (networking race while the container
+    # finishes booting). Daytona's own internal retries ("after N attempts") are exhausted, but a
+    # fresh sandbox operation usually succeeds, so treat it as transient and let _PROVIDER_RETRY run.
+    "failed to resolve container ip",
 )
 _RETRYABLE_DAYTONA_CAUSES = (ClientConnectionError, ConnectionError, TimeoutError)
 _FIXED_PROVIDER_WAIT = wait_fixed(2)
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
+
+# Hard ceiling for a single Daytona toolbox / control-plane HTTP round trip. The daytona SDK
+# forwards ``_request_timeout=None`` to aiohttp when no timeout is supplied, and aiohttp treats an
+# explicit ``None`` as ``ClientTimeout(total=None)`` -> the request never times out. A stalled
+# connection to the Daytona toolbox then hangs the coroutine forever (no exception is ever raised,
+# so ``_PROVIDER_RETRY`` never fires and the run stalls IN_PROGRESS). Bounding each individual call
+# turns that silent hang into a retryable ``SandboxConnectionError``. This bounds ONE round trip,
+# not a whole command, so long-running agent PTY streaming (polled via ``handle.wait()``) is
+# unaffected.
+_TOOLBOX_CALL_TIMEOUT_SECONDS = 120.0
+
+# Ceiling for waiting on a sandbox to reach the "started" state. Sandbox START is provisioning
+# (snapshot pull + container create) and legitimately takes far longer than a normal toolbox round
+# trip, so it gets its own, much larger bound rather than reusing ``_TOOLBOX_CALL_TIMEOUT_SECONDS``
+# (which would abort healthy slow snapshot pulls). It still must be FINITE: the Daytona SDK's
+# ``wait_for_sandbox_start(timeout=0)`` means "no timeout" and polls ``refresh_data()`` forever, so a
+# sandbox wedged in a non-started / non-error state (e.g. stuck ``pulling_snapshot`` / ``creating``)
+# would otherwise hang ``delete_sandbox`` / ``_find_reusable_sandbox`` indefinitely -- and because
+# those run inside ``_PROVIDER_RETRY``, tenacity never fires. Bounding the wait converts a wedged
+# start into a retryable ``SandboxConnectionError``. 600s comfortably exceeds a normal provisioning
+# window (the create path's ``create_timeout`` default is ~360s) while still catching a true hang.
+_SANDBOX_START_TIMEOUT_SECONDS = 600.0
+
+_T = TypeVar("_T")
+
+
+async def _bounded(description: str, awaitable: Awaitable[_T], timeout: float | None) -> _T:
+    """Await ``awaitable`` with a hard timeout, converting a stall into a retryable error.
+
+    A numeric ``timeout`` bounds one HTTP round trip: on expiry the resulting ``TimeoutError`` is
+    converted to ``SandboxConnectionError`` so the enclosing ``_PROVIDER_RETRY`` retries the call
+    instead of the coroutine hanging forever. A ``timeout`` of ``None`` means "no bound" -- the
+    awaitable runs to completion. This is used only for command-carrying ``process.exec`` calls with
+    no caller-supplied command timeout, where the HTTP request legitimately stays open for the whole
+    (potentially very long) in-sandbox command runtime; capping those would abort legitimate long
+    builds/installs/tests. Short control-plane / toolbox / poll-loop calls always pass a numeric
+    timeout and therefore stay bounded.
+    """
+    if timeout is None:
+        return await awaitable
+    try:
+        async with asyncio.timeout(timeout):
+            return await awaitable
+    except TimeoutError as exc:
+        raise SandboxConnectionError(f"Daytona call timed out after {timeout:g}s: {description}") from exc
+
+
+async def _collect_sandboxes(sandboxes: AsyncIterator[AsyncSandbox]) -> list[AsyncSandbox]:
+    return [sandbox async for sandbox in sandboxes]
+
+
+def _exec_transport_timeout(command_timeout: float | None) -> float | None:
+    """Transport ceiling for a command-carrying ``process.exec`` call.
+
+    Daytona's ``process.exec`` holds the HTTP request open for the entire in-sandbox command runtime,
+    so the transport bound effectively bounds the command itself. Two cases:
+
+    * ``command_timeout`` supplied -> the in-sandbox ``timeout`` shell wrapper (see ``_command``)
+      enforces the real limit, so we allow that runtime plus a generous network margin.
+    * ``command_timeout is None`` (the public ``Sandbox.exec`` default) -> the command is
+      intentionally unbounded, so we return ``None`` (no transport bound). Returning a fixed ceiling
+      here would silently abort and retry a legitimately long setup/build/test command after the
+      ceiling elapsed.
+
+    Short control-plane probes (``test -e`` / ``cat`` / ``rm`` in the PTY poll loop, egress updates,
+    ``refresh_data``, PTY session setup, etc.) do NOT go through this helper: they pass
+    ``_TOOLBOX_CALL_TIMEOUT_SECONDS`` to ``_bounded`` directly and stay bounded, because a stalled
+    control-plane call is the silent-stall vector this fix targets.
+    """
+    if command_timeout is None:
+        return None
+    return command_timeout + _TOOLBOX_CALL_TIMEOUT_SECONDS
 
 
 def _pty_result_summary(result: PtyResult | None) -> str:
@@ -271,9 +347,26 @@ class DaytonaSandbox(Sandbox):
         cwd: str | None = None,
         timeout: float | None = None,
     ) -> ExecResult:
-        full_command = _command(command, cwd, timeout)
+        # An untimed command is intentionally unbounded at the transport layer (``timeout=None`` ->
+        # ``_exec_transport_timeout`` returns ``None``) so long builds/installs/tests can run to
+        # completion; an explicit ``timeout`` bounds the round trip at that runtime plus a margin.
+        return await self._run_exec(_command(command, cwd, timeout), _exec_transport_timeout(timeout))
+
+    @_PROVIDER_RETRY
+    async def _control_exec(self, command: str) -> ExecResult:
+        """Run a short internal control-plane probe (``test -e`` / ``cat`` / ``rm`` in the PTY poll
+        loop) with a hard transport bound.
+
+        Unlike the public :meth:`exec` -- which leaves an untimed command unbounded so long agent
+        commands are not cut off -- these probes MUST stay bounded at ``_TOOLBOX_CALL_TIMEOUT_SECONDS``:
+        they fire every ``_PTY_STATUS_POLL_SECONDS`` and a stalled probe is exactly the silent
+        IN_PROGRESS hang this fix targets.
+        """
+        return await self._run_exec(_command(command, None, None), _TOOLBOX_CALL_TIMEOUT_SECONDS)
+
+    async def _run_exec(self, full_command: str, transport_timeout: float | None) -> ExecResult:
         try:
-            result = await self._sandbox.process.exec(full_command)
+            result = await _bounded("process.exec", self._sandbox.process.exec(full_command), transport_timeout)
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
 
@@ -330,9 +423,13 @@ class DaytonaSandbox(Sandbox):
         network_allow_list, domain_allow_list = _resolve_daytona_allowed_addresses(allowed_addresses)
 
         try:
-            await self._sandbox.update_network_settings(
-                network_allow_list=",".join(network_allow_list),
-                domain_allow_list=",".join(domain_allow_list),
+            await _bounded(
+                "update_network_settings",
+                self._sandbox.update_network_settings(
+                    network_allow_list=",".join(network_allow_list),
+                    domain_allow_list=",".join(domain_allow_list),
+                ),
+                _TOOLBOX_CALL_TIMEOUT_SECONDS,
             )
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
@@ -340,10 +437,14 @@ class DaytonaSandbox(Sandbox):
     @_PROVIDER_RETRY
     async def clear_egress_rules(self) -> None:
         try:
-            await self._sandbox.update_network_settings(
-                network_block_all=False,
-                network_allow_list="",
-                domain_allow_list="",
+            await _bounded(
+                "update_network_settings",
+                self._sandbox.update_network_settings(
+                    network_block_all=False,
+                    network_allow_list="",
+                    domain_allow_list="",
+                ),
+                _TOOLBOX_CALL_TIMEOUT_SECONDS,
             )
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
@@ -362,9 +463,13 @@ class DaytonaSandbox(Sandbox):
 
         try:
             handle = await self._create_pty_session(session_id, on_data, env_vars)
-            await handle.send_input("stty -echo\n")
-            await handle.send_input(
-                f"mkdir -p {shlex.quote(_STATUS_DIR)}; {command}; echo $? > {shlex.quote(status_path)}; exit\n"
+            await _bounded("pty.send_input", handle.send_input("stty -echo\n"), _TOOLBOX_CALL_TIMEOUT_SECONDS)
+            await _bounded(
+                "pty.send_input",
+                handle.send_input(
+                    f"mkdir -p {shlex.quote(_STATUS_DIR)}; {command}; echo $? > {shlex.quote(status_path)}; exit\n"
+                ),
+                _TOOLBOX_CALL_TIMEOUT_SECONDS,
             )
             wait_task = asyncio.create_task(handle.wait())
 
@@ -372,7 +477,7 @@ class DaytonaSandbox(Sandbox):
             while True:
                 done, _ = await asyncio.wait({wait_task}, timeout=_PTY_STATUS_POLL_SECONDS)
                 await self._check_sandbox_alive()
-                result = await self.exec(f"test -e {shlex.quote(status_path)}")
+                result = await self._control_exec(f"test -e {shlex.quote(status_path)}")
                 if result.exit_code == 0:
                     break
 
@@ -394,11 +499,11 @@ class DaytonaSandbox(Sandbox):
                         f"Daytona PTY exited before writing command status for {self._sandbox_ref}: "
                         f"session_id={session_id}, {_pty_result_summary(wait_result)}"
                     )
-                await handle.disconnect()
+                await _bounded("pty.disconnect", handle.disconnect(), _TOOLBOX_CALL_TIMEOUT_SECONDS)
                 handle = await self._reconnect_pty(session_id, on_data, wait_result)
                 wait_task = asyncio.create_task(handle.wait())
 
-            result = await self.exec(f"cat {shlex.quote(status_path)}")
+            result = await self._control_exec(f"cat {shlex.quote(status_path)}")
             if result.exit_code != 0 or not result.output:
                 raise SandboxError(
                     f"Failed to read Daytona PTY exit code for {self._sandbox_ref}: status_path={status_path}"
@@ -413,11 +518,15 @@ class DaytonaSandbox(Sandbox):
                     await wait_task
             if handle:
                 with suppress(Exception):
-                    await handle.disconnect()
+                    await _bounded("pty.disconnect", handle.disconnect(), _TOOLBOX_CALL_TIMEOUT_SECONDS)
             with suppress(Exception):
-                await self._sandbox.process.kill_pty_session(session_id)
+                await _bounded(
+                    "pty.kill_pty_session",
+                    self._sandbox.process.kill_pty_session(session_id),
+                    _TOOLBOX_CALL_TIMEOUT_SECONDS,
+                )
             with suppress(Exception):
-                await self.exec(f"rm -f {shlex.quote(status_path)}")
+                await self._control_exec(f"rm -f {shlex.quote(status_path)}")
 
     @_PROVIDER_RETRY
     async def _create_pty_session(
@@ -427,10 +536,14 @@ class DaytonaSandbox(Sandbox):
         env_vars: dict[str, str],
     ) -> AsyncPtyHandle:
         try:
-            return await self._sandbox.process.create_pty_session(
-                id=session_id,
-                on_data=on_data,
-                envs={"TERM": "dumb", "LANG": "C.UTF-8", **env_vars},
+            return await _bounded(
+                "process.create_pty_session",
+                self._sandbox.process.create_pty_session(
+                    id=session_id,
+                    on_data=on_data,
+                    envs={"TERM": "dumb", "LANG": "C.UTF-8", **env_vars},
+                ),
+                _TOOLBOX_CALL_TIMEOUT_SECONDS,
             )
         except _SANDBOX_OPERATION_ERRORS as exc:
             await self._check_sandbox_alive()
@@ -444,8 +557,16 @@ class DaytonaSandbox(Sandbox):
         wait_result: PtyResult | None,
     ) -> AsyncPtyHandle:
         try:
-            await self._sandbox.process.get_pty_session_info(session_id)
-            return await self._sandbox.process.connect_pty_session(session_id, on_data)
+            await _bounded(
+                "process.get_pty_session_info",
+                self._sandbox.process.get_pty_session_info(session_id),
+                _TOOLBOX_CALL_TIMEOUT_SECONDS,
+            )
+            return await _bounded(
+                "process.connect_pty_session",
+                self._sandbox.process.connect_pty_session(session_id, on_data),
+                _TOOLBOX_CALL_TIMEOUT_SECONDS,
+            )
         except (DaytonaNotFoundError, DaytonaConnectionError) as exc:
             await self._check_sandbox_alive()
             if isinstance(exc, DaytonaNotFoundError) or "not found" in str(exc).lower():
@@ -461,7 +582,7 @@ class DaytonaSandbox(Sandbox):
     @_PROVIDER_RETRY
     async def _check_sandbox_alive(self) -> None:
         try:
-            await self._sandbox.refresh_data()
+            await _bounded("refresh_data", self._sandbox.refresh_data(), _TOOLBOX_CALL_TIMEOUT_SECONDS)
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
 
@@ -536,7 +657,7 @@ class DaytonaSandboxProvider(SandboxProvider):
 
     async def _find_reusable_sandbox(self, name: str) -> AsyncSandbox | None:
         try:
-            sandbox = await self._daytona.get(name)
+            sandbox = await _bounded("daytona.get", self._daytona.get(name), _TOOLBOX_CALL_TIMEOUT_SECONDS)
         except DaytonaNotFoundError:
             return None
         except DaytonaError as exc:
@@ -548,7 +669,11 @@ class DaytonaSandboxProvider(SandboxProvider):
                 return None
             if sandbox.state in (SandboxState.DESTROYING, SandboxState.DESTROYED, SandboxState.STOPPED):
                 return None
-            await sandbox.wait_for_sandbox_start(timeout=0)
+            await _bounded(
+                "wait_for_sandbox_start",
+                sandbox.wait_for_sandbox_start(timeout=0),
+                _SANDBOX_START_TIMEOUT_SECONDS,
+            )
             return sandbox
         except DaytonaError as exc:
             raise self._sandbox_error(exc) from exc
@@ -556,7 +681,9 @@ class DaytonaSandboxProvider(SandboxProvider):
     @_PROVIDER_RETRY
     async def get_sandbox(self, instance_id: str) -> DaytonaSandbox:
         try:
-            return DaytonaSandbox(await self._daytona.get(instance_id))
+            return DaytonaSandbox(
+                await _bounded("daytona.get", self._daytona.get(instance_id), _TOOLBOX_CALL_TIMEOUT_SECONDS)
+            )
         except DaytonaNotFoundError as exc:
             raise SandboxNotFoundError(f"Sandbox not found: id_or_name={instance_id}.") from exc
         except DaytonaError as exc:
@@ -565,14 +692,22 @@ class DaytonaSandboxProvider(SandboxProvider):
     @_PROVIDER_RETRY
     async def delete_sandbox(self, instance_id: str) -> None:
         try:
-            sandbox = await self._daytona.get(instance_id)
+            sandbox = await _bounded("daytona.get", self._daytona.get(instance_id), _TOOLBOX_CALL_TIMEOUT_SECONDS)
             if sandbox.state not in (*_REMOVED_SANDBOX_STATES, *_FAILED_SANDBOX_STATES):
-                await sandbox.wait_for_sandbox_start(timeout=0)
-                await sandbox.refresh_data()
+                await _bounded(
+                    "wait_for_sandbox_start",
+                    sandbox.wait_for_sandbox_start(timeout=0),
+                    _SANDBOX_START_TIMEOUT_SECONDS,
+                )
+                await _bounded("refresh_data", sandbox.refresh_data(), _TOOLBOX_CALL_TIMEOUT_SECONDS)
             if sandbox.state in _REMOVED_SANDBOX_STATES:
                 return
             if sandbox.state not in _FAILED_SANDBOX_STATES:
-                await sandbox.set_autostop_interval(interval=1)
+                await _bounded(
+                    "set_autostop_interval",
+                    sandbox.set_autostop_interval(interval=1),
+                    _TOOLBOX_CALL_TIMEOUT_SECONDS,
+                )
             await self._daytona.delete(sandbox)
         except DaytonaNotFoundError:
             return
@@ -593,7 +728,11 @@ class DaytonaSandboxProvider(SandboxProvider):
     async def _list_sandboxes(self, query: SandboxQuery) -> list[AsyncSandbox]:
         try:
             daytona_query = ListSandboxesQuery(labels=query.labels, limit=query.page_size)
-            return [sandbox async for sandbox in self._daytona.list(daytona_query)]
+            return await _bounded(
+                "daytona.list",
+                _collect_sandboxes(self._daytona.list(daytona_query)),
+                _TOOLBOX_CALL_TIMEOUT_SECONDS,
+            )
         except DaytonaError as exc:
             raise self._sandbox_error(exc) from exc
 

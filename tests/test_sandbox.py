@@ -25,11 +25,13 @@ from benchmark_service.sandbox import (
     ImageSource,
     Resources,
     Sandbox,
+    SandboxConnectionError,
     SandboxCreateRequest,
     SandboxError,
     SandboxNotFoundError,
     SandboxQuery,
 )
+from tenacity import wait_fixed
 from benchmark_service.sandbox.daytona import DaytonaSandbox, DaytonaSandboxProvider, daytona_retry_after_seconds
 
 
@@ -138,6 +140,20 @@ class MisclassifiedTransportProcess(Process):
         return await super().exec(command)
 
 
+class ContainerIpProcess(Process):
+    """First exec fails with Daytona's 'failed to resolve container IP' runner race, then succeeds."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        self.attempts += 1
+        if self.attempts == 1:
+            raise DaytonaError("Failed to execute command: failed to resolve container IP after 3 attempts")
+        return await super().exec(command)
+
+
 class DetailedFailedExecuteCommandProcess(Process):
     def __init__(self) -> None:
         super().__init__()
@@ -151,6 +167,58 @@ class DetailedFailedExecuteCommandProcess(Process):
 class RemovedSandboxProcess(Process):
     async def exec(self, command: str) -> SimpleNamespace:
         raise DaytonaNotFoundError("sandbox not found")
+
+
+class HangingProcess(Process):
+    """Simulates a stalled Daytona toolbox connection: ``exec`` never completes.
+
+    Mirrors the production failure where the daytona SDK forwards ``_request_timeout=None`` and
+    aiohttp then disables the timeout entirely, so a stalled connection hangs the coroutine forever.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        self.attempts += 1
+        await asyncio.Event().wait()  # never resolves
+        raise AssertionError("unreachable")
+
+
+class SlowSuccessProcess(Process):
+    """A command whose transport round trip outlasts the toolbox ceiling but still succeeds.
+
+    Daytona holds the ``process.exec`` HTTP request open for the whole in-sandbox command runtime, so
+    a legitimately long (untimed) command produces a long round trip. It must NOT be capped at the
+    control-plane ceiling.
+    """
+
+    def __init__(self, delay: float) -> None:
+        super().__init__()
+        self.delay = delay
+        self.attempts = 0
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        self.attempts += 1
+        await asyncio.sleep(self.delay)
+        return await super().exec(command)
+
+
+class HangingRefreshSandbox:
+    """Inner sandbox whose control-plane ``refresh_data`` stalls forever (the production hang)."""
+
+    id = "sandbox-id"
+    name = "sandbox-name"
+    state = SandboxState.STARTED
+
+    def __init__(self) -> None:
+        self.process = Process()
+        self.attempts = 0
+
+    async def refresh_data(self) -> None:
+        self.attempts += 1
+        await asyncio.Event().wait()  # never resolves
 
 
 class PtyHandle:
@@ -439,6 +507,24 @@ class ErrorStateSandbox(InnerSandbox):
 
     async def wait_for_sandbox_start(self, timeout: int) -> None:
         raise DaytonaError("sandbox failed to start")
+
+
+class HungStartInnerSandbox(InnerSandbox):
+    """A sandbox wedged mid-provisioning: ``wait_for_sandbox_start`` never returns.
+
+    The Daytona SDK's ``wait_for_sandbox_start(timeout=0)`` means "no timeout" and polls
+    ``refresh_data`` forever, so a sandbox stuck in a non-started/non-error state hangs the reuse and
+    delete paths indefinitely unless the wait is bounded.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.start_attempts = 0
+
+    async def wait_for_sandbox_start(self, timeout: int) -> None:
+        assert timeout == 0
+        self.start_attempts += 1
+        await asyncio.Event().wait()  # never resolves
 
 
 class RecreatedInnerSandbox(InnerSandbox):
@@ -738,7 +824,9 @@ async def test_daytona_command_wraps_shell_pipelines_when_timeout_is_set() -> No
     inner = InnerSandbox()
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    await sandbox.exec("container_id=$(docker compose ps -q main); cat /tmp/file | docker exec -i \"$container_id\" cat", timeout=60)
+    await sandbox.exec(
+        'container_id=$(docker compose ps -q main); cat /tmp/file | docker exec -i "$container_id" cat', timeout=60
+    )
 
     assert inner.process.command == (
         "timeout 60 sh -c "
@@ -793,6 +881,111 @@ async def test_daytona_exec_retries_failed_execute_command_errors() -> None:
 async def test_daytona_exec_retries_wrapped_connection_errors() -> None:
     inner = InnerSandbox()
     process = WrappedConnectionErrorProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    result = await sandbox.exec("pytest")
+
+    assert result.exit_code == 0
+    assert process.attempts == 2
+
+
+async def test_daytona_exec_with_timeout_bounds_hanging_toolbox_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stalled exec with an explicit command timeout must be bounded, retried, then reraised.
+
+    When the caller supplies a ``timeout`` the transport round trip is bounded (command runtime plus
+    a network margin), so a stall converts to a retryable ``SandboxConnectionError`` instead of
+    hanging forever. The outer ``asyncio.wait_for`` guards the test itself so a regression fails fast
+    instead of hanging the suite.
+    """
+    import benchmark_service.sandbox.daytona as daytona_module
+
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(daytona_module, "_FIXED_PROVIDER_WAIT", wait_fixed(0))
+
+    inner = InnerSandbox()
+    process = HangingProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxConnectionError, match="timed out"):
+        await asyncio.wait_for(sandbox.exec("pytest", timeout=0), timeout=5)
+
+    assert process.attempts == 3  # _PROVIDER_RETRY retried the bounded call before reraising
+
+
+async def test_daytona_exec_does_not_cap_untimed_long_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An untimed command must run to completion even when it outlasts the toolbox ceiling.
+
+    Daytona's ``process.exec`` holds the HTTP request open for the whole command runtime. With no
+    caller-supplied ``timeout`` the transport must stay unbounded so a legitimately long
+    setup/build/test command is not aborted (and re-executed up to three times) after the
+    control-plane ceiling elapses. The exec here sleeps well past the (tiny, monkeypatched) ceiling
+    and must still succeed on the first attempt.
+    """
+    import benchmark_service.sandbox.daytona as daytona_module
+
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(daytona_module, "_FIXED_PROVIDER_WAIT", wait_fixed(0))
+
+    inner = InnerSandbox()
+    process = SlowSuccessProcess(delay=0.2)
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    result = await asyncio.wait_for(sandbox.exec("sleep 999"), timeout=5)
+
+    assert result.exit_code == 0
+    assert process.attempts == 1  # not capped at the ceiling, not retried
+
+
+async def test_daytona_control_exec_bounds_hanging_toolbox_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Short internal control-plane probes stay bounded even without an explicit timeout.
+
+    The PTY poll loop fires ``test -e``/``cat``/``rm`` probes through ``_control_exec`` every few
+    seconds; a stalled probe is exactly the silent IN_PROGRESS hang this fix targets, so it must be
+    bounded and retried rather than left to hang forever like an untimed user command.
+    """
+    import benchmark_service.sandbox.daytona as daytona_module
+
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(daytona_module, "_FIXED_PROVIDER_WAIT", wait_fixed(0))
+
+    inner = InnerSandbox()
+    process = HangingProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxConnectionError, match="timed out"):
+        await asyncio.wait_for(sandbox._control_exec("test -e /tmp/x"), timeout=5)  # pyright: ignore[reportPrivateUsage]
+
+    assert process.attempts == 3
+
+
+async def test_daytona_check_sandbox_alive_bounds_hanging_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stalled control-plane ``refresh_data`` (the d935a496 / 7d5d7e63 stall vector) is bounded.
+
+    ``refresh_data`` is the 5-second liveness poll inside the PTY wait loop; if the toolbox stalls it
+    must convert to a retryable ``SandboxConnectionError`` instead of hanging the whole run.
+    """
+    import benchmark_service.sandbox.daytona as daytona_module
+
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(daytona_module, "_FIXED_PROVIDER_WAIT", wait_fixed(0))
+
+    inner = HangingRefreshSandbox()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxConnectionError, match="timed out"):
+        await asyncio.wait_for(sandbox._check_sandbox_alive(), timeout=5)  # pyright: ignore[reportPrivateUsage]
+
+    assert inner.attempts == 3
+
+
+async def test_daytona_exec_retries_container_ip_resolution_failures() -> None:
+    """Daytona 'failed to resolve container IP' runner races are transient and must be retried."""
+    inner = InnerSandbox()
+    process = ContainerIpProcess()
     inner.process = process
     sandbox = DaytonaSandbox(cast(Any, inner))
 
@@ -1087,6 +1280,48 @@ async def test_daytona_provider_reuses_started_sandbox() -> None:
 
     assert sandbox.id == inner.id
     assert daytona.created is False
+
+
+async def test_daytona_provider_reuse_bounds_hung_sandbox_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sandbox wedged mid-start must not hang the reuse path forever.
+
+    ``_find_reusable_sandbox`` waits for a provisioning sandbox to reach "started"; the SDK's
+    ``wait_for_sandbox_start(timeout=0)`` is infinite, so the wait must be bounded, converted to a
+    retryable ``SandboxConnectionError``, and retried by ``_PROVIDER_RETRY``.
+    """
+    import benchmark_service.sandbox.daytona as daytona_module
+
+    monkeypatch.setattr(daytona_module, "_SANDBOX_START_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(daytona_module, "_FIXED_PROVIDER_WAIT", wait_fixed(0))
+
+    inner = HungStartInnerSandbox()
+    daytona = DaytonaClient(inner)
+
+    with pytest.raises(SandboxConnectionError, match="timed out"):
+        await asyncio.wait_for(_provider(daytona).create_sandbox(_request(inner.name)), timeout=5)
+
+    assert inner.start_attempts == 3
+
+
+async def test_daytona_provider_delete_bounds_hung_sandbox_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sandbox wedged mid-start must not hang the delete path forever.
+
+    ``delete_sandbox`` waits for a non-terminal sandbox to reach "started" before tearing it down; the
+    infinite SDK wait must be bounded so a wedged provisioning state converts to a retryable
+    ``SandboxConnectionError`` instead of hanging inside ``_PROVIDER_RETRY``.
+    """
+    import benchmark_service.sandbox.daytona as daytona_module
+
+    monkeypatch.setattr(daytona_module, "_SANDBOX_START_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(daytona_module, "_FIXED_PROVIDER_WAIT", wait_fixed(0))
+
+    inner = HungStartInnerSandbox()
+    daytona = DaytonaClient(inner)
+
+    with pytest.raises(SandboxConnectionError, match="timed out"):
+        await asyncio.wait_for(_provider(daytona).delete_sandbox(inner.name), timeout=5)
+
+    assert inner.start_attempts == 3
 
 
 async def test_daytona_provider_delete_sets_autostop_before_delete() -> None:

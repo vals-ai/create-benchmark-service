@@ -92,6 +92,18 @@ _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
 # unaffected.
 _TOOLBOX_CALL_TIMEOUT_SECONDS = 120.0
 
+# Ceiling for waiting on a sandbox to reach the "started" state. Sandbox START is provisioning
+# (snapshot pull + container create) and legitimately takes far longer than a normal toolbox round
+# trip, so it gets its own, much larger bound rather than reusing ``_TOOLBOX_CALL_TIMEOUT_SECONDS``
+# (which would abort healthy slow snapshot pulls). It still must be FINITE: the Daytona SDK's
+# ``wait_for_sandbox_start(timeout=0)`` means "no timeout" and polls ``refresh_data()`` forever, so a
+# sandbox wedged in a non-started / non-error state (e.g. stuck ``pulling_snapshot`` / ``creating``)
+# would otherwise hang ``delete_sandbox`` / ``_find_reusable_sandbox`` indefinitely -- and because
+# those run inside ``_PROVIDER_RETRY``, tenacity never fires. Bounding the wait converts a wedged
+# start into a retryable ``SandboxConnectionError``. 600s comfortably exceeds a normal provisioning
+# window (the create path's ``create_timeout`` default is ~360s) while still catching a true hang.
+_SANDBOX_START_TIMEOUT_SECONDS = 600.0
+
 _T = TypeVar("_T")
 
 
@@ -657,7 +669,11 @@ class DaytonaSandboxProvider(SandboxProvider):
                 return None
             if sandbox.state in (SandboxState.DESTROYING, SandboxState.DESTROYED, SandboxState.STOPPED):
                 return None
-            await sandbox.wait_for_sandbox_start(timeout=0)
+            await _bounded(
+                "wait_for_sandbox_start",
+                sandbox.wait_for_sandbox_start(timeout=0),
+                _SANDBOX_START_TIMEOUT_SECONDS,
+            )
             return sandbox
         except DaytonaError as exc:
             raise self._sandbox_error(exc) from exc
@@ -678,7 +694,11 @@ class DaytonaSandboxProvider(SandboxProvider):
         try:
             sandbox = await _bounded("daytona.get", self._daytona.get(instance_id), _TOOLBOX_CALL_TIMEOUT_SECONDS)
             if sandbox.state not in (*_REMOVED_SANDBOX_STATES, *_FAILED_SANDBOX_STATES):
-                await sandbox.wait_for_sandbox_start(timeout=0)
+                await _bounded(
+                    "wait_for_sandbox_start",
+                    sandbox.wait_for_sandbox_start(timeout=0),
+                    _SANDBOX_START_TIMEOUT_SECONDS,
+                )
                 await _bounded("refresh_data", sandbox.refresh_data(), _TOOLBOX_CALL_TIMEOUT_SECONDS)
             if sandbox.state in _REMOVED_SANDBOX_STATES:
                 return

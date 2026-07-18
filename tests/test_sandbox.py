@@ -509,6 +509,24 @@ class ErrorStateSandbox(InnerSandbox):
         raise DaytonaError("sandbox failed to start")
 
 
+class HungStartInnerSandbox(InnerSandbox):
+    """A sandbox wedged mid-provisioning: ``wait_for_sandbox_start`` never returns.
+
+    The Daytona SDK's ``wait_for_sandbox_start(timeout=0)`` means "no timeout" and polls
+    ``refresh_data`` forever, so a sandbox stuck in a non-started/non-error state hangs the reuse and
+    delete paths indefinitely unless the wait is bounded.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.start_attempts = 0
+
+    async def wait_for_sandbox_start(self, timeout: int) -> None:
+        assert timeout == 0
+        self.start_attempts += 1
+        await asyncio.Event().wait()  # never resolves
+
+
 class RecreatedInnerSandbox(InnerSandbox):
     id = "recreated-sandbox-id"
 
@@ -1262,6 +1280,48 @@ async def test_daytona_provider_reuses_started_sandbox() -> None:
 
     assert sandbox.id == inner.id
     assert daytona.created is False
+
+
+async def test_daytona_provider_reuse_bounds_hung_sandbox_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sandbox wedged mid-start must not hang the reuse path forever.
+
+    ``_find_reusable_sandbox`` waits for a provisioning sandbox to reach "started"; the SDK's
+    ``wait_for_sandbox_start(timeout=0)`` is infinite, so the wait must be bounded, converted to a
+    retryable ``SandboxConnectionError``, and retried by ``_PROVIDER_RETRY``.
+    """
+    import benchmark_service.sandbox.daytona as daytona_module
+
+    monkeypatch.setattr(daytona_module, "_SANDBOX_START_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(daytona_module, "_FIXED_PROVIDER_WAIT", wait_fixed(0))
+
+    inner = HungStartInnerSandbox()
+    daytona = DaytonaClient(inner)
+
+    with pytest.raises(SandboxConnectionError, match="timed out"):
+        await asyncio.wait_for(_provider(daytona).create_sandbox(_request(inner.name)), timeout=5)
+
+    assert inner.start_attempts == 3
+
+
+async def test_daytona_provider_delete_bounds_hung_sandbox_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A sandbox wedged mid-start must not hang the delete path forever.
+
+    ``delete_sandbox`` waits for a non-terminal sandbox to reach "started" before tearing it down; the
+    infinite SDK wait must be bounded so a wedged provisioning state converts to a retryable
+    ``SandboxConnectionError`` instead of hanging inside ``_PROVIDER_RETRY``.
+    """
+    import benchmark_service.sandbox.daytona as daytona_module
+
+    monkeypatch.setattr(daytona_module, "_SANDBOX_START_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(daytona_module, "_FIXED_PROVIDER_WAIT", wait_fixed(0))
+
+    inner = HungStartInnerSandbox()
+    daytona = DaytonaClient(inner)
+
+    with pytest.raises(SandboxConnectionError, match="timed out"):
+        await asyncio.wait_for(_provider(daytona).delete_sandbox(inner.name), timeout=5)
+
+    assert inner.start_attempts == 3
 
 
 async def test_daytona_provider_delete_sets_autostop_before_delete() -> None:

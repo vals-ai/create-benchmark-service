@@ -111,6 +111,24 @@ class ComposeSandbox(Sandbox):
         finally:
             await self._outer.exec(shlex.join(["rm", "-f", temp]), timeout=10)
 
+    async def stream_download(self, remote_path: str) -> AsyncGenerator[bytes, None]:
+        temp = self._temp_path("compose-download", remote_path)
+        try:
+            read_file = shlex.quote(f"cat {shlex.quote(remote_path)}")
+            result = await self._outer.exec(
+                (
+                    f"{self._container_lookup()}; "
+                    f"docker exec \"$container_id\" sh -lc {read_file} > {shlex.quote(temp)}"
+                ),
+                timeout=60,
+            )
+            if result.exit_code != 0:
+                raise SandboxError(f"compose download failed: {result.output}")
+            async for chunk in self._outer.stream_download(temp):
+                yield chunk
+        finally:
+            await self._outer.exec(shlex.join(["rm", "-f", temp]), timeout=10)
+
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
         await self._outer.modify_egress_rules(allowed_addresses)
 

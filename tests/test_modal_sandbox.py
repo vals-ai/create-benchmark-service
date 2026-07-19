@@ -32,13 +32,13 @@ def _aio(fn: Any) -> SimpleNamespace:
     return SimpleNamespace(aio=fn)
 
 
-async def _chunks(*chunks: str) -> AsyncGenerator[str, None]:
+async def _chunks(*chunks: str | bytes) -> AsyncGenerator[str | bytes, None]:
     for chunk in chunks:
         yield chunk
 
 
 class FakeProcess:
-    def __init__(self, chunks: list[str], exit_code: int) -> None:
+    def __init__(self, chunks: list[str] | list[bytes], exit_code: int) -> None:
         self.stdout = _chunks(*chunks)
         self.wait = _aio(self._wait)
         self._exit_code = exit_code
@@ -350,6 +350,20 @@ async def test_download_file_returns_bytes() -> None:
 
     assert await sandbox.download_file("/tmp/out.bin") == b"data"
     assert inner.filesystem.reads == ["/tmp/out.bin"]
+
+
+async def test_stream_download_yields_chunks() -> None:
+    """Verify Modal file downloads stream binary chunks without buffering the whole file.
+
+    Test cases:
+    - Multiple binary chunks are yielded in order.
+    """
+    inner = FakeInnerSandbox(process=FakeProcess([b"hello", b" world"], 0), file_content=b"buffered fallback")
+    sandbox = _sandbox(inner)
+
+    chunks = [chunk async for chunk in sandbox.stream_download("/tmp/out.bin")]
+
+    assert chunks == [b"hello", b" world"]
 
 
 async def test_egress_rule_updates_replace_outbound_policy() -> None:

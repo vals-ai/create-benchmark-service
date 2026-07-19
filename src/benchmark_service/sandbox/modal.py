@@ -206,6 +206,26 @@ class ModalSandbox(Sandbox):
             raise _sandbox_error(exc) from exc
         return bytes(content)
 
+    async def stream_download(self, remote_path: str) -> AsyncGenerator[bytes, None]:
+        await self._raise_if_finished()
+        process = await self._start_download_process(remote_path)
+        try:
+            async for chunk in process.stdout:
+                yield bytes(chunk)
+            exit_code = await process.wait.aio()
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
+        if exit_code != 0:
+            await self._raise_if_finished(attempts=6, wait_seconds=0.5)
+            raise SandboxError(f"File download failed: path={remote_path}, exit_code={exit_code}.")
+
+    @_PROVIDER_RETRY
+    async def _start_download_process(self, remote_path: str) -> Any:
+        try:
+            return await self._sandbox.exec.aio("cat", "--", remote_path, text=False)
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
+
     async def _set_outbound_network_policy(self, cidrs: list[str], domains: list[str]) -> None:
         try:
             set_policy = cast(Any, self._sandbox)._experimental_set_outbound_network_policy

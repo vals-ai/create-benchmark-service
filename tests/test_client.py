@@ -4,6 +4,7 @@ import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
@@ -367,6 +368,54 @@ async def test_evaluate_response_omits_unspecified_provider_config(
         json={"task_id": "task-1", "response": "answer"},
         timeout=10,
     )
+
+
+async def test_evaluate_response_does_not_retry_read_timeout(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    """A ReadTimeout on the non-idempotent POST must NOT be retried.
+
+    Regression (launch-load): retrying /evaluate-response on ReadTimeout re-issued the
+    POST while the server was still processing a slow evaluation, launching up to 5
+    overlapping server-side evaluations (5x amplification). The request must be attempted
+    exactly once and the ReadTimeout surfaced.
+    """
+    client, mock_http = benchmark_client
+    mock_http.post = AsyncMock(side_effect=httpx.ReadTimeout("evaluation too slow"))
+
+    with pytest.raises(httpx.ReadTimeout):
+        await client.evaluate_response("task-1", "answer")
+
+    assert mock_http.post.call_count == 1
+
+
+async def test_evaluate_response_retries_connect_error(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    """Connection-phase failures are safe to retry: the request never reached the server.
+
+    A ConnectError (or ConnectTimeout / PoolTimeout) means no overlapping server-side
+    evaluation is possible, so evaluate_response should still retry these and succeed once
+    a connection is established.
+    """
+    client, mock_http = benchmark_client
+    mock_http.post = AsyncMock(
+        side_effect=[
+            httpx.ConnectError("connection refused"),
+            httpx.ConnectError("connection refused"),
+            _mock_response(json_data={"score": 1.0}),
+        ]
+    )
+
+    # Keep tenacity's backoff instant so the retry test stays fast.
+    async def _no_wait(_seconds: float) -> None:
+        return None
+
+    with patch("tenacity.asyncio._portable_async_sleep", _no_wait):
+        result = await client.evaluate_response("task-1", "answer")
+
+    assert result == {"score": 1.0}
+    assert mock_http.post.call_count == 3
 
 
 async def test_websocket_request_includes_provider_config() -> None:

@@ -406,7 +406,7 @@ class BenchmarkServiceApp(FastAPI):
                 run_id=body.run_id,
                 task_id=body.task_id,
                 status=V1EvalStatus.ERROR,
-                evaluator_version=self._service_version,
+                evaluator_version=self._current_service_version(),
                 errors=[str(exc)],
             )
         else:
@@ -414,7 +414,7 @@ class BenchmarkServiceApp(FastAPI):
                 run_id=body.run_id,
                 task_id=body.task_id,
                 status=V1EvalStatus.EVALUATED,
-                evaluator_version=self._service_version,
+                evaluator_version=self._current_service_version(),
                 result=jsonable_encoder(raw_result),
                 errors=[],
             )

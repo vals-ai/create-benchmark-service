@@ -30,19 +30,42 @@ from benchmark_service.v1_schemas import V1DatasetTasksResponse
 
 _stream_chunk_adapter: TypeAdapter[StreamChunk] = TypeAdapter(StreamChunk)
 
+# Connection-phase failures: the request provably never reached the server (no
+# connection, or none free in the pool), so retrying cannot duplicate any server-side
+# work. Safe to retry even for non-idempotent requests.
+_CONNECT_PHASE_EXCEPTIONS = (
+    httpx.ConnectError,
+    httpx.ConnectTimeout,
+    httpx.PoolTimeout,
+)
+
+# Full retry set for idempotent requests (GETs, and pure recomputations like
+# /final-score). Also covers failures that can occur after the request was sent —
+# read/write timeouts, protocol errors — which are safe to repeat only because the
+# operation has no side effects.
 _retry_http = retry(
     retry=retry_if_exception_type(
-        (
+        _CONNECT_PHASE_EXCEPTIONS
+        + (
             httpx.RemoteProtocolError,
-            httpx.ConnectError,
-            httpx.ConnectTimeout,
             httpx.ReadError,
             httpx.ReadTimeout,
             httpx.WriteError,
             httpx.WriteTimeout,
-            httpx.PoolTimeout,
         )
     ),
+    stop=stop_after_attempt(5),
+    wait=wait_random(min=1, max=10),
+    reraise=True,
+)
+
+# Retry set for NON-IDEMPOTENT requests (e.g. POST /evaluate-response). Only
+# connection-phase failures are retried. A ReadTimeout here means the request already
+# reached the server and it is (slowly) processing the evaluation, so retrying would
+# launch overlapping server-side evaluations — up to 5x amplification of expensive
+# eval work. Such post-send failures are therefore surfaced instead of retried.
+_retry_http_connect_only = retry(
+    retry=retry_if_exception_type(_CONNECT_PHASE_EXCEPTIONS),
     stop=stop_after_attempt(5),
     wait=wait_random(min=1, max=10),
     reraise=True,
@@ -279,7 +302,7 @@ class BenchmarkServiceClient:
         result = await self._websocket_request("setup-task", request, on_message)
         return SetupTaskResponse.model_validate(result)
 
-    @_retry_http
+    @_retry_http_connect_only
     async def evaluate_response(
         self,
         task_id: str,
@@ -288,6 +311,10 @@ class BenchmarkServiceClient:
         sandbox_provider: SandboxProviderConfig | None = None,
     ) -> Any:
         """Evaluate a text response without a live sandbox.
+
+        Uses connection-phase-only retries: this POST is non-idempotent, so a
+        ReadTimeout (server already processing a slow eval) must not be retried, or
+        the client would spawn overlapping server-side evaluations.
 
         Args:
             task_id: The task to evaluate.

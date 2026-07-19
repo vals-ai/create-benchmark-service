@@ -4,6 +4,7 @@ Run: AWS_PROFILE=vals uv run pytest tests/integration
 """
 
 import json
+import os
 from collections.abc import AsyncGenerator
 from typing import Any, Literal, cast
 
@@ -18,14 +19,13 @@ from benchmark_service import (
 
 ProviderType = Literal["daytona", "modal"]
 
-_AWS_REGION = "us-east-1"
-_PROVIDER_SECRET_NAMES: dict[ProviderType, str] = {
-    "daytona": "AgenticHarnessSecrets",
-    "modal": "vcb-modal-provider",
+_PROVIDER_SECRET_ENV_NAMES: dict[ProviderType, str] = {
+    "daytona": "TEST_DAYTONA_SECRET_NAME",
+    "modal": "TEST_MODAL_SECRET_NAME",
 }
 
 
-@pytest.fixture(params=tuple(_PROVIDER_SECRET_NAMES), ids=tuple(_PROVIDER_SECRET_NAMES))
+@pytest.fixture(params=tuple(_PROVIDER_SECRET_ENV_NAMES), ids=tuple(_PROVIDER_SECRET_ENV_NAMES))
 def provider_type(request: pytest.FixtureRequest) -> ProviderType:
     """Select each supported provider as an independent pytest case."""
     return cast(ProviderType, request.param)
@@ -34,11 +34,17 @@ def provider_type(request: pytest.FixtureRequest) -> ProviderType:
 @pytest.fixture
 def sandbox_provider_config(provider_type: ProviderType) -> SandboxProviderConfig:
     """Load and validate a provider config from its AWS Secrets Manager JSON."""
-    secrets_client = cast(Any, boto3).client("secretsmanager", region_name=_AWS_REGION)
+    aws_region = os.environ.get("TEST_AWS_REGION")
+    secret_env_name = _PROVIDER_SECRET_ENV_NAMES[provider_type]
+    secret_name = os.environ.get(secret_env_name)
+    if not aws_region or not secret_name:
+        pytest.fail(f"TEST_AWS_REGION and {secret_env_name} must be set to run provider integration tests.")
+
+    secrets_client = cast(Any, boto3).client("secretsmanager", region_name=aws_region)
     try:
         response = cast(
             dict[str, object],
-            secrets_client.get_secret_value(SecretId=_PROVIDER_SECRET_NAMES[provider_type]),
+            secrets_client.get_secret_value(SecretId=secret_name),
         )
     finally:
         secrets_client.close()

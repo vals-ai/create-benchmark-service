@@ -31,7 +31,7 @@ typecheck: ## Type check code with basedpyright
 test: ## Run tests
 	uv run pytest --ignore=tests/integration
 
-test-provider-integration: ## Run live sandbox provider integration tests
+test-provider-integration:
 	uv run pytest tests/integration
 
 docker-build: ## Build Docker image

@@ -12,6 +12,10 @@ jobs:
     name: ${{ matrix.provider }} provider integration
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      TEST_AWS_REGION: ${{ secrets.TEST_AWS_REGION }}
+      TEST_DAYTONA_SECRET_NAME: ${{ secrets.TEST_DAYTONA_SECRET_NAME }}
+      TEST_MODAL_SECRET_NAME: ${{ secrets.TEST_MODAL_SECRET_NAME }}
     strategy:
       fail-fast: false
       matrix:
@@ -39,7 +43,7 @@ jobs:
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: ${{ secrets.AWS_OIDC_TEST }}
-          aws-region: us-east-1
+          aws-region: ${{ env.TEST_AWS_REGION }}
 
       - name: Run provider integration tests
         run: uv run pytest tests/integration/test_sandbox_provider.py -v -k "${{ matrix.provider }}"

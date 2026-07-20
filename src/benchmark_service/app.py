@@ -21,6 +21,7 @@ from benchmark_service.auth import LEGACY_TENANT_SENTINEL, get_auth_settings, ge
 from benchmark_service.base import BenchmarkService
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.schemas import (
+    AbortTaskRequest,
     EvaluateInstanceRequest,
     EvaluateResponseRequest,
     FinalScoreRequest,
@@ -29,6 +30,7 @@ from benchmark_service.schemas import (
     RetrieveTaskResponse,
     SetupTaskRequest,
     StreamErrorChunk,
+    StreamResultChunk,
     TaskFilter,
     VerifyTaskIdsResponse,
     VersionResponse,
@@ -189,6 +191,7 @@ class BenchmarkServiceApp(FastAPI):
         self.add_api_route("/verify-task-ids", self._verify_task_ids, methods=["GET"])
         self.add_api_route("/retrieve-task/", self._retrieve_task, methods=["GET"])
         self.add_api_websocket_route("/ws/setup-task", self._setup_task)
+        self.add_api_websocket_route("/ws/abort-task", self._abort_task)
         self.add_api_route("/evaluate-response/", self._evaluate_response, methods=["POST"])
         self.add_api_websocket_route("/ws/evaluate-response", self._evaluate_response_stream)
         self.add_api_websocket_route("/ws/evaluate-instance", self._evaluate_instance)
@@ -307,6 +310,36 @@ class BenchmarkServiceApp(FastAPI):
             error_chunk = StreamErrorChunk(type="error", data=error_msg)
             if not await send_json_if_connected(websocket, error_chunk.model_dump()):
                 logger.warning("setup-task websocket disconnected before error chunk could be sent")
+        finally:
+            with suppress(RuntimeError):
+                await websocket.close()
+
+    async def _abort_task(self, websocket: WebSocket) -> None:
+        await websocket.accept()
+
+        try:
+            tenant = await self._authorize_websocket(websocket)
+            if tenant is None:
+                return
+
+            request = AbortTaskRequest(**await websocket.receive_json())
+            if not await self.service.check_dataset_access(tenant, request.dataset):
+                await websocket.close(code=1008, reason="Dataset not allowed")
+                return
+
+            response = await self.service.abort_task(request)
+            chunk = StreamResultChunk(type="result", data=response.model_dump())
+            if not await send_json_if_connected(websocket, chunk.model_dump()):
+                logger.warning("abort-task websocket disconnected before result could be sent")
+
+        except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
+            logger.warning("abort-task websocket disconnected")
+        except Exception as e:
+            error_msg = f"{str(e)}\n{traceback.format_exc()}"
+            logger.error(f"WebSocket error: {error_msg}")
+            error_chunk = StreamErrorChunk(type="error", data=error_msg)
+            if not await send_json_if_connected(websocket, error_chunk.model_dump()):
+                logger.warning("abort-task websocket disconnected before error chunk could be sent")
         finally:
             with suppress(RuntimeError):
                 await websocket.close()

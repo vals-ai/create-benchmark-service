@@ -1,11 +1,13 @@
 """Tests for BenchmarkServiceClient."""
 
+import asyncio
 import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+import benchmark_service.client as client_module
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
@@ -61,6 +63,7 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
                 "cwd": "/work",
                 "resources": {"vcpu": 2, "memory": 4, "disk": 10},
                 "agent_timeout": None,
+                "setup_lifecycle": {"type": "standard"},
             },
         ),
         (
@@ -110,6 +113,28 @@ async def test_retrieve_task_accepts_legacy_shape(
     assert result.source.model_dump() == {"type": "image", "image": "python:3.12"}
     assert result.model_dump()["docker_image"] == "python:3.12"
     assert result.resources.model_dump() == {"vcpu": 2, "memory": 4, "disk": 10}
+    assert result.setup_lifecycle.type == "standard"
+
+
+async def test_retrieve_task_accepts_abortable_setup_lifecycle(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    mock_http.get = AsyncMock(
+        return_value=_mock_response(
+            json_data={
+                "source": {"type": "image", "image": "python:3.12"},
+                "problem_path": "/tmp/problem_statement.txt",
+                "cwd": "/work",
+                "resources": {"vcpu": 2, "memory": 4, "disk": 10},
+                "setup_lifecycle": {"type": "abortable"},
+            }
+        )
+    )
+
+    result = await client.retrieve_task("task-1")
+
+    assert result.setup_lifecycle.type == "abortable"
 
 
 async def test_retrieve_task_tolerates_legacy_enable_docker_field(
@@ -471,18 +496,84 @@ def _make_client(url: str = BASE_URL) -> BenchmarkServiceClient:
     ids=["setup_task", "evaluate_instance"],
 )
 async def test_ws_result_chunk(method: str, args: list[str]) -> None:
-    result_data = {"status": "ok"} if method == "setup_task" else {"score": 1.0}
+    result_data = (
+        {"status": "ok", "egress_allowlist": ["https://task-gateway.example"]}
+        if method == "setup_task"
+        else {"score": 1.0}
+    )
     messages = [json.dumps({"type": "result", "data": result_data})]
     mock_connect = _ws_mock(messages)
 
     client = _make_client()
-    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect) as connect:
         result = await getattr(client, method)(*args)
 
+    assert connect.call_args.kwargs["ping_timeout"] is None
     if method == "setup_task":
         assert result.status == "ok"
+        assert result.egress_allowlist == ["https://task-gateway.example"]
     else:
         assert result == {"score": 1.0}
+
+
+async def test_setup_task_defaults_to_no_dynamic_egress() -> None:
+    mock_connect = _ws_mock([json.dumps({"type": "result", "data": {"status": "ok"}})])
+
+    client = _make_client()
+    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+        result = await client.setup_task("task-1", "inst-1", DAYTONA_CONFIG)
+
+    assert result.egress_allowlist == []
+
+
+async def test_abort_task_serializes_identity() -> None:
+    mock_connect = _ws_mock([json.dumps({"type": "result", "data": {"status": "ok"}})])
+    client = _make_client()
+
+    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect) as connect:
+        result = await client.abort_task("task-1", "run-1", "inst-1", dataset="validation")
+
+    assert result.status == "ok"
+    assert connect.call_args.kwargs["ping_timeout"] == 60
+    ws = mock_connect.__aenter__.return_value
+    assert json.loads(ws.send.call_args.args[0]) == {
+        "task_id": "task-1",
+        "run_id": "run-1",
+        "instance_id": "inst-1",
+        "dataset": "validation",
+    }
+
+
+async def test_abort_task_retries_a_lost_response(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _make_client()
+    request = AsyncMock(
+        side_effect=[
+            BenchmarkServiceError("response lost"),
+            {"status": "ok"},
+        ]
+    )
+    monkeypatch.setattr(client, "_websocket_request", request)
+    monkeypatch.setattr(client_module.asyncio, "sleep", AsyncMock())
+
+    result = await client.abort_task("task-1", "run-1", "inst-1")
+
+    assert result.status == "ok"
+    assert request.await_count == 2
+
+
+async def test_abort_task_has_an_overall_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = _make_client()
+
+    async def hang(*_args: Any, **_kwargs: Any) -> dict[str, Any]:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    request = AsyncMock(side_effect=hang)
+    monkeypatch.setattr(client, "_websocket_request", request)
+    monkeypatch.setattr(client_module, "_ABORT_TASK_TIMEOUT_SECONDS", 0.01)
+
+    with pytest.raises(TimeoutError):
+        await client.abort_task("task-1", "run-1", "inst-1")
 
 
 @pytest.mark.parametrize(

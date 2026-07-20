@@ -475,6 +475,34 @@ class RecreatedInnerSandbox(InnerSandbox):
     id = "recreated-sandbox-id"
 
 
+class InactiveSandbox(InnerSandbox):
+    def __init__(self, state: SandboxState) -> None:
+        super().__init__()
+        self.state = state
+
+    async def wait_for_sandbox_start(self, timeout: int) -> None:
+        raise AssertionError("inactive sandbox deletion must not wait for startup")
+
+    async def refresh_data(self) -> None:
+        raise AssertionError("inactive sandbox deletion must not refresh before deletion")
+
+    async def set_autostop_interval(self, interval: int) -> None:
+        raise AssertionError("inactive sandbox deletion must not update autostop")
+
+
+class BuildingSandbox(InnerSandbox):
+    state = SandboxState.BUILDING_SNAPSHOT
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.waited_for_start = False
+
+    async def wait_for_sandbox_start(self, timeout: int) -> None:
+        assert timeout == 0
+        self.waited_for_start = True
+        self.state = SandboxState.STARTED
+
+
 class RefreshToErrorSandbox(InnerSandbox):
     async def refresh_data(self) -> None:
         await super().refresh_data()
@@ -1279,6 +1307,28 @@ async def test_daytona_provider_delete_removes_sandbox_that_fails_after_refresh(
 
     assert inner.refresh_count == 1
     assert inner.autostop_interval is None
+    assert daytona.deleted is True
+
+
+@pytest.mark.parametrize("state", [SandboxState.STOPPED, SandboxState.ARCHIVED])
+async def test_daytona_provider_delete_removes_inactive_sandbox_without_starting(state: SandboxState) -> None:
+    inner = InactiveSandbox(state)
+    daytona = DaytonaClient(inner)
+
+    await _provider(daytona).delete_sandbox(inner.name)
+
+    assert daytona.deleted is True
+
+
+async def test_daytona_provider_delete_waits_for_building_sandbox() -> None:
+    inner = BuildingSandbox()
+    daytona = DaytonaClient(inner)
+
+    await _provider(daytona).delete_sandbox(inner.name)
+
+    assert inner.waited_for_start is True
+    assert inner.refresh_count == 1
+    assert inner.autostop_interval == 1
     assert daytona.deleted is True
 
 

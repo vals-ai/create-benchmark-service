@@ -83,7 +83,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 - `validate_task_ids(task_ids, dataset)` — raise `ValueError` if any ID is not in the dataset
 - `list_tasks(dataset)` — return `list[V1Task]` (id, question, timeout) for the lab-facing `GET /v1/datasets/{dataset}/tasks` endpoint. Must be overridden before exposing task listing; the base implementation fails closed to avoid leaking evaluator-only data.
 - `check_auth(headers)` — legacy boolean auth hook. Override for custom auth that does not need tenant or dataset awareness.
-- `resolve_tenant(headers)` — validate request authorization and return a tenant ID, `"_legacy"` for legacy auth, or `None` to reject.
+- `resolve_tenant(headers)` — validate request authorization and return an `AuthResult`. Use `AuthResult(tenant=...)` on success or `AuthResult(failure=...)` to reject with a specific reason.
 - `check_dataset_access(tenant, dataset)` — return whether a resolved tenant may access a dataset.
 - `get_service_version()` — optional benchmark-owned service version override. If it returns `None`, `/version` falls back to the installed benchmark package version.
 - `get_dataset_version(dataset)` — optional dataset release/version hook. The value is returned on the dataset task-list response after auth and dataset access checks.
@@ -275,17 +275,17 @@ class MyBenchmarkService(BenchmarkService):
     # ... other abstract methods
 ```
 
-For tenant-aware custom authentication, override `resolve_tenant()` directly and return a tenant ID. Override `check_dataset_access()` if your service needs dataset rules that differ from the configured allowlist:
+For tenant-aware custom authentication, override `resolve_tenant()` directly and return an `AuthResult`. Override `check_dataset_access()` if your service needs dataset rules that differ from the configured allowlist:
 
 ```python
-from benchmark_service import BenchmarkService
+from benchmark_service import AuthFailure, AuthResult, BenchmarkService
 
 class MyBenchmarkService(BenchmarkService):
-    async def resolve_tenant(self, headers: dict[str, str]) -> str | None:
+    async def resolve_tenant(self, headers: dict[str, str]) -> AuthResult:
         token = headers.get("authorization")
         if token == "Bearer internal-token":
-            return "internal"
-        return None
+            return AuthResult(tenant="internal")
+        return AuthResult(failure=AuthFailure.INVALID_KEY)
 
     async def check_dataset_access(self, tenant: str, dataset: str | None) -> bool:
         return tenant == "internal" and (dataset or "default") in {"default", "validation"}

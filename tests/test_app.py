@@ -6,7 +6,7 @@ from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
-from fastapi import WebSocket
+from fastapi import Request, WebSocket
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
@@ -160,7 +160,34 @@ def test_evaluate_response_invalid_task() -> None:
     with TestClient(BenchmarkServiceApp(StubBenchmark), raise_server_exceptions=False) as c:
         response = c.post("/evaluate-response/", json={"task_id": "nonexistent", "response": "2"})
     assert response.status_code == 500
-    assert response.json() == {"detail": "Internal server error"}
+    body = response.json()
+    assert body["detail"] == "Evaluation failed"
+    assert body["errors"] and isinstance(body["errors"], list)
+
+
+async def test_exception_handler_withholds_errors_when_tenant_unset() -> None:
+    """Fail-closed: request.state.tenant unset must not produce errors[].
+
+    When the exception handler fires and no tenant has been resolved (e.g. on a
+    public path or before auth runs), errors[] must be withheld — the caller is
+    unknown, so internal detail must not leak.
+    """
+    from unittest.mock import MagicMock
+
+    from starlette.datastructures import State
+
+    app = BenchmarkServiceApp(StubBenchmark)
+
+    request = MagicMock(spec=Request)
+    request.state = State()  # no tenant attribute set
+
+    exc = RuntimeError("internal detail that must not leak")
+    response = await app._exception_handler(request, exc)  # type: ignore[attr-defined]
+    body = json.loads(response.body)  # type: ignore[attr-defined]
+
+    assert response.status_code == 500
+    assert body["detail"] == "Evaluation failed"
+    assert "errors" not in body
 
 
 @pytest.mark.parametrize(
@@ -544,3 +571,99 @@ def test_setup_task_ws_close_for_disallowed_dataset(auth_client: TestClient) -> 
                 ws.receive_json()
     assert exc_info.value.code == 1008
     assert exc_info.value.reason == "Dataset not allowed"
+
+
+class TestAuthFailureMessages:
+    """HTTP-level assertions for distinct auth-failure status codes and detail messages."""
+
+    PROJECT_ID = "descope-project"
+
+    @pytest.fixture
+    def descope_client(self, monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
+        monkeypatch.setenv("AUTH_REQUIRED", "true")
+        monkeypatch.setenv("DESCOPE_PROJECT_ID", self.PROJECT_ID)
+        monkeypatch.setenv(
+            "DESCOPE_TENANT_ALLOWLIST_JSON",
+            json.dumps({"tenants": {"tenant-a": {"datasets": ["default"]}}}),
+        )
+        monkeypatch.delenv("BENCHMARK_API_KEY", raising=False)
+        auth_module.clear_auth_cache()
+        auth_module.clear_allowlist_cache()
+        with TestClient(BenchmarkServiceApp(StubBenchmark)) as c:
+            yield c
+        auth_module.clear_auth_cache()
+        auth_module.clear_allowlist_cache()
+
+    def _patch_exchange(self, tenants: list[str]) -> Any:
+        return patch.object(
+            auth_module,
+            "_exchange_descope_access_key",
+            return_value={"tenants": {t: {} for t in tenants}},
+        )
+
+    def _patch_exchange_raises(self) -> Any:
+        return patch.object(
+            auth_module,
+            "_exchange_descope_access_key",
+            side_effect=RuntimeError("rejected"),
+        )
+
+    def test_missing_key_returns_401_with_message(self, descope_client: TestClient) -> None:
+        response = descope_client.get("/verify-task-ids")
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Missing x-descope-api-key header"
+
+    def test_invalid_key_returns_401_with_message(self, descope_client: TestClient) -> None:
+        with self._patch_exchange_raises():
+            response = descope_client.get("/verify-task-ids", headers={"x-descope-api-key": "bad"})
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Invalid or expired access key"
+
+    def test_multi_tenant_key_returns_401_with_message(self, descope_client: TestClient) -> None:
+        with self._patch_exchange(["tenant-a", "tenant-b"]):
+            response = descope_client.get("/verify-task-ids", headers={"x-descope-api-key": "multi"})
+        assert response.status_code == 401
+        assert response.json()["detail"] == "Access key must be scoped to exactly one tenant"
+
+    def test_not_allowlisted_returns_403_with_message(self, descope_client: TestClient) -> None:
+        with self._patch_exchange(["unknown-org"]):
+            response = descope_client.get("/verify-task-ids", headers={"x-descope-api-key": "rogue"})
+        assert response.status_code == 403
+        detail = response.json()["detail"]
+        assert "allowlist" in detail.lower()
+        assert "service operator" in detail
+
+    def test_valid_key_returns_200(self, descope_client: TestClient) -> None:
+        with self._patch_exchange(["tenant-a"]):
+            response = descope_client.get("/verify-task-ids", headers={"x-descope-api-key": "valid"})
+        assert response.status_code == 200
+
+
+class TestDescopeStartupCheck:
+    """Server refuses to start when auth_required=true and DESCOPE_PROJECT_ID is missing."""
+
+    def test_missing_project_id_raises_at_startup(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("AUTH_REQUIRED", "true")
+        monkeypatch.delenv("DESCOPE_PROJECT_ID", raising=False)
+        auth_module.clear_allowlist_cache()
+        with pytest.raises(RuntimeError, match="DESCOPE_PROJECT_ID"):
+            with TestClient(BenchmarkServiceApp(StubBenchmark)):
+                pass
+
+    def test_startup_succeeds_when_project_id_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("AUTH_REQUIRED", "true")
+        monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
+        monkeypatch.setenv(
+            "DESCOPE_TENANT_ALLOWLIST_JSON",
+            json.dumps({"tenants": {}}),
+        )
+        auth_module.clear_allowlist_cache()
+        with TestClient(BenchmarkServiceApp(StubBenchmark)):
+            pass
+
+    def test_startup_succeeds_when_auth_not_required(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("AUTH_REQUIRED", "false")
+        monkeypatch.delenv("DESCOPE_PROJECT_ID", raising=False)
+        auth_module.clear_allowlist_cache()
+        with TestClient(BenchmarkServiceApp(StubBenchmark)):
+            pass

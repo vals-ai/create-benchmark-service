@@ -278,8 +278,11 @@ def test_internal_error_does_not_leak_traceback(trial_client: TestClient) -> Non
             headers={"x-descope-api-key": "trial-key"},
         )
     assert resp.status_code == 500
-    assert resp.json()["detail"] == "Internal server error"
-    assert "Traceback" not in resp.text and "rubric.py" not in resp.text
+    body = resp.json()
+    assert body == {"detail": "Evaluation failed"}
+    assert "errors" not in body
+    assert "rubric.py" not in resp.text
+    assert "Traceback" not in resp.text
 
 
 def test_trial_tenant_blocked_on_internal_endpoint(trial_client: TestClient) -> None:

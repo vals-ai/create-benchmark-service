@@ -9,6 +9,7 @@ import logging
 import os
 from collections.abc import Mapping
 from dataclasses import dataclass
+from enum import Enum
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,25 @@ DESCOPE_API_KEY_HEADER = "x-descope-api-key"
 DEFAULT_AUTH_CACHE_TTL_SECONDS = 300
 AUTH_CACHE_MAX_SIZE = 1024
 LEGACY_TENANT_SENTINEL = "_legacy"
+
+
+class AuthFailure(Enum):
+    NO_KEY = "no_key"
+    INVALID_KEY = "invalid_key"
+    MULTI_TENANT = "multi_tenant"
+    LEGACY_TENANT = "legacy_tenant"
+    NOT_ALLOWLISTED = "not_allowlisted"
+    REJECTED = "rejected"
+
+
+@dataclass(frozen=True)
+class AuthResult:
+    tenant: str | None = None
+    failure: AuthFailure | None = None
+
+    @property
+    def ok(self) -> bool:
+        return self.failure is None
 
 
 class TenantConfig(BaseModel):
@@ -189,55 +209,56 @@ def _check_legacy_benchmark_api_key(headers: Mapping[str, str], settings: AuthSe
     return hmac.compare_digest(authorization, expected)
 
 
-async def resolve_descope_tenant(headers: Mapping[str, str]) -> str | None:
+async def resolve_descope_tenant(headers: Mapping[str, str]) -> AuthResult:
     """Validate a Descope access key and resolve a single allowlisted tenant."""
     settings = get_auth_settings()
-    if not settings.descope_project_id:
-        logger.warning("AUTH_REQUIRED is true but DESCOPE_PROJECT_ID is not configured")
-        return None
 
     access_key = headers.get(DESCOPE_API_KEY_HEADER)
     if not access_key:
-        return None
+        return AuthResult(failure=AuthFailure.NO_KEY)
 
     cache_key = (settings.descope_project_id, access_key)
     cached = _auth_cache.get(cache_key)
     if cached is not None:
-        return cached
+        return AuthResult(tenant=cached)
 
     try:
         jwt_response = await _exchange_descope_access_key(settings.descope_project_id, access_key)
     except Exception:
         logger.warning("Failed to exchange Descope access key", exc_info=True)
-        return None
+        return AuthResult(failure=AuthFailure.INVALID_KEY)
 
     tenants = list(jwt_response.get("tenants", {}).keys())
     if len(tenants) != 1:
         logger.warning("Descope access key must be scoped to exactly one tenant, got %s", len(tenants))
-        return None
+        return AuthResult(failure=AuthFailure.MULTI_TENANT)
 
     tenant = tenants[0]
     if tenant == LEGACY_TENANT_SENTINEL:
         logger.info("Descope tenant %s is reserved for legacy auth compatibility", tenant)
-        return None
+        return AuthResult(failure=AuthFailure.LEGACY_TENANT)
 
     allowlist = load_allowlist()
     if tenant not in allowlist.tenants:
         logger.info("Descope tenant %s is not in the service allowlist", tenant)
-        return None
+        return AuthResult(failure=AuthFailure.NOT_ALLOWLISTED)
 
     _auth_cache[cache_key] = tenant
-    return tenant
+    return AuthResult(tenant=tenant)
 
 
-async def resolve_caller_tenant(headers: Mapping[str, str]) -> str | None:
-    """Return the caller tenant id, "_legacy" sentinel, or None to reject."""
+async def resolve_caller_tenant(headers: Mapping[str, str]) -> AuthResult:
+    """Return the caller AuthResult: tenant id, "_legacy" sentinel, or a failure reason."""
     settings = get_auth_settings()
     if settings.auth_required:
         return await resolve_descope_tenant(headers)
-    return LEGACY_TENANT_SENTINEL if _check_legacy_benchmark_api_key(headers, settings) else None
+    return (
+        AuthResult(tenant=LEGACY_TENANT_SENTINEL)
+        if _check_legacy_benchmark_api_key(headers, settings)
+        else AuthResult(failure=AuthFailure.REJECTED)
+    )
 
 
 async def check_benchmark_service_auth(headers: Mapping[str, str]) -> bool:
     """Validate benchmark-service auth headers using the configured auth mode."""
-    return await resolve_caller_tenant(headers) is not None
+    return (await resolve_caller_tenant(headers)).ok

@@ -12,6 +12,8 @@ import pytest
 from benchmark_service import Sandbox
 from benchmark_service import auth as auth_module
 from benchmark_service.auth import (
+    AuthFailure,
+    AuthResult,
     clear_allowlist_cache,
     clear_auth_cache,
     resolve_caller_tenant,
@@ -57,58 +59,51 @@ def _mock_jwt_response(tenants: list[str]) -> dict[str, Any]:
     return {"tenants": {t: {} for t in tenants}}
 
 
+# Table-driven: every AuthFailure reason including REJECTED -> expected AuthResult
+@pytest.mark.parametrize(
+    ("headers", "exchange_tenants", "exchange_raises", "expected_failure"),
+    [
+        ({}, None, False, AuthFailure.NO_KEY),
+        ({"x-descope-api-key": "k"}, None, True, AuthFailure.INVALID_KEY),
+        ({"x-descope-api-key": "k"}, ["t1", "t2"], False, AuthFailure.MULTI_TENANT),
+        ({"x-descope-api-key": "k"}, ["_legacy"], False, AuthFailure.LEGACY_TENANT),
+        ({"x-descope-api-key": "k"}, ["unlisted-org"], False, AuthFailure.NOT_ALLOWLISTED),
+    ],
+)
 @pytest.mark.usefixtures("descope_env")
-async def test_resolve_descope_tenant_returns_tenant_when_in_allowlist() -> None:
+async def test_resolve_descope_tenant_failure_table(
+    headers: dict[str, str],
+    exchange_tenants: list[str] | None,
+    exchange_raises: bool,
+    expected_failure: AuthFailure,
+) -> None:
+    if exchange_tenants is not None or exchange_raises:
+        side_effect = RuntimeError("bad") if exchange_raises else None
+        return_value = _mock_jwt_response(exchange_tenants or []) if not exchange_raises else None
+        with patch.object(
+            auth_module,
+            "_exchange_descope_access_key",
+            side_effect=side_effect,
+            return_value=return_value,
+        ):
+            result = await resolve_descope_tenant(headers)
+    else:
+        result = await resolve_descope_tenant(headers)
+    assert result == AuthResult(failure=expected_failure)
+    assert not result.ok
+
+
+@pytest.mark.usefixtures("descope_env")
+async def test_resolve_descope_tenant_success() -> None:
     headers = {"x-descope-api-key": "key-acme"}
     with patch.object(
         auth_module,
         "_exchange_descope_access_key",
         return_value=_mock_jwt_response(["acme-corp"]),
     ):
-        tenant = await resolve_descope_tenant(headers)
-    assert tenant == "acme-corp"
-
-
-@pytest.mark.usefixtures("descope_env")
-async def test_resolve_descope_tenant_returns_none_when_tenant_not_in_allowlist() -> None:
-    headers = {"x-descope-api-key": "key-rogue"}
-    with patch.object(
-        auth_module,
-        "_exchange_descope_access_key",
-        return_value=_mock_jwt_response(["unknown-org"]),
-    ):
-        tenant = await resolve_descope_tenant(headers)
-    assert tenant is None
-
-
-@pytest.mark.usefixtures("descope_env")
-async def test_resolve_descope_tenant_rejects_multi_tenant_jwt() -> None:
-    headers = {"x-descope-api-key": "key-multi"}
-    with patch.object(
-        auth_module,
-        "_exchange_descope_access_key",
-        return_value=_mock_jwt_response(["acme-corp", "vals-internal"]),
-    ):
-        tenant = await resolve_descope_tenant(headers)
-    assert tenant is None
-
-
-@pytest.mark.usefixtures("descope_env")
-async def test_resolve_descope_tenant_rejects_reserved_legacy_tenant(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv(
-        "DESCOPE_TENANT_ALLOWLIST_JSON",
-        _allowlist_env({"tenants": {"_legacy": {"datasets": ["secret"]}}}),
-    )
-    headers = {"x-descope-api-key": "key-reserved"}
-    with patch.object(
-        auth_module,
-        "_exchange_descope_access_key",
-        return_value=_mock_jwt_response(["_legacy"]),
-    ):
-        tenant = await resolve_descope_tenant(headers)
-    assert tenant is None
+        result = await resolve_descope_tenant(headers)
+    assert result == AuthResult(tenant="acme-corp")
+    assert result.ok
 
 
 async def test_resolve_caller_tenant_legacy_no_api_key_required(
@@ -116,8 +111,9 @@ async def test_resolve_caller_tenant_legacy_no_api_key_required(
 ) -> None:
     monkeypatch.setenv("AUTH_REQUIRED", "false")
     monkeypatch.delenv("BENCHMARK_API_KEY", raising=False)
-    tenant = await resolve_caller_tenant({})
-    assert tenant == "_legacy"
+    result = await resolve_caller_tenant({})
+    assert result == AuthResult(tenant="_legacy")
+    assert result.ok
 
 
 async def test_resolve_caller_tenant_legacy_correct_api_key(
@@ -125,8 +121,9 @@ async def test_resolve_caller_tenant_legacy_correct_api_key(
 ) -> None:
     monkeypatch.setenv("AUTH_REQUIRED", "false")
     monkeypatch.setenv("BENCHMARK_API_KEY", "secret123")
-    tenant = await resolve_caller_tenant({"authorization": "Bearer secret123"})
-    assert tenant == "_legacy"
+    result = await resolve_caller_tenant({"authorization": "Bearer secret123"})
+    assert result == AuthResult(tenant="_legacy")
+    assert result.ok
 
 
 async def test_resolve_caller_tenant_legacy_wrong_api_key(
@@ -134,8 +131,9 @@ async def test_resolve_caller_tenant_legacy_wrong_api_key(
 ) -> None:
     monkeypatch.setenv("AUTH_REQUIRED", "false")
     monkeypatch.setenv("BENCHMARK_API_KEY", "secret123")
-    tenant = await resolve_caller_tenant({"authorization": "Bearer wrong"})
-    assert tenant is None
+    result = await resolve_caller_tenant({"authorization": "Bearer wrong"})
+    assert result == AuthResult(failure=AuthFailure.REJECTED)
+    assert not result.ok
 
 
 class _BareBenchmark(BenchmarkService):
@@ -175,17 +173,28 @@ class _LegacyOverrideBenchmark(_BareBenchmark):
 
 async def test_resolve_tenant_legacy_override_returns_sentinel_on_true() -> None:
     service = _LegacyOverrideBenchmark(allow=True)
-    tenant = await service.resolve_tenant({})
-    assert tenant == "_legacy"
+    result = await service.resolve_tenant({})
+    assert result == AuthResult(tenant="_legacy")
+    assert result.ok
 
 
 async def test_resolve_tenant_legacy_override_returns_none_on_false() -> None:
     service = _LegacyOverrideBenchmark(allow=False)
-    tenant = await service.resolve_tenant({})
-    assert tenant is None
+    result = await service.resolve_tenant({})
+    assert result == AuthResult(failure=AuthFailure.REJECTED)
+    assert not result.ok
 
 
 async def test_check_dataset_access_legacy_sentinel_always_allowed() -> None:
     service = _BareBenchmark()
     assert await service.check_dataset_access("_legacy", "anything") is True
     assert await service.check_dataset_access("_legacy", None) is True
+
+
+def test_auth_types_exported_from_package() -> None:
+    import benchmark_service
+
+    assert hasattr(benchmark_service, "AuthResult")
+    assert hasattr(benchmark_service, "AuthFailure")
+    assert benchmark_service.AuthResult is AuthResult
+    assert benchmark_service.AuthFailure is AuthFailure

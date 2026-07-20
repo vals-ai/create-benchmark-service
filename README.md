@@ -118,19 +118,16 @@ Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` 
 
 #### Sandbox providers
 
-`sandbox_provider` is selected per setup/evaluate-instance request and carries the provider credentials. The tracker resolves it from AWS Secrets Manager (`sandbox_provider_secret_name`); the secret's keys are the config fields:
+Callers resolve provider credentials before sending the request; the framework does not read or store the backing secret. Modal requests use:
 
 ```json
-{"type": "daytona", "api_key": "...", "api_url": "...", "target": "..."}
 {"type": "modal", "MODAL_TOKEN_ID": "...", "MODAL_TOKEN_SECRET": "..."}
 ```
 
-Provider compatibility notes:
+Modal compatibility notes:
 
-- Modal supports both `ImageSource` (registry pull) and `SnapshotSource` (a Modal filesystem snapshot created via `Sandbox.snapshot_filesystem()`, restored by image id).
-- Modal sandboxes do not expose a disk-size parameter; `Resources.disk` is accepted for schema compatibility but not enforced.
-- Nested Docker (Docker-in-Docker) capability is granted on every sandbox for both providers — Daytona supports it natively and the Modal adapter requests it unconditionally — so benchmarks never configure it. The benchmark service still owns the Docker-capable image, dockerd startup flags, compose workflow, and cleanup.
-- Transient Modal connection errors are retried up to three attempts, matching the Daytona adapter's provider-level retry shape. Non-transient command failures still surface as `SandboxCommandError` with the command exit code.
+- `ImageSource` selects a registry image and `SnapshotSource` selects a Modal Image ID. `Resources.disk` is accepted for schema compatibility but Modal does not enforce the requested disk size.
+- Every Modal sandbox uses the VM runtime. Direct workloads run in the selected image; Docker-in-Docker workloads must provide Docker in the outer image and manage the daemon and Compose lifecycle inside the sandbox.
 
 Benchmark services can send `eval_resume_state` updates to the tracker while evaluation is running. The tracker stores the latest value and sends it back on eval-only retry, so the benchmark service can continue evaluation without recreating the original agent sandbox.
 

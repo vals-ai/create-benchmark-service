@@ -6,7 +6,7 @@ from typing import Any, Awaitable, Callable, cast
 
 import pytest
 from aiohttp import ClientConnectionError, ClientResponseError, RequestInfo
-from daytona import SandboxState
+from daytona import GpuType, SandboxState
 from daytona.common.errors import (
     DaytonaConflictError,
     DaytonaConnectionError,
@@ -29,6 +29,7 @@ from benchmark_service.sandbox import (
     SandboxError,
     SandboxNotFoundError,
     SandboxQuery,
+    SnapshotSource,
 )
 from benchmark_service.sandbox.daytona import (
     _PTY_STDOUT_TAIL_MAX_BYTES,  # pyright: ignore[reportPrivateUsage]
@@ -625,10 +626,14 @@ def _provider(daytona: DaytonaClient) -> DaytonaSandboxProvider:
     return provider
 
 
-def _request(name: str) -> SandboxCreateRequest:
+def _request(
+    name: str,
+    resources: Resources | None = None,
+    source: ImageSource | SnapshotSource | None = None,
+) -> SandboxCreateRequest:
     return SandboxCreateRequest(
-        source=ImageSource(image="python:3.12"),
-        resources=Resources(vcpu=2, memory=4, disk=10),
+        source=source or ImageSource(image="python:3.12"),
+        resources=resources or Resources(vcpu=2, memory=4, disk=10),
         name=name,
         labels={},
         env_vars={},
@@ -1199,6 +1204,66 @@ async def test_daytona_provider_reuses_started_sandbox() -> None:
 
     assert sandbox.id == inner.id
     assert daytona.created is False
+
+
+class CapturingCreateDaytonaClient(DaytonaClient):
+    def __init__(self, sandbox: "InnerSandbox") -> None:
+        super().__init__(sandbox)
+        self.create_params: Any | None = None
+
+    async def get(self, instance_id: str) -> "InnerSandbox":
+        raise DaytonaNotFoundError("sandbox not found")
+
+    async def create(self, *args: object, **_kwargs: object) -> "InnerSandbox":
+        self.create_params = args[0]
+        self.created = True
+        return self.sandbox
+
+
+async def test_daytona_provider_maps_gpu_resources() -> None:
+    inner = InnerSandbox()
+    daytona = CapturingCreateDaytonaClient(inner)
+    resources = Resources(vcpu=2, memory=4, disk=10, gpu=1, gpu_type="H100")
+
+    await _provider(daytona).create_sandbox(_request(inner.name, resources=resources))
+
+    assert daytona.create_params is not None
+    assert daytona.create_params.resources.gpu == 1
+    assert daytona.create_params.resources.gpu_type == GpuType.H100
+
+
+async def test_daytona_provider_omits_gpu_by_default() -> None:
+    inner = InnerSandbox()
+    daytona = CapturingCreateDaytonaClient(inner)
+
+    await _provider(daytona).create_sandbox(_request(inner.name))
+
+    assert daytona.create_params is not None
+    assert daytona.create_params.resources.gpu is None
+    assert daytona.create_params.resources.gpu_type is None
+
+
+async def test_daytona_provider_rejects_unsupported_gpu_type() -> None:
+    daytona = CapturingCreateDaytonaClient(InnerSandbox())
+    resources = Resources(vcpu=2, memory=4, disk=10, gpu=1, gpu_type="T4")
+
+    with pytest.raises(SandboxError, match="Unsupported Daytona GPU type: T4"):
+        await _provider(daytona).create_sandbox(_request("sandbox-name", resources=resources))
+
+
+async def test_daytona_provider_rejects_gpu_for_snapshot_source() -> None:
+    daytona = CapturingCreateDaytonaClient(InnerSandbox())
+    resources = Resources(vcpu=2, memory=4, disk=10, gpu=1, gpu_type="H100")
+
+    with pytest.raises(SandboxError, match="GPUs cannot be requested"):
+        await _provider(daytona).create_sandbox(
+            _request("sandbox-name", resources=resources, source=SnapshotSource(snapshot="snap-1"))
+        )
+
+
+def test_resources_gpu_type_requires_gpu_count() -> None:
+    with pytest.raises(ValueError, match="gpu_type requires gpu >= 1"):
+        Resources(vcpu=2, memory=4, disk=10, gpu_type="H100")
 
 
 async def test_daytona_provider_delete_sets_autostop_before_delete() -> None:

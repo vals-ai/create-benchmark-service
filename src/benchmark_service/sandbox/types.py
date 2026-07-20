@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, Mapping
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class ImageSource(BaseModel):
@@ -49,6 +49,14 @@ class Resources(BaseModel):
     vcpu: int = Field(description="Logical sandbox CPU count")
     memory: int = Field(description="Sandbox memory")
     disk: int = Field(description="Sandbox ephemeral disk")
+    gpu: int = Field(default=0, ge=0, description="Number of GPUs to allocate")
+    gpu_type: str | None = Field(default=None, description="GPU type to allocate, e.g. 'H100' (provider-specific)")
+
+    @model_validator(mode="after")
+    def _validate_gpu(self) -> Self:
+        if self.gpu_type is not None and self.gpu < 1:
+            raise ValueError("gpu_type requires gpu >= 1")
+        return self
 
 
 class SandboxCreateRequest(BaseModel):

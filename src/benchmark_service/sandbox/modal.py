@@ -328,6 +328,11 @@ class ModalSandboxProvider(SandboxProvider):
         if existing is not None:
             return ModalSandbox(existing, name=request.name)
         image = self._resolve_image(request.source, client)
+        gpu: str | None = None
+        if request.resources.gpu:
+            if not request.resources.gpu_type:
+                raise SandboxError("Modal sandbox provider requires gpu_type when gpu is requested")
+            gpu = f"{request.resources.gpu_type}:{request.resources.gpu}"
         create_kwargs: dict[str, Any] = {
             "app": app,
             "name": modal_name,
@@ -336,6 +341,7 @@ class ModalSandboxProvider(SandboxProvider):
             "tags": request.labels,
             "cpu": float(request.resources.vcpu),
             "memory": request.resources.memory * 1024,
+            "gpu": gpu,
             "idle_timeout": request.auto_stop_interval * 60 if request.auto_stop_interval else None,
             "timeout": _MAX_LIFETIME_SECONDS,
             "block_network": False,

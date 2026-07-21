@@ -67,11 +67,8 @@ class SandboxCreateRequest(BaseModel):
     env_vars: dict[str, str]
     auto_stop_interval: int
     create_timeout: int
-    ttl_minutes: int | None = Field(
-        default=None,
-        ge=0,
-        description="Wall-clock TTL in minutes after which the sandbox is destroyed regardless of state; None leaves the provider default, 0 disables",
-    )
+    # Wall-clock TTL after which the sandbox is destroyed regardless of state; None = provider default, 0 = disabled.
+    ttl_minutes: int | None = None
 
 
 class SandboxQuery(BaseModel):

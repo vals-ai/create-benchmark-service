@@ -125,6 +125,8 @@ Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` 
 {"type": "modal", "MODAL_TOKEN_ID": "...", "MODAL_TOKEN_SECRET": "..."}
 ```
 
+An experimental, non-deploying Kubernetes provider scaffold is described in [Kubernetes sandbox provider](docs/KUBERNETES_SANDBOX_PROVIDER.md). It is not registered in `SandboxProviderConfig` and cannot run sandboxes yet.
+
 Provider compatibility notes:
 
 - Modal supports both `ImageSource` (registry pull) and `SnapshotSource` (a Modal filesystem snapshot created via `Sandbox.snapshot_filesystem()`, restored by image id).

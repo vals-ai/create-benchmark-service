@@ -131,8 +131,10 @@ def test_builds_deterministic_isolated_job_and_network_policies() -> None:
     }
     egress = build_egress_policy(resource_name, settings.namespace, ["api.example.com", "10.0.0.3/24"])
     rules = _list(_dict(egress["spec"])["egress"])
-    assert rules[1]["toCIDR"] == ["10.0.0.0/24"]
-    assert rules[1]["toFQDNs"] == [{"matchName": "api.example.com"}]
+    dns_ports = _list(_dict(rules[0])["toPorts"])
+    assert _dict(dns_ports[0])["rules"] == {"dns": [{"matchPattern": "*"}]}
+    assert rules[1] == {"toCIDR": ["10.0.0.0/24"]}
+    assert rules[2] == {"toFQDNs": [{"matchName": "api.example.com"}]}
 
     invalid_cases = [
         (_request(source=SnapshotSource(snapshot="snapshot-1")), _settings(), "source type"),

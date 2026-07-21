@@ -641,7 +641,7 @@ class TestKubernetesSandboxBackendEgressAndCleanup:
         body = replace[3]
         rules = cast(dict[str, Any], body["spec"])["egress"]
         assert rules[1]["toCIDR"] == ["10.0.0.0/24"]
-        assert rules[1]["toFQDNs"] == [{"matchName": "api.example.com"}]
+        assert rules[2]["toFQDNs"] == [{"matchName": "api.example.com"}]
         assert ("delete_custom", ("benchmark-sandboxes", "ciliumnetworkpolicies", "task-1-egress")) in api.operations
         assert sum(name == "patch_job" for name, _ in api.operations) == 2
 

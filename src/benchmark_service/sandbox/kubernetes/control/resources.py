@@ -213,11 +213,11 @@ def build_egress_policy(
     allowed_addresses: list[str],
 ) -> dict[str, object]:
     cidrs, domains = resolve_allowed_addresses(allowed_addresses)
-    destination_rule: dict[str, object] = {}
+    destination_rules: list[dict[str, object]] = []
     if cidrs:
-        destination_rule["toCIDR"] = cidrs
+        destination_rules.append({"toCIDR": cidrs})
     if domains:
-        destination_rule["toFQDNs"] = [{"matchName": domain} for domain in domains]
+        destination_rules.append({"toFQDNs": [{"matchName": domain} for domain in domains]})
 
     return {
         "apiVersion": "cilium.io/v2",
@@ -238,13 +238,13 @@ def build_egress_policy(
                     "toPorts": [
                         {
                             "ports": [
-                                {"port": "53", "protocol": "UDP"},
-                                {"port": "53", "protocol": "TCP"},
-                            ]
+                                {"port": "53", "protocol": "ANY"},
+                            ],
+                            "rules": {"dns": [{"matchPattern": "*"}]},
                         }
                     ],
                 },
-                destination_rule,
+                *destination_rules,
             ],
         },
     }

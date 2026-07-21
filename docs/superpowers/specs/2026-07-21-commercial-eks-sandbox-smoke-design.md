@@ -52,7 +52,7 @@ The root Make targets provide one ordered interface:
 2. `make kubernetes-aws-deploy` applies the saved foundation plan, creates a `vals-dev` kubeconfig, builds and pushes the control-service image, records its digest, saves the workload plan against the live cluster, and applies that saved plan using pinned image references.
 3. `make kubernetes-aws-port-forward` forwards the control service to a local port without creating a load balancer.
 4. `make kubernetes-aws-test` runs the opt-in live integration contract against the forwarded endpoint.
-5. `make kubernetes-aws-destroy` destroys the workload layer first, destroys the foundation second, and verifies that resources carrying the deployment tags no longer exist.
+5. `make kubernetes-aws-destroy` destroys the workload layer first, destroys the foundation second, and verifies that no live resource carrying the deployment tags remains. Deleted EC2 records still present in the tag index are confirmed through EC2 before they are ignored.
 
 Deploy and destroy use a unique deployment name and dedicated Terraform state. A failed live test leaves the environment running for inspection; teardown is an explicit command so logs and failed Pods remain available until the operator is finished debugging.
 

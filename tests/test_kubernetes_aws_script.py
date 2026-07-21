@@ -37,6 +37,9 @@ printf '%s %s\\n' "$command_name" "$*" >> "$RECORD_PATH"
 
 case "$command_name" in
   aws)
+    if [[ "${SHIM_EC2_VERIFY_FAIL:-0}" == "1" && "$*" == *"ec2 describe-"* ]]; then
+      exit 1
+    fi
     case "$*" in
       *"sts get-caller-identity"*)
         printf '%s\\t%s\\n' "${SHIM_ACCOUNT:-123456789012}" "${SHIM_ARN:-arn:aws:iam::123456789012:user/tester}"
@@ -64,6 +67,15 @@ case "$command_name" in
         ;;
       *"resourcegroupstaggingapi get-resources"*)
         printf '%s\\n' "${SHIM_TAGGED_ARNS:-}"
+        ;;
+      *"ec2 describe-vpcs"*)
+        printf '%s\\n' "${SHIM_VPC_ID:-}"
+        ;;
+      *"ec2 describe-instances"*)
+        printf '%s\\n' "${SHIM_INSTANCE_STATE:-}"
+        ;;
+      *"ec2 describe-nat-gateways"*)
+        printf '%s\\n' "${SHIM_NAT_GATEWAY_STATE:-}"
         ;;
     esac
     ;;
@@ -380,12 +392,47 @@ esac
 
         before_destroy = len(record_path.read_text().splitlines())
 
-        residue_result = run("destroy", {"SHIM_TAGGED_ARNS": "arn:aws:ec2:us-east-2:123456789012:vpc/test"})
+        verification_failure_result = run(
+            "destroy",
+            {
+                "SHIM_TAGGED_ARNS": "arn:aws:ec2:us-east-2:123456789012:subnet/subnet-unknown",
+                "SHIM_EC2_VERIFY_FAIL": "1",
+            },
+        )
+
+        assert verification_failure_result.returncode != 0
+        verification_failure_commands = record_path.read_text().splitlines()[before_destroy:]
+        assert any(
+            "destroy" in command and "workload.tfstate" in command
+            for command in verification_failure_commands
+        )
+        assert any(
+            "get namespace benchmark-sandboxes --ignore-not-found -o name" in command
+            for command in verification_failure_commands
+        )
+        assert any(
+            "destroy" in command and "foundation.tfstate" in command
+            for command in verification_failure_commands
+        )
+        assert any("ec2 describe-subnets" in command for command in verification_failure_commands)
+        assert not any(command.startswith("rm -rf -- ") for command in verification_failure_commands)
+        assert runtime_dir.exists()
+        assert state_dir.exists()
+
+        before_destroy = len(record_path.read_text().splitlines())
+
+        residue_result = run(
+            "destroy",
+            {
+                "SHIM_TAGGED_ARNS": "arn:aws:ec2:us-east-2:123456789012:vpc/test",
+                "SHIM_VPC_ID": "test",
+            },
+        )
 
         assert residue_result.returncode != 0
         residue_commands = record_path.read_text().splitlines()[before_destroy:]
-        assert any("destroy" in command and "workload.tfstate" in command for command in residue_commands)
-        assert any("get namespace benchmark-sandboxes --ignore-not-found -o name" in command for command in residue_commands)
+        assert not any("destroy" in command and "workload.tfstate" in command for command in residue_commands)
+        assert not any(command.startswith("kubectl ") for command in residue_commands)
         assert any("destroy" in command and "foundation.tfstate" in command for command in residue_commands)
         assert any("resourcegroupstaggingapi get-resources" in command for command in residue_commands)
         assert not any(command.startswith("rm -rf -- ") for command in residue_commands)
@@ -395,7 +442,20 @@ esac
 
         before_destroy = len(record_path.read_text().splitlines())
 
-        destroy_result = run("destroy")
+        destroy_result = run(
+            "destroy",
+            {
+                "SHIM_TAGGED_ARNS": " ".join(
+                    [
+                        "arn:aws:ec2:us-east-2:123456789012:instance/i-deleted",
+                        "arn:aws:ec2:us-east-2:123456789012:natgateway/nat-deleted",
+                        "arn:aws:ec2:us-east-2:123456789012:subnet/subnet-deleted",
+                    ]
+                ),
+                "SHIM_INSTANCE_STATE": "terminated",
+                "SHIM_NAT_GATEWAY_STATE": "deleted",
+            },
+        )
 
         assert destroy_result.returncode == 0, destroy_result.stderr
 
@@ -413,6 +473,9 @@ esac
         cleanup = next(index for index, command in enumerate(destroy_commands) if command.startswith("rm -rf -- "))
         assert not any(command.startswith("kubectl ") for command in destroy_commands)
         assert not any("destroy" in command and "workload.tfstate" in command for command in destroy_commands)
+        assert any("ec2 describe-instances" in command for command in destroy_commands)
+        assert any("ec2 describe-nat-gateways" in command for command in destroy_commands)
+        assert any("ec2 describe-subnets" in command for command in destroy_commands)
         assert foundation_destroy < tag_check < cleanup
         assert not runtime_dir.exists()
         assert not state_dir.exists()

@@ -201,10 +201,13 @@ make kubernetes-aws-destroy
 For a full deployment, destroy first removes the Kubernetes workload and checks that the
 `benchmark-sandboxes` namespace is gone. It then destroys EKS, ECR, the node group, NAT
 gateway, and VPC, and queries AWS for resources with the smoke's project and deployment
-tags. Only after the required namespace check and the tagged-resource check are empty does
-it delete the local state, kubeconfig, token, and runtime metadata.
+tags. Because the tag index can retain deleted EC2 resources, the script confirms matching
+EC2 ARNs against their service APIs and ignores only absent, `terminated`, or `deleted`
+records. It deletes the local state, kubeconfig, token, and runtime metadata only after no
+live tagged resource remains.
 
-Successful Terraform destroy plus an empty tagged-resource query is the cleanup signal.
+Successful Terraform destroy plus no live resource from the tagged-resource check is the
+cleanup signal.
 Check the AWS console if billing or service quotas show anything unexpected; some AWS
 resources can take time to disappear from service views.
 
@@ -224,8 +227,8 @@ succeeds, run plan again before another deploy so the saved plan matches empty s
 
 Destroy is retryable. If workload cleanup stops, the next call retries that phase. Once the
 namespace is confirmed absent, the runtime metadata moves to the foundation phase so a
-later retry does not call a deleted Kubernetes API. A failed tagged-resource check also
-keeps local metadata for another destroy attempt.
+later retry does not call a deleted Kubernetes API. A live tagged-resource result also keeps
+local metadata for another destroy attempt.
 
 A failed deploy can still leave chargeable resources. If local state or runtime metadata is
 lost before cleanup, stop and reconcile the tagged AWS resources before creating another

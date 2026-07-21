@@ -21,7 +21,7 @@
 - Keep the benchmark container non-privileged. Only the Docker daemon sidecar is privileged.
 - Use `runc` for this smoke. Do not claim Kata isolation until a separate runtime/node configuration passes its live gate.
 - Tag every AWS resource with `Project=create-benchmark-service-kubernetes`, `Deployment=${deployment_name}`, and `ManagedBy=Terraform`.
-- Use separate local state files for foundation and workload. Destroy workload first, verify its namespace is gone, then destroy foundation and verify no tagged AWS resources remain.
+- Use separate local state files for foundation and workload. Destroy workload first, verify its namespace is gone, then destroy foundation and verify no live tagged AWS resources remain; confirm tag-indexed EC2 records through their service APIs because deleted records can remain indexed temporarily.
 - A failed live test leaves the environment running for inspection. Destruction is always explicit.
 - Preserve the unrelated untracked `tests/__init__.py`; never stage it.
 - Commit each implementation task separately, pull before every push, and never force push.
@@ -236,7 +236,7 @@ In `main.tf`:
 - create `10.42.0.0/16` with two `/20` private subnets and two `/24` public subnets;
 - enable one NAT gateway, DNS hostnames, and EKS subnet tags;
 - create EKS 1.35 with private endpoint access, public endpoint access restricted to `operator_cidr`, cluster-creator admin access, and `coredns`, `kube-proxy`, and `vpc-cni` add-ons;
-- create one AL2023 x86_64 managed node group with desired/minimum 1, maximum 2, 100 GiB disk, and the `node.cilium.io/agent-not-ready=true:NoExecute` taint;
+- create one AL2023 x86_64 managed node group with desired/minimum 1, maximum 2, and a 100 GiB disk; do not add a Cilium bootstrap taint because the workload layer installs Cilium after the node group becomes ready;
 - disable EKS deletion protection for this disposable environment; and
 - create one immutable, scan-on-push ECR repository with `force_delete = true` for the control and mirrored daemon images.
 
@@ -519,7 +519,7 @@ kubectl --context "$kube_context" -n benchmark-sandboxes \
 2. destroy workload state;
 3. confirm `benchmark-sandboxes` no longer exists;
 4. destroy foundation state;
-5. query the Resource Groups Tagging API for both mandatory tags and fail if any ARN remains; and
+5. query the Resource Groups Tagging API for both mandatory tags, confirm indexed EC2 records through their service APIs, and fail if any live ARN remains; and
 6. remove only the validated deployment's runtime and state directories after every residue check passes.
 
 If workload destruction fails, stop before foundation destruction so the EKS API remains reachable.
@@ -722,7 +722,7 @@ aws resourcegroupstaggingapi get-resources \
   --tag-filters Key=Project,Values=create-benchmark-service-kubernetes Key=Deployment,Values=cbs-kubernetes-smoke
 ```
 
-Expected: workload and foundation destroys succeed, the Kubernetes namespace check passes before cluster deletion, and `ResourceTagMappingList` is empty afterward.
+Expected: workload and foundation destroys succeed, the Kubernetes namespace check passes before cluster deletion, and every indexed ARN is either absent or in a terminal deleted state afterward. The tag index itself can retain EC2 tombstones temporarily.
 
 - [ ] **Step 5: Record any final proof-only documentation update**
 

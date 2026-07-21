@@ -454,6 +454,7 @@ class TestKubernetesSandboxBackendStreaming:
         - Split UTF-8, stderr, and a nonzero exit become ordered command events.
         - Cwd, timeout, and environment values are shell quoted.
         - Buffered exec rejects output beyond its configured cap.
+        - Cancellation and early stream closure terminate the remote process.
         """
         api = MockKubernetesApi()
         request = _request()
@@ -512,6 +513,15 @@ class TestKubernetesSandboxBackendStreaming:
             await pending_chunk
         assert blocking_session.closed is True
         assert cancelled_remote.terminated and cancelled_remote.terminated[0][0] == "task-1-pod"
+
+        closed_remote = MockRemoteExec()
+        closed_remote.command_sessions.append(MockRemoteExecSession([(b"started", b"", None)]))
+        closed_backend = KubernetesSandboxBackend(_settings(), api, closed_remote)
+        closed_stream = closed_backend.command("task-1", CommandRequest(command="sleep 30"))
+        assert isinstance(await anext(closed_stream), CommandOutputEvent)
+        await closed_stream.aclose()
+        assert closed_remote.sessions[0].closed is True
+        assert closed_remote.terminated and closed_remote.terminated[0][0] == "task-1-pod"
 
     async def test_streams_base64_files_across_arbitrary_boundaries(self) -> None:
         """Transfer binary files without joining request or response streams.

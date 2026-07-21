@@ -412,15 +412,17 @@ class KubernetesSandboxBackend:
             pod_name,
             ["sh", "-lc", self._shell_command(request, command_id)],
         )
+        stream_completed = False
         try:
             async for event in self._stream_session(session):
                 yield event
-        except asyncio.CancelledError:
-            await session.close()
-            await self._remote_exec().terminate(pod_name, command_id)
-            raise
+            stream_completed = True
         finally:
-            await session.close()
+            try:
+                await session.close()
+            finally:
+                if not stream_completed:
+                    await self._remote_exec().terminate(pod_name, command_id)
 
     async def upload_file(
         self,

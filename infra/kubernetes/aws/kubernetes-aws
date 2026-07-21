@@ -371,8 +371,9 @@ port_forward() {
 }
 
 run_live_test() {
-  local port_forward_pid
+  local port_forward_pid=""
   local attempt
+  local test_status=0
 
   require_value TEST_KUBERNETES_IMAGE
   load_runtime_file
@@ -402,7 +403,10 @@ run_live_test() {
   export TEST_KUBERNETES_CONTROL_TOKEN="$api_token"
   export TEST_KUBERNETES_IMAGE
   export TEST_KUBERNETES_COMPOSE_IMAGE="$docker_image"
-  uv run pytest "$repository_root/tests/integration/test_kubernetes_control_service.py" -q
+  uv run pytest "$repository_root/tests/integration/test_kubernetes_control_service.py" -q || test_status=$?
+  cleanup_port_forward
+  trap - EXIT INT TERM
+  return "$test_status"
 }
 
 destroy_stack() {

@@ -203,6 +203,7 @@ esac
         assert "allowed_account_ids = [var.aws_account_id]" in foundation_main
         assert "node.cilium.io/agent-not-ready" not in foundation_main
         assert 'export TEST_KUBERNETES_COMPOSE_IMAGE="$docker_image"' in orchestration_script
+        assert "trap - EXIT INT TERM" in orchestration_script
 
         for env_updates, expected_error in preflight_cases:
             record_path.write_text("")
@@ -343,6 +344,15 @@ esac
         failed_test_commands = record_path.read_text().splitlines()[before_test:]
         assert "compose-image-env pytest" in failed_test_commands
         assert not any(" destroy " in f" {command} " for command in failed_test_commands)
+
+        before_successful_test = len(record_path.read_text().splitlines())
+
+        successful_test_result = run("test")
+
+        assert successful_test_result.returncode == 0, successful_test_result.stderr
+        successful_test_commands = record_path.read_text().splitlines()[before_successful_test:]
+        assert "compose-image-env pytest" in successful_test_commands
+        assert not any(" destroy " in f" {command} " for command in successful_test_commands)
 
         before_destroy = len(record_path.read_text().splitlines())
 

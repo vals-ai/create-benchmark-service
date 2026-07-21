@@ -1,0 +1,466 @@
+#!/bin/bash
+
+set -euo pipefail
+
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repository_root="$(cd "$script_dir/../../.." && pwd)"
+foundation_root="$script_dir/foundation"
+workload_root="$script_dir/../workload"
+
+aws_region="${AWS_REGION:-us-east-2}"
+deployment_name="${KUBERNETES_DEPLOYMENT_NAME:-cbs-kubernetes-smoke}"
+dind_source_image="${DIND_SOURCE_IMAGE:-docker:28.3.3-dind}"
+
+fail() {
+  printf 'Error: %s\n' "$1" >&2
+  exit 1
+}
+
+require_value() {
+  local name="$1"
+  local value="${!name:-}"
+  [[ -n "$value" ]] || fail "$name is required."
+}
+
+require_commands() {
+  local command_name
+  for command_name in aws curl docker git kubectl openssl terraform uv; do
+    command -v "$command_name" >/dev/null 2>&1 || fail "$command_name is required."
+  done
+}
+
+validate_inputs() {
+  require_value AWS_ACCOUNT_ID
+  require_value AWS_OPERATOR_CIDR
+  require_value AWS_PROFILE
+
+  [[ "$AWS_PROFILE" == "vals-dev" ]] || fail "AWS_PROFILE must be vals-dev."
+  [[ "$AWS_ACCOUNT_ID" =~ ^[0-9]{12}$ ]] || fail "AWS_ACCOUNT_ID must be a 12-digit account ID."
+  [[ "$deployment_name" =~ ^[a-z][a-z0-9-]{2,31}$ ]] || fail \
+    "KUBERNETES_DEPLOYMENT_NAME must be a 3-32 character lowercase DNS label."
+
+  uv run python - "$AWS_OPERATOR_CIDR" >/dev/null <<'PY'
+import ipaddress
+import sys
+
+network = ipaddress.IPv4Network(sys.argv[1], strict=False)
+if network.prefixlen < 24:
+    raise ValueError("AWS_OPERATOR_CIDR must be no broader than /24")
+PY
+}
+
+configure_paths() {
+  state_dir="$script_dir/.state/$deployment_name"
+  runtime_dir="$script_dir/.runtime/$deployment_name"
+  foundation_state="$state_dir/foundation.tfstate"
+  workload_state="$state_dir/workload.tfstate"
+  foundation_plan="$state_dir/foundation.tfplan"
+  workload_plan="$state_dir/workload.tfplan"
+  runtime_file="$runtime_dir/deployment.env"
+}
+
+validate_identity() {
+  local identity
+  local actual_account
+  local actual_arn
+
+  identity="$(aws sts get-caller-identity --profile vals-dev --query '[Account,Arn]' --output text)"
+  read -r actual_account actual_arn <<< "$identity"
+
+  [[ "$actual_arn" == arn:aws:* ]] || fail \
+    "AWS identity must use the commercial aws partition; got $actual_arn."
+  [[ "$actual_account" == "$AWS_ACCOUNT_ID" ]] || fail \
+    "AWS account mismatch: expected $AWS_ACCOUNT_ID, got $actual_account."
+}
+
+preflight() {
+  require_commands
+  validate_inputs
+  configure_paths
+  validate_identity
+}
+
+initialize_and_validate_roots() {
+  terraform -chdir="$foundation_root" init -backend=false -input=false
+  terraform -chdir="$foundation_root" validate
+  terraform -chdir="$workload_root" init -backend=false -input=false
+  terraform -chdir="$workload_root" validate
+}
+
+plan_foundation() {
+  mkdir -p "$state_dir"
+  initialize_and_validate_roots
+  terraform -chdir="$foundation_root" plan \
+    -state="$foundation_state" \
+    -out="$foundation_plan" \
+    -var="aws_profile=vals-dev" \
+    -var="aws_region=$aws_region" \
+    -var="deployment_name=$deployment_name" \
+    -var="operator_cidr=$AWS_OPERATOR_CIDR"
+  printf '%s\n' \
+    "Foundation plan saved. The workload plan is created after foundation apply because its Kubernetes provider needs the live API endpoint."
+}
+
+ecr_image_exists() {
+  local repository_name="$1"
+  local image_tag="$2"
+
+  aws ecr describe-images \
+    --profile vals-dev \
+    --region "$aws_region" \
+    --repository-name "$repository_name" \
+    --image-ids "imageTag=$image_tag" >/dev/null 2>&1
+}
+
+resolve_ecr_digest() {
+  local repository_name="$1"
+  local image_tag="$2"
+  local digest
+
+  digest="$(aws ecr describe-images \
+    --profile vals-dev \
+    --region "$aws_region" \
+    --repository-name "$repository_name" \
+    --image-ids "imageTag=$image_tag" \
+    --query 'imageDetails[0].imageDigest' \
+    --output text)"
+  [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || fail \
+    "ECR returned an invalid digest for $image_tag: $digest."
+
+  printf '%s\n' "$digest"
+}
+
+write_foundation_runtime_contents() {
+  printf 'runtime_phase=foundation\n'
+  printf 'aws_region=%q\n' "$aws_region"
+  printf 'operator_cidr=%q\n' "$operator_cidr"
+  printf 'cluster_name=%q\n' "$cluster_name"
+  printf 'image_repository_url=%q\n' "$image_repository_url"
+  printf 'kubeconfig_path=%q\n' "$kubeconfig_path"
+  printf 'kube_context=%q\n' "$kube_context"
+}
+
+write_foundation_runtime_file() {
+  local current_aws_region="$aws_region"
+  local current_cluster_name="$cluster_name"
+  local current_image_repository_url="$image_repository_url"
+  local existing_runtime_phase=""
+
+  if [[ -f "$runtime_file" ]]; then
+    # shellcheck disable=SC1090
+    source "$runtime_file"
+    existing_runtime_phase="${runtime_phase:-}"
+  fi
+
+  aws_region="$current_aws_region"
+  operator_cidr="$AWS_OPERATOR_CIDR"
+  cluster_name="$current_cluster_name"
+  image_repository_url="$current_image_repository_url"
+  kubeconfig_path="$runtime_dir/kubeconfig"
+  kube_context="$deployment_name"
+  if [[ "$existing_runtime_phase" == "workload" ]]; then
+    return
+  fi
+
+  mkdir -p "$runtime_dir"
+  umask 077
+  write_foundation_runtime_contents > "$runtime_file"
+  chmod 600 "$runtime_file"
+}
+
+transition_to_foundation_runtime() {
+  local temporary_runtime_file="$runtime_file.tmp"
+
+  umask 077
+  write_foundation_runtime_contents > "$temporary_runtime_file"
+  chmod 600 "$temporary_runtime_file"
+  mv -f -- "$temporary_runtime_file" "$runtime_file"
+  runtime_phase="foundation"
+  unset api_token control_image docker_image allowed_image_prefixes
+}
+
+write_runtime_file() {
+  local saved_api_token=""
+  local saved_runtime_phase="foundation"
+  local current_cluster_name="$cluster_name"
+  local current_image_repository_url="$image_repository_url"
+  local current_control_image="$control_image"
+  local current_docker_image="$docker_image"
+
+  mkdir -p "$runtime_dir"
+  if [[ -f "$runtime_file" ]]; then
+    # shellcheck disable=SC1090
+    source "$runtime_file"
+    saved_api_token="${api_token:-}"
+    saved_runtime_phase="${runtime_phase:-foundation}"
+  fi
+  if [[ -z "$saved_api_token" ]]; then
+    saved_api_token="$(openssl rand -hex 32)"
+  fi
+  [[ "$saved_api_token" =~ ^[0-9a-f]{64}$ ]] || fail "The runtime API token is invalid."
+
+  api_token="$saved_api_token"
+  cluster_name="$current_cluster_name"
+  image_repository_url="$current_image_repository_url"
+  control_image="$current_control_image"
+  docker_image="$current_docker_image"
+  kubeconfig_path="$runtime_dir/kubeconfig"
+  kube_context="$deployment_name"
+  benchmark_image_prefix="${TEST_KUBERNETES_IMAGE%@*}@sha256:"
+  stack_image_prefix="$image_repository_url@sha256:"
+  allowed_image_prefixes="[\"$benchmark_image_prefix\",\"$stack_image_prefix\"]"
+
+  umask 077
+  {
+    printf 'runtime_phase=%q\n' "$saved_runtime_phase"
+    printf 'api_token=%q\n' "$api_token"
+    printf 'aws_region=%q\n' "$aws_region"
+    printf 'operator_cidr=%q\n' "$AWS_OPERATOR_CIDR"
+    printf 'cluster_name=%q\n' "$cluster_name"
+    printf 'image_repository_url=%q\n' "$image_repository_url"
+    printf 'control_image=%q\n' "$control_image"
+    printf 'docker_image=%q\n' "$docker_image"
+    printf 'allowed_image_prefixes=%q\n' "$allowed_image_prefixes"
+    printf 'kubeconfig_path=%q\n' "$kubeconfig_path"
+    printf 'kube_context=%q\n' "$kube_context"
+  } > "$runtime_file"
+  chmod 600 "$runtime_file"
+}
+
+transition_to_workload_runtime() {
+  local temporary_runtime_file="$runtime_file.tmp"
+
+  umask 077
+  {
+    printf 'runtime_phase=workload\n'
+    printf 'api_token=%q\n' "$api_token"
+    printf 'aws_region=%q\n' "$aws_region"
+    printf 'operator_cidr=%q\n' "$AWS_OPERATOR_CIDR"
+    printf 'cluster_name=%q\n' "$cluster_name"
+    printf 'image_repository_url=%q\n' "$image_repository_url"
+    printf 'control_image=%q\n' "$control_image"
+    printf 'docker_image=%q\n' "$docker_image"
+    printf 'allowed_image_prefixes=%q\n' "$allowed_image_prefixes"
+    printf 'kubeconfig_path=%q\n' "$kubeconfig_path"
+    printf 'kube_context=%q\n' "$kube_context"
+  } > "$temporary_runtime_file"
+  chmod 600 "$temporary_runtime_file"
+  mv -f -- "$temporary_runtime_file" "$runtime_file"
+  runtime_phase="workload"
+}
+
+load_runtime_file() {
+  [[ -f "$runtime_file" ]] || fail "Runtime file not found: $runtime_file. Run deploy first."
+  # shellcheck disable=SC1090
+  source "$runtime_file"
+  [[ "${runtime_phase:-}" == "foundation" || "${runtime_phase:-}" == "workload" ]] || fail \
+    "Runtime deployment phase is invalid."
+  [[ -n "${cluster_name:-}" ]] || fail "Runtime cluster name is invalid."
+  [[ -n "${image_repository_url:-}" ]] || fail "Runtime image repository is invalid."
+  [[ "${kubeconfig_path:-}" == "$runtime_dir/kubeconfig" ]] || fail "Runtime kubeconfig path is invalid."
+  [[ "${kube_context:-}" == "$deployment_name" ]] || fail "Runtime kubeconfig context is invalid."
+  export KUBECONFIG="$kubeconfig_path"
+}
+
+require_workload_runtime() {
+  [[ "$runtime_phase" == "workload" ]] || fail "Workload runtime metadata is not available."
+  [[ "${api_token:-}" =~ ^[0-9a-f]{64}$ ]] || fail "The runtime API token is invalid."
+  [[ -n "${control_image:-}" ]] || fail "Runtime control image is invalid."
+  [[ -n "${docker_image:-}" ]] || fail "Runtime Docker image is invalid."
+  [[ -n "${allowed_image_prefixes:-}" ]] || fail "Runtime image prefixes are invalid."
+}
+
+deploy_stack() {
+  local repository_name
+  local registry_host
+  local commit_sha
+  local control_tag
+  local dind_tag="dind-28.3.3"
+  local control_tagged_image
+  local dind_tagged_image
+  local control_digest
+  local dind_digest
+
+  [[ -f "$foundation_plan" ]] || fail "Foundation plan not found. Run plan first."
+  require_value TEST_KUBERNETES_IMAGE
+  [[ "$TEST_KUBERNETES_IMAGE" =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[0-9a-f]{64}$ ]] || fail \
+    "TEST_KUBERNETES_IMAGE must be a sha256 digest reference."
+  initialize_and_validate_roots
+
+  terraform -chdir="$foundation_root" apply \
+    -state="$foundation_state" \
+    "$foundation_plan"
+
+  cluster_name="$(terraform -chdir="$foundation_root" output -state="$foundation_state" -raw cluster_name)"
+  image_repository_url="$(terraform -chdir="$foundation_root" output -state="$foundation_state" -raw image_repository_url)"
+  write_foundation_runtime_file
+  repository_name="${image_repository_url#*/}"
+  registry_host="${image_repository_url%%/*}"
+
+  aws ecr get-login-password --profile vals-dev --region "$aws_region" \
+    | docker login --username AWS --password-stdin "$registry_host"
+
+  commit_sha="$(git -C "$repository_root" rev-parse --short=12 HEAD)"
+  control_tag="control-$commit_sha"
+  control_tagged_image="$image_repository_url:$control_tag"
+  if ! ecr_image_exists "$repository_name" "$control_tag"; then
+    docker build \
+      -f "$repository_root/infra/kubernetes/Dockerfile.control" \
+      --build-arg "PACKAGE_VERSION=0.0.0+$commit_sha" \
+      -t "$control_tagged_image" \
+      "$repository_root"
+    docker push "$control_tagged_image"
+  fi
+
+  dind_tagged_image="$image_repository_url:$dind_tag"
+  if ! ecr_image_exists "$repository_name" "$dind_tag"; then
+    docker pull "$dind_source_image"
+    docker tag "$dind_source_image" "$dind_tagged_image"
+    docker push "$dind_tagged_image"
+  fi
+
+  control_digest="$(resolve_ecr_digest "$repository_name" "$control_tag")"
+  dind_digest="$(resolve_ecr_digest "$repository_name" "$dind_tag")"
+  control_image="$image_repository_url@$control_digest"
+  docker_image="$image_repository_url@$dind_digest"
+
+  write_runtime_file
+  aws eks update-kubeconfig \
+    --profile vals-dev \
+    --region "$aws_region" \
+    --name "$cluster_name" \
+    --kubeconfig "$kubeconfig_path" \
+    --alias "$kube_context"
+  export KUBECONFIG="$kubeconfig_path"
+
+  TF_VAR_kubeconfig_path="$kubeconfig_path" \
+    TF_VAR_kubeconfig_context="$kube_context" \
+    TF_VAR_control_image="$control_image" \
+    TF_VAR_docker_image="$docker_image" \
+    TF_VAR_allowed_image_prefixes="$allowed_image_prefixes" \
+    TF_VAR_api_token="$api_token" \
+    terraform -chdir="$workload_root" plan \
+      -state="$workload_state" \
+      -out="$workload_plan"
+  transition_to_workload_runtime
+  TF_VAR_api_token="$api_token" \
+    terraform -chdir="$workload_root" apply \
+      -state="$workload_state" \
+      "$workload_plan"
+
+  kubectl --context "$kube_context" -n kube-system \
+    rollout status daemonset/cilium --timeout=15m
+  kubectl --context "$kube_context" -n benchmark-sandboxes \
+    rollout status deployment/kubernetes-sandbox-control --timeout=15m
+}
+
+port_forward() {
+  load_runtime_file
+  require_workload_runtime
+  kubectl --context "$kube_context" -n benchmark-sandboxes \
+    port-forward service/kubernetes-sandbox-control 8080:8080
+}
+
+run_live_test() {
+  local port_forward_pid
+  local attempt
+
+  require_value TEST_KUBERNETES_IMAGE
+  load_runtime_file
+  require_workload_runtime
+  kubectl --context "$kube_context" -n benchmark-sandboxes \
+    port-forward service/kubernetes-sandbox-control 8080:8080 &
+  port_forward_pid=$!
+
+  cleanup_port_forward() {
+    kill "$port_forward_pid" 2>/dev/null || true
+    wait "$port_forward_pid" 2>/dev/null || true
+  }
+  trap cleanup_port_forward EXIT INT TERM
+
+  for attempt in $(seq 1 30); do
+    if curl --fail --silent --show-error http://127.0.0.1:8080/health >/dev/null; then
+      break
+    fi
+    if [[ "$attempt" == "30" ]]; then
+      fail "The Kubernetes control service did not become healthy."
+    fi
+    sleep 2
+  done
+
+  export TEST_KUBERNETES_CONTROL_URL="http://127.0.0.1:8080"
+  export TEST_KUBERNETES_CONTROL_TOKEN="$api_token"
+  export TEST_KUBERNETES_IMAGE
+  uv run pytest "$repository_root/tests/integration/test_kubernetes_control_service.py" -q
+}
+
+destroy_stack() {
+  local namespace_name
+  local tagged_arns
+  local expected_state_dir="$script_dir/.state/$deployment_name"
+  local expected_runtime_dir="$script_dir/.runtime/$deployment_name"
+
+  load_runtime_file
+  initialize_and_validate_roots
+
+  if [[ "$runtime_phase" == "workload" ]]; then
+    require_workload_runtime
+    TF_VAR_kubeconfig_path="$kubeconfig_path" \
+      TF_VAR_kubeconfig_context="$kube_context" \
+      TF_VAR_control_image="$control_image" \
+      TF_VAR_docker_image="$docker_image" \
+      TF_VAR_allowed_image_prefixes="$allowed_image_prefixes" \
+      TF_VAR_api_token="$api_token" \
+      terraform -chdir="$workload_root" destroy \
+        -auto-approve \
+        -state="$workload_state"
+
+    if ! namespace_name="$(kubectl --context "$kube_context" get namespace benchmark-sandboxes \
+      --ignore-not-found -o name)"; then
+      fail "Unable to verify that namespace benchmark-sandboxes was removed."
+    fi
+    [[ -z "$namespace_name" ]] || fail "Namespace benchmark-sandboxes still exists after workload destroy."
+    transition_to_foundation_runtime
+  fi
+
+  TF_VAR_aws_profile="vals-dev" \
+    TF_VAR_aws_region="$aws_region" \
+    TF_VAR_deployment_name="$deployment_name" \
+    TF_VAR_operator_cidr="$operator_cidr" \
+    terraform -chdir="$foundation_root" destroy \
+      -auto-approve \
+      -state="$foundation_state"
+
+  tagged_arns="$(aws resourcegroupstaggingapi get-resources \
+    --profile vals-dev \
+    --region "$aws_region" \
+    --tag-filters \
+      'Key=Project,Values=create-benchmark-service-kubernetes' \
+      "Key=Deployment,Values=$deployment_name" \
+    --query 'ResourceTagMappingList[].ResourceARN' \
+    --output text)"
+  [[ -z "$tagged_arns" || "$tagged_arns" == "None" ]] || fail \
+    "Tagged AWS resources remain after destroy: $tagged_arns."
+
+  [[ "$state_dir" == "$expected_state_dir" ]] || fail "Refusing to clean an unexpected state directory."
+  [[ "$runtime_dir" == "$expected_runtime_dir" ]] || fail "Refusing to clean an unexpected runtime directory."
+  rm -rf -- "$runtime_dir" "$state_dir"
+}
+
+main() {
+  [[ "$#" == "1" ]] || fail "Usage: $0 plan|deploy|port-forward|test|destroy"
+  preflight
+
+  case "$1" in
+    plan) plan_foundation ;;
+    deploy) deploy_stack ;;
+    port-forward) port_forward ;;
+    test) run_live_test ;;
+    destroy) destroy_stack ;;
+    *) fail "Unknown command: $1" ;;
+  esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

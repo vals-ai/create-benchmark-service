@@ -65,9 +65,16 @@ a Kubernetes `ClusterIP`; the smoke does not create public control-service ingre
 Terraform 1.11+ because the workload keeps the generated API token out of saved state and
 plan data. Docker must be running.
 
-**Images.** Choose a benchmark test image that the EKS nodes can pull and pin it with a
-`sha256` digest. The deploy does not build or mirror this image. A private image registry
-must already allow pulls from the node role.
+**Images.** Choose a benchmark test image and pin it with a `sha256` digest. Kubernetes
+pulls this image for a direct sandbox, so a private registry needs the appropriate node
+registry access before deploy. The smoke does not configure that access or mirror the
+benchmark image.
+
+The optional Compose path pulls the same image as the `main` service through the DinD
+daemon instead of Kubernetes. This smoke does not provide Docker registry credentials or a
+credential helper, so the Compose `main` image must be anonymously pullable. Private
+Compose pulls require a later registry-auth or mirroring addition even when the direct
+Kubernetes pull works.
 
 **Charges.** Deploy creates chargeable AWS resources, including an EKS cluster, one
 on-demand `m6i.xlarge` node, and one NAT gateway. EBS storage, ECR storage, network traffic,
@@ -87,10 +94,12 @@ The three image settings serve different purposes:
    sidecar.
 
 `TEST_KUBERNETES_COMPOSE_IMAGE` is optional. It is the outer sandbox image for the Compose
-contract and must contain the Docker CLI and Compose plugin. The mirrored
-`docker:28.3.3-dind` image can fill this role while it talks to the separate daemon sidecar.
-The Compose `main` service still uses `TEST_KUBERNETES_IMAGE`; the outer image does not
-replace the benchmark image.
+contract and must contain the Docker CLI and Compose plugin. Every custom outer image must
+also be digest-pinned and match the control service's image allowlist. The current smoke
+allows the `TEST_KUBERNETES_IMAGE` repository and its generated ECR repository. The
+mirrored `docker:28.3.3-dind` image can fill this role while it talks to the separate daemon
+sidecar. The Compose `main` service still uses the anonymously pullable
+`TEST_KUBERNETES_IMAGE`; the outer image does not replace the benchmark image.
 
 ### Configure the shell
 
@@ -160,7 +169,8 @@ sandboxes it creates and reports cleanup failures. It skips the Compose contract
 `TEST_KUBERNETES_COMPOSE_IMAGE` is set.
 
 To use the mirrored Docker image for the optional Compose outer, load the runtime metadata
-after deploy and export its digest:
+after deploy and export its digest. This generated value is already digest-pinned and
+allowlisted:
 
 ```bash
 source "infra/kubernetes/aws/.runtime/${KUBERNETES_DEPLOYMENT_NAME}/deployment.env"

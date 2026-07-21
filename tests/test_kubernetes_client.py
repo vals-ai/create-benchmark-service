@@ -2,17 +2,23 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncGenerator, Mapping
 
 import httpx
 import pytest
+from fastapi import FastAPI, WebSocket
+from httpx_ws.transport import ASGIWebSocketTransport
 
 from benchmark_service.sandbox.kubernetes.client import KubernetesControlClientDriver
+from benchmark_service.sandbox.kubernetes.protocol import SandboxRecord
+from benchmark_service.sandbox.kubernetes.sandbox import KubernetesSandbox
 from benchmark_service.sandbox.types import (
     ExecResult,
     ImageSource,
     Resources,
+    SandboxCommandError,
     SandboxCreateRequest,
     SandboxNotFoundError,
     SandboxQuery,
@@ -136,9 +142,7 @@ class TestKubernetesControlClientLifecycle:
             fetched = await driver.get_sandbox("sandbox-1")
             listed = [
                 sandbox
-                async for sandbox in driver.list_sandboxes(
-                    SandboxQuery(labels={"run_id": "run-1"}, page_size=2)
-                )
+                async for sandbox in driver.list_sandboxes(SandboxQuery(labels={"run_id": "run-1"}, page_size=2))
             ]
             await driver.delete_sandbox("sandbox-1")
             with pytest.raises(SandboxNotFoundError, match="request_id=req-1"):
@@ -166,3 +170,107 @@ class TestKubernetesControlClientLifecycle:
                     connect_timeout=connect_timeout,
                     request_timeout=request_timeout,
                 )
+
+
+class CommandTestDriver(KubernetesControlClientDriver):
+    """Supply file and egress operations outside command test scope."""
+
+    def sandbox_for_test(self, instance_id: str) -> KubernetesSandbox:
+        return self._sandbox(driver_record(instance_id))
+
+    async def upload_file(self, instance_id: str, remote_path: str, content: bytes) -> None:
+        raise AssertionError("operation is outside this command test")
+
+    async def download_file(self, instance_id: str, remote_path: str) -> bytes:
+        raise AssertionError("operation is outside this command test")
+
+    async def stream_download(
+        self,
+        instance_id: str,
+        remote_path: str,
+    ) -> AsyncGenerator[bytes, None]:
+        raise AssertionError("operation is outside this command test")
+        yield
+
+    async def modify_egress_rules(self, instance_id: str, allowed_addresses: list[str]) -> None:
+        raise AssertionError("operation is outside this command test")
+
+    async def clear_egress_rules(self, instance_id: str) -> None:
+        raise AssertionError("operation is outside this command test")
+
+
+class TestKubernetesControlClientCommands:
+    """Command behavior for the private control API client."""
+
+    async def test_streams_command_events_and_preserves_exec_payload(self) -> None:
+        """Deliver command output before exit and keep buffered exec distinct.
+
+        Test cases:
+        - WebSocket stdout and stderr events are yielded in order before exit.
+        - A nonzero exit becomes the shared command error.
+        - Buffered exec sends all supported request fields without retries.
+        """
+        app = FastAPI()
+        release_exit = asyncio.Event()
+        observed_payloads: list[dict[str, object]] = []
+
+        async def command(websocket: WebSocket, instance_id: str) -> None:
+            assert websocket.headers["authorization"] == "Bearer test-token"
+            await websocket.accept()
+            observed_payloads.append(await websocket.receive_json())
+            if instance_id == "failed":
+                await websocket.send_json({"type": "exit", "exit_code": 7})
+                return
+            await websocket.send_json({"type": "stdout", "data": "hel"})
+            await websocket.send_json({"type": "stderr", "data": "lo"})
+            await release_exit.wait()
+            await websocket.send_json({"type": "exit", "exit_code": 0})
+
+        async def exec_command(instance_id: str, payload: dict[str, object]) -> dict[str, object]:
+            assert instance_id == "sandbox-1"
+            observed_payloads.append(payload)
+            return {"exit_code": 0, "output": "done"}
+
+        app.websocket("/v1/sandboxes/{instance_id}/command")(command)
+        app.post("/v1/sandboxes/{instance_id}/exec")(exec_command)
+
+        transport = ASGIWebSocketTransport(app=app)
+        async with transport:
+            driver = CommandTestDriver(
+                api_url="https://sandbox.internal",
+                api_token="test-token",
+                transport=transport,
+            )
+            try:
+                sandbox = driver.sandbox_for_test("sandbox-1")
+                chunks = sandbox.command(
+                    "printf hello",
+                    cwd="/workspace",
+                    timeout=3,
+                    env_vars={"FOO": "bar"},
+                )
+                assert await anext(chunks) == "hel"
+                assert await anext(chunks) == "lo"
+                release_exit.set()
+                with pytest.raises(StopAsyncIteration):
+                    await anext(chunks)
+
+                failed = driver.sandbox_for_test("failed")
+                with pytest.raises(SandboxCommandError) as error_info:
+                    _ = [chunk async for chunk in failed.command("false")]
+
+                result = await sandbox.exec("echo done", cwd="/workspace", timeout=5)
+            finally:
+                await driver.close()
+
+        assert error_info.value.exit_code == 7
+        assert result == ExecResult(exit_code=0, output="done")
+        assert observed_payloads == [
+            {"command": "printf hello", "cwd": "/workspace", "timeout": 3.0, "env_vars": {"FOO": "bar"}},
+            {"command": "false", "cwd": None, "timeout": None, "env_vars": None},
+            {"command": "echo done", "cwd": "/workspace", "timeout": 5.0, "env_vars": None},
+        ]
+
+
+def driver_record(instance_id: str) -> SandboxRecord:
+    return SandboxRecord(id=instance_id, name="task-1", state="running")

@@ -1,22 +1,30 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from typing import Any
 from urllib.parse import quote
 
 import httpx
+from httpx_ws import HTTPXWSException, WebSocketUpgradeError, aconnect_ws
 
 from benchmark_service.sandbox.kubernetes.protocol import (
+    CommandExitEvent,
+    CommandOutputEvent,
+    CommandRequest,
     ControlErrorDetail,
     ControlErrorResponse,
+    ExecResponse,
     SandboxListPage,
     SandboxRecord,
+    command_event_adapter,
 )
 from benchmark_service.sandbox.kubernetes.runtime import KubernetesRuntimeDriver
 from benchmark_service.sandbox.kubernetes.sandbox import KubernetesSandbox
 from benchmark_service.sandbox.types import (
+    ExecResult,
     Sandbox,
+    SandboxCommandError,
     SandboxConnectionError,
     SandboxCreateRequest,
     SandboxError,
@@ -53,6 +61,9 @@ class KubernetesControlClientDriver(KubernetesRuntimeDriver):
 
     def _url(self, path: str) -> str:
         return f"{self._api_url}{path}"
+
+    def _ws_url(self, path: str) -> str:
+        return self._url(path).replace("https://", "wss://", 1).replace("http://", "ws://", 1)
 
     def _sandbox(self, record: SandboxRecord) -> KubernetesSandbox:
         return KubernetesSandbox(
@@ -166,6 +177,68 @@ class KubernetesControlClientDriver(KubernetesRuntimeDriver):
             if not page.continue_token:
                 return
             continue_token = page.continue_token
+
+    async def exec(
+        self,
+        instance_id: str,
+        command: str,
+        *,
+        cwd: str | None = None,
+        timeout: float | None = None,
+    ) -> ExecResult:
+        response = await self._request(
+            "POST",
+            f"/v1/sandboxes/{quote(instance_id, safe='')}/exec",
+            retryable=False,
+            json=CommandRequest(command=command, cwd=cwd, timeout=timeout).model_dump(mode="json"),
+        )
+        result = ExecResponse.model_validate(response.json())
+        return ExecResult(exit_code=result.exit_code, output=result.output)
+
+    async def command(
+        self,
+        instance_id: str,
+        command: str,
+        *,
+        cwd: str | None = None,
+        timeout: float | None = None,
+        env_vars: Mapping[str, str] | None = None,
+    ) -> AsyncGenerator[str, None]:
+        request = CommandRequest(
+            command=command,
+            cwd=cwd,
+            timeout=timeout,
+            env_vars=dict(env_vars) if env_vars is not None else None,
+        )
+        path = f"/v1/sandboxes/{quote(instance_id, safe='')}/command"
+        terminal_error: SandboxError | None = None
+        try:
+            async with aconnect_ws(self._ws_url(path), client=self._client) as websocket:
+                await websocket.send_json(request.model_dump(mode="json"))
+                while True:
+                    event = command_event_adapter.validate_python(await websocket.receive_json())
+                    if isinstance(event, CommandOutputEvent):
+                        yield event.data
+                    elif isinstance(event, CommandExitEvent):
+                        if event.exit_code != 0:
+                            terminal_error = SandboxCommandError(event.exit_code)
+                        break
+                    else:
+                        terminal_error = self._error_from_detail(
+                            ControlErrorDetail(
+                                code=event.code,
+                                message=event.message,
+                                request_id=event.request_id,
+                            )
+                        )
+                        break
+        except WebSocketUpgradeError as error:
+            self._raise_for_response(error.response)
+            raise SandboxConnectionError("WebSocket upgrade failed") from error
+        except (httpx.TransportError, HTTPXWSException) as error:
+            raise SandboxConnectionError(str(error)) from error
+        if terminal_error is not None:
+            raise terminal_error
 
     async def close(self) -> None:
         await self._client.aclose()

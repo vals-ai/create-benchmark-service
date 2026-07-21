@@ -85,12 +85,14 @@ async def decode_base64_chunks(chunks: AsyncIterable[bytes | str]) -> AsyncGener
 class AiohttpRemoteExecSession:
     """Adapt Kubernetes channel frames to the remote-exec session contract."""
 
-    def __init__(self, websocket: Any) -> None:
+    def __init__(self, websocket: Any, request_context: Any) -> None:
         self._websocket = websocket
+        self._request_context = request_context
         self._stdout: deque[bytes] = deque()
         self._stderr: deque[bytes] = deque()
         self._return_code: int | None = None
         self._closed = False
+        self._released = False
 
     async def read_stdout(self) -> bytes:
         return self._stdout.popleft() if self._stdout else b""
@@ -136,9 +138,13 @@ class AiohttpRemoteExecSession:
         return self._return_code
 
     async def close(self) -> None:
-        if not self._websocket.closed:
-            await self._websocket.close()
-        self._closed = True
+        if self._released:
+            return
+        self._released = True
+        try:
+            await self._request_context.__aexit__(None, None, None)
+        finally:
+            self._closed = True
 
 
 class KubernetesRemoteExec:
@@ -169,10 +175,11 @@ class KubernetesRemoteExec:
                 _preload_content=False,
                 _headers={"sec-websocket-protocol": "v5.channel.k8s.io"},
             )
-            websocket: Any = await request
+            request_context: Any = await request
+            websocket: Any = await request_context.__aenter__()
         except Exception as error:
             raise SandboxConnectionError(f"Could not open Kubernetes exec stream: {error}") from error
-        return AiohttpRemoteExecSession(websocket)
+        return AiohttpRemoteExecSession(websocket, request_context)
 
     async def terminate(self, pod_name: str, command_id: str) -> None:
         session: RemoteExecSession | None = None

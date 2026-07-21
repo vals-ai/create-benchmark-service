@@ -16,6 +16,7 @@ from benchmark_service.sandbox.kubernetes.control.backend import SandboxConflict
 from benchmark_service.sandbox.kubernetes.control.egress import CiliumEgressPolicyDriver
 from benchmark_service.sandbox.kubernetes.control.kubernetes import KubernetesSandboxBackend
 from benchmark_service.sandbox.kubernetes.control.remote_exec import (
+    KubernetesRemoteExec,
     RemoteExecSession,
     decode_base64_chunks,
     encode_base64_chunks,
@@ -370,9 +371,77 @@ class MockRemoteExec:
         self.closed = True
 
 
+class FakeExecWebsocket:
+    """Record remote-exec writes and closure."""
+
+    def __init__(self) -> None:
+        self.sent: list[bytes] = []
+        self.closed = False
+
+    async def send_bytes(self, data: bytes) -> None:
+        self.sent.append(data)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class FakeWebsocketContext:
+    """Expose a WebSocket through aiohttp's request-context shape."""
+
+    def __init__(self) -> None:
+        self.websocket = FakeExecWebsocket()
+        self.entered = 0
+        self.exited = 0
+
+    async def __aenter__(self) -> FakeExecWebsocket:
+        self.entered += 1
+        return self.websocket
+
+    async def __aexit__(self, *args: object) -> None:
+        del args
+        self.exited += 1
+        await self.websocket.close()
+
+
+class FakeExecCore:
+    """Return the request context used by kubernetes_asyncio remote exec."""
+
+    def __init__(self, request_context: FakeWebsocketContext) -> None:
+        self.request_context = request_context
+
+    async def connect_get_namespaced_pod_exec(self, *args: object, **kwargs: object) -> FakeWebsocketContext:
+        del args, kwargs
+        return self.request_context
+
+
 async def _chunks(values: list[bytes]) -> AsyncGenerator[bytes, None]:
     for value in values:
         yield value
+
+
+class TestKubernetesRemoteExec:
+    """Kubernetes WebSocket lifecycle behavior."""
+
+    async def test_enters_and_exits_websocket_request_context(self) -> None:
+        """Use the WebSocket response inside its aiohttp request context.
+
+        Test cases:
+        - Opening enters the request context before sending channel frames.
+        - Closing exits the request context exactly once.
+        """
+        request_context = FakeWebsocketContext()
+        remote_exec = KubernetesRemoteExec.__new__(KubernetesRemoteExec)
+        remote_exec.settings = _settings()
+        cast(Any, remote_exec)._core = FakeExecCore(request_context)
+
+        session = await remote_exec.open("task-1-pod", ["true"], stdin=True)
+        await session.write_stdin(b"input")
+        await session.close()
+        await session.close()
+
+        assert request_context.entered == 1
+        assert request_context.websocket.sent == [b"\x00input"]
+        assert request_context.exited == 1
 
 
 class TestKubernetesSandboxBackendStreaming:

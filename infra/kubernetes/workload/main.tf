@@ -89,12 +89,14 @@ resource "kubernetes_limit_range_v1" "sandboxes" {
     limit {
       type = "Container"
       default = {
-        cpu    = "2"
-        memory = "4Gi"
+        cpu                 = "2"
+        memory              = "4Gi"
+        "ephemeral-storage" = "20Gi"
       }
       default_request = {
-        cpu    = "250m"
-        memory = "256Mi"
+        cpu                 = "250m"
+        memory              = "256Mi"
+        "ephemeral-storage" = "1Gi"
       }
     }
   }
@@ -169,10 +171,11 @@ resource "kubernetes_secret_v1" "control" {
     namespace = kubernetes_namespace_v1.sandboxes.metadata[0].name
   }
 
-  data = {
+  data_wo = {
     KUBERNETES_SANDBOX_API_TOKEN = var.api_token
   }
-  type = "Opaque"
+  data_wo_revision = 1
+  type             = "Opaque"
 }
 
 resource "kubernetes_deployment_v1" "control" {

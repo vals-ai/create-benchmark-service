@@ -20,7 +20,7 @@ variable "control_image" {
   type = string
 
   validation {
-    condition     = can(regex("^[^[:space:]@]+@sha256:[0-9a-fA-F]{64}$", var.control_image))
+    condition     = can(regex("^[^[:space:]@]+@sha256:[0-9a-f]{64}$", var.control_image))
     error_message = "control_image must be a non-empty sha256 digest reference."
   }
 }
@@ -29,7 +29,7 @@ variable "docker_image" {
   type = string
 
   validation {
-    condition     = can(regex("^[^[:space:]@]+@sha256:[0-9a-fA-F]{64}$", var.docker_image))
+    condition     = can(regex("^[^[:space:]@]+@sha256:[0-9a-f]{64}$", var.docker_image))
     error_message = "docker_image must be a non-empty sha256 digest reference."
   }
 }
@@ -38,17 +38,18 @@ variable "allowed_image_prefixes" {
   type = list(string)
 
   validation {
-    condition = length([
-      for prefix in var.allowed_image_prefixes : prefix
-      if length(trimspace(prefix)) > 0
-    ]) > 0
-    error_message = "allowed_image_prefixes must contain at least one non-empty prefix."
+    condition = length(var.allowed_image_prefixes) > 0 && alltrue([
+      for prefix in var.allowed_image_prefixes :
+      length(prefix) > 0 && prefix == trimspace(prefix) && !strcontains(prefix, ",")
+    ])
+    error_message = "allowed_image_prefixes must contain trimmed, non-empty, comma-free prefixes."
   }
 }
 
 variable "api_token" {
   type      = string
   sensitive = true
+  ephemeral = true
 
   validation {
     condition     = length(trimspace(var.api_token)) >= 32

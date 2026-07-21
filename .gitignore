@@ -13,3 +13,8 @@ __pycache__/
 .superpowers/
 
 src/benchmark_service/_version.py
+
+# Disposable Kubernetes smoke state and secrets
+infra/kubernetes/aws/.runtime/
+infra/kubernetes/aws/.state/
+infra/kubernetes/aws/**/.terraform/

@@ -206,9 +206,11 @@ async def test_live_kubernetes_control_service_contract() -> None:
                 should_succeed=True,
             )
     finally:
-        if command_stream is not None:
-            await command_stream.aclose()
-        await _delete_created_sandboxes(driver, sandbox_ids)
+        try:
+            if command_stream is not None:
+                await command_stream.aclose()
+        finally:
+            await _delete_created_sandboxes(driver, sandbox_ids)
 
 
 @pytest.mark.skipif(
@@ -262,14 +264,23 @@ async def test_live_kubernetes_compose_contract() -> None:
 
         assert "".join(command_chunks) == "compose-first\ncompose-second\n"
         assert len(command_chunks) >= 2
-    finally:
-        try:
-            if outer is not None:
-                teardown_result = await outer.exec(
+    except BaseException:
+        if outer is not None:
+            try:
+                await outer.exec(
                     f"{compose_command} down --volumes --remove-orphans",
                     timeout=180,
                 )
+            except Exception:
+                pass
+        raise
+    else:
+        assert outer is not None
+        teardown_result = await outer.exec(
+            f"{compose_command} down --volumes --remove-orphans",
+            timeout=180,
+        )
 
-                assert teardown_result.exit_code == 0, teardown_result.output
-        finally:
-            await _delete_created_sandboxes(driver, sandbox_ids)
+        assert teardown_result.exit_code == 0, teardown_result.output
+    finally:
+        await _delete_created_sandboxes(driver, sandbox_ids)

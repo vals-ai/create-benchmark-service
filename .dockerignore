@@ -1,0 +1,13 @@
+.git
+.github
+.pytest_cache
+.ruff_cache
+.venv
+docs
+tests
+**/__pycache__
+*.pyc
+*.tfstate
+*.tfstate.*
+infra/kubernetes/aws/.runtime
+infra/kubernetes/aws/.state

@@ -80,11 +80,21 @@ module "eks" {
 
   eks_managed_node_groups = {
     sandbox = {
-      ami_type                   = "AL2023_x86_64_STANDARD"
-      capacity_type              = "ON_DEMAND"
-      instance_types             = var.node_instance_types
-      disk_size                  = 100
-      use_custom_launch_template = false
+      ami_type       = "AL2023_x86_64_STANDARD"
+      capacity_type  = "ON_DEMAND"
+      instance_types = var.node_instance_types
+
+      block_device_mappings = {
+        xvda = {
+          device_name = "/dev/xvda"
+          ebs = {
+            delete_on_termination = true
+            encrypted             = true
+            volume_size           = 100
+            volume_type           = "gp3"
+          }
+        }
+      }
 
       min_size     = 1
       max_size     = 2

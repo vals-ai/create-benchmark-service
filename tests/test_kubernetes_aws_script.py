@@ -196,6 +196,7 @@ esac
         foundation_main = FOUNDATION_MAIN_PATH.read_text()
         assert 'variable "aws_account_id"' in foundation_variables
         assert "allowed_account_ids = [var.aws_account_id]" in foundation_main
+        assert "node.cilium.io/agent-not-ready" not in foundation_main
 
         for env_updates, expected_error in preflight_cases:
             record_path.write_text("")

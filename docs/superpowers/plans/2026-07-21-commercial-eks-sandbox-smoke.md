@@ -11,6 +11,7 @@
 ## Global Constraints
 
 - Provision only the commercial `aws` partition in the first smoke; reject GovCloud and China partitions in preflight.
+- Require `AWS_PROFILE=vals-dev`; reject every other profile and pass `vals-dev` explicitly to AWS CLI, Terraform, and EKS token commands.
 - Require `AWS_ACCOUNT_ID` and compare it with `aws sts get-caller-identity` before plan, apply, test, or destroy.
 - Default to `us-east-2`, EKS 1.35, one `m6i.xlarge` on-demand managed node, and one NAT gateway; expose all as Terraform variables.
 - Enable private EKS API access and limit public EKS API access to the required `AWS_OPERATOR_CIDR` value.
@@ -145,7 +146,7 @@ git push origin jf/test-kubernetes
 - Modify: `.gitignore`
 
 **Interfaces:**
-- Consumes: `aws_region`, `deployment_name`, `operator_cidr`, `kubernetes_version`, `node_instance_types`, and common tags.
+- Consumes: `aws_profile`, `aws_region`, `deployment_name`, `operator_cidr`, `kubernetes_version`, `node_instance_types`, and common tags.
 - Produces: `cluster_name`, `cluster_endpoint`, `cluster_certificate_authority_data`, `image_repository_url`, `aws_region`, and `deployment_tags`.
 
 - [ ] **Step 1: Establish the validation failure**
@@ -170,6 +171,15 @@ Define these defaults and validations in `variables.tf`:
 variable "aws_region" {
   type    = string
   default = "us-east-2"
+}
+
+variable "aws_profile" {
+  type    = string
+  default = "vals-dev"
+  validation {
+    condition     = var.aws_profile == "vals-dev"
+    error_message = "aws_profile must be vals-dev for this disposable smoke."
+  }
 }
 
 variable "deployment_name" {
@@ -200,7 +210,7 @@ variable "node_instance_types" {
 }
 ```
 
-Create locals for the cluster name and the three mandatory tags. Do not accept caller overrides for those mandatory tag keys.
+Configure the AWS provider with `profile = var.aws_profile` and `region = var.aws_region`. Create locals for the cluster name and the three mandatory tags. Do not accept caller overrides for those mandatory tag keys.
 
 - [ ] **Step 4: Build the disposable VPC, EKS cluster, and ECR repository**
 
@@ -303,7 +313,7 @@ exec {
 }
 ```
 
-Require non-empty digest references for `control_image` and `docker_image`, require at least one non-empty `allowed_image_prefixes` entry, and mark `api_token` sensitive with a minimum length of 32.
+Set `aws_profile` to `vals-dev` by default and reject another value. Require non-empty digest references for `control_image` and `docker_image`, require at least one non-empty `allowed_image_prefixes` entry, and mark `api_token` sensitive with a minimum length of 32.
 
 - [ ] **Step 3: Install Cilium in AWS VPC CNI chaining mode**
 
@@ -400,7 +410,7 @@ git push origin jf/test-kubernetes
 - Create: `tests/test_kubernetes_aws_script.py`
 
 **Interfaces:**
-- Consumes: command `plan|deploy|port-forward|test|destroy` and environment values `AWS_ACCOUNT_ID`, `AWS_PROFILE`, `AWS_REGION`, `AWS_OPERATOR_CIDR`, `KUBERNETES_DEPLOYMENT_NAME`, `TEST_KUBERNETES_IMAGE`, and optional `DIND_SOURCE_IMAGE`.
+- Consumes: command `plan|deploy|port-forward|test|destroy` and environment values `AWS_ACCOUNT_ID`, `AWS_PROFILE=vals-dev`, `AWS_REGION`, `AWS_OPERATOR_CIDR`, `KUBERNETES_DEPLOYMENT_NAME`, `TEST_KUBERNETES_IMAGE`, and optional `DIND_SOURCE_IMAGE`.
 - Produces: two local state files, a mode-0600 runtime environment file, pinned ECR digests, and ordered Terraform operations.
 
 - [ ] **Step 1: Write the failing orchestration test**
@@ -408,6 +418,7 @@ git push origin jf/test-kubernetes
 Add one table-driven pytest test with local executable shims. It must prove:
 
 - missing `AWS_ACCOUNT_ID` and `AWS_OPERATOR_CIDR` fail before Terraform;
+- an absent profile or any `AWS_PROFILE` other than `vals-dev` fails before AWS or Terraform;
 - a returned partition other than `aws` is rejected;
 - an account mismatch fails and prints both expected and actual IDs;
 - deploy orders foundation apply, ECR publishing, workload apply, and readiness;
@@ -437,6 +448,8 @@ dind_source_image="${DIND_SOURCE_IMAGE:-docker:28.3.3-dind}"
 ```
 
 Validate the deployment name with `^[a-z][a-z0-9-]{2,31}$`, the operator CIDR with Python's `ipaddress.IPv4Network`, and the AWS identity using `aws sts get-caller-identity`. Reject any ARN not beginning with `arn:aws:` and any account unequal to `AWS_ACCOUNT_ID`.
+
+Require `AWS_PROFILE` to equal `vals-dev`. Pass `--profile vals-dev` to every AWS CLI command, set the foundation AWS provider profile to `vals-dev`, and set `AWS_PROFILE=vals-dev` in Kubernetes and Helm EKS token exec blocks.
 
 Use only these state paths after validating `deployment_name`:
 
@@ -593,7 +606,7 @@ State plainly that Terraform builds only the control image. The benchmark provid
 Show these commands in order:
 
 ```bash
-export AWS_PROFILE
+export AWS_PROFILE=vals-dev
 export AWS_ACCOUNT_ID
 export AWS_REGION=us-east-2
 export AWS_OPERATOR_CIDR
@@ -660,11 +673,11 @@ Expected: every command succeeds before AWS provisioning.
 Run:
 
 ```bash
-aws sts get-caller-identity
-aws configure get region
+aws --profile vals-dev sts get-caller-identity
+aws --profile vals-dev configure get region
 ```
 
-Compare the returned account with `AWS_ACCOUNT_ID` and confirm the ARN begins with `arn:aws:`. Stop before apply if either check differs.
+Run both commands with `--profile vals-dev`. Compare the returned account with `AWS_ACCOUNT_ID` and confirm the ARN begins with `arn:aws:`. Stop before apply if either check differs.
 
 - [ ] **Step 3: Provision and capture the live proof**
 

@@ -38,6 +38,8 @@ infra/kubernetes/
 
 The foundation layer creates a dedicated VPC, public and private subnets, outbound access for private worker nodes, an EKS cluster, one managed node group, ECR storage for the control image, and the IAM roles used by those resources. The EKS API enables private access and restricts public access to an explicitly supplied operator CIDR. No existing VPC, cluster, node group, ECR repository, or IAM role is imported into this disposable stack.
 
+Every AWS and EKS command uses the `vals-dev` profile. Preflight rejects another profile and compares the profile's STS account ID with an explicitly supplied expected account ID before Terraform can plan, apply, test, or destroy.
+
 The workload layer creates the sandbox namespace, service account, namespace-scoped RBAC, `ResourceQuota`, `LimitRange`, `runc` `RuntimeClass`, Cilium installation and policy support, control-service Secret, Deployment, and ClusterIP Service. Cilium runs in AWS VPC CNI chaining mode for the initial test so the current `CiliumNetworkPolicy` egress driver can exercise CIDR and FQDN rules.
 
 The control service uses its in-cluster service account. Sandbox Pods do not mount a service-account token. A local operator reaches the ClusterIP service only through `kubectl port-forward`.

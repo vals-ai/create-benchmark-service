@@ -40,7 +40,7 @@ The foundation layer creates a dedicated VPC, public and private subnets, outbou
 
 Every AWS and EKS command uses the `vals-dev` profile. Preflight rejects another profile and compares the profile's STS account ID with an explicitly supplied expected account ID before Terraform can plan, apply, test, or destroy.
 
-The workload layer creates the sandbox namespace, service account, namespace-scoped RBAC, `ResourceQuota`, `LimitRange`, `runc` `RuntimeClass`, Cilium installation and policy support, control-service Secret, Deployment, and ClusterIP Service. Cilium runs in AWS VPC CNI chaining mode for the initial test so the current `CiliumNetworkPolicy` egress driver can exercise CIDR and FQDN rules.
+The workload layer creates the sandbox namespace, service account, namespace-scoped RBAC, `ResourceQuota`, `LimitRange`, `runc` `RuntimeClass`, Cilium installation and policy support, control-service Secret, Deployment, and ClusterIP Service. It connects through a supplied kubeconfig path and context rather than embedding an EKS authentication flow. The AWS orchestration creates that kubeconfig with `vals-dev`; a later cloud foundation can provide another context without changing the workload resources. Cilium runs in AWS VPC CNI chaining mode for the initial test so the current `CiliumNetworkPolicy` egress driver can exercise CIDR and FQDN rules.
 
 The control service uses its in-cluster service account. Sandbox Pods do not mount a service-account token. A local operator reaches the ClusterIP service only through `kubectl port-forward`.
 
@@ -48,8 +48,8 @@ The control service uses its in-cluster service account. Sandbox Pods do not mou
 
 The root Make targets provide one ordered interface:
 
-1. `make kubernetes-aws-plan` validates required tools, AWS identity, region, operator CIDR, Terraform inputs, and both Terraform plans without changing AWS.
-2. `make kubernetes-aws-deploy` applies the foundation, builds and pushes the control-service image, records its digest, and applies the workload using pinned image references.
+1. `make kubernetes-aws-plan` validates required tools, AWS identity, region, operator CIDR, and both Terraform roots, then saves the foundation plan without changing AWS.
+2. `make kubernetes-aws-deploy` applies the saved foundation plan, creates a `vals-dev` kubeconfig, builds and pushes the control-service image, records its digest, saves the workload plan against the live cluster, and applies that saved plan using pinned image references.
 3. `make kubernetes-aws-port-forward` forwards the control service to a local port without creating a load balancer.
 4. `make kubernetes-aws-test` runs the opt-in live integration contract against the forwarded endpoint.
 5. `make kubernetes-aws-destroy` destroys the workload layer first, destroys the foundation second, and verifies that resources carrying the deployment tags no longer exist.

@@ -4,7 +4,7 @@
 
 **Goal:** Add a repeatable commercial AWS EKS environment that runs the Kubernetes sandbox control service, proves the live provider contract through a local port-forward, and completely tears down its Kubernetes and AWS resources.
 
-**Architecture:** A foundation Terraform root creates a dedicated VPC, EKS cluster, managed node group, IAM, and ECR repository. A separate workload Terraform root connects with `aws eks get-token` and creates Cilium, the namespace-scoped control service, RBAC, quotas, and the `runc` runtime class; one orchestration script applies and destroys the two roots in dependency order.
+**Architecture:** A foundation Terraform root creates a dedicated VPC, EKS cluster, managed node group, IAM, and ECR repository. A separate workload Terraform root connects through a supplied kubeconfig path/context and creates Cilium, the namespace-scoped control service, RBAC, quotas, and the `runc` runtime class; the AWS orchestration generates that kubeconfig with `vals-dev` and applies and destroys the two roots in dependency order.
 
 **Tech Stack:** Terraform 1.10+, AWS provider 6.x, terraform-aws-vpc 6.6.1, terraform-aws-eks 21.24.0, Kubernetes provider 3.2.1, Helm provider 3.x, Amazon EKS 1.35, Amazon Linux 2023 managed nodes, Cilium 1.19.6, Docker, AWS CLI, kubectl, Bash, Python 3.12, pytest.
 
@@ -16,6 +16,7 @@
 - Default to `us-east-2`, EKS 1.35, one `m6i.xlarge` on-demand managed node, and one NAT gateway; expose all as Terraform variables.
 - Enable private EKS API access and limit public EKS API access to the required `AWS_OPERATOR_CIDR` value.
 - Keep the control service as `ClusterIP`; use `kubectl port-forward` for the smoke.
+- Keep `infra/kubernetes/workload` cloud-neutral: it accepts a kubeconfig path/context and contains no AWS or EKS authentication commands.
 - Build only the control-service image. The benchmark request supplies the main sandbox image; mirror the pinned Docker daemon image into the stack ECR repository without rebuilding it.
 - Keep the benchmark container non-privileged. Only the Docker daemon sidecar is privileged.
 - Use `runc` for this smoke. Do not claim Kata isolation until a separate runtime/node configuration passes its live gate.
@@ -34,8 +35,8 @@
 - `infra/kubernetes/aws/foundation/variables.tf`: commercial AWS, network, cluster, node, and tag inputs.
 - `infra/kubernetes/aws/foundation/main.tf`: VPC, EKS, managed node group, add-ons, and ECR repository.
 - `infra/kubernetes/aws/foundation/outputs.tf`: values consumed by image publishing and the workload layer.
-- `infra/kubernetes/workload/versions.tf`: Kubernetes and Helm providers using EKS exec authentication.
-- `infra/kubernetes/workload/variables.tf`: cluster connection, image, token, limits, and Cilium inputs.
+- `infra/kubernetes/workload/versions.tf`: Kubernetes and Helm providers using a supplied kubeconfig path/context.
+- `infra/kubernetes/workload/variables.tf`: kubeconfig, image, token, limits, and Cilium inputs.
 - `infra/kubernetes/workload/main.tf`: Cilium and cloud-neutral Kubernetes resources.
 - `infra/kubernetes/workload/outputs.tf`: namespace and service names used by port-forward and verification.
 - `infra/kubernetes/aws/kubernetes-aws`: checked orchestration for plan, deploy, port-forward, test, and destroy.
@@ -285,7 +286,7 @@ git push origin jf/test-kubernetes
 - Create: `infra/kubernetes/workload/outputs.tf`
 
 **Interfaces:**
-- Consumes: EKS connection values plus `control_image`, `docker_image`, `allowed_image_prefixes`, and `api_token`.
+- Consumes: `kubeconfig_path`, `kubeconfig_context`, `control_image`, `docker_image`, `allowed_image_prefixes`, and `api_token`.
 - Produces: `namespace`, `service_name`, and `runtime_class_name`.
 
 - [ ] **Step 1: Establish the validation failure**
@@ -298,22 +299,25 @@ terraform -chdir=infra/kubernetes/workload init -backend=false
 
 Expected: failure because the workload Terraform root does not exist.
 
-- [ ] **Step 2: Configure short-lived EKS authentication**
+- [ ] **Step 2: Configure kubeconfig-based authentication**
 
-Require Kubernetes provider `3.2.1` and Helm provider `~> 3.0`. Configure both providers with the supplied endpoint and CA plus this exec authentication:
+Require Kubernetes provider `3.2.1` and Helm provider `~> 3.0`. Require non-empty absolute `kubeconfig_path` and non-empty `kubeconfig_context` values. Configure both providers from those values:
 
 ```hcl
-exec {
-  api_version = "client.authentication.k8s.io/v1"
-  command     = "aws"
-  args        = ["eks", "get-token", "--cluster-name", var.cluster_name, "--region", var.aws_region]
-  env = {
-    AWS_PROFILE = var.aws_profile
+provider "kubernetes" {
+  config_path    = var.kubeconfig_path
+  config_context = var.kubeconfig_context
+}
+
+provider "helm" {
+  kubernetes = {
+    config_path    = var.kubeconfig_path
+    config_context = var.kubeconfig_context
   }
 }
 ```
 
-Set `aws_profile` to `vals-dev` by default and reject another value. Require non-empty digest references for `control_image` and `docker_image`, require at least one non-empty `allowed_image_prefixes` entry, and mark `api_token` sensitive with a minimum length of 32.
+Do not reference AWS, EKS, cloud region, or cloud credentials in this root. Require non-empty digest references for `control_image` and `docker_image`, require at least one non-empty `allowed_image_prefixes` entry, and mark `api_token` sensitive with a minimum length of 32.
 
 - [ ] **Step 3: Install Cilium in AWS VPC CNI chaining mode**
 
@@ -461,7 +465,7 @@ infra/kubernetes/aws/.runtime/${deployment_name}/deployment.env
 
 - [ ] **Step 4: Implement plan and deploy**
 
-`plan` must initialize and validate both roots, then create a saved foundation plan using the deployment, region, and operator CIDR. If foundation state already exposes a cluster, also create a workload plan; otherwise report that workload planning follows foundation creation.
+`plan` must initialize and validate both roots, then create a saved foundation plan using the deployment, region, and operator CIDR. It must report that the workload plan is created after foundation apply because the Kubernetes provider needs a live API endpoint.
 
 `deploy` must:
 
@@ -472,8 +476,8 @@ infra/kubernetes/aws/.runtime/${deployment_name}/deployment.env
 5. pull `docker:28.3.3-dind`, tag it `dind-28.3.3`, and push it only if absent;
 6. resolve both ECR digests with `aws ecr describe-images` and reject non-`sha256:` results;
 7. generate a 64-character token with `openssl rand -hex 32` only when the mode-0600 runtime file is absent;
-8. update a deployment-specific kubeconfig context;
-9. derive exact digest prefixes for the benchmark repository and the stack ECR repository, then apply workload state with endpoint, CA, image digests, allowed prefixes, API token, region, and profile passed through `TF_VAR_*`; and
+8. create a deployment-specific kubeconfig with `aws eks update-kubeconfig --profile vals-dev`, an explicit file path, and an explicit context alias;
+9. derive exact digest prefixes for the benchmark repository and the stack ECR repository, then create and apply a saved workload plan with the absolute kubeconfig path/context, image digests, allowed prefixes, and API token passed through `TF_VAR_*`; and
 10. wait for Cilium and the control Deployment to become ready.
 
 Never print the API token or include it in a command argument.

@@ -123,9 +123,10 @@ Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` 
 ```json
 {"type": "daytona", "api_key": "...", "api_url": "...", "target": "..."}
 {"type": "modal", "MODAL_TOKEN_ID": "...", "MODAL_TOKEN_SECRET": "..."}
+{"type": "kubernetes", "KUBERNETES_API_URL": "https://sandbox.internal", "KUBERNETES_API_TOKEN": "..."}
 ```
 
-An experimental, non-deploying Kubernetes provider scaffold is described in [Kubernetes sandbox provider](docs/KUBERNETES_SANDBOX_PROVIDER.md). It is not registered in `SandboxProviderConfig` and cannot run sandboxes yet.
+The Kubernetes provider calls a private sandbox control service over HTTPS and WebSocket. The client supports lifecycle operations, buffered exec, streaming commands, binary upload, buffered and streaming download, and temporary egress allowlists. This branch does not deploy the control service or any EKS resources; see [Kubernetes sandbox provider](docs/KUBERNETES_SANDBOX_PROVIDER.md) for the cluster boundary and rollout gates.
 
 Provider compatibility notes:
 
@@ -134,6 +135,8 @@ Provider compatibility notes:
 - GPUs are requested via `Resources.gpu` (count) and `Resources.gpu_type`. Modal requires `gpu_type` (any Modal GPU name, e.g. `H100`, `A100-80GB`, `T4`) and passes `"<type>:<count>"` to the sandbox. Daytona accepts a count with an optional type restricted to its `GpuType` enum (`H100`, `H200`, `RTX-PRO-6000`, `RTX-4090`, `RTX-5090`); GPU requests are rejected for Daytona `SnapshotSource` sandboxes because snapshot resources are fixed at snapshot creation.
 - Nested Docker (Docker-in-Docker) capability is granted on every sandbox for both providers — Daytona supports it natively and the Modal adapter requests it unconditionally — so benchmarks never configure it. The benchmark service still owns the Docker-capable image, dockerd startup flags, compose workflow, and cleanup.
 - Transient Modal connection errors are retried up to three attempts, matching the Daytona adapter's provider-level retry shape. Non-transient command failures still surface as `SandboxCommandError` with the command exit code.
+- Kubernetes uses `ImageSource` for direct control-service creates. Compose remains the shared DinD wrapper around an outer image. `SnapshotSource` is not accepted until the control service has a portable image-plus-workspace restore contract.
+- Kubernetes cluster details do not appear in benchmark requests. Runtime class, namespace, EKS region, image policy, and network-policy driver are control-service deployment settings.
 
 Benchmark services can send `eval_resume_state` updates to the tracker while evaluation is running. The tracker stores the latest value and sends it back on eval-only retry, so the benchmark service can continue evaluation without recreating the original agent sandbox.
 
@@ -221,7 +224,7 @@ Pydantic models used across requests and responses:
 
 - **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `Resources`
 - **`SandboxSource`** — `ImageSource(type="image", image=...)` or `SnapshotSource(type="snapshot", snapshot=...)`
-- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; currently `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET)` or `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)`
+- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; Daytona, Modal, or `KubernetesProviderConfig(type="kubernetes", KUBERNETES_API_URL, KUBERNETES_API_TOKEN, KUBERNETES_CONNECT_TIMEOUT=10, KUBERNETES_REQUEST_TIMEOUT=60)`
 - **`Resources`** — `vcpu`, `memory`, `disk`, optional `gpu` (count, default 0) and `gpu_type` (requires `gpu >= 1`)
 - **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, optional `sandbox_provider` with Daytona header fallback, `dataset`
 - **`EvaluateResponseRequest`** — `task_id`, `response` or `eval_resume_state`, optional `sandbox_provider`, `dataset`

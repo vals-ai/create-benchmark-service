@@ -13,6 +13,7 @@ from starlette.websockets import WebSocketDisconnect
 from benchmark_service import auth as auth_module
 from benchmark_service.app import BenchmarkServiceApp, send_json_if_connected
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
+from benchmark_service.sandbox.kubernetes.config import KubernetesProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
 from benchmark_service.sandbox.types import (
     ExecResult,
@@ -254,7 +255,9 @@ def test_websocket_setup_task_resolves_sandbox_provider(
     - A provider config object in the request body creates that provider directly.
     """
 
-    def create_provider(_config: ModalProviderConfig | DaytonaProviderConfig) -> SandboxProvider:
+    def create_provider(
+        _config: ModalProviderConfig | DaytonaProviderConfig | KubernetesProviderConfig,
+    ) -> SandboxProvider:
         return ProviderSelectionProvider()
 
     class RuntimeProviderBenchmark(StubBenchmark):
@@ -262,6 +265,7 @@ def test_websocket_setup_task_resolves_sandbox_provider(
             yield StreamResultChunk(type="result", data={"task_id": task_id, "sandbox_name": sandbox.name})
 
     monkeypatch.setattr(DaytonaProviderConfig, "create_provider", create_provider)
+    monkeypatch.setattr(KubernetesProviderConfig, "create_provider", create_provider)
     monkeypatch.setattr(ModalProviderConfig, "create_provider", create_provider)
 
     with TestClient(BenchmarkServiceApp(RuntimeProviderBenchmark)) as c:
@@ -271,9 +275,9 @@ def test_websocket_setup_task_resolves_sandbox_provider(
                     "task_id": "task-1",
                     "instance_id": "i-1",
                     "sandbox_provider": {
-                        "type": "modal",
-                        "MODAL_TOKEN_ID": "id",
-                        "MODAL_TOKEN_SECRET": "secret",
+                        "type": "kubernetes",
+                        "KUBERNETES_API_URL": "https://sandbox.internal",
+                        "KUBERNETES_API_TOKEN": "secret-reference-value",
                     },
                 }
             )

@@ -11,8 +11,11 @@ import pytest
 from fastapi import FastAPI, WebSocket
 from httpx_ws.transport import ASGIWebSocketTransport
 
+from benchmark_service.sandbox import sandbox_provider_config_from_mapping
 from benchmark_service.sandbox.kubernetes.client import KubernetesControlClientDriver
+from benchmark_service.sandbox.kubernetes.config import KubernetesProviderConfig
 from benchmark_service.sandbox.kubernetes.protocol import SandboxRecord
+from benchmark_service.sandbox.kubernetes.provider import KubernetesSandboxProvider
 from benchmark_service.sandbox.kubernetes.sandbox import KubernetesSandbox
 from benchmark_service.sandbox.types import (
     ExecResult,
@@ -170,6 +173,26 @@ class TestKubernetesControlClientLifecycle:
                     connect_timeout=connect_timeout,
                     request_timeout=request_timeout,
                 )
+
+    def test_parses_public_provider_config_and_keeps_implementations_concrete(self) -> None:
+        """Register a usable provider config without exposing cluster settings.
+
+        Test cases:
+        - The kubernetes discriminator parses the private API URL and token.
+        - The production driver, provider, and sandbox fully implement their contracts.
+        """
+        parsed = sandbox_provider_config_from_mapping(
+            {
+                "type": "kubernetes",
+                "KUBERNETES_API_URL": "https://sandbox.internal",
+                "KUBERNETES_API_TOKEN": "secret-reference-value",
+            }
+        )
+
+        assert isinstance(parsed, KubernetesProviderConfig)
+        assert not KubernetesControlClientDriver.__abstractmethods__
+        assert not KubernetesSandboxProvider.__abstractmethods__
+        assert not KubernetesSandbox.__abstractmethods__
 
 
 class CommandTestDriver(KubernetesControlClientDriver):

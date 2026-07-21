@@ -2,67 +2,88 @@
 
 ## Status
 
-The `benchmark_service.sandbox.kubernetes` package is an experimental scaffold. It defines the boundary between the benchmark-service framework and a Kubernetes sandbox runtime, but it cannot create a sandbox yet.
+The framework has a registered `kubernetes` provider client and a private control-service protocol. It covers create, get, list, delete, buffered exec, streaming command output, binary upload, buffered and streaming download, and temporary egress restrictions.
 
-This first change deliberately does not:
+This branch does not create or change an EKS cluster, install cluster resources, or deploy the control service. A configured client is runnable only after the private service has been deployed and passed the live gates below.
 
-- register Kubernetes in `SandboxProviderConfig`;
-- add a Kubernetes SDK or controller dependency;
-- install custom resources, Helm charts, or manifests;
-- create or change an EKS cluster; or
-- deploy anything to AWS GovCloud.
+## Configuration
 
-Callers should continue using the existing Daytona or Modal provider configurations until a Kubernetes driver passes the rollout checks below.
+The request-scoped provider secret contains only the private service connection:
 
-## Component boundary
-
-The framework-facing provider stays independent of the Kubernetes runtime:
-
-```text
-Benchmark service
-  -> KubernetesSandboxProvider
-    -> KubernetesRuntimeDriver
-      -> KubernetesSandbox
-        -> exec, command, upload, download, and egress operations
-      -> Kata driver (first implementation)
-      -> KubeVirt driver (fallback)
+```json
+{
+  "type": "kubernetes",
+  "KUBERNETES_API_URL": "https://sandbox-control.internal",
+  "KUBERNETES_API_TOKEN": "...",
+  "KUBERNETES_CONNECT_TIMEOUT": 10,
+  "KUBERNETES_REQUEST_TIMEOUT": 60
+}
 ```
 
-`KubernetesSandboxProvider` implements the existing `SandboxProvider` interface and delegates create, get, list, delete, and close operations to a `KubernetesRuntimeDriver`. The driver returns `KubernetesSandbox` objects, which delegate command execution, command streaming, file transfer, download streaming, and egress changes back to the same driver using their sandbox ID.
+The URL must be reachable from the tracker or benchmark service. Put the token in the same secret flow used for other provider credentials. Do not place the EKS endpoint, kubeconfig, namespace, runtime class, cloud region, or node details in this request.
 
-This keeps Kubernetes API and sandbox-controller calls in one runtime-specific implementation. `KubernetesSandbox` only stores the shared ID, name, and state fields and applies the existing `Sandbox` method signatures.
+## Boundary
 
-Kata or KubeVirt selection belongs in deployment configuration, not in a benchmark request. This keeps the existing `SandboxCreateRequest` stable and prevents benchmark definitions from depending on cluster implementation details.
+EKS is the sandbox provider. The tracker and benchmark services do not need to move to Kubernetes and do not receive Kubernetes credentials.
 
-## Portability rules
+```text
+Tracker or benchmark service
+  -> HTTPS and WebSocket
+Private sandbox control service in EKS
+  -> namespace-scoped Kubernetes API
+Job -> Kata-isolated sandbox Pod
+  -> workspace volume and optional DinD sidecar
+```
 
-The first driver and later drivers should follow the same rules:
+The framework client translates the shared `SandboxProvider` operations to the private API. The control service handles Kubernetes resources, readiness, cleanup, command execution, file transfer, and network policy. This boundary keeps provider selection portable: another cluster implementation can expose the same API without changing benchmark code.
 
-- Benchmark environments remain OCI images. Runtime-specific machine images are cluster infrastructure, not benchmark inputs.
-- Workspace persistence uses a portable storage interface. A replacement sandbox can attach or restore the same workspace without exposing a cloud disk identifier to the benchmark service.
-- Sandbox names and labels retain their current retry and lookup meaning.
-- File transfer, command streaming, resource requests, and egress rules keep the existing `Sandbox` behavior.
-- Provider and driver errors map to the shared sandbox exceptions instead of leaking Kubernetes client errors to callers.
+## Operation contract
 
-Changing drivers should be straightforward for newly created sandboxes because callers use the shared provider contract. Live migration of a running sandbox between Kata and KubeVirt is outside the first implementation; a runtime change will recreate the sandbox and restore its workspace when persistence is enabled.
+- Lifecycle reads and idempotent writes use bounded retries. Commands and uploads are not replayed after an unknown outcome.
+- `command()` uses WebSocket events and yields stdout and stderr chunks as they arrive. A nonzero terminal event becomes `SandboxCommandError` after prior output has been delivered.
+- `stream_download()` yields response bytes without joining them. `download_file()` intentionally buffers those chunks for the existing shared return type.
+- Baseline egress is unrestricted, matching the existing providers. `modify_egress_rules()` installs a temporary allowlist; `clear_egress_rules()` restores unrestricted egress.
+- Control-service errors use stable codes plus a request ID. Kubernetes client exceptions do not cross the service boundary.
 
-## First deployment target
+## Workload rules
 
-The initial target is a private Amazon EKS cluster in the team's AWS GovCloud account. The EKS API endpoint should be private, worker nodes should run in private subnets, and sandbox, controller, and runtime images should be mirrored into GovCloud ECR. Cluster access, workload identity, logs, storage, and network policy must remain inside the account boundary selected for the service.
+- Direct creates accept `ImageSource`. Images must match the deployment allowlist and be resolved to an approved digest before a Pod starts.
+- Compose uses the existing `ComposeSandbox` wrapper with a Docker-in-Docker outer image. The DinD sidecar stays inside the sandbox VM boundary.
+- `SnapshotSource` is rejected until image and workspace restore semantics are defined and tested.
+- CPU, memory, ephemeral disk, GPU count, and GPU type map to Pod requests, limits, and scheduling constraints. Supported GPU types are a deployment allowlist.
+- Sandbox identity comes from the server. User names and labels are stored only under the control service's label prefix and cannot set arbitrary Kubernetes metadata.
 
-Kata is the preferred first driver because it provides a VM boundary while retaining a pod-oriented Kubernetes workflow. KubeVirt remains a driver-level fallback for workloads that require a fuller virtual-machine model or cannot run on the chosen Kata node configuration.
+## Initial EKS target
 
-The same provider package can later support other clouds. Terraform should separate cloud-specific cluster modules from the shared Kubernetes platform layer, while each cluster selects a compatible runtime driver through deployment configuration.
+The first deployment target is Amazon EKS in AWS GovCloud with a private API endpoint and private worker subnets. EKS-managed control plane use is acceptable; all workload images, logs, storage, secrets, and data paths remain in the team's account and VPC boundary.
 
-## Rollout gates
+Kata Containers is the first isolation target. In GovCloud, plan for compatible bare-metal worker nodes unless AWS documents nested virtualization support for the selected GovCloud instance type. EKS Fargate is not part of this design. Runtime selection belongs to the cluster deployment, not the provider request.
 
-Kubernetes should not be added to the public provider configuration until all of these gates pass:
+Cilium is the first egress-policy backend because the required policy includes domain-aware rules. The control service calls an internal egress-driver interface so another implementation can replace it without changing the public provider.
 
-1. Implement a Kata-backed `KubernetesRuntimeDriver` against a private, disposable EKS cluster.
-2. Mirror every controller, runtime, and benchmark image into GovCloud ECR and pin deployable images by digest.
-3. Prove create, get, list, delete, command streaming, file upload/download, Docker and Compose execution, egress restriction, retry-by-name, timeout handling, and cleanup.
-4. Verify that failed and interrupted runs do not leave sandboxes, volumes, or network rules behind.
-5. Add a Kubernetes provider configuration and register it in `SandboxProviderConfig` only after the live proof passes.
-6. Add the KubeVirt driver only if Kata compatibility testing identifies workloads that need it.
+## Security and reliability requirements
 
-Later infrastructure work can add Terraform and deployment packaging once this runtime contract has been proven. That work should be reviewed and deployed separately from this scaffold.
+- Private load balancer and private DNS only; no public control-service ingress.
+- Bearer authentication, request IDs, body and file-size limits, and redacted structured logs.
+- Namespace-scoped service account with only the resources and subresources used by the service, including Pod exec.
+- Pod Security restricted defaults, non-root control-service container, read-only root filesystem, dropped capabilities, seccomp, and no host namespace or host-path access.
+- Kata runtime class enforced on every sandbox Pod. Sandbox containers do not receive service-account tokens or Kubernetes API access.
+- Default-deny ingress for sandboxes. Baseline egress remains unrestricted until a temporary allowlist is installed.
+- Image registry allowlist, digest resolution, pull policy, resource ceilings, quota, and per-caller concurrency limits.
+- Retry-by-name, create timeout, automatic stop deadline, finalizers, and a janitor for expired Jobs, Pods, volumes, and network policies.
+- Command cancellation closes the remote exec session. Client disconnects must not leak control-service tasks.
+
+## Live rollout gates
+
+Before selecting this provider in a real run:
+
+1. Deploy the control service and policies to a disposable private EKS cluster using a separate infrastructure change.
+2. Mirror and pin control, runtime, DinD, and benchmark images in GovCloud ECR.
+3. Prove create, retry-by-name, get, paginated list, delete, readiness, timeout, and automatic cleanup.
+4. Prove command chunks and large file chunks arrive before completion, and cancellation stops the remote process.
+5. Prove binary upload/download, Compose/DinD, CPU and memory limits, ephemeral storage, and every supported GPU mapping.
+6. Prove temporary domain/CIDR allowlists and unrestricted restore with DNS and IPv4/IPv6 behavior documented.
+7. Interrupt the client and control service during create, command, upload, download, and delete; verify there are no orphan resources.
+8. Run the shared sandbox integration contract against the private endpoint and record the image digests, cluster version, runtime version, and test results.
+
+Terraform and multi-cloud cluster modules come after this provider boundary is proven. They should supply the same control-service API and keep cloud-specific networking, identity, storage, and node configuration outside benchmark requests.

@@ -8,6 +8,7 @@ import pytest
 
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
+from benchmark_service.sandbox.kubernetes.config import KubernetesProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
 from benchmark_service.v1_schemas import V1DatasetTasksResponse
 
@@ -410,9 +411,19 @@ def test_get_sandbox_provider_uses_each_provider_config() -> None:
     daytona_provider = client.get_sandbox_provider(DAYTONA_CONFIG)
     same_daytona_provider = client.get_sandbox_provider(DAYTONA_CONFIG)
     modal_provider = client.get_sandbox_provider(ModalProviderConfig(MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret"))
+    kubernetes_config = KubernetesProviderConfig.model_validate(
+        {
+            "KUBERNETES_API_URL": "https://sandbox.internal",
+            "KUBERNETES_API_TOKEN": "secret-reference-value",
+        }
+    )
+    kubernetes_provider = client.get_sandbox_provider(kubernetes_config)
+    same_kubernetes_provider = client.get_sandbox_provider(kubernetes_config)
 
     assert same_daytona_provider is daytona_provider
     assert modal_provider is not daytona_provider
+    assert same_kubernetes_provider is kubernetes_provider
+    assert kubernetes_provider is not modal_provider
 
 
 async def test_verify_task_ids_no_dataset_omitted(

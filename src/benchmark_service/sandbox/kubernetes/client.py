@@ -102,6 +102,8 @@ class KubernetesControlClientDriver(KubernetesRuntimeDriver):
                 code="not_found" if response.status_code == 404 else "control_error",
                 message=response.text or f"Control API returned HTTP {response.status_code}",
             )
+        if response.status_code in _RETRYABLE_STATUSES:
+            raise SandboxConnectionError(detail.message)
         raise self._error_from_detail(detail, status_code=response.status_code)
 
     async def _request(

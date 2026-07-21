@@ -139,6 +139,9 @@ def test_builds_deterministic_isolated_job_and_network_policies() -> None:
         (_request(resources=Resources(vcpu=2, memory=4, disk=20, gpu=1)), _settings(), "gpu_type"),
         (_request(source=ImageSource(image=f"outside/image@sha256:{DIGEST}")), _settings(), "allowlist"),
         (_request(source=ImageSource(image="registry.internal/python:latest")), _settings(), "digest"),
+        (_request(resources=Resources(vcpu=65, memory=4, disk=20)), _settings(), "ceilings: vcpu"),
+        (_request(resources=Resources(vcpu=0, memory=4, disk=20)), _settings(), "must be positive"),
+        (_request(env_vars={"BAD-NAME": "value"}), _settings(), "Invalid sandbox environment"),
     ]
     for invalid_request, invalid_settings, message in invalid_cases:
         with pytest.raises(SandboxError, match=message):

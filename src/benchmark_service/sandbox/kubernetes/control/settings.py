@@ -15,7 +15,13 @@ class KubernetesControlSettings(BaseModel):
     hard_lifetime_seconds: int = Field(default=86400, gt=0)
     finished_ttl_seconds: int = Field(default=300, ge=0)
     exec_output_limit_bytes: int = Field(default=16 * 1024 * 1024, gt=0)
+    upload_limit_bytes: int = Field(default=8 * 1024 * 1024 * 1024, gt=0)
     janitor_interval_seconds: int = Field(default=60, gt=0)
+    max_create_timeout_seconds: int = Field(default=900, gt=0)
+    max_vcpu: int = Field(default=64, gt=0)
+    max_memory_gib: int = Field(default=256, gt=0)
+    max_disk_gib: int = Field(default=1024, gt=0)
+    max_gpu: int = Field(default=8, ge=0)
     gpu_resource_name: str = "nvidia.com/gpu"
     gpu_type_label: str = "sandbox.vals.ai/gpu-type"
     allowed_image_prefixes: tuple[str, ...] = ()

@@ -54,11 +54,16 @@ class MockKubernetesApi:
         self.list_result: dict[str, object] | None = None
         self.get_error: KubernetesApiError | None = None
         self.ready_on_create = True
+        self.create_conflict_job: dict[str, object] | None = None
         self.closed = False
 
     async def create_job(self, namespace: str, body: dict[str, object]) -> dict[str, object]:
         name = str(_metadata(body)["name"])
         self.operations.append(("create_job", (namespace, name)))
+        if self.create_conflict_job is not None:
+            self.jobs[name] = self.create_conflict_job
+            self.pods[name] = [_ready_pod(name)]
+            raise KubernetesApiError(409, "already exists")
         self.jobs[name] = body
         if self.ready_on_create:
             self.pods.setdefault(name, [_ready_pod(name)])
@@ -199,6 +204,13 @@ class TestKubernetesSandboxBackendLifecycle:
         with pytest.raises(SandboxConflictError, match="conflicting specification"):
             await backend.create_sandbox(conflicting)
 
+        race_api = MockKubernetesApi()
+        race_api.create_conflict_job = build_job(request, _settings())
+        race_backend = KubernetesSandboxBackend(_settings(), race_api, jitter=lambda delay: delay)
+        raced = await race_backend.create_sandbox(request)
+        assert raced.id == "task-1"
+        assert sum(name == "create_job" for name, _ in race_api.operations) == 1
+
     async def test_reports_pending_failures_states_and_api_errors(self) -> None:
         """Translate readiness and API failures into stable sandbox errors.
 
@@ -241,9 +253,14 @@ class TestKubernetesSandboxBackendLifecycle:
 
         timeout_api = MockKubernetesApi()
         timeout_api.ready_on_create = False
-        timeout_backend = KubernetesSandboxBackend(_settings(), timeout_api)
+        times = iter([0.0, 2.0])
+        timeout_backend = KubernetesSandboxBackend(
+            _settings(),
+            timeout_api,
+            monotonic=times.__next__,
+        )
         with pytest.raises(SandboxConnectionError, match="Timed out"):
-            await timeout_backend.create_sandbox(_request(create_timeout=0))
+            await timeout_backend.create_sandbox(_request(create_timeout=1))
         assert "task-1" not in timeout_api.jobs
         assert ("delete_ingress", ("benchmark-sandboxes", "task-1-ingress")) in timeout_api.operations
 
@@ -465,6 +482,16 @@ class TestKubernetesSandboxBackendStreaming:
         assert base64.b64decode(b"".join(remote.sessions[0].stdin)) == b"first"
         assert b"".join(downloaded) == b"first"
         assert all("'/workspace/a b;$(false).bin'" in command[-1] for command in remote.opened_commands)
+
+        limited_remote = MockRemoteExec()
+        limited_backend = KubernetesSandboxBackend(
+            _settings().model_copy(update={"upload_limit_bytes": 4}),
+            api,
+            limited_remote,
+        )
+        with pytest.raises(SandboxError, match="Upload exceeded 4 bytes"):
+            await limited_backend.upload_file("task-1", path, _chunks([b"123", b"45"]))
+        assert limited_remote.sessions[0].closed is True
 
 
 class TestKubernetesSandboxBackendEgressAndCleanup:

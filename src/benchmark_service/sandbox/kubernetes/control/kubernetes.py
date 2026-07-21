@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import codecs
 import json
+import random
 import shlex
 import time
 import uuid
@@ -55,6 +56,10 @@ from benchmark_service.sandbox.types import (
 )
 
 Result = TypeVar("Result")
+
+
+def _default_jitter(delay: float) -> float:
+    return random.uniform(delay * 0.8, delay * 1.2)
 
 
 def _dict(value: object) -> dict[str, Any]:
@@ -118,6 +123,7 @@ class KubernetesSandboxBackend:
         wait: Callable[[float], Awaitable[None]] = asyncio.sleep,
         monotonic: Callable[[], float] = time.monotonic,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
+        jitter: Callable[[float], float] | None = None,
     ) -> None:
         self.settings = settings
         self.api = api
@@ -126,6 +132,7 @@ class KubernetesSandboxBackend:
         self._wait = wait
         self._monotonic = monotonic
         self._now = now
+        self._jitter: Callable[[float], float] = jitter or _default_jitter
 
     def _record(self, job: dict[str, object], state: str) -> SandboxRecord:
         metadata = _metadata(job)
@@ -154,7 +161,7 @@ class KubernetesSandboxBackend:
                 retryable = error.status == 429 or error.status >= 500 or error.status == 0
                 if not retryable or attempt == 2:
                     raise self._map_error(error) from error
-                await self._wait(0.25 * (2**attempt))
+                await self._wait(self._jitter(0.25 * (2**attempt)))
         raise SandboxConnectionError("Kubernetes API retry attempts exhausted")
 
     async def _pods(self, resource_name: str) -> list[dict[str, object]]:
@@ -217,7 +224,24 @@ class KubernetesSandboxBackend:
                 )
             )
             ingress_created = True
-            await self._call(lambda: self.api.create_job(self.settings.namespace, job_body))
+            try:
+                await self._call(lambda: self.api.create_job(self.settings.namespace, job_body))
+            except SandboxError as error:
+                cause = error.__cause__
+                if not isinstance(cause, KubernetesApiError) or cause.status != 409:
+                    raise
+                ingress_created = False
+                raced_job = await self._call(lambda: self.api.get_job(self.settings.namespace, resource_name))
+                if raced_job is None:
+                    raise SandboxConnectionError(
+                        f"Sandbox create conflicted but no Job was found: {resource_name}"
+                    ) from error
+                if _annotations(raced_job).get(FINGERPRINT_ANNOTATION) != expected_fingerprint:
+                    raise SandboxConflictError(
+                        f"Sandbox {request.name} already exists with a conflicting specification"
+                    ) from error
+                await self._touch(resource_name)
+                return await self._wait_ready(resource_name, request.create_timeout)
             job_created = True
             record = await self._wait_ready(resource_name, request.create_timeout)
             ready = True
@@ -404,13 +428,21 @@ class KubernetesSandboxBackend:
         remote_path: str,
         chunks: AsyncIterable[bytes],
     ) -> None:
+        async def limited_chunks() -> AsyncGenerator[bytes, None]:
+            uploaded = 0
+            async for chunk in chunks:
+                uploaded += len(chunk)
+                if uploaded > self.settings.upload_limit_bytes:
+                    raise SandboxError(f"Upload exceeded {self.settings.upload_limit_bytes} bytes")
+                yield chunk
+
         await self._touch(instance_id)
         pod_name = await self._ready_pod_name(instance_id)
         parent = remote_path.rpartition("/")[0] or "."
         shell_command = f"mkdir -p {shlex.quote(parent)} && base64 -d > {shlex.quote(remote_path)}"
         session = await self._remote_exec().open(pod_name, ["sh", "-lc", shell_command], stdin=True)
         try:
-            async for encoded in encode_base64_chunks(chunks):
+            async for encoded in encode_base64_chunks(limited_chunks()):
                 await session.write_stdin(encoded.encode("ascii"))
             await session.close_stdin()
             async for event in self._stream_session(session):

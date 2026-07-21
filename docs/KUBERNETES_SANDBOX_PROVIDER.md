@@ -6,6 +6,8 @@ The framework has a registered `kubernetes` provider client and a private contro
 
 This branch does not create or change an EKS cluster, install cluster resources, or deploy the control service. A configured client is runnable only after the private service has been deployed and passed the live gates below.
 
+The `kubernetes-sandbox-control` entrypoint starts the service against an already prepared cluster. Importing the package or starting the client never installs Kubernetes resources outside individual sandbox Jobs and their per-sandbox policies.
+
 ## Configuration
 
 The request-scoped provider secret contains only the private service connection:
@@ -61,12 +63,42 @@ Kata Containers is the first isolation target. In GovCloud, plan for compatible 
 
 Cilium is the first egress-policy backend because the required policy includes domain-aware rules. The control service calls an internal egress-driver interface so another implementation can replace it without changing the public provider.
 
+## Control-service environment
+
+Required:
+
+- `KUBERNETES_SANDBOX_API_TOKEN`
+- `KUBERNETES_SANDBOX_DOCKER_IMAGE`
+
+Common deployment settings:
+
+- `KUBERNETES_SANDBOX_NAMESPACE` (default `benchmark-sandboxes`)
+- `KUBERNETES_SANDBOX_RUNTIME_CLASS` (default `kata-qemu`)
+- `KUBERNETES_SANDBOX_ALLOWED_IMAGE_PREFIXES` (comma-separated)
+- `KUBERNETES_SANDBOX_REQUIRE_IMAGE_DIGEST` (set `true` in shared environments)
+- `KUBERNETES_SANDBOX_HARD_LIFETIME_SECONDS` and `KUBERNETES_SANDBOX_FINISHED_TTL_SECONDS`
+- `KUBERNETES_SANDBOX_JANITOR_INTERVAL_SECONDS`
+- `KUBERNETES_SANDBOX_EXEC_OUTPUT_LIMIT_BYTES`
+- `KUBERNETES_SANDBOX_UPLOAD_LIMIT_BYTES`
+- `KUBERNETES_SANDBOX_MAX_CREATE_TIMEOUT_SECONDS`
+- `KUBERNETES_SANDBOX_MAX_VCPU`, `KUBERNETES_SANDBOX_MAX_MEMORY_GIB`, `KUBERNETES_SANDBOX_MAX_DISK_GIB`, and `KUBERNETES_SANDBOX_MAX_GPU`
+- `KUBERNETES_SANDBOX_GPU_RESOURCE_NAME` and `KUBERNETES_SANDBOX_GPU_TYPE_LABEL`
+- `KUBERNETES_SANDBOX_HOST` and `KUBERNETES_SANDBOX_PORT`
+
+`KUBERNETES_SANDBOX_ALLOW_LOCAL_KUBECONFIG` defaults to `false`. Enable it only for local development against a disposable cluster. The normal process loads in-cluster service-account credentials.
+
+The service account is namespace-scoped. Its Role needs `get`, `list`, `create`, `patch`, and `delete` for `batch/jobs`; `get` and `list` for Pods; `get` and `create` for `pods/exec`; `get`, `create`, `update`, and `delete` for `networking.k8s.io/networkpolicies`; and `get`, `create`, `update`, and `delete` for `cilium.io/ciliumnetworkpolicies`. It does not need Secrets, Nodes, cluster-wide workloads, or RBAC mutation.
+
+Apply a namespace `ResourceQuota` and `LimitRange` for aggregate capacity, plus connection and request concurrency limits at the private ingress. The service enforces per-sandbox CPU, memory, disk, GPU, create-time, command-output, and upload ceilings; Kubernetes admission remains the final aggregate-capacity guard.
+
+Expose `/health` and the `/v1/sandboxes` API only through a private load balancer and private DNS. Store the API token in the deployment secret mechanism, mount it only into the control service, and rotate it independently of Kubernetes credentials.
+
 ## Security and reliability requirements
 
 - Private load balancer and private DNS only; no public control-service ingress.
 - Bearer authentication, request IDs, body and file-size limits, and redacted structured logs.
 - Namespace-scoped service account with only the resources and subresources used by the service, including Pod exec.
-- Pod Security restricted defaults, non-root control-service container, read-only root filesystem, dropped capabilities, seccomp, and no host namespace or host-path access.
+- Restricted settings for the control-service Pod and the main sandbox container, with dropped capabilities, seccomp, and no host namespace or host-path access. DinD is the one privileged container and must be admitted only in the Kata sandbox namespace; a namespace-wide restricted Pod Security profile would reject it.
 - Kata runtime class enforced on every sandbox Pod. Sandbox containers do not receive service-account tokens or Kubernetes API access.
 - Default-deny ingress for sandboxes. Baseline egress remains unrestricted until a temporary allowlist is installed.
 - Image registry allowlist, digest resolution, pull policy, resource ceilings, quota, and per-caller concurrency limits.
@@ -85,5 +117,20 @@ Before selecting this provider in a real run:
 6. Prove temporary domain/CIDR allowlists and unrestricted restore with DNS and IPv4/IPv6 behavior documented.
 7. Interrupt the client and control service during create, command, upload, download, and delete; verify there are no orphan resources.
 8. Run the shared sandbox integration contract against the private endpoint and record the image digests, cluster version, runtime version, and test results.
+
+Local checks do not need a cluster:
+
+```bash
+uv run pytest tests/test_kubernetes_client.py tests/test_kubernetes_control_app.py tests/test_kubernetes_resources.py tests/test_kubernetes_backend.py -q
+```
+
+After a private deployment exists, run the opt-in live contract:
+
+```bash
+TEST_KUBERNETES_CONTROL_URL=https://sandbox-control.internal \
+TEST_KUBERNETES_CONTROL_TOKEN=... \
+TEST_KUBERNETES_IMAGE=registry.internal/benchmark@sha256:... \
+uv run pytest tests/integration/test_kubernetes_control_service.py -q
+```
 
 Terraform and multi-cloud cluster modules come after this provider boundary is proven. They should supply the same control-service API and keep cloud-specific networking, identity, storage, and node configuration outside benchmark requests.

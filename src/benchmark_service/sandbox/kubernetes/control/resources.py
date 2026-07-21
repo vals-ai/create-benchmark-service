@@ -22,6 +22,7 @@ USER_LABEL_PREFIX = "sandbox.vals.ai/label-"
 
 _INVALID_DNS = re.compile(r"[^a-z0-9]+")
 _DIGEST = re.compile(r"@sha256:[0-9a-f]{64}$")
+_ENV_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 
 
 def sandbox_name(value: str) -> str:
@@ -82,6 +83,23 @@ def build_job(
         _validate_image(settings.docker_image, settings)
     if request.resources.gpu and not request.resources.gpu_type:
         raise SandboxError("Kubernetes sandbox provider requires gpu_type when gpu is requested")
+    if request.resources.vcpu <= 0 or request.resources.memory <= 0 or request.resources.disk <= 0:
+        raise SandboxError("Kubernetes sandbox vcpu, memory, and disk must be positive")
+    if request.create_timeout <= 0 or request.auto_stop_interval < 0:
+        raise SandboxError("Kubernetes sandbox create_timeout must be positive and auto_stop_interval nonnegative")
+    invalid_env_names = sorted(name for name in request.env_vars if _ENV_NAME.fullmatch(name) is None)
+    if invalid_env_names:
+        raise SandboxError(f"Invalid sandbox environment variable names: {', '.join(invalid_env_names)}")
+    ceilings = {
+        "vcpu": (request.resources.vcpu, settings.max_vcpu),
+        "memory": (request.resources.memory, settings.max_memory_gib),
+        "disk": (request.resources.disk, settings.max_disk_gib),
+        "gpu": (request.resources.gpu, settings.max_gpu),
+        "create_timeout": (request.create_timeout, settings.max_create_timeout_seconds),
+    }
+    exceeded = [name for name, (requested, maximum) in ceilings.items() if requested > maximum]
+    if exceeded:
+        raise SandboxError(f"Sandbox request exceeds configured ceilings: {', '.join(exceeded)}")
 
     resource_name = sandbox_name(request.name)
     labels = _labels(request, resource_name)

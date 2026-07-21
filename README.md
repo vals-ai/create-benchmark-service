@@ -128,6 +128,8 @@ Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` 
 
 The Kubernetes provider calls a private sandbox control service over HTTPS and WebSocket. The client supports lifecycle operations, buffered exec, streaming commands, binary upload, buffered and streaming download, and temporary egress allowlists. This branch does not deploy the control service or any EKS resources; see [Kubernetes sandbox provider](docs/KUBERNETES_SANDBOX_PROVIDER.md) for the cluster boundary and rollout gates.
 
+The repository also includes the non-deploying `kubernetes-sandbox-control` process entrypoint. It expects an already prepared cluster namespace, Kata runtime, Cilium installation, image registry, service account, and private network endpoint.
+
 Provider compatibility notes:
 
 - Modal supports both `ImageSource` (registry pull) and `SnapshotSource` (a Modal filesystem snapshot created via `Sandbox.snapshot_filesystem()`, restored by image id).

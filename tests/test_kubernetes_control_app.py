@@ -141,6 +141,12 @@ class TestKubernetesControlApp:
             health = await client.get("/health")
             unauthorized = await client.get("/v1/sandboxes/sandbox-1")
             headers = {"Authorization": "Bearer test-token", "X-Request-ID": "req-test"}
+            invalid = await client.post("/v1/sandboxes", headers=headers, json={"name": "missing-fields"})
+            malformed_list = await client.get(
+                "/v1/sandboxes",
+                headers=headers,
+                params={"label": "malformed"},
+            )
             created = await client.post("/v1/sandboxes", headers=headers, json=_create_payload())
             fetched = await client.get("/v1/sandboxes/sandbox-1", headers=headers)
             listed = await client.get(
@@ -175,6 +181,8 @@ class TestKubernetesControlApp:
         responses = [
             health,
             unauthorized,
+            invalid,
+            malformed_list,
             created,
             fetched,
             listed,
@@ -187,6 +195,8 @@ class TestKubernetesControlApp:
         ]
         assert health.json() == {"status": "ok"}
         assert unauthorized.status_code == 401
+        assert invalid.status_code == malformed_list.status_code == 422
+        assert invalid.json()["error"]["request_id"] == "req-test"
         assert all(response.headers["X-Request-ID"] for response in responses)
         assert created.status_code == 201 and fetched.json() == SANDBOX.model_dump(mode="json")
         assert listed.json()["continue_token"] == "next"

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import secrets
 import uuid
 from collections.abc import AsyncIterator, Mapping
@@ -33,10 +34,12 @@ from benchmark_service.sandbox.types import (
 )
 
 logger = logging.getLogger(__name__)
+_REQUEST_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
 def _request_id(headers: Mapping[str, str]) -> str:
-    return headers.get("x-request-id") or str(uuid.uuid4())
+    value = headers.get("x-request-id")
+    return value if value and _REQUEST_ID.fullmatch(value) else str(uuid.uuid4())
 
 
 def _authorized(authorization: str | None, token: str) -> bool:
@@ -109,8 +112,20 @@ def create_kubernetes_control_app(
         status_code, detail = _error_detail(error, request.state.request_id)
         return _error_response(status_code, detail)
 
+    async def handle_invalid_request(request: Request, error: Exception) -> JSONResponse:
+        return _error_response(
+            422,
+            ControlErrorDetail(
+                code="invalid_request",
+                message=str(error),
+                request_id=request.state.request_id,
+            ),
+        )
+
     app.middleware("http")(add_request_id)
     app.add_exception_handler(SandboxError, handle_sandbox_error)
+    app.add_exception_handler(ValidationError, handle_invalid_request)
+    app.add_exception_handler(ValueError, handle_invalid_request)
 
     def require_auth(request: Request) -> JSONResponse | None:
         if _authorized(request.headers.get("authorization"), settings.api_token):
@@ -155,6 +170,8 @@ def create_kubernetes_control_app(
                 ),
             )
         limit = int(request.query_params.get("limit", "10"))
+        if limit < 1 or limit > 100:
+            raise ValueError("limit must be between 1 and 100")
         page = await backend.list_sandboxes(labels, limit, request.query_params.get("continue_token"))
         return JSONResponse(content=page.model_dump(mode="json"))
 

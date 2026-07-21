@@ -143,7 +143,10 @@ class KubernetesAsyncioApi:
             if error.status != 409:
                 raise self._raise(error) from error
             name = cast(dict[str, Any], body["metadata"])["name"]
-            await self._networking.replace_namespaced_network_policy(name, namespace, cast(Any, body))
+            try:
+                await self._networking.replace_namespaced_network_policy(name, namespace, cast(Any, body))
+            except ApiException as replace_error:
+                raise self._raise(replace_error) from replace_error
 
     async def delete_network_policy(self, namespace: str, name: str) -> None:
         try:
@@ -164,7 +167,10 @@ class KubernetesAsyncioApi:
         except ApiException as error:
             if error.status != 404:
                 raise self._raise(error) from error
-            await self._custom.create_namespaced_custom_object("cilium.io", "v2", namespace, plural, body)
+            try:
+                await self._custom.create_namespaced_custom_object("cilium.io", "v2", namespace, plural, body)
+            except ApiException as create_error:
+                raise self._raise(create_error) from create_error
 
     async def delete_custom_object(self, namespace: str, plural: str, name: str) -> None:
         try:

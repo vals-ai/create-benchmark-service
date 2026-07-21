@@ -22,6 +22,7 @@ from benchmark_service.sandbox.types import (
     ImageSource,
     Resources,
     SandboxCommandError,
+    SandboxConnectionError,
     SandboxCreateRequest,
     SandboxNotFoundError,
     SandboxQuery,
@@ -173,6 +174,32 @@ class TestKubernetesControlClientLifecycle:
                     connect_timeout=connect_timeout,
                     request_timeout=request_timeout,
                 )
+
+    async def test_maps_exhausted_retryable_status_to_connection_error(self) -> None:
+        """Keep exhausted control-service failures retryable by framework callers.
+
+        Test cases:
+        - Three HTTP 503 responses become SandboxConnectionError.
+        """
+        attempts = 0
+
+        def handler(_request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            attempts += 1
+            return httpx.Response(503, json={"error": {"code": "busy", "message": "retry later"}})
+
+        driver = LifecycleTestDriver(
+            api_url="https://sandbox.internal",
+            api_token="test-token",
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            with pytest.raises(SandboxConnectionError, match="retry later"):
+                await driver.get_sandbox("sandbox-1")
+        finally:
+            await driver.close()
+
+        assert attempts == 3
 
     def test_parses_public_provider_config_and_keeps_implementations_concrete(self) -> None:
         """Register a usable provider config without exposing cluster settings.

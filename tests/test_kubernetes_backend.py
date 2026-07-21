@@ -414,6 +414,25 @@ class FakeExecCore:
         return self.request_context
 
 
+class RecordingKubernetesRemoteExec(KubernetesRemoteExec):
+    """Record commands passed through the concrete termination method."""
+
+    def __init__(self, session: RemoteExecSession) -> None:
+        self.session = session
+        self.commands: list[list[str]] = []
+
+    async def open(
+        self,
+        pod_name: str,
+        command: list[str],
+        *,
+        stdin: bool = False,
+    ) -> RemoteExecSession:
+        del pod_name, stdin
+        self.commands.append(command)
+        return self.session
+
+
 async def _chunks(values: list[bytes]) -> AsyncGenerator[bytes, None]:
     for value in values:
         yield value
@@ -442,6 +461,23 @@ class TestKubernetesRemoteExec:
         assert request_context.entered == 1
         assert request_context.websocket.sent == [b"\x00input"]
         assert request_context.exited == 1
+
+    async def test_termination_pattern_does_not_match_cleanup_shell(self) -> None:
+        """Keep the cleanup command from terminating its own remote exec shell.
+
+        Test cases:
+        - The process pattern still matches the sandbox command identifier.
+        - The literal identifier is absent from the cleanup shell command.
+        """
+        command_id = "sandbox-command-abc123"
+        session = MockRemoteExecSession([(b"", b"", 0)])
+        remote_exec = RecordingKubernetesRemoteExec(session)
+
+        await remote_exec.terminate("task-1-pod", command_id)
+
+        shell_command = remote_exec.commands[0][-1]
+        assert "[s]andbox-command-abc123" in shell_command
+        assert command_id not in shell_command
 
 
 class TestKubernetesSandboxBackendStreaming:

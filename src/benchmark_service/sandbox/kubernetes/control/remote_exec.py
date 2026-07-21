@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import binascii
-import json
+import shlex
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterable
 from typing import Any, Protocol, cast
@@ -183,14 +184,17 @@ class KubernetesRemoteExec:
 
     async def terminate(self, pod_name: str, command_id: str) -> None:
         session: RemoteExecSession | None = None
+        command_pattern = f"[{command_id[0]}]{command_id[1:]}"
         try:
-            session = await self.open(
-                pod_name,
-                ["sh", "-lc", f"pkill -TERM -f {json.dumps(command_id)} 2>/dev/null || true"],
-            )
-            while session.is_open():
-                await session.update(0.1)
-        except SandboxError:
+            async with asyncio.timeout(10):
+                session = await self.open(
+                    pod_name,
+                    ["sh", "-lc", f"pkill -TERM -f {shlex.quote(command_pattern)} 2>/dev/null || true"],
+                )
+                while session.is_open():
+                    await session.update(0.1)
+                    await asyncio.sleep(0)
+        except (SandboxError, TimeoutError):
             pass
         finally:
             if session is not None:

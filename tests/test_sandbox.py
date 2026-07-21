@@ -954,6 +954,42 @@ async def test_daytona_command_raises_sandbox_not_found_when_removed() -> None:
         _ = [chunk async for chunk in sandbox.command("pytest")]
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        # The real-world Sentry shape (VALKYRIE-6X): the toolbox exec endpoint returns a generic
+        # 400 whose body carries the "resolve container IP" / "no IP address found" wording when
+        # the container backing the sandbox has already been reclaimed. There is no HTTP 404 or
+        # NOT_FOUND error_code on this path, so the classifier must match by message text.
+        "Failed to execute command: bad request: failed to resolve container IP after 3 attempts: no IP address found",
+        # Variant with a different attempt count / minor wording drift.
+        "failed to resolve container IP after 5 attempts",
+        # Just the "no IP address found" tail on its own.
+        "toolbox request failed: no IP address found",
+    ],
+)
+async def test_daytona_exec_classifies_removed_container_as_not_found(message: str) -> None:
+    """A destroyed-container 400 must classify as SandboxNotFoundError, not generic SandboxError.
+
+    Test cases:
+    - The provider surfaces the destroyed-container signature through DaytonaError with no 404
+      status and no NOT_FOUND error_code; only the message text distinguishes it.
+    - `_sandbox_error` must route this to SandboxNotFoundError so callers (the tracker) can treat
+      the sandbox as gone and skip the hard-error path.
+    """
+
+    class RemovedContainerProcess(Process):
+        async def exec(self, command: str) -> SimpleNamespace:
+            raise DaytonaError(message)
+
+    inner = InnerSandbox()
+    inner.process = RemovedContainerProcess()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxNotFoundError, match="Sandbox not found: name=sandbox-name, id=sandbox-id\\."):
+        await sandbox.exec("pytest")
+
+
 async def test_daytona_download_file_streams_content() -> None:
     sandbox = DaytonaSandbox(cast(Any, InnerSandbox()))
 

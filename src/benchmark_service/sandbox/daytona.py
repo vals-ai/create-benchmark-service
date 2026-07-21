@@ -73,6 +73,14 @@ _KNOWN_THROTTLERS = ("sandbox-create", "sandbox-lifecycle", "authenticated", "an
 _DELETE_CONFLICT_MESSAGES = ("state change in progress", "modified by another operation")
 _REMOVED_SANDBOX_CLIENT_STATUSES = (404, 502)
 _FAILED_EXECUTE_COMMAND_PREFIX = "failed to execute command:"
+# Daytona's runner responds with a generic 400 ("bad request") when the container backing the
+# sandbox is already gone -- the toolbox cannot route to a container that no longer has an IP.
+# There is no HTTP 404 or NOT_FOUND error_code on this path, so match by message text and treat
+# it as a not-found: retrying exec against a container with no IP will never succeed.
+_REMOVED_CONTAINER_MESSAGES = (
+    "failed to resolve container ip",
+    "no ip address found",
+)
 # Daytona sometimes flattens a transport failure into a bare DaytonaError message with no chained
 # cause; these substrings recover those cases by text when no typed cause survives to match.
 _TRANSPORT_ERROR_MESSAGES = (
@@ -181,6 +189,8 @@ def _is_delete_conflict(exc: DaytonaConflictError) -> bool:
 def _is_not_found_error(exc: DaytonaError | ClientResponseError) -> bool:
     if isinstance(exc, ClientResponseError):
         return exc.status in _REMOVED_SANDBOX_CLIENT_STATUSES
+    if _message_contains(exc, _REMOVED_CONTAINER_MESSAGES):
+        return True
     return (
         isinstance(exc, DaytonaNotFoundError)
         or exc.status_code == 404

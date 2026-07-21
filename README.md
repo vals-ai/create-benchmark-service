@@ -126,9 +126,9 @@ Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` 
 {"type": "kubernetes", "KUBERNETES_API_URL": "https://sandbox.internal", "KUBERNETES_API_TOKEN": "..."}
 ```
 
-The Kubernetes provider calls a private sandbox control service over HTTPS and WebSocket. The client supports lifecycle operations, buffered exec, streaming commands, binary upload, buffered and streaming download, and temporary egress allowlists. This branch does not deploy the control service or any EKS resources; see [Kubernetes sandbox provider](docs/KUBERNETES_SANDBOX_PROVIDER.md) for the cluster boundary and rollout gates.
+The Kubernetes provider calls a private sandbox control service over HTTPS and WebSocket. The client supports lifecycle operations, buffered exec, streaming commands, binary upload, buffered and streaming download, and temporary egress allowlists. This repository includes a Terraform-backed commercial AWS smoke that creates a disposable EKS cluster, installs the workload, runs the opt-in live contract, and destroys the stack. It uses `runc`; it is not the later GovCloud/Kata deployment or a production configuration. See [Kubernetes sandbox provider](docs/KUBERNETES_SANDBOX_PROVIDER.md) for setup, charges, recovery, and cleanup.
 
-The repository also includes the non-deploying `kubernetes-sandbox-control` process entrypoint. It expects an already prepared cluster namespace, Kata runtime, Cilium installation, image registry, service account, and private network endpoint.
+The `kubernetes-sandbox-control` entrypoint can also run against an independently prepared cluster. Cluster credentials, runtime class, namespace, region, image policy, and network policy remain deployment settings rather than benchmark request fields.
 
 Provider compatibility notes:
 

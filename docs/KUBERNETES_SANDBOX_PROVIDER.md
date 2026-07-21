@@ -1,16 +1,33 @@
 # Kubernetes sandbox provider
 
-## Status
+The Kubernetes provider sends the shared sandbox API to a private control service in a
+cluster. Benchmark services do not receive Kubernetes credentials or cluster settings.
 
-The framework has a registered `kubernetes` provider client and a private control-service protocol. It covers create, get, list, delete, buffered exec, streaming command output, binary upload, buffered and streaming download, and temporary egress restrictions.
+This repository includes a disposable commercial AWS smoke for that deployment shape. It
+creates EKS and its VPC, installs the control service and Cilium, runs the live provider
+contract, and destroys the resources. The smoke is for development only: it uses `runc`,
+one `m6i.xlarge` node, one NAT gateway, and `us-east-2` by default. It does not test Kata,
+GPUs, GovCloud, multi-cloud support, or production readiness.
 
-This branch does not create or change an EKS cluster, install cluster resources, or deploy the control service. A configured client is runnable only after the private service has been deployed and passed the live gates below.
+## How the provider runs
 
-The `kubernetes-sandbox-control` entrypoint starts the service against an already prepared cluster. Importing the package or starting the client never installs Kubernetes resources outside individual sandbox Jobs and their per-sandbox policies.
+```text
+Tracker or benchmark service
+  -> private control-service HTTP and WebSocket API
+EKS control service
+  -> namespace-scoped Kubernetes API
+Sandbox Job
+  -> benchmark-provided primary image
+  -> privileged Docker daemon sidecar when Docker is enabled
+```
 
-## Configuration
+The client supports idempotent create, get, list, delete, buffered and streaming commands,
+binary upload, buffered and streaming download, command timeout, and temporary egress
+allowlists. The control service creates Jobs and per-sandbox network policies in the
+`benchmark-sandboxes` namespace.
 
-The request-scoped provider secret contains only the private service connection:
+For a hosted caller, the request-scoped provider secret contains only the private service
+connection:
 
 ```json
 {
@@ -22,109 +39,203 @@ The request-scoped provider secret contains only the private service connection:
 }
 ```
 
-The URL must be reachable from the tracker or benchmark service. Put the token in the same secret flow used for other provider credentials. Do not place the EKS endpoint, kubeconfig, namespace, runtime class, cloud region, or node details in this request.
+Do not put an EKS endpoint, kubeconfig, namespace, runtime class, AWS region, or node details
+in this secret.
 
-## Boundary
+## Commercial AWS smoke
 
-EKS is the sandbox provider. The tracker and benchmark services do not need to move to Kubernetes and do not receive Kubernetes credentials.
+### Prerequisites
 
-```text
-Tracker or benchmark service
-  -> HTTPS and WebSocket
-Private sandbox control service in EKS
-  -> namespace-scoped Kubernetes API
-Job -> Kata-isolated sandbox Pod
-  -> workspace volume and optional DinD sidecar
-```
+**AWS account.** Use the `vals-dev` profile. The wrapper rejects every other profile, checks
+the expected 12-digit account ID, and requires an identity in the commercial `arn:aws:`
+partition. Set the expected account ID yourself; do not derive it from the current session,
+because the value is a guard against using the wrong account.
 
-The framework client translates the shared `SandboxProvider` operations to the private API. The control service handles Kubernetes resources, readiness, cleanup, command execution, file transfer, and network policy. This boundary keeps provider selection portable: another cluster implementation can expose the same API without changing benchmark code.
+The identity needs permission to create and delete the EKS, IAM, VPC, EC2, EBS, and ECR
+resources in the Terraform plan. It also needs STS identity lookup, EKS kubeconfig access,
+ECR push access, and Resource Groups Tagging API reads used by the cleanup check.
 
-## Operation contract
+**Operator network.** Supply an IPv4 CIDR no broader than `/24`. Use the public address of
+the machine running the smoke as a `/32` whenever possible. Terraform enables the EKS
+private endpoint and limits its public endpoint to this CIDR. The control service itself is
+a Kubernetes `ClusterIP`; the smoke does not create public control-service ingress.
 
-- Lifecycle reads and idempotent writes use bounded retries. Commands and uploads are not replayed after an unknown outcome.
-- `command()` uses WebSocket events and yields stdout and stderr chunks as they arrive. A nonzero terminal event becomes `SandboxCommandError` after prior output has been delivered.
-- `stream_download()` yields response bytes without joining them. `download_file()` intentionally buffers those chunks for the existing shared return type.
-- Baseline egress is unrestricted, matching the existing providers. `modify_egress_rules()` installs a temporary allowlist; `clear_egress_rules()` restores unrestricted egress.
-- Control-service errors use stable codes plus a request ID. Kubernetes client exceptions do not cross the service boundary.
+**Tools.** Install `aws`, `curl`, `docker`, `git`, `kubectl`, `openssl`, `terraform`, and
+`uv`. The foundation module accepts Terraform 1.10+, but the complete lifecycle requires
+Terraform 1.11+ because the workload keeps the generated API token out of saved state and
+plan data. Docker must be running.
 
-## Workload rules
+**Images.** Choose a benchmark test image that the EKS nodes can pull and pin it with a
+`sha256` digest. The deploy does not build or mirror this image. A private image registry
+must already allow pulls from the node role.
 
-- Direct creates accept `ImageSource`. Images must match the deployment allowlist and be resolved to an approved digest before a Pod starts.
-- Compose uses the existing `ComposeSandbox` wrapper with a Docker-in-Docker outer image. The DinD sidecar stays inside the sandbox VM boundary.
-- `SnapshotSource` is rejected until image and workspace restore semantics are defined and tested.
-- CPU, memory, ephemeral disk, GPU count, and GPU type map to Pod requests, limits, and scheduling constraints. Supported GPU types are a deployment allowlist.
-- Sandbox identity comes from the server. User names and labels are stored only under the control service's label prefix and cannot set arbitrary Kubernetes metadata.
+**Charges.** Deploy creates chargeable AWS resources, including an EKS cluster, one
+on-demand `m6i.xlarge` node, and one NAT gateway. EBS storage, ECR storage, network traffic,
+and public IPv4 use can also incur charges. Billing can continue after a failed deploy, so
+run destroy and check its result even when deploy or test fails.
 
-## Initial EKS target
+### Image roles
 
-The first deployment target is Amazon EKS in AWS GovCloud with a private API endpoint and private worker subnets. EKS-managed control plane use is acceptable; all workload images, logs, storage, secrets, and data paths remain in the team's account and VPC boundary.
+The three image settings serve different purposes:
 
-Kata Containers is the first isolation target. In GovCloud, plan for compatible bare-metal worker nodes unless AWS documents nested virtualization support for the selected GovCloud instance type. EKS Fargate is not part of this design. Runtime selection belongs to the cluster deployment, not the provider request.
+1. The Terraform-backed deploy builds the control-service image from this repository,
+   pushes it to the smoke ECR repository, and deploys it by digest.
+2. `TEST_KUBERNETES_IMAGE` is the digest-pinned image supplied by the benchmark. It becomes
+   the primary sandbox container. The deploy does not build it.
+3. The deploy pulls `docker:28.3.3-dind`, copies it to the smoke ECR repository without
+   rebuilding it, resolves the ECR digest, and uses it as the privileged Docker daemon
+   sidecar.
 
-Cilium is the first egress-policy backend because the required policy includes domain-aware rules. The control service calls an internal egress-driver interface so another implementation can replace it without changing the public provider.
+`TEST_KUBERNETES_COMPOSE_IMAGE` is optional. It is the outer sandbox image for the Compose
+contract and must contain the Docker CLI and Compose plugin. The mirrored
+`docker:28.3.3-dind` image can fill this role while it talks to the separate daemon sidecar.
+The Compose `main` service still uses `TEST_KUBERNETES_IMAGE`; the outer image does not
+replace the benchmark image.
 
-## Control-service environment
+### Configure the shell
 
-Required:
-
-- `KUBERNETES_SANDBOX_API_TOKEN`
-- `KUBERNETES_SANDBOX_DOCKER_IMAGE`
-
-Common deployment settings:
-
-- `KUBERNETES_SANDBOX_NAMESPACE` (default `benchmark-sandboxes`)
-- `KUBERNETES_SANDBOX_RUNTIME_CLASS` (default `kata-qemu`)
-- `KUBERNETES_SANDBOX_ALLOWED_IMAGE_PREFIXES` (comma-separated)
-- `KUBERNETES_SANDBOX_REQUIRE_IMAGE_DIGEST` (set `true` in shared environments)
-- `KUBERNETES_SANDBOX_HARD_LIFETIME_SECONDS` and `KUBERNETES_SANDBOX_FINISHED_TTL_SECONDS`
-- `KUBERNETES_SANDBOX_JANITOR_INTERVAL_SECONDS`
-- `KUBERNETES_SANDBOX_EXEC_OUTPUT_LIMIT_BYTES`
-- `KUBERNETES_SANDBOX_UPLOAD_LIMIT_BYTES`
-- `KUBERNETES_SANDBOX_MAX_CREATE_TIMEOUT_SECONDS`
-- `KUBERNETES_SANDBOX_MAX_VCPU`, `KUBERNETES_SANDBOX_MAX_MEMORY_GIB`, `KUBERNETES_SANDBOX_MAX_DISK_GIB`, and `KUBERNETES_SANDBOX_MAX_GPU`
-- `KUBERNETES_SANDBOX_GPU_RESOURCE_NAME` and `KUBERNETES_SANDBOX_GPU_TYPE_LABEL`
-- `KUBERNETES_SANDBOX_HOST` and `KUBERNETES_SANDBOX_PORT`
-
-`KUBERNETES_SANDBOX_ALLOW_LOCAL_KUBECONFIG` defaults to `false`. Enable it only for local development against a disposable cluster. The normal process loads in-cluster service-account credentials.
-
-The service account is namespace-scoped. Its Role needs `get`, `list`, `create`, `patch`, and `delete` for `batch/jobs`; `get` and `list` for Pods; `get` and `create` for `pods/exec`; `get`, `create`, `update`, and `delete` for `networking.k8s.io/networkpolicies`; and `get`, `create`, `update`, and `delete` for `cilium.io/ciliumnetworkpolicies`. It does not need Secrets, Nodes, cluster-wide workloads, or RBAC mutation.
-
-Apply a namespace `ResourceQuota` and `LimitRange` for aggregate capacity, plus connection and request concurrency limits at the private ingress. The service enforces per-sandbox CPU, memory, disk, GPU, create-time, command-output, and upload ceilings; Kubernetes admission remains the final aggregate-capacity guard.
-
-Expose `/health` and the `/v1/sandboxes` API only through a private load balancer and private DNS. Store the API token in the deployment secret mechanism, mount it only into the control service, and rotate it independently of Kubernetes credentials.
-
-## Security and reliability requirements
-
-- Private load balancer and private DNS only; no public control-service ingress.
-- Bearer authentication, request IDs, body and file-size limits, and redacted structured logs.
-- Namespace-scoped service account with only the resources and subresources used by the service, including Pod exec.
-- Restricted settings for the control-service Pod and the main sandbox container, with dropped capabilities, seccomp, and no host namespace or host-path access. DinD is the one privileged container and must be admitted only in the Kata sandbox namespace; a namespace-wide restricted Pod Security profile would reject it.
-- Kata runtime class enforced on every sandbox Pod. Sandbox containers do not receive service-account tokens or Kubernetes API access.
-- Default-deny ingress for sandboxes. Baseline egress remains unrestricted until a temporary allowlist is installed.
-- Image registry allowlist, digest resolution, pull policy, resource ceilings, quota, and per-caller concurrency limits.
-- Retry-by-name, create timeout, automatic stop deadline, finalizers, and a janitor for expired Jobs, Pods, volumes, and network policies.
-- Command cancellation closes the remote exec session. Client disconnects must not leak control-service tasks.
-
-## Live rollout gates
-
-Before selecting this provider in a real run:
-
-1. Deploy the control service and policies to a disposable private EKS cluster using a separate infrastructure change.
-2. Mirror and pin control, runtime, DinD, and benchmark images in GovCloud ECR.
-3. Prove create, retry-by-name, get, paginated list, delete, readiness, timeout, and automatic cleanup.
-4. Prove command chunks and large file chunks arrive before completion, and cancellation stops the remote process.
-5. Prove binary upload/download, Compose/DinD, CPU and memory limits, ephemeral storage, and every supported GPU mapping.
-6. Prove temporary domain/CIDR allowlists and unrestricted restore with DNS and IPv4/IPv6 behavior documented.
-7. Interrupt the client and control service during create, command, upload, download, and delete; verify there are no orphan resources.
-8. Run the shared sandbox integration contract against the private endpoint and record the image digests, cluster version, runtime version, and test results.
-
-Local checks do not need a cluster:
+Replace the account ID, operator address, image repository, and image digest before running
+these commands:
 
 ```bash
-uv run pytest tests/test_kubernetes_client.py tests/test_kubernetes_control_app.py tests/test_kubernetes_resources.py tests/test_kubernetes_backend.py -q
+export AWS_PROFILE=vals-dev
+export AWS_ACCOUNT_ID=123456789012
+export AWS_OPERATOR_CIDR=203.0.113.10/32
+export AWS_REGION=us-east-2
+export KUBERNETES_DEPLOYMENT_NAME=cbs-kubernetes-smoke
+export TEST_KUBERNETES_IMAGE=registry.example.com/benchmark/image@sha256:0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef
 ```
 
-After a private deployment exists, run the opt-in live contract:
+Confirm that the profile shows the account you set and an `arn:aws:` ARN:
+
+```bash
+aws sts get-caller-identity --profile vals-dev
+```
+
+Keep the same exported values for plan, deploy, test, and destroy. A different deployment
+name points at a different local state and runtime directory.
+
+### Plan
+
+```bash
+make kubernetes-aws-plan
+```
+
+Plan initializes and validates both Terraform roots and saves the foundation plan under
+`infra/kubernetes/aws/.state/$KUBERNETES_DEPLOYMENT_NAME/`. It does not create the workload
+plan yet because that provider needs the live EKS API endpoint. Review the saved foundation
+plan before deploy.
+
+### Deploy
+
+```bash
+make kubernetes-aws-deploy
+```
+
+Deploy applies the reviewed foundation plan, builds and pushes the control image, mirrors
+the Docker daemon image, writes a private kubeconfig and generated API token, and applies
+the workload. It waits for Cilium and the control-service Deployment to become ready.
+
+The foundation includes a two-AZ VPC, private worker subnets, one NAT gateway, EKS 1.35,
+one on-demand `m6i.xlarge` node with a 100 GiB encrypted `gp3` root volume, and an immutable
+ECR repository. The workload installs Cilium in AWS VPC CNI chaining mode, creates the
+`benchmark-sandboxes` namespace, and configures the `runc` RuntimeClass, quota, limits,
+namespace-scoped RBAC, token Secret, control Deployment, and `ClusterIP` Service.
+
+`runc` plus a privileged DinD sidecar is not the planned isolation model for untrusted
+workloads. Keep this cluster disposable and use it only for the smoke contract.
+
+### Test
+
+The test command starts its own local port-forward, waits for `/health`, and runs the opt-in
+live contract:
+
+```bash
+make kubernetes-aws-test
+```
+
+It checks lifecycle idempotency, real-time command output, cancellation, timeout handling,
+large binary streaming, and temporary egress rules. It always attempts to delete the
+sandboxes it creates and reports cleanup failures. It skips the Compose contract unless
+`TEST_KUBERNETES_COMPOSE_IMAGE` is set.
+
+To use the mirrored Docker image for the optional Compose outer, load the runtime metadata
+after deploy and export its digest:
+
+```bash
+source "infra/kubernetes/aws/.runtime/${KUBERNETES_DEPLOYMENT_NAME}/deployment.env"
+export TEST_KUBERNETES_COMPOSE_IMAGE="$docker_image"
+make kubernetes-aws-test
+```
+
+The runtime file contains the generated control-service token. It is mode `0600`, ignored
+by Git, and must not be printed, copied into logs, or committed.
+
+For manual API work, run this blocking command in a separate terminal:
+
+```bash
+make kubernetes-aws-port-forward
+```
+
+It opens only a local tunnel at `http://127.0.0.1:8080`; it does not deploy a load balancer
+or make the control service public.
+
+### Destroy
+
+Tests and failed deploys do not destroy the stack automatically. Always run:
+
+```bash
+make kubernetes-aws-destroy
+```
+
+For a full deployment, destroy first removes the Kubernetes workload and checks that the
+`benchmark-sandboxes` namespace is gone. It then destroys EKS, ECR, the node group, NAT
+gateway, and VPC, and queries AWS for resources with the smoke's project and deployment
+tags. Only after the required namespace check and the tagged-resource check are empty does
+it delete the local state, kubeconfig, token, and runtime metadata.
+
+Successful Terraform destroy plus an empty tagged-resource query is the cleanup signal.
+Check the AWS console if billing or service quotas show anything unexpected; some AWS
+resources can take time to disappear from service views.
+
+## Recovery and retries
+
+The deploy writes foundation recovery metadata before the first apply and keeps separate
+Terraform state for the foundation and workload. If deploy stops after resources start
+creating, keep the same environment values and run:
+
+```bash
+make kubernetes-aws-destroy
+```
+
+Do not delete `infra/kubernetes/aws/.state/` or `.runtime/` by hand. Those files contain the
+state, phase, kubeconfig, and token needed to clean up a partial deployment. After destroy
+succeeds, run plan again before another deploy so the saved plan matches empty state.
+
+Destroy is retryable. If workload cleanup stops, the next call retries that phase. Once the
+namespace is confirmed absent, the runtime metadata moves to the foundation phase so a
+later retry does not call a deleted Kubernetes API. A failed tagged-resource check also
+keeps local metadata for another destroy attempt.
+
+A failed deploy can still leave chargeable resources. If local state or runtime metadata is
+lost before cleanup, stop and reconcile the tagged AWS resources before creating another
+deployment with the same name.
+
+## Local checks
+
+The provider unit tests do not need a cluster:
+
+```bash
+uv run pytest \
+  tests/test_kubernetes_client.py \
+  tests/test_kubernetes_control_app.py \
+  tests/test_kubernetes_resources.py \
+  tests/test_kubernetes_backend.py \
+  -q
+```
+
+The live contract skips unless its control URL, token, and benchmark image variables are
+set:
 
 ```bash
 TEST_KUBERNETES_CONTROL_URL=https://sandbox-control.internal \
@@ -133,4 +244,14 @@ TEST_KUBERNETES_IMAGE=registry.internal/benchmark@sha256:... \
 uv run pytest tests/integration/test_kubernetes_control_service.py -q
 ```
 
-Terraform and multi-cloud cluster modules come after this provider boundary is proven. They should supply the same control-service API and keep cloud-specific networking, identity, storage, and node configuration outside benchmark requests.
+## Later deployment targets
+
+The next isolation target is Kata Containers on compatible nodes in AWS GovCloud, with all
+workload images, storage, secrets, logs, and data paths kept in the team's cloud account and
+VPC. That design still needs GovCloud instance and runtime validation; this `runc` smoke is
+not evidence that Kata works there.
+
+Future Terraform roots can add GovCloud and other cloud environments behind the same
+private control-service API. Cloud-specific VPC, identity, storage, registry, and node
+configuration stays out of benchmark requests, so benchmark code and provider secrets do
+not change when the cluster implementation changes.

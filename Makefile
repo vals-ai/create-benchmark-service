@@ -1,4 +1,6 @@
-.PHONY: install dev run format lint test test-provider-integration clean help
+.PHONY: install dev run format lint test test-provider-integration clean help \
+	kubernetes-aws-plan kubernetes-aws-deploy kubernetes-aws-port-forward \
+	kubernetes-aws-test kubernetes-aws-destroy
 
 PYTHON_VERSION := 3.12
 
@@ -39,3 +41,6 @@ docker-build: ## Build Docker image
 
 docker-run: ## Run Docker container
 	docker run -p 8001:8001 benchmark-service:latest
+
+kubernetes-aws-plan kubernetes-aws-deploy kubernetes-aws-port-forward kubernetes-aws-test kubernetes-aws-destroy:
+	$(MAKE) -C infra/kubernetes/aws $(@:kubernetes-aws-%=%)

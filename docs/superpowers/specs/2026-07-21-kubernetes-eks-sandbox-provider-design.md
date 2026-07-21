@@ -64,7 +64,7 @@ The client and service use a versioned private API:
 - `PUT /v1/sandboxes/{id}/files?path=...` uploads a file.
 - `GET /v1/sandboxes/{id}/files?path=...` streams file bytes as they arrive.
 - `PUT /v1/sandboxes/{id}/egress` replaces the sandbox allowlist.
-- `DELETE /v1/sandboxes/{id}/egress` restores the deployment's default policy.
+- `DELETE /v1/sandboxes/{id}/egress` restores unrestricted egress, matching the existing provider contract.
 
 Every response carries a request ID. Errors use a small stable code set that the client maps to `SandboxNotFoundError`, `SandboxConnectionError`, `SandboxCommandError`, or `SandboxError`; Kubernetes client exceptions never reach framework callers.
 
@@ -78,6 +78,7 @@ The Job template includes:
 
 - the requested OCI image, pinned or resolved according to the deployment image policy;
 - requested CPU, memory, and ephemeral-storage requests and limits;
+- requested GPU count as the configured extended resource, with GPU type mapped to a deployment-controlled node label;
 - a workspace `emptyDir` bounded by the requested disk size;
 - requested environment variables and framework labels;
 - the configured Kata `RuntimeClass` and matching node selector;
@@ -110,7 +111,7 @@ Transient API, transport, and control-service failures receive bounded retries w
 
 ## Network isolation
 
-Sandbox Pods start with default-deny ingress and egress. They may reach cluster DNS and the explicitly configured control path. CIDR and domain allowlists use an `EgressPolicyDriver` so the provider contract does not depend on one CNI.
+Sandbox Pods start with denied ingress. Baseline egress remains unrestricted because tracker currently applies allowlists only around commands that request them, and `clear_egress_rules` explicitly restores unrestricted access for every existing provider. A restricted policy permits cluster DNS plus the requested destinations and must fail closed if reconciliation cannot complete. CIDR and domain allowlists use an `EgressPolicyDriver` so the provider contract does not depend on one CNI.
 
 The first production target is Cilium because `CiliumNetworkPolicy` supports DNS-aware `toFQDNs` rules, while standard Kubernetes and EKS VPC CNI policies operate at IP and port layers. Kata plus Cilium has documented networking limitations, so connectivity, MTU, DNS policy, and fail-closed behavior are deployment acceptance tests. If that combination is not reliable in GovCloud, the fallback is a private egress proxy selected by the same driver boundary, not best-effort DNS-to-IP snapshots.
 
@@ -125,7 +126,7 @@ Additional gates are:
 - private-only Kubernetes API access and a private control-service load balancer;
 - GovCloud ECR mirrors with digest pins for every image;
 - namespace-scoped RBAC and admission rules preventing host access or runtime-class overrides;
-- default-deny network policy before a sandbox becomes ready;
+- denied baseline ingress plus fail-closed restricted-egress reconciliation;
 - multi-AZ control-service replicas and sandbox node capacity;
 - encrypted logs and storage with retention configured inside the account;
 - Pod and node interruption tests, orphan cleanup tests, and API throttling tests; and

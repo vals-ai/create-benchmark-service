@@ -65,6 +65,7 @@ module "eks" {
   endpoint_public_access_cidrs             = [var.operator_cidr]
   deletion_protection                      = false
   enable_cluster_creator_admin_permissions = true
+  encryption_config                        = null
 
   addons = {
     coredns    = {}
@@ -79,10 +80,11 @@ module "eks" {
 
   eks_managed_node_groups = {
     sandbox = {
-      ami_type       = "AL2023_x86_64_STANDARD"
-      capacity_type  = "ON_DEMAND"
-      instance_types = var.node_instance_types
-      disk_size      = 100
+      ami_type                   = "AL2023_x86_64_STANDARD"
+      capacity_type              = "ON_DEMAND"
+      instance_types             = var.node_instance_types
+      disk_size                  = 100
+      use_custom_launch_template = false
 
       min_size     = 1
       max_size     = 2

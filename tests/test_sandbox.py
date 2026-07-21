@@ -6,7 +6,7 @@ from typing import Any, Awaitable, Callable, cast
 
 import pytest
 from aiohttp import ClientConnectionError, ClientResponseError, RequestInfo
-from daytona import SandboxState
+from daytona import GpuType, SandboxState
 from daytona.common.errors import (
     DaytonaConflictError,
     DaytonaConnectionError,
@@ -30,8 +30,10 @@ from benchmark_service.sandbox import (
     SandboxError,
     SandboxNotFoundError,
     SandboxQuery,
+    SnapshotSource,
 )
 from benchmark_service.sandbox.daytona import (
+    _PTY_STDOUT_TAIL_MAX_BYTES,  # pyright: ignore[reportPrivateUsage]
     DaytonaProviderConfig,
     DaytonaSandbox,
     DaytonaSandboxProvider,
@@ -273,6 +275,31 @@ class CrashingReconnectProcess(ReconnectingProcess):
         raise DaytonaConnectionError("toolbox unreachable")
 
 
+class FloodingPtyHandle(PtyHandle):
+    async def send_input(self, data: str) -> None:
+        self.inputs.append(data)
+        if data.startswith("stty"):
+            return
+        for index in range(200):
+            result = self._on_data(f"chunk-{index:04d}-".encode() + b"x" * 1024)
+            if result is not None:
+                await result
+
+
+class FloodingProcess(Process):
+    async def create_pty_session(
+        self,
+        *,
+        id: str,
+        on_data: Callable[[bytes], None | Awaitable[None]],
+        envs: dict[str, str],
+    ) -> PtyHandle:
+        assert id
+        self.pty_envs = envs
+        self.pty_handle = FloodingPtyHandle(on_data)
+        return self.pty_handle
+
+
 class BlockingPtyHandle(PtyHandle):
     disconnected = False
 
@@ -451,6 +478,34 @@ class RecreatedInnerSandbox(InnerSandbox):
     id = "recreated-sandbox-id"
 
 
+class InactiveSandbox(InnerSandbox):
+    def __init__(self, state: SandboxState) -> None:
+        super().__init__()
+        self.state = state
+
+    async def wait_for_sandbox_start(self, timeout: int) -> None:
+        raise AssertionError("inactive sandbox deletion must not wait for startup")
+
+    async def refresh_data(self) -> None:
+        raise AssertionError("inactive sandbox deletion must not refresh before deletion")
+
+    async def set_autostop_interval(self, interval: int) -> None:
+        raise AssertionError("inactive sandbox deletion must not update autostop")
+
+
+class BuildingSandbox(InnerSandbox):
+    state = SandboxState.BUILDING_SNAPSHOT
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.waited_for_start = False
+
+    async def wait_for_sandbox_start(self, timeout: int) -> None:
+        assert timeout == 0
+        self.waited_for_start = True
+        self.state = SandboxState.STARTED
+
+
 class RefreshToErrorSandbox(InnerSandbox):
     async def refresh_data(self) -> None:
         await super().refresh_data()
@@ -578,10 +633,14 @@ def _provider(daytona: DaytonaClient) -> DaytonaSandboxProvider:
     return provider
 
 
-def _request(name: str) -> SandboxCreateRequest:
+def _request(
+    name: str,
+    resources: Resources | None = None,
+    source: ImageSource | SnapshotSource | None = None,
+) -> SandboxCreateRequest:
     return SandboxCreateRequest(
-        source=ImageSource(image="python:3.12"),
-        resources=Resources(vcpu=2, memory=4, disk=10),
+        source=source or ImageSource(image="python:3.12"),
+        resources=resources or Resources(vcpu=2, memory=4, disk=10),
         name=name,
         labels={},
         env_vars={},
@@ -659,6 +718,19 @@ async def test_compose_sandbox_routes_operations_through_main_service() -> None:
         f"docker exec \"$container_id\" sh -lc 'cat /workspace/reward.json' > {download_temp}"
     ) in outer.exec_commands
     assert downloaded == b"downloaded"
+
+
+async def test_compose_stream_download_streams_from_outer_and_cleans_temp() -> None:
+    outer = RecordingSandbox()
+    source = ComposeSource(outer=ImageSource(image="img"), service="main")
+    sandbox = ComposeSandbox(outer, source)
+
+    chunks = [chunk async for chunk in sandbox.stream_download("/workspace/reward.json")]
+
+    assert chunks == [b"downloaded"]
+    download_temp = outer.downloads[0]
+    assert download_temp.startswith("/var/tmp/compose-download-")
+    assert outer.exec_commands[-1] == f"rm -f {download_temp}"
 
 
 async def test_compose_command_rejects_invalid_environment_names_before_outer_call() -> None:
@@ -895,6 +967,47 @@ async def test_daytona_download_file_streams_content() -> None:
     assert await sandbox.download_file("/tmp/result.txt") == b"hello world"
 
 
+async def test_daytona_stream_download_yields_chunks() -> None:
+    sandbox = DaytonaSandbox(cast(Any, InnerSandbox()))
+
+    chunks = [chunk async for chunk in sandbox.stream_download("/tmp/result.txt")]
+
+    assert chunks == [b"hello", b" world"]
+
+
+async def test_daytona_stream_download_raises_sandbox_not_found_when_removed() -> None:
+    inner = InnerSandbox()
+    inner.fs = RemovedSandboxFiles()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxNotFoundError, match="Sandbox not found: name=sandbox-name, id=sandbox-id\\."):
+        _ = [chunk async for chunk in sandbox.stream_download("/tmp/result.txt")]
+
+
+async def test_daytona_pty_caps_result_output_without_dropping_streamed_chunks() -> None:
+    """The PTY exec result should retain only a bounded output tail.
+
+    Test cases:
+    - Every chunk is still forwarded to the streaming queue.
+    - ExecResult.output is capped near the tail limit and keeps the newest output.
+    """
+    inner = InnerSandbox()
+    inner.process = FloodingProcess()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+    queue: asyncio.Queue[str] = asyncio.Queue()
+
+    result = await sandbox._exec_pty("noisy", queue, {})  # pyright: ignore[reportPrivateUsage]
+
+    chunk_length = 1024 + len("chunk-0000-")
+    total_streamed = 0
+    while not queue.empty():
+        total_streamed += len(queue.get_nowait())
+    assert total_streamed == 200 * chunk_length
+    assert len(result.output) <= _PTY_STDOUT_TAIL_MAX_BYTES + chunk_length
+    assert "chunk-0199-" in result.output
+    assert "chunk-0000-" not in result.output
+
+
 async def test_daytona_command_streams_output() -> None:
     sandbox = DaytonaSandbox(cast(Any, InnerSandbox()))
 
@@ -1119,6 +1232,66 @@ async def test_daytona_provider_recovers_existing_sandbox_on_create_conflict() -
     assert sandbox.id == inner.id
 
 
+class CapturingCreateDaytonaClient(DaytonaClient):
+    def __init__(self, sandbox: "InnerSandbox") -> None:
+        super().__init__(sandbox)
+        self.create_params: Any | None = None
+
+    async def get(self, instance_id: str) -> "InnerSandbox":
+        raise DaytonaNotFoundError("sandbox not found")
+
+    async def create(self, *args: object, **_kwargs: object) -> "InnerSandbox":
+        self.create_params = args[0]
+        self.created = True
+        return self.sandbox
+
+
+async def test_daytona_provider_maps_gpu_resources() -> None:
+    inner = InnerSandbox()
+    daytona = CapturingCreateDaytonaClient(inner)
+    resources = Resources(vcpu=2, memory=4, disk=10, gpu=1, gpu_type="H100")
+
+    await _provider(daytona).create_sandbox(_request(inner.name, resources=resources))
+
+    assert daytona.create_params is not None
+    assert daytona.create_params.resources.gpu == 1
+    assert daytona.create_params.resources.gpu_type == GpuType.H100
+
+
+async def test_daytona_provider_omits_gpu_by_default() -> None:
+    inner = InnerSandbox()
+    daytona = CapturingCreateDaytonaClient(inner)
+
+    await _provider(daytona).create_sandbox(_request(inner.name))
+
+    assert daytona.create_params is not None
+    assert daytona.create_params.resources.gpu is None
+    assert daytona.create_params.resources.gpu_type is None
+
+
+async def test_daytona_provider_rejects_unsupported_gpu_type() -> None:
+    daytona = CapturingCreateDaytonaClient(InnerSandbox())
+    resources = Resources(vcpu=2, memory=4, disk=10, gpu=1, gpu_type="T4")
+
+    with pytest.raises(SandboxError, match="Unsupported Daytona GPU type: T4"):
+        await _provider(daytona).create_sandbox(_request("sandbox-name", resources=resources))
+
+
+async def test_daytona_provider_rejects_gpu_for_snapshot_source() -> None:
+    daytona = CapturingCreateDaytonaClient(InnerSandbox())
+    resources = Resources(vcpu=2, memory=4, disk=10, gpu=1, gpu_type="H100")
+
+    with pytest.raises(SandboxError, match="GPUs cannot be requested"):
+        await _provider(daytona).create_sandbox(
+            _request("sandbox-name", resources=resources, source=SnapshotSource(snapshot="snap-1"))
+        )
+
+
+def test_resources_gpu_type_requires_gpu_count() -> None:
+    with pytest.raises(ValueError, match="gpu_type requires gpu >= 1"):
+        Resources(vcpu=2, memory=4, disk=10, gpu_type="H100")
+
+
 async def test_daytona_provider_delete_sets_autostop_before_delete() -> None:
     inner = InnerSandbox()
     daytona = DaytonaClient(inner)
@@ -1230,6 +1403,28 @@ async def test_daytona_provider_delete_removes_sandbox_that_fails_after_refresh(
     assert daytona.deleted is True
 
 
+@pytest.mark.parametrize("state", [SandboxState.STOPPED, SandboxState.ARCHIVED])
+async def test_daytona_provider_delete_removes_inactive_sandbox_without_starting(state: SandboxState) -> None:
+    inner = InactiveSandbox(state)
+    daytona = DaytonaClient(inner)
+
+    await _provider(daytona).delete_sandbox(inner.name)
+
+    assert daytona.deleted is True
+
+
+async def test_daytona_provider_delete_waits_for_building_sandbox() -> None:
+    inner = BuildingSandbox()
+    daytona = DaytonaClient(inner)
+
+    await _provider(daytona).delete_sandbox(inner.name)
+
+    assert inner.waited_for_start is True
+    assert inner.refresh_count == 1
+    assert inner.autostop_interval == 1
+    assert daytona.deleted is True
+
+
 async def test_daytona_provider_lists_sandboxes_with_query() -> None:
     inner = InnerSandbox()
     daytona = DaytonaClient(inner)
@@ -1287,28 +1482,13 @@ async def test_daytona_updates_egress_rules() -> None:
     }
 
 
-class CapturingCreateClient(DaytonaClient):
-    """Forces the create path (get raises NotFound) and captures the params."""
-
-    def __init__(self, sandbox: InnerSandbox) -> None:
-        super().__init__(sandbox)
-        self.create_params: Any = None
-
-    async def get(self, instance_id: str) -> InnerSandbox:
-        raise DaytonaNotFoundError("sandbox not found")
-
-    async def create(self, *args: object, **_kwargs: object) -> InnerSandbox:
-        self.create_params = args[0]
-        self.created = True
-        return self.sandbox
-
-
 async def test_daytona_create_forwards_network_block_all() -> None:
-    daytona = CapturingCreateClient(InnerSandbox())
+    daytona = CapturingCreateDaytonaClient(InnerSandbox())
     request = _request("grade-sb").model_copy(update={"network_block_all": True})
 
     await _provider(daytona).create_sandbox(request)
 
+    assert daytona.create_params is not None
     assert daytona.create_params.network_block_all is True
 
 

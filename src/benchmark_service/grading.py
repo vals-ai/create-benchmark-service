@@ -194,9 +194,14 @@ def _resolve_grading_spec(task: RetrieveTaskResponse) -> _ResolvedSpec:
         raise ValueError(
             "eval_sandbox.resources cannot override a snapshot-backed sandbox; use an image source with explicit resources"
         )
+    resources = spec.resources if spec.resources is not None else task.resources
+    if isinstance(source, SnapshotSource):
+        # The snapshot owns its resources; generation GPU settings cannot be
+        # forwarded through the required create-request resources field.
+        resources = resources.model_copy(update={"gpu": 0, "gpu_type": None})
     return _ResolvedSpec(
         source=source,
-        resources=spec.resources if spec.resources is not None else task.resources,
+        resources=resources,
         network_block_all=spec.network_block_all,
         grade_timeout=spec.timeout_s if spec.timeout_s is not None else DEFAULT_GRADE_TIMEOUT_S,
     )

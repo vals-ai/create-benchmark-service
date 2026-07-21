@@ -4,6 +4,7 @@ import asyncio
 import os
 import shlex
 import uuid
+from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import suppress
 from typing import Any, Literal
@@ -18,6 +19,9 @@ from daytona import (
     DaytonaNotFoundError,
     ListSandboxesQuery,
     SandboxState,
+)
+from daytona import (
+    GpuType,
 )
 from daytona import (
     Resources as DaytonaResources,
@@ -53,10 +57,16 @@ from benchmark_service.sandbox.types import (
 
 _PTY_STATUS_CHECK_ATTEMPTS = 30
 _PTY_STATUS_POLL_SECONDS = 5
+_PTY_STDOUT_TAIL_MAX_BYTES = 64 * 1024
 _STATUS_DIR = "/tmp/.sandbox-provider"
 _REMOVED_SANDBOX_STATES = (SandboxState.DESTROYING, SandboxState.DESTROYED)
 _FAILED_SANDBOX_STATES = (SandboxState.ERROR, SandboxState.BUILD_FAILED)
-_DEAD_SANDBOX_STATES = (*_REMOVED_SANDBOX_STATES, SandboxState.STOPPED, *_FAILED_SANDBOX_STATES)
+_DEAD_SANDBOX_STATES = (
+    *_REMOVED_SANDBOX_STATES,
+    SandboxState.STOPPED,
+    *_FAILED_SANDBOX_STATES,
+)
+_DELETE_WITHOUT_START_STATES = (*_DEAD_SANDBOX_STATES, SandboxState.ARCHIVED)
 _SANDBOX_OPERATION_ERRORS = (DaytonaError, ClientResponseError)
 _TRANSIENT_DAYTONA_ERRORS = (DaytonaConnectionError, DaytonaRateLimitError, DaytonaTimeoutError)
 _RETRY_AFTER_PREFIX = "retry-after-"
@@ -131,6 +141,19 @@ class DaytonaProviderConfig(BaseModel):
 
     def create_provider(self) -> SandboxProvider:
         return DaytonaSandboxProvider(self)
+
+
+def _daytona_gpu_type(gpu_type: str | None) -> GpuType | None:
+    if gpu_type is None:
+        return None
+    try:
+        member = GpuType(gpu_type)
+    except ValueError:
+        member = GpuType.UNKNOWN_DEFAULT_OPEN_API
+    if member is GpuType.UNKNOWN_DEFAULT_OPEN_API:
+        supported = ", ".join(t.value for t in GpuType if t is not GpuType.UNKNOWN_DEFAULT_OPEN_API)
+        raise SandboxError(f"Unsupported Daytona GPU type: {gpu_type}. Supported types: {supported}")
+    return member
 
 
 def _get_config_header(headers: Mapping[str, str], *names: str) -> str | None:
@@ -349,6 +372,14 @@ class DaytonaSandbox(Sandbox):
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
 
+    async def stream_download(self, remote_path: str) -> AsyncGenerator[bytes, None]:
+        try:
+            stream = await self._sandbox.fs.download_file_stream(remote_path)
+            async for chunk in stream:
+                yield chunk
+        except _SANDBOX_OPERATION_ERRORS as exc:
+            raise self._sandbox_error(exc) from exc
+
     @_PROVIDER_RETRY
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
         network_allow_list, domain_allow_list = _resolve_daytona_allowed_addresses(allowed_addresses)
@@ -375,13 +406,21 @@ class DaytonaSandbox(Sandbox):
     async def _exec_pty(self, command: str, output: asyncio.Queue[str], env_vars: dict[str, str]) -> ExecResult:
         session_id = f"{self.id}:exec-{uuid.uuid4().hex}"
         status_path = f"{_STATUS_DIR}/{uuid.uuid4().hex}.status"
-        stdout: list[str] = []
+        # Keep only a bounded tail of the output for the ExecResult; the full stream is
+        # forwarded through the queue, so retaining it all would grow without limit on
+        # long-running, chatty commands.
+        stdout: deque[str] = deque()
+        stdout_bytes = 0
         handle: AsyncPtyHandle | None = None
         wait_task: asyncio.Task[PtyResult] | None = None
 
         async def on_data(data: bytes) -> None:
+            nonlocal stdout_bytes
             text = data.decode("utf-8", errors="replace")
             stdout.append(text)
+            stdout_bytes += len(text)
+            while stdout_bytes > _PTY_STDOUT_TAIL_MAX_BYTES and len(stdout) > 1:
+                stdout_bytes -= len(stdout.popleft())
             output.put_nowait(text)
 
         try:
@@ -519,6 +558,8 @@ class DaytonaSandboxProvider(SandboxProvider):
             cpu=request.resources.vcpu,
             memory=request.resources.memory,
             disk=request.resources.disk,
+            gpu=request.resources.gpu or None,
+            gpu_type=_daytona_gpu_type(request.resources.gpu_type),
         )
 
         match request.source:
@@ -534,6 +575,8 @@ class DaytonaSandboxProvider(SandboxProvider):
                     env_vars=request.env_vars,
                 )
             case SnapshotSource(snapshot=snapshot):
+                if request.resources.gpu:
+                    raise SandboxError("Daytona snapshot sandboxes use the snapshot's resources; GPUs cannot be requested")
                 params = CreateSandboxFromSnapshotParams(
                     auto_stop_interval=request.auto_stop_interval,
                     auto_delete_interval=0,
@@ -607,12 +650,12 @@ class DaytonaSandboxProvider(SandboxProvider):
     async def delete_sandbox(self, instance_id: str) -> None:
         try:
             sandbox = await self._daytona.get(instance_id)
-            if sandbox.state not in (*_REMOVED_SANDBOX_STATES, *_FAILED_SANDBOX_STATES):
+            if sandbox.state not in _DELETE_WITHOUT_START_STATES:
                 await sandbox.wait_for_sandbox_start(timeout=0)
                 await sandbox.refresh_data()
             if sandbox.state in _REMOVED_SANDBOX_STATES:
                 return
-            if sandbox.state not in _FAILED_SANDBOX_STATES:
+            if sandbox.state not in _DELETE_WITHOUT_START_STATES:
                 await sandbox.set_autostop_interval(interval=1)
             await self._daytona.delete(sandbox)
         except DaytonaNotFoundError:

@@ -224,6 +224,26 @@ class ModalSandbox(Sandbox):
             raise _sandbox_error(exc) from exc
         return bytes(content)
 
+    async def stream_download(self, remote_path: str) -> AsyncGenerator[bytes, None]:
+        await self._raise_if_finished()
+        process = await self._start_download_process(remote_path)
+        try:
+            async for chunk in process.stdout:
+                yield bytes(chunk)
+            exit_code = await process.wait.aio()
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
+        if exit_code != 0:
+            await self._raise_if_finished(attempts=6, wait_seconds=0.5)
+            raise SandboxError(f"File download failed: path={remote_path}, exit_code={exit_code}.")
+
+    @_PROVIDER_RETRY
+    async def _start_download_process(self, remote_path: str) -> Any:
+        try:
+            return await self._sandbox.exec.aio("cat", "--", remote_path, text=False)
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
+
     async def _set_outbound_network_policy(self, cidrs: list[str], domains: list[str]) -> None:
         try:
             set_policy = cast(Any, self._sandbox)._experimental_set_outbound_network_policy
@@ -327,6 +347,11 @@ class ModalSandboxProvider(SandboxProvider):
             return ModalSandbox(existing, name=request.name)
         image = self._resolve_image(request.source, client)
         allow_all_egress = not request.network_block_all
+        gpu: str | None = None
+        if request.resources.gpu:
+            if not request.resources.gpu_type:
+                raise SandboxError("Modal sandbox provider requires gpu_type when gpu is requested")
+            gpu = f"{request.resources.gpu_type}:{request.resources.gpu}"
         create_kwargs: dict[str, Any] = {
             "app": app,
             "name": modal_name,
@@ -335,6 +360,7 @@ class ModalSandboxProvider(SandboxProvider):
             "tags": request.labels,
             "cpu": float(request.resources.vcpu),
             "memory": request.resources.memory * 1024,
+            "gpu": gpu,
             "idle_timeout": request.auto_stop_interval * 60 if request.auto_stop_interval else None,
             "timeout": _MAX_LIFETIME_SECONDS,
             "block_network": request.network_block_all,

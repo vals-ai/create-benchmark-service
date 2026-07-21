@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator, AsyncIterable
+from datetime import datetime
 from typing import Protocol
 
 from benchmark_service.sandbox.kubernetes.protocol import (
@@ -47,5 +48,7 @@ class SandboxControlBackend(Protocol):
     async def modify_egress_rules(self, instance_id: str, allowed_addresses: list[str]) -> None: ...
 
     async def clear_egress_rules(self, instance_id: str) -> None: ...
+
+    async def delete_idle_sandboxes(self, now: datetime) -> int: ...
 
     async def close(self) -> None: ...

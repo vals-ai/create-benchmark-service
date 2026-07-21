@@ -7,6 +7,7 @@ import shlex
 import time
 import uuid
 from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Any, TypeVar, cast
 
 from benchmark_service.sandbox.kubernetes.control.api import (
@@ -14,10 +15,13 @@ from benchmark_service.sandbox.kubernetes.control.api import (
     KubernetesApiError,
 )
 from benchmark_service.sandbox.kubernetes.control.backend import SandboxConflictError
+from benchmark_service.sandbox.kubernetes.control.egress import EgressPolicyDriver
 from benchmark_service.sandbox.kubernetes.control.resources import (
     FINGERPRINT_ANNOTATION,
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
+    AUTO_STOP_ANNOTATION,
+    LAST_ACTIVITY_ANNOTATION,
     ORIGINAL_NAME_ANNOTATION,
     SANDBOX_ID_LABEL,
     build_ingress_policy,
@@ -109,15 +113,19 @@ class KubernetesSandboxBackend:
         settings: KubernetesControlSettings,
         api: KubernetesApi,
         remote_exec: RemoteExec | None = None,
+        egress_driver: EgressPolicyDriver | None = None,
         *,
         wait: Callable[[float], Awaitable[None]] = asyncio.sleep,
         monotonic: Callable[[], float] = time.monotonic,
+        now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> None:
         self.settings = settings
         self.api = api
         self.remote_exec = remote_exec
+        self.egress_driver = egress_driver
         self._wait = wait
         self._monotonic = monotonic
+        self._now = now
 
     def _record(self, job: dict[str, object], state: str) -> SandboxRecord:
         metadata = _metadata(job)
@@ -195,6 +203,7 @@ class KubernetesSandboxBackend:
                     build_ingress_policy(resource_name, self.settings.namespace),
                 )
             )
+            await self._touch(resource_name)
             return await self._wait_ready(resource_name, request.create_timeout)
 
         ingress_created = False
@@ -235,6 +244,7 @@ class KubernetesSandboxBackend:
         job = await self._call(lambda: self.api.get_job(self.settings.namespace, resource_name))
         if job is None:
             raise SandboxNotFoundError(f"Sandbox not found: {instance_id}")
+        await self._touch(resource_name)
         return self._record(job, _job_state(job, await self._pods(resource_name)))
 
     async def list_sandboxes(
@@ -281,6 +291,21 @@ class KubernetesSandboxBackend:
         if self.remote_exec is None:
             raise SandboxError("Kubernetes remote exec is not configured")
         return self.remote_exec
+
+    def _egress_driver(self) -> EgressPolicyDriver:
+        if self.egress_driver is None:
+            raise SandboxError("Kubernetes egress policy driver is not configured")
+        return self.egress_driver
+
+    async def _touch(self, instance_id: str) -> None:
+        resource_name = sandbox_name(instance_id)
+        await self._call(
+            lambda: self.api.patch_job(
+                self.settings.namespace,
+                resource_name,
+                {"metadata": {"annotations": {LAST_ACTIVITY_ANNOTATION: self._now().isoformat()}}},
+            )
+        )
 
     async def _ready_pod_name(self, instance_id: str) -> str:
         resource_name = sandbox_name(instance_id)
@@ -356,6 +381,7 @@ class KubernetesSandboxBackend:
         instance_id: str,
         request: CommandRequest,
     ) -> AsyncGenerator[CommandEvent, None]:
+        await self._touch(instance_id)
         pod_name = await self._ready_pod_name(instance_id)
         command_id = f"sandbox-command-{uuid.uuid4().hex}"
         session = await self._remote_exec().open(
@@ -378,6 +404,7 @@ class KubernetesSandboxBackend:
         remote_path: str,
         chunks: AsyncIterable[bytes],
     ) -> None:
+        await self._touch(instance_id)
         pod_name = await self._ready_pod_name(instance_id)
         parent = remote_path.rpartition("/")[0] or "."
         shell_command = f"mkdir -p {shlex.quote(parent)} && base64 -d > {shlex.quote(remote_path)}"
@@ -393,6 +420,7 @@ class KubernetesSandboxBackend:
             await session.close()
 
     async def stream_download(self, instance_id: str, remote_path: str) -> AsyncGenerator[bytes, None]:
+        await self._touch(instance_id)
         pod_name = await self._ready_pod_name(instance_id)
         session = await self._remote_exec().open(
             pod_name,
@@ -416,10 +444,52 @@ class KubernetesSandboxBackend:
             await session.close()
 
     async def modify_egress_rules(self, instance_id: str, allowed_addresses: list[str]) -> None:
-        raise NotImplementedError
+        try:
+            await self._egress_driver().apply(instance_id, allowed_addresses)
+        except KubernetesApiError as error:
+            raise self._map_error(error) from error
+        await self._touch(instance_id)
 
     async def clear_egress_rules(self, instance_id: str) -> None:
-        raise NotImplementedError
+        try:
+            await self._egress_driver().clear(instance_id)
+        except KubernetesApiError as error:
+            if error.status != 404:
+                raise self._map_error(error) from error
+        await self._touch(instance_id)
+
+    async def delete_idle_sandboxes(self, now: datetime) -> int:
+        continue_token: str | None = None
+        deleted = 0
+        while True:
+            result = await self._call(
+                lambda: self.api.list_jobs(
+                    self.settings.namespace,
+                    f"{MANAGED_BY_LABEL}={MANAGED_BY_VALUE}",
+                    100,
+                    continue_token,
+                )
+            )
+            for job in cast(list[dict[str, object]], result.get("items", [])):
+                annotations = _annotations(job)
+                try:
+                    interval_minutes = int(annotations.get(AUTO_STOP_ANNOTATION, "0"))
+                    last_activity = datetime.fromisoformat(annotations[LAST_ACTIVITY_ANNOTATION])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if interval_minutes <= 0 or last_activity.tzinfo is None:
+                    continue
+                if (now - last_activity).total_seconds() < interval_minutes * 60:
+                    continue
+                resource_name = _metadata(job).get("name")
+                if isinstance(resource_name, str) and resource_name:
+                    await self.delete_sandbox(resource_name)
+                    deleted += 1
+            metadata = _dict(result.get("metadata"))
+            token = metadata.get("continue")
+            continue_token = token if isinstance(token, str) and token else None
+            if continue_token is None:
+                return deleted
 
     async def close(self) -> None:
         if self.remote_exec is not None:

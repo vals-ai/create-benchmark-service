@@ -6,12 +6,14 @@ import asyncio
 import base64
 from collections import deque
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 import pytest
 
 from benchmark_service.sandbox.kubernetes.control.api import KubernetesApiError
 from benchmark_service.sandbox.kubernetes.control.backend import SandboxConflictError
+from benchmark_service.sandbox.kubernetes.control.egress import CiliumEgressPolicyDriver
 from benchmark_service.sandbox.kubernetes.control.kubernetes import KubernetesSandboxBackend
 from benchmark_service.sandbox.kubernetes.control.remote_exec import (
     RemoteExecSession,
@@ -80,6 +82,13 @@ class MockKubernetesApi:
 
     async def patch_job(self, namespace: str, name: str, body: dict[str, object]) -> None:
         self.operations.append(("patch_job", (namespace, name, body)))
+        if name in self.jobs:
+            patch_annotations = cast(dict[str, Any], _metadata(body).get("annotations", {}))
+            annotations = cast(
+                dict[str, Any],
+                _metadata(self.jobs[name]).setdefault("annotations", {}),
+            )
+            annotations.update(patch_annotations)
 
     async def delete_job(self, namespace: str, name: str) -> None:
         self.operations.append(("delete_job", (namespace, name)))
@@ -456,3 +465,60 @@ class TestKubernetesSandboxBackendStreaming:
         assert base64.b64decode(b"".join(remote.sessions[0].stdin)) == b"first"
         assert b"".join(downloaded) == b"first"
         assert all("'/workspace/a b;$(false).bin'" in command[-1] for command in remote.opened_commands)
+
+
+class TestKubernetesSandboxBackendEgressAndCleanup:
+    """Temporary egress and idle sandbox cleanup behavior."""
+
+    async def test_replaces_egress_touches_activity_and_clears_to_unrestricted(self) -> None:
+        """Keep temporary allowlists separate from unrestricted baseline egress.
+
+        Test cases:
+        - Mixed domains and CIDRs replace one Cilium policy.
+        - Successful replace and clear refresh the sandbox activity timestamp.
+        - Clear deletes only the egress policy.
+        """
+        api = MockKubernetesApi()
+        request = _request()
+        api.jobs["task-1"] = build_job(request, _settings())
+        now = datetime(2026, 7, 21, 12, tzinfo=UTC)
+        egress = CiliumEgressPolicyDriver(_settings(), api)
+        backend = KubernetesSandboxBackend(_settings(), api, egress_driver=egress, now=lambda: now)
+
+        await backend.modify_egress_rules("task-1", ["api.example.com", "10.0.0.3/24"])
+        await backend.clear_egress_rules("task-1")
+
+        replace_index = next(index for index, item in enumerate(api.operations) if item[0] == "replace_custom")
+        first_patch_index = next(index for index, item in enumerate(api.operations) if item[0] == "patch_job")
+        assert replace_index < first_patch_index
+        replace = cast(tuple[str, str, str, dict[str, object]], api.operations[replace_index][1])
+        body = replace[3]
+        rules = cast(dict[str, Any], body["spec"])["egress"]
+        assert rules[1]["toCIDR"] == ["10.0.0.0/24"]
+        assert rules[1]["toFQDNs"] == [{"matchName": "api.example.com"}]
+        assert ("delete_custom", ("benchmark-sandboxes", "ciliumnetworkpolicies", "task-1-egress")) in api.operations
+        assert sum(name == "patch_job" for name, _ in api.operations) == 2
+
+    async def test_deletes_only_expired_idle_sandboxes_idempotently(self) -> None:
+        """Use activity annotations without deleting retained or malformed Jobs.
+
+        Test cases:
+        - Expired positive intervals are deleted through the ordinary delete path.
+        - Zero intervals and malformed timestamps are retained.
+        - A second janitor pass is safe and finds no duplicate work.
+        """
+        api = MockKubernetesApi()
+        settings = _settings()
+        now = datetime(2026, 7, 21, 12, tzinfo=UTC)
+        expired = _request(name="expired", auto_stop_interval=1)
+        retained = _request(name="retained", auto_stop_interval=0)
+        malformed = _request(name="malformed", auto_stop_interval=1)
+        api.jobs["expired"] = build_job(expired, settings, now=now - timedelta(minutes=2))
+        api.jobs["retained"] = build_job(retained, settings, now=now - timedelta(days=1))
+        api.jobs["malformed"] = build_job(malformed, settings, now=now - timedelta(days=1))
+        _metadata(api.jobs["malformed"])["annotations"]["sandbox.vals.ai/last-activity"] = "not-a-date"
+        backend = KubernetesSandboxBackend(settings, api)
+
+        assert await backend.delete_idle_sandboxes(now) == 1
+        assert await backend.delete_idle_sandboxes(now) == 0
+        assert set(api.jobs) == {"retained", "malformed"}

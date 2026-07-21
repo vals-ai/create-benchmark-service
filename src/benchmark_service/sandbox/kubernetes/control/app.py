@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import asyncio
+import logging
 import secrets
 import uuid
 from collections.abc import AsyncIterator, Mapping
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+from datetime import UTC, datetime
 
 from fastapi import FastAPI, Request, Response, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -28,6 +31,8 @@ from benchmark_service.sandbox.types import (
     SandboxError,
     SandboxNotFoundError,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _request_id(headers: Mapping[str, str]) -> str:
@@ -73,9 +78,22 @@ def create_kubernetes_control_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        async def run_janitor() -> None:
+            while True:
+                await asyncio.sleep(settings.janitor_interval_seconds)
+                try:
+                    await backend.delete_idle_sandboxes(datetime.now(UTC))
+                except Exception:
+                    logger.exception("Kubernetes sandbox janitor failed")
+                    continue
+
+        janitor = asyncio.create_task(run_janitor())
         try:
             yield
         finally:
+            janitor.cancel()
+            with suppress(asyncio.CancelledError):
+                await janitor
             await backend.close()
 
     app = FastAPI(lifespan=lifespan)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator, AsyncIterable
+from datetime import datetime
 
 import httpx
 import pytest
@@ -33,6 +34,7 @@ class RecordingControlBackend:
     def __init__(self) -> None:
         self.operations: list[tuple[str, object]] = []
         self.closed = False
+        self.janitor_calls = 0
 
     async def create_sandbox(self, request: SandboxCreateRequest) -> SandboxRecord:
         self.operations.append(("create", request))
@@ -87,6 +89,11 @@ class RecordingControlBackend:
 
     async def clear_egress_rules(self, instance_id: str) -> None:
         self.operations.append(("clear_egress", instance_id))
+
+    async def delete_idle_sandboxes(self, now: datetime) -> int:
+        del now
+        self.janitor_calls += 1
+        return 0
 
     async def close(self) -> None:
         self.closed = True
@@ -231,3 +238,17 @@ class TestKubernetesControlApp:
         assert error_event["type"] == "error"
         assert error_event["request_id"] == "req-error"
         assert backend.operations[-1][0] == "command"
+
+    async def test_lifespan_cancels_janitor_and_closes_backend(self) -> None:
+        """Stop background cleanup before closing Kubernetes clients.
+
+        Test cases:
+        - App shutdown cancels the janitor and closes the backend once.
+        """
+        backend = RecordingControlBackend()
+        app = create_kubernetes_control_app(_settings(), backend)
+
+        async with app.router.lifespan_context(app):
+            pass
+
+        assert backend.closed is True

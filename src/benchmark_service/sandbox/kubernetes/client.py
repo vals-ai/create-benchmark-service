@@ -14,6 +14,7 @@ from benchmark_service.sandbox.kubernetes.protocol import (
     CommandRequest,
     ControlErrorDetail,
     ControlErrorResponse,
+    EgressRequest,
     ExecResponse,
     SandboxListPage,
     SandboxRecord,
@@ -239,6 +240,52 @@ class KubernetesControlClientDriver(KubernetesRuntimeDriver):
             raise SandboxConnectionError(str(error)) from error
         if terminal_error is not None:
             raise terminal_error
+
+    async def upload_file(self, instance_id: str, remote_path: str, content: bytes) -> None:
+        await self._request(
+            "PUT",
+            f"/v1/sandboxes/{quote(instance_id, safe='')}/files",
+            retryable=False,
+            params={"path": remote_path},
+            content=content,
+        )
+
+    async def download_file(self, instance_id: str, remote_path: str) -> bytes:
+        return b"".join([chunk async for chunk in self.stream_download(instance_id, remote_path)])
+
+    async def stream_download(
+        self,
+        instance_id: str,
+        remote_path: str,
+    ) -> AsyncGenerator[bytes, None]:
+        try:
+            async with self._client.stream(
+                "GET",
+                self._url(f"/v1/sandboxes/{quote(instance_id, safe='')}/files"),
+                params={"path": remote_path},
+            ) as response:
+                self._raise_for_response(response)
+                async for chunk in response.aiter_bytes():
+                    if chunk:
+                        yield chunk
+        except httpx.TransportError as error:
+            raise SandboxConnectionError(str(error)) from error
+
+    async def modify_egress_rules(self, instance_id: str, allowed_addresses: list[str]) -> None:
+        await self._request(
+            "PUT",
+            f"/v1/sandboxes/{quote(instance_id, safe='')}/egress",
+            retryable=False,
+            json=EgressRequest(allowed_addresses=allowed_addresses).model_dump(mode="json"),
+        )
+
+    async def clear_egress_rules(self, instance_id: str) -> None:
+        await self._request(
+            "DELETE",
+            f"/v1/sandboxes/{quote(instance_id, safe='')}/egress",
+            retryable=False,
+            not_found_ok=True,
+        )
 
     async def close(self) -> None:
         await self._client.aclose()

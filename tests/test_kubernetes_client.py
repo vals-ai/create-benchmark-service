@@ -272,5 +272,81 @@ class TestKubernetesControlClientCommands:
         ]
 
 
+class DelayedByteStream(httpx.AsyncByteStream):
+    """Yield two chunks with a caller-controlled boundary."""
+
+    def __init__(self, release_second_chunk: asyncio.Event) -> None:
+        self.release_second_chunk = release_second_chunk
+
+    async def __aiter__(self) -> AsyncGenerator[bytes, None]:
+        yield b"first"
+        await self.release_second_chunk.wait()
+        yield b"second"
+
+
+class TestKubernetesControlClientFilesAndEgress:
+    """File and egress behavior for the private control API client."""
+
+    async def test_streams_files_and_replaces_temporary_egress_rules(self) -> None:
+        """Preserve binary files and temporary egress semantics.
+
+        Test cases:
+        - Streaming download yields before the response is complete.
+        - Buffered download joins the same chunks and upload preserves arbitrary bytes.
+        - Egress replacement sends the allowlist and clear restores unrestricted access.
+        """
+        release_second_chunk = asyncio.Event()
+        observed_uploads: list[tuple[str, bytes]] = []
+        observed_egress: list[list[str]] = []
+        clear_calls = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal clear_calls
+            assert request.headers["Authorization"] == "Bearer test-token"
+            if request.url.path.endswith("files"):
+                assert request.url.params["path"] == "/workspace/data.bin"
+            if request.method == "GET":
+                return httpx.Response(200, stream=DelayedByteStream(release_second_chunk))
+            if request.method == "PUT" and request.url.path.endswith("files"):
+                observed_uploads.append((request.url.params["path"], await request.aread()))
+                return httpx.Response(204)
+            if request.method == "PUT":
+                observed_egress.append(json.loads(await request.aread())["allowed_addresses"])
+                return httpx.Response(204)
+            if request.method == "DELETE":
+                clear_calls += 1
+                return httpx.Response(204)
+            raise AssertionError(f"Unexpected request: {request.method} {request.url}")
+
+        driver = KubernetesControlClientDriver(
+            api_url="https://sandbox.internal",
+            api_token="test-token",
+            transport=httpx.MockTransport(handler),
+        )
+        allowed_addresses = ["api.example.com", "10.0.0.0/8"]
+        try:
+            stream = driver.stream_download("sandbox-1", "/workspace/data.bin")
+            assert await anext(stream) == b"first"
+            pending_chunk = asyncio.create_task(anext(stream))
+            await asyncio.sleep(0)
+            assert pending_chunk.done() is False
+            release_second_chunk.set()
+            assert await pending_chunk == b"second"
+            with pytest.raises(StopAsyncIteration):
+                await anext(stream)
+
+            downloaded = await driver.download_file("sandbox-1", "/workspace/data.bin")
+            await driver.upload_file("sandbox-1", "/workspace/data.bin", b"\x00\xffpayload")
+            await driver.modify_egress_rules("sandbox-1", allowed_addresses)
+            await driver.clear_egress_rules("sandbox-1")
+        finally:
+            await driver.close()
+
+        assert downloaded == b"firstsecond"
+        assert observed_uploads == [("/workspace/data.bin", b"\x00\xffpayload")]
+        assert observed_egress == [allowed_addresses]
+        assert clear_calls == 1
+
+
 def driver_record(instance_id: str) -> SandboxRecord:
     return SandboxRecord(id=instance_id, name="task-1", state="running")

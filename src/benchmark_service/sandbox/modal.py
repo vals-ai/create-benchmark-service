@@ -343,7 +343,7 @@ class ModalSandboxProvider(SandboxProvider):
             "memory": request.resources.memory * 1024,
             "gpu": gpu,
             "idle_timeout": request.auto_stop_interval * 60 if request.auto_stop_interval else None,
-            "timeout": _MAX_LIFETIME_SECONDS,
+            "timeout": request.ttl_minutes * 60 if request.ttl_minutes else _MAX_LIFETIME_SECONDS,
             "block_network": False,
             "outbound_cidr_allowlist": list(_ALLOW_ALL_CIDRS),
             "outbound_domain_allowlist": list(_ALLOW_ALL_DOMAINS),

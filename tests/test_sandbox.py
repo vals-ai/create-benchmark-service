@@ -1261,6 +1261,27 @@ async def test_daytona_provider_rejects_gpu_for_snapshot_source() -> None:
         )
 
 
+async def test_daytona_provider_passes_ttl_minutes() -> None:
+    inner = InnerSandbox()
+    daytona = CapturingCreateDaytonaClient(inner)
+    request = _request(inner.name).model_copy(update={"ttl_minutes": 90})
+
+    await _provider(daytona).create_sandbox(request)
+
+    assert daytona.create_params is not None
+    assert daytona.create_params.ttl_minutes == 90
+
+
+async def test_daytona_provider_omits_ttl_by_default() -> None:
+    inner = InnerSandbox()
+    daytona = CapturingCreateDaytonaClient(inner)
+
+    await _provider(daytona).create_sandbox(_request(inner.name))
+
+    assert daytona.create_params is not None
+    assert daytona.create_params.ttl_minutes is None
+
+
 def test_resources_gpu_type_requires_gpu_count() -> None:
     with pytest.raises(ValueError, match="gpu_type requires gpu >= 1"):
         Resources(vcpu=2, memory=4, disk=10, gpu_type="H100")

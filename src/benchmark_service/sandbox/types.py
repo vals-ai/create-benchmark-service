@@ -67,6 +67,11 @@ class SandboxCreateRequest(BaseModel):
     env_vars: dict[str, str]
     auto_stop_interval: int
     create_timeout: int
+    ttl_minutes: int | None = Field(
+        default=None,
+        ge=0,
+        description="Wall-clock TTL in minutes after which the sandbox is destroyed regardless of state; None leaves the provider default, 0 disables",
+    )
 
 
 class SandboxQuery(BaseModel):
@@ -117,6 +122,11 @@ class Sandbox(ABC):
     @property
     @abstractmethod
     def state(self) -> str: ...
+
+    @property
+    def auto_destroy_at(self) -> str | None:
+        """When the sandbox will be destroyed by its TTL, if the provider supports one."""
+        return None
 
     @abstractmethod
     async def exec(

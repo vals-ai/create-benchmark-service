@@ -273,6 +273,10 @@ class DaytonaSandbox(Sandbox):
         return str(self._sandbox.state)
 
     @property
+    def auto_destroy_at(self) -> str | None:
+        return self._sandbox.auto_destroy_at
+
+    @property
     def _sandbox_ref(self) -> str:
         return f"name={self.name}, id={self.id}"
 
@@ -546,6 +550,7 @@ class DaytonaSandboxProvider(SandboxProvider):
             case ImageSource(image=image):
                 params = CreateSandboxFromImageParams(
                     auto_stop_interval=request.auto_stop_interval,
+                    ttl_minutes=request.ttl_minutes,
                     auto_delete_interval=0,
                     name=request.name,
                     labels=request.labels,
@@ -559,6 +564,7 @@ class DaytonaSandboxProvider(SandboxProvider):
                     raise SandboxError("Daytona snapshot sandboxes use the snapshot's resources; GPUs cannot be requested")
                 params = CreateSandboxFromSnapshotParams(
                     auto_stop_interval=request.auto_stop_interval,
+                    ttl_minutes=request.ttl_minutes,
                     auto_delete_interval=0,
                     name=request.name,
                     labels=request.labels,

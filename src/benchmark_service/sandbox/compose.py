@@ -33,6 +33,10 @@ class ComposeSandbox(Sandbox):
     def state(self) -> str:
         return self._outer.state
 
+    @property
+    def auto_destroy_at(self) -> str | None:
+        return self._outer.auto_destroy_at
+
     def _compose_command(self, parts: list[str]) -> str:
         return f"{self._compose_command_prefix} {shlex.join(parts)}"
 

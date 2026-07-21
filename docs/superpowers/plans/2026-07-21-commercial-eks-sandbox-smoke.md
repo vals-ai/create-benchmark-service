@@ -102,10 +102,13 @@ RUN groupadd --gid 10001 sandbox-control \
     && useradd --uid 10001 --gid 10001 --create-home sandbox-control
 
 WORKDIR /app
-COPY pyproject.toml uv.lock README.md ./
+COPY pyproject.toml uv.lock README.md .python-version Makefile ./
 COPY src ./src
 COPY cli ./cli
-RUN uv sync --frozen --no-dev --no-editable
+COPY templates ./templates
+RUN mkdir .github
+ARG PACKAGE_VERSION=0.0.0
+RUN SETUPTOOLS_SCM_PRETEND_VERSION="${PACKAGE_VERSION}" uv sync --frozen --no-dev --no-editable
 
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -121,7 +124,11 @@ CMD ["kubernetes-sandbox-control"]
 Run:
 
 ```bash
-docker build -f infra/kubernetes/Dockerfile.control -t kubernetes-sandbox-control:test .
+docker build \
+  -f infra/kubernetes/Dockerfile.control \
+  --build-arg PACKAGE_VERSION="0.0.0+$(git rev-parse --short=12 HEAD)" \
+  -t kubernetes-sandbox-control:test \
+  .
 docker image inspect kubernetes-sandbox-control:test --format '{{.Config.User}} {{json .Config.Cmd}}'
 docker run --rm --entrypoint python kubernetes-sandbox-control:test -c 'import benchmark_service.sandbox.kubernetes.control.main'
 ```

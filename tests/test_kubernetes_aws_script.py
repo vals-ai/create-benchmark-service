@@ -126,6 +126,10 @@ case "$command_name" in
       shift 2
       exec "$REAL_PYTHON" "$@"
     fi
+    if [[ "$*" == *"test_kubernetes_control_service.py"* ]]; then
+      [[ "${TEST_KUBERNETES_COMPOSE_IMAGE:-}" == 123456789012.dkr.ecr.us-east-2.amazonaws.com/test/sandbox-images@sha256:*2 ]]
+      printf 'compose-image-env pytest\n' >> "$RECORD_PATH"
+    fi
     if [[ "${SHIM_UV_FAIL:-0}" == "1" && "$*" == *"pytest"* ]]; then
       exit 1
     fi
@@ -194,9 +198,11 @@ esac
     try:
         foundation_variables = FOUNDATION_VARIABLES_PATH.read_text()
         foundation_main = FOUNDATION_MAIN_PATH.read_text()
+        orchestration_script = SCRIPT_PATH.read_text()
         assert 'variable "aws_account_id"' in foundation_variables
         assert "allowed_account_ids = [var.aws_account_id]" in foundation_main
         assert "node.cilium.io/agent-not-ready" not in foundation_main
+        assert 'export TEST_KUBERNETES_COMPOSE_IMAGE="$docker_image"' in orchestration_script
 
         for env_updates, expected_error in preflight_cases:
             record_path.write_text("")
@@ -335,6 +341,7 @@ esac
 
         assert test_result.returncode != 0
         failed_test_commands = record_path.read_text().splitlines()[before_test:]
+        assert "compose-image-env pytest" in failed_test_commands
         assert not any(" destroy " in f" {command} " for command in failed_test_commands)
 
         before_destroy = len(record_path.read_text().splitlines())

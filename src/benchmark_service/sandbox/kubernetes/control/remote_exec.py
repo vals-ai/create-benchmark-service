@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import binascii
-import shlex
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterable
 from typing import Any, Protocol, cast
@@ -184,12 +183,22 @@ class KubernetesRemoteExec:
 
     async def terminate(self, pod_name: str, command_id: str) -> None:
         session: RemoteExecSession | None = None
-        command_pattern = f"[{command_id[0]}]{command_id[1:]}"
+        pid_file = f"/tmp/{command_id}.pid"
+        shell_command = (
+            "terminate_tree() { "
+            'target_pid="$1"; child_pids=""; '
+            'if [ -r "/proc/$target_pid/task/$target_pid/children" ]; then '
+            'read -r child_pids < "/proc/$target_pid/task/$target_pid/children" || true; fi; '
+            'for child_pid in $child_pids; do terminate_tree "$child_pid"; done; '
+            'kill -TERM "$target_pid" 2>/dev/null || true; }; '
+            f"if read -r command_pid < {pid_file} && [ \"$command_pid\" -gt 1 ] 2>/dev/null; then "
+            'terminate_tree "$command_pid"; fi'
+        )
         try:
             async with asyncio.timeout(10):
                 session = await self.open(
                     pod_name,
-                    ["sh", "-lc", f"pkill -TERM -f {shlex.quote(command_pattern)} 2>/dev/null || true"],
+                    ["sh", "-lc", shell_command],
                 )
                 while session.is_open():
                     await session.update(0.1)

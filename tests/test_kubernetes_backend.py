@@ -462,12 +462,12 @@ class TestKubernetesRemoteExec:
         assert request_context.websocket.sent == [b"\x00input"]
         assert request_context.exited == 1
 
-    async def test_termination_pattern_does_not_match_cleanup_shell(self) -> None:
-        """Keep the cleanup command from terminating its own remote exec shell.
+    async def test_termination_uses_pid_file_and_shell_builtins(self) -> None:
+        """Terminate the recorded process tree without image-specific tools.
 
         Test cases:
-        - The process pattern still matches the sandbox command identifier.
-        - The literal identifier is absent from the cleanup shell command.
+        - The cleanup command reads the command-specific PID file.
+        - Descendants are walked through procfs without relying on pkill.
         """
         command_id = "sandbox-command-abc123"
         session = MockRemoteExecSession([(b"", b"", 0)])
@@ -476,8 +476,10 @@ class TestKubernetesRemoteExec:
         await remote_exec.terminate("task-1-pod", command_id)
 
         shell_command = remote_exec.commands[0][-1]
-        assert "[s]andbox-command-abc123" in shell_command
-        assert command_id not in shell_command
+        assert "/tmp/sandbox-command-abc123.pid" in shell_command
+        assert "/proc/$target_pid/task/$target_pid/children" in shell_command
+        assert "kill -TERM" in shell_command
+        assert "pkill" not in shell_command
 
 
 class TestKubernetesSandboxBackendStreaming:
@@ -527,6 +529,8 @@ class TestKubernetesSandboxBackendStreaming:
         assert "cd '/workspace/a b'" in shell_command
         assert "SECRET='value; $(false)'" in shell_command
         assert "timeout 3" in shell_command
+        assert "SANDBOX_COMMAND_PID_FILE=/tmp/sandbox-command-" in shell_command
+        assert "printf '%s\\n' \"$$\" > \"$SANDBOX_COMMAND_PID_FILE\"" in shell_command
         assert command_session.closed is True
 
         limited_remote = MockRemoteExec()

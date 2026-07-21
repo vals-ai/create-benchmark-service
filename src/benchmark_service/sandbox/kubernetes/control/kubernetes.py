@@ -349,6 +349,7 @@ class KubernetesSandboxBackend:
     def _shell_command(self, request: CommandRequest, command_id: str) -> str:
         env = validate_command_env(request.env_vars)
         command = request.command
+        pid_file = f"/tmp/{command_id}.pid"
         if request.timeout is not None:
             command = f"timeout {request.timeout:g} sh -lc {shlex.quote(command)}"
         if env:
@@ -358,7 +359,10 @@ class KubernetesSandboxBackend:
             command = f"cd {shlex.quote(request.cwd)} && {command}"
         return (
             f"SANDBOX_COMMAND_ID={shlex.quote(command_id)}; export SANDBOX_COMMAND_ID; "
-            "trap 'pkill -TERM -P $$ 2>/dev/null || true' TERM INT; "
+            f"SANDBOX_COMMAND_PID_FILE={shlex.quote(pid_file)}; "
+            "printf '%s\\n' \"$$\" > \"$SANDBOX_COMMAND_PID_FILE\"; "
+            "trap 'exit 143' TERM INT; "
+            "trap 'rm -f \"$SANDBOX_COMMAND_PID_FILE\"' EXIT; "
             f"{command}"
         )
 

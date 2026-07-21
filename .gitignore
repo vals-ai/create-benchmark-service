@@ -9,4 +9,7 @@ __pycache__/
 # Environment variables
 .env
 
+# Local agent execution state
+.superpowers/
+
 src/benchmark_service/_version.py

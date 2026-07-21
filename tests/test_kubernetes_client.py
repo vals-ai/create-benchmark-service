@@ -257,6 +257,7 @@ class TestKubernetesControlClientCommands:
 
         Test cases:
         - WebSocket stdout and stderr events are yielded in order before exit.
+        - Closing a command stream early closes its WebSocket without leaking GeneratorExit.
         - A nonzero exit becomes the shared command error.
         - Buffered exec sends all supported request fields without retries.
         """
@@ -301,6 +302,11 @@ class TestKubernetesControlClientCommands:
                 )
                 assert await anext(chunks) == "hel"
                 assert await anext(chunks) == "lo"
+
+                cancelled = sandbox.command("sleep 60")
+                assert await anext(cancelled) == "hel"
+                await cancelled.aclose()
+
                 release_exit.set()
                 with pytest.raises(StopAsyncIteration):
                     await anext(chunks)
@@ -317,6 +323,7 @@ class TestKubernetesControlClientCommands:
         assert result == ExecResult(exit_code=0, output="done")
         assert observed_payloads == [
             {"command": "printf hello", "cwd": "/workspace", "timeout": 3.0, "env_vars": {"FOO": "bar"}},
+            {"command": "sleep 60", "cwd": None, "timeout": None, "env_vars": None},
             {"command": "false", "cwd": None, "timeout": None, "env_vars": None},
             {"command": "echo done", "cwd": "/workspace", "timeout": 5.0, "env_vars": None},
         ]

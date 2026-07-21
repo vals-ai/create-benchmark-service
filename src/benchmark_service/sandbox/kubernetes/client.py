@@ -216,7 +216,9 @@ class KubernetesControlClientDriver(KubernetesRuntimeDriver):
         path = f"/v1/sandboxes/{quote(instance_id, safe='')}/command"
         terminal_error: SandboxError | None = None
         try:
-            async with aconnect_ws(self._ws_url(path), client=self._client) as websocket:
+            connection = aconnect_ws(self._ws_url(path), client=self._client)
+            websocket = await connection.__aenter__()
+            try:
                 await websocket.send_json(request.model_dump(mode="json"))
                 while True:
                     event = command_event_adapter.validate_python(await websocket.receive_json())
@@ -235,6 +237,8 @@ class KubernetesControlClientDriver(KubernetesRuntimeDriver):
                             )
                         )
                         break
+            finally:
+                await connection.__aexit__(None, None, None)
         except WebSocketUpgradeError as error:
             self._raise_for_response(error.response)
             raise SandboxConnectionError("WebSocket upgrade failed") from error

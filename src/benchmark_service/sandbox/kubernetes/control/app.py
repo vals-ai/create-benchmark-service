@@ -13,6 +13,7 @@ from fastapi import FastAPI, Request, Response, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import ValidationError
 from starlette.middleware.base import RequestResponseEndpoint
+from starlette.websockets import WebSocketDisconnect
 
 from benchmark_service.sandbox.kubernetes.control.backend import (
     SandboxConflictError,
@@ -236,6 +237,14 @@ def create_kubernetes_control_app(
         return Response(status_code=204)
 
     async def command(websocket: WebSocket, instance_id: str) -> None:
+        async def forward_events(payload: CommandRequest) -> None:
+            async for event in backend.command(instance_id, payload):
+                await websocket.send_json(event.model_dump(mode="json"))
+
+        async def wait_for_disconnect() -> None:
+            while (await websocket.receive())["type"] != "websocket.disconnect":
+                pass
+
         request_id = _request_id(websocket.headers)
         if not _authorized(websocket.headers.get("authorization"), settings.api_token):
             await websocket.close(code=1008, reason="Authentication required")
@@ -243,8 +252,19 @@ def create_kubernetes_control_app(
         await websocket.accept(headers=[(b"x-request-id", request_id.encode())])
         try:
             payload = CommandRequest.model_validate(await websocket.receive_json())
-            async for event in backend.command(instance_id, payload):
-                await websocket.send_json(event.model_dump(mode="json"))
+            event_task = asyncio.create_task(forward_events(payload))
+            disconnect_task = asyncio.create_task(wait_for_disconnect())
+            tasks = (event_task, disconnect_task)
+            try:
+                completed, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in completed:
+                    task.result()
+            finally:
+                for task in tasks:
+                    task.cancel()
+                await asyncio.gather(*tasks, return_exceptions=True)
+        except WebSocketDisconnect:
+            pass
         except (SandboxError, ValidationError) as error:
             if isinstance(error, SandboxError):
                 _, detail = _error_detail(error, request_id)
@@ -262,7 +282,8 @@ def create_kubernetes_control_app(
             )
             await websocket.send_json(event.model_dump(mode="json"))
         finally:
-            await websocket.close()
+            with suppress(RuntimeError):
+                await websocket.close()
 
     app.add_api_route("/health", health, methods=["GET"])
     app.add_api_route("/v1/sandboxes", create, methods=["POST"])

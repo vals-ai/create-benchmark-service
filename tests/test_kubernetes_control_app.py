@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncGenerator, AsyncIterable
 from datetime import datetime
 
@@ -35,6 +36,7 @@ class RecordingControlBackend:
         self.operations: list[tuple[str, object]] = []
         self.closed = False
         self.janitor_calls = 0
+        self.command_closed = asyncio.Event()
 
     async def create_sandbox(self, request: SandboxCreateRequest) -> SandboxRecord:
         self.operations.append(("create", request))
@@ -66,6 +68,13 @@ class RecordingControlBackend:
         request: CommandRequest,
     ) -> AsyncGenerator[CommandEvent, None]:
         self.operations.append(("command", (instance_id, request)))
+        if request.command == "sleep 60":
+            try:
+                yield CommandOutputEvent(type="stdout", data="started")
+                await asyncio.Event().wait()
+            finally:
+                self.command_closed.set()
+            return
         yield CommandOutputEvent(type="stdout", data="first")
         yield CommandOutputEvent(type="stderr", data="second")
         yield CommandExitEvent(type="exit", exit_code=0)
@@ -214,6 +223,7 @@ class TestKubernetesControlApp:
         Test cases:
         - Incorrect tokens close before command execution.
         - Valid commands receive stdout, stderr, and exit events in order.
+        - Client disconnect cancels a command producer that is still running.
         """
         backend = RecordingControlBackend()
         app = create_kubernetes_control_app(_settings(), backend)
@@ -234,6 +244,15 @@ class TestKubernetesControlApp:
             ) as websocket:
                 await websocket.send_json({"command": "printf ok"})
                 events = [await websocket.receive_json() for _ in range(3)]
+
+            async with aconnect_ws(
+                "ws://control/v1/sandboxes/sandbox-1/command",
+                client=client,
+                headers={"Authorization": "Bearer test-token"},
+            ) as websocket:
+                await websocket.send_json({"command": "sleep 60"})
+                assert (await websocket.receive_json())["data"] == "started"
+            await asyncio.wait_for(backend.command_closed.wait(), timeout=1)
 
             async with aconnect_ws(
                 "ws://control/v1/sandboxes/sandbox-1/command",

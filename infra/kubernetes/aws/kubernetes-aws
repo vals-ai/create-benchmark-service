@@ -313,6 +313,7 @@ deploy_stack() {
   control_tagged_image="$image_repository_url:$control_tag"
   if ! ecr_image_exists "$repository_name" "$control_tag"; then
     docker build \
+      --platform linux/amd64 \
       -f "$repository_root/infra/kubernetes/Dockerfile.control" \
       --build-arg "PACKAGE_VERSION=0.0.0+$commit_sha" \
       -t "$control_tagged_image" \
@@ -322,7 +323,7 @@ deploy_stack() {
 
   dind_tagged_image="$image_repository_url:$dind_tag"
   if ! ecr_image_exists "$repository_name" "$dind_tag"; then
-    docker pull "$dind_source_image"
+    docker pull --platform linux/amd64 "$dind_source_image"
     docker tag "$dind_source_image" "$dind_tagged_image"
     docker push "$dind_tagged_image"
   fi

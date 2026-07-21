@@ -299,6 +299,10 @@ esac
         )
         assert workload_validation < deploy_foundation_apply
         assert foundation_apply < image_publish < workload_apply < readiness
+        control_build = next(command for command in commands if command.startswith("docker build "))
+        dind_pull = next(command for command in commands if command.startswith("docker pull "))
+        assert "--platform linux/amd64" in control_build
+        assert "--platform linux/amd64" in dind_pull
         assert all("--profile vals-dev" in command for command in commands if command.startswith("aws "))
         assert all("0000000000000000000000000000000000000000000000000000000000000007" not in command for command in commands)
         assert "terraform-token-env plan" in commands

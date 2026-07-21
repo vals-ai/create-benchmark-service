@@ -58,12 +58,12 @@ class KubernetesRuntimeDriver(ABC):
     @abstractmethod
     async def download_file(self, instance_id: str, remote_path: str) -> bytes: ...
 
-    async def stream_download(
+    @abstractmethod
+    def stream_download(
         self,
         instance_id: str,
         remote_path: str,
-    ) -> AsyncGenerator[bytes, None]:
-        yield await self.download_file(instance_id, remote_path)
+    ) -> AsyncGenerator[bytes, None]: ...
 
     @abstractmethod
     async def modify_egress_rules(

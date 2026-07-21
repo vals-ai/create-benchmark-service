@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator, Mapping
 
 from benchmark_service.sandbox.kubernetes.runtime import KubernetesRuntimeDriver
-from benchmark_service.sandbox.types import ExecResult, Sandbox
+from benchmark_service.sandbox.types import ExecResult, Sandbox, validate_command_env
 
 
 class KubernetesSandbox(Sandbox):
@@ -55,12 +55,13 @@ class KubernetesSandbox(Sandbox):
         timeout: float | None = None,
         env_vars: Mapping[str, str] | None = None,
     ) -> AsyncGenerator[str, None]:
+        env = validate_command_env(env_vars) if env_vars is not None else None
         return self._driver.command(
             self.id,
             command,
             cwd=cwd,
             timeout=timeout,
-            env_vars=env_vars,
+            env_vars=env,
         )
 
     async def upload_file(self, remote_path: str, content: bytes) -> None:

@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Mapping
 
+import pytest
+
 from benchmark_service.sandbox.kubernetes import (
     KubernetesRuntimeDriver,
     KubernetesSandbox,
@@ -44,6 +46,7 @@ class MockKubernetesRuntimeDriver(KubernetesRuntimeDriver):
         ] = []
         self.uploaded_files: list[tuple[str, str, bytes]] = []
         self.downloaded_files: list[tuple[str, str]] = []
+        self.streamed_files: list[tuple[str, str]] = []
         self.egress_changes: list[tuple[str, list[str]]] = []
         self.cleared_egress: list[str] = []
         self.closed = False
@@ -102,6 +105,15 @@ class MockKubernetesRuntimeDriver(KubernetesRuntimeDriver):
         self.downloaded_files.append((instance_id, remote_path))
 
         return b"artifact"
+
+    async def stream_download(
+        self,
+        instance_id: str,
+        remote_path: str,
+    ) -> AsyncGenerator[bytes, None]:
+        self.streamed_files.append((instance_id, remote_path))
+        yield b"first"
+        yield b"second"
 
     async def modify_egress_rules(
         self,
@@ -165,6 +177,30 @@ class TestKubernetesSandboxProvider:
 class TestKubernetesSandbox:
     """Sandbox operations delegated through the Kubernetes runtime driver."""
 
+    def test_requires_runtime_download_stream(self) -> None:
+        """Require runtime drivers to provide genuine download streaming.
+
+        Test cases:
+        - The runtime contract marks stream_download as abstract.
+        """
+        assert "stream_download" in KubernetesRuntimeDriver.__abstractmethods__
+
+    async def test_rejects_invalid_command_environment(self) -> None:
+        """Reject unsafe command environments before contacting the runtime.
+
+        Test cases:
+        - Invalid shell variable names are rejected.
+        - Reserved terminal variables are rejected.
+        """
+        driver = MockKubernetesRuntimeDriver()
+
+        cases = [({"BAD-NAME": "x"}, "Invalid"), ({"TERM": "x"}, "Reserved")]
+        for env_vars, message in cases:
+            with pytest.raises(ValueError, match=message):
+                _ = [chunk async for chunk in driver.sandbox.command("true", env_vars=env_vars)]
+
+        assert driver.streamed_commands == []
+
     async def test_delegates_commands_files_and_egress_to_runtime(self) -> None:
         """The sandbox must expose the complete shared operation surface.
 
@@ -202,7 +238,7 @@ class TestKubernetesSandbox:
         assert exec_result == ExecResult(exit_code=0, output="command output")
         assert command_chunks == ["first chunk", "second chunk"]
         assert downloaded_content == b"artifact"
-        assert streamed_content == [b"artifact"]
+        assert streamed_content == [b"first", b"second"]
         assert driver.executed_commands == [
             ("sandbox-1", "python main.py", "/workspace", 30)
         ]
@@ -212,9 +248,7 @@ class TestKubernetesSandbox:
         assert driver.uploaded_files == [
             ("sandbox-1", "/workspace/input.txt", b"input")
         ]
-        assert driver.downloaded_files == [
-            ("sandbox-1", "/workspace/output.txt"),
-            ("sandbox-1", "/workspace/archive.tar"),
-        ]
+        assert driver.downloaded_files == [("sandbox-1", "/workspace/output.txt")]
+        assert driver.streamed_files == [("sandbox-1", "/workspace/archive.tar")]
         assert driver.egress_changes == [("sandbox-1", allowed_addresses)]
         assert driver.cleared_egress == ["sandbox-1"]

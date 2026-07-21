@@ -93,6 +93,7 @@ plan_foundation() {
   terraform -chdir="$foundation_root" plan \
     -state="$foundation_state" \
     -out="$foundation_plan" \
+    -var="aws_account_id=$AWS_ACCOUNT_ID" \
     -var="aws_profile=vals-dev" \
     -var="aws_region=$aws_region" \
     -var="deployment_name=$deployment_name" \
@@ -166,6 +167,7 @@ write_foundation_runtime_file() {
   umask 077
   write_foundation_runtime_contents > "$runtime_file"
   chmod 600 "$runtime_file"
+  runtime_phase="foundation"
 }
 
 transition_to_foundation_runtime() {
@@ -287,13 +289,19 @@ deploy_stack() {
     "TEST_KUBERNETES_IMAGE must be a sha256 digest reference."
   initialize_and_validate_roots
 
+  cluster_name="$deployment_name-eks"
+  image_repository_url="$AWS_ACCOUNT_ID.dkr.ecr.$aws_region.amazonaws.com/$deployment_name/sandbox-images"
+  write_foundation_runtime_file
+
   terraform -chdir="$foundation_root" apply \
     -state="$foundation_state" \
     "$foundation_plan"
 
   cluster_name="$(terraform -chdir="$foundation_root" output -state="$foundation_state" -raw cluster_name)"
   image_repository_url="$(terraform -chdir="$foundation_root" output -state="$foundation_state" -raw image_repository_url)"
-  write_foundation_runtime_file
+  if [[ "$runtime_phase" == "foundation" ]]; then
+    write_foundation_runtime_file
+  fi
   repository_name="${image_repository_url#*/}"
   registry_host="${image_repository_url%%/*}"
 
@@ -380,6 +388,7 @@ run_live_test() {
 
   for attempt in $(seq 1 30); do
     if curl --fail --silent --show-error http://127.0.0.1:8080/health >/dev/null; then
+      kill -0 "$port_forward_pid" 2>/dev/null || fail "The kubectl port-forward process exited."
       break
     fi
     if [[ "$attempt" == "30" ]]; then
@@ -423,7 +432,8 @@ destroy_stack() {
     transition_to_foundation_runtime
   fi
 
-  TF_VAR_aws_profile="vals-dev" \
+  TF_VAR_aws_account_id="$AWS_ACCOUNT_ID" \
+    TF_VAR_aws_profile="vals-dev" \
     TF_VAR_aws_region="$aws_region" \
     TF_VAR_deployment_name="$deployment_name" \
     TF_VAR_operator_cidr="$operator_cidr" \

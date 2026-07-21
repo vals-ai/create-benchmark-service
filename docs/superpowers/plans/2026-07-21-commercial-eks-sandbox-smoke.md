@@ -12,7 +12,7 @@
 
 - Provision only the commercial `aws` partition in the first smoke; reject GovCloud and China partitions in preflight.
 - Require `AWS_PROFILE=vals-dev`; reject every other profile and pass `vals-dev` explicitly to AWS CLI, Terraform, and EKS token commands.
-- Require `AWS_ACCOUNT_ID` and compare it with `aws sts get-caller-identity` before plan, apply, test, or destroy.
+- Require `AWS_ACCOUNT_ID`, compare it with `aws sts get-caller-identity` before plan, apply, test, or destroy, and bind the foundation provider with `allowed_account_ids`.
 - Default to `us-east-2`, EKS 1.35, one `m6i.xlarge` on-demand managed node, and one NAT gateway; expose all as Terraform variables.
 - Enable private EKS API access and limit public EKS API access to the required `AWS_OPERATOR_CIDR` value.
 - Keep the control service as `ClusterIP`; use `kubectl port-forward` for the smoke.
@@ -154,7 +154,7 @@ git push origin jf/test-kubernetes
 - Modify: `.gitignore`
 
 **Interfaces:**
-- Consumes: `aws_profile`, `aws_region`, `deployment_name`, `operator_cidr`, `kubernetes_version`, `node_instance_types`, and common tags.
+- Consumes: `aws_account_id`, `aws_profile`, `aws_region`, `deployment_name`, `operator_cidr`, `kubernetes_version`, `node_instance_types`, and common tags.
 - Produces: `cluster_name`, `cluster_endpoint`, `cluster_certificate_authority_data`, `image_repository_url`, `aws_region`, and `deployment_tags`.
 
 - [ ] **Step 1: Establish the validation failure**
@@ -190,6 +190,14 @@ variable "aws_profile" {
   }
 }
 
+variable "aws_account_id" {
+  type = string
+  validation {
+    condition     = can(regex("^[0-9]{12}$", var.aws_account_id))
+    error_message = "aws_account_id must be a 12-digit account ID."
+  }
+}
+
 variable "deployment_name" {
   type    = string
   default = "cbs-kubernetes-smoke"
@@ -218,7 +226,7 @@ variable "node_instance_types" {
 }
 ```
 
-Configure the AWS provider with `profile = var.aws_profile` and `region = var.aws_region`. Create locals for the cluster name and the three mandatory tags. Do not accept caller overrides for those mandatory tag keys.
+Configure the AWS provider with `profile = var.aws_profile`, `region = var.aws_region`, and `allowed_account_ids = [var.aws_account_id]`. Create locals for the cluster name and the three mandatory tags. Do not accept caller overrides for those mandatory tag keys.
 
 - [ ] **Step 4: Build the disposable VPC, EKS cluster, and ECR repository**
 
@@ -430,9 +438,13 @@ Add one table-driven pytest test with local executable shims. It must prove:
 
 - missing `AWS_ACCOUNT_ID` and `AWS_OPERATOR_CIDR` fail before Terraform;
 - an absent profile or any `AWS_PROFILE` other than `vals-dev` fails before AWS or Terraform;
+- a traversal-shaped deployment name and operator CIDR broader than `/24` fail before AWS or Terraform;
 - a returned partition other than `aws` is rejected;
 - an account mismatch fails and prints both expected and actual IDs;
+- the foundation plan and destroy bind Terraform to the validated account ID;
+- a failed foundation apply leaves deterministic recovery metadata that can destroy the partial state;
 - deploy orders foundation apply, ECR publishing, workload apply, and readiness;
+- a dead port-forward cannot pass the live test through an unrelated listener;
 - test failure does not invoke destroy; and
 - destroy orders workload destroy, namespace verification, foundation destroy, tag verification, then local secret cleanup.
 
@@ -460,7 +472,7 @@ dind_source_image="${DIND_SOURCE_IMAGE:-docker:28.3.3-dind}"
 
 Validate the deployment name with `^[a-z][a-z0-9-]{2,31}$`, the operator CIDR with Python's `ipaddress.IPv4Network`, and the AWS identity using `aws sts get-caller-identity`. Reject any ARN not beginning with `arn:aws:` and any account unequal to `AWS_ACCOUNT_ID`.
 
-Require `AWS_PROFILE` to equal `vals-dev`. Pass `--profile vals-dev` to every AWS CLI command, set the foundation AWS provider profile to `vals-dev`, and set `AWS_PROFILE=vals-dev` in Kubernetes and Helm EKS token exec blocks.
+Require `AWS_PROFILE` to equal `vals-dev`. Pass `--profile vals-dev` to every AWS CLI command, pass `AWS_ACCOUNT_ID` into the foundation `aws_account_id` variable for plan and destroy, set the foundation AWS provider profile to `vals-dev`, and set `AWS_PROFILE=vals-dev` in Kubernetes and Helm EKS token exec blocks.
 
 Use only these state paths after validating `deployment_name`:
 
@@ -472,12 +484,12 @@ infra/kubernetes/aws/.runtime/${deployment_name}/deployment.env
 
 - [ ] **Step 4: Implement plan and deploy**
 
-`plan` must initialize and validate both roots, then create a saved foundation plan using the deployment, region, and operator CIDR. It must report that the workload plan is created after foundation apply because the Kubernetes provider needs a live API endpoint.
+`plan` must initialize and validate both roots, then create a saved foundation plan using the account ID, deployment, region, and operator CIDR. It must report that the workload plan is created after foundation apply because the Kubernetes provider needs a live API endpoint.
 
 `deploy` must:
 
 1. run preflight;
-2. apply the saved foundation plan;
+2. write mode-0600 deterministic foundation recovery metadata, then apply the saved foundation plan;
 3. log in to the output ECR repository;
 4. build the control image with tag `control-$(git rev-parse --short=12 HEAD)` if that tag is absent;
 5. pull `docker:28.3.3-dind`, tag it `dind-28.3.3`, and push it only if absent;
@@ -488,6 +500,7 @@ infra/kubernetes/aws/.runtime/${deployment_name}/deployment.env
 10. wait for Cilium and the control Deployment to become ready.
 
 Never print the API token or include it in a command argument.
+The pre-apply recovery metadata must use `${deployment_name}-eks`, the commercial ECR URL derived from the validated account, region, and deployment, and the validated runtime paths. Preserve an existing workload-phase runtime file so a failed redeploy cannot lose its cleanup token.
 
 - [ ] **Step 5: Implement port-forward, test, and destroy**
 
@@ -498,7 +511,7 @@ kubectl --context "$kube_context" -n benchmark-sandboxes \
   port-forward service/kubernetes-sandbox-control 8080:8080
 ```
 
-`test` must start that port-forward in the background, wait for `/health`, export the local control URL/token and supplied benchmark image, run the live pytest file, and stop only the port-forward on exit. It must not call destroy.
+`test` must start that port-forward in the background, wait for `/health`, confirm the started port-forward process is still alive, export the local control URL/token and supplied benchmark image, run the live pytest file, and stop only the port-forward on exit. It must not call destroy.
 
 `destroy` must:
 

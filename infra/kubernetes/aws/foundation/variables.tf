@@ -13,6 +13,15 @@ variable "aws_profile" {
   }
 }
 
+variable "aws_account_id" {
+  type = string
+
+  validation {
+    condition     = can(regex("^[0-9]{12}$", var.aws_account_id))
+    error_message = "aws_account_id must be a 12-digit account ID."
+  }
+}
+
 variable "deployment_name" {
   type    = string
   default = "cbs-kubernetes-smoke"

@@ -8,12 +8,15 @@ from __future__ import annotations
 import os
 import shutil
 import subprocess
+import sys
 from collections.abc import Mapping
 from pathlib import Path
 
 
 REPOSITORY_ROOT = Path(__file__).parents[1]
 SCRIPT_PATH = REPOSITORY_ROOT / "infra/kubernetes/aws/kubernetes-aws"
+FOUNDATION_MAIN_PATH = REPOSITORY_ROOT / "infra/kubernetes/aws/foundation/main.tf"
+FOUNDATION_VARIABLES_PATH = REPOSITORY_ROOT / "infra/kubernetes/aws/foundation/variables.tf"
 
 
 def test_kubernetes_aws_orchestration(tmp_path: Path) -> None:
@@ -75,6 +78,9 @@ case "$command_name" in
     if [[ "$*" == *" apply "* && -n "$state_path" ]]; then
       : > "$state_path"
     fi
+    if [[ "${SHIM_FOUNDATION_APPLY_FAIL:-0}" == "1" && "$*" == *" apply "*"foundation.tfstate"* ]]; then
+      exit 1
+    fi
     if [[ "$*" == *"workload.tfplan"* && "$*" == *" plan "* ]]; then
       [[ "${TF_VAR_api_token:-}" == "0000000000000000000000000000000000000000000000000000000000000007" ]]
       printf 'terraform-token-env plan\\n' >> "$RECORD_PATH"
@@ -90,6 +96,10 @@ case "$command_name" in
     if [[ "${SHIM_WORKLOAD_DESTROY_FAIL:-0}" == "1" && "$*" == *"destroy"*"workload.tfstate"* ]]; then
       exit 1
     fi
+    if [[ "$*" == *" destroy "*"foundation.tfstate"* ]]; then
+      [[ "${TF_VAR_aws_account_id:-}" == "123456789012" ]]
+      printf 'terraform-account-env destroy\\n' >> "$RECORD_PATH"
+    fi
     ;;
   openssl)
     printf '%064d\\n' 7
@@ -98,6 +108,12 @@ case "$command_name" in
     printf '0123456789ab\\n'
     ;;
   kubectl)
+    if [[ "$*" == *"port-forward service/kubernetes-sandbox-control"* ]]; then
+      if [[ "${SHIM_PORT_FORWARD_DEAD:-0}" == "1" ]]; then
+        exit 1
+      fi
+      while true; do sleep 1; done
+    fi
     if [[ "$*" == *"get namespace benchmark-sandboxes"* ]]; then
       if [[ "${SHIM_NAMESPACE_FAILURE:-0}" == "1" ]]; then
         exit 1
@@ -106,11 +122,18 @@ case "$command_name" in
     fi
     ;;
   uv)
+    if [[ "${1:-}" == "run" && "${2:-}" == "python" ]]; then
+      shift 2
+      exec "$REAL_PYTHON" "$@"
+    fi
     if [[ "${SHIM_UV_FAIL:-0}" == "1" && "$*" == *"pytest"* ]]; then
       exit 1
     fi
     ;;
   curl)
+    if [[ "${SHIM_PORT_FORWARD_DEAD:-0}" == "1" ]]; then
+      sleep 0.1
+    fi
     printf '{"status":"ok"}\\n'
     ;;
   rm)
@@ -131,6 +154,7 @@ esac
         "KUBERNETES_DEPLOYMENT_NAME": "test-orchestration",
         "PATH": f"{executable_dir}{os.pathsep}{os.defpath}",
         "RECORD_PATH": str(record_path),
+        "REAL_PYTHON": sys.executable,
         "TEST_KUBERNETES_IMAGE": (
             "123456789012.dkr.ecr.us-east-2.amazonaws.com/benchmark@"
             f"sha256:{'b' * 64}"
@@ -161,11 +185,18 @@ esac
         ({"AWS_PROFILE": "production"}, "vals-dev"),
         ({"SHIM_ARN": "arn:aws-us-gov:iam::123456789012:user/tester"}, "commercial aws partition"),
         ({"SHIM_ACCOUNT": "210987654321"}, "expected 123456789012, got 210987654321"),
+        ({"AWS_OPERATOR_CIDR": "10.0.0.0/16"}, "no broader than /24"),
+        ({"KUBERNETES_DEPLOYMENT_NAME": "../escape"}, "lowercase DNS label"),
     )
 
     state_dir = REPOSITORY_ROOT / "infra/kubernetes/aws/.state/test-orchestration"
     runtime_dir = REPOSITORY_ROOT / "infra/kubernetes/aws/.runtime/test-orchestration"
     try:
+        foundation_variables = FOUNDATION_VARIABLES_PATH.read_text()
+        foundation_main = FOUNDATION_MAIN_PATH.read_text()
+        assert 'variable "aws_account_id"' in foundation_variables
+        assert "allowed_account_ids = [var.aws_account_id]" in foundation_main
+
         for env_updates, expected_error in preflight_cases:
             record_path.write_text("")
 
@@ -177,6 +208,36 @@ esac
             if "SHIM_ARN" not in env_updates and "SHIM_ACCOUNT" not in env_updates:
                 assert "aws " not in commands
             assert "terraform " not in commands
+
+        record_path.write_text("")
+
+        plan_result = run("plan")
+        plan_commands = record_path.read_text().splitlines()
+        assert any("-var=aws_account_id=123456789012" in command for command in plan_commands)
+
+        interrupted_apply_result = run("deploy", {"SHIM_FOUNDATION_APPLY_FAIL": "1"})
+
+        assert plan_result.returncode == 0, plan_result.stderr
+        assert interrupted_apply_result.returncode != 0
+        foundation_runtime = (runtime_dir / "deployment.env").read_text()
+        assert "runtime_phase=foundation" in foundation_runtime
+        assert "cluster_name=test-orchestration-eks" in foundation_runtime
+        assert (
+            "image_repository_url=123456789012.dkr.ecr.us-east-2.amazonaws.com/"
+            "test-orchestration/sandbox-images"
+        ) in foundation_runtime
+        assert (runtime_dir / "deployment.env").stat().st_mode & 0o777 == 0o600
+
+        before_apply_recovery = len(record_path.read_text().splitlines())
+
+        apply_recovery_result = run("destroy")
+
+        assert apply_recovery_result.returncode == 0, apply_recovery_result.stderr
+        apply_recovery_commands = record_path.read_text().splitlines()[before_apply_recovery:]
+        assert any("destroy" in command and "foundation.tfstate" in command for command in apply_recovery_commands)
+        assert "terraform-account-env destroy" in apply_recovery_commands
+        assert not runtime_dir.exists()
+        assert not state_dir.exists()
 
         record_path.write_text("")
 
@@ -253,6 +314,15 @@ esac
 
         assert interrupted_redeploy_result.returncode != 0
         assert (runtime_dir / "deployment.env").read_text() == preserved_runtime
+
+        before_dead_port_forward = len(record_path.read_text().splitlines())
+
+        dead_port_forward_result = run("test", {"SHIM_PORT_FORWARD_DEAD": "1"})
+
+        assert dead_port_forward_result.returncode != 0
+        dead_port_forward_commands = record_path.read_text().splitlines()[before_dead_port_forward:]
+        assert not any(command.startswith("uv run pytest") for command in dead_port_forward_commands)
+        assert not any(" destroy " in f" {command} " for command in dead_port_forward_commands)
 
         before_test = len(record_path.read_text().splitlines())
 

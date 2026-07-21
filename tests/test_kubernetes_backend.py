@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import base64
+from collections import deque
+from collections.abc import AsyncGenerator
 from typing import Any, cast
 
 import pytest
@@ -9,6 +13,11 @@ import pytest
 from benchmark_service.sandbox.kubernetes.control.api import KubernetesApiError
 from benchmark_service.sandbox.kubernetes.control.backend import SandboxConflictError
 from benchmark_service.sandbox.kubernetes.control.kubernetes import KubernetesSandboxBackend
+from benchmark_service.sandbox.kubernetes.control.remote_exec import (
+    RemoteExecSession,
+    decode_base64_chunks,
+    encode_base64_chunks,
+)
 from benchmark_service.sandbox.kubernetes.control.resources import (
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
@@ -17,12 +26,17 @@ from benchmark_service.sandbox.kubernetes.control.resources import (
 )
 from benchmark_service.sandbox.kubernetes.control.settings import KubernetesControlSettings
 from benchmark_service.sandbox.types import (
-    ImageSource,
-    Resources,
-    SandboxConnectionError,
     SandboxCreateRequest,
     SandboxError,
+    SandboxConnectionError,
+    ImageSource,
+    Resources,
     SandboxNotFoundError,
+)
+from benchmark_service.sandbox.kubernetes.protocol import (
+    CommandExitEvent,
+    CommandOutputEvent,
+    CommandRequest,
 )
 
 DIGEST = "a" * 64
@@ -226,3 +240,219 @@ class TestKubernetesSandboxBackendLifecycle:
 
         await backend.close()
         assert api.closed is True
+
+
+class MockRemoteExecSession:
+    """Emit configured channel frames and record stdin without buffering in production code."""
+
+    def __init__(
+        self,
+        updates: list[tuple[bytes, bytes, int | None]],
+        *,
+        finish_on_stdin_close: bool = False,
+    ) -> None:
+        self.updates = deque(updates)
+        self.stdout: deque[bytes] = deque()
+        self.stderr: deque[bytes] = deque()
+        self.stdin: list[bytes] = []
+        self.finish_on_stdin_close = finish_on_stdin_close
+        self._return_code: int | None = None
+        self.closed = False
+
+    async def read_stdout(self) -> bytes:
+        return self.stdout.popleft() if self.stdout else b""
+
+    async def read_stderr(self) -> bytes:
+        return self.stderr.popleft() if self.stderr else b""
+
+    async def write_stdin(self, data: bytes) -> None:
+        self.stdin.append(data)
+
+    async def close_stdin(self) -> None:
+        if self.finish_on_stdin_close:
+            self.updates.append((b"", b"", 0))
+
+    async def update(self, timeout: float) -> None:
+        del timeout
+        if not self.updates:
+            return
+        stdout, stderr, return_code = self.updates.popleft()
+        if stdout:
+            self.stdout.append(stdout)
+        if stderr:
+            self.stderr.append(stderr)
+        if return_code is not None:
+            self._return_code = return_code
+
+    def is_open(self) -> bool:
+        return bool(self.updates or self.stdout or self.stderr) or self._return_code is None
+
+    @property
+    def return_code(self) -> int | None:
+        return self._return_code
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+class BlockingRemoteExecSession(MockRemoteExecSession):
+    """Hold one exec update until the consumer cancels."""
+
+    def __init__(self) -> None:
+        super().__init__([])
+        self.started = asyncio.Event()
+
+    async def update(self, timeout: float) -> None:
+        del timeout
+        self.started.set()
+        await asyncio.Event().wait()
+
+
+class MockRemoteExec:
+    """Select fake sessions by remote command and record quoted arguments."""
+
+    def __init__(self) -> None:
+        self.command_sessions: deque[MockRemoteExecSession] = deque()
+        self.opened_commands: list[list[str]] = []
+        self.sessions: list[MockRemoteExecSession] = []
+        self.terminated: list[tuple[str, str]] = []
+        self.closed = False
+
+    async def open(
+        self,
+        pod_name: str,
+        command: list[str],
+        *,
+        stdin: bool = False,
+    ) -> RemoteExecSession:
+        del pod_name
+        self.opened_commands.append(command)
+        shell_command = command[-1]
+        if "base64 -d" in shell_command and stdin:
+            session = MockRemoteExecSession([], finish_on_stdin_close=True)
+        elif shell_command.startswith("base64 "):
+            session = MockRemoteExecSession([(b"Zm", b"", None), (b"ly c3Q=\n", b"", 0)])
+        else:
+            session = self.command_sessions.popleft()
+        self.sessions.append(session)
+        return session
+
+    async def terminate(self, pod_name: str, command_id: str) -> None:
+        self.terminated.append((pod_name, command_id))
+
+    async def close(self) -> None:
+        self.closed = True
+
+
+async def _chunks(values: list[bytes]) -> AsyncGenerator[bytes, None]:
+    for value in values:
+        yield value
+
+
+class TestKubernetesSandboxBackendStreaming:
+    """Remote command and file streaming through Kubernetes exec channels."""
+
+    async def test_streams_commands_quotes_inputs_and_caps_buffered_exec(self) -> None:
+        """Stream decoded output while preserving exit, quoting, and output limits.
+
+        Test cases:
+        - Split UTF-8, stderr, and a nonzero exit become ordered command events.
+        - Cwd, timeout, and environment values are shell quoted.
+        - Buffered exec rejects output beyond its configured cap.
+        """
+        api = MockKubernetesApi()
+        request = _request()
+        api.jobs["task-1"] = build_job(request, _settings())
+        api.pods["task-1"] = [_ready_pod("task-1")]
+        remote = MockRemoteExec()
+        command_session = MockRemoteExecSession(
+            [(b"start \xe2", b"", None), (b"\x82\xac", b"warning", None), (b"", b"", 7)]
+        )
+        remote.command_sessions.append(command_session)
+        backend = KubernetesSandboxBackend(_settings(), api, remote)
+
+        events = [
+            event
+            async for event in backend.command(
+                "task-1",
+                CommandRequest(
+                    command="printf ok",
+                    cwd="/workspace/a b",
+                    timeout=3,
+                    env_vars={"SECRET": "value; $(false)"},
+                ),
+            )
+        ]
+
+        output_events = [event for event in events if isinstance(event, CommandOutputEvent)]
+        assert [(event.type, event.data) for event in output_events] == [
+            ("stdout", "start "),
+            ("stdout", "€"),
+            ("stderr", "warning"),
+        ]
+        assert isinstance(events[-1], CommandExitEvent) and events[-1].exit_code == 7
+        shell_command = remote.opened_commands[0][-1]
+        assert "cd '/workspace/a b'" in shell_command
+        assert "SECRET='value; $(false)'" in shell_command
+        assert "timeout 3" in shell_command
+        assert command_session.closed is True
+
+        limited_remote = MockRemoteExec()
+        limited_remote.command_sessions.append(MockRemoteExecSession([(b"12345", b"", 0)]))
+        limited_settings = _settings().model_copy(update={"exec_output_limit_bytes": 4})
+        limited_backend = KubernetesSandboxBackend(limited_settings, api, limited_remote)
+        with pytest.raises(SandboxError, match="exceeded 4 bytes"):
+            await limited_backend.exec("task-1", CommandRequest(command="true"))
+        assert limited_remote.sessions[0].closed is True
+
+        cancelled_remote = MockRemoteExec()
+        blocking_session = BlockingRemoteExecSession()
+        cancelled_remote.command_sessions.append(blocking_session)
+        cancelled_backend = KubernetesSandboxBackend(_settings(), api, cancelled_remote)
+        stream = cancelled_backend.command("task-1", CommandRequest(command="sleep 30"))
+        pending_chunk = asyncio.create_task(anext(stream))
+        await blocking_session.started.wait()
+        pending_chunk.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await pending_chunk
+        assert blocking_session.closed is True
+        assert cancelled_remote.terminated and cancelled_remote.terminated[0][0] == "task-1-pod"
+
+    async def test_streams_base64_files_across_arbitrary_boundaries(self) -> None:
+        """Transfer binary files without joining request or response streams.
+
+        Test cases:
+        - Base64 helpers preserve one-byte, two-byte, whitespace, and quartet splits.
+        - Upload and download quote paths containing shell metacharacters.
+        """
+        content = b"\x00first\xffsecond"
+        encoded = [chunk async for chunk in encode_base64_chunks(_chunks([content[:1], content[1:3], content[3:]]))]
+        decoded = [
+            chunk
+            async for chunk in decode_base64_chunks(
+                _chunks(
+                    [
+                        base64.b64encode(content)[:2],
+                        b" \n" + base64.b64encode(content)[2:5],
+                        base64.b64encode(content)[5:],
+                    ]
+                )
+            )
+        ]
+        assert base64.b64decode("".join(encoded)) == content
+        assert b"".join(decoded) == content
+
+        api = MockKubernetesApi()
+        request = _request()
+        api.jobs["task-1"] = build_job(request, _settings())
+        api.pods["task-1"] = [_ready_pod("task-1")]
+        remote = MockRemoteExec()
+        backend = KubernetesSandboxBackend(_settings(), api, remote)
+        path = "/workspace/a b;$(false).bin"
+
+        await backend.upload_file("task-1", path, _chunks([b"f", b"ir", b"st"]))
+        downloaded = [chunk async for chunk in backend.stream_download("task-1", path)]
+
+        assert base64.b64decode(b"".join(remote.sessions[0].stdin)) == b"first"
+        assert b"".join(downloaded) == b"first"
+        assert all("'/workspace/a b;$(false).bin'" in command[-1] for command in remote.opened_commands)

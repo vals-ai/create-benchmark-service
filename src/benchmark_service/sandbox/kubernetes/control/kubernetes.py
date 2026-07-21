@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import json
+import shlex
 import time
+import uuid
 from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable
 from typing import Any, TypeVar, cast
 
@@ -23,9 +26,17 @@ from benchmark_service.sandbox.kubernetes.control.resources import (
     sandbox_name,
     user_label_key,
 )
+from benchmark_service.sandbox.kubernetes.control.remote_exec import (
+    RemoteExec,
+    RemoteExecSession,
+    decode_base64_chunks,
+    encode_base64_chunks,
+)
 from benchmark_service.sandbox.kubernetes.control.settings import KubernetesControlSettings
 from benchmark_service.sandbox.kubernetes.protocol import (
     CommandEvent,
+    CommandExitEvent,
+    CommandOutputEvent,
     CommandRequest,
     ExecResponse,
     SandboxListPage,
@@ -36,6 +47,7 @@ from benchmark_service.sandbox.types import (
     SandboxCreateRequest,
     SandboxError,
     SandboxNotFoundError,
+    validate_command_env,
 )
 
 Result = TypeVar("Result")
@@ -96,12 +108,14 @@ class KubernetesSandboxBackend:
         self,
         settings: KubernetesControlSettings,
         api: KubernetesApi,
+        remote_exec: RemoteExec | None = None,
         *,
         wait: Callable[[float], Awaitable[None]] = asyncio.sleep,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self.settings = settings
         self.api = api
+        self.remote_exec = remote_exec
         self._wait = wait
         self._monotonic = monotonic
 
@@ -263,16 +277,100 @@ class KubernetesSandboxBackend:
             except SandboxNotFoundError:
                 pass
 
+    def _remote_exec(self) -> RemoteExec:
+        if self.remote_exec is None:
+            raise SandboxError("Kubernetes remote exec is not configured")
+        return self.remote_exec
+
+    async def _ready_pod_name(self, instance_id: str) -> str:
+        resource_name = sandbox_name(instance_id)
+        pods = await self._pods(resource_name)
+        for pod in pods:
+            pod_status = _dict(pod.get("status"))
+            ready = pod_status.get("phase") == "Running" and any(
+                _dict(condition).get("type") == "Ready" and _dict(condition).get("status") == "True"
+                for condition in _list(pod_status.get("conditions"))
+            )
+            if ready:
+                name = _metadata(pod).get("name")
+                if isinstance(name, str) and name:
+                    return name
+        raise SandboxConnectionError(f"Sandbox does not have a ready Pod: {instance_id}")
+
+    def _shell_command(self, request: CommandRequest, command_id: str) -> str:
+        env = validate_command_env(request.env_vars)
+        command = request.command
+        if request.timeout is not None:
+            command = f"timeout {request.timeout:g} sh -lc {shlex.quote(command)}"
+        if env:
+            assignments = " ".join(f"{name}={shlex.quote(value)}" for name, value in sorted(env.items()))
+            command = f"env {assignments} sh -lc {shlex.quote(command)}"
+        if request.cwd:
+            command = f"cd {shlex.quote(request.cwd)} && {command}"
+        return (
+            f"SANDBOX_COMMAND_ID={shlex.quote(command_id)}; export SANDBOX_COMMAND_ID; "
+            "trap 'pkill -TERM -P $$ 2>/dev/null || true' TERM INT; "
+            f"{command}"
+        )
+
+    async def _stream_session(
+        self,
+        session: RemoteExecSession,
+    ) -> AsyncGenerator[CommandEvent, None]:
+        stdout_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        stderr_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        while session.is_open():
+            await session.update(0.1)
+            stdout = await session.read_stdout()
+            stderr = await session.read_stderr()
+            if stdout and (text := stdout_decoder.decode(stdout)):
+                yield CommandOutputEvent(type="stdout", data=text)
+            if stderr and (text := stderr_decoder.decode(stderr)):
+                yield CommandOutputEvent(type="stderr", data=text)
+        if text := stdout_decoder.decode(b"", final=True):
+            yield CommandOutputEvent(type="stdout", data=text)
+        if text := stderr_decoder.decode(b"", final=True):
+            yield CommandOutputEvent(type="stderr", data=text)
+        yield CommandExitEvent(type="exit", exit_code=session.return_code if session.return_code is not None else 1)
+
     async def exec(self, instance_id: str, request: CommandRequest) -> ExecResponse:
-        raise NotImplementedError
+        output: list[str] = []
+        output_size = 0
+        exit_code = 1
+        stream = self.command(instance_id, request)
+        try:
+            async for event in stream:
+                if isinstance(event, CommandOutputEvent):
+                    output_size += len(event.data.encode())
+                    if output_size > self.settings.exec_output_limit_bytes:
+                        raise SandboxError(f"Command output exceeded {self.settings.exec_output_limit_bytes} bytes")
+                    output.append(event.data)
+                elif isinstance(event, CommandExitEvent):
+                    exit_code = event.exit_code
+        finally:
+            await stream.aclose()
+        return ExecResponse(exit_code=exit_code, output="".join(output))
 
     async def command(
         self,
         instance_id: str,
         request: CommandRequest,
     ) -> AsyncGenerator[CommandEvent, None]:
-        raise NotImplementedError
-        yield
+        pod_name = await self._ready_pod_name(instance_id)
+        command_id = f"sandbox-command-{uuid.uuid4().hex}"
+        session = await self._remote_exec().open(
+            pod_name,
+            ["sh", "-lc", self._shell_command(request, command_id)],
+        )
+        try:
+            async for event in self._stream_session(session):
+                yield event
+        except asyncio.CancelledError:
+            await session.close()
+            await self._remote_exec().terminate(pod_name, command_id)
+            raise
+        finally:
+            await session.close()
 
     async def upload_file(
         self,
@@ -280,11 +378,42 @@ class KubernetesSandboxBackend:
         remote_path: str,
         chunks: AsyncIterable[bytes],
     ) -> None:
-        raise NotImplementedError
+        pod_name = await self._ready_pod_name(instance_id)
+        parent = remote_path.rpartition("/")[0] or "."
+        shell_command = f"mkdir -p {shlex.quote(parent)} && base64 -d > {shlex.quote(remote_path)}"
+        session = await self._remote_exec().open(pod_name, ["sh", "-lc", shell_command], stdin=True)
+        try:
+            async for encoded in encode_base64_chunks(chunks):
+                await session.write_stdin(encoded.encode("ascii"))
+            await session.close_stdin()
+            async for event in self._stream_session(session):
+                if isinstance(event, CommandExitEvent) and event.exit_code != 0:
+                    raise SandboxError(f"Could not upload file: {remote_path}")
+        finally:
+            await session.close()
 
     async def stream_download(self, instance_id: str, remote_path: str) -> AsyncGenerator[bytes, None]:
-        raise NotImplementedError
-        yield
+        pod_name = await self._ready_pod_name(instance_id)
+        session = await self._remote_exec().open(
+            pod_name,
+            ["sh", "-lc", f"base64 {shlex.quote(remote_path)}"],
+        )
+
+        async def encoded_chunks() -> AsyncGenerator[bytes, None]:
+            while session.is_open():
+                await session.update(0.1)
+                if stdout := await session.read_stdout():
+                    yield stdout
+                if stderr := await session.read_stderr():
+                    raise SandboxError(f"Could not download file {remote_path}: {stderr.decode(errors='replace')}")
+
+        try:
+            async for chunk in decode_base64_chunks(encoded_chunks()):
+                yield chunk
+            if session.return_code not in {None, 0}:
+                raise SandboxError(f"Could not download file: {remote_path}")
+        finally:
+            await session.close()
 
     async def modify_egress_rules(self, instance_id: str, allowed_addresses: list[str]) -> None:
         raise NotImplementedError
@@ -293,4 +422,6 @@ class KubernetesSandboxBackend:
         raise NotImplementedError
 
     async def close(self) -> None:
+        if self.remote_exec is not None:
+            await self.remote_exec.close()
         await self.api.close()

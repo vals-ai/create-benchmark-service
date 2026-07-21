@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 2
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.14'",
@@ -435,6 +435,7 @@ dependencies = [
     { name = "descope" },
     { name = "fastapi", extra = ["standard"] },
     { name = "httpx" },
+    { name = "httpx-ws" },
     { name = "jinja2" },
     { name = "modal" },
     { name = "pyyaml" },
@@ -462,6 +463,7 @@ requires-dist = [
     { name = "descope", specifier = ">=1.13.0" },
     { name = "fastapi", extras = ["standard"], specifier = ">=0.135.3" },
     { name = "httpx", specifier = ">=0.28.1" },
+    { name = "httpx-ws", specifier = ">=0.9.0" },
     { name = "jinja2", specifier = ">=3.1.6" },
     { name = "modal", specifier = ">=1.4.2" },
     { name = "pyyaml", specifier = ">=6.0.2" },

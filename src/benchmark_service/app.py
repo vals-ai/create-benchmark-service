@@ -66,6 +66,7 @@ async def send_json_if_connected(websocket: WebSocket, payload: dict[str, Any]) 
 
 
 _PUBLIC_PATHS = frozenset({"/health", "/version"})
+_FORCE_AGENT_TIMEOUT_ENV = "BENCHMARK_SERVICE_FORCE_AGENT_TIMEOUT_SECONDS"
 
 
 def _require_descope_tenant(tenant: str | None) -> None:
@@ -87,6 +88,27 @@ def _is_trial_tenant(tenant: str | None) -> bool:
         return False
     cfg = get_tenant_config(tenant)
     return cfg is not None and cfg.trial_mode
+
+
+def _forced_agent_timeout() -> float | None:
+    raw_timeout = os.environ.get(_FORCE_AGENT_TIMEOUT_ENV)
+    if raw_timeout is None or not raw_timeout.strip():
+        return None
+
+    try:
+        timeout = float(raw_timeout)
+    except ValueError as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"{_FORCE_AGENT_TIMEOUT_ENV} must be a positive number of seconds.",
+        ) from error
+
+    if timeout <= 0:
+        raise HTTPException(
+            status_code=500,
+            detail=f"{_FORCE_AGENT_TIMEOUT_ENV} must be a positive number of seconds.",
+        )
+    return timeout
 
 
 # Lab-facing /v1 endpoints a trial tenant may reach. Deny-by-default: add new
@@ -274,7 +296,11 @@ class BenchmarkServiceApp(FastAPI):
     ) -> RetrieveTaskResponse:
         if not await self.service.check_dataset_access(request.state.tenant, dataset):
             raise HTTPException(status_code=403, detail="Dataset not allowed")
-        return await self.service.retrieve_task(task_id, skip_validation, dataset=dataset)
+        task = await self.service.retrieve_task(task_id, skip_validation, dataset=dataset)
+        forced_timeout = _forced_agent_timeout()
+        if forced_timeout is not None:
+            task.agent_timeout = forced_timeout
+        return task
 
     async def _setup_task(self, websocket: WebSocket) -> None:
         await websocket.accept()

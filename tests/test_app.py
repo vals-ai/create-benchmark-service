@@ -122,6 +122,27 @@ def test_retrieve_task(client: TestClient) -> None:
     assert data["problem_path"] == "/tmp/problem_statement.txt"
     assert data["source"] == {"type": "image", "image": "python:3.12-slim"}
     assert data["docker_image"] == "python:3.12-slim"
+    assert data["agent_timeout"] == 60.0
+
+
+def test_retrieve_task_force_agent_timeout(client: TestClient, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("BENCHMARK_SERVICE_FORCE_AGENT_TIMEOUT_SECONDS", "180")
+
+    response = client.get("/retrieve-task/", params={"task_id": "task-1"})
+
+    assert response.status_code == 200
+    assert response.json()["agent_timeout"] == 180.0
+
+
+def test_retrieve_task_rejects_invalid_forced_agent_timeout(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("BENCHMARK_SERVICE_FORCE_AGENT_TIMEOUT_SECONDS", "nope")
+
+    response = client.get("/retrieve-task/", params={"task_id": "task-1"})
+
+    assert response.status_code == 500
+    assert "positive number of seconds" in response.json()["detail"]
 
 
 def test_retrieve_task_invalid(client: TestClient) -> None:

@@ -35,7 +35,15 @@ from daytona.common.errors import (
 from daytona.common.pty import PtyResult
 from daytona.handle.async_pty_handle import AsyncPtyHandle
 from pydantic import BaseModel
-from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_exponential, wait_fixed
+from tenacity import (
+    RetryCallState,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_chain,
+    wait_exponential,
+    wait_random,
+)
 
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
@@ -72,6 +80,7 @@ _RETRY_AFTER_PREFIX = "retry-after-"
 _KNOWN_THROTTLERS = ("sandbox-create", "sandbox-lifecycle", "authenticated", "anonymous")
 _DELETE_CONFLICT_MESSAGES = ("state change in progress", "modified by another operation")
 _REMOVED_SANDBOX_CLIENT_STATUSES = (404, 502)
+_RETRYABLE_PROVIDER_STATUSES = (408, 429, 500, 502, 503, 504)
 _FAILED_EXECUTE_COMMAND_PREFIX = "failed to execute command:"
 # Daytona sometimes flattens a transport failure into a bare DaytonaError message with no chained
 # cause; these substrings recover those cases by text when no typed cause survives to match.
@@ -80,12 +89,16 @@ _TRANSPORT_ERROR_MESSAGES = (
     "[errno 32] broken pipe",
     "[errno 9] bad file descriptor",
     "502 bad gateway",
-    "failed to create sandbox: an unexpected error occurred.",
+    "an unexpected error occurred.",
     "failed to register with sysbox-mgr",
     "server disconnected",
+    "temporary authentication service error",
 )
 _RETRYABLE_DAYTONA_CAUSES = (ClientConnectionError, ConnectionError, TimeoutError)
-_FIXED_PROVIDER_WAIT = wait_fixed(2)
+_PROVIDER_RETRY_DELAYS_SECONDS = (5, 25, 90, 300, 420)
+_FIXED_PROVIDER_WAIT = wait_chain(
+    *(wait_random(delay * 0.9, delay) for delay in _PROVIDER_RETRY_DELAYS_SECONDS)
+)
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
 
 
@@ -203,8 +216,16 @@ def _has_retryable_cause(exc: BaseException) -> bool:
     return False
 
 
+def _provider_status_code(exc: DaytonaError | ClientResponseError) -> int | None:
+    if isinstance(exc, ClientResponseError):
+        return exc.status
+    return exc.status_code
+
+
 def _is_transient_daytona_error(exc: DaytonaError | ClientResponseError) -> bool:
     if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS) or _has_retryable_cause(exc):
+        return True
+    if _provider_status_code(exc) in _RETRYABLE_PROVIDER_STATUSES:
         return True
     return _message_contains(exc, _TRANSPORT_ERROR_MESSAGES)
 
@@ -250,7 +271,7 @@ def daytona_retry_after_seconds(exc: DaytonaRateLimitError) -> float | None:
 
 _PROVIDER_RETRY = retry(
     retry=retry_if_exception_type(SandboxConnectionError),
-    stop=stop_after_attempt(3),
+    stop=stop_after_attempt(len(_PROVIDER_RETRY_DELAYS_SECONDS) + 1),
     wait=_provider_retry_wait,
     reraise=True,
 )

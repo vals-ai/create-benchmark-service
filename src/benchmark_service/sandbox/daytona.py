@@ -35,7 +35,15 @@ from daytona.common.errors import (
 from daytona.common.pty import PtyResult
 from daytona.handle.async_pty_handle import AsyncPtyHandle
 from pydantic import BaseModel
-from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_exponential, wait_fixed
+from tenacity import (
+    RetryCallState,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_chain,
+    wait_exponential,
+    wait_random,
+)
 
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
@@ -81,11 +89,17 @@ _TRANSPORT_ERROR_MESSAGES = (
     "[errno 9] bad file descriptor",
     "502 bad gateway",
     "failed to create sandbox: an unexpected error occurred.",
+    "failed to get sandbox: an unexpected error occurred.",
+    "failed to refresh sandbox data: an unexpected error occurred.",
+    "failed to remove sandbox: an unexpected error occurred.",
     "failed to register with sysbox-mgr",
     "server disconnected",
 )
 _RETRYABLE_DAYTONA_CAUSES = (ClientConnectionError, ConnectionError, TimeoutError)
-_FIXED_PROVIDER_WAIT = wait_fixed(2)
+_PROVIDER_RETRY_DELAYS_SECONDS = (5, 25, 90, 300, 420)
+_FIXED_PROVIDER_WAIT = wait_chain(
+    *(wait_random(delay * 0.9, delay) for delay in _PROVIDER_RETRY_DELAYS_SECONDS)
+)
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
 
 
@@ -250,7 +264,7 @@ def daytona_retry_after_seconds(exc: DaytonaRateLimitError) -> float | None:
 
 _PROVIDER_RETRY = retry(
     retry=retry_if_exception_type(SandboxConnectionError),
-    stop=stop_after_attempt(3),
+    stop=stop_after_attempt(len(_PROVIDER_RETRY_DELAYS_SECONDS) + 1),
     wait=_provider_retry_wait,
     reraise=True,
 )

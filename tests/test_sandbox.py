@@ -33,6 +33,7 @@ from benchmark_service.sandbox import (
 )
 from benchmark_service.sandbox.daytona import (
     _PTY_STDOUT_TAIL_MAX_BYTES,  # pyright: ignore[reportPrivateUsage]
+    _is_transient_daytona_error,  # pyright: ignore[reportPrivateUsage]
     DaytonaSandbox,
     DaytonaSandboxProvider,
     daytona_retry_after_seconds,
@@ -522,6 +523,18 @@ class BareHtml502RefreshSandbox(InnerSandbox):
         await super().refresh_data()
 
 
+class UnexpectedRefreshSandbox(InnerSandbox):
+    def __init__(self) -> None:
+        super().__init__()
+        self.refresh_attempts = 0
+
+    async def refresh_data(self) -> None:
+        self.refresh_attempts += 1
+        if self.refresh_attempts < 6:
+            raise DaytonaError("Failed to refresh sandbox data: An unexpected error occurred.")
+        await super().refresh_data()
+
+
 class DaytonaClient:
     def __init__(self, sandbox: InnerSandbox) -> None:
         self.sandbox = sandbox
@@ -618,6 +631,32 @@ class ReusableLookupConnectionDaytonaClient(DaytonaClient):
                 ClientConnectionError("tcp reset"),
             )
         raise DaytonaNotFoundError("sandbox not found")
+
+
+class UnexpectedGetDaytonaClient(DaytonaClient):
+    def __init__(self, sandbox: InnerSandbox) -> None:
+        super().__init__(sandbox)
+        self.get_attempts = 0
+
+    async def get(self, instance_id: str) -> InnerSandbox:
+        self.get_attempts += 1
+        if self.get_attempts == 1:
+            raise DaytonaError("Failed to get sandbox: An unexpected error occurred.")
+        return await super().get(instance_id)
+
+
+class UnexpectedRemoveDaytonaClient(DaytonaClient):
+    def __init__(self, sandbox: InnerSandbox) -> None:
+        super().__init__(sandbox)
+        self.delete_attempts = 0
+
+    async def delete(self, sandbox: InnerSandbox) -> None:
+        self.delete_attempts += 1
+        if self.delete_attempts == 1:
+            raise DaytonaError(
+                "Failed to remove sandbox: Failed to refresh sandbox data: An unexpected error occurred."
+            )
+        await super().delete(sandbox)
 
 
 def _provider(daytona: DaytonaClient) -> DaytonaSandboxProvider:
@@ -835,6 +874,37 @@ def test_daytona_retry_after_uses_any_retry_after_header() -> None:
     exc = DaytonaRateLimitError("rate limited", headers={"retry-after-custom": "5"})
 
     assert daytona_retry_after_seconds(exc) == 5
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Failed to get sandbox: An unexpected error occurred.",
+        "Failed to refresh sandbox data: An unexpected error occurred.",
+        "Failed to remove sandbox: Failed to refresh sandbox data: An unexpected error occurred.",
+    ],
+)
+def test_daytona_unexpected_provider_errors_are_transient(message: str) -> None:
+    assert _is_transient_daytona_error(DaytonaError(message))
+
+
+async def test_daytona_unexpected_refresh_uses_staged_backoff(monkeypatch: pytest.MonkeyPatch) -> None:
+    inner = UnexpectedRefreshSandbox()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+    observed_waits: list[float] = []
+
+    async def record_wait(seconds: float) -> None:
+        observed_waits.append(seconds)
+
+    retryer = cast(Any, DaytonaSandbox._check_sandbox_alive).retry  # pyright: ignore[reportPrivateUsage]
+    monkeypatch.setattr(retryer, "sleep", record_wait)
+
+    await sandbox._check_sandbox_alive()  # pyright: ignore[reportPrivateUsage]
+
+    assert inner.refresh_attempts == 6
+    assert len(observed_waits) == 5
+    for observed, expected in zip(observed_waits, (5, 25, 90, 300, 420), strict=True):
+        assert expected * 0.9 <= observed <= expected
 
 
 async def test_daytona_exec_retries_rate_limits() -> None:
@@ -1293,6 +1363,38 @@ async def test_daytona_provider_delete_retries_bare_html_502_refresh_errors() ->
     await _provider(daytona).delete_sandbox(inner.name)
 
     assert inner.refresh_attempts == 2
+    assert daytona.deleted is True
+
+
+async def test_daytona_provider_get_retries_unexpected_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    inner = InnerSandbox()
+    daytona = UnexpectedGetDaytonaClient(inner)
+
+    async def no_wait(_seconds: float) -> None:
+        pass
+
+    retryer = cast(Any, DaytonaSandboxProvider.get_sandbox).retry
+    monkeypatch.setattr(retryer, "sleep", no_wait)
+
+    sandbox = await _provider(daytona).get_sandbox(inner.name)
+
+    assert sandbox.id == inner.id
+    assert daytona.get_attempts == 2
+
+
+async def test_daytona_provider_delete_retries_unexpected_remove_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    inner = InnerSandbox()
+    daytona = UnexpectedRemoveDaytonaClient(inner)
+
+    async def no_wait(_seconds: float) -> None:
+        pass
+
+    retryer = cast(Any, DaytonaSandboxProvider.delete_sandbox).retry
+    monkeypatch.setattr(retryer, "sleep", no_wait)
+
+    await _provider(daytona).delete_sandbox(inner.name)
+
+    assert daytona.delete_attempts == 2
     assert daytona.deleted is True
 
 

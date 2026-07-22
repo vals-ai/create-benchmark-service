@@ -460,6 +460,35 @@ def _make_client(url: str = BASE_URL) -> BenchmarkServiceClient:
 
 
 @pytest.mark.parametrize(
+    ("configured_max_size", "expected_max_size"),
+    [
+        (None, 10 * 1024 * 1024),
+        (12 * 1024 * 1024, 12 * 1024 * 1024),
+    ],
+    ids=["default", "override"],
+)
+async def test_websocket_message_size_limit_reaches_connection(
+    configured_max_size: int | None, expected_max_size: int
+) -> None:
+    mock_connect = _ws_mock([json.dumps({"type": "result", "data": {"status": "ok"}})])
+    client = (
+        _make_client()
+        if configured_max_size is None
+        else BenchmarkServiceClient(
+            url=BASE_URL,
+            headers=HEADERS,
+            timeout=10,
+            max_websocket_message_size=configured_max_size,
+        )
+    )
+
+    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect) as connect:
+        await client.setup_task("task-1", "inst-1", DAYTONA_CONFIG)
+
+    assert connect.call_args.kwargs["max_size"] == expected_max_size
+
+
+@pytest.mark.parametrize(
     ("method", "args"),
     [
         ("setup_task", ["task-1", "inst-1", DAYTONA_CONFIG]),

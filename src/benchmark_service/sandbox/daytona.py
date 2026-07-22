@@ -80,6 +80,7 @@ _RETRY_AFTER_PREFIX = "retry-after-"
 _KNOWN_THROTTLERS = ("sandbox-create", "sandbox-lifecycle", "authenticated", "anonymous")
 _DELETE_CONFLICT_MESSAGES = ("state change in progress", "modified by another operation")
 _REMOVED_SANDBOX_CLIENT_STATUSES = (404, 502)
+_RETRYABLE_PROVIDER_STATUSES = (408, 429, 500, 502, 503, 504)
 _FAILED_EXECUTE_COMMAND_PREFIX = "failed to execute command:"
 # Daytona sometimes flattens a transport failure into a bare DaytonaError message with no chained
 # cause; these substrings recover those cases by text when no typed cause survives to match.
@@ -88,12 +89,10 @@ _TRANSPORT_ERROR_MESSAGES = (
     "[errno 32] broken pipe",
     "[errno 9] bad file descriptor",
     "502 bad gateway",
-    "failed to create sandbox: an unexpected error occurred.",
-    "failed to get sandbox: an unexpected error occurred.",
-    "failed to refresh sandbox data: an unexpected error occurred.",
-    "failed to remove sandbox: an unexpected error occurred.",
+    "an unexpected error occurred.",
     "failed to register with sysbox-mgr",
     "server disconnected",
+    "temporary authentication service error",
 )
 _RETRYABLE_DAYTONA_CAUSES = (ClientConnectionError, ConnectionError, TimeoutError)
 _PROVIDER_RETRY_DELAYS_SECONDS = (5, 25, 90, 300, 420)
@@ -217,8 +216,16 @@ def _has_retryable_cause(exc: BaseException) -> bool:
     return False
 
 
+def _provider_status_code(exc: DaytonaError | ClientResponseError) -> int | None:
+    if isinstance(exc, ClientResponseError):
+        return exc.status
+    return exc.status_code
+
+
 def _is_transient_daytona_error(exc: DaytonaError | ClientResponseError) -> bool:
     if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS) or _has_retryable_cause(exc):
+        return True
+    if _provider_status_code(exc) in _RETRYABLE_PROVIDER_STATUSES:
         return True
     return _message_contains(exc, _TRANSPORT_ERROR_MESSAGES)
 

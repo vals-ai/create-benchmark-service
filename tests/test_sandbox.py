@@ -882,10 +882,50 @@ def test_daytona_retry_after_uses_any_retry_after_header() -> None:
         "Failed to get sandbox: An unexpected error occurred.",
         "Failed to refresh sandbox data: An unexpected error occurred.",
         "Failed to remove sandbox: Failed to refresh sandbox data: An unexpected error occurred.",
+        "Failed to list sandboxes: An unexpected error occurred.",
     ],
 )
 def test_daytona_unexpected_provider_errors_are_transient(message: str) -> None:
     assert _is_transient_daytona_error(DaytonaError(message))
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Failed to create sandbox: Temporary authentication service error",
+        "Failed to get sandbox: Temporary authentication service error",
+        "Failed to refresh sandbox data: Temporary authentication service error",
+        "Failed to remove sandbox: Failed to refresh sandbox data: Temporary authentication service error",
+        "Failed to set auto-stop interval: Temporary authentication service error",
+    ],
+)
+def test_daytona_temporary_authentication_errors_are_transient(message: str) -> None:
+    assert _is_transient_daytona_error(DaytonaError(message))
+
+
+@pytest.mark.parametrize("status_code", [408, 429, 500, 502, 503, 504])
+def test_daytona_retryable_http_statuses_are_transient(status_code: int) -> None:
+    assert _is_transient_daytona_error(DaytonaError("provider request failed", status_code=status_code))
+
+
+def test_daytona_retryable_client_response_status_is_transient() -> None:
+    assert _is_transient_daytona_error(_client_response_error(503, "service unavailable"))
+
+
+@pytest.mark.parametrize("status_code", [400, 401, 403, 404, 409])
+def test_daytona_permanent_http_statuses_are_not_transient(status_code: int) -> None:
+    assert not _is_transient_daytona_error(DaytonaError("provider request failed", status_code=status_code))
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Failed to create sandbox: Snapshot example not found.",
+        "Failed to create sandbox: SandboxState.BUILD_FAILED: unexpected status from image registry: 403 Forbidden",
+    ],
+)
+def test_daytona_permanent_provider_errors_are_not_transient(message: str) -> None:
+    assert not _is_transient_daytona_error(DaytonaError(message))
 
 
 async def test_daytona_unexpected_refresh_uses_staged_backoff(monkeypatch: pytest.MonkeyPatch) -> None:

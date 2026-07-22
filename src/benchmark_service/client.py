@@ -29,6 +29,7 @@ from benchmark_service.schemas import (
 from benchmark_service.v1_schemas import V1DatasetTasksResponse
 
 _stream_chunk_adapter: TypeAdapter[StreamChunk] = TypeAdapter(StreamChunk)
+_DEFAULT_MAX_WEBSOCKET_MESSAGE_SIZE = 10 * 1024 * 1024
 
 _retry_http = retry(
     retry=retry_if_exception_type(
@@ -79,19 +80,29 @@ class BenchmarkServiceClient:
     _url: str
     _headers: dict[str, str]
     _timeout: int
+    _max_websocket_message_size: int
     _sandbox_providers: dict[str, SandboxProvider]
 
-    def __init__(self, url: str, headers: dict[str, str], timeout: int = 60):
+    def __init__(
+        self,
+        url: str,
+        headers: dict[str, str],
+        timeout: int = 60,
+        *,
+        max_websocket_message_size: int = _DEFAULT_MAX_WEBSOCKET_MESSAGE_SIZE,
+    ):
         """Initialize the client.
 
         Args:
             url: Base URL of the benchmark service.
             headers: Headers to include in all requests.
             timeout: Request timeout in seconds.
+            max_websocket_message_size: Maximum inbound WebSocket message size in bytes.
         """
         self._url = url
         self._headers = headers
         self._timeout = timeout
+        self._max_websocket_message_size = max_websocket_message_size
         self._sandbox_providers = {}
         self._http_client = httpx.AsyncClient(
             follow_redirects=True,
@@ -148,7 +159,7 @@ class BenchmarkServiceClient:
             additional_headers=self._headers,
             open_timeout=60,
             ping_timeout=None,
-            max_size=10 * 1024 * 1024,  # 10MB
+            max_size=self._max_websocket_message_size,
         ) as websocket:
             await websocket.send(request.model_dump_json())
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from collections.abc import AsyncGenerator, AsyncIterator
 from typing import Any, Protocol, cast
 
-from kubernetes_asyncio import client, config
+import aiohttp
+from kubernetes_asyncio import client, config, watch
 from kubernetes_asyncio.client.exceptions import ApiException
 from kubernetes_asyncio.config.config_exception import ConfigException
 
@@ -16,6 +18,9 @@ class KubernetesApiError(Exception):
         self.status = status
         self.reason = reason
         super().__init__(f"Kubernetes API returned {status}: {reason}")
+
+
+type ResourceWatchEvent = tuple[str, dict[str, object]]
 
 
 class KubernetesApi(Protocol):
@@ -37,10 +42,6 @@ class KubernetesApi(Protocol):
 
     async def list_pods(self, namespace: str, label_selector: str) -> list[dict[str, object]]: ...
 
-    async def create_network_policy(self, namespace: str, body: dict[str, object]) -> None: ...
-
-    async def delete_network_policy(self, namespace: str, name: str) -> None: ...
-
     async def replace_custom_object(
         self,
         namespace: str,
@@ -54,6 +55,38 @@ class KubernetesApi(Protocol):
     async def close(self) -> None: ...
 
 
+class KubernetesResourceWatchApi(Protocol):
+    async def list_jobs(
+        self,
+        namespace: str,
+        label_selector: str,
+        limit: int,
+        continue_token: str | None,
+    ) -> dict[str, object]: ...
+
+    async def list_pods_page(
+        self,
+        namespace: str,
+        label_selector: str,
+        limit: int,
+        continue_token: str | None,
+    ) -> dict[str, object]: ...
+
+    def watch_jobs(
+        self,
+        namespace: str,
+        label_selector: str,
+        resource_version: str,
+    ) -> AsyncGenerator[ResourceWatchEvent, None]: ...
+
+    def watch_pods(
+        self,
+        namespace: str,
+        label_selector: str,
+        resource_version: str,
+    ) -> AsyncGenerator[ResourceWatchEvent, None]: ...
+
+
 class KubernetesAsyncioApi:
     """Narrow dictionary-based adapter over kubernetes-asyncio."""
 
@@ -61,11 +94,10 @@ class KubernetesAsyncioApi:
         self._api_client = api_client
         self._batch = client.BatchV1Api(api_client)
         self._core = client.CoreV1Api(api_client)
-        self._networking = client.NetworkingV1Api(api_client)
         self._custom = client.CustomObjectsApi(api_client)
 
     @classmethod
-    async def create(cls, settings: KubernetesControlSettings) -> "KubernetesAsyncioApi":
+    async def create(cls, settings: KubernetesControlSettings) -> KubernetesAsyncioApi:
         try:
             config.load_incluster_config()  # pyright: ignore[reportUnknownMemberType]
         except ConfigException:
@@ -81,11 +113,16 @@ class KubernetesAsyncioApi:
     def _raise(self, error: ApiException) -> KubernetesApiError:
         return KubernetesApiError(error.status or 0, error.reason or str(error))
 
+    def _raise_connection(self, error: aiohttp.ClientError | TimeoutError | OSError) -> KubernetesApiError:
+        return KubernetesApiError(0, str(error))
+
     async def create_job(self, namespace: str, body: dict[str, object]) -> dict[str, object]:
         try:
             result = await self._batch.create_namespaced_job(namespace, cast(Any, body))
         except ApiException as error:
             raise self._raise(error) from error
+        except (aiohttp.ClientError, TimeoutError, OSError) as error:
+            raise self._raise_connection(error) from error
         return self._dict(result)
 
     async def get_job(self, namespace: str, name: str) -> dict[str, object] | None:
@@ -95,6 +132,8 @@ class KubernetesAsyncioApi:
             if error.status == 404:
                 return None
             raise self._raise(error) from error
+        except (aiohttp.ClientError, TimeoutError, OSError) as error:
+            raise self._raise_connection(error) from error
         return self._dict(result)
 
     async def list_jobs(
@@ -113,6 +152,8 @@ class KubernetesAsyncioApi:
             )
         except ApiException as error:
             raise self._raise(error) from error
+        except (aiohttp.ClientError, TimeoutError, OSError) as error:
+            raise self._raise_connection(error) from error
         return self._dict(result)
 
     async def patch_job(self, namespace: str, name: str, body: dict[str, object]) -> None:
@@ -120,6 +161,8 @@ class KubernetesAsyncioApi:
             await self._batch.patch_namespaced_job(name, namespace, body)
         except ApiException as error:
             raise self._raise(error) from error
+        except (aiohttp.ClientError, TimeoutError, OSError) as error:
+            raise self._raise_connection(error) from error
 
     async def delete_job(self, namespace: str, name: str) -> None:
         try:
@@ -127,33 +170,94 @@ class KubernetesAsyncioApi:
         except ApiException as error:
             if error.status != 404:
                 raise self._raise(error) from error
+        except (aiohttp.ClientError, TimeoutError, OSError) as error:
+            raise self._raise_connection(error) from error
 
     async def list_pods(self, namespace: str, label_selector: str) -> list[dict[str, object]]:
+        result = await self.list_pods_page(namespace, label_selector, 500, None)
+        return cast(list[dict[str, object]], result.get("items", []))
+
+    async def list_pods_page(
+        self,
+        namespace: str,
+        label_selector: str,
+        limit: int,
+        continue_token: str | None,
+    ) -> dict[str, object]:
         try:
-            result = await self._core.list_namespaced_pod(namespace, label_selector=label_selector)
+            result = await self._core.list_namespaced_pod(
+                namespace,
+                label_selector=label_selector,
+                limit=limit,
+                _continue=continue_token or "",
+            )
         except ApiException as error:
             raise self._raise(error) from error
-        serialized = self._dict(result)
-        return cast(list[dict[str, object]], serialized.get("items", []))
+        except (aiohttp.ClientError, TimeoutError, OSError) as error:
+            raise self._raise_connection(error) from error
+        return self._dict(result)
 
-    async def create_network_policy(self, namespace: str, body: dict[str, object]) -> None:
+    async def watch_jobs(
+        self,
+        namespace: str,
+        label_selector: str,
+        resource_version: str,
+    ) -> AsyncGenerator[ResourceWatchEvent, None]:
+        resource_watch = watch.Watch()
         try:
-            await self._networking.create_namespaced_network_policy(namespace, cast(Any, body))
-        except ApiException as error:
-            if error.status != 409:
-                raise self._raise(error) from error
-            name = cast(dict[str, Any], body["metadata"])["name"]
             try:
-                await self._networking.replace_namespaced_network_policy(name, namespace, cast(Any, body))
-            except ApiException as replace_error:
-                raise self._raise(replace_error) from replace_error
-
-    async def delete_network_policy(self, namespace: str, name: str) -> None:
-        try:
-            await self._networking.delete_namespaced_network_policy(name, namespace)
-        except ApiException as error:
-            if error.status != 404:
+                events = cast(
+                    AsyncIterator[dict[str, Any]],
+                    cast(Any, resource_watch).stream(
+                        self._batch.list_namespaced_job,
+                        namespace,
+                        label_selector=label_selector,
+                        resource_version=resource_version,
+                        timeout_seconds=300,
+                    ),
+                )
+                async for event in events:
+                    raw_object = event.get("raw_object")
+                    event_type = event.get("type")
+                    if isinstance(raw_object, dict) and isinstance(event_type, str):
+                        yield event_type, cast(dict[str, object], raw_object)
+            except ApiException as error:
                 raise self._raise(error) from error
+            except (aiohttp.ClientError, TimeoutError, OSError) as error:
+                raise self._raise_connection(error) from error
+        finally:
+            resource_watch.stop()
+
+    async def watch_pods(
+        self,
+        namespace: str,
+        label_selector: str,
+        resource_version: str,
+    ) -> AsyncGenerator[ResourceWatchEvent, None]:
+        resource_watch = watch.Watch()
+        try:
+            try:
+                events = cast(
+                    AsyncIterator[dict[str, Any]],
+                    cast(Any, resource_watch).stream(
+                        self._core.list_namespaced_pod,
+                        namespace,
+                        label_selector=label_selector,
+                        resource_version=resource_version,
+                        timeout_seconds=300,
+                    ),
+                )
+                async for event in events:
+                    raw_object = event.get("raw_object")
+                    event_type = event.get("type")
+                    if isinstance(raw_object, dict) and isinstance(event_type, str):
+                        yield event_type, cast(dict[str, object], raw_object)
+            except ApiException as error:
+                raise self._raise(error) from error
+            except (aiohttp.ClientError, TimeoutError, OSError) as error:
+                raise self._raise_connection(error) from error
+        finally:
+            resource_watch.stop()
 
     async def replace_custom_object(
         self,
@@ -171,6 +275,10 @@ class KubernetesAsyncioApi:
                 await self._custom.create_namespaced_custom_object("cilium.io", "v2", namespace, plural, body)
             except ApiException as create_error:
                 raise self._raise(create_error) from create_error
+            except (aiohttp.ClientError, TimeoutError, OSError) as create_error:
+                raise self._raise_connection(create_error) from create_error
+        except (aiohttp.ClientError, TimeoutError, OSError) as error:
+            raise self._raise_connection(error) from error
 
     async def delete_custom_object(self, namespace: str, plural: str, name: str) -> None:
         try:
@@ -178,6 +286,8 @@ class KubernetesAsyncioApi:
         except ApiException as error:
             if error.status != 404:
                 raise self._raise(error) from error
+        except (aiohttp.ClientError, TimeoutError, OSError) as error:
+            raise self._raise_connection(error) from error
 
     async def close(self) -> None:
         await self._api_client.close()

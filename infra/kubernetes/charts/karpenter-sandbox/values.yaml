@@ -1,0 +1,13 @@
+clusterName: ""
+nodeRole: ""
+amiAlias: al2023@latest
+capacityTypes:
+  - on-demand
+categories:
+  - c
+  - m
+  - r
+rootVolumeSize: 100Gi
+limits:
+  cpu: "2500"
+  memory: 5000Gi

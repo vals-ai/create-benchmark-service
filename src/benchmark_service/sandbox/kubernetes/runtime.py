@@ -75,5 +75,5 @@ class KubernetesRuntimeDriver(ABC):
     @abstractmethod
     async def clear_egress_rules(self, instance_id: str) -> None: ...
 
-    async def close(self) -> None:
-        pass
+    @abstractmethod
+    async def close(self) -> None: ...

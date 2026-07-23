@@ -126,7 +126,9 @@ Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` 
 {"type": "kubernetes", "KUBERNETES_API_URL": "https://sandbox.internal", "KUBERNETES_API_TOKEN": "..."}
 ```
 
-The Kubernetes provider calls a private sandbox control service over HTTPS and WebSocket. The client supports lifecycle operations, buffered exec, streaming commands, binary upload, buffered and streaming download, and temporary egress allowlists. This repository includes a Terraform-backed commercial AWS smoke that creates a disposable EKS cluster, installs the workload, runs the opt-in live contract, and destroys the stack. It uses `runc`; it is not the later GovCloud/Kata deployment or a production configuration. See [Kubernetes sandbox provider](docs/KUBERNETES_SANDBOX_PROVIDER.md) for setup, charges, recovery, and cleanup.
+The Kubernetes provider calls a private sandbox control service over HTTP or HTTPS. Commands use heartbeat-capable NDJSON, and the Terraform deployment sends command and file bytes from the control service directly to an authenticated agent inside each sandbox Pod. Kubernetes watches handle lifecycle state; the API server is not the normal command data plane and the deployed control role has no `pods/exec` permission. The existing control-service WebSocket route and Kubernetes exec implementation remain available only for compatibility with independently prepared clusters.
+
+The provider supports lifecycle operations, buffered exec, streaming commands, binary upload, buffered and streaming download, and temporary egress allowlists. This repository includes Terraform profiles for a small commercial AWS smoke and a later 2,000-sandbox vals-dev test. Both provision and destroy the selected profile symmetrically. The 2,000 target is a configured capacity and opt-in live test, not a performance claim until the vals-dev burst and stream soak pass through the private VPC path. The current runtime is `runc`; it is not the later GovCloud/Kata deployment. See [Kubernetes sandbox provider](docs/KUBERNETES_SANDBOX_PROVIDER.md) for setup, charges, scale testing, recovery, and cleanup.
 
 The `kubernetes-sandbox-control` entrypoint can also run against an independently prepared cluster. Cluster credentials, runtime class, namespace, region, image policy, and network policy remain deployment settings rather than benchmark request fields.
 
@@ -226,7 +228,7 @@ Pydantic models used across requests and responses:
 
 - **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `Resources`
 - **`SandboxSource`** — `ImageSource(type="image", image=...)` or `SnapshotSource(type="snapshot", snapshot=...)`
-- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; Daytona, Modal, or `KubernetesProviderConfig(type="kubernetes", KUBERNETES_API_URL, KUBERNETES_API_TOKEN, KUBERNETES_CONNECT_TIMEOUT=10, KUBERNETES_REQUEST_TIMEOUT=60)`
+- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; Daytona, Modal, or `KubernetesProviderConfig(type="kubernetes", KUBERNETES_API_URL, KUBERNETES_API_TOKEN, KUBERNETES_CONNECT_TIMEOUT=10, KUBERNETES_REQUEST_TIMEOUT=60, KUBERNETES_STREAM_READ_TIMEOUT=45)`
 - **`Resources`** — `vcpu`, `memory`, `disk`, optional `gpu` (count, default 0) and `gpu_type` (requires `gpu >= 1`)
 - **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, optional `sandbox_provider` with Daytona header fallback, `dataset`
 - **`EvaluateResponseRequest`** — `task_id`, `response` or `eval_resume_state`, optional `sandbox_provider`, `dataset`

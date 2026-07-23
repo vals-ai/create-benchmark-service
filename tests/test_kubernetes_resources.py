@@ -8,12 +8,11 @@ from typing import Any, cast
 
 import pytest
 
+from benchmark_service.sandbox.kubernetes.control.agent import agent_token
+from benchmark_service.sandbox.kubernetes.control.egress import build_egress_policy
 from benchmark_service.sandbox.kubernetes.control.resources import (
-    FINGERPRINT_LABEL,
     FINGERPRINT_ANNOTATION,
-    SANDBOX_ID_LABEL,
-    build_egress_policy,
-    build_ingress_policy,
+    FINGERPRINT_LABEL,
     build_job,
     request_fingerprint,
     sandbox_name,
@@ -43,9 +42,11 @@ def _list(value: object) -> list[Any]:
 def _settings(**changes: object) -> KubernetesControlSettings:
     values: dict[str, object] = {
         "api_token": "test-token",
+        "agent_image": f"registry.internal/control@sha256:{DIGEST}",
         "docker_image": f"registry.internal/docker@sha256:{DIGEST}",
         "allowed_image_prefixes": ("registry.internal/",),
         "require_image_digest": True,
+        "sandbox_node_selector": {"karpenter.sh/nodepool": "sandbox"},
     }
     values.update(changes)
     return KubernetesControlSettings.model_validate(values)
@@ -71,7 +72,7 @@ def test_builds_deterministic_isolated_job_and_network_policies() -> None:
     Test cases:
     - Names and fingerprints are deterministic despite unsafe input or mapping order.
     - Jobs enforce resources, Kata, Pod security, workspace, DinD, image, and GPU rules.
-    - Baseline ingress is denied while temporary egress allows DNS and exact destinations.
+    - Temporary egress allows DNS and exact destinations.
     - Unsupported sources and unsafe image or GPU requests fail before API calls.
     """
     unsafe_name = "Bad Name/" + "x" * 80
@@ -80,6 +81,7 @@ def test_builds_deterministic_isolated_job_and_network_policies() -> None:
     assert sandbox_name("task-1") == "task-1"
 
     request = _request(name=unsafe_name)
+    resource_name = sandbox_name(unsafe_name)
     reordered = request.model_copy(
         update={
             "labels": dict(reversed(list(request.labels.items()))),
@@ -97,6 +99,7 @@ def test_builds_deterministic_isolated_job_and_network_policies() -> None:
     template = _dict(spec["template"])
     pod_spec = _dict(template["spec"])
     containers = _list(pod_spec["containers"])
+    init_containers = _list(pod_spec["initContainers"])
     volumes = _list(pod_spec["volumes"])
     sandbox = _dict(containers[0])
     docker = _dict(containers[1])
@@ -104,6 +107,7 @@ def test_builds_deterministic_isolated_job_and_network_policies() -> None:
     assert metadata["name"] == sandbox_name(unsafe_name)
     assert metadata["labels"][FINGERPRINT_LABEL] == request_fingerprint(request)[:63]
     assert metadata["annotations"][FINGERPRINT_ANNOTATION] == request_fingerprint(request)
+    assert template["metadata"]["annotations"]["karpenter.sh/do-not-disrupt"] == "true"
     assert spec["backoffLimit"] == 0
     assert spec["activeDeadlineSeconds"] == settings.hard_lifetime_seconds
     assert spec["ttlSecondsAfterFinished"] == settings.finished_ttl_seconds
@@ -115,20 +119,38 @@ def test_builds_deterministic_isolated_job_and_network_policies() -> None:
         "requests": {"cpu": "2", "memory": "4Gi", "ephemeral-storage": "20Gi", "nvidia.com/gpu": "2"},
         "limits": {"cpu": "2", "memory": "4Gi", "ephemeral-storage": "20Gi", "nvidia.com/gpu": "2"},
     }
-    assert pod_spec["nodeSelector"] == {"sandbox.vals.ai/gpu-type": "H100"}
+    assert pod_spec["nodeSelector"] == {
+        "karpenter.sh/nodepool": "sandbox",
+        "sandbox.vals.ai/gpu-type": "H100",
+    }
+    assert pod_spec["tolerations"] == [
+        {
+            "key": "sandbox.vals.ai/dedicated",
+            "operator": "Equal",
+            "value": "sandboxes",
+            "effect": "NoSchedule",
+        }
+    ]
     assert {volume["name"]: volume for volume in volumes}["workspace"]["emptyDir"] == {"sizeLimit": "20Gi"}
+    assert {volume["name"]: volume for volume in volumes}["sandbox-agent"]["emptyDir"] == {}
+    assert init_containers[0]["image"] == settings.agent_image
+    assert init_containers[0]["command"] == [
+        "cp",
+        "/usr/local/bin/kubernetes-sandbox-agent",
+        "/vals-agent/sandbox-agent",
+    ]
+    assert sandbox["command"] == ["/vals-agent/sandbox-agent"]
+    assert sandbox["ports"] == [{"name": "agent", "containerPort": 8787, "protocol": "TCP"}]
+    sandbox_env = {item["name"]: item["value"] for item in _list(sandbox["env"])}
+    assert sandbox_env["VALS_SANDBOX_AGENT_TOKEN"] == agent_token("test-token", resource_name)
+    assert sandbox_env["VALS_SANDBOX_AGENT_PORT"] == "8787"
+    assert sandbox_env["VALS_SANDBOX_AGENT_HEARTBEAT_SECONDS"] == "10"
+    assert sandbox["securityContext"] == {"allowPrivilegeEscalation": False}
     assert docker["securityContext"] == {"privileged": True}
     assert docker["readinessProbe"]["exec"]["command"][-1] == "docker info >/dev/null 2>&1"
-    assert sandbox["readinessProbe"]["exec"]["command"] == ["sh", "-lc", "true"]
+    assert sandbox["readinessProbe"]["tcpSocket"] == {"port": "agent"}
     assert all("hostPath" not in volume for volume in volumes)
 
-    resource_name = sandbox_name(unsafe_name)
-    ingress = build_ingress_policy(resource_name, settings.namespace)
-    assert ingress["spec"] == {
-        "podSelector": {"matchLabels": {SANDBOX_ID_LABEL: resource_name}},
-        "policyTypes": ["Ingress"],
-        "ingress": [],
-    }
     egress = build_egress_policy(resource_name, settings.namespace, ["api.example.com", "10.0.0.3/24"])
     rules = _list(_dict(egress["spec"])["egress"])
     dns_ports = _list(_dict(rules[0])["toPorts"])
@@ -140,6 +162,7 @@ def test_builds_deterministic_isolated_job_and_network_policies() -> None:
         (_request(source=SnapshotSource(snapshot="snapshot-1")), _settings(), "source type"),
         (_request(resources=Resources(vcpu=2, memory=4, disk=20, gpu=1)), _settings(), "gpu_type"),
         (_request(source=ImageSource(image=f"outside/image@sha256:{DIGEST}")), _settings(), "allowlist"),
+        (_request(), _settings(agent_image=f"outside/control@sha256:{DIGEST}"), "allowlist"),
         (_request(source=ImageSource(image="registry.internal/python:latest")), _settings(), "digest"),
         (_request(resources=Resources(vcpu=65, memory=4, disk=20)), _settings(), "ceilings: vcpu"),
         (_request(resources=Resources(vcpu=0, memory=4, disk=20)), _settings(), "must be positive"),

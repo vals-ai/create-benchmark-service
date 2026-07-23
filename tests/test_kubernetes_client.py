@@ -5,17 +5,15 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncGenerator, Mapping
+from typing import cast
 
 import httpx
 import pytest
-from fastapi import FastAPI, WebSocket
-from httpx_ws.transport import ASGIWebSocketTransport
 
 from benchmark_service.sandbox import sandbox_provider_config_from_mapping
 from benchmark_service.sandbox.kubernetes.client import KubernetesControlClientDriver
 from benchmark_service.sandbox.kubernetes.config import KubernetesProviderConfig
 from benchmark_service.sandbox.kubernetes.protocol import SandboxRecord
-from benchmark_service.sandbox.kubernetes.provider import KubernetesSandboxProvider
 from benchmark_service.sandbox.kubernetes.sandbox import KubernetesSandbox
 from benchmark_service.sandbox.types import (
     ExecResult,
@@ -28,10 +26,15 @@ from benchmark_service.sandbox.types import (
     SandboxQuery,
 )
 
-SANDBOX = {"id": "sandbox-1", "name": "task-1", "state": "running"}
+SANDBOX = {
+    "id": "sandbox-1",
+    "name": "task-1",
+    "state": "running",
+    "labels": {"run_id": "run-1"},
+}
 
 
-class LifecycleTestDriver(KubernetesControlClientDriver):
+class MockLifecycleDriver(KubernetesControlClientDriver):
     """Supply operations outside the lifecycle test scope."""
 
     async def exec(
@@ -124,6 +127,7 @@ class TestKubernetesControlClientLifecycle:
             if request.method == "GET":
                 list_calls += 1
                 assert request.url.params.get_list("label") == ["run_id=run-1"]
+                assert request.url.params["limit"] == "100"
                 if list_calls == 1:
                     return httpx.Response(200, json={"items": [SANDBOX], "continue_token": "next"})
                 assert request.url.params["continue_token"] == "next"
@@ -135,7 +139,7 @@ class TestKubernetesControlClientLifecycle:
                 return httpx.Response(404, json={"error": {"code": "not_found", "message": "gone"}})
             raise AssertionError(f"Unexpected request: {request.method} {request.url}")
 
-        driver = LifecycleTestDriver(
+        driver = MockLifecycleDriver(
             api_url="https://sandbox.internal",
             api_token="test-token",
             transport=httpx.MockTransport(handler),
@@ -146,7 +150,7 @@ class TestKubernetesControlClientLifecycle:
             fetched = await driver.get_sandbox("sandbox-1")
             listed = [
                 sandbox
-                async for sandbox in driver.list_sandboxes(SandboxQuery(labels={"run_id": "run-1"}, page_size=2))
+                async for sandbox in driver.list_sandboxes(SandboxQuery(labels={"run_id": "run-1"}, page_size=250))
             ]
             await driver.delete_sandbox("sandbox-1")
             with pytest.raises(SandboxNotFoundError, match="request_id=req-1"):
@@ -154,61 +158,7 @@ class TestKubernetesControlClientLifecycle:
         finally:
             await driver.close()
 
-        assert created.id == fetched.id == "sandbox-1"
-        assert [sandbox.id for sandbox in listed] == ["sandbox-1", "sandbox-2"]
-        assert get_calls == 2
-        assert list_calls == 2
-        assert calls.count(("DELETE", "/v1/sandboxes/sandbox-1")) == 1
-
-    async def test_rejects_invalid_timeouts(self) -> None:
-        """Reject unusable client timeouts before opening a connection.
-
-        Test cases:
-        - Connect and request timeouts must both be positive.
-        """
-        for connect_timeout, request_timeout in [(0, 1), (1, 0)]:
-            with pytest.raises(ValueError, match="positive"):
-                LifecycleTestDriver(
-                    api_url="https://sandbox.internal",
-                    api_token="test-token",
-                    connect_timeout=connect_timeout,
-                    request_timeout=request_timeout,
-                )
-
-    async def test_maps_exhausted_retryable_status_to_connection_error(self) -> None:
-        """Keep exhausted control-service failures retryable by framework callers.
-
-        Test cases:
-        - Three HTTP 503 responses become SandboxConnectionError.
-        """
-        attempts = 0
-
-        def handler(_request: httpx.Request) -> httpx.Response:
-            nonlocal attempts
-            attempts += 1
-            return httpx.Response(503, json={"error": {"code": "busy", "message": "retry later"}})
-
-        driver = LifecycleTestDriver(
-            api_url="https://sandbox.internal",
-            api_token="test-token",
-            transport=httpx.MockTransport(handler),
-        )
-        try:
-            with pytest.raises(SandboxConnectionError, match="retry later"):
-                await driver.get_sandbox("sandbox-1")
-        finally:
-            await driver.close()
-
-        assert attempts == 3
-
-    def test_parses_public_provider_config_and_keeps_implementations_concrete(self) -> None:
-        """Register a usable provider config without exposing cluster settings.
-
-        Test cases:
-        - The kubernetes discriminator parses the private API URL and token.
-        - The production driver, provider, and sandbox fully implement their contracts.
-        """
-        parsed = sandbox_provider_config_from_mapping(
+        provider_config = sandbox_provider_config_from_mapping(
             {
                 "type": "kubernetes",
                 "KUBERNETES_API_URL": "https://sandbox.internal",
@@ -216,13 +166,50 @@ class TestKubernetesControlClientLifecycle:
             }
         )
 
-        assert isinstance(parsed, KubernetesProviderConfig)
-        assert not KubernetesControlClientDriver.__abstractmethods__
-        assert not KubernetesSandboxProvider.__abstractmethods__
-        assert not KubernetesSandbox.__abstractmethods__
+        assert created.id == fetched.id == "sandbox-1"
+        assert isinstance(created, KubernetesSandbox)
+        assert isinstance(provider_config, KubernetesProviderConfig)
+        assert created.labels == {"run_id": "run-1"}
+        assert [sandbox.id for sandbox in listed] == ["sandbox-1", "sandbox-2"]
+        assert get_calls == 2
+        assert list_calls == 2
+        assert calls.count(("DELETE", "/v1/sandboxes/sandbox-1")) == 1
+
+    async def test_maps_exhausted_retryable_status_to_connection_error(self) -> None:
+        """Keep exhausted control-service failures retryable by framework callers.
+
+        Test cases:
+        - HTTP 429 and 503 responses retry three times and become connection errors.
+        """
+        for status_code in (429, 503):
+            attempts = 0
+
+            def handler(
+                _request: httpx.Request,
+                status_code: int = status_code,
+            ) -> httpx.Response:
+                nonlocal attempts
+                attempts += 1
+                return httpx.Response(
+                    status_code,
+                    json={"error": {"code": "busy", "message": "retry later"}},
+                )
+
+            driver = MockLifecycleDriver(
+                api_url="https://sandbox.internal",
+                api_token="test-token",
+                transport=httpx.MockTransport(handler),
+            )
+            try:
+                with pytest.raises(SandboxConnectionError, match="retry later"):
+                    await driver.get_sandbox("sandbox-1")
+            finally:
+                await driver.close()
+
+            assert attempts == 3
 
 
-class CommandTestDriver(KubernetesControlClientDriver):
+class MockCommandDriver(KubernetesControlClientDriver):
     """Supply file and egress operations outside command test scope."""
 
     def sandbox_for_test(self, instance_id: str) -> KubernetesSandbox:
@@ -256,68 +243,83 @@ class TestKubernetesControlClientCommands:
         """Deliver command output before exit and keep buffered exec distinct.
 
         Test cases:
-        - WebSocket stdout and stderr events are yielded in order before exit.
-        - Closing a command stream early closes its WebSocket without leaking GeneratorExit.
+        - HTTP stdout and stderr events are yielded in order before exit.
+        - Closing a command stream early closes its response without leaking GeneratorExit.
         - A nonzero exit becomes the shared command error.
         - Buffered exec sends all supported request fields without retries.
         """
-        app = FastAPI()
         release_exit = asyncio.Event()
         observed_payloads: list[dict[str, object]] = []
+        opened_streams: list[MockDelayedCommandStream] = []
 
-        async def command(websocket: WebSocket, instance_id: str) -> None:
-            assert websocket.headers["authorization"] == "Bearer test-token"
-            await websocket.accept()
-            observed_payloads.append(await websocket.receive_json())
-            if instance_id == "failed":
-                await websocket.send_json({"type": "exit", "exit_code": 7})
-                return
-            await websocket.send_json({"type": "stdout", "data": "hel"})
-            await websocket.send_json({"type": "stderr", "data": "lo"})
-            await release_exit.wait()
-            await websocket.send_json({"type": "exit", "exit_code": 0})
-
-        async def exec_command(instance_id: str, payload: dict[str, object]) -> dict[str, object]:
-            assert instance_id == "sandbox-1"
+        async def handler(request: httpx.Request) -> httpx.Response:
+            assert request.headers["authorization"] == "Bearer test-token"
+            if request.url.path.endswith("/command"):
+                assert request.extensions["timeout"]["read"] == 23
+            payload = cast(dict[str, object], json.loads(await request.aread()))
             observed_payloads.append(payload)
-            return {"exit_code": 0, "output": "done"}
+            if request.url.path.endswith("/exec"):
+                return httpx.Response(200, json={"exit_code": 0, "output": "done"})
 
-        app.websocket("/v1/sandboxes/{instance_id}/command")(command)
-        app.post("/v1/sandboxes/{instance_id}/exec")(exec_command)
-
-        transport = ASGIWebSocketTransport(app=app)
-        async with transport:
-            driver = CommandTestDriver(
-                api_url="https://sandbox.internal",
-                api_token="test-token",
-                transport=transport,
-            )
-            try:
-                sandbox = driver.sandbox_for_test("sandbox-1")
-                chunks = sandbox.command(
-                    "printf hello",
-                    cwd="/workspace",
-                    timeout=3,
-                    env_vars={"FOO": "bar"},
+            instance_id = request.url.path.split("/")[-2]
+            if instance_id == "truncated":
+                return httpx.Response(
+                    200,
+                    headers={"Content-Type": "application/x-ndjson"},
+                    stream=MockStaticCommandStream([b'{"type":"stdout","data":"partial"}\n']),
                 )
-                assert await anext(chunks) == "hel"
-                assert await anext(chunks) == "lo"
+            if instance_id == "invalid":
+                return httpx.Response(
+                    200,
+                    headers={"Content-Type": "application/x-ndjson"},
+                    stream=MockStaticCommandStream([b"not-json\n"]),
+                )
+            stream = MockDelayedCommandStream(
+                release_exit=None if instance_id == "failed" else release_exit,
+                exit_code=7 if instance_id == "failed" else 0,
+            )
+            opened_streams.append(stream)
 
-                cancelled = sandbox.command("sleep 60")
-                assert await anext(cancelled) == "hel"
-                await cancelled.aclose()
+            return httpx.Response(200, headers={"Content-Type": "application/x-ndjson"}, stream=stream)
 
-                release_exit.set()
-                with pytest.raises(StopAsyncIteration):
-                    await anext(chunks)
+        driver = MockCommandDriver(
+            api_url="https://sandbox.internal",
+            api_token="test-token",
+            stream_read_timeout=23,
+            transport=httpx.MockTransport(handler),
+        )
+        try:
+            sandbox = driver.sandbox_for_test("sandbox-1")
+            chunks = sandbox.command(
+                "printf hello",
+                cwd="/workspace",
+                timeout=3,
+                env_vars={"FOO": "bar"},
+            )
+            assert await anext(chunks) == "hel"
+            assert await anext(chunks) == "lo"
 
-                failed = driver.sandbox_for_test("failed")
-                with pytest.raises(SandboxCommandError) as error_info:
-                    _ = [chunk async for chunk in failed.command("false")]
+            cancelled = sandbox.command("sleep 60")
+            assert await anext(cancelled) == "hel"
+            await cancelled.aclose()
+            assert opened_streams[1].closed.is_set()
 
-                result = await sandbox.exec("echo done", cwd="/workspace", timeout=5)
-            finally:
-                await driver.close()
+            release_exit.set()
+            with pytest.raises(StopAsyncIteration):
+                await anext(chunks)
+
+            failed = driver.sandbox_for_test("failed")
+            with pytest.raises(SandboxCommandError) as error_info:
+                _ = [chunk async for chunk in failed.command("false")]
+
+            for instance_id, message in [("truncated", "exit event"), ("invalid", "invalid command event")]:
+                incomplete = driver.sandbox_for_test(instance_id)
+                with pytest.raises(SandboxConnectionError, match=message):
+                    _ = [chunk async for chunk in incomplete.command("true")]
+
+            result = await sandbox.exec("echo done", cwd="/workspace", timeout=5)
+        finally:
+            await driver.close()
 
         assert error_info.value.exit_code == 7
         assert result == ExecResult(exit_code=0, output="done")
@@ -325,11 +327,46 @@ class TestKubernetesControlClientCommands:
             {"command": "printf hello", "cwd": "/workspace", "timeout": 3.0, "env_vars": {"FOO": "bar"}},
             {"command": "sleep 60", "cwd": None, "timeout": None, "env_vars": None},
             {"command": "false", "cwd": None, "timeout": None, "env_vars": None},
+            {"command": "true", "cwd": None, "timeout": None, "env_vars": None},
+            {"command": "true", "cwd": None, "timeout": None, "env_vars": None},
             {"command": "echo done", "cwd": "/workspace", "timeout": 5.0, "env_vars": None},
         ]
 
 
-class DelayedByteStream(httpx.AsyncByteStream):
+class MockDelayedCommandStream(httpx.AsyncByteStream):
+    """Emit command events around a caller-controlled exit boundary."""
+
+    def __init__(self, release_exit: asyncio.Event | None, exit_code: int) -> None:
+        self.release_exit = release_exit
+        self.exit_code = exit_code
+        self.closed = asyncio.Event()
+
+    async def __aiter__(self) -> AsyncGenerator[bytes, None]:
+        if self.release_exit is not None:
+            yield b'\n{"type":"stdout","data":"hel"}\n'
+            yield b'{"type":"stderr","data":"lo"}\n'
+            await self.release_exit.wait()
+        yield f'{{"type":"exit","exit_code":{self.exit_code}}}\n'.encode()
+
+    async def aclose(self) -> None:
+        self.closed.set()
+
+
+class MockStaticCommandStream(httpx.AsyncByteStream):
+    """Emit a fixed command response for protocol-failure cases."""
+
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = chunks
+
+    async def __aiter__(self) -> AsyncGenerator[bytes, None]:
+        for chunk in self.chunks:
+            yield chunk
+
+    async def aclose(self) -> None:
+        pass
+
+
+class MockDelayedByteStream(httpx.AsyncByteStream):
     """Yield two chunks with a caller-controlled boundary."""
 
     def __init__(self, release_second_chunk: asyncio.Event) -> None:
@@ -363,7 +400,7 @@ class TestKubernetesControlClientFilesAndEgress:
             if request.url.path.endswith("files"):
                 assert request.url.params["path"] == "/workspace/data.bin"
             if request.method == "GET":
-                return httpx.Response(200, stream=DelayedByteStream(release_second_chunk))
+                return httpx.Response(200, stream=MockDelayedByteStream(release_second_chunk))
             if request.method == "PUT" and request.url.path.endswith("files"):
                 observed_uploads.append((request.url.params["path"], await request.aread()))
                 return httpx.Response(204)

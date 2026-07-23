@@ -11,6 +11,7 @@ import os
 import time
 import uuid
 from collections.abc import AsyncGenerator
+from contextlib import suppress
 
 import pytest
 
@@ -55,11 +56,7 @@ def _request(name: str, image: str) -> SandboxCreateRequest:
 
 
 def _connection_command(host: str) -> str:
-    return (
-        "python -c \"import socket; "
-        f"connection = socket.create_connection(('{host}', 443), 2); "
-        "connection.close()\""
-    )
+    return f"python -c \"import socket; connection = socket.create_connection(('{host}', 443), 2); connection.close()\""
 
 
 async def _wait_for_command_state(
@@ -107,7 +104,7 @@ async def test_live_kubernetes_control_service_contract() -> None:
 
     Test cases:
     - Repeated creation is idempotent and lifecycle queries find the unique sandbox.
-    - WebSocket output arrives before completion, cancellation stops its process, and timeout uses exit code 124.
+    - HTTP stream output arrives before completion, cancellation stops its process, and timeout uses exit code 124.
     - Large binary downloads stream in chunks and temporary egress rules can be cleared.
     """
     sandbox_name = f"contract-{uuid.uuid4().hex[:12]}"
@@ -238,7 +235,7 @@ async def test_live_kubernetes_compose_contract() -> None:
             "services:\n"
             "  main:\n"
             f"    image: {os.environ['TEST_KUBERNETES_IMAGE']}\n"
-            "    command: [\"sh\", \"-lc\", \"trap : TERM INT; while :; do sleep 3600; done\"]\n"
+            '    command: ["sh", "-lc", "trap : TERM INT; while :; do sleep 3600; done"]\n'
         ).encode()
         await outer.upload_file(compose_path, compose_content)
 
@@ -266,13 +263,11 @@ async def test_live_kubernetes_compose_contract() -> None:
         assert len(command_chunks) >= 2
     except BaseException:
         if outer is not None:
-            try:
+            with suppress(Exception):
                 await outer.exec(
                     f"{compose_command} down --volumes --remove-orphans",
                     timeout=180,
                 )
-            except Exception:
-                pass
         raise
     else:
         assert outer is not None

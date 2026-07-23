@@ -6,7 +6,6 @@ from typing import Any
 from urllib.parse import quote
 
 import httpx
-from httpx_ws import HTTPXWSException, WebSocketUpgradeError, aconnect_ws
 
 from benchmark_service.sandbox.kubernetes.protocol import (
     CommandExitEvent,
@@ -33,7 +32,8 @@ from benchmark_service.sandbox.types import (
     SandboxQuery,
 )
 
-_RETRYABLE_STATUSES = frozenset({500, 502, 503, 504})
+_RETRYABLE_STATUSES = frozenset({429, 500, 502, 503, 504})
+_LIST_PAGE_LIMIT = 100
 
 
 class KubernetesControlClientDriver(KubernetesRuntimeDriver):
@@ -46,25 +46,35 @@ class KubernetesControlClientDriver(KubernetesRuntimeDriver):
         *,
         connect_timeout: float = 10,
         request_timeout: float = 60,
+        stream_read_timeout: float = 45,
+        max_connections: int = 256,
+        max_keepalive_connections: int = 64,
         transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        if connect_timeout <= 0 or request_timeout <= 0:
+        if connect_timeout <= 0 or request_timeout <= 0 or stream_read_timeout <= 0:
             raise ValueError("Kubernetes control API timeouts must be positive")
+        if max_connections <= 0 or max_keepalive_connections < 0:
+            raise ValueError("Kubernetes control API connection limits must not be negative")
+        if max_keepalive_connections > max_connections:
+            raise ValueError("Kubernetes keepalive connections cannot exceed total connections")
 
         self._api_url = api_url.rstrip("/")
+        self._connect_timeout = connect_timeout
+        self._request_timeout = request_timeout
+        self._stream_read_timeout = stream_read_timeout
         self._client = httpx.AsyncClient(
             headers={"Authorization": f"Bearer {api_token}"},
             timeout=httpx.Timeout(request_timeout, connect=connect_timeout),
             follow_redirects=False,
-            limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+            limits=httpx.Limits(
+                max_connections=max_connections,
+                max_keepalive_connections=max_keepalive_connections,
+            ),
             transport=transport,
         )
 
     def _url(self, path: str) -> str:
         return f"{self._api_url}{path}"
-
-    def _ws_url(self, path: str) -> str:
-        return self._url(path).replace("https://", "wss://", 1).replace("http://", "ws://", 1)
 
     def _sandbox(self, record: SandboxRecord) -> KubernetesSandbox:
         return KubernetesSandbox(
@@ -72,6 +82,7 @@ class KubernetesControlClientDriver(KubernetesRuntimeDriver):
             name=record.name,
             state=record.state,
             driver=self,
+            labels=record.labels,
         )
 
     def _error_from_detail(
@@ -162,7 +173,7 @@ class KubernetesControlClientDriver(KubernetesRuntimeDriver):
         yielded = 0
         while yielded < query.page_size:
             params = [("label", f"{name}={value}") for name, value in sorted(query.labels.items())]
-            params.append(("limit", str(query.page_size - yielded)))
+            params.append(("limit", str(min(query.page_size - yielded, _LIST_PAGE_LIMIT))))
             if continue_token:
                 params.append(("continue_token", continue_token))
             response = await self._request(
@@ -215,20 +226,35 @@ class KubernetesControlClientDriver(KubernetesRuntimeDriver):
         )
         path = f"/v1/sandboxes/{quote(instance_id, safe='')}/command"
         terminal_error: SandboxError | None = None
+        terminal_received = False
         try:
-            connection = aconnect_ws(self._ws_url(path), client=self._client)
-            websocket = await connection.__aenter__()
-            try:
-                await websocket.send_json(request.model_dump(mode="json"))
-                while True:
-                    event = command_event_adapter.validate_python(await websocket.receive_json())
+            async with self._client.stream(
+                "POST",
+                self._url(path),
+                json=request.model_dump(mode="json"),
+                timeout=httpx.Timeout(
+                    self._request_timeout,
+                    connect=self._connect_timeout,
+                    read=self._stream_read_timeout,
+                ),
+            ) as response:
+                self._raise_for_response(response)
+                async for line in response.aiter_lines():
+                    if not line:
+                        continue
+                    try:
+                        event = command_event_adapter.validate_json(line)
+                    except ValueError as error:
+                        raise SandboxConnectionError("Control API returned an invalid command event") from error
                     if isinstance(event, CommandOutputEvent):
                         yield event.data
                     elif isinstance(event, CommandExitEvent):
+                        terminal_received = True
                         if event.exit_code != 0:
                             terminal_error = SandboxCommandError(event.exit_code)
                         break
                     else:
+                        terminal_received = True
                         terminal_error = self._error_from_detail(
                             ControlErrorDetail(
                                 code=event.code,
@@ -237,13 +263,10 @@ class KubernetesControlClientDriver(KubernetesRuntimeDriver):
                             )
                         )
                         break
-            finally:
-                await connection.__aexit__(None, None, None)
-        except WebSocketUpgradeError as error:
-            self._raise_for_response(error.response)
-            raise SandboxConnectionError("WebSocket upgrade failed") from error
-        except (httpx.TransportError, HTTPXWSException) as error:
+        except httpx.TransportError as error:
             raise SandboxConnectionError(str(error)) from error
+        if not terminal_received:
+            raise SandboxConnectionError("Control API command stream ended without an exit event")
         if terminal_error is not None:
             raise terminal_error
 

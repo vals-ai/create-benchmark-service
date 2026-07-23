@@ -9,6 +9,7 @@ class SandboxRecord(BaseModel):
     id: str
     name: str
     state: str
+    labels: dict[str, str] = Field(default_factory=dict)
 
 
 class SandboxListPage(BaseModel):

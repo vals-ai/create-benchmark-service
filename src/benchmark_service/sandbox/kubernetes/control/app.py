@@ -1,13 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-import logging
 import re
 import secrets
 import uuid
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import asynccontextmanager, suppress
-from datetime import UTC, datetime
 
 from fastapi import FastAPI, Request, Response, WebSocket
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -22,6 +20,8 @@ from benchmark_service.sandbox.kubernetes.control.backend import (
 from benchmark_service.sandbox.kubernetes.control.settings import KubernetesControlSettings
 from benchmark_service.sandbox.kubernetes.protocol import (
     CommandErrorEvent,
+    CommandEvent,
+    CommandExitEvent,
     CommandRequest,
     ControlErrorDetail,
     ControlErrorResponse,
@@ -34,7 +34,6 @@ from benchmark_service.sandbox.types import (
     SandboxNotFoundError,
 )
 
-logger = logging.getLogger(__name__)
 _REQUEST_ID = re.compile(r"^[A-Za-z0-9._-]{1,128}$")
 
 
@@ -64,6 +63,50 @@ def _error_response(status_code: int, detail: ControlErrorDetail) -> JSONRespons
     return JSONResponse(status_code=status_code, content=body)
 
 
+async def command_events_to_ndjson(
+    stream: AsyncGenerator[CommandEvent, None],
+    *,
+    request_id: str,
+    heartbeat_seconds: float,
+) -> AsyncGenerator[bytes, None]:
+    """Encode command events and keep an idle HTTP stream alive."""
+    pending_event: asyncio.Task[CommandEvent] | None = None
+    terminal_received = False
+    try:
+        while True:
+            if pending_event is None:
+                pending_event = asyncio.create_task(anext(stream))
+            completed, _ = await asyncio.wait((pending_event,), timeout=heartbeat_seconds)
+            if not completed:
+                yield b"\n"
+                continue
+            try:
+                event = pending_event.result()
+            except StopAsyncIteration:
+                if terminal_received:
+                    return
+                raise SandboxConnectionError("Command stream ended without a terminal event") from None
+            pending_event = None
+            terminal_received = isinstance(event, (CommandExitEvent, CommandErrorEvent))
+            yield f"{event.model_dump_json()}\n".encode()
+            if terminal_received:
+                return
+    except SandboxError as error:
+        _, detail = _error_detail(error, request_id)
+        event = CommandErrorEvent(
+            type="error",
+            code=detail.code,
+            message=detail.message,
+            request_id=request_id,
+        )
+        yield f"{event.model_dump_json()}\n".encode()
+    finally:
+        if pending_event is not None:
+            pending_event.cancel()
+            await asyncio.gather(pending_event, return_exceptions=True)
+        await stream.aclose()
+
+
 def _parse_labels(values: list[str]) -> dict[str, str]:
     labels: dict[str, str] = {}
     for value in values:
@@ -77,27 +120,16 @@ def _parse_labels(values: list[str]) -> dict[str, str]:
 def create_kubernetes_control_app(
     settings: KubernetesControlSettings,
     backend: SandboxControlBackend,
+    *,
+    readiness: Callable[[], Awaitable[bool]] | None = None,
 ) -> FastAPI:
     """Create the private sandbox control service without changing cluster state."""
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        async def run_janitor() -> None:
-            while True:
-                await asyncio.sleep(settings.janitor_interval_seconds)
-                try:
-                    await backend.delete_idle_sandboxes(datetime.now(UTC))
-                except Exception:
-                    logger.exception("Kubernetes sandbox janitor failed")
-                    continue
-
-        janitor = asyncio.create_task(run_janitor())
         try:
             yield
         finally:
-            janitor.cancel()
-            with suppress(asyncio.CancelledError):
-                await janitor
             await backend.close()
 
     app = FastAPI(lifespan=lifespan)
@@ -142,6 +174,11 @@ def create_kubernetes_control_app(
 
     async def health() -> dict[str, str]:
         return {"status": "ok"}
+
+    async def ready() -> Response:
+        if readiness is None or await readiness():
+            return JSONResponse(content={"status": "ready"})
+        return JSONResponse(status_code=503, content={"status": "unavailable"})
 
     async def create(request: Request) -> Response:
         if error := require_auth(request):
@@ -188,6 +225,22 @@ def create_kubernetes_control_app(
         payload = CommandRequest.model_validate(await request.json())
         result = await backend.exec(instance_id, payload)
         return JSONResponse(content=result.model_dump(mode="json"))
+
+    async def stream_command(request: Request, instance_id: str) -> Response:
+        if error := require_auth(request):
+            return error
+        payload = CommandRequest.model_validate(await request.json())
+        request_id = request.state.request_id
+
+        return StreamingResponse(
+            command_events_to_ndjson(
+                backend.command(instance_id, payload),
+                request_id=request_id,
+                heartbeat_seconds=settings.command_heartbeat_seconds,
+            ),
+            media_type="application/x-ndjson",
+            headers={"Cache-Control": "no-store", "X-Accel-Buffering": "no"},
+        )
 
     async def upload(request: Request, instance_id: str) -> Response:
         if error := require_auth(request):
@@ -286,11 +339,13 @@ def create_kubernetes_control_app(
                 await websocket.close()
 
     app.add_api_route("/health", health, methods=["GET"])
+    app.add_api_route("/ready", ready, methods=["GET"])
     app.add_api_route("/v1/sandboxes", create, methods=["POST"])
     app.add_api_route("/v1/sandboxes", list_sandboxes, methods=["GET"])
     app.add_api_route("/v1/sandboxes/{instance_id}", get, methods=["GET"])
     app.add_api_route("/v1/sandboxes/{instance_id}", delete, methods=["DELETE"])
     app.add_api_route("/v1/sandboxes/{instance_id}/exec", exec_command, methods=["POST"])
+    app.add_api_route("/v1/sandboxes/{instance_id}/command", stream_command, methods=["POST"])
     app.add_api_route("/v1/sandboxes/{instance_id}/files", upload, methods=["PUT"])
     app.add_api_route("/v1/sandboxes/{instance_id}/files", download, methods=["GET"])
     app.add_api_route("/v1/sandboxes/{instance_id}/egress", modify_egress, methods=["PUT"])

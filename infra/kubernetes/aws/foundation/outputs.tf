@@ -19,6 +19,14 @@ output "aws_region" {
   value = var.aws_region
 }
 
+output "karpenter_queue_name" {
+  value = module.karpenter.queue_name
+}
+
+output "karpenter_node_iam_role_name" {
+  value = module.karpenter.node_iam_role_name
+}
+
 output "deployment_tags" {
   value = local.tags
 }

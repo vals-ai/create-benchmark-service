@@ -30,15 +30,85 @@ resource "helm_release" "cilium" {
 
   values = [yamlencode({
     cni = {
-      chainingMode = "aws-cni"
-      exclusive    = false
+      chainingMode                 = "aws-cni"
+      exclusive                    = false
+      enableRouteMTUForCNIChaining = true
     }
     enableIPv4Masquerade = false
     routingMode          = "native"
+    encryption = {
+      enabled = true
+      type    = "wireguard"
+    }
     operator = {
-      replicas = 1
+      replicas = 2
     }
   })]
+}
+
+resource "helm_release" "karpenter" {
+  name       = "karpenter"
+  repository = "oci://public.ecr.aws/karpenter"
+  chart      = "karpenter"
+  version    = var.karpenter_version
+  namespace  = "kube-system"
+
+  wait            = true
+  atomic          = true
+  timeout         = 900
+  cleanup_on_fail = true
+
+  values = [yamlencode({
+    dnsPolicy = "Default"
+    nodeSelector = {
+      "karpenter.sh/controller" = "true"
+    }
+    controller = {
+      resources = {
+        requests = {
+          cpu    = "500m"
+          memory = "512Mi"
+        }
+        limits = {
+          cpu    = "2"
+          memory = "2Gi"
+        }
+      }
+    }
+    settings = {
+      clusterName       = var.cluster_name
+      eksControlPlane   = true
+      interruptionQueue = var.karpenter_queue_name
+    }
+  })]
+
+  depends_on = [helm_release.cilium]
+}
+
+resource "helm_release" "karpenter_capacity" {
+  name      = "sandbox-capacity"
+  chart     = "${path.module}/../charts/karpenter-sandbox"
+  namespace = "kube-system"
+
+  wait            = true
+  atomic          = true
+  timeout         = 600
+  cleanup_on_fail = true
+
+  values = [yamlencode({
+    clusterName    = var.cluster_name
+    nodeRole       = var.karpenter_node_iam_role_name
+    amiAlias       = var.karpenter_ami_alias
+    capacityTypes  = var.karpenter_capacity_types
+    categories     = var.karpenter_instance_categories
+    rootVolumeSize = var.karpenter_root_volume_size
+    limits = {
+      cpu    = var.karpenter_cpu_limit
+      memory = var.karpenter_memory_limit
+    }
+  })]
+
+  depends_on = [helm_release.karpenter]
 }
 
 resource "kubernetes_namespace_v1" "sandboxes" {
@@ -68,13 +138,13 @@ resource "kubernetes_resource_quota_v1" "sandboxes" {
 
   spec {
     hard = {
-      pods                         = "20"
-      "requests.cpu"               = "8"
-      "limits.cpu"                 = "8"
-      "requests.memory"            = "16Gi"
-      "limits.memory"              = "16Gi"
-      "requests.ephemeral-storage" = "100Gi"
-      "limits.ephemeral-storage"   = "100Gi"
+      pods                         = tostring(var.namespace_pod_quota)
+      "requests.cpu"               = var.namespace_cpu_quota
+      "limits.cpu"                 = var.namespace_cpu_limit_quota
+      "requests.memory"            = var.namespace_memory_quota
+      "limits.memory"              = var.namespace_memory_limit_quota
+      "requests.ephemeral-storage" = var.namespace_storage_quota
+      "limits.ephemeral-storage"   = var.namespace_storage_limit_quota
     }
   }
 }
@@ -118,25 +188,13 @@ resource "kubernetes_role_v1" "control" {
   rule {
     api_groups = ["batch"]
     resources  = ["jobs"]
-    verbs      = ["get", "list", "create", "patch", "delete"]
+    verbs      = ["get", "list", "watch", "create", "patch", "delete"]
   }
 
   rule {
     api_groups = [""]
     resources  = ["pods"]
-    verbs      = ["get", "list"]
-  }
-
-  rule {
-    api_groups = [""]
-    resources  = ["pods/exec"]
-    verbs      = ["get", "create"]
-  }
-
-  rule {
-    api_groups = ["networking.k8s.io"]
-    resources  = ["networkpolicies"]
-    verbs      = ["get", "create", "update", "delete"]
+    verbs      = ["get", "list", "watch"]
   }
 
   rule {
@@ -165,6 +223,36 @@ resource "kubernetes_role_binding_v1" "control" {
   }
 }
 
+resource "kubernetes_network_policy_v1" "sandbox_ingress" {
+  metadata {
+    name      = "sandbox-ingress"
+    namespace = kubernetes_namespace_v1.sandboxes.metadata[0].name
+  }
+
+  spec {
+    pod_selector {
+      match_labels = {
+        "app.kubernetes.io/managed-by" = "benchmark-sandbox-control"
+      }
+    }
+
+    policy_types = ["Ingress"]
+
+    ingress {
+      from {
+        pod_selector {
+          match_labels = local.control_labels
+        }
+      }
+
+      ports {
+        port     = tostring(var.agent_port)
+        protocol = "TCP"
+      }
+    }
+  }
+}
+
 resource "kubernetes_secret_v1" "control" {
   metadata {
     name      = "kubernetes-sandbox-control"
@@ -186,7 +274,7 @@ resource "kubernetes_deployment_v1" "control" {
   }
 
   spec {
-    replicas = 1
+    replicas = var.control_replicas
 
     strategy {
       type = "RollingUpdate"
@@ -208,6 +296,26 @@ resource "kubernetes_deployment_v1" "control" {
       spec {
         service_account_name = kubernetes_service_account_v1.control.metadata[0].name
         runtime_class_name   = kubernetes_runtime_class_v1.runc.metadata[0].name
+
+        topology_spread_constraint {
+          max_skew           = 1
+          topology_key       = "topology.kubernetes.io/zone"
+          when_unsatisfiable = "ScheduleAnyway"
+
+          label_selector {
+            match_labels = local.control_labels
+          }
+        }
+
+        topology_spread_constraint {
+          max_skew           = 1
+          topology_key       = "kubernetes.io/hostname"
+          when_unsatisfiable = "ScheduleAnyway"
+
+          label_selector {
+            match_labels = local.control_labels
+          }
+        }
 
         security_context {
           run_as_non_root = true
@@ -239,6 +347,17 @@ resource "kubernetes_deployment_v1" "control" {
             protocol       = "TCP"
           }
 
+          resources {
+            requests = {
+              cpu    = var.control_cpu_request
+              memory = var.control_memory_request
+            }
+            limits = {
+              cpu    = var.control_cpu_limit
+              memory = var.control_memory_limit
+            }
+          }
+
           env {
             name = "KUBERNETES_SANDBOX_API_TOKEN"
             value_from {
@@ -265,6 +384,16 @@ resource "kubernetes_deployment_v1" "control" {
           }
 
           env {
+            name  = "KUBERNETES_SANDBOX_AGENT_IMAGE"
+            value = var.control_image
+          }
+
+          env {
+            name  = "KUBERNETES_SANDBOX_AGENT_PORT"
+            value = tostring(var.agent_port)
+          }
+
+          env {
             name  = "KUBERNETES_SANDBOX_DOCKER_ENABLED"
             value = "true"
           }
@@ -276,7 +405,12 @@ resource "kubernetes_deployment_v1" "control" {
 
           env {
             name  = "KUBERNETES_SANDBOX_REQUIRE_IMAGE_DIGEST"
-            value = "true"
+            value = tostring(var.require_image_digest)
+          }
+
+          env {
+            name  = "KUBERNETES_SANDBOX_NODE_SELECTOR"
+            value = "karpenter.sh/nodepool=sandbox"
           }
 
           env {
@@ -305,8 +439,18 @@ resource "kubernetes_deployment_v1" "control" {
           }
 
           env {
-            name  = "KUBERNETES_SANDBOX_JANITOR_INTERVAL_SECONDS"
-            value = "60"
+            name  = "KUBERNETES_SANDBOX_COMMAND_HEARTBEAT_SECONDS"
+            value = tostring(var.command_heartbeat_seconds)
+          }
+
+          env {
+            name  = "KUBERNETES_SANDBOX_ACTIVITY_WRITE_INTERVAL_SECONDS"
+            value = tostring(var.activity_write_interval_seconds)
+          }
+
+          env {
+            name  = "KUBERNETES_SANDBOX_EXEC_CONNECTION_POOL_SIZE"
+            value = tostring(var.exec_connection_pool_size)
           }
 
           env {
@@ -331,7 +475,7 @@ resource "kubernetes_deployment_v1" "control" {
 
           readiness_probe {
             http_get {
-              path   = "/health"
+              path   = "/ready"
               port   = "http"
               scheme = "HTTP"
             }
@@ -369,7 +513,22 @@ resource "kubernetes_deployment_v1" "control" {
     }
   }
 
-  depends_on = [helm_release.cilium]
+  depends_on = [helm_release.cilium, helm_release.karpenter_capacity]
+}
+
+resource "kubernetes_pod_disruption_budget_v1" "control" {
+  metadata {
+    name      = "kubernetes-sandbox-control"
+    namespace = kubernetes_namespace_v1.sandboxes.metadata[0].name
+  }
+
+  spec {
+    max_unavailable = "1"
+
+    selector {
+      match_labels = local.control_labels
+    }
+  }
 }
 
 resource "kubernetes_service_v1" "control" {
@@ -387,6 +546,120 @@ resource "kubernetes_service_v1" "control" {
       port        = 8080
       target_port = "http"
       protocol    = "TCP"
+    }
+  }
+}
+
+resource "kubernetes_cron_job_v1" "sandbox_janitor" {
+  metadata {
+    name      = "kubernetes-sandbox-janitor"
+    namespace = kubernetes_namespace_v1.sandboxes.metadata[0].name
+  }
+
+  spec {
+    schedule                      = "* * * * *"
+    concurrency_policy            = "Forbid"
+    starting_deadline_seconds     = 30
+    successful_jobs_history_limit = 1
+    failed_jobs_history_limit     = 2
+
+    job_template {
+      metadata {}
+
+      spec {
+        backoff_limit              = 2
+        ttl_seconds_after_finished = 300
+
+        template {
+          metadata {
+            labels = {
+              "app.kubernetes.io/name" = "kubernetes-sandbox-janitor"
+            }
+          }
+
+          spec {
+            service_account_name = kubernetes_service_account_v1.control.metadata[0].name
+            runtime_class_name   = kubernetes_runtime_class_v1.runc.metadata[0].name
+            restart_policy       = "Never"
+
+            security_context {
+              run_as_non_root = true
+              run_as_user     = 10001
+              run_as_group    = 10001
+
+              seccomp_profile {
+                type = "RuntimeDefault"
+              }
+            }
+
+            container {
+              name    = "janitor"
+              image   = var.control_image
+              command = ["kubernetes-sandbox-janitor"]
+
+              security_context {
+                allow_privilege_escalation = false
+                read_only_root_filesystem  = true
+
+                capabilities {
+                  drop = ["ALL"]
+                }
+              }
+
+              resources {
+                requests = {
+                  cpu    = "50m"
+                  memory = "64Mi"
+                }
+                limits = {
+                  cpu    = "250m"
+                  memory = "256Mi"
+                }
+              }
+
+              env {
+                name = "KUBERNETES_SANDBOX_API_TOKEN"
+                value_from {
+                  secret_key_ref {
+                    name = kubernetes_secret_v1.control.metadata[0].name
+                    key  = "KUBERNETES_SANDBOX_API_TOKEN"
+                  }
+                }
+              }
+
+              env {
+                name  = "KUBERNETES_SANDBOX_NAMESPACE"
+                value = kubernetes_namespace_v1.sandboxes.metadata[0].name
+              }
+
+              env {
+                name  = "KUBERNETES_SANDBOX_DOCKER_IMAGE"
+                value = var.docker_image
+              }
+
+              env {
+                name  = "KUBERNETES_SANDBOX_ACTIVITY_WRITE_INTERVAL_SECONDS"
+                value = tostring(var.activity_write_interval_seconds)
+              }
+
+              env {
+                name  = "XDG_CACHE_HOME"
+                value = "/tmp/.cache"
+              }
+
+              volume_mount {
+                name       = "tmp"
+                mount_path = "/tmp"
+              }
+            }
+
+            volume {
+              name = "tmp"
+              empty_dir {}
+            }
+          }
+        }
+      }
     }
   }
 }

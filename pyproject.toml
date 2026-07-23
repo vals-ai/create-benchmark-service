@@ -26,6 +26,7 @@ dependencies = [
 [project.scripts]
 create-benchmark-service = "cli.cli:main"
 kubernetes-sandbox-control = "benchmark_service.sandbox.kubernetes.control.main:main"
+kubernetes-sandbox-janitor = "benchmark_service.sandbox.kubernetes.control.janitor:main"
 
 [dependency-groups]
 dev = [

@@ -1,7 +1,14 @@
+FROM golang:1.26.5-bookworm AS sandbox-agent
+
+WORKDIR /src
+COPY infra/kubernetes/agent/go.mod infra/kubernetes/agent/main.go ./
+RUN CGO_ENABLED=0 go build -trimpath -ldflags="-s -w" -o /out/kubernetes-sandbox-agent .
+
 FROM ghcr.io/astral-sh/uv:0.7.13 AS uv
 FROM python:3.12-slim-bookworm
 
 COPY --from=uv /uv /uvx /bin/
+COPY --from=sandbox-agent /out/kubernetes-sandbox-agent /usr/local/bin/kubernetes-sandbox-agent
 
 RUN groupadd --gid 10001 sandbox-control \
     && useradd --uid 10001 --gid 10001 --create-home sandbox-control

@@ -15,6 +15,7 @@ from benchmark_service.sandbox.kubernetes.control import (
     KubernetesControlSettings,
     create_kubernetes_control_app,
 )
+from benchmark_service.sandbox.kubernetes.control.app import command_events_to_ndjson
 from benchmark_service.sandbox.kubernetes.protocol import (
     CommandEvent,
     CommandExitEvent,
@@ -24,12 +25,12 @@ from benchmark_service.sandbox.kubernetes.protocol import (
     SandboxListPage,
     SandboxRecord,
 )
-from benchmark_service.sandbox.types import SandboxCreateRequest
+from benchmark_service.sandbox.types import SandboxConnectionError, SandboxCreateRequest
 
 SANDBOX = SandboxRecord(id="sandbox-1", name="task-1", state="running")
 
 
-class RecordingControlBackend:
+class MockControlBackend:
     """Record each private API operation for contract assertions."""
 
     def __init__(self) -> None:
@@ -74,6 +75,12 @@ class RecordingControlBackend:
                 await asyncio.Event().wait()
             finally:
                 self.command_closed.set()
+            return
+        if request.command == "fail after output":
+            yield CommandOutputEvent(type="stdout", data="started")
+            raise SandboxConnectionError("exec stream disconnected")
+        if request.command == "truncate":
+            yield CommandOutputEvent(type="stdout", data="partial")
             return
         yield CommandOutputEvent(type="stdout", data="first")
         yield CommandOutputEvent(type="stderr", data="second")
@@ -138,8 +145,13 @@ class TestKubernetesControlApp:
         - Lifecycle, exec, chunked files, pagination, and egress reach distinct backend methods.
         - Every HTTP response includes a request ID.
         """
-        backend = RecordingControlBackend()
-        app = create_kubernetes_control_app(_settings(), backend)
+        backend = MockControlBackend()
+        cache_ready = True
+
+        async def readiness() -> bool:
+            return cache_ready
+
+        app = create_kubernetes_control_app(_settings(), backend, readiness=readiness)
         transport = httpx.ASGITransport(app=app)
 
         async def upload_chunks() -> AsyncGenerator[bytes, None]:
@@ -148,6 +160,9 @@ class TestKubernetesControlApp:
 
         async with httpx.AsyncClient(transport=transport, base_url="http://control") as client:
             health = await client.get("/health")
+            ready = await client.get("/ready")
+            cache_ready = False
+            unavailable = await client.get("/ready")
             unauthorized = await client.get("/v1/sandboxes/sandbox-1")
             headers = {"Authorization": "Bearer test-token", "X-Request-ID": "req-test"}
             invalid = await client.post("/v1/sandboxes", headers=headers, json={"name": "missing-fields"})
@@ -189,6 +204,8 @@ class TestKubernetesControlApp:
 
         responses = [
             health,
+            ready,
+            unavailable,
             unauthorized,
             invalid,
             malformed_list,
@@ -203,6 +220,9 @@ class TestKubernetesControlApp:
             deleted,
         ]
         assert health.json() == {"status": "ok"}
+        assert ready.json() == {"status": "ready"}
+        assert unavailable.status_code == 503
+        assert unavailable.json() == {"status": "unavailable"}
         assert unauthorized.status_code == 401
         assert invalid.status_code == malformed_list.status_code == 422
         assert invalid.json()["error"]["request_id"] == "req-test"
@@ -225,7 +245,7 @@ class TestKubernetesControlApp:
         - Valid commands receive stdout, stderr, and exit events in order.
         - Client disconnect cancels a command producer that is still running.
         """
-        backend = RecordingControlBackend()
+        backend = MockControlBackend()
         app = create_kubernetes_control_app(_settings(), backend)
         transport = ASGIWebSocketTransport(app=app)
         async with transport, httpx.AsyncClient(transport=transport) as client:
@@ -268,16 +288,119 @@ class TestKubernetesControlApp:
         assert error_event["request_id"] == "req-error"
         assert backend.operations[-1][0] == "command"
 
-    async def test_lifespan_cancels_janitor_and_closes_backend(self) -> None:
-        """Stop background cleanup before closing Kubernetes clients.
+    async def test_http_command_stream_preserves_events_and_errors(self) -> None:
+        """Stream command events over proxy-friendly HTTP without removing WebSockets.
 
         Test cases:
-        - App shutdown cancels the janitor and closes the backend once.
+        - Successful commands return ordered NDJSON events with buffering disabled.
+        - Backend failures become terminal error events with the request ID.
+        - A backend stream that ends without an exit event fails closed.
+        - Missing authentication is rejected before command execution.
         """
-        backend = RecordingControlBackend()
+        backend = MockControlBackend()
         app = create_kubernetes_control_app(_settings(), backend)
+        transport = httpx.ASGITransport(app=app)
+        headers = {"Authorization": "Bearer test-token", "X-Request-ID": "req-http"}
+
+        async with httpx.AsyncClient(transport=transport, base_url="http://control") as client:
+            unauthorized = await client.post(
+                "/v1/sandboxes/sandbox-1/command",
+                json={"command": "true"},
+            )
+            async with client.stream(
+                "POST",
+                "/v1/sandboxes/sandbox-1/command",
+                headers=headers,
+                json={"command": "printf ok"},
+            ) as response:
+                events = [event async for event in response.aiter_lines() if event]
+            async with client.stream(
+                "POST",
+                "/v1/sandboxes/sandbox-1/command",
+                headers=headers,
+                json={"command": "fail after output"},
+            ) as failed_response:
+                failed_events = [event async for event in failed_response.aiter_lines() if event]
+            async with client.stream(
+                "POST",
+                "/v1/sandboxes/sandbox-1/command",
+                headers=headers,
+                json={"command": "truncate"},
+            ) as truncated_response:
+                truncated_events = [event async for event in truncated_response.aiter_lines() if event]
+
+        assert unauthorized.status_code == 401
+        assert response.headers["content-type"].startswith("application/x-ndjson")
+        assert response.headers["x-accel-buffering"] == "no"
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["x-request-id"] == "req-http"
+        assert [CommandOutputEvent.model_validate_json(event).data for event in events[:2]] == [
+            "first",
+            "second",
+        ]
+        assert CommandExitEvent.model_validate_json(events[-1]).exit_code == 0
+        assert CommandOutputEvent.model_validate_json(failed_events[0]).data == "started"
+        assert '"type":"error"' in failed_events[-1]
+        assert '"request_id":"req-http"' in failed_events[-1]
+        assert CommandOutputEvent.model_validate_json(truncated_events[0]).data == "partial"
+        assert '"type":"error"' in truncated_events[-1]
+        assert "terminal event" in truncated_events[-1]
+
+    async def test_http_command_stream_sends_idle_heartbeats_and_closes_upstream(self) -> None:
+        """Keep an idle HTTP stream alive without losing cancellation.
+
+        Test cases:
+        - A blocked command emits a blank NDJSON heartbeat.
+        - Closing the encoded stream closes the backend command generator.
+        """
+        upstream_closed = asyncio.Event()
+
+        async def blocked_command() -> AsyncGenerator[CommandEvent, None]:
+            try:
+                yield CommandOutputEvent(type="stdout", data="started")
+                await asyncio.Event().wait()
+            finally:
+                upstream_closed.set()
+
+        events = command_events_to_ndjson(
+            blocked_command(),
+            request_id="req-heartbeat",
+            heartbeat_seconds=0,
+        )
+
+        assert CommandOutputEvent.model_validate_json(await anext(events)).data == "started"
+        assert await anext(events) == b"\n"
+
+        await events.aclose()
+
+        assert upstream_closed.is_set()
+
+    async def test_lifespan_leaves_cleanup_to_one_shot_worker_and_closes_backend(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Keep cleanup out of horizontally scaled request replicas.
+
+        Test cases:
+        - Request-service lifespan never starts a janitor loop.
+        - App shutdown closes the backend once.
+        """
+        backend = MockControlBackend()
+        app = create_kubernetes_control_app(_settings(), backend)
+        real_sleep = asyncio.sleep
+        sleep_calls = 0
+
+        async def immediate_then_block(_seconds: float) -> None:
+            nonlocal sleep_calls
+            sleep_calls += 1
+            if sleep_calls == 1:
+                return
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(asyncio, "sleep", immediate_then_block)
 
         async with app.router.lifespan_context(app):
-            pass
+            await real_sleep(0)
 
+        assert backend.janitor_calls == 0
         assert backend.closed is True

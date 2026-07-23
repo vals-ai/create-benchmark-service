@@ -5,7 +5,7 @@ import json
 import re
 from datetime import UTC, datetime
 
-from benchmark_service.sandbox.egress import resolve_allowed_addresses
+from benchmark_service.sandbox.kubernetes.control.agent import agent_token
 from benchmark_service.sandbox.kubernetes.control.settings import KubernetesControlSettings
 from benchmark_service.sandbox.types import ImageSource, SandboxCreateRequest, SandboxError
 
@@ -18,6 +18,7 @@ FINGERPRINT_ANNOTATION = "sandbox.vals.ai/request-fingerprint"
 ORIGINAL_NAME_ANNOTATION = "sandbox.vals.ai/original-name"
 AUTO_STOP_ANNOTATION = "sandbox.vals.ai/auto-stop-minutes"
 LAST_ACTIVITY_ANNOTATION = "sandbox.vals.ai/last-activity"
+USER_LABELS_ANNOTATION = "sandbox.vals.ai/user-labels"
 USER_LABEL_PREFIX = "sandbox.vals.ai/label-"
 
 _INVALID_DNS = re.compile(r"[^a-z0-9]+")
@@ -68,17 +69,14 @@ def _labels(request: SandboxCreateRequest, resource_name: str) -> dict[str, str]
     return labels
 
 
-def build_job(
-    request: SandboxCreateRequest,
-    settings: KubernetesControlSettings,
-    *,
-    now: datetime | None = None,
-) -> dict[str, object]:
+def _validate_request(request: SandboxCreateRequest, settings: KubernetesControlSettings) -> ImageSource:
     if not isinstance(request.source, ImageSource):
         raise SandboxError(f"Kubernetes sandbox provider does not support source type: {request.source.type}")
 
-    image = request.source.image
-    _validate_image(image, settings)
+    source = request.source
+    _validate_image(source.image, settings)
+    if settings.agent_image is not None:
+        _validate_image(settings.agent_image, settings)
     if settings.docker_enabled:
         _validate_image(settings.docker_image, settings)
     if request.resources.gpu and not request.resources.gpu_type:
@@ -87,9 +85,11 @@ def build_job(
         raise SandboxError("Kubernetes sandbox vcpu, memory, and disk must be positive")
     if request.create_timeout <= 0 or request.auto_stop_interval < 0:
         raise SandboxError("Kubernetes sandbox create_timeout must be positive and auto_stop_interval nonnegative")
+
     invalid_env_names = sorted(name for name in request.env_vars if _ENV_NAME.fullmatch(name) is None)
     if invalid_env_names:
         raise SandboxError(f"Invalid sandbox environment variable names: {', '.join(invalid_env_names)}")
+
     ceilings = {
         "vcpu": (request.resources.vcpu, settings.max_vcpu),
         "memory": (request.resources.memory, settings.max_memory_gib),
@@ -101,22 +101,90 @@ def build_job(
     if exceeded:
         raise SandboxError(f"Sandbox request exceeds configured ceilings: {', '.join(exceeded)}")
 
-    resource_name = sandbox_name(request.name)
-    labels = _labels(request, resource_name)
-    resources: dict[str, str] = {
+    return source
+
+
+def _resource_requirements(
+    request: SandboxCreateRequest,
+    settings: KubernetesControlSettings,
+) -> tuple[dict[str, str], dict[str, str]]:
+    resources = {
         "cpu": str(request.resources.vcpu),
         "memory": f"{request.resources.memory}Gi",
         "ephemeral-storage": f"{request.resources.disk}Gi",
     }
-    node_selector: dict[str, str] = {}
+    node_selector = dict(settings.sandbox_node_selector)
     if request.resources.gpu:
         resources[settings.gpu_resource_name] = str(request.resources.gpu)
         assert request.resources.gpu_type is not None
         node_selector[settings.gpu_type_label] = request.resources.gpu_type
 
+    return resources, node_selector
+
+
+def build_job(
+    request: SandboxCreateRequest,
+    settings: KubernetesControlSettings,
+    *,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    source = _validate_request(request, settings)
+    resource_name = sandbox_name(request.name)
+    labels = _labels(request, resource_name)
+    resources, node_selector = _resource_requirements(request, settings)
+
     env = [{"name": name, "value": value} for name, value in sorted(request.env_vars.items())]
     volume_mounts: list[dict[str, object]] = [{"name": "workspace", "mountPath": "/workspace"}]
     volumes: list[dict[str, object]] = [{"name": "workspace", "emptyDir": {"sizeLimit": f"{request.resources.disk}Gi"}}]
+    init_containers: list[dict[str, object]] = []
+    sandbox_command = ["sh", "-lc", "trap : TERM INT; while :; do sleep 3600; done"]
+    sandbox_readiness: dict[str, object] = {
+        "exec": {"command": ["sh", "-lc", "true"]},
+        "periodSeconds": 2,
+    }
+    sandbox_ports: list[dict[str, object]] = []
+    if settings.agent_image is not None:
+        env.extend(
+            [
+                {
+                    "name": "VALS_SANDBOX_AGENT_TOKEN",
+                    "value": agent_token(settings.api_token, resource_name),
+                },
+                {"name": "VALS_SANDBOX_AGENT_PORT", "value": str(settings.agent_port)},
+                {
+                    "name": "VALS_SANDBOX_AGENT_HEARTBEAT_SECONDS",
+                    "value": str(settings.agent_heartbeat_seconds),
+                },
+            ]
+        )
+        volume_mounts.append({"name": "sandbox-agent", "mountPath": "/vals-agent", "readOnly": True})
+        volumes.append({"name": "sandbox-agent", "emptyDir": {}})
+        init_containers.append(
+            {
+                "name": "install-sandbox-agent",
+                "image": settings.agent_image,
+                "command": [
+                    "cp",
+                    "/usr/local/bin/kubernetes-sandbox-agent",
+                    "/vals-agent/sandbox-agent",
+                ],
+                "volumeMounts": [{"name": "sandbox-agent", "mountPath": "/vals-agent"}],
+                "securityContext": {
+                    "runAsUser": 0,
+                    "allowPrivilegeEscalation": False,
+                    "readOnlyRootFilesystem": True,
+                    "capabilities": {"drop": ["ALL"]},
+                },
+            }
+        )
+        sandbox_command = ["/vals-agent/sandbox-agent"]
+        sandbox_readiness = {
+            "tcpSocket": {"port": "agent"},
+            "periodSeconds": 2,
+        }
+        sandbox_ports = [
+            {"name": "agent", "containerPort": settings.agent_port, "protocol": "TCP"},
+        ]
     containers: list[dict[str, object]] = []
     if settings.docker_enabled:
         env.append({"name": "DOCKER_HOST", "value": "unix:///var/run/docker.sock"})
@@ -140,18 +208,15 @@ def build_job(
         0,
         {
             "name": settings.sandbox_container_name,
-            "image": image,
-            "command": ["sh", "-lc", "trap : TERM INT; while :; do sleep 3600; done"],
+            "image": source.image,
+            "command": sandbox_command,
             "env": env,
             "resources": {"requests": resources, "limits": resources},
             "volumeMounts": volume_mounts,
-            "readinessProbe": {
-                "exec": {"command": ["sh", "-lc", "true"]},
-                "periodSeconds": 2,
-            },
+            "ports": sandbox_ports,
+            "readinessProbe": sandbox_readiness,
             "securityContext": {
                 "allowPrivilegeEscalation": False,
-                "capabilities": {"drop": ["ALL"]},
             },
         },
     )
@@ -161,15 +226,27 @@ def build_job(
         FINGERPRINT_ANNOTATION: request_fingerprint(request),
         AUTO_STOP_ANNOTATION: str(request.auto_stop_interval),
         LAST_ACTIVITY_ANNOTATION: (now or datetime.now(UTC)).isoformat(),
+        USER_LABELS_ANNOTATION: json.dumps(request.labels, sort_keys=True, separators=(",", ":")),
     }
+    pod_annotations = {**annotations, "karpenter.sh/do-not-disrupt": "true"}
     pod_spec: dict[str, object] = {
         "runtimeClassName": settings.runtime_class_name,
         "automountServiceAccountToken": False,
         "restartPolicy": "Never",
+        "tolerations": [
+            {
+                "key": "sandbox.vals.ai/dedicated",
+                "operator": "Equal",
+                "value": "sandboxes",
+                "effect": "NoSchedule",
+            }
+        ],
         "securityContext": {"seccompProfile": {"type": "RuntimeDefault"}},
         "containers": containers,
         "volumes": volumes,
     }
+    if init_containers:
+        pod_spec["initContainers"] = init_containers
     if node_selector:
         pod_spec["nodeSelector"] = node_selector
 
@@ -187,64 +264,8 @@ def build_job(
             "activeDeadlineSeconds": settings.hard_lifetime_seconds,
             "ttlSecondsAfterFinished": settings.finished_ttl_seconds,
             "template": {
-                "metadata": {"labels": labels, "annotations": annotations},
+                "metadata": {"labels": labels, "annotations": pod_annotations},
                 "spec": pod_spec,
             },
-        },
-    }
-
-
-def build_ingress_policy(resource_name: str, namespace: str) -> dict[str, object]:
-    return {
-        "apiVersion": "networking.k8s.io/v1",
-        "kind": "NetworkPolicy",
-        "metadata": {"name": f"{resource_name}-ingress", "namespace": namespace},
-        "spec": {
-            "podSelector": {"matchLabels": {SANDBOX_ID_LABEL: resource_name}},
-            "policyTypes": ["Ingress"],
-            "ingress": [],
-        },
-    }
-
-
-def build_egress_policy(
-    resource_name: str,
-    namespace: str,
-    allowed_addresses: list[str],
-) -> dict[str, object]:
-    cidrs, domains = resolve_allowed_addresses(allowed_addresses)
-    destination_rules: list[dict[str, object]] = []
-    if cidrs:
-        destination_rules.append({"toCIDR": cidrs})
-    if domains:
-        destination_rules.append({"toFQDNs": [{"matchName": domain} for domain in domains]})
-
-    return {
-        "apiVersion": "cilium.io/v2",
-        "kind": "CiliumNetworkPolicy",
-        "metadata": {"name": f"{resource_name}-egress", "namespace": namespace},
-        "spec": {
-            "endpointSelector": {"matchLabels": {SANDBOX_ID_LABEL: resource_name}},
-            "egress": [
-                {
-                    "toEndpoints": [
-                        {
-                            "matchLabels": {
-                                "k8s:io.kubernetes.pod.namespace": "kube-system",
-                                "k8s:k8s-app": "kube-dns",
-                            }
-                        }
-                    ],
-                    "toPorts": [
-                        {
-                            "ports": [
-                                {"port": "53", "protocol": "ANY"},
-                            ],
-                            "rules": {"dns": [{"matchPattern": "*"}]},
-                        }
-                    ],
-                },
-                *destination_rules,
-            ],
         },
     }

@@ -152,8 +152,15 @@ class KubernetesRemoteExec:
 
     def __init__(self, settings: KubernetesControlSettings) -> None:
         self.settings = settings
-        self._api_client = WsApiClient(heartbeat=30)
+        configuration = client.Configuration.get_default_copy()
+        configuration.connection_pool_maxsize = settings.exec_connection_pool_size
+        self._api_client = WsApiClient(configuration=configuration, heartbeat=30)
         self._core = client.CoreV1Api(self._api_client)
+
+    @property
+    def connection_pool_size(self) -> int:
+        """Return the configured Kubernetes exec connection capacity."""
+        return self._api_client.configuration.connection_pool_maxsize
 
     async def open(
         self,
@@ -191,7 +198,7 @@ class KubernetesRemoteExec:
             'read -r child_pids < "/proc/$target_pid/task/$target_pid/children" || true; fi; '
             'for child_pid in $child_pids; do terminate_tree "$child_pid"; done; '
             'kill -TERM "$target_pid" 2>/dev/null || true; }; '
-            f"if read -r command_pid < {pid_file} && [ \"$command_pid\" -gt 1 ] 2>/dev/null; then "
+            f'if read -r command_pid < {pid_file} && [ "$command_pid" -gt 1 ] 2>/dev/null; then '
             'terminate_tree "$command_pid"; fi'
         )
         try:

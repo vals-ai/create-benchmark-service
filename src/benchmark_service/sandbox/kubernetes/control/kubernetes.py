@@ -1,41 +1,47 @@
 from __future__ import annotations
 
 import asyncio
-import codecs
 import json
 import random
-import shlex
 import time
-import uuid
 from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable
+from contextlib import suppress
 from datetime import UTC, datetime
-from typing import Any, TypeVar, cast
+from typing import TypeVar, cast
 
+from benchmark_service.sandbox.kubernetes.control.agent import PodDataPlane
 from benchmark_service.sandbox.kubernetes.control.api import (
     KubernetesApi,
     KubernetesApiError,
 )
 from benchmark_service.sandbox.kubernetes.control.backend import SandboxConflictError
+from benchmark_service.sandbox.kubernetes.control.cache import ResourceCache
+from benchmark_service.sandbox.kubernetes.control.data_plane import SandboxDataPlane
 from benchmark_service.sandbox.kubernetes.control.egress import EgressPolicyDriver
+from benchmark_service.sandbox.kubernetes.control.remote_exec import RemoteExec
+from benchmark_service.sandbox.kubernetes.control.resource_data import (
+    PodEndpoint,
+    job_state,
+    metadata,
+    pending_failure,
+    ready_pod_endpoint,
+    ready_pod_name,
+    resource_annotations,
+    resource_dict,
+)
 from benchmark_service.sandbox.kubernetes.control.resources import (
+    AUTO_STOP_ANNOTATION,
     FINGERPRINT_ANNOTATION,
+    LAST_ACTIVITY_ANNOTATION,
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
-    AUTO_STOP_ANNOTATION,
-    LAST_ACTIVITY_ANNOTATION,
     ORIGINAL_NAME_ANNOTATION,
     SANDBOX_ID_LABEL,
-    build_ingress_policy,
+    USER_LABELS_ANNOTATION,
     build_job,
     safe_label_value,
     sandbox_name,
     user_label_key,
-)
-from benchmark_service.sandbox.kubernetes.control.remote_exec import (
-    RemoteExec,
-    RemoteExecSession,
-    decode_base64_chunks,
-    encode_base64_chunks,
 )
 from benchmark_service.sandbox.kubernetes.control.settings import KubernetesControlSettings
 from benchmark_service.sandbox.kubernetes.protocol import (
@@ -52,7 +58,6 @@ from benchmark_service.sandbox.types import (
     SandboxCreateRequest,
     SandboxError,
     SandboxNotFoundError,
-    validate_command_env,
 )
 
 Result = TypeVar("Result")
@@ -62,52 +67,18 @@ def _default_jitter(delay: float) -> float:
     return random.uniform(delay * 0.8, delay * 1.2)
 
 
-def _dict(value: object) -> dict[str, Any]:
-    return cast(dict[str, Any], value) if isinstance(value, dict) else {}
-
-
-def _list(value: object) -> list[Any]:
-    return cast(list[Any], value) if isinstance(value, list) else []
-
-
-def _metadata(resource: dict[str, object]) -> dict[str, Any]:
-    return _dict(resource.get("metadata"))
-
-
-def _annotations(resource: dict[str, object]) -> dict[str, str]:
-    return cast(dict[str, str], _metadata(resource).get("annotations", {}))
-
-
-def _job_state(job: dict[str, object], pods: list[dict[str, object]]) -> str:
-    status = _dict(job.get("status"))
-    if status.get("failed") or any(
-        _dict(condition).get("type") == "Failed" and _dict(condition).get("status") == "True"
-        for condition in _list(status.get("conditions"))
-    ):
-        return "failed"
-    if status.get("succeeded") or status.get("completionTime"):
-        return "stopped"
-    for pod in pods:
-        pod_status = _dict(pod.get("status"))
-        if pod_status.get("phase") == "Failed":
-            return "failed"
-        if pod_status.get("phase") == "Running" and any(
-            _dict(condition).get("type") == "Ready" and _dict(condition).get("status") == "True"
-            for condition in _list(pod_status.get("conditions"))
-        ):
-            return "running"
-    return "pending"
-
-
-def _pending_failure(job: dict[str, object], pods: list[dict[str, object]]) -> str | None:
-    summary = json.dumps({"job": job.get("status"), "pods": [pod.get("status") for pod in pods]}).lower()
-    if "imagepullbackoff" in summary or "errimagepull" in summary:
-        return "Sandbox image pull failed"
-    if "unschedulable" in summary:
-        return "Sandbox could not be scheduled"
-    if "quota" in summary or "failedcreate" in summary:
-        return "Sandbox creation was rejected by cluster quota or policy"
-    return None
+def _user_labels(resource: dict[str, object]) -> dict[str, str]:
+    encoded = resource_annotations(resource).get(USER_LABELS_ANNOTATION)
+    if encoded is None:
+        return {}
+    try:
+        labels = json.loads(encoded)
+    except (TypeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(labels, dict):
+        return {}
+    raw_labels = cast(dict[object, object], labels)
+    return {name: value for name, value in raw_labels.items() if isinstance(name, str) and isinstance(value, str)}
 
 
 class KubernetesSandboxBackend:
@@ -120,6 +91,8 @@ class KubernetesSandboxBackend:
         remote_exec: RemoteExec | None = None,
         egress_driver: EgressPolicyDriver | None = None,
         *,
+        resource_cache: ResourceCache | None = None,
+        pod_agent: PodDataPlane | None = None,
         wait: Callable[[float], Awaitable[None]] = asyncio.sleep,
         monotonic: Callable[[], float] = time.monotonic,
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
@@ -127,21 +100,31 @@ class KubernetesSandboxBackend:
     ) -> None:
         self.settings = settings
         self.api = api
-        self.remote_exec = remote_exec
         self.egress_driver = egress_driver
+        self.resource_cache = resource_cache
         self._wait = wait
         self._monotonic = monotonic
         self._now = now
         self._jitter: Callable[[float], float] = jitter or _default_jitter
+        self._activity_lock = asyncio.Lock()
+        self._activity_writes: dict[str, datetime] = {}
+        self.data_plane = SandboxDataPlane(
+            settings,
+            remote_exec,
+            pod_agent,
+            self._ready_pod_name,
+            self._ready_pod_endpoint,
+        )
 
     def _record(self, job: dict[str, object], state: str) -> SandboxRecord:
-        metadata = _metadata(job)
-        annotations = _annotations(job)
-        name = str(metadata.get("name", ""))
+        job_metadata = metadata(job)
+        job_annotations = resource_annotations(job)
+        name = str(job_metadata.get("name", ""))
         return SandboxRecord(
             id=name,
-            name=annotations.get(ORIGINAL_NAME_ANNOTATION, name),
+            name=job_annotations.get(ORIGINAL_NAME_ANNOTATION, name),
             state=state,
+            labels=_user_labels(job),
         )
 
     def _map_error(self, error: KubernetesApiError) -> SandboxError:
@@ -165,6 +148,8 @@ class KubernetesSandboxBackend:
         raise SandboxConnectionError("Kubernetes API retry attempts exhausted")
 
     async def _pods(self, resource_name: str) -> list[dict[str, object]]:
+        if self.resource_cache is not None:
+            return await self.resource_cache.pods(resource_name)
         return await self._call(
             lambda: self.api.list_pods(
                 self.settings.namespace,
@@ -177,16 +162,19 @@ class KubernetesSandboxBackend:
         resource_name: str,
         timeout: float,
     ) -> SandboxRecord:
+        if self.resource_cache is not None:
+            job, pods = await self.resource_cache.wait_ready(resource_name, timeout)
+            return self._record(job, job_state(job, pods))
         deadline = self._monotonic() + timeout
         while True:
             job = await self._call(lambda: self.api.get_job(self.settings.namespace, resource_name))
             if job is None:
                 raise SandboxNotFoundError(f"Sandbox disappeared during creation: {resource_name}")
             pods = await self._pods(resource_name)
-            failure = _pending_failure(job, pods)
+            failure = pending_failure(job, pods)
             if failure:
                 raise SandboxError(failure)
-            state = _job_state(job, pods)
+            state = job_state(job, pods)
             if state == "running":
                 return self._record(job, state)
             if state in {"failed", "stopped"}:
@@ -198,45 +186,33 @@ class KubernetesSandboxBackend:
     async def create_sandbox(self, request: SandboxCreateRequest) -> SandboxRecord:
         resource_name = sandbox_name(request.name)
         job_body = build_job(request, self.settings)
-        expected_fingerprint = _annotations(job_body)[FINGERPRINT_ANNOTATION]
-        existing = await self._call(lambda: self.api.get_job(self.settings.namespace, resource_name))
+        expected_fingerprint = resource_annotations(job_body)[FINGERPRINT_ANNOTATION]
+        if self.resource_cache is not None:
+            existing = await self.resource_cache.job(resource_name)
+        else:
+            existing = await self._call(lambda: self.api.get_job(self.settings.namespace, resource_name))
 
         if existing is not None:
-            if _annotations(existing).get(FINGERPRINT_ANNOTATION) != expected_fingerprint:
+            if resource_annotations(existing).get(FINGERPRINT_ANNOTATION) != expected_fingerprint:
                 raise SandboxConflictError(f"Sandbox {request.name} already exists with a conflicting specification")
-            await self._call(
-                lambda: self.api.create_network_policy(
-                    self.settings.namespace,
-                    build_ingress_policy(resource_name, self.settings.namespace),
-                )
-            )
             await self._touch(resource_name)
             return await self._wait_ready(resource_name, request.create_timeout)
 
-        ingress_created = False
         job_created = False
         ready = False
         try:
-            await self._call(
-                lambda: self.api.create_network_policy(
-                    self.settings.namespace,
-                    build_ingress_policy(resource_name, self.settings.namespace),
-                )
-            )
-            ingress_created = True
             try:
                 await self._call(lambda: self.api.create_job(self.settings.namespace, job_body))
             except SandboxError as error:
                 cause = error.__cause__
                 if not isinstance(cause, KubernetesApiError) or cause.status != 409:
                     raise
-                ingress_created = False
                 raced_job = await self._call(lambda: self.api.get_job(self.settings.namespace, resource_name))
                 if raced_job is None:
                     raise SandboxConnectionError(
                         f"Sandbox create conflicted but no Job was found: {resource_name}"
                     ) from error
-                if _annotations(raced_job).get(FINGERPRINT_ANNOTATION) != expected_fingerprint:
+                if resource_annotations(raced_job).get(FINGERPRINT_ANNOTATION) != expected_fingerprint:
                     raise SandboxConflictError(
                         f"Sandbox {request.name} already exists with a conflicting specification"
                     ) from error
@@ -248,28 +224,19 @@ class KubernetesSandboxBackend:
             return record
         finally:
             if not ready and job_created:
-                try:
+                with suppress(SandboxError):
                     await self._call(lambda: self.api.delete_job(self.settings.namespace, resource_name))
-                except SandboxError:
-                    pass
-            if not ready and ingress_created:
-                try:
-                    await self._call(
-                        lambda: self.api.delete_network_policy(
-                            self.settings.namespace,
-                            f"{resource_name}-ingress",
-                        )
-                    )
-                except SandboxError:
-                    pass
 
     async def get_sandbox(self, instance_id: str) -> SandboxRecord:
         resource_name = sandbox_name(instance_id)
-        job = await self._call(lambda: self.api.get_job(self.settings.namespace, resource_name))
+        if self.resource_cache is not None:
+            job = await self.resource_cache.job(resource_name)
+        else:
+            job = await self._call(lambda: self.api.get_job(self.settings.namespace, resource_name))
         if job is None:
             raise SandboxNotFoundError(f"Sandbox not found: {instance_id}")
         await self._touch(resource_name)
-        return self._record(job, _job_state(job, await self._pods(resource_name)))
+        return self._record(job, job_state(job, await self._pods(resource_name)))
 
     async def list_sandboxes(
         self,
@@ -289,10 +256,10 @@ class KubernetesSandboxBackend:
         )
         items: list[SandboxRecord] = []
         for job in cast(list[dict[str, object]], result.get("items", [])):
-            resource_name = str(_metadata(job).get("name", ""))
-            items.append(self._record(job, _job_state(job, await self._pods(resource_name))))
-        metadata = _dict(result.get("metadata"))
-        return SandboxListPage(items=items, continue_token=metadata.get("continue"))
+            resource_name = str(metadata(job).get("name", ""))
+            items.append(self._record(job, job_state(job, await self._pods(resource_name))))
+        page_metadata = resource_dict(result.get("metadata"))
+        return SandboxListPage(items=items, continue_token=page_metadata.get("continue"))
 
     async def delete_sandbox(self, instance_id: str) -> None:
         resource_name = sandbox_name(instance_id)
@@ -303,18 +270,12 @@ class KubernetesSandboxBackend:
                 f"{resource_name}-egress",
             ),
             lambda: self.api.delete_job(self.settings.namespace, resource_name),
-            lambda: self.api.delete_network_policy(self.settings.namespace, f"{resource_name}-ingress"),
         ]
         for operation in operations:
-            try:
+            with suppress(SandboxNotFoundError):
                 await self._call(operation)
-            except SandboxNotFoundError:
-                pass
-
-    def _remote_exec(self) -> RemoteExec:
-        if self.remote_exec is None:
-            raise SandboxError("Kubernetes remote exec is not configured")
-        return self.remote_exec
+        async with self._activity_lock:
+            self._activity_writes.pop(resource_name, None)
 
     def _egress_driver(self) -> EgressPolicyDriver:
         if self.egress_driver is None:
@@ -323,68 +284,48 @@ class KubernetesSandboxBackend:
 
     async def _touch(self, instance_id: str) -> None:
         resource_name = sandbox_name(instance_id)
-        await self._call(
-            lambda: self.api.patch_job(
-                self.settings.namespace,
-                resource_name,
-                {"metadata": {"annotations": {LAST_ACTIVITY_ANNOTATION: self._now().isoformat()}}},
+        now = self._now()
+        async with self._activity_lock:
+            last_write = self._activity_writes.get(resource_name)
+            if (
+                last_write is not None
+                and (now - last_write).total_seconds() < self.settings.activity_write_interval_seconds
+            ):
+                return
+            self._activity_writes[resource_name] = now
+        try:
+            await self._call(
+                lambda: self.api.patch_job(
+                    self.settings.namespace,
+                    resource_name,
+                    {"metadata": {"annotations": {LAST_ACTIVITY_ANNOTATION: now.isoformat()}}},
+                )
             )
-        )
+        except Exception:
+            async with self._activity_lock:
+                if self._activity_writes.get(resource_name) == now:
+                    self._activity_writes.pop(resource_name, None)
+            raise
 
     async def _ready_pod_name(self, instance_id: str) -> str:
         resource_name = sandbox_name(instance_id)
+        if self.resource_cache is not None:
+            return await self.resource_cache.ready_pod_name(resource_name)
         pods = await self._pods(resource_name)
         for pod in pods:
-            pod_status = _dict(pod.get("status"))
-            ready = pod_status.get("phase") == "Running" and any(
-                _dict(condition).get("type") == "Ready" and _dict(condition).get("status") == "True"
-                for condition in _list(pod_status.get("conditions"))
-            )
-            if ready:
-                name = _metadata(pod).get("name")
-                if isinstance(name, str) and name:
-                    return name
+            if name := ready_pod_name(pod):
+                return name
         raise SandboxConnectionError(f"Sandbox does not have a ready Pod: {instance_id}")
 
-    def _shell_command(self, request: CommandRequest, command_id: str) -> str:
-        env = validate_command_env(request.env_vars)
-        command = request.command
-        pid_file = f"/tmp/{command_id}.pid"
-        if request.timeout is not None:
-            command = f"timeout {request.timeout:g} sh -lc {shlex.quote(command)}"
-        if env:
-            assignments = " ".join(f"{name}={shlex.quote(value)}" for name, value in sorted(env.items()))
-            command = f"env {assignments} sh -lc {shlex.quote(command)}"
-        if request.cwd:
-            command = f"cd {shlex.quote(request.cwd)} && {command}"
-        return (
-            f"SANDBOX_COMMAND_ID={shlex.quote(command_id)}; export SANDBOX_COMMAND_ID; "
-            f"SANDBOX_COMMAND_PID_FILE={shlex.quote(pid_file)}; "
-            "printf '%s\\n' \"$$\" > \"$SANDBOX_COMMAND_PID_FILE\"; "
-            "trap 'exit 143' TERM INT; "
-            "trap 'rm -f \"$SANDBOX_COMMAND_PID_FILE\"' EXIT; "
-            f"{command}"
-        )
-
-    async def _stream_session(
-        self,
-        session: RemoteExecSession,
-    ) -> AsyncGenerator[CommandEvent, None]:
-        stdout_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-        stderr_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-        while session.is_open():
-            await session.update(0.1)
-            stdout = await session.read_stdout()
-            stderr = await session.read_stderr()
-            if stdout and (text := stdout_decoder.decode(stdout)):
-                yield CommandOutputEvent(type="stdout", data=text)
-            if stderr and (text := stderr_decoder.decode(stderr)):
-                yield CommandOutputEvent(type="stderr", data=text)
-        if text := stdout_decoder.decode(b"", final=True):
-            yield CommandOutputEvent(type="stdout", data=text)
-        if text := stderr_decoder.decode(b"", final=True):
-            yield CommandOutputEvent(type="stderr", data=text)
-        yield CommandExitEvent(type="exit", exit_code=session.return_code if session.return_code is not None else 1)
+    async def _ready_pod_endpoint(self, instance_id: str) -> PodEndpoint:
+        resource_name = sandbox_name(instance_id)
+        if self.resource_cache is not None:
+            return await self.resource_cache.ready_pod_endpoint(resource_name)
+        pods = await self._pods(resource_name)
+        for pod in pods:
+            if endpoint := ready_pod_endpoint(pod):
+                return endpoint
+        raise SandboxConnectionError(f"Sandbox does not have a ready Pod IP: {instance_id}")
 
     async def exec(self, instance_id: str, request: CommandRequest) -> ExecResponse:
         output: list[str] = []
@@ -404,29 +345,53 @@ class KubernetesSandboxBackend:
             await stream.aclose()
         return ExecResponse(exit_code=exit_code, output="".join(output))
 
+    async def _refresh_activity_after_interval(self, instance_id: str) -> None:
+        """Persist activity after one debounce interval while a command remains open.
+
+        Arguments
+        - instance_id: Sandbox identifier to refresh.
+        """
+        await self._wait(self.settings.activity_write_interval_seconds)
+        await self._touch(instance_id)
+
     async def command(
         self,
         instance_id: str,
         request: CommandRequest,
     ) -> AsyncGenerator[CommandEvent, None]:
         await self._touch(instance_id)
-        pod_name = await self._ready_pod_name(instance_id)
-        command_id = f"sandbox-command-{uuid.uuid4().hex}"
-        session = await self._remote_exec().open(
-            pod_name,
-            ["sh", "-lc", self._shell_command(request, command_id)],
-        )
-        stream_completed = False
+        stream = self.data_plane.command(instance_id, request)
+        pending_event: asyncio.Task[CommandEvent] | None = None
+        refresh_task: asyncio.Task[None] | None = None
         try:
-            async for event in self._stream_session(session):
+            pending_event = asyncio.create_task(anext(stream))
+            refresh_task = asyncio.create_task(self._refresh_activity_after_interval(instance_id))
+            while True:
+                completed, _ = await asyncio.wait(
+                    (pending_event, refresh_task),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if refresh_task in completed:
+                    refresh_task.result()
+                    refresh_task = asyncio.create_task(self._refresh_activity_after_interval(instance_id))
+                if pending_event not in completed:
+                    continue
+                try:
+                    event = pending_event.result()
+                except StopAsyncIteration:
+                    return
+                pending_event = asyncio.create_task(anext(stream))
                 yield event
-            stream_completed = True
         finally:
-            try:
-                await session.close()
-            finally:
-                if not stream_completed:
-                    await self._remote_exec().terminate(pod_name, command_id)
+            if pending_event is not None:
+                pending_event.cancel()
+            if refresh_task is not None:
+                refresh_task.cancel()
+            if pending_event is not None:
+                await asyncio.gather(pending_event, return_exceptions=True)
+            if refresh_task is not None:
+                await asyncio.gather(refresh_task, return_exceptions=True)
+            await stream.aclose()
 
     async def upload_file(
         self,
@@ -434,52 +399,13 @@ class KubernetesSandboxBackend:
         remote_path: str,
         chunks: AsyncIterable[bytes],
     ) -> None:
-        async def limited_chunks() -> AsyncGenerator[bytes, None]:
-            uploaded = 0
-            async for chunk in chunks:
-                uploaded += len(chunk)
-                if uploaded > self.settings.upload_limit_bytes:
-                    raise SandboxError(f"Upload exceeded {self.settings.upload_limit_bytes} bytes")
-                yield chunk
-
         await self._touch(instance_id)
-        pod_name = await self._ready_pod_name(instance_id)
-        parent = remote_path.rpartition("/")[0] or "."
-        shell_command = f"mkdir -p {shlex.quote(parent)} && base64 -d > {shlex.quote(remote_path)}"
-        session = await self._remote_exec().open(pod_name, ["sh", "-lc", shell_command], stdin=True)
-        try:
-            async for encoded in encode_base64_chunks(limited_chunks()):
-                await session.write_stdin(encoded.encode("ascii"))
-            await session.close_stdin()
-            async for event in self._stream_session(session):
-                if isinstance(event, CommandExitEvent) and event.exit_code != 0:
-                    raise SandboxError(f"Could not upload file: {remote_path}")
-        finally:
-            await session.close()
+        await self.data_plane.upload_file(instance_id, remote_path, chunks)
 
     async def stream_download(self, instance_id: str, remote_path: str) -> AsyncGenerator[bytes, None]:
         await self._touch(instance_id)
-        pod_name = await self._ready_pod_name(instance_id)
-        session = await self._remote_exec().open(
-            pod_name,
-            ["sh", "-lc", f"base64 {shlex.quote(remote_path)}"],
-        )
-
-        async def encoded_chunks() -> AsyncGenerator[bytes, None]:
-            while session.is_open():
-                await session.update(0.1)
-                if stdout := await session.read_stdout():
-                    yield stdout
-                if stderr := await session.read_stderr():
-                    raise SandboxError(f"Could not download file {remote_path}: {stderr.decode(errors='replace')}")
-
-        try:
-            async for chunk in decode_base64_chunks(encoded_chunks()):
-                yield chunk
-            if session.return_code not in {None, 0}:
-                raise SandboxError(f"Could not download file: {remote_path}")
-        finally:
-            await session.close()
+        async for chunk in self.data_plane.stream_download(instance_id, remote_path):
+            yield chunk
 
     async def modify_egress_rules(self, instance_id: str, allowed_addresses: list[str]) -> None:
         try:
@@ -501,7 +427,7 @@ class KubernetesSandboxBackend:
         deleted = 0
         while True:
             result = await self._call(
-                lambda: self.api.list_jobs(
+                lambda continue_token=continue_token: self.api.list_jobs(
                     self.settings.namespace,
                     f"{MANAGED_BY_LABEL}={MANAGED_BY_VALUE}",
                     100,
@@ -509,27 +435,29 @@ class KubernetesSandboxBackend:
                 )
             )
             for job in cast(list[dict[str, object]], result.get("items", [])):
-                annotations = _annotations(job)
+                job_annotations = resource_annotations(job)
                 try:
-                    interval_minutes = int(annotations.get(AUTO_STOP_ANNOTATION, "0"))
-                    last_activity = datetime.fromisoformat(annotations[LAST_ACTIVITY_ANNOTATION])
+                    interval_minutes = int(job_annotations.get(AUTO_STOP_ANNOTATION, "0"))
+                    last_activity = datetime.fromisoformat(job_annotations[LAST_ACTIVITY_ANNOTATION])
                 except (KeyError, TypeError, ValueError):
                     continue
                 if interval_minutes <= 0 or last_activity.tzinfo is None:
                     continue
-                if (now - last_activity).total_seconds() < interval_minutes * 60:
+                idle_threshold = interval_minutes * 60 + self.settings.activity_write_interval_seconds
+                if (now - last_activity).total_seconds() < idle_threshold:
                     continue
-                resource_name = _metadata(job).get("name")
+                resource_name = metadata(job).get("name")
                 if isinstance(resource_name, str) and resource_name:
                     await self.delete_sandbox(resource_name)
                     deleted += 1
-            metadata = _dict(result.get("metadata"))
-            token = metadata.get("continue")
+            page_metadata = resource_dict(result.get("metadata"))
+            token = page_metadata.get("continue")
             continue_token = token if isinstance(token, str) and token else None
             if continue_token is None:
                 return deleted
 
     async def close(self) -> None:
-        if self.remote_exec is not None:
-            await self.remote_exec.close()
+        if self.resource_cache is not None:
+            await self.resource_cache.close()
+        await self.data_plane.close()
         await self.api.close()

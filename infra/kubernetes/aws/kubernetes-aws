@@ -10,6 +10,9 @@ workload_root="$script_dir/../workload"
 aws_region="${AWS_REGION:-us-east-2}"
 deployment_name="${KUBERNETES_DEPLOYMENT_NAME:-cbs-kubernetes-smoke}"
 dind_source_image="${DIND_SOURCE_IMAGE:-docker:28.3.3-dind}"
+scale_profile="${KUBERNETES_SCALE_PROFILE:-smoke}"
+destroy_retry_delay_seconds="${KUBERNETES_DESTROY_RETRY_DELAY_SECONDS:-10}"
+foundation_destroy_max_attempts=3
 
 fail() {
   printf 'Error: %s\n' "$1" >&2
@@ -29,6 +32,152 @@ require_commands() {
   done
 }
 
+configure_scale_profile() {
+  local configured_ami_alias="${KARPENTER_AMI_ALIAS:-${karpenter_ami_alias:-}}"
+
+  case "$scale_profile" in
+    smoke)
+      karpenter_ami_alias="${configured_ami_alias:-al2023@latest}"
+      karpenter_capacity_types='["on-demand"]'
+      create_spot_service_linked_role=false
+      nat_gateway_per_az=false
+      system_node_min_size=1
+      system_node_max_size=2
+      system_node_desired_size=1
+      coredns_replica_count=2
+      control_replicas=3
+      activity_write_interval_seconds=30
+      exec_connection_pool_size=1024
+      namespace_pod_quota=20
+      namespace_cpu_quota=8
+      namespace_cpu_limit_quota=80
+      namespace_memory_quota=16Gi
+      namespace_memory_limit_quota=160Gi
+      namespace_storage_quota=100Gi
+      namespace_storage_limit_quota=800Gi
+      karpenter_cpu_limit=64
+      karpenter_memory_limit=128Gi
+      karpenter_root_volume_size=100Gi
+      ;;
+    scale-100-spot)
+      [[ "$configured_ami_alias" =~ ^al2023@v[0-9]{8}$ ]] || fail \
+        "KARPENTER_AMI_ALIAS must pin al2023@vYYYYMMDD for $scale_profile."
+      karpenter_ami_alias="$configured_ami_alias"
+      karpenter_capacity_types='["spot"]'
+      create_spot_service_linked_role=true
+      nat_gateway_per_az=false
+      system_node_min_size=2
+      system_node_max_size=3
+      system_node_desired_size=2
+      coredns_replica_count=2
+      control_replicas=3
+      activity_write_interval_seconds=30
+      exec_connection_pool_size=1024
+      namespace_pod_quota=150
+      namespace_cpu_quota=160
+      namespace_cpu_limit_quota=350
+      namespace_memory_quota=160Gi
+      namespace_memory_limit_quota=600Gi
+      namespace_storage_quota=700Gi
+      namespace_storage_limit_quota=3000Gi
+      karpenter_cpu_limit=256
+      karpenter_memory_limit=512Gi
+      karpenter_root_volume_size=250Gi
+      required_vcpu_quota=256
+      required_vcpu_quota_label=256
+      ;;
+    scale-250-spot)
+      [[ "$configured_ami_alias" =~ ^al2023@v[0-9]{8}$ ]] || fail \
+        "KARPENTER_AMI_ALIAS must pin al2023@vYYYYMMDD for $scale_profile."
+      karpenter_ami_alias="$configured_ami_alias"
+      karpenter_capacity_types='["spot"]'
+      create_spot_service_linked_role=true
+      nat_gateway_per_az=false
+      system_node_min_size=2
+      system_node_max_size=3
+      system_node_desired_size=2
+      coredns_replica_count=2
+      control_replicas=3
+      activity_write_interval_seconds=30
+      exec_connection_pool_size=1024
+      namespace_pod_quota=300
+      namespace_cpu_quota=400
+      namespace_cpu_limit_quota=900
+      namespace_memory_quota=400Gi
+      namespace_memory_limit_quota=1500Gi
+      namespace_storage_quota=2000Gi
+      namespace_storage_limit_quota=7500Gi
+      karpenter_cpu_limit=512
+      karpenter_memory_limit=1024Gi
+      karpenter_root_volume_size=250Gi
+      required_vcpu_quota=512
+      required_vcpu_quota_label=512
+      ;;
+    scale-500-spot)
+      [[ "$configured_ami_alias" =~ ^al2023@v[0-9]{8}$ ]] || fail \
+        "KARPENTER_AMI_ALIAS must pin al2023@vYYYYMMDD for $scale_profile."
+      karpenter_ami_alias="$configured_ami_alias"
+      karpenter_capacity_types='["spot"]'
+      create_spot_service_linked_role=true
+      nat_gateway_per_az=false
+      system_node_min_size=3
+      system_node_max_size=3
+      system_node_desired_size=3
+      coredns_replica_count=2
+      control_replicas=3
+      activity_write_interval_seconds=30
+      exec_connection_pool_size=1024
+      namespace_pod_quota=600
+      namespace_cpu_quota=800
+      namespace_cpu_limit_quota=1800
+      namespace_memory_quota=800Gi
+      namespace_memory_limit_quota=3000Gi
+      namespace_storage_quota=4000Gi
+      namespace_storage_limit_quota=15000Gi
+      karpenter_cpu_limit=1024
+      karpenter_memory_limit=2048Gi
+      karpenter_root_volume_size=250Gi
+      required_vcpu_quota=1024
+      required_vcpu_quota_label=1,024
+      ;;
+    scale-2000|scale-2000-spot)
+      [[ "$configured_ami_alias" =~ ^al2023@v[0-9]{8}$ ]] || fail \
+        "KARPENTER_AMI_ALIAS must pin al2023@vYYYYMMDD for $scale_profile."
+      karpenter_ami_alias="$configured_ami_alias"
+      if [[ "$scale_profile" == "scale-2000-spot" ]]; then
+        karpenter_capacity_types='["spot"]'
+        create_spot_service_linked_role=true
+      else
+        karpenter_capacity_types='["on-demand"]'
+        create_spot_service_linked_role=false
+      fi
+      nat_gateway_per_az=true
+      system_node_min_size=3
+      system_node_max_size=6
+      system_node_desired_size=3
+      coredns_replica_count=6
+      control_replicas=6
+      activity_write_interval_seconds=300
+      exec_connection_pool_size=1024
+      namespace_pod_quota=2200
+      namespace_cpu_quota=5000
+      namespace_cpu_limit_quota=8500
+      namespace_memory_quota=9000Gi
+      namespace_memory_limit_quota=17000Gi
+      namespace_storage_quota=44000Gi
+      namespace_storage_limit_quota=82000Gi
+      karpenter_cpu_limit=5000
+      karpenter_memory_limit=10000Gi
+      karpenter_root_volume_size=500Gi
+      required_vcpu_quota=5000
+      required_vcpu_quota_label=5,000
+      ;;
+    *)
+      fail "KUBERNETES_SCALE_PROFILE must be smoke, scale-100-spot, scale-250-spot, scale-500-spot, scale-2000, or scale-2000-spot."
+      ;;
+  esac
+}
+
 validate_inputs() {
   require_value AWS_ACCOUNT_ID
   require_value AWS_OPERATOR_CIDR
@@ -36,8 +185,10 @@ validate_inputs() {
 
   [[ "$AWS_PROFILE" == "vals-dev" ]] || fail "AWS_PROFILE must be vals-dev."
   [[ "$AWS_ACCOUNT_ID" =~ ^[0-9]{12}$ ]] || fail "AWS_ACCOUNT_ID must be a 12-digit account ID."
-  [[ "$deployment_name" =~ ^[a-z][a-z0-9-]{2,31}$ ]] || fail \
-    "KUBERNETES_DEPLOYMENT_NAME must be a 3-32 character lowercase DNS label."
+  [[ "$deployment_name" =~ ^[a-z][a-z0-9-]{2,24}$ ]] || fail \
+    "KUBERNETES_DEPLOYMENT_NAME must be a 3-25 character lowercase DNS label."
+  [[ "$destroy_retry_delay_seconds" =~ ^[0-9]+$ ]] || fail \
+    "KUBERNETES_DESTROY_RETRY_DELAY_SECONDS must be a non-negative integer."
 
   uv run python - "$AWS_OPERATOR_CIDR" >/dev/null <<'PY'
 import ipaddress
@@ -56,6 +207,7 @@ configure_paths() {
   workload_state="$state_dir/workload.tfstate"
   foundation_plan="$state_dir/foundation.tfplan"
   workload_plan="$state_dir/workload.tfplan"
+  plan_input_file="$state_dir/foundation-plan.env"
   runtime_file="$runtime_dir/deployment.env"
 }
 
@@ -76,6 +228,7 @@ validate_identity() {
 preflight() {
   require_commands
   validate_inputs
+  configure_scale_profile
   configure_paths
   validate_identity
 }
@@ -87,7 +240,88 @@ initialize_and_validate_roots() {
   terraform -chdir="$workload_root" validate
 }
 
+write_plan_inputs() {
+  local temporary_plan_input_file="$plan_input_file.tmp"
+
+  umask 077
+  {
+    printf 'planned_aws_account_id=%q\n' "$AWS_ACCOUNT_ID"
+    printf 'planned_aws_profile=%q\n' "$AWS_PROFILE"
+    printf 'planned_aws_region=%q\n' "$aws_region"
+    printf 'planned_deployment_name=%q\n' "$deployment_name"
+    printf 'planned_operator_cidr=%q\n' "$AWS_OPERATOR_CIDR"
+    printf 'planned_scale_profile=%q\n' "$scale_profile"
+    printf 'planned_karpenter_ami_alias=%q\n' "$karpenter_ami_alias"
+    printf 'planned_karpenter_capacity_types=%q\n' "$karpenter_capacity_types"
+    printf 'planned_nat_gateway_per_az=%q\n' "$nat_gateway_per_az"
+  } > "$temporary_plan_input_file"
+  chmod 600 "$temporary_plan_input_file"
+  mv -f -- "$temporary_plan_input_file" "$plan_input_file"
+}
+
+require_unchanged_plan_inputs() {
+  [[ -f "$plan_input_file" ]] || fail "Foundation plan inputs not found. Run plan again."
+  # shellcheck disable=SC1090
+  source "$plan_input_file"
+
+  [[ "${planned_aws_account_id:-}" == "$AWS_ACCOUNT_ID" ]] || fail "AWS_ACCOUNT_ID changed since plan."
+  [[ "${planned_aws_profile:-}" == "$AWS_PROFILE" ]] || fail "AWS_PROFILE changed since plan."
+  [[ "${planned_aws_region:-}" == "$aws_region" ]] || fail "AWS_REGION changed since plan."
+  [[ "${planned_deployment_name:-}" == "$deployment_name" ]] || fail \
+    "KUBERNETES_DEPLOYMENT_NAME changed since plan."
+  [[ "${planned_operator_cidr:-}" == "$AWS_OPERATOR_CIDR" ]] || fail \
+    "AWS_OPERATOR_CIDR changed since plan."
+  [[ "${planned_scale_profile:-}" == "$scale_profile" ]] || fail \
+    "KUBERNETES_SCALE_PROFILE changed since plan."
+  [[ "${planned_karpenter_ami_alias:-}" == "$karpenter_ami_alias" ]] || fail \
+    "KARPENTER_AMI_ALIAS changed since plan."
+  [[ "${planned_karpenter_capacity_types:-}" == "$karpenter_capacity_types" ]] || fail \
+    "Karpenter capacity types changed since plan."
+  [[ "${planned_nat_gateway_per_az:-}" == "$nat_gateway_per_az" ]] || fail \
+    "NAT topology changed since plan."
+}
+
+check_scale_quotas() {
+  local quota_code
+  local quota_name
+  local vcpu_quota
+
+  case "$scale_profile" in
+    scale-2000)
+      quota_code="L-1216C47A"
+      quota_name="Standard On-Demand"
+      ;;
+    scale-100-spot|scale-250-spot|scale-500-spot|scale-2000-spot)
+      quota_code="L-34B43A08"
+      quota_name="Standard Spot"
+      ;;
+    *) return 0 ;;
+  esac
+
+  vcpu_quota="$(aws service-quotas get-service-quota \
+    --profile vals-dev \
+    --region "$aws_region" \
+    --service-code ec2 \
+    --quota-code "$quota_code" \
+    --query Quota.Value \
+    --output text)" || fail "Unable to read the EC2 $quota_name vCPU quota."
+  if ! uv run python - "$vcpu_quota" "$karpenter_cpu_limit" >/dev/null <<'PY'
+from decimal import Decimal, InvalidOperation
+import sys
+
+try:
+    sufficient = Decimal(sys.argv[1]) >= Decimal(sys.argv[2])
+except InvalidOperation:
+    sufficient = False
+raise SystemExit(0 if sufficient else 1)
+PY
+  then
+    fail "$scale_profile requires at least $required_vcpu_quota_label $quota_name vCPUs in $aws_region."
+  fi
+}
+
 plan_foundation() {
+  check_scale_quotas
   mkdir -p "$state_dir"
   initialize_and_validate_roots
   terraform -chdir="$foundation_root" plan \
@@ -97,7 +331,14 @@ plan_foundation() {
     -var="aws_profile=vals-dev" \
     -var="aws_region=$aws_region" \
     -var="deployment_name=$deployment_name" \
-    -var="operator_cidr=$AWS_OPERATOR_CIDR"
+    -var="operator_cidr=$AWS_OPERATOR_CIDR" \
+    -var="system_node_min_size=$system_node_min_size" \
+    -var="system_node_max_size=$system_node_max_size" \
+    -var="system_node_desired_size=$system_node_desired_size" \
+    -var="coredns_replica_count=$coredns_replica_count" \
+    -var="create_spot_service_linked_role=$create_spot_service_linked_role" \
+    -var="nat_gateway_per_az=$nat_gateway_per_az"
+  write_plan_inputs
   printf '%s\n' \
     "Foundation plan saved. The workload plan is created after foundation apply because its Kubernetes provider needs the live API endpoint."
 }
@@ -133,6 +374,8 @@ resolve_ecr_digest() {
 
 write_foundation_runtime_contents() {
   printf 'runtime_phase=foundation\n'
+  printf 'scale_profile=%q\n' "$scale_profile"
+  printf 'karpenter_ami_alias=%q\n' "$karpenter_ami_alias"
   printf 'aws_region=%q\n' "$aws_region"
   printf 'operator_cidr=%q\n' "$operator_cidr"
   printf 'cluster_name=%q\n' "$cluster_name"
@@ -215,6 +458,8 @@ write_runtime_file() {
   umask 077
   {
     printf 'runtime_phase=%q\n' "$saved_runtime_phase"
+    printf 'scale_profile=%q\n' "$scale_profile"
+    printf 'karpenter_ami_alias=%q\n' "$karpenter_ami_alias"
     printf 'api_token=%q\n' "$api_token"
     printf 'aws_region=%q\n' "$aws_region"
     printf 'operator_cidr=%q\n' "$AWS_OPERATOR_CIDR"
@@ -235,6 +480,8 @@ transition_to_workload_runtime() {
   umask 077
   {
     printf 'runtime_phase=workload\n'
+    printf 'scale_profile=%q\n' "$scale_profile"
+    printf 'karpenter_ami_alias=%q\n' "$karpenter_ami_alias"
     printf 'api_token=%q\n' "$api_token"
     printf 'aws_region=%q\n' "$aws_region"
     printf 'operator_cidr=%q\n' "$AWS_OPERATOR_CIDR"
@@ -255,6 +502,7 @@ load_runtime_file() {
   [[ -f "$runtime_file" ]] || fail "Runtime file not found: $runtime_file. Run deploy first."
   # shellcheck disable=SC1090
   source "$runtime_file"
+  configure_scale_profile
   [[ "${runtime_phase:-}" == "foundation" || "${runtime_phase:-}" == "workload" ]] || fail \
     "Runtime deployment phase is invalid."
   [[ -n "${cluster_name:-}" ]] || fail "Runtime cluster name is invalid."
@@ -276,17 +524,20 @@ deploy_stack() {
   local repository_name
   local registry_host
   local commit_sha
+  local control_source_hash
   local control_tag
   local dind_tag="dind-28.3.3"
   local control_tagged_image
   local dind_tagged_image
   local control_digest
   local dind_digest
+  local cilium_status
 
   [[ -f "$foundation_plan" ]] || fail "Foundation plan not found. Run plan first."
   require_value TEST_KUBERNETES_IMAGE
   [[ "$TEST_KUBERNETES_IMAGE" =~ ^[A-Za-z0-9][A-Za-z0-9._:/-]*@sha256:[0-9a-f]{64}$ ]] || fail \
     "TEST_KUBERNETES_IMAGE must be a sha256 digest reference."
+  require_unchanged_plan_inputs
   initialize_and_validate_roots
 
   cluster_name="$deployment_name-eks"
@@ -309,7 +560,14 @@ deploy_stack() {
     | docker login --username AWS --password-stdin "$registry_host"
 
   commit_sha="$(git -C "$repository_root" rev-parse --short=12 HEAD)"
-  control_tag="control-$commit_sha"
+  control_source_hash="$(
+    cd "$repository_root"
+    {
+      printf '%s\n' infra/kubernetes/Dockerfile.control pyproject.toml uv.lock README.md .python-version Makefile
+      find src cli templates infra/kubernetes/agent -type f
+    } | LC_ALL=C sort | git hash-object --stdin-paths | git hash-object --stdin
+  )"
+  control_tag="control-$commit_sha-${control_source_hash:0:12}"
   control_tagged_image="$image_repository_url:$control_tag"
   if ! ecr_image_exists "$repository_name" "$control_tag"; then
     docker build \
@@ -344,9 +602,27 @@ deploy_stack() {
 
   TF_VAR_kubeconfig_path="$kubeconfig_path" \
     TF_VAR_kubeconfig_context="$kube_context" \
+    TF_VAR_cluster_name="$cluster_name" \
+    TF_VAR_karpenter_queue_name="$cluster_name-karpenter" \
+    TF_VAR_karpenter_node_iam_role_name="$cluster_name-karpenter" \
+    TF_VAR_karpenter_ami_alias="$karpenter_ami_alias" \
+    TF_VAR_karpenter_capacity_types="$karpenter_capacity_types" \
     TF_VAR_control_image="$control_image" \
     TF_VAR_docker_image="$docker_image" \
     TF_VAR_allowed_image_prefixes="$allowed_image_prefixes" \
+    TF_VAR_control_replicas="$control_replicas" \
+    TF_VAR_activity_write_interval_seconds="$activity_write_interval_seconds" \
+    TF_VAR_exec_connection_pool_size="$exec_connection_pool_size" \
+    TF_VAR_namespace_pod_quota="$namespace_pod_quota" \
+    TF_VAR_namespace_cpu_quota="$namespace_cpu_quota" \
+    TF_VAR_namespace_cpu_limit_quota="$namespace_cpu_limit_quota" \
+    TF_VAR_namespace_memory_quota="$namespace_memory_quota" \
+    TF_VAR_namespace_memory_limit_quota="$namespace_memory_limit_quota" \
+    TF_VAR_namespace_storage_quota="$namespace_storage_quota" \
+    TF_VAR_namespace_storage_limit_quota="$namespace_storage_limit_quota" \
+    TF_VAR_karpenter_cpu_limit="$karpenter_cpu_limit" \
+    TF_VAR_karpenter_memory_limit="$karpenter_memory_limit" \
+    TF_VAR_karpenter_root_volume_size="$karpenter_root_volume_size" \
     TF_VAR_api_token="$api_token" \
     terraform -chdir="$workload_root" plan \
       -state="$workload_state" \
@@ -359,6 +635,10 @@ deploy_stack() {
 
   kubectl --context "$kube_context" -n kube-system \
     rollout status daemonset/cilium --timeout=15m
+  cilium_status="$(kubectl --context "$kube_context" -n kube-system \
+    exec daemonset/cilium -c cilium-agent -- cilium-dbg status)"
+  [[ "$cilium_status" =~ Encryption:[[:space:]]+Wireguard ]] || fail \
+    "Cilium did not report WireGuard encryption as enabled."
   kubectl --context "$kube_context" -n benchmark-sandboxes \
     rollout status deployment/kubernetes-sandbox-control --timeout=15m
 }
@@ -389,12 +669,12 @@ run_live_test() {
   trap cleanup_port_forward EXIT INT TERM
 
   for attempt in $(seq 1 30); do
-    if curl --fail --silent --show-error http://127.0.0.1:8080/health >/dev/null; then
+    if curl --fail --silent --show-error http://127.0.0.1:8080/ready >/dev/null; then
       kill -0 "$port_forward_pid" 2>/dev/null || fail "The kubectl port-forward process exited."
       break
     fi
     if [[ "$attempt" == "30" ]]; then
-      fail "The Kubernetes control service did not become healthy."
+      fail "The Kubernetes control service did not become ready."
     fi
     sleep 2
   done
@@ -440,6 +720,15 @@ tagged_resource_is_live() {
         --query 'NatGateways[0].State' \
         --output text)" || fail "Unable to verify tagged AWS resource $tagged_arn."
       [[ -n "$resource_value" && "$resource_value" != "None" && "$resource_value" != "deleted" ]]
+      ;;
+    vpc-endpoint)
+      resource_value="$(aws ec2 describe-vpc-endpoints \
+        --profile vals-dev \
+        --region "$aws_region" \
+        --filters "Name=vpc-endpoint-id,Values=$resource_id" \
+        --query 'VpcEndpoints[0].VpcEndpointId' \
+        --output text)" || fail "Unable to verify tagged AWS resource $tagged_arn."
+      [[ -n "$resource_value" && "$resource_value" != "None" ]]
       ;;
     vpc)
       resource_value="$(aws ec2 describe-vpcs \
@@ -490,6 +779,37 @@ tagged_resource_is_live() {
   esac
 }
 
+destroy_foundation() {
+  local attempt
+
+  for ((attempt = 1; attempt <= foundation_destroy_max_attempts; attempt++)); do
+    if TF_VAR_aws_account_id="$AWS_ACCOUNT_ID" \
+      TF_VAR_aws_profile="vals-dev" \
+      TF_VAR_aws_region="$aws_region" \
+      TF_VAR_deployment_name="$deployment_name" \
+      TF_VAR_operator_cidr="$operator_cidr" \
+      TF_VAR_system_node_min_size="$system_node_min_size" \
+      TF_VAR_system_node_max_size="$system_node_max_size" \
+      TF_VAR_system_node_desired_size="$system_node_desired_size" \
+      TF_VAR_coredns_replica_count="$coredns_replica_count" \
+      TF_VAR_create_spot_service_linked_role="$create_spot_service_linked_role" \
+      TF_VAR_nat_gateway_per_az="$nat_gateway_per_az" \
+      terraform -chdir="$foundation_root" destroy \
+        -auto-approve \
+        -state="$foundation_state"; then
+      return 0
+    fi
+
+    if [[ "$attempt" == "$foundation_destroy_max_attempts" ]]; then
+      return 1
+    fi
+
+    printf 'Foundation destroy attempt %s failed; retrying in %s seconds.\n' \
+      "$attempt" "$destroy_retry_delay_seconds" >&2
+    sleep "$destroy_retry_delay_seconds"
+  done
+}
+
 destroy_stack() {
   local namespace_name
   local tagged_arns
@@ -505,9 +825,27 @@ destroy_stack() {
     require_workload_runtime
     TF_VAR_kubeconfig_path="$kubeconfig_path" \
       TF_VAR_kubeconfig_context="$kube_context" \
+      TF_VAR_cluster_name="$cluster_name" \
+      TF_VAR_karpenter_queue_name="$cluster_name-karpenter" \
+      TF_VAR_karpenter_node_iam_role_name="$cluster_name-karpenter" \
+      TF_VAR_karpenter_ami_alias="$karpenter_ami_alias" \
+      TF_VAR_karpenter_capacity_types="$karpenter_capacity_types" \
       TF_VAR_control_image="$control_image" \
       TF_VAR_docker_image="$docker_image" \
       TF_VAR_allowed_image_prefixes="$allowed_image_prefixes" \
+      TF_VAR_control_replicas="$control_replicas" \
+      TF_VAR_activity_write_interval_seconds="$activity_write_interval_seconds" \
+      TF_VAR_exec_connection_pool_size="$exec_connection_pool_size" \
+      TF_VAR_namespace_pod_quota="$namespace_pod_quota" \
+      TF_VAR_namespace_cpu_quota="$namespace_cpu_quota" \
+      TF_VAR_namespace_cpu_limit_quota="$namespace_cpu_limit_quota" \
+      TF_VAR_namespace_memory_quota="$namespace_memory_quota" \
+      TF_VAR_namespace_memory_limit_quota="$namespace_memory_limit_quota" \
+      TF_VAR_namespace_storage_quota="$namespace_storage_quota" \
+      TF_VAR_namespace_storage_limit_quota="$namespace_storage_limit_quota" \
+      TF_VAR_karpenter_cpu_limit="$karpenter_cpu_limit" \
+      TF_VAR_karpenter_memory_limit="$karpenter_memory_limit" \
+      TF_VAR_karpenter_root_volume_size="$karpenter_root_volume_size" \
       TF_VAR_api_token="$api_token" \
       terraform -chdir="$workload_root" destroy \
         -auto-approve \
@@ -521,14 +859,7 @@ destroy_stack() {
     transition_to_foundation_runtime
   fi
 
-  TF_VAR_aws_account_id="$AWS_ACCOUNT_ID" \
-    TF_VAR_aws_profile="vals-dev" \
-    TF_VAR_aws_region="$aws_region" \
-    TF_VAR_deployment_name="$deployment_name" \
-    TF_VAR_operator_cidr="$operator_cidr" \
-    terraform -chdir="$foundation_root" destroy \
-      -auto-approve \
-      -state="$foundation_state"
+  destroy_foundation
 
   tagged_arns="$(aws resourcegroupstaggingapi get-resources \
     --profile vals-dev \

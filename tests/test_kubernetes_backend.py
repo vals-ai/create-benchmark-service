@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections import deque
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterable
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
@@ -16,11 +16,11 @@ from benchmark_service.sandbox.kubernetes.control.backend import SandboxConflict
 from benchmark_service.sandbox.kubernetes.control.egress import CiliumEgressPolicyDriver
 from benchmark_service.sandbox.kubernetes.control.kubernetes import KubernetesSandboxBackend
 from benchmark_service.sandbox.kubernetes.control.remote_exec import (
-    KubernetesRemoteExec,
     RemoteExecSession,
     decode_base64_chunks,
     encode_base64_chunks,
 )
+from benchmark_service.sandbox.kubernetes.control.resource_data import PodEndpoint
 from benchmark_service.sandbox.kubernetes.control.resources import (
     MANAGED_BY_LABEL,
     MANAGED_BY_VALUE,
@@ -28,18 +28,18 @@ from benchmark_service.sandbox.kubernetes.control.resources import (
     user_label_key,
 )
 from benchmark_service.sandbox.kubernetes.control.settings import KubernetesControlSettings
-from benchmark_service.sandbox.types import (
-    SandboxCreateRequest,
-    SandboxError,
-    SandboxConnectionError,
-    ImageSource,
-    Resources,
-    SandboxNotFoundError,
-)
 from benchmark_service.sandbox.kubernetes.protocol import (
     CommandExitEvent,
     CommandOutputEvent,
     CommandRequest,
+)
+from benchmark_service.sandbox.types import (
+    ImageSource,
+    Resources,
+    SandboxConnectionError,
+    SandboxCreateRequest,
+    SandboxError,
+    SandboxNotFoundError,
 )
 
 DIGEST = "a" * 64
@@ -52,6 +52,8 @@ class MockKubernetesApi:
         self.jobs: dict[str, dict[str, object]] = {}
         self.pods: dict[str, list[dict[str, object]]] = {}
         self.operations: list[tuple[str, object]] = []
+        self.activity_patch_count = 0
+        self.activity_refreshed = asyncio.Event()
         self.list_result: dict[str, object] | None = None
         self.get_error: KubernetesApiError | None = None
         self.ready_on_create = True
@@ -88,6 +90,9 @@ class MockKubernetesApi:
 
     async def patch_job(self, namespace: str, name: str, body: dict[str, object]) -> None:
         self.operations.append(("patch_job", (namespace, name, body)))
+        self.activity_patch_count += 1
+        if self.activity_patch_count >= 2:
+            self.activity_refreshed.set()
         if name in self.jobs:
             patch_annotations = cast(dict[str, Any], _metadata(body).get("annotations", {}))
             annotations = cast(
@@ -127,6 +132,47 @@ class MockKubernetesApi:
         self.closed = True
 
 
+class MockResourceCache:
+    """Return watched resources and record cache use."""
+
+    def __init__(self, job: dict[str, object], pod: dict[str, object]) -> None:
+        self.job_value = job
+        self.pod = pod
+        self.operations: list[str] = []
+        self.closed = False
+
+    async def job(self, resource_name: str) -> dict[str, object] | None:
+        self.operations.append(f"job:{resource_name}")
+        return self.job_value
+
+    async def pods(self, resource_name: str) -> list[dict[str, object]]:
+        self.operations.append(f"pods:{resource_name}")
+        return [self.pod]
+
+    async def wait_ready(
+        self,
+        resource_name: str,
+        timeout: float,
+    ) -> tuple[dict[str, object], list[dict[str, object]]]:
+        del timeout
+        self.operations.append(f"wait:{resource_name}")
+        return self.job_value, [self.pod]
+
+    async def ready_pod_name(self, resource_name: str) -> str:
+        self.operations.append(f"ready:{resource_name}")
+        return str(_metadata(self.pod)["name"])
+
+    async def ready_pod_endpoint(self, resource_name: str) -> PodEndpoint:
+        self.operations.append(f"endpoint:{resource_name}")
+        return PodEndpoint(
+            name=str(_metadata(self.pod)["name"]),
+            ip=str(cast(dict[str, object], self.pod["status"])["podIP"]),
+        )
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 def _metadata(resource: dict[str, object]) -> dict[str, Any]:
     value = resource["metadata"]
     assert isinstance(value, dict)
@@ -159,7 +205,11 @@ def _request(**changes: object) -> SandboxCreateRequest:
 def _ready_pod(name: str) -> dict[str, object]:
     return {
         "metadata": {"name": f"{name}-pod"},
-        "status": {"phase": "Running", "conditions": [{"type": "Ready", "status": "True"}]},
+        "status": {
+            "phase": "Running",
+            "podIP": "10.0.0.8",
+            "conditions": [{"type": "Ready", "status": "True"}],
+        },
     }
 
 
@@ -170,7 +220,7 @@ class TestKubernetesSandboxBackendLifecycle:
         """Reconcile deterministic Jobs without leaking caller cluster control.
 
         Test cases:
-        - Ingress is created before a Job and readiness returns a running record.
+        - Job readiness returns a running record without per-sandbox ingress writes.
         - Matching retries reuse while conflicting specifications fail.
         - Listing preserves selectors and continuation; delete removes every owned resource.
         """
@@ -186,7 +236,8 @@ class TestKubernetesSandboxBackendLifecycle:
         await backend.delete_sandbox(created.id)
 
         assert created == reused and created.state == "running"
-        assert first_create_operations.index("create_ingress") < first_create_operations.index("create_job")
+        assert created.labels == request.labels
+        assert "create_ingress" not in first_create_operations
         assert first_create_operations.count("create_job") == 1
         assert page.continue_token == "next" and [item.id for item in page.items] == [created.id]
         list_call = next(value for name, value in api.operations if name == "list_jobs")
@@ -198,7 +249,7 @@ class TestKubernetesSandboxBackendLifecycle:
         )
         assert ("delete_custom", ("benchmark-sandboxes", "ciliumnetworkpolicies", "task-1-egress")) in api.operations
         assert ("delete_job", ("benchmark-sandboxes", "task-1")) in api.operations
-        assert ("delete_ingress", ("benchmark-sandboxes", "task-1-ingress")) in api.operations
+        assert not any(name == "delete_ingress" for name, _ in api.operations)
 
         conflicting = _request(resources=Resources(vcpu=3, memory=4, disk=20))
         api.jobs["task-1"] = build_job(request, _settings())
@@ -212,18 +263,58 @@ class TestKubernetesSandboxBackendLifecycle:
         assert raced.id == "task-1"
         assert sum(name == "create_job" for name, _ in race_api.operations) == 1
 
+    async def test_uses_shared_watch_cache_for_readiness_and_pod_state(self) -> None:
+        """Avoid request-driven Kubernetes reads when the production cache is available.
+
+        Test cases:
+        - Create readiness, get, and list use the shared watched state.
+        - No get-Job or list-Pod API calls are made for those operations.
+        - Backend shutdown closes the watches before the API client.
+        """
+        api = MockKubernetesApi()
+        request = _request()
+        job = build_job(request, _settings())
+        pod = _ready_pod("task-1")
+        cache = MockResourceCache(job, pod)
+        api.list_result = {"items": [job], "metadata": {}}
+        backend = KubernetesSandboxBackend(_settings(), api, resource_cache=cache)
+
+        created = await backend.create_sandbox(request)
+        fetched = await backend.get_sandbox("task-1")
+        listed = await backend.list_sandboxes({}, 10, None)
+        await backend.close()
+
+        assert created.state == fetched.state == listed.items[0].state == "running"
+        assert "wait:task-1" in cache.operations
+        assert cache.operations.count("pods:task-1") == 2
+        assert not any(name in {"get_job", "list_pods"} for name, _ in api.operations)
+        assert cache.closed is True
+
     async def test_reports_pending_failures_states_and_api_errors(self) -> None:
         """Translate readiness and API failures into stable sandbox errors.
 
         Test cases:
-        - Image pull and scheduling failures have actionable messages.
+        - Image pull failures have an actionable message.
         - Missing resources and API authorization/availability use shared errors.
         - Completed and failed Jobs produce stable states.
         """
         request = _request()
         cases = [
-            ({"containerStatuses": [{"state": {"waiting": {"reason": "ImagePullBackOff"}}}]}, "image pull"),
-            ({"conditions": [{"reason": "Unschedulable", "message": "no nodes"}]}, "scheduled"),
+            (
+                {
+                    "containerStatuses": [
+                        {
+                            "state": {
+                                "waiting": {
+                                    "reason": "ErrImagePull",
+                                    "message": "pull access denied for registry.internal/private",
+                                }
+                            }
+                        }
+                    ]
+                },
+                "image pull",
+            ),
         ]
         for pod_status, message in cases:
             api = MockKubernetesApi()
@@ -263,7 +354,7 @@ class TestKubernetesSandboxBackendLifecycle:
         with pytest.raises(SandboxConnectionError, match="Timed out"):
             await timeout_backend.create_sandbox(_request(create_timeout=1))
         assert "task-1" not in timeout_api.jobs
-        assert ("delete_ingress", ("benchmark-sandboxes", "task-1-ingress")) in timeout_api.operations
+        assert not any(name == "delete_ingress" for name, _ in timeout_api.operations)
 
         await backend.close()
         assert api.closed is True
@@ -322,7 +413,7 @@ class MockRemoteExecSession:
         self.closed = True
 
 
-class BlockingRemoteExecSession(MockRemoteExecSession):
+class MockBlockingRemoteExecSession(MockRemoteExecSession):
     """Hold one exec update until the consumer cancels."""
 
     def __init__(self) -> None:
@@ -336,7 +427,7 @@ class BlockingRemoteExecSession(MockRemoteExecSession):
 
 
 class MockRemoteExec:
-    """Select fake sessions by remote command and record quoted arguments."""
+    """Select mock sessions by remote command and record quoted arguments."""
 
     def __init__(self) -> None:
         self.command_sessions: deque[MockRemoteExecSession] = deque()
@@ -371,115 +462,68 @@ class MockRemoteExec:
         self.closed = True
 
 
-class FakeExecWebsocket:
-    """Record remote-exec writes and closure."""
+class MockPodAgent:
+    """Record direct Pod command and file traffic."""
 
     def __init__(self) -> None:
-        self.sent: list[bytes] = []
+        self.calls: list[tuple[str, object]] = []
         self.closed = False
 
-    async def send_bytes(self, data: bytes) -> None:
-        self.sent.append(data)
+    async def command(
+        self,
+        pod_ip: str,
+        resource_name: str,
+        request: CommandRequest,
+    ) -> AsyncGenerator[CommandOutputEvent | CommandExitEvent, None]:
+        self.calls.append(("command", (pod_ip, resource_name, request)))
+        yield CommandOutputEvent(type="stdout", data="direct")
+        yield CommandExitEvent(type="exit", exit_code=0)
+
+    async def upload_file(
+        self,
+        pod_ip: str,
+        resource_name: str,
+        remote_path: str,
+        chunks: AsyncIterable[bytes],
+    ) -> None:
+        self.calls.append(("upload", (pod_ip, resource_name, remote_path, b"".join([chunk async for chunk in chunks]))))
+
+    async def stream_download(
+        self,
+        pod_ip: str,
+        resource_name: str,
+        remote_path: str,
+    ) -> AsyncGenerator[bytes, None]:
+        self.calls.append(("download", (pod_ip, resource_name, remote_path)))
+        yield b"direct-file"
 
     async def close(self) -> None:
         self.closed = True
 
 
-class FakeWebsocketContext:
-    """Expose a WebSocket through aiohttp's request-context shape."""
+class MockBlockingPodAgent(MockPodAgent):
+    """Hold a direct command open without producing output."""
 
     def __init__(self) -> None:
-        self.websocket = FakeExecWebsocket()
-        self.entered = 0
-        self.exited = 0
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
 
-    async def __aenter__(self) -> FakeExecWebsocket:
-        self.entered += 1
-        return self.websocket
-
-    async def __aexit__(self, *args: object) -> None:
-        del args
-        self.exited += 1
-        await self.websocket.close()
-
-
-class FakeExecCore:
-    """Return the request context used by kubernetes_asyncio remote exec."""
-
-    def __init__(self, request_context: FakeWebsocketContext) -> None:
-        self.request_context = request_context
-
-    async def connect_get_namespaced_pod_exec(self, *args: object, **kwargs: object) -> FakeWebsocketContext:
-        del args, kwargs
-        return self.request_context
-
-
-class RecordingKubernetesRemoteExec(KubernetesRemoteExec):
-    """Record commands passed through the concrete termination method."""
-
-    def __init__(self, session: RemoteExecSession) -> None:
-        self.session = session
-        self.commands: list[list[str]] = []
-
-    async def open(
+    async def command(
         self,
-        pod_name: str,
-        command: list[str],
-        *,
-        stdin: bool = False,
-    ) -> RemoteExecSession:
-        del pod_name, stdin
-        self.commands.append(command)
-        return self.session
+        pod_ip: str,
+        resource_name: str,
+        request: CommandRequest,
+    ) -> AsyncGenerator[CommandOutputEvent | CommandExitEvent, None]:
+        self.calls.append(("command", (pod_ip, resource_name, request)))
+        self.started.set()
+        await self.release.wait()
+        yield CommandExitEvent(type="exit", exit_code=0)
 
 
 async def _chunks(values: list[bytes]) -> AsyncGenerator[bytes, None]:
     for value in values:
         yield value
-
-
-class TestKubernetesRemoteExec:
-    """Kubernetes WebSocket lifecycle behavior."""
-
-    async def test_enters_and_exits_websocket_request_context(self) -> None:
-        """Use the WebSocket response inside its aiohttp request context.
-
-        Test cases:
-        - Opening enters the request context before sending channel frames.
-        - Closing exits the request context exactly once.
-        """
-        request_context = FakeWebsocketContext()
-        remote_exec = KubernetesRemoteExec.__new__(KubernetesRemoteExec)
-        remote_exec.settings = _settings()
-        cast(Any, remote_exec)._core = FakeExecCore(request_context)
-
-        session = await remote_exec.open("task-1-pod", ["true"], stdin=True)
-        await session.write_stdin(b"input")
-        await session.close()
-        await session.close()
-
-        assert request_context.entered == 1
-        assert request_context.websocket.sent == [b"\x00input"]
-        assert request_context.exited == 1
-
-    async def test_termination_uses_pid_file_and_shell_builtins(self) -> None:
-        """Terminate the recorded process tree without image-specific tools.
-
-        Test cases:
-        - The cleanup command reads the command-specific PID file.
-        - Descendants are walked through procfs without relying on pkill.
-        """
-        command_id = "sandbox-command-abc123"
-        session = MockRemoteExecSession([(b"", b"", 0)])
-        remote_exec = RecordingKubernetesRemoteExec(session)
-
-        await remote_exec.terminate("task-1-pod", command_id)
-
-        shell_command = remote_exec.commands[0][-1]
-        assert "/tmp/sandbox-command-abc123.pid" in shell_command
-        assert "/proc/$target_pid/task/$target_pid/children" in shell_command
-        assert "kill -TERM" in shell_command
-        assert "pkill" not in shell_command
 
 
 class TestKubernetesSandboxBackendStreaming:
@@ -530,7 +574,7 @@ class TestKubernetesSandboxBackendStreaming:
         assert "SECRET='value; $(false)'" in shell_command
         assert "timeout 3" in shell_command
         assert "SANDBOX_COMMAND_PID_FILE=/tmp/sandbox-command-" in shell_command
-        assert "printf '%s\\n' \"$$\" > \"$SANDBOX_COMMAND_PID_FILE\"" in shell_command
+        assert 'printf \'%s\\n\' "$$" > "$SANDBOX_COMMAND_PID_FILE"' in shell_command
         assert command_session.closed is True
 
         limited_remote = MockRemoteExec()
@@ -542,7 +586,7 @@ class TestKubernetesSandboxBackendStreaming:
         assert limited_remote.sessions[0].closed is True
 
         cancelled_remote = MockRemoteExec()
-        blocking_session = BlockingRemoteExecSession()
+        blocking_session = MockBlockingRemoteExecSession()
         cancelled_remote.command_sessions.append(blocking_session)
         cancelled_backend = KubernetesSandboxBackend(_settings(), api, cancelled_remote)
         stream = cancelled_backend.command("task-1", CommandRequest(command="sleep 30"))
@@ -612,6 +656,97 @@ class TestKubernetesSandboxBackendStreaming:
             await limited_backend.upload_file("task-1", path, _chunks([b"123", b"45"]))
         assert limited_remote.sessions[0].closed is True
 
+    async def test_uses_direct_pod_agent_when_configured(self) -> None:
+        """Keep command and file bytes away from Kubernetes exec.
+
+        Test cases:
+        - Watched Pod IP state selects the direct authenticated data plane.
+        - Commands, uploads, and downloads do not open Kubernetes exec sessions.
+        - Backend shutdown closes the Pod HTTP pool.
+        """
+        api = MockKubernetesApi()
+        request = _request()
+        job = build_job(request, _settings())
+        pod = _ready_pod("task-1")
+        cache = MockResourceCache(job, pod)
+        agent = MockPodAgent()
+        backend = KubernetesSandboxBackend(
+            _settings(),
+            api,
+            resource_cache=cache,
+            pod_agent=agent,
+        )
+
+        events = [event async for event in backend.command("task-1", CommandRequest(command="true"))]
+        await backend.upload_file("task-1", "/workspace/file.bin", _chunks([b"up", b"load"]))
+        downloaded = [chunk async for chunk in backend.stream_download("task-1", "/workspace/file.bin")]
+        await backend.close()
+
+        assert isinstance(events[0], CommandOutputEvent) and events[0].data == "direct"
+        assert isinstance(events[-1], CommandExitEvent) and events[-1].exit_code == 0
+        assert agent.calls == [
+            ("command", ("10.0.0.8", "task-1", CommandRequest(command="true"))),
+            ("upload", ("10.0.0.8", "task-1", "/workspace/file.bin", b"upload")),
+            ("download", ("10.0.0.8", "task-1", "/workspace/file.bin")),
+        ]
+        assert downloaded == [b"direct-file"]
+        assert cache.operations.count("endpoint:task-1") == 3
+        assert agent.closed is True
+
+    async def test_refreshes_activity_while_command_is_quiet(self) -> None:
+        """Keep a live command from being mistaken for an idle sandbox.
+
+        Test cases:
+        - Activity is refreshed while a direct command produces no output.
+        - The command stays open during the refresh and completes normally afterward.
+        """
+        api = MockKubernetesApi()
+        settings = _settings().model_copy(update={"activity_write_interval_seconds": 30})
+        job = build_job(_request(), settings)
+        api.jobs["task-1"] = job
+        cache = MockResourceCache(job, _ready_pod("task-1"))
+        agent = MockBlockingPodAgent()
+        refresh_waiting = asyncio.Event()
+        release_refresh = asyncio.Event()
+        wait_calls = 0
+        current_time = [datetime(2026, 7, 22, tzinfo=UTC)]
+
+        async def controlled_wait(seconds: float) -> None:
+            nonlocal wait_calls
+            assert seconds == 30
+            wait_calls += 1
+            if wait_calls == 1:
+                refresh_waiting.set()
+                await release_refresh.wait()
+                return
+            await asyncio.Event().wait()
+
+        backend = KubernetesSandboxBackend(
+            settings,
+            api,
+            resource_cache=cache,
+            pod_agent=agent,
+            wait=controlled_wait,
+            now=lambda: current_time[0],
+        )
+        stream = backend.command("task-1", CommandRequest(command="sleep 120"))
+        event_task = asyncio.create_task(anext(stream))
+        await agent.started.wait()
+        await asyncio.wait_for(refresh_waiting.wait(), timeout=0.1)
+
+        current_time[0] += timedelta(seconds=31)
+        release_refresh.set()
+        await asyncio.wait_for(api.activity_refreshed.wait(), timeout=0.1)
+
+        assert not event_task.done()
+        assert api.activity_patch_count == 2
+
+        agent.release.set()
+        event = await event_task
+        await stream.aclose()
+
+        assert isinstance(event, CommandExitEvent) and event.exit_code == 0
+
 
 class TestKubernetesSandboxBackendEgressAndCleanup:
     """Temporary egress and idle sandbox cleanup behavior."""
@@ -621,18 +756,21 @@ class TestKubernetesSandboxBackendEgressAndCleanup:
 
         Test cases:
         - Mixed domains and CIDRs replace one Cilium policy.
-        - Successful replace and clear refresh the sandbox activity timestamp.
+        - Activity writes inside the debounce interval are coalesced.
+        - Activity after the debounce interval persists a new timestamp.
         - Clear deletes only the egress policy.
         """
         api = MockKubernetesApi()
         request = _request()
         api.jobs["task-1"] = build_job(request, _settings())
-        now = datetime(2026, 7, 21, 12, tzinfo=UTC)
+        current_time = [datetime(2026, 7, 21, 12, tzinfo=UTC)]
         egress = CiliumEgressPolicyDriver(_settings(), api)
-        backend = KubernetesSandboxBackend(_settings(), api, egress_driver=egress, now=lambda: now)
+        backend = KubernetesSandboxBackend(_settings(), api, egress_driver=egress, now=lambda: current_time[0])
 
         await backend.modify_egress_rules("task-1", ["api.example.com", "10.0.0.3/24"])
         await backend.clear_egress_rules("task-1")
+        current_time[0] += timedelta(seconds=31)
+        await backend.modify_egress_rules("task-1", ["api.example.com"])
 
         replace_index = next(index for index, item in enumerate(api.operations) if item[0] == "replace_custom")
         first_patch_index = next(index for index, item in enumerate(api.operations) if item[0] == "patch_job")
@@ -657,9 +795,11 @@ class TestKubernetesSandboxBackendEgressAndCleanup:
         settings = _settings()
         now = datetime(2026, 7, 21, 12, tzinfo=UTC)
         expired = _request(name="expired", auto_stop_interval=1)
+        debounce_grace = _request(name="debounce-grace", auto_stop_interval=1)
         retained = _request(name="retained", auto_stop_interval=0)
         malformed = _request(name="malformed", auto_stop_interval=1)
         api.jobs["expired"] = build_job(expired, settings, now=now - timedelta(minutes=2))
+        api.jobs["debounce-grace"] = build_job(debounce_grace, settings, now=now - timedelta(seconds=75))
         api.jobs["retained"] = build_job(retained, settings, now=now - timedelta(days=1))
         api.jobs["malformed"] = build_job(malformed, settings, now=now - timedelta(days=1))
         _metadata(api.jobs["malformed"])["annotations"]["sandbox.vals.ai/last-activity"] = "not-a-date"
@@ -667,4 +807,4 @@ class TestKubernetesSandboxBackendEgressAndCleanup:
 
         assert await backend.delete_idle_sandboxes(now) == 1
         assert await backend.delete_idle_sandboxes(now) == 0
-        assert set(api.jobs) == {"retained", "malformed"}
+        assert set(api.jobs) == {"debounce-grace", "retained", "malformed"}

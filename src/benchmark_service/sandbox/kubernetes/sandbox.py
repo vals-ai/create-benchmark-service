@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Mapping
 
+from benchmark_service.sandbox.kubernetes.protocol import SandboxRecord
 from benchmark_service.sandbox.kubernetes.runtime import KubernetesRuntimeDriver
 from benchmark_service.sandbox.types import ExecResult, Sandbox, validate_command_env
 
@@ -15,23 +16,31 @@ class KubernetesSandbox(Sandbox):
         name: str,
         state: str,
         driver: KubernetesRuntimeDriver,
+        labels: Mapping[str, str] | None = None,
     ) -> None:
-        self._instance_id = instance_id
-        self._name = name
-        self._state = state
+        self._sandbox = SandboxRecord(
+            id=instance_id,
+            name=name,
+            state=state,
+            labels=dict(labels or {}),
+        )
         self._driver = driver
 
     @property
     def id(self) -> str:
-        return self._instance_id
+        return self._sandbox.id
 
     @property
     def name(self) -> str:
-        return self._name
+        return self._sandbox.name
 
     @property
     def state(self) -> str:
-        return self._state
+        return self._sandbox.state
+
+    @property
+    def labels(self) -> dict[str, str]:
+        return self._sandbox.labels
 
     async def exec(
         self,

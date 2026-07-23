@@ -204,6 +204,10 @@ class StreamErrorChunk(BaseModel):
 
     type: Literal["error"] = Field(description="Chunk type identifier")
     data: str = Field(description="Error message")
+    recovery: Literal["none", "fresh_sandbox"] = Field(
+        default="none",
+        description="Recovery action the benchmark service requests",
+    )
 
 
 class StreamEvalResumeStateChunk(BaseModel):

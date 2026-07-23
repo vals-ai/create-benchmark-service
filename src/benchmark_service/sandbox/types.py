@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import re
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class ImageSource(BaseModel):
@@ -17,13 +18,45 @@ class SnapshotSource(BaseModel):
     snapshot: str
 
 
-SandboxSource = Annotated[ImageSource | SnapshotSource, Field(discriminator="type")]
+BaseSandboxSource = Annotated[ImageSource | SnapshotSource, Field(discriminator="type")]
+
+
+class ComposeSource(BaseModel):
+    type: Literal["compose"] = "compose"
+    outer: BaseSandboxSource
+    service: str = "main"
+    compose_command: str = "docker compose"
+
+
+SandboxSource = Annotated[ImageSource | SnapshotSource | ComposeSource, Field(discriminator="type")]
+
+_ENV_VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_RESERVED_COMMAND_ENV_NAMES = frozenset({"LANG", "TERM"})
+
+
+def validate_command_env(env_vars: Mapping[str, str] | None) -> dict[str, str]:
+    env = dict(env_vars or {})
+    invalid_names = [name for name in env if _ENV_VAR_NAME.fullmatch(name) is None]
+    if invalid_names:
+        raise ValueError(f"Invalid environment variable names: {', '.join(invalid_names)}")
+    reserved_names = sorted(env.keys() & _RESERVED_COMMAND_ENV_NAMES)
+    if reserved_names:
+        raise ValueError(f"Reserved command environment variable names: {', '.join(reserved_names)}")
+    return env
 
 
 class Resources(BaseModel):
     vcpu: int = Field(description="Logical sandbox CPU count")
     memory: int = Field(description="Sandbox memory")
     disk: int = Field(description="Sandbox ephemeral disk")
+    gpu: int = Field(default=0, ge=0, description="Number of GPUs to allocate")
+    gpu_type: str | None = Field(default=None, description="GPU type to allocate, e.g. 'H100' (provider-specific)")
+
+    @model_validator(mode="after")
+    def _validate_gpu(self) -> Self:
+        if self.gpu_type is not None and self.gpu < 1:
+            raise ValueError("gpu_type requires gpu >= 1")
+        return self
 
 
 class SandboxCreateRequest(BaseModel):
@@ -101,6 +134,7 @@ class Sandbox(ABC):
         *,
         cwd: str | None = None,
         timeout: float | None = None,
+        env_vars: Mapping[str, str] | None = None,
     ) -> AsyncGenerator[str, None]: ...
 
     @abstractmethod
@@ -108,6 +142,20 @@ class Sandbox(ABC):
 
     @abstractmethod
     async def download_file(self, remote_path: str) -> bytes: ...
+
+    async def stream_download(self, remote_path: str) -> AsyncGenerator[bytes, None]:
+        """Stream a file's content in chunks without buffering the whole file in memory.
+
+        Providers that support chunked reads should override this; the default falls back
+        to a full in-memory download.
+        """
+        yield await self.download_file(remote_path)
+
+    async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
+        raise SandboxError("Sandbox provider does not support modifying egress rules")
+
+    async def clear_egress_rules(self) -> None:
+        raise SandboxError("Sandbox provider does not support modifying egress rules")
 
 
 class SandboxProvider(ABC):

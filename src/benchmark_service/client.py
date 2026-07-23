@@ -294,6 +294,7 @@ class BenchmarkServiceClient:
         task_id: str,
         response: str,
         dataset: str | None = None,
+        sandbox_provider: SandboxProviderConfig | None = None,
     ) -> Any:
         """Evaluate a text response without a live sandbox.
 
@@ -301,8 +302,14 @@ class BenchmarkServiceClient:
             task_id: The task to evaluate.
             response: The agent's response to evaluate.
             dataset: Optional dataset name.
+            sandbox_provider: Optional request-scoped provider config when evaluation creates a sandbox.
         """
-        request = EvaluateResponseRequest(task_id=task_id, response=response, dataset=dataset)
+        request = EvaluateResponseRequest(
+            task_id=task_id,
+            response=response,
+            sandbox_provider=sandbox_provider,
+            dataset=dataset,
+        )
         body = request.model_dump(exclude_none=True)
 
         resp = await self._http_client.post(
@@ -328,9 +335,19 @@ class BenchmarkServiceClient:
         on_message: Callable[[str], None] | None = None,
         dataset: str | None = None,
         on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
+        sandbox_provider: SandboxProviderConfig | None = None,
     ) -> dict[str, Any]:
-        """Resume evaluation from state previously streamed by the benchmark service."""
-        request = EvaluateResponseRequest(task_id=task_id, eval_resume_state=eval_resume_state, dataset=dataset)
+        """Resume evaluation from state previously streamed by the benchmark service.
+
+        ``sandbox_provider`` is sent only with this request; benchmark-owned
+        ``eval_resume_state`` remains independently persistable.
+        """
+        request = EvaluateResponseRequest(
+            task_id=task_id,
+            eval_resume_state=eval_resume_state,
+            sandbox_provider=sandbox_provider,
+            dataset=dataset,
+        )
         return await self._websocket_request("evaluate-response", request, on_message, on_eval_resume_state)
 
     async def evaluate_instance(

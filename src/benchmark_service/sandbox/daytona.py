@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import shlex
 import uuid
+from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import suppress
 from typing import Any, Literal
@@ -19,6 +20,9 @@ from daytona import (
     SandboxState,
 )
 from daytona import (
+    GpuType,
+)
+from daytona import (
     Resources as DaytonaResources,
 )
 from daytona.common.errors import (
@@ -28,10 +32,20 @@ from daytona.common.errors import (
     DaytonaRateLimitError,
     DaytonaTimeoutError,
 )
+from daytona.common.pty import PtyResult
 from daytona.handle.async_pty_handle import AsyncPtyHandle
 from pydantic import BaseModel
-from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_exponential, wait_fixed
+from tenacity import (
+    RetryCallState,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_chain,
+    wait_exponential,
+    wait_random,
+)
 
+from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
     ExecResult,
     ImageSource,
@@ -45,19 +59,28 @@ from benchmark_service.sandbox.types import (
     SandboxProvider,
     SandboxQuery,
     SnapshotSource,
+    validate_command_env,
 )
 
 _PTY_STATUS_CHECK_ATTEMPTS = 30
+_PTY_STATUS_POLL_SECONDS = 5
+_PTY_STDOUT_TAIL_MAX_BYTES = 64 * 1024
 _STATUS_DIR = "/tmp/.sandbox-provider"
 _REMOVED_SANDBOX_STATES = (SandboxState.DESTROYING, SandboxState.DESTROYED)
 _FAILED_SANDBOX_STATES = (SandboxState.ERROR, SandboxState.BUILD_FAILED)
-_DEAD_SANDBOX_STATES = (*_REMOVED_SANDBOX_STATES, SandboxState.STOPPED, *_FAILED_SANDBOX_STATES)
+_DEAD_SANDBOX_STATES = (
+    *_REMOVED_SANDBOX_STATES,
+    SandboxState.STOPPED,
+    *_FAILED_SANDBOX_STATES,
+)
+_DELETE_WITHOUT_START_STATES = (*_DEAD_SANDBOX_STATES, SandboxState.ARCHIVED)
 _SANDBOX_OPERATION_ERRORS = (DaytonaError, ClientResponseError)
 _TRANSIENT_DAYTONA_ERRORS = (DaytonaConnectionError, DaytonaRateLimitError, DaytonaTimeoutError)
 _RETRY_AFTER_PREFIX = "retry-after-"
 _KNOWN_THROTTLERS = ("sandbox-create", "sandbox-lifecycle", "authenticated", "anonymous")
 _DELETE_CONFLICT_MESSAGES = ("state change in progress", "modified by another operation")
 _REMOVED_SANDBOX_CLIENT_STATUSES = (404, 502)
+_RETRYABLE_PROVIDER_STATUSES = (408, 429, 500, 502, 503, 504)
 _FAILED_EXECUTE_COMMAND_PREFIX = "failed to execute command:"
 # Daytona sometimes flattens a transport failure into a bare DaytonaError message with no chained
 # cause; these substrings recover those cases by text when no typed cause survives to match.
@@ -66,11 +89,32 @@ _TRANSPORT_ERROR_MESSAGES = (
     "[errno 32] broken pipe",
     "[errno 9] bad file descriptor",
     "502 bad gateway",
+    "an unexpected error occurred.",
+    "failed to register with sysbox-mgr",
     "server disconnected",
+    "temporary authentication service error",
 )
 _RETRYABLE_DAYTONA_CAUSES = (ClientConnectionError, ConnectionError, TimeoutError)
-_FIXED_PROVIDER_WAIT = wait_fixed(2)
+_PROVIDER_RETRY_DELAYS_SECONDS = (5, 25, 90, 300, 420)
+_FIXED_PROVIDER_WAIT = wait_chain(
+    *(wait_random(delay * 0.9, delay) for delay in _PROVIDER_RETRY_DELAYS_SECONDS)
+)
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
+
+
+def _pty_result_summary(result: PtyResult | None) -> str:
+    if result is None:
+        return "unavailable"
+    error = result.error[:200] if result.error else None
+    return f"exit_code={result.exit_code}, error={error!r}"
+
+
+def _resolve_daytona_allowed_addresses(allowed_addresses: list[str]) -> tuple[list[str], list[str]]:
+    cidrs, domains = resolve_allowed_addresses(allowed_addresses)
+    if cidrs and domains:
+        raise ValueError("allowed addresses cannot mix domains and CIDRs")
+
+    return cidrs, domains
 
 
 class DaytonaProviderConfig(BaseModel):
@@ -90,6 +134,19 @@ class DaytonaProviderConfig(BaseModel):
 
     def create_provider(self) -> SandboxProvider:
         return DaytonaSandboxProvider(self)
+
+
+def _daytona_gpu_type(gpu_type: str | None) -> GpuType | None:
+    if gpu_type is None:
+        return None
+    try:
+        member = GpuType(gpu_type)
+    except ValueError:
+        member = GpuType.UNKNOWN_DEFAULT_OPEN_API
+    if member is GpuType.UNKNOWN_DEFAULT_OPEN_API:
+        supported = ", ".join(t.value for t in GpuType if t is not GpuType.UNKNOWN_DEFAULT_OPEN_API)
+        raise SandboxError(f"Unsupported Daytona GPU type: {gpu_type}. Supported types: {supported}")
+    return member
 
 
 def _get_config_header(headers: Mapping[str, str], *names: str) -> str | None:
@@ -159,8 +216,16 @@ def _has_retryable_cause(exc: BaseException) -> bool:
     return False
 
 
+def _provider_status_code(exc: DaytonaError | ClientResponseError) -> int | None:
+    if isinstance(exc, ClientResponseError):
+        return exc.status
+    return exc.status_code
+
+
 def _is_transient_daytona_error(exc: DaytonaError | ClientResponseError) -> bool:
     if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS) or _has_retryable_cause(exc):
+        return True
+    if _provider_status_code(exc) in _RETRYABLE_PROVIDER_STATUSES:
         return True
     return _message_contains(exc, _TRANSPORT_ERROR_MESSAGES)
 
@@ -206,7 +271,7 @@ def daytona_retry_after_seconds(exc: DaytonaRateLimitError) -> float | None:
 
 _PROVIDER_RETRY = retry(
     retry=retry_if_exception_type(SandboxConnectionError),
-    stop=stop_after_attempt(3),
+    stop=stop_after_attempt(len(_PROVIDER_RETRY_DELAYS_SECONDS) + 1),
     wait=_provider_retry_wait,
     reraise=True,
 )
@@ -264,9 +329,11 @@ class DaytonaSandbox(Sandbox):
         *,
         cwd: str | None = None,
         timeout: float | None = None,
+        env_vars: Mapping[str, str] | None = None,
     ) -> AsyncGenerator[str, None]:
+        env = validate_command_env(env_vars)
         output: asyncio.Queue[str] = asyncio.Queue()
-        exec_task = asyncio.create_task(self._exec_pty(_command(command, cwd, timeout), output))
+        exec_task = asyncio.create_task(self._exec_pty(_command(command, cwd, timeout), output, env))
 
         try:
             while not exec_task.done():
@@ -302,37 +369,94 @@ class DaytonaSandbox(Sandbox):
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
 
-    async def _exec_pty(self, command: str, output: asyncio.Queue[str]) -> ExecResult:
+    async def stream_download(self, remote_path: str) -> AsyncGenerator[bytes, None]:
+        try:
+            stream = await self._sandbox.fs.download_file_stream(remote_path)
+            async for chunk in stream:
+                yield chunk
+        except _SANDBOX_OPERATION_ERRORS as exc:
+            raise self._sandbox_error(exc) from exc
+
+    @_PROVIDER_RETRY
+    async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
+        network_allow_list, domain_allow_list = _resolve_daytona_allowed_addresses(allowed_addresses)
+
+        try:
+            await self._sandbox.update_network_settings(
+                network_allow_list=",".join(network_allow_list),
+                domain_allow_list=",".join(domain_allow_list),
+            )
+        except _SANDBOX_OPERATION_ERRORS as exc:
+            raise self._sandbox_error(exc) from exc
+
+    @_PROVIDER_RETRY
+    async def clear_egress_rules(self) -> None:
+        try:
+            await self._sandbox.update_network_settings(
+                network_block_all=False,
+                network_allow_list="",
+                domain_allow_list="",
+            )
+        except _SANDBOX_OPERATION_ERRORS as exc:
+            raise self._sandbox_error(exc) from exc
+
+    async def _exec_pty(self, command: str, output: asyncio.Queue[str], env_vars: dict[str, str]) -> ExecResult:
         session_id = f"{self.id}:exec-{uuid.uuid4().hex}"
         status_path = f"{_STATUS_DIR}/{uuid.uuid4().hex}.status"
-        stdout: list[str] = []
+        # Keep only a bounded tail of the output for the ExecResult; the full stream is
+        # forwarded through the queue, so retaining it all would grow without limit on
+        # long-running, chatty commands.
+        stdout: deque[str] = deque()
+        stdout_bytes = 0
         handle: AsyncPtyHandle | None = None
+        wait_task: asyncio.Task[PtyResult] | None = None
 
         async def on_data(data: bytes) -> None:
+            nonlocal stdout_bytes
             text = data.decode("utf-8", errors="replace")
             stdout.append(text)
+            stdout_bytes += len(text)
+            while stdout_bytes > _PTY_STDOUT_TAIL_MAX_BYTES and len(stdout) > 1:
+                stdout_bytes -= len(stdout.popleft())
             output.put_nowait(text)
 
         try:
-            handle = await self._create_pty_session(session_id, on_data)
+            handle = await self._create_pty_session(session_id, on_data, env_vars)
             await handle.send_input("stty -echo\n")
             await handle.send_input(
                 f"mkdir -p {shlex.quote(_STATUS_DIR)}; {command}; echo $? > {shlex.quote(status_path)}; exit\n"
             )
-            with suppress(Exception):
-                await handle.wait()
+            wait_task = asyncio.create_task(handle.wait())
 
-            for _ in range(_PTY_STATUS_CHECK_ATTEMPTS):
+            reconnect_attempts = 0
+            while True:
+                done, _ = await asyncio.wait({wait_task}, timeout=_PTY_STATUS_POLL_SECONDS)
                 await self._check_sandbox_alive()
                 result = await self.exec(f"test -e {shlex.quote(status_path)}")
                 if result.exit_code == 0:
                     break
-                handle = await self._reconnect_pty(session_id, on_data)
-                await asyncio.sleep(1)
-            else:
-                raise SandboxConnectionError(
-                    f"Daytona PTY command did not write an exit code for {self._sandbox_ref}: session_id={session_id}"
-                )
+
+                if not done:
+                    continue
+
+                reconnect_attempts += 1
+                if reconnect_attempts == _PTY_STATUS_CHECK_ATTEMPTS:
+                    raise SandboxConnectionError(
+                        f"Daytona PTY command did not write an exit code for {self._sandbox_ref}: "
+                        f"session_id={session_id}"
+                    )
+
+                wait_result: PtyResult | None = None
+                with suppress(Exception):
+                    wait_result = await wait_task
+                if wait_result is not None and wait_result.exit_code not in (None, 0):
+                    raise SandboxError(
+                        f"Daytona PTY exited before writing command status for {self._sandbox_ref}: "
+                        f"session_id={session_id}, {_pty_result_summary(wait_result)}"
+                    )
+                await handle.disconnect()
+                handle = await self._reconnect_pty(session_id, on_data, wait_result)
+                wait_task = asyncio.create_task(handle.wait())
 
             result = await self.exec(f"cat {shlex.quote(status_path)}")
             if result.exit_code != 0 or not result.output:
@@ -343,6 +467,10 @@ class DaytonaSandbox(Sandbox):
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
         finally:
+            if wait_task:
+                wait_task.cancel()
+                with suppress(Exception, asyncio.CancelledError):
+                    await wait_task
             if handle:
                 with suppress(Exception):
                     await handle.disconnect()
@@ -356,12 +484,13 @@ class DaytonaSandbox(Sandbox):
         self,
         session_id: str,
         on_data: Callable[[bytes], Awaitable[None]],
+        env_vars: dict[str, str],
     ) -> AsyncPtyHandle:
         try:
             return await self._sandbox.process.create_pty_session(
                 id=session_id,
                 on_data=on_data,
-                envs={"TERM": "dumb", "LANG": "C.UTF-8"},
+                envs={"TERM": "dumb", "LANG": "C.UTF-8", **env_vars},
             )
         except _SANDBOX_OPERATION_ERRORS as exc:
             await self._check_sandbox_alive()
@@ -372,22 +501,17 @@ class DaytonaSandbox(Sandbox):
         self,
         session_id: str,
         on_data: Callable[[bytes], Awaitable[None]],
+        wait_result: PtyResult | None,
     ) -> AsyncPtyHandle:
         try:
             await self._sandbox.process.get_pty_session_info(session_id)
-            handle = await self._sandbox.process.connect_pty_session(session_id, on_data)
-            with suppress(Exception):
-                await handle.wait()
-            return handle
-        except DaytonaNotFoundError as exc:
-            raise SandboxError(
-                f"Daytona PTY session no longer exists for {self._sandbox_ref}: session_id={session_id}"
-            ) from exc
-        except DaytonaConnectionError as exc:
+            return await self._sandbox.process.connect_pty_session(session_id, on_data)
+        except (DaytonaNotFoundError, DaytonaConnectionError) as exc:
             await self._check_sandbox_alive()
-            if "not found" in str(exc).lower():
+            if isinstance(exc, DaytonaNotFoundError) or "not found" in str(exc).lower():
                 raise SandboxError(
-                    f"Daytona PTY session no longer exists for {self._sandbox_ref}: session_id={session_id}"
+                    f"Daytona PTY session disappeared before command status was written for {self._sandbox_ref}: "
+                    f"session_id={session_id}, wait_result=({_pty_result_summary(wait_result)}), state={self.state}"
                 ) from exc
             raise self._sandbox_error(exc) from exc
         except _SANDBOX_OPERATION_ERRORS as exc:
@@ -435,6 +559,8 @@ class DaytonaSandboxProvider(SandboxProvider):
             cpu=request.resources.vcpu,
             memory=request.resources.memory,
             disk=request.resources.disk,
+            gpu=request.resources.gpu or None,
+            gpu_type=_daytona_gpu_type(request.resources.gpu_type),
         )
 
         match request.source:
@@ -450,6 +576,8 @@ class DaytonaSandboxProvider(SandboxProvider):
                     env_vars=request.env_vars,
                 )
             case SnapshotSource(snapshot=snapshot):
+                if request.resources.gpu:
+                    raise SandboxError("Daytona snapshot sandboxes use the snapshot's resources; GPUs cannot be requested")
                 params = CreateSandboxFromSnapshotParams(
                     auto_stop_interval=request.auto_stop_interval,
                     auto_delete_interval=0,
@@ -460,6 +588,8 @@ class DaytonaSandboxProvider(SandboxProvider):
                     network_block_all=False,
                     env_vars=request.env_vars,
                 )
+            case _:
+                raise SandboxError("ComposeSource must be unwrapped before provider.create_sandbox")
 
         try:
             inner = await self._daytona.create(params, timeout=request.create_timeout)
@@ -477,6 +607,9 @@ class DaytonaSandboxProvider(SandboxProvider):
             raise self._sandbox_error(exc) from exc
 
         try:
+            if sandbox.state in _FAILED_SANDBOX_STATES:
+                await self.delete_sandbox(sandbox.id)
+                return None
             if sandbox.state in (SandboxState.DESTROYING, SandboxState.DESTROYED, SandboxState.STOPPED):
                 return None
             await sandbox.wait_for_sandbox_start(timeout=0)
@@ -497,12 +630,12 @@ class DaytonaSandboxProvider(SandboxProvider):
     async def delete_sandbox(self, instance_id: str) -> None:
         try:
             sandbox = await self._daytona.get(instance_id)
-            if sandbox.state not in (*_REMOVED_SANDBOX_STATES, *_FAILED_SANDBOX_STATES):
+            if sandbox.state not in _DELETE_WITHOUT_START_STATES:
                 await sandbox.wait_for_sandbox_start(timeout=0)
                 await sandbox.refresh_data()
             if sandbox.state in _REMOVED_SANDBOX_STATES:
                 return
-            if sandbox.state not in _FAILED_SANDBOX_STATES:
+            if sandbox.state not in _DELETE_WITHOUT_START_STATES:
                 await sandbox.set_autostop_interval(interval=1)
             await self._daytona.delete(sandbox)
         except DaytonaNotFoundError:
@@ -533,6 +666,7 @@ class DaytonaSandboxProvider(SandboxProvider):
 
 
 def _command(command: str, cwd: str | None, timeout: float | None) -> str:
+    command = f"sh -c {shlex.quote(command)}"
     if timeout is not None:
         command = f"timeout {timeout:g} {command}"
     if cwd:

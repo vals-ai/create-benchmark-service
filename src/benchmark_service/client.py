@@ -429,18 +429,19 @@ class BenchmarkServiceClient:
         task_id: str,
         payload_data: str,
         payload_schema: str,
+        payload_type: V1PayloadType = V1PayloadType.TEXT,
         dataset: str | None = None,
     ) -> V1EvalResponse:
         """Evaluate via the lab-facing /v1/evaluate surface (Descope-authenticated).
 
-        Unlike evaluate_response, payload_data is whatever the deployed benchmark's
-        eval_mode expects on /v1 — raw text or an artifact-by-reference key.
+        payload_data is either inline text or an uploaded artifact key, as
+        selected by payload_type.
         """
         request = V1EvalRequest(
             run_id=run_id,
             task_id=task_id,
             dataset=dataset,
-            payload=V1Payload(type=V1PayloadType.TEXT, schema=payload_schema, data=payload_data),
+            payload=V1Payload(type=payload_type, schema=payload_schema, data=payload_data),
         )
         response = await self._http_client.post(
             f"{self._url}/v1/evaluate",

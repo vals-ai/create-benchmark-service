@@ -13,6 +13,7 @@ from benchmark_service.v1_schemas import (
     V1DatasetTasksResponse,
     V1EvalResponse,
     V1EvalStatus,
+    V1PayloadType,
     V1ScoreItem,
     V1ScoreResponse,
 )
@@ -634,7 +635,12 @@ async def test_client_v1_evaluate_posts_payload_and_returns_v1_eval_response(
     mock_http.post = AsyncMock(return_value=mock_resp)
 
     result = await client.v1_evaluate(
-        run_id="run-1", task_id="task-1", payload_data="abc-key", payload_schema="codemig.text.v1", dataset="validation"
+        run_id="run-1",
+        task_id="task-1",
+        payload_data="abc-key",
+        payload_schema="code-migration.workspace-tar.v1",
+        payload_type=V1PayloadType.ARTIFACT,
+        dataset="validation",
     )
 
     assert isinstance(result, V1EvalResponse)
@@ -642,7 +648,11 @@ async def test_client_v1_evaluate_posts_payload_and_returns_v1_eval_response(
     assert result.result == {"resolved": True}
     called_url, called_kwargs = mock_http.post.call_args
     assert called_url[0] == f"{BASE_URL}/v1/evaluate"
-    assert called_kwargs["json"]["payload"] == {"type": "text", "schema": "codemig.text.v1", "data": "abc-key"}
+    assert called_kwargs["json"]["payload"] == {
+        "type": "artifact",
+        "schema": "code-migration.workspace-tar.v1",
+        "data": "abc-key",
+    }
     assert called_kwargs["json"]["dataset"] == "validation"
 
 

@@ -1,7 +1,7 @@
 """HTTP/WebSocket client for communicating with a benchmark service."""
 
 from collections.abc import Callable
-from typing import Any
+from typing import Any, assert_never
 
 import httpx
 import websockets
@@ -53,6 +53,10 @@ class BenchmarkServiceError(Exception):
     """Exception raised for benchmark service communication errors."""
 
     pass
+
+
+class BenchmarkServiceSandboxSetupError(BenchmarkServiceError):
+    """Exception raised when setup should be retried in a fresh sandbox."""
 
 
 class BenchmarkServiceUnauthenticatedError(BenchmarkServiceError):
@@ -157,7 +161,11 @@ class BenchmarkServiceClient:
 
                 match chunk.type:
                     case "error":
-                        raise BenchmarkServiceError(chunk.data)
+                        if chunk.recovery == "none":
+                            raise BenchmarkServiceError(chunk.data)
+                        if chunk.recovery == "fresh_sandbox":
+                            raise BenchmarkServiceSandboxSetupError(chunk.data)
+                        assert_never(chunk.recovery)
                     case "result":
                         return chunk.data
                     case "message":

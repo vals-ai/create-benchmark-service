@@ -6,7 +6,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
-from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
+from benchmark_service.client import (
+    BenchmarkServiceClient,
+    BenchmarkServiceError,
+    BenchmarkServiceSandboxSetupError,
+)
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
 from benchmark_service.v1_schemas import V1DatasetTasksResponse
@@ -503,6 +507,32 @@ async def test_ws_error_chunk(method: str, args: list[str]) -> None:
     client = _make_client()
     with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
         with pytest.raises(BenchmarkServiceError, match="something went wrong"):
+            await getattr(client, method)(*args)
+
+
+@pytest.mark.parametrize(
+    ("method", "args"),
+    [
+        ("setup_task", ["task-1", "inst-1", DAYTONA_CONFIG]),
+        ("evaluate_instance", ["task-1", "inst-1", DAYTONA_CONFIG]),
+    ],
+    ids=["setup_task", "evaluate_instance"],
+)
+async def test_ws_fresh_sandbox_error_chunk(method: str, args: list[str]) -> None:
+    messages = [
+        json.dumps(
+            {
+                "type": "error",
+                "data": "sandbox storage is unavailable",
+                "recovery": "fresh_sandbox",
+            }
+        )
+    ]
+    mock_connect = _ws_mock(messages)
+
+    client = _make_client()
+    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+        with pytest.raises(BenchmarkServiceSandboxSetupError, match="sandbox storage is unavailable"):
             await getattr(client, method)(*args)
 
 

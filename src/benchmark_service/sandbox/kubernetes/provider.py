@@ -1,3 +1,5 @@
+"""Adapt a Kubernetes runtime driver to the public sandbox-provider contract."""
+
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator
@@ -30,4 +32,5 @@ class KubernetesSandboxProvider(SandboxProvider):
         return self._driver.list_sandboxes(query)
 
     async def close(self) -> None:
+        """Release resources held by the runtime driver."""
         await self._driver.close()

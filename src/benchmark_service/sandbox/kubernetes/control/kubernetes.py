@@ -1,3 +1,5 @@
+"""Reconcile Kubernetes Jobs behind the private sandbox control protocol."""
+
 from __future__ import annotations
 
 import asyncio
@@ -82,7 +84,7 @@ def _user_labels(resource: dict[str, object]) -> dict[str, str]:
 
 
 class KubernetesSandboxBackend:
-    """Reconcile EKS Jobs behind the private control-service protocol."""
+    """Reconcile Kubernetes Jobs behind the private control-service protocol."""
 
     def __init__(
         self,
@@ -184,6 +186,7 @@ class KubernetesSandboxBackend:
             await self._wait(0.5)
 
     async def create_sandbox(self, request: SandboxCreateRequest) -> SandboxRecord:
+        """Create or reuse a matching Job, removing an unready new Job on failure."""
         resource_name = sandbox_name(request.name)
         job_body = build_job(request, self.settings)
         expected_fingerprint = resource_annotations(job_body)[FINGERPRINT_ANNOTATION]
@@ -224,6 +227,7 @@ class KubernetesSandboxBackend:
             return record
         finally:
             if not ready and job_created:
+                # Failed readiness removes only this new Job so later creates can recover.
                 with suppress(SandboxError):
                     await self._call(lambda: self.api.delete_job(self.settings.namespace, resource_name))
 
@@ -262,15 +266,13 @@ class KubernetesSandboxBackend:
         return SandboxListPage(items=items, continue_token=page_metadata.get("continue"))
 
     async def delete_sandbox(self, instance_id: str) -> None:
+        """Delete the sandbox Job and its per-sandbox egress policy."""
         resource_name = sandbox_name(instance_id)
         operations: list[Callable[[], Awaitable[None]]] = [
-            lambda: self.api.delete_custom_object(
-                self.settings.namespace,
-                "ciliumnetworkpolicies",
-                f"{resource_name}-egress",
-            ),
+            lambda: self._egress_driver().clear(resource_name),
             lambda: self.api.delete_job(self.settings.namespace, resource_name),
         ]
+        # Remove the policy first so Job teardown cannot leave sandbox-specific residue.
         for operation in operations:
             with suppress(SandboxNotFoundError):
                 await self._call(operation)
@@ -359,6 +361,7 @@ class KubernetesSandboxBackend:
         instance_id: str,
         request: CommandRequest,
     ) -> AsyncGenerator[CommandEvent, None]:
+        """Stream command events while periodically persisting sandbox activity."""
         await self._touch(instance_id)
         stream = self.data_plane.command(instance_id, request)
         pending_event: asyncio.Task[CommandEvent] | None = None
@@ -457,6 +460,7 @@ class KubernetesSandboxBackend:
                 return deleted
 
     async def close(self) -> None:
+        """Close shared watches, data-plane transports, and the Kubernetes client."""
         if self.resource_cache is not None:
             await self.resource_cache.close()
         await self.data_plane.close()

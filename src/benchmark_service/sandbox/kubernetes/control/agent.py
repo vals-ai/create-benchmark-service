@@ -1,3 +1,5 @@
+"""Connect the control service to the authenticated sandbox Pod agent."""
+
 from __future__ import annotations
 
 import hashlib
@@ -174,4 +176,5 @@ class PodAgentClient:
             raise SandboxConnectionError(f"Sandbox agent connection failed: {error}") from error
 
     async def close(self) -> None:
+        """Close the connections shared by Pod-agent operations."""
         await self._client.aclose()

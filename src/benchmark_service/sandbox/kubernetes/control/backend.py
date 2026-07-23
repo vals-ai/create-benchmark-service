@@ -1,3 +1,5 @@
+"""Define the control-service backend contract and conflict error."""
+
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator, AsyncIterable

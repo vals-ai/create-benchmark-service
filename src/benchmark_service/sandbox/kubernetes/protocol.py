@@ -1,3 +1,5 @@
+"""Define wire models shared by Kubernetes control clients and servers."""
+
 from __future__ import annotations
 
 from typing import Annotated, Literal

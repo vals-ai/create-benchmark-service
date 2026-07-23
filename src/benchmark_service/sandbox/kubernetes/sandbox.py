@@ -1,3 +1,5 @@
+"""Represent a Kubernetes sandbox through its runtime-driver operations."""
+
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Mapping
@@ -64,6 +66,7 @@ class KubernetesSandbox(Sandbox):
         timeout: float | None = None,
         env_vars: Mapping[str, str] | None = None,
     ) -> AsyncGenerator[str, None]:
+        """Stream command output and propagate execution errors from the runtime."""
         env = validate_command_env(env_vars) if env_vars is not None else None
         return self._driver.command(
             self.id,
@@ -80,6 +83,7 @@ class KubernetesSandbox(Sandbox):
         return await self._driver.download_file(self.id, remote_path)
 
     async def stream_download(self, remote_path: str) -> AsyncGenerator[bytes, None]:
+        """Stream a remote file without collecting its contents in this handle."""
         async for chunk in self._driver.stream_download(self.id, remote_path):
             yield chunk
 

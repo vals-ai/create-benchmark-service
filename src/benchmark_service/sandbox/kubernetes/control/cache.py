@@ -1,3 +1,5 @@
+"""Maintain shared watched Kubernetes resource state for sandbox readiness."""
+
 from __future__ import annotations
 
 import asyncio
@@ -118,6 +120,7 @@ class SandboxResourceCache:
             self._jobs = jobs
             self._job_resource_version = resource_version
             self._revision += 1
+            # Revision changes wake every readiness waiter sharing this resource state.
             self._condition.notify_all()
 
     async def _replace_pods(self) -> None:
@@ -126,6 +129,7 @@ class SandboxResourceCache:
             self._pods = pods
             self._pod_resource_version = resource_version
             self._revision += 1
+            # Revision changes wake every readiness waiter sharing this resource state.
             self._condition.notify_all()
 
     async def start(self) -> None:
@@ -188,6 +192,7 @@ class SandboxResourceCache:
                             or self._job_resource_version
                         )
                         self._revision += 1
+                        # Revision changes wake every readiness waiter sharing this resource state.
                         self._condition.notify_all()
                     retry_delay = 0.25
             except KubernetesApiError as error:
@@ -195,6 +200,7 @@ class SandboxResourceCache:
                     await self._set_watch_error(error)
                     return
                 if error.status == 410:
+                    # Expired Kubernetes watch history requires a complete resource relist.
                     relist_delay = await self._relist(self._replace_jobs, retry_delay)
                     if relist_delay is None:
                         return
@@ -234,6 +240,7 @@ class SandboxResourceCache:
                             or self._pod_resource_version
                         )
                         self._revision += 1
+                        # Revision changes wake every readiness waiter sharing this resource state.
                         self._condition.notify_all()
                     retry_delay = 0.25
             except KubernetesApiError as error:
@@ -241,6 +248,7 @@ class SandboxResourceCache:
                     await self._set_watch_error(error)
                     return
                 if error.status == 410:
+                    # Expired Kubernetes watch history requires a complete resource relist.
                     relist_delay = await self._relist(self._replace_pods, retry_delay)
                     if relist_delay is None:
                         return

@@ -1,3 +1,5 @@
+"""Build validated Kubernetes Job resources for sandbox runtime instances."""
+
 from __future__ import annotations
 
 import hashlib
@@ -122,21 +124,51 @@ def _resource_requirements(
     return resources, node_selector
 
 
-def build_job(
+def _build_agent_init_container(settings: KubernetesControlSettings) -> dict[str, object]:
+    assert settings.agent_image is not None
+
+    # The init container injects the control binary without changing benchmark images.
+    return {
+        "name": "install-sandbox-agent",
+        "image": settings.agent_image,
+        "command": [
+            "cp",
+            "/usr/local/bin/kubernetes-sandbox-agent",
+            "/vals-agent/sandbox-agent",
+        ],
+        "volumeMounts": [{"name": "sandbox-agent", "mountPath": "/vals-agent"}],
+        "securityContext": {
+            "runAsUser": 0,
+            "allowPrivilegeEscalation": False,
+            "readOnlyRootFilesystem": True,
+            "capabilities": {"drop": ["ALL"]},
+        },
+    }
+
+
+def _build_docker_sidecar(settings: KubernetesControlSettings) -> dict[str, object]:
+    # Privileged access stays confined to the Docker sidecar.
+    return {
+        "name": "docker",
+        "image": settings.docker_image,
+        "securityContext": {"privileged": True},
+        "env": [{"name": "DOCKER_TLS_CERTDIR", "value": ""}],
+        "volumeMounts": [{"name": "docker-socket", "mountPath": "/var/run"}],
+        "readinessProbe": {
+            "exec": {"command": ["sh", "-lc", "docker info >/dev/null 2>&1"]},
+            "periodSeconds": 2,
+        },
+    }
+
+
+def _build_sandbox_container(
     request: SandboxCreateRequest,
     settings: KubernetesControlSettings,
-    *,
-    now: datetime | None = None,
+    source: ImageSource,
+    resource_name: str,
 ) -> dict[str, object]:
-    source = _validate_request(request, settings)
-    resource_name = sandbox_name(request.name)
-    labels = _labels(request, resource_name)
-    resources, node_selector = _resource_requirements(request, settings)
-
     env = [{"name": name, "value": value} for name, value in sorted(request.env_vars.items())]
     volume_mounts: list[dict[str, object]] = [{"name": "workspace", "mountPath": "/workspace"}]
-    volumes: list[dict[str, object]] = [{"name": "workspace", "emptyDir": {"sizeLimit": f"{request.resources.disk}Gi"}}]
-    init_containers: list[dict[str, object]] = []
     sandbox_command = ["sh", "-lc", "trap : TERM INT; while :; do sleep 3600; done"]
     sandbox_readiness: dict[str, object] = {
         "exec": {"command": ["sh", "-lc", "true"]},
@@ -158,25 +190,6 @@ def build_job(
             ]
         )
         volume_mounts.append({"name": "sandbox-agent", "mountPath": "/vals-agent", "readOnly": True})
-        volumes.append({"name": "sandbox-agent", "emptyDir": {}})
-        init_containers.append(
-            {
-                "name": "install-sandbox-agent",
-                "image": settings.agent_image,
-                "command": [
-                    "cp",
-                    "/usr/local/bin/kubernetes-sandbox-agent",
-                    "/vals-agent/sandbox-agent",
-                ],
-                "volumeMounts": [{"name": "sandbox-agent", "mountPath": "/vals-agent"}],
-                "securityContext": {
-                    "runAsUser": 0,
-                    "allowPrivilegeEscalation": False,
-                    "readOnlyRootFilesystem": True,
-                    "capabilities": {"drop": ["ALL"]},
-                },
-            }
-        )
         sandbox_command = ["/vals-agent/sandbox-agent"]
         sandbox_readiness = {
             "tcpSocket": {"port": "agent"},
@@ -185,50 +198,44 @@ def build_job(
         sandbox_ports = [
             {"name": "agent", "containerPort": settings.agent_port, "protocol": "TCP"},
         ]
-    containers: list[dict[str, object]] = []
     if settings.docker_enabled:
         env.append({"name": "DOCKER_HOST", "value": "unix:///var/run/docker.sock"})
         volume_mounts.append({"name": "docker-socket", "mountPath": "/var/run"})
-        volumes.append({"name": "docker-socket", "emptyDir": {}})
-        containers.append(
-            {
-                "name": "docker",
-                "image": settings.docker_image,
-                "securityContext": {"privileged": True},
-                "env": [{"name": "DOCKER_TLS_CERTDIR", "value": ""}],
-                "volumeMounts": [{"name": "docker-socket", "mountPath": "/var/run"}],
-                "readinessProbe": {
-                    "exec": {"command": ["sh", "-lc", "docker info >/dev/null 2>&1"]},
-                    "periodSeconds": 2,
-                },
-            }
-        )
 
-    containers.insert(
-        0,
-        {
-            "name": settings.sandbox_container_name,
-            "image": source.image,
-            "command": sandbox_command,
-            "env": env,
-            "resources": {"requests": resources, "limits": resources},
-            "volumeMounts": volume_mounts,
-            "ports": sandbox_ports,
-            "readinessProbe": sandbox_readiness,
-            "securityContext": {
-                "allowPrivilegeEscalation": False,
-            },
+    resources, _node_selector = _resource_requirements(request, settings)
+
+    return {
+        "name": settings.sandbox_container_name,
+        "image": source.image,
+        "command": sandbox_command,
+        "env": env,
+        "resources": {"requests": resources, "limits": resources},
+        "volumeMounts": volume_mounts,
+        "ports": sandbox_ports,
+        "readinessProbe": sandbox_readiness,
+        "securityContext": {
+            "allowPrivilegeEscalation": False,
         },
-    )
-
-    annotations = {
-        ORIGINAL_NAME_ANNOTATION: request.name,
-        FINGERPRINT_ANNOTATION: request_fingerprint(request),
-        AUTO_STOP_ANNOTATION: str(request.auto_stop_interval),
-        LAST_ACTIVITY_ANNOTATION: (now or datetime.now(UTC)).isoformat(),
-        USER_LABELS_ANNOTATION: json.dumps(request.labels, sort_keys=True, separators=(",", ":")),
     }
-    pod_annotations = {**annotations, "karpenter.sh/do-not-disrupt": "true"}
+
+
+def _build_pod_spec(
+    request: SandboxCreateRequest,
+    settings: KubernetesControlSettings,
+    source: ImageSource,
+    resource_name: str,
+) -> dict[str, object]:
+    containers = [_build_sandbox_container(request, settings, source, resource_name)]
+    volumes: list[dict[str, object]] = [{"name": "workspace", "emptyDir": {"sizeLimit": f"{request.resources.disk}Gi"}}]
+    init_containers: list[dict[str, object]] = []
+    if settings.agent_image is not None:
+        volumes.append({"name": "sandbox-agent", "emptyDir": {}})
+        init_containers.append(_build_agent_init_container(settings))
+    if settings.docker_enabled:
+        volumes.append({"name": "docker-socket", "emptyDir": {}})
+        containers.append(_build_docker_sidecar(settings))
+
+    _, node_selector = _resource_requirements(request, settings)
     pod_spec: dict[str, object] = {
         "runtimeClassName": settings.runtime_class_name,
         "automountServiceAccountToken": False,
@@ -249,6 +256,34 @@ def build_job(
         pod_spec["initContainers"] = init_containers
     if node_selector:
         pod_spec["nodeSelector"] = node_selector
+
+    return pod_spec
+
+
+def _build_annotations(request: SandboxCreateRequest, now: datetime) -> dict[str, str]:
+    return {
+        ORIGINAL_NAME_ANNOTATION: request.name,
+        FINGERPRINT_ANNOTATION: request_fingerprint(request),
+        AUTO_STOP_ANNOTATION: str(request.auto_stop_interval),
+        LAST_ACTIVITY_ANNOTATION: now.isoformat(),
+        USER_LABELS_ANNOTATION: json.dumps(request.labels, sort_keys=True, separators=(",", ":")),
+    }
+
+
+def build_job(
+    request: SandboxCreateRequest,
+    settings: KubernetesControlSettings,
+    *,
+    now: datetime | None = None,
+) -> dict[str, object]:
+    source = _validate_request(request, settings)
+    resource_name = sandbox_name(request.name)
+    labels = _labels(request, resource_name)
+    annotations = _build_annotations(request, now or datetime.now(UTC))
+    pod_spec = _build_pod_spec(request, settings, source, resource_name)
+
+    # Deployment annotations cannot replace control-owned lifecycle metadata.
+    pod_annotations = {**settings.sandbox_pod_annotations, **annotations}
 
     return {
         "apiVersion": "batch/v1",

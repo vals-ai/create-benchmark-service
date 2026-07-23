@@ -1,3 +1,5 @@
+"""Implement the provider-side client for the private Kubernetes control API."""
+
 from __future__ import annotations
 
 import asyncio
@@ -218,6 +220,7 @@ class KubernetesControlClientDriver(KubernetesRuntimeDriver):
         timeout: float | None = None,
         env_vars: Mapping[str, str] | None = None,
     ) -> AsyncGenerator[str, None]:
+        """Stream command output and fail when the control service omits a terminal event."""
         request = CommandRequest(
             command=command,
             cwd=cwd,
@@ -287,6 +290,7 @@ class KubernetesControlClientDriver(KubernetesRuntimeDriver):
         instance_id: str,
         remote_path: str,
     ) -> AsyncGenerator[bytes, None]:
+        """Stream remote-file bytes without buffering them in the provider process."""
         try:
             async with self._client.stream(
                 "GET",
@@ -317,4 +321,5 @@ class KubernetesControlClientDriver(KubernetesRuntimeDriver):
         )
 
     async def close(self) -> None:
+        """Close the HTTP connections held by this driver."""
         await self._client.aclose()

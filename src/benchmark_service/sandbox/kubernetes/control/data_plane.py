@@ -1,3 +1,5 @@
+"""Route sandbox commands and file transfers through Pod data-plane transports."""
+
 from __future__ import annotations
 
 import codecs
@@ -120,6 +122,7 @@ class SandboxDataPlane:
                 await session.close()
             finally:
                 if not stream_completed:
+                    # An incomplete command stream must terminate its remote process group.
                     await self._remote_exec().terminate(pod_name, command_id)
 
     async def upload_file(

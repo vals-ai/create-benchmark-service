@@ -1,3 +1,5 @@
+"""Validate provider configuration for the Kubernetes control service."""
+
 from __future__ import annotations
 
 from typing import Literal, Self
@@ -28,6 +30,7 @@ class KubernetesProviderConfig(BaseModel):
         return self
 
     def create_provider(self) -> SandboxProvider:
+        """Build a provider that owns a dedicated control-service HTTP client."""
         driver = KubernetesControlClientDriver(
             api_url=str(self.KUBERNETES_API_URL),
             api_token=self.KUBERNETES_API_TOKEN,

@@ -9,7 +9,7 @@ from typing import Any, cast
 import pytest
 
 from benchmark_service.sandbox.kubernetes.control.agent import agent_token
-from benchmark_service.sandbox.kubernetes.control.egress import build_egress_policy
+from benchmark_service.sandbox.kubernetes.control.cilium_egress import build_egress_policy
 from benchmark_service.sandbox.kubernetes.control.resources import (
     FINGERPRINT_ANNOTATION,
     FINGERPRINT_LABEL,
@@ -47,6 +47,7 @@ def _settings(**changes: object) -> KubernetesControlSettings:
         "allowed_image_prefixes": ("registry.internal/",),
         "require_image_digest": True,
         "sandbox_node_selector": {"karpenter.sh/nodepool": "sandbox"},
+        "sandbox_pod_annotations": {"karpenter.sh/do-not-disrupt": "true"},
     }
     values.update(changes)
     return KubernetesControlSettings.model_validate(values)
@@ -72,6 +73,7 @@ def test_builds_deterministic_isolated_job_and_network_policies() -> None:
     Test cases:
     - Names and fingerprints are deterministic despite unsafe input or mapping order.
     - Jobs enforce resources, Kata, Pod security, workspace, DinD, image, and GPU rules.
+    - Pod scheduling annotations cannot override control-owned lifecycle metadata.
     - Temporary egress allows DNS and exact destinations.
     - Unsupported sources and unsafe image or GPU requests fail before API calls.
     """
@@ -174,6 +176,23 @@ def test_builds_deterministic_isolated_job_and_network_policies() -> None:
 
     with pytest.raises(ValueError, match="cannot be empty"):
         build_egress_policy("sandbox-1", settings.namespace, [])
+
+    cloud_neutral = build_job(
+        _request(resources=Resources(vcpu=1, memory=1, disk=1)),
+        _settings(sandbox_pod_annotations={"scheduler.example/retain": "yes"}),
+    )
+    cloud_neutral_template = _dict(_dict(cloud_neutral["spec"])["template"])
+    cloud_neutral_annotations = _dict(cloud_neutral_template["metadata"])["annotations"]
+    assert cloud_neutral_annotations["scheduler.example/retain"] == "yes"
+    assert "karpenter.sh/do-not-disrupt" not in cloud_neutral_annotations
+
+    collision_job = build_job(
+        request,
+        _settings(sandbox_pod_annotations={FINGERPRINT_ANNOTATION: "deployment-value"}),
+    )
+    collision_template = _dict(_dict(collision_job["spec"])["template"])
+    collision_annotations = _dict(collision_template["metadata"])["annotations"]
+    assert collision_annotations[FINGERPRINT_ANNOTATION] == request_fingerprint(request)
 
     no_docker = build_job(_request(resources=Resources(vcpu=1, memory=1, disk=1)), _settings(docker_enabled=False))
     no_docker_copy = deepcopy(no_docker)

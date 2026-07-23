@@ -1,3 +1,5 @@
+"""Expose the Kubernetes sandbox provider integration."""
+
 from benchmark_service.sandbox.kubernetes.client import KubernetesControlClientDriver
 from benchmark_service.sandbox.kubernetes.config import KubernetesProviderConfig
 from benchmark_service.sandbox.kubernetes.provider import KubernetesSandboxProvider

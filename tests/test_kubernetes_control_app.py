@@ -15,7 +15,7 @@ from benchmark_service.sandbox.kubernetes.control import (
     KubernetesControlSettings,
     create_kubernetes_control_app,
 )
-from benchmark_service.sandbox.kubernetes.control.app import command_events_to_ndjson
+from benchmark_service.sandbox.kubernetes.control.streaming import command_events_to_ndjson
 from benchmark_service.sandbox.kubernetes.protocol import (
     CommandEvent,
     CommandExitEvent,

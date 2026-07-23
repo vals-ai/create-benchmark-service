@@ -1,3 +1,5 @@
+"""Implement Kubernetes exec WebSocket transport and binary stream helpers."""
+
 from __future__ import annotations
 
 import asyncio
@@ -189,6 +191,7 @@ class KubernetesRemoteExec:
         return AiohttpRemoteExecSession(websocket, request_context)
 
     async def terminate(self, pod_name: str, command_id: str) -> None:
+        """Terminate the recorded command process tree after an interrupted stream."""
         session: RemoteExecSession | None = None
         pid_file = f"/tmp/{command_id}.pid"
         shell_command = (

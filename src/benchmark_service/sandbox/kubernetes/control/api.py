@@ -1,3 +1,5 @@
+"""Adapt kubernetes-asyncio calls to the control service's resource protocol."""
+
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator, AsyncIterator
@@ -44,13 +46,22 @@ class KubernetesApi(Protocol):
 
     async def replace_custom_object(
         self,
+        group: str,
+        version: str,
         namespace: str,
         plural: str,
         name: str,
         body: dict[str, object],
     ) -> None: ...
 
-    async def delete_custom_object(self, namespace: str, plural: str, name: str) -> None: ...
+    async def delete_custom_object(
+        self,
+        group: str,
+        version: str,
+        namespace: str,
+        plural: str,
+        name: str,
+    ) -> None: ...
 
     async def close(self) -> None: ...
 
@@ -98,6 +109,7 @@ class KubernetesAsyncioApi:
 
     @classmethod
     async def create(cls, settings: KubernetesControlSettings) -> KubernetesAsyncioApi:
+        """Create an API client from in-cluster config or opted-in local kubeconfig."""
         try:
             config.load_incluster_config()  # pyright: ignore[reportUnknownMemberType]
         except ConfigException:
@@ -203,6 +215,7 @@ class KubernetesAsyncioApi:
         label_selector: str,
         resource_version: str,
     ) -> AsyncGenerator[ResourceWatchEvent, None]:
+        """Yield Job watch events and stop the Kubernetes watch when iteration ends."""
         resource_watch = watch.Watch()
         try:
             try:
@@ -234,6 +247,7 @@ class KubernetesAsyncioApi:
         label_selector: str,
         resource_version: str,
     ) -> AsyncGenerator[ResourceWatchEvent, None]:
+        """Yield Pod watch events and stop the Kubernetes watch when iteration ends."""
         resource_watch = watch.Watch()
         try:
             try:
@@ -261,18 +275,20 @@ class KubernetesAsyncioApi:
 
     async def replace_custom_object(
         self,
+        group: str,
+        version: str,
         namespace: str,
         plural: str,
         name: str,
         body: dict[str, object],
     ) -> None:
         try:
-            await self._custom.replace_namespaced_custom_object("cilium.io", "v2", namespace, plural, name, body)
+            await self._custom.replace_namespaced_custom_object(group, version, namespace, plural, name, body)
         except ApiException as error:
             if error.status != 404:
                 raise self._raise(error) from error
             try:
-                await self._custom.create_namespaced_custom_object("cilium.io", "v2", namespace, plural, body)
+                await self._custom.create_namespaced_custom_object(group, version, namespace, plural, body)
             except ApiException as create_error:
                 raise self._raise(create_error) from create_error
             except (aiohttp.ClientError, TimeoutError, OSError) as create_error:
@@ -280,9 +296,16 @@ class KubernetesAsyncioApi:
         except (aiohttp.ClientError, TimeoutError, OSError) as error:
             raise self._raise_connection(error) from error
 
-    async def delete_custom_object(self, namespace: str, plural: str, name: str) -> None:
+    async def delete_custom_object(
+        self,
+        group: str,
+        version: str,
+        namespace: str,
+        plural: str,
+        name: str,
+    ) -> None:
         try:
-            await self._custom.delete_namespaced_custom_object("cilium.io", "v2", namespace, plural, name)
+            await self._custom.delete_namespaced_custom_object(group, version, namespace, plural, name)
         except ApiException as error:
             if error.status != 404:
                 raise self._raise(error) from error
@@ -290,4 +313,5 @@ class KubernetesAsyncioApi:
             raise self._raise_connection(error) from error
 
     async def close(self) -> None:
+        """Close the underlying kubernetes-asyncio client."""
         await self._api_client.close()

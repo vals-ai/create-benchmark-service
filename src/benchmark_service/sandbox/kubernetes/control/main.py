@@ -1,3 +1,5 @@
+"""Load control-service settings and start the Kubernetes control process."""
+
 from __future__ import annotations
 
 import asyncio
@@ -10,7 +12,7 @@ from benchmark_service.sandbox.kubernetes.control.agent import PodAgentClient
 from benchmark_service.sandbox.kubernetes.control.api import KubernetesAsyncioApi
 from benchmark_service.sandbox.kubernetes.control.app import create_kubernetes_control_app
 from benchmark_service.sandbox.kubernetes.control.cache import SandboxResourceCache
-from benchmark_service.sandbox.kubernetes.control.egress import CiliumEgressPolicyDriver
+from benchmark_service.sandbox.kubernetes.control.egress import select_egress_driver
 from benchmark_service.sandbox.kubernetes.control.kubernetes import KubernetesSandboxBackend
 from benchmark_service.sandbox.kubernetes.control.remote_exec import KubernetesRemoteExec
 from benchmark_service.sandbox.kubernetes.control.settings import KubernetesControlSettings
@@ -99,6 +101,8 @@ def load_settings(environ: Mapping[str, str] | None = None) -> KubernetesControl
         gpu_resource_name=values.get("KUBERNETES_SANDBOX_GPU_RESOURCE_NAME", "nvidia.com/gpu"),
         gpu_type_label=values.get("KUBERNETES_SANDBOX_GPU_TYPE_LABEL", "sandbox.vals.ai/gpu-type"),
         sandbox_node_selector=_mapping(values, "KUBERNETES_SANDBOX_NODE_SELECTOR"),
+        sandbox_pod_annotations=_mapping(values, "KUBERNETES_SANDBOX_POD_ANNOTATIONS"),
+        egress_driver=_required(values, "KUBERNETES_SANDBOX_EGRESS_DRIVER"),
         allowed_image_prefixes=prefixes,
         require_image_digest=_boolean(values, "KUBERNETES_SANDBOX_REQUIRE_IMAGE_DIGEST", False),
         allow_local_kubeconfig=_boolean(values, "KUBERNETES_SANDBOX_ALLOW_LOCAL_KUBECONFIG", False),
@@ -107,12 +111,13 @@ def load_settings(environ: Mapping[str, str] | None = None) -> KubernetesControl
 
 async def _serve(environ: Mapping[str, str]) -> None:
     settings = load_settings(environ)
+    egress_factory = select_egress_driver(settings)
     api = await KubernetesAsyncioApi.create(settings)
     resource_cache = SandboxResourceCache(settings.namespace, api)
     await resource_cache.start()
     remote_exec = None if settings.agent_image is not None else KubernetesRemoteExec(settings)
     pod_agent = PodAgentClient(settings) if settings.agent_image is not None else None
-    egress = CiliumEgressPolicyDriver(settings, api)
+    egress = egress_factory(api)
     backend = KubernetesSandboxBackend(
         settings,
         api,

@@ -1,3 +1,5 @@
+"""Define deployment-owned settings for the Kubernetes control service."""
+
 from __future__ import annotations
 
 from pydantic import BaseModel, Field, field_validator
@@ -31,6 +33,8 @@ class KubernetesControlSettings(BaseModel):
     gpu_resource_name: str = "nvidia.com/gpu"
     gpu_type_label: str = "sandbox.vals.ai/gpu-type"
     sandbox_node_selector: dict[str, str] = Field(default_factory=dict)
+    sandbox_pod_annotations: dict[str, str] = Field(default_factory=dict)
+    egress_driver: str = "cilium"
     allowed_image_prefixes: tuple[str, ...] = ()
     require_image_digest: bool = False
     allow_local_kubeconfig: bool = False
@@ -42,6 +46,7 @@ class KubernetesControlSettings(BaseModel):
         "docker_image",
         "gpu_resource_name",
         "gpu_type_label",
+        "egress_driver",
     )
     @classmethod
     def require_nonempty(cls, value: str) -> str:

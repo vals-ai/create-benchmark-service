@@ -5,15 +5,16 @@ from __future__ import annotations
 import asyncio
 import base64
 from collections import deque
-from collections.abc import AsyncGenerator, AsyncIterable
+from collections.abc import AsyncGenerator, AsyncIterable, Callable
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
 import pytest
 
+from benchmark_service.sandbox.kubernetes.control import janitor
 from benchmark_service.sandbox.kubernetes.control.api import KubernetesApiError
 from benchmark_service.sandbox.kubernetes.control.backend import SandboxConflictError
-from benchmark_service.sandbox.kubernetes.control.egress import CiliumEgressPolicyDriver
+from benchmark_service.sandbox.kubernetes.control.egress import create_egress_driver
 from benchmark_service.sandbox.kubernetes.control.kubernetes import KubernetesSandboxBackend
 from benchmark_service.sandbox.kubernetes.control.remote_exec import (
     RemoteExecSession,
@@ -118,18 +119,40 @@ class MockKubernetesApi:
 
     async def replace_custom_object(
         self,
+        group: str,
+        version: str,
         namespace: str,
         plural: str,
         name: str,
         body: dict[str, object],
     ) -> None:
-        self.operations.append(("replace_custom", (namespace, plural, name, body)))
+        self.operations.append(("replace_custom", (group, version, namespace, plural, name, body)))
 
-    async def delete_custom_object(self, namespace: str, plural: str, name: str) -> None:
-        self.operations.append(("delete_custom", (namespace, plural, name)))
+    async def delete_custom_object(
+        self,
+        group: str,
+        version: str,
+        namespace: str,
+        plural: str,
+        name: str,
+    ) -> None:
+        self.operations.append(("delete_custom", (group, version, namespace, plural, name)))
 
     async def close(self) -> None:
         self.closed = True
+
+
+class MockEgressPolicyDriver:
+    """Record selected egress policy operations without using Cilium."""
+
+    def __init__(self, operations: list[tuple[str, object]]) -> None:
+        self.operations = operations
+
+    async def apply(self, instance_id: str, allowed_addresses: list[str]) -> None:
+        self.operations.append(("apply_egress", (instance_id, allowed_addresses)))
+
+    async def clear(self, instance_id: str) -> None:
+        self.operations.append(("clear_egress", instance_id))
 
 
 class MockResourceCache:
@@ -225,7 +248,8 @@ class TestKubernetesSandboxBackendLifecycle:
         - Listing preserves selectors and continuation; delete removes every owned resource.
         """
         api = MockKubernetesApi()
-        backend = KubernetesSandboxBackend(_settings(), api)
+        egress = MockEgressPolicyDriver(api.operations)
+        backend = KubernetesSandboxBackend(_settings(), api, egress_driver=egress)
         request = _request()
         created = await backend.create_sandbox(request)
         first_create_operations = [operation[0] for operation in api.operations]
@@ -247,8 +271,11 @@ class TestKubernetesSandboxBackendLifecycle:
             5,
             "prior",
         )
-        assert ("delete_custom", ("benchmark-sandboxes", "ciliumnetworkpolicies", "task-1-egress")) in api.operations
+        assert ("clear_egress", "task-1") in api.operations
         assert ("delete_job", ("benchmark-sandboxes", "task-1")) in api.operations
+        assert api.operations.index(("clear_egress", "task-1")) < api.operations.index(
+            ("delete_job", ("benchmark-sandboxes", "task-1"))
+        )
         assert not any(name == "delete_ingress" for name, _ in api.operations)
 
         conflicting = _request(resources=Resources(vcpu=3, memory=4, disk=20))
@@ -759,12 +786,13 @@ class TestKubernetesSandboxBackendEgressAndCleanup:
         - Activity writes inside the debounce interval are coalesced.
         - Activity after the debounce interval persists a new timestamp.
         - Clear deletes only the egress policy.
+        - Unsupported configured drivers fail before use.
         """
         api = MockKubernetesApi()
         request = _request()
         api.jobs["task-1"] = build_job(request, _settings())
         current_time = [datetime(2026, 7, 21, 12, tzinfo=UTC)]
-        egress = CiliumEgressPolicyDriver(_settings(), api)
+        egress = create_egress_driver(_settings(), api)
         backend = KubernetesSandboxBackend(_settings(), api, egress_driver=egress, now=lambda: current_time[0])
 
         await backend.modify_egress_rules("task-1", ["api.example.com", "10.0.0.3/24"])
@@ -775,19 +803,34 @@ class TestKubernetesSandboxBackendEgressAndCleanup:
         replace_index = next(index for index, item in enumerate(api.operations) if item[0] == "replace_custom")
         first_patch_index = next(index for index, item in enumerate(api.operations) if item[0] == "patch_job")
         assert replace_index < first_patch_index
-        replace = cast(tuple[str, str, str, dict[str, object]], api.operations[replace_index][1])
-        body = replace[3]
+        replace = cast(tuple[str, str, str, str, str, dict[str, object]], api.operations[replace_index][1])
+        assert replace[:5] == (
+            "cilium.io",
+            "v2",
+            "benchmark-sandboxes",
+            "ciliumnetworkpolicies",
+            "task-1-egress",
+        )
+        body = replace[5]
         rules = cast(dict[str, Any], body["spec"])["egress"]
         assert rules[1]["toCIDR"] == ["10.0.0.0/24"]
         assert rules[2]["toFQDNs"] == [{"matchName": "api.example.com"}]
-        assert ("delete_custom", ("benchmark-sandboxes", "ciliumnetworkpolicies", "task-1-egress")) in api.operations
+        assert (
+            "delete_custom",
+            ("cilium.io", "v2", "benchmark-sandboxes", "ciliumnetworkpolicies", "task-1-egress"),
+        ) in api.operations
         assert sum(name == "patch_job" for name, _ in api.operations) == 2
+
+        unsupported_settings = _settings().model_copy(update={"egress_driver": "unsupported"})
+        with pytest.raises(ValueError, match="Unsupported Kubernetes egress driver: unsupported"):
+            create_egress_driver(unsupported_settings, api)
 
     async def test_deletes_only_expired_idle_sandboxes_idempotently(self) -> None:
         """Use activity annotations without deleting retained or malformed Jobs.
 
         Test cases:
         - Expired positive intervals are deleted through the ordinary delete path.
+        - The selected non-Cilium driver clears egress before each expired Job.
         - Zero intervals and malformed timestamps are retained.
         - A second janitor pass is safe and finds no duplicate work.
         """
@@ -803,8 +846,65 @@ class TestKubernetesSandboxBackendEgressAndCleanup:
         api.jobs["retained"] = build_job(retained, settings, now=now - timedelta(days=1))
         api.jobs["malformed"] = build_job(malformed, settings, now=now - timedelta(days=1))
         _metadata(api.jobs["malformed"])["annotations"]["sandbox.vals.ai/last-activity"] = "not-a-date"
-        backend = KubernetesSandboxBackend(settings, api)
+        egress = MockEgressPolicyDriver(api.operations)
+        backend = KubernetesSandboxBackend(settings, api, egress_driver=egress)
 
         assert await backend.delete_idle_sandboxes(now) == 1
         assert await backend.delete_idle_sandboxes(now) == 0
         assert set(api.jobs) == {"debounce-grace", "retained", "malformed"}
+        assert ("clear_egress", "expired") in api.operations
+        assert api.operations.index(("clear_egress", "expired")) < api.operations.index(
+            ("delete_job", ("benchmark-sandboxes", "expired"))
+        )
+
+    async def test_janitor_uses_selected_egress_driver_for_idle_cleanup(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """Run one cleanup pass with the deployment-selected egress driver.
+
+        Test cases:
+        - The configured non-Cilium driver clears an expired sandbox before Job deletion.
+        - The janitor returns its deletion count and closes the Kubernetes client.
+        """
+        settings = _settings()
+        api = MockKubernetesApi()
+        api.jobs["expired"] = build_job(
+            _request(name="expired", auto_stop_interval=1),
+            settings,
+            now=datetime(2020, 1, 1, tzinfo=UTC),
+        )
+        egress = MockEgressPolicyDriver(api.operations)
+
+        async def create_api(loaded_settings: KubernetesControlSettings) -> MockKubernetesApi:
+            assert loaded_settings.egress_driver == "cilium"
+            return api
+
+        def select_driver(
+            loaded_settings: KubernetesControlSettings,
+        ) -> Callable[[MockKubernetesApi], MockEgressPolicyDriver]:
+            assert loaded_settings.egress_driver == "cilium"
+
+            def create_driver(selected_api: MockKubernetesApi) -> MockEgressPolicyDriver:
+                assert selected_api is api
+                return egress
+
+            return create_driver
+
+        monkeypatch.setattr(janitor.KubernetesAsyncioApi, "create", create_api)
+        monkeypatch.setattr(janitor, "select_egress_driver", select_driver)
+
+        deleted = await janitor.run_janitor_once(
+            {
+                "KUBERNETES_SANDBOX_API_TOKEN": "test-token",
+                "KUBERNETES_SANDBOX_DOCKER_IMAGE": settings.docker_image,
+                "KUBERNETES_SANDBOX_EGRESS_DRIVER": "cilium",
+            }
+        )
+
+        assert deleted == 1
+        assert api.operations[-2:] == [
+            ("clear_egress", "expired"),
+            ("delete_job", ("benchmark-sandboxes", "expired")),
+        ]
+        assert api.closed is True

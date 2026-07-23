@@ -18,8 +18,17 @@ func TestAgentCommandsAndFiles(t *testing.T) {
 	t.Parallel()
 	token := "sandbox-token"
 	handler := newAgentHandler(token)
+	directory := t.TempDir()
+	resolvedDirectory, err := filepath.EvalSymlinks(directory)
+	if err != nil {
+		t.Fatal(err)
+	}
 
-	commandBody, err := json.Marshal(commandRequest{Command: "printf first; printf warning >&2; exit 7"})
+	commandBody, err := json.Marshal(commandRequest{
+		Command: "printf 'first:%s' \"$TASK_VALUE\"; printf '%s' \"$PWD\" >&2; exit 7",
+		Cwd:     directory,
+		EnvVars: map[string]string{"TASK_VALUE": "configured"},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -30,13 +39,18 @@ func TestAgentCommandsAndFiles(t *testing.T) {
 	if commandResponse.Code != http.StatusOK {
 		t.Fatalf("command status = %d, body = %s", commandResponse.Code, commandResponse.Body.String())
 	}
-	for _, expected := range []string{`"type":"stdout"`, `"data":"first"`, `"type":"stderr"`, `"exit_code":7`} {
+	for _, expected := range []string{
+		`"type":"stdout"`,
+		`"data":"first:configured"`,
+		`"type":"stderr"`,
+		`"data":"` + resolvedDirectory + `"`,
+		`"exit_code":7`,
+	} {
 		if !strings.Contains(commandResponse.Body.String(), expected) {
 			t.Errorf("command response missing %s: %s", expected, commandResponse.Body.String())
 		}
 	}
 
-	directory := t.TempDir()
 	path := filepath.Join(directory, "nested", "result.bin")
 	uploadRequest := httptest.NewRequest(http.MethodPut, "/v1/files?path="+path, bytes.NewReader([]byte{0, 1, 2, 255}))
 	uploadRequest.Header.Set("Authorization", "Bearer "+token)

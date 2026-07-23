@@ -27,6 +27,10 @@ const defaultCommandHeartbeat = 10 * time.Second
 
 var environmentName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*$`)
 
+var errCommandStdout = errors.New("could not open command stdout")
+
+var errCommandStderr = errors.New("could not open command stderr")
+
 type commandRequest struct {
 	Command string            `json:"command"`
 	Cwd     string            `json:"cwd"`
@@ -38,6 +42,15 @@ type commandEvent struct {
 	Type     string `json:"type"`
 	Data     string `json:"data,omitempty"`
 	ExitCode *int   `json:"exit_code,omitempty"`
+}
+
+type runningCommand struct {
+	command     *exec.Cmd
+	stdout      io.ReadCloser
+	stderr      io.ReadCloser
+	cancel      context.CancelFunc
+	context     context.Context
+	processDone chan struct{}
 }
 
 func newAgentHandler(token string) http.Handler {
@@ -94,54 +107,96 @@ func handleCommand(response http.ResponseWriter, request *http.Request, heartbea
 		return
 	}
 
-	commandContext, cancelCommand := context.WithCancel(request.Context())
-	defer cancelCommand()
+	command, err := startCommand(request, payload)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, errCommandStdout) || errors.Is(err, errCommandStderr) {
+			status = http.StatusInternalServerError
+		}
+		http.Error(response, err.Error(), status)
+		return
+	}
+	defer command.close()
+
+	events, waitResult := collectCommandEvents(command)
+	streamCommandEvents(response, command, events, waitResult, heartbeat)
+}
+
+func startCommand(request *http.Request, payload commandRequest) (*runningCommand, error) {
+	var commandContext context.Context
+	var cancelCommand context.CancelFunc
 	if payload.Timeout != nil {
-		timeoutContext, cancelTimeout := context.WithTimeout(
-			commandContext,
+		commandContext, cancelCommand = context.WithTimeout(
+			request.Context(),
 			time.Duration(*payload.Timeout*float64(time.Second)),
 		)
-		defer cancelTimeout()
-		commandContext = timeoutContext
+	} else {
+		commandContext, cancelCommand = context.WithCancel(request.Context())
 	}
 
-	command := exec.Command("sh", "-lc", payload.Command)
-	command.Dir = payload.Cwd
-	command.Env = os.Environ()
+	process := exec.Command("sh", "-lc", payload.Command)
+	process.Dir = payload.Cwd
+	process.Env = os.Environ()
 	for name, value := range payload.EnvVars {
-		command.Env = append(command.Env, name+"="+value)
+		process.Env = append(process.Env, name+"="+value)
 	}
-	command.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	stdout, err := command.StdoutPipe()
+	process.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	stdout, err := process.StdoutPipe()
 	if err != nil {
-		http.Error(response, "could not open command stdout", http.StatusInternalServerError)
-		return
+		cancelCommand()
+		return nil, errCommandStdout
 	}
-	stderr, err := command.StderrPipe()
+	stderr, err := process.StderrPipe()
 	if err != nil {
-		http.Error(response, "could not open command stderr", http.StatusInternalServerError)
-		return
+		cancelCommand()
+		return nil, errCommandStderr
 	}
-	if err := command.Start(); err != nil {
-		http.Error(response, "could not start command: "+err.Error(), http.StatusBadRequest)
-		return
+	if err := process.Start(); err != nil {
+		cancelCommand()
+		return nil, fmt.Errorf("could not start command: %w", err)
 	}
 
 	processDone := make(chan struct{})
-	go terminateOnContext(commandContext, command.Process.Pid, processDone)
+	// Context cancellation targets the command's process group.
+	go terminateOnContext(commandContext, process.Process.Pid, processDone)
+	return &runningCommand{
+		command:     process,
+		stdout:      stdout,
+		stderr:      stderr,
+		cancel:      cancelCommand,
+		context:     commandContext,
+		processDone: processDone,
+	}, nil
+}
+
+func (command *runningCommand) close() {
+	command.cancel()
+}
+
+func collectCommandEvents(command *runningCommand) (<-chan commandEvent, <-chan error) {
 	events := make(chan commandEvent, 16)
 	var readers sync.WaitGroup
 	readers.Add(2)
-	go readCommandOutput(stdout, "stdout", events, &readers)
-	go readCommandOutput(stderr, "stderr", events, &readers)
+	go readCommandOutput(command.stdout, "stdout", events, &readers)
+	go readCommandOutput(command.stderr, "stderr", events, &readers)
 	waitResult := make(chan error, 1)
 	go func() {
+		// Readers finish before the exit event so trailing output is preserved.
 		readers.Wait()
-		waitResult <- command.Wait()
-		close(processDone)
+		waitResult <- command.command.Wait()
+		close(command.processDone)
 		close(events)
 	}()
+	return events, waitResult
+}
 
+func streamCommandEvents(
+	response http.ResponseWriter,
+	command *runningCommand,
+	events <-chan commandEvent,
+	waitResult <-chan error,
+	heartbeat time.Duration,
+) {
 	response.Header().Set("Content-Type", "application/x-ndjson")
 	response.Header().Set("Cache-Control", "no-store")
 	response.Header().Set("X-Accel-Buffering", "no")
@@ -167,7 +222,7 @@ func handleCommand(response http.ResponseWriter, request *http.Request, heartbea
 			}
 			if err := encoder.Encode(event); err != nil {
 				writeFailed = true
-				cancelCommand()
+				command.cancel()
 				continue
 			}
 			if flusher != nil {
@@ -179,7 +234,7 @@ func handleCommand(response http.ResponseWriter, request *http.Request, heartbea
 			}
 			if _, err := io.WriteString(response, "\n"); err != nil {
 				writeFailed = true
-				cancelCommand()
+				command.cancel()
 				continue
 			}
 			if flusher != nil {
@@ -188,7 +243,7 @@ func handleCommand(response http.ResponseWriter, request *http.Request, heartbea
 		}
 	}
 
-	exitCode := commandExitCode(<-waitResult, commandContext.Err())
+	exitCode := commandExitCode(<-waitResult, command.context.Err())
 	if writeFailed {
 		return
 	}

@@ -33,8 +33,12 @@ The package is split by the boundary it serves:
 - `control/api.py` and `control/cache.py` contain Kubernetes API access and shared watches.
 - `control/resources.py` builds sandbox Jobs, and `control/egress.py` manages network
   policy.
-- `infra/kubernetes/aws/` provisions and destroys EKS infrastructure;
-  `infra/kubernetes/workload/` installs the cluster workload.
+- `infra/kubernetes/modules/sandbox-workload/` contains shared Kubernetes resources.
+- `infra/kubernetes/aws/foundation/` provisions EKS, VPC, IAM, and ECR.
+- `infra/kubernetes/aws/workload/` installs AWS add-ons and composes the shared module.
+
+A future GCP root reuses the shared module while supplying GKE capacity, registry,
+scheduling metadata, and its egress driver.
 
 Provider-facing commands use `POST /v1/sandboxes/{id}/command` with newline-delimited JSON.
 Blank lines are heartbeats, so a quiet command does not look dead to an idle proxy. The
@@ -461,7 +465,7 @@ uv run pytest \
 
 (cd infra/kubernetes/agent && go test -race ./...)
 terraform -chdir=infra/kubernetes/aws/foundation validate
-terraform -chdir=infra/kubernetes/workload validate
+terraform -chdir=infra/kubernetes/aws/workload validate
 helm lint infra/kubernetes/charts/karpenter-sandbox \
   --set clusterName=test-cluster \
   --set nodeRole=test-node-role

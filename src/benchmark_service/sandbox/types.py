@@ -160,6 +160,17 @@ class Sandbox(ABC):
 
 
 class SandboxProvider(ABC):
+    @property
+    def admission_pool_id(self) -> str | None:
+        return None
+
+    async def check_admission(
+        self,
+        source: SandboxSource,
+        resources: Resources,
+    ) -> bool:
+        return True
+
     @abstractmethod
     async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox: ...
 

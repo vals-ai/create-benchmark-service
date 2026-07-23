@@ -2,6 +2,7 @@ from __future__ import annotations
 
 # pyright: reportPrivateUsage=false
 
+import asyncio
 from collections.abc import AsyncGenerator
 from types import SimpleNamespace
 from typing import Any, cast
@@ -47,6 +48,16 @@ class FakeProcess:
         return self._exit_code
 
 
+class HangingProcess(FakeProcess):
+    def __init__(self) -> None:
+        super().__init__([], 137)
+        self.stdout = self._stream_until_cancelled()
+
+    async def _stream_until_cancelled(self) -> AsyncGenerator[str, None]:
+        yield "line1\n"
+        await asyncio.Event().wait()
+
+
 class FakeFilesystem:
     def __init__(self, content: bytes = b"", error: ModalError | None = None) -> None:
         self.content = content
@@ -78,7 +89,7 @@ class FakeInnerSandbox:
         exec_error: ModalError | None = None,
         file_error: ModalError | None = None,
         poll_result: int | None = None,
-        poll_results: list[int | None] | None = None,
+        poll_results: list[int | ModalError | None] | None = None,
     ) -> None:
         self.object_id = object_id
         self.commands: list[tuple[str, ...]] = []
@@ -113,7 +124,10 @@ class FakeInnerSandbox:
     async def _poll(self) -> int | None:
         # None means still running, mirroring modal.Sandbox.poll().
         if self._poll_results:
-            return self._poll_results.pop(0)
+            poll_result = self._poll_results.pop(0)
+            if isinstance(poll_result, ModalError):
+                raise poll_result
+            return poll_result
         return self._poll_result
 
     async def _set_outbound_network_policy(
@@ -312,6 +326,29 @@ async def test_command_maps_terminated_sandbox_to_not_found() -> None:
             chunks.append(chunk)
 
     assert chunks == ["line1\n"]
+
+
+async def test_command_detects_termination_while_output_stalls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Detect remote termination even when Modal leaves the output iterator open.
+
+    Test cases:
+    - A stalled stream raises SandboxNotFoundError after the sandbox poll reports termination.
+    - A transient poll failure is retried without aborting the command first.
+    """
+    monkeypatch.setattr(modal_module, "_COMMAND_STATUS_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(cast(Any, modal_module.ModalSandbox._raise_if_finished).retry, "sleep", _noop)
+    sandbox = _sandbox(
+        FakeInnerSandbox(
+            process=HangingProcess(),
+            poll_results=[None, ModalConnectionError("temporary poll failure"), 137],
+        )
+    )
+
+    async def consume_command() -> list[str]:
+        return [chunk async for chunk in sandbox.command("run")]
+
+    with pytest.raises(SandboxNotFoundError, match="poll_result=137"):
+        await asyncio.wait_for(consume_command(), timeout=1)
 
 
 async def test_command_reports_modal_poll_result_when_sandbox_finished() -> None:

@@ -41,6 +41,7 @@ _APP_NAME = "benchmark-service"
 _MAX_LIFETIME_SECONDS = 24 * 60 * 60
 _ALLOW_ALL_CIDRS = ("0.0.0.0/0",)
 _ALLOW_ALL_DOMAINS = ("*",)
+_COMMAND_STATUS_POLL_SECONDS = 10
 _MAX_NAME_LENGTH = 64
 _INVALID_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_.-]")
 _APP_ID_PATTERN = re.compile(r"^ap-[a-zA-Z0-9]{22}$")
@@ -132,6 +133,7 @@ class ModalSandbox(Sandbox):
         # Modal does not expose a cached lifecycle state on the sandbox handle.
         return "unknown"
 
+    @_PROVIDER_RETRY
     async def _raise_if_finished(self, *, attempts: int = 1, wait_seconds: float = 0) -> None:
         try:
             for attempt in range(attempts):
@@ -195,13 +197,33 @@ class ModalSandbox(Sandbox):
         env = validate_command_env(env_vars) if env_vars is not None else None
         await self._raise_if_finished()
         process = await self._start_process(command, cwd=cwd, timeout=timeout, env_vars=env)
+        output_iterator = process.stdout.__aiter__()
+        next_chunk_task = asyncio.create_task(anext(output_iterator))
 
         try:
-            async for chunk in process.stdout:
+            while True:
+                completed, _ = await asyncio.wait(
+                    {next_chunk_task},
+                    timeout=_COMMAND_STATUS_POLL_SECONDS,
+                )
+                if not completed:
+                    await self._raise_if_finished()
+                    continue
+
+                try:
+                    chunk = next_chunk_task.result()
+                except StopAsyncIteration:
+                    break
+
                 yield str(chunk)
+                next_chunk_task = asyncio.create_task(anext(output_iterator))
             exit_code = await process.wait.aio()
         except ModalError as exc:
             raise _sandbox_error(exc) from exc
+        finally:
+            if not next_chunk_task.done():
+                next_chunk_task.cancel()
+                await asyncio.gather(next_chunk_task, return_exceptions=True)
 
         if exit_code != 0:
             await self._raise_if_finished(attempts=6, wait_seconds=0.5)

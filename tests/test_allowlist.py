@@ -54,6 +54,7 @@ def test_load_allowlist_empty_when_neither_set(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.delenv("DESCOPE_TENANT_ALLOWLIST_JSON", raising=False)
     monkeypatch.delenv("DESCOPE_ALLOWLIST_PATH", raising=False)
 
@@ -62,6 +63,25 @@ def test_load_allowlist_empty_when_neither_set(
 
     assert config.tenants == {}
     assert any("No tenant allowlist configured" in rec.message for rec in caplog.records)
+
+
+def test_unknown_tenant_policy_field_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(
+        "DESCOPE_TENANT_ALLOWLIST_JSON",
+        json.dumps(
+            {
+                "tenants": {
+                    "limited-tenant": {
+                        "datasets": ["validation"],
+                        "evaluation_quotaa": {"limit": 1, "period": "week"},
+                    }
+                }
+            }
+        ),
+    )
+
+    with pytest.raises(ValueError, match="evaluation_quotaa"):
+        load_allowlist()
 
 
 def test_tenant_config_parses_trial_mode_from_allowlist_json(monkeypatch: pytest.MonkeyPatch) -> None:

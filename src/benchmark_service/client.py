@@ -12,6 +12,7 @@ from tenacity import (
     stop_after_attempt,
     wait_random,
 )
+from websockets.exceptions import ConnectionClosed
 
 from benchmark_service.sandbox import SandboxProvider, SandboxProviderConfig
 from benchmark_service.schemas import (
@@ -154,29 +155,38 @@ class BenchmarkServiceClient:
             BenchmarkServiceError: If an "error" chunk is received or the connection
                 closes without a result.
         """
-        async with websockets.connect(
-            f"{self._ws_url}/ws/{path}",
-            additional_headers=self._headers,
-            open_timeout=60,
-            ping_timeout=None,
-            max_size=10 * 1024 * 1024,  # 10MB
-        ) as websocket:
-            await websocket.send(request.model_dump_json())
+        try:
+            async with websockets.connect(
+                f"{self._ws_url}/ws/{path}",
+                additional_headers=self._headers,
+                open_timeout=60,
+                ping_timeout=None,
+                max_size=10 * 1024 * 1024,  # 10MB
+            ) as websocket:
+                await websocket.send(request.model_dump_json())
 
-            async for message in websocket:
-                chunk: StreamChunk = _stream_chunk_adapter.validate_json(message)
+                async for message in websocket:
+                    chunk: StreamChunk = _stream_chunk_adapter.validate_json(message)
 
-                match chunk.type:
-                    case "error":
-                        raise BenchmarkServiceError(chunk.data)
-                    case "result":
-                        return chunk.data
-                    case "message":
-                        if on_message:
-                            on_message(chunk.data)
-                    case "eval_resume_state":
-                        if on_eval_resume_state:
-                            on_eval_resume_state(chunk.data)
+                    match chunk.type:
+                        case "error":
+                            raise BenchmarkServiceError(chunk.data)
+                        case "result":
+                            return chunk.data
+                        case "message":
+                            if on_message:
+                                on_message(chunk.data)
+                        case "eval_resume_state":
+                            if on_eval_resume_state:
+                                on_eval_resume_state(chunk.data)
+        except ConnectionClosed as exc:
+            close_frame = exc.rcvd or exc.sent
+            if close_frame is None:
+                detail = "without a close code"
+            else:
+                reason = f": {close_frame.reason}" if close_frame.reason else ""
+                detail = f"with code {close_frame.code}{reason}"
+            raise BenchmarkServiceError(f"WebSocket closed {detail}") from exc
 
         raise BenchmarkServiceError("Exited websocket without returning final result")
 
@@ -290,7 +300,6 @@ class BenchmarkServiceClient:
         result = await self._websocket_request("setup-task", request, on_message)
         return SetupTaskResponse.model_validate(result)
 
-    @_retry_http
     async def evaluate_response(
         self,
         task_id: str,
@@ -298,7 +307,7 @@ class BenchmarkServiceClient:
         dataset: str | None = None,
         sandbox_provider: SandboxProviderConfig | None = None,
     ) -> Any:
-        """Evaluate a text response without a live sandbox.
+        """Evaluate a text response without retrying a submitted request.
 
         Args:
             task_id: The task to evaluate.

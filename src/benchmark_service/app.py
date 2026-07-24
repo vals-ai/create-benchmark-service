@@ -19,7 +19,7 @@ from uvicorn.protocols.utils import ClientDisconnected
 from websockets.exceptions import ConnectionClosed
 
 from benchmark_service._version import __version__ as _framework_version
-from benchmark_service.auth import LEGACY_TENANT_SENTINEL, get_auth_settings, get_tenant_config, load_allowlist
+from benchmark_service.auth import LEGACY_TENANT_SENTINEL, get_tenant_config, load_allowlist
 from benchmark_service.base import BenchmarkService
 from benchmark_service.grading import SUBMISSION_ARTIFACT_SANDBOX_PATH, evaluate_submission
 from benchmark_service.inflight import InflightMiddleware
@@ -67,6 +67,10 @@ from benchmark_service.v1_schemas import (
 )
 
 logger = logging.getLogger(__name__)
+
+_EVALUATION_QUOTA_UNAVAILABLE_DETAIL = (
+    "Evaluation quota enforcement is temporarily unavailable; try again later."
+)
 
 
 async def send_json_if_connected(websocket: WebSocket, payload: dict[str, Any]) -> bool:
@@ -218,7 +222,7 @@ class _GradingAdmission:
         )
 
     @asynccontextmanager
-    async def acquire(self, key: tuple[str, str, str]) -> AsyncGenerator[None, None]:
+    async def reserve(self, key: tuple[str, str, str]) -> AsyncGenerator[None, None]:
         tenant, run_id, task_id = key
         if key in self._admitted:
             raise _DuplicateGradingRequest(
@@ -234,6 +238,16 @@ class _GradingAdmission:
 
         self._admitted.add(key)
         self._admitted_by_tenant[tenant] += 1
+        try:
+            yield
+        finally:
+            self._admitted.discard(key)
+            self._admitted_by_tenant[tenant] -= 1
+            if self._admitted_by_tenant[tenant] == 0:
+                del self._admitted_by_tenant[tenant]
+
+    @asynccontextmanager
+    async def acquire_active_slot(self) -> AsyncGenerator[None, None]:
         acquired = False
         try:
             try:
@@ -247,10 +261,12 @@ class _GradingAdmission:
         finally:
             if acquired:
                 self._active.release()
-            self._admitted.discard(key)
-            self._admitted_by_tenant[tenant] -= 1
-            if self._admitted_by_tenant[tenant] == 0:
-                del self._admitted_by_tenant[tenant]
+
+    @asynccontextmanager
+    async def acquire(self, key: tuple[str, str, str]) -> AsyncGenerator[None, None]:
+        async with self.reserve(key):
+            async with self.acquire_active_slot():
+                yield
 
 
 def _get_service_metadata(service_cls: type[BenchmarkService]) -> tuple[str | None, str | None]:
@@ -292,12 +308,12 @@ class BenchmarkServiceApp(FastAPI):
 
     def __init__(self, service_cls: type[BenchmarkService]) -> None:
         self._service_name, self._service_version = _get_service_metadata(service_cls)
+        configured_deployment_name = os.getenv(evaluation_quota.SERVICE_NAME_ENV, "").strip()
 
         @asynccontextmanager
         async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
-            if get_auth_settings().auth_required:
-                allowlist = load_allowlist()
-                evaluation_quota.require_configured(allowlist)
+            allowlist = load_allowlist()
+            evaluation_quota.require_configured(allowlist, service_name=configured_deployment_name)
             submission_artifacts.require_configured()
             if not submission_artifacts.is_configured():
                 logger.warning(
@@ -324,7 +340,7 @@ class BenchmarkServiceApp(FastAPI):
         super().__init__(title=service_cls.__name__, lifespan=lifespan)
         self._grading_provider: SandboxProvider | None = None
         self._grading_admission = _GradingAdmission.from_env()
-        self._deployment_name = os.getenv("SERVICE_NAME", service_cls.__name__)
+        self._deployment_name = configured_deployment_name or service_cls.__name__
         self.add_middleware(InflightMiddleware, service_name=self._deployment_name)
         self._register_routes()
 
@@ -418,6 +434,14 @@ class BenchmarkServiceApp(FastAPI):
                 detail=str(exc),
                 headers={"Retry-After": str(exc.retry_after_seconds)},
             ) from exc
+        except evaluation_quota.EvaluationQuotaUnavailable as exc:
+            logger.warning(
+                "Evaluation quota storage unavailable for service %s tenant %s",
+                self._deployment_name,
+                tenant,
+                exc_info=True,
+            )
+            raise HTTPException(status_code=503, detail=_EVALUATION_QUOTA_UNAVAILABLE_DETAIL) from exc
 
     async def _consume_websocket_evaluation_quota(
         self,
@@ -430,7 +454,17 @@ class BenchmarkServiceApp(FastAPI):
                 tenant=tenant,
             )
         except evaluation_quota.EvaluationQuotaExceeded as exc:
-            await websocket.close(code=1008, reason=str(exc))
+            reset_timestamp = exc.reset_at.isoformat(timespec="seconds").replace("+00:00", "Z")
+            await websocket.close(code=1008, reason=f"Evaluation quota reached; retry after {reset_timestamp}.")
+            return False
+        except evaluation_quota.EvaluationQuotaUnavailable:
+            logger.warning(
+                "Evaluation quota storage unavailable for service %s tenant %s",
+                self._deployment_name,
+                tenant,
+                exc_info=True,
+            )
+            await websocket.close(code=1011, reason=_EVALUATION_QUOTA_UNAVAILABLE_DETAIL)
             return False
         return True
 
@@ -618,37 +652,38 @@ class BenchmarkServiceApp(FastAPI):
                     detail="Grading sandbox is not configured; contact the benchmark service owner.",
                 )
             try:
-                async with self._grading_admission.acquire((tenant, body.run_id, body.task_id)):
-                    submission: GradingSubmission
-                    if body.payload.type == V1PayloadType.ARTIFACT:
-                        try:
-                            artifact_reference = await submission_artifacts.stat(body.payload.data, tenant=tenant)
-                        except submission_artifacts.SubmissionArtifactNotFound as exc:
-                            raise HTTPException(status_code=404, detail=str(exc)) from exc
-                        except submission_artifacts.SubmissionArtifactTooLarge as exc:
-                            raise HTTPException(status_code=413, detail=str(exc)) from exc
-                        submission = ArtifactGradingSubmission(
-                            task_id=body.task_id,
-                            schema_id=body.payload.schema_id,
-                            artifact_reference=artifact_reference,
-                            sandbox_path=SUBMISSION_ARTIFACT_SANDBOX_PATH,
-                        )
-                    else:
-                        submission = TextGradingSubmission(
-                            task_id=body.task_id,
-                            schema_id=body.payload.schema_id,
-                            text=body.payload.data,
-                        )
+                async with self._grading_admission.reserve((tenant, body.run_id, body.task_id)):
                     await self._consume_evaluation_quota(tenant)
-                    response = await evaluate_submission(
-                        service=self.service,
-                        run_id=body.run_id,
-                        tenant=tenant,
-                        submission=submission,
-                        provider=provider,
-                        evaluator_version=self._service_version,
-                        dataset=body.dataset,
-                    )
+                    async with self._grading_admission.acquire_active_slot():
+                        submission: GradingSubmission
+                        if body.payload.type == V1PayloadType.ARTIFACT:
+                            try:
+                                artifact_reference = await submission_artifacts.stat(body.payload.data, tenant=tenant)
+                            except submission_artifacts.SubmissionArtifactNotFound as exc:
+                                raise HTTPException(status_code=404, detail=str(exc)) from exc
+                            except submission_artifacts.SubmissionArtifactTooLarge as exc:
+                                raise HTTPException(status_code=413, detail=str(exc)) from exc
+                            submission = ArtifactGradingSubmission(
+                                task_id=body.task_id,
+                                schema_id=body.payload.schema_id,
+                                artifact_reference=artifact_reference,
+                                sandbox_path=SUBMISSION_ARTIFACT_SANDBOX_PATH,
+                            )
+                        else:
+                            submission = TextGradingSubmission(
+                                task_id=body.task_id,
+                                schema_id=body.payload.schema_id,
+                                text=body.payload.data,
+                            )
+                        response = await evaluate_submission(
+                            service=self.service,
+                            run_id=body.run_id,
+                            tenant=tenant,
+                            submission=submission,
+                            provider=provider,
+                            evaluator_version=self._service_version,
+                            dataset=body.dataset,
+                        )
             except _DuplicateGradingRequest as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             except _GradingCapacityExceeded as exc:

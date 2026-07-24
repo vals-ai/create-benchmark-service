@@ -6,6 +6,8 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from websockets.exceptions import ConnectionClosedError
+from websockets.frames import Close
 
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
@@ -442,8 +444,9 @@ async def test_verify_task_ids_no_dataset_omitted(
 class _AsyncIterator:
     """Async iterator over a list of strings."""
 
-    def __init__(self, items: list[str]) -> None:
+    def __init__(self, items: list[str], terminal_error: Exception | None = None) -> None:
         self._items = iter(items)
+        self._terminal_error = terminal_error
 
     def __aiter__(self) -> "_AsyncIterator":
         return self
@@ -452,12 +455,16 @@ class _AsyncIterator:
         try:
             return next(self._items)
         except StopIteration:
+            if self._terminal_error is not None:
+                error = self._terminal_error
+                self._terminal_error = None
+                raise error
             raise StopAsyncIteration
 
 
-def _ws_mock(messages: list[str]) -> AsyncMock:
+def _ws_mock(messages: list[str], terminal_error: Exception | None = None) -> AsyncMock:
     """Create a mock websockets.connect context manager yielding messages."""
-    ws = _AsyncIterator(messages)
+    ws = _AsyncIterator(messages, terminal_error)
     ws.send = AsyncMock()  # type: ignore[attr-defined]
 
     mock_connect = AsyncMock()
@@ -597,6 +604,28 @@ async def test_ws_connection_closed_without_result(method: str, args: list[str])
             await getattr(client, method)(*args)
 
 
+@pytest.mark.parametrize(
+    ("code", "reason"),
+    [
+        (1008, "Evaluation quota reached; retry after 2026-07-27T00:00:00Z."),
+        (1011, "Evaluation quota enforcement is temporarily unavailable; try again later."),
+    ],
+)
+async def test_ws_quota_close_is_reported_as_benchmark_service_error(
+    code: int,
+    reason: str,
+) -> None:
+    close_frame = Close(code, reason)
+    mock_connect = _ws_mock([], ConnectionClosedError(close_frame, None))
+    client = _make_client()
+
+    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+        with pytest.raises(BenchmarkServiceError) as exc_info:
+            await client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG)
+
+    assert str(exc_info.value) == f"WebSocket closed with code {code}: {reason}"
+
+
 async def test_client_list_tasks_returns_v1_dataset_tasks_response(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
@@ -707,6 +736,13 @@ async def test_client_v1_evaluate_raises_on_error_status(
     ("method", "kwargs"),
     [
         (
+            "evaluate_response",
+            {
+                "task_id": "task-1",
+                "response": "answer",
+            },
+        ),
+        (
             "v1_evaluate",
             {
                 "run_id": "run-1",
@@ -725,7 +761,7 @@ async def test_client_v1_evaluate_raises_on_error_status(
         ),
     ],
 )
-async def test_client_v1_mutations_do_not_retry_after_response_transport_failure(
+async def test_client_mutations_do_not_retry_after_response_transport_failure(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
     method: str,
     kwargs: dict[str, Any],

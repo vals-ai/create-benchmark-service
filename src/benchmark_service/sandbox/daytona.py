@@ -7,6 +7,7 @@ import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import suppress
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from aiohttp import ClientConnectionError, ClientResponseError
@@ -304,6 +305,8 @@ _PROVIDER_RETRY = retry(
 class DaytonaSandbox(Sandbox):
     def __init__(self, sandbox: AsyncSandbox) -> None:
         self._sandbox = sandbox
+        self.labels = dict(sandbox.labels)
+        self.created_at = self._parse_created_at(sandbox.created_at)
 
     @property
     def id(self) -> str:
@@ -316,6 +319,19 @@ class DaytonaSandbox(Sandbox):
     @property
     def state(self) -> str:
         return str(self._sandbox.state)
+
+    def _parse_created_at(self, value: str | None) -> datetime | None:
+        if value is None:
+            return None
+
+        try:
+            created_at = datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise SandboxError(f"Invalid Daytona creation time for {self._sandbox_ref}.") from exc
+
+        if created_at.tzinfo is None or created_at.utcoffset() is None:
+            raise SandboxError(f"Invalid Daytona creation time for {self._sandbox_ref}.")
+        return created_at.astimezone(UTC)
 
     @property
     def _sandbox_ref(self) -> str:
@@ -557,11 +573,12 @@ class DaytonaSandbox(Sandbox):
 
 class DaytonaSandboxProvider(SandboxProvider):
     def __init__(self, config: DaytonaProviderConfig) -> None:
+        self._target = config.DAYTONA_TARGET
         self._daytona = AsyncDaytona(
             config=DaytonaConfig(
                 api_key=config.DAYTONA_API_KEY,
                 api_url=config.DAYTONA_API_URL,
-                target=config.DAYTONA_TARGET,
+                target=self._target,
                 connection_pool_maxsize=None,
             )
         )
@@ -697,7 +714,12 @@ class DaytonaSandboxProvider(SandboxProvider):
     @_PROVIDER_RETRY
     async def _list_sandboxes(self, query: SandboxQuery) -> list[AsyncSandbox]:
         try:
-            daytona_query = ListSandboxesQuery(labels=query.labels, limit=query.page_size)
+            daytona_query = ListSandboxesQuery(
+                labels=query.labels,
+                targets=[self._target],
+                created_at_before=query.created_at_lte,
+                limit=query.page_size,
+            )
             return [sandbox async for sandbox in self._daytona.list(daytona_query)]
         except DaytonaError as exc:
             raise self._sandbox_error(exc) from exc

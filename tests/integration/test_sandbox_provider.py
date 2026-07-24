@@ -9,6 +9,7 @@ import asyncio
 import shlex
 import time
 from collections.abc import Awaitable, Callable
+from datetime import timedelta
 from uuid import uuid4
 
 import pytest
@@ -133,6 +134,73 @@ async def _read_stream_until_ready(sandbox: Sandbox, ready: asyncio.Event) -> No
 
 class TestSandboxProviderIntegration:
     """Run the same live contract checks against every configured provider."""
+
+    @pytest.mark.parametrize(
+        "provider_type",
+        [
+            "daytona",
+            pytest.param("modal", marks=pytest.mark.skip(reason="Daytona-only provider contract.")),
+        ],
+    )
+    async def test_daytona_inventory_metadata_and_filtering(
+        self,
+        provider_type: str,
+        sandbox_provider: SandboxProvider,
+    ) -> None:
+        """Verify Daytona inventory metadata and inclusive cutoff filtering."""
+        assert provider_type == "daytona"
+
+        sandbox_name = f"cbs-daytona-inventory-{uuid4().hex[:10]}"
+        labels = {"ProviderInventoryTest": sandbox_name}
+        query = SandboxQuery(labels=labels)
+        request = SandboxCreateRequest(
+            source=ImageSource(image=_TEST_IMAGE),
+            resources=_TEST_RESOURCES,
+            name=sandbox_name,
+            labels=labels,
+            env_vars={},
+            auto_stop_interval=10,
+            create_timeout=360,
+        )
+        sandbox_id: str | None = None
+
+        try:
+            sandbox = await sandbox_provider.create_sandbox(request)
+            sandbox_id = sandbox.id
+            await _wait_until_listed(sandbox_provider, query, sandbox.id)
+
+            listed = [
+                candidate async for candidate in sandbox_provider.list_sandboxes(query) if candidate.id == sandbox.id
+            ]
+            assert len(listed) == 1
+            listed_labels = listed[0].labels
+            assert listed_labels is not None
+            assert all(listed_labels.get(key) == value for key, value in labels.items())
+            created_at = listed[0].created_at
+            assert created_at is not None
+            assert created_at.utcoffset() == timedelta(0)
+
+            cutoff_query = SandboxQuery(labels=labels, created_at_lte=created_at)
+            await _wait_until_listed(sandbox_provider, cutoff_query, sandbox.id)
+
+            earlier_cutoff_query = SandboxQuery(
+                labels=labels,
+                created_at_lte=created_at - timedelta(microseconds=1),
+            )
+            await _wait_until_not_listed(sandbox_provider, earlier_cutoff_query, sandbox.id)
+
+            await asyncio.wait_for(
+                sandbox_provider.delete_sandbox(sandbox.id),
+                timeout=_POLL_TIMEOUT_SECONDS,
+            )
+            await _wait_until_not_found(sandbox_provider, sandbox.id)
+            sandbox_id = None
+        finally:
+            if sandbox_id is not None:
+                await asyncio.wait_for(
+                    sandbox_provider.delete_sandbox(sandbox_id),
+                    timeout=_POLL_TIMEOUT_SECONDS,
+                )
 
     async def test_provider_contract(self, sandbox_provider: SandboxProvider) -> None:
         """Verify each provider implements the shared sandbox lifecycle and operation contract.

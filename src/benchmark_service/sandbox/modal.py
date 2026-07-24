@@ -435,6 +435,9 @@ class ModalSandboxProvider(SandboxProvider):
 
     @_PROVIDER_RETRY
     async def _list_sandboxes(self, query: SandboxQuery) -> list[ModalSdkSandbox]:
+        if query.created_at_lte is not None:
+            raise SandboxError("Modal sandbox provider does not support filtering by creation time")
+
         client, app = await self._connect()
         try:
             sandboxes: list[ModalSdkSandbox] = []

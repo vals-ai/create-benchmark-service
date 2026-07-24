@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -667,6 +668,17 @@ async def test_list_sandboxes_filters_by_labels(monkeypatch: pytest.MonkeyPatch)
     assert [sandbox.id for sandbox in sandboxes] == ["sb-123"]
     assert captured["app_id"] == "ap-1"
     assert captured["tags"] == {"run_id": "r1"}
+
+
+async def test_list_sandboxes_rejects_creation_time_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = _provider(monkeypatch, SimpleNamespace())
+    query = SandboxQuery(
+        labels={},
+        created_at_lte=datetime(2026, 7, 24, 12, 30, tzinfo=UTC),
+    )
+
+    with pytest.raises(SandboxError, match="does not support filtering by creation time"):
+        _ = [sandbox async for sandbox in provider.list_sandboxes(query)]
 
 
 async def test_create_sandbox_reuses_running_sandbox_with_same_name(monkeypatch: pytest.MonkeyPatch) -> None:

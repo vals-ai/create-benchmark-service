@@ -1,12 +1,13 @@
 import asyncio
 import shlex
 from collections.abc import AsyncGenerator, Mapping
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, cast
 
 import pytest
 from aiohttp import ClientConnectionError, ClientResponseError, RequestInfo
-from daytona import GpuType, SandboxState
+from daytona import DaytonaConfig, GpuType, SandboxState
 from daytona.common.errors import (
     DaytonaConflictError,
     DaytonaConnectionError,
@@ -18,6 +19,7 @@ from daytona.common.pty import PtyResult
 from multidict import CIMultiDict, CIMultiDictProxy
 from yarl import URL
 
+import benchmark_service.sandbox.daytona as daytona_module
 from benchmark_service.sandbox import (
     ComposeSource,
     ComposeSandbox,
@@ -420,6 +422,8 @@ class InnerSandbox:
     state = SandboxState.STARTED
 
     def __init__(self) -> None:
+        self.labels: dict[str, str] = {}
+        self.created_at: str | None = None
         self.process = Process()
         self.fs = Files()
         self.autostop_interval: int | None = None
@@ -686,6 +690,39 @@ def _request(
         auto_stop_interval=600,
         create_timeout=360,
     )
+
+
+def test_sandbox_metadata_defaults_are_optional_for_existing_subclasses() -> None:
+    sandbox = RecordingSandbox()
+
+    assert sandbox.labels is None
+    assert sandbox.created_at is None
+
+
+def test_sandbox_metadata_remains_assignable_for_existing_subclasses() -> None:
+    created_at = datetime(2026, 7, 24, 12, 30, tzinfo=UTC)
+
+    class AttributeSandbox(RecordingSandbox):
+        def __init__(self) -> None:
+            super().__init__()
+            self.labels = {"run_id": "r1"}
+            self.created_at = created_at
+
+    sandbox = AttributeSandbox()
+
+    assert sandbox.labels == {"run_id": "r1"}
+    assert sandbox.created_at == created_at
+
+
+def test_compose_sandbox_delegates_inventory_metadata() -> None:
+    created_at = datetime(2026, 7, 24, 12, 30, tzinfo=UTC)
+    outer = RecordingSandbox()
+    outer.labels = {"run_id": "r1"}
+    outer.created_at = created_at
+    sandbox = ComposeSandbox(outer, ComposeSource(outer=ImageSource(image="docker:28.3.3-dind")))
+
+    assert sandbox.labels == {"run_id": "r1"}
+    assert sandbox.created_at == created_at
 
 
 async def test_compose_sandbox_routes_operations_through_main_service() -> None:
@@ -1323,6 +1360,31 @@ async def test_daytona_provider_creates_fresh_sandbox() -> None:
     assert daytona.created is True
 
 
+def test_daytona_sandbox_exposes_inventory_metadata() -> None:
+    inner = InnerSandbox()
+    inner.labels = {"Benchmark": "vcb", "clean-up": "true"}
+    inner.created_at = "2026-07-24T05:30:00-07:00"
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    assert sandbox.labels == {"Benchmark": "vcb", "clean-up": "true"}
+    assert sandbox.created_at == datetime(2026, 7, 24, 12, 30, tzinfo=UTC)
+
+
+def test_daytona_sandbox_allows_missing_creation_timestamp() -> None:
+    inner = InnerSandbox()
+
+    assert DaytonaSandbox(cast(Any, inner)).created_at is None
+
+
+@pytest.mark.parametrize("created_at", ["not-a-timestamp", "2026-07-24T12:30:00"])
+def test_daytona_sandbox_rejects_invalid_creation_timestamp(created_at: str) -> None:
+    inner = InnerSandbox()
+    inner.created_at = created_at
+
+    with pytest.raises(SandboxError):
+        _ = DaytonaSandbox(cast(Any, inner)).created_at
+
+
 async def test_daytona_provider_recovers_existing_sandbox_on_create_conflict() -> None:
     """A lost create response followed by a retry hits a name conflict; the
     provider must recover the existing sandbox by name instead of failing and
@@ -1565,18 +1627,42 @@ async def test_daytona_provider_delete_waits_for_building_sandbox() -> None:
     assert daytona.deleted is True
 
 
-async def test_daytona_provider_lists_sandboxes_with_query() -> None:
+def test_sandbox_query_rejects_naive_creation_cutoff() -> None:
+    with pytest.raises(ValueError):
+        SandboxQuery(labels={"Benchmark": "vcb"}, created_at_lte=datetime(2026, 7, 24, 12, 30))
+
+
+async def test_daytona_provider_lists_sandboxes_with_query(monkeypatch: pytest.MonkeyPatch) -> None:
     inner = InnerSandbox()
     daytona = DaytonaClient(inner)
+    cutoff = datetime(2026, 7, 24, 12, 30, tzinfo=UTC)
+
+    def create_daytona(*, config: DaytonaConfig) -> DaytonaClient:
+        assert config.target == "configured-target"
+        return daytona
+
+    monkeypatch.setattr(daytona_module, "AsyncDaytona", create_daytona)
+    provider = DaytonaSandboxProvider(
+        DaytonaProviderConfig(
+            DAYTONA_API_KEY="test-key",
+            DAYTONA_API_URL="https://daytona.example.test",
+            DAYTONA_TARGET="configured-target",
+        )
+    )
 
     sandboxes = [
-        sandbox async for sandbox in _provider(daytona).list_sandboxes(SandboxQuery(labels={"Benchmark": "vcb"}))
+        sandbox
+        async for sandbox in provider.list_sandboxes(
+            SandboxQuery(labels={"Benchmark": "vcb"}, page_size=25, created_at_lte=cutoff)
+        )
     ]
 
     assert [sandbox.id for sandbox in sandboxes] == [inner.id]
     assert daytona.listed_query is not None
     assert daytona.listed_query.labels == {"Benchmark": "vcb"}
-    assert daytona.listed_query.limit == 10
+    assert daytona.listed_query.limit == 25
+    assert daytona.listed_query.targets == ["configured-target"]
+    assert daytona.listed_query.created_at_before == cutoff
 
 
 async def test_daytona_updates_egress_rules() -> None:

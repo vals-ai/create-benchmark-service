@@ -3,9 +3,10 @@
 import asyncio
 import os
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
-from functools import lru_cache
-from typing import Protocol, cast
+from functools import lru_cache, partial
+from typing import Protocol, TypeVar, cast
 
 import boto3
 from botocore.config import Config
@@ -21,6 +22,7 @@ MAX_DOWNLOAD_BYTES_ENV = "SUBMISSION_ARTIFACT_MAX_DOWNLOAD_BYTES"
 DEFAULT_MAX_DOWNLOAD_BYTES = 64 * 1024**2
 
 _KEY_SEGMENT_RE = re.compile(KEY_SEGMENT_PATTERN)
+_T = TypeVar("_T")
 
 
 class SubmissionArtifactNotFound(Exception):
@@ -219,14 +221,39 @@ def _download_sync(reference: SubmissionArtifactReference, tenant: str) -> bytes
         body.close()
 
 
+async def _run_in_thread(operation: Callable[[], _T]) -> _T:
+    """Keep cancellation from detaching blocking storage work from its caller."""
+    worker = asyncio.create_task(asyncio.to_thread(operation))
+    cancellation: asyncio.CancelledError | None = None
+    while not worker.done():
+        try:
+            await asyncio.shield(worker)
+        except asyncio.CancelledError as exc:
+            if cancellation is None:
+                cancellation = exc
+        except Exception:  # noqa: BLE001
+            break
+
+    try:
+        result = worker.result()
+    except BaseException:  # noqa: BLE001
+        if cancellation is not None:
+            raise cancellation from None
+        raise
+
+    if cancellation is not None:
+        raise cancellation
+    return result
+
+
 async def stat(key: str, *, tenant: str) -> SubmissionArtifactReference:
     """Capture the artifact's immutable identity without fetching it.
 
     This admission check runs before any expensive grading work is provisioned.
     """
-    return await asyncio.to_thread(_stat_sync, key, tenant)
+    return await _run_in_thread(partial(_stat_sync, key, tenant))
 
 
 async def download(reference: SubmissionArtifactReference, *, tenant: str) -> bytes:
     """Fetch the admitted artifact version for server-side grading."""
-    return await asyncio.to_thread(_download_sync, reference, tenant)
+    return await _run_in_thread(partial(_download_sync, reference, tenant))

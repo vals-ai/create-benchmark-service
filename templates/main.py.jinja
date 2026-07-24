@@ -1,6 +1,7 @@
 """Benchmark service entry point."""
 
 from benchmark_service import BenchmarkServiceApp
+
 from {{ benchmark_package }}.benchmark_service import ExampleBenchmark
 
 app = BenchmarkServiceApp(ExampleBenchmark)

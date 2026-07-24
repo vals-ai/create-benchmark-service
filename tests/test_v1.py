@@ -2,7 +2,6 @@
 
 import json
 from collections.abc import Generator
-from dataclasses import dataclass
 from typing import Any
 from unittest.mock import patch
 
@@ -233,16 +232,14 @@ def test_v1_evaluate_serializes_pydantic_result(
     assert body["evaluator_version"] == "stub-service-1.0"
 
 
-def test_v1_evaluate_preserves_json_compatible_non_dict_result(
-    descope_client: TestClient, monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("result", [[1, 2], "complete"])
+def test_v1_evaluate_preserves_json_compatible_list_and_scalar_results(
+    descope_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    result: Any,
 ) -> None:
-    @dataclass(frozen=True)
-    class StubEvalResult:
-        pass_percentage: float
-        explanation: str
-
-    async def stub_eval(self: object, request: object, dataset: object = None) -> StubEvalResult:
-        return StubEvalResult(pass_percentage=0.5, explanation="partial credit")
+    async def stub_eval(self: object, request: object, dataset: object = None) -> Any:
+        return result
 
     monkeypatch.setattr(StubBenchmark, "evaluate_response", stub_eval)
 
@@ -257,7 +254,7 @@ def test_v1_evaluate_preserves_json_compatible_non_dict_result(
         headers={"x-descope-api-key": "key-acme"},
     )
     assert resp.status_code == 200
-    assert resp.json()["result"] == {"pass_percentage": 0.5, "explanation": "partial credit"}
+    assert resp.json()["result"] == result
 
 
 def test_v1_evaluate_rejects_artifact_payload_with_400(descope_client: TestClient) -> None:

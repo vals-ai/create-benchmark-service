@@ -26,6 +26,7 @@ from benchmark_service.sandbox import (
     SnapshotSource,
     sandbox_provider_config_from_mapping,
 )
+from benchmark_service.schemas import ArtifactGradingSubmission, EvalMode, GradingSubmission, TextGradingSubmission
 
 __all__ = [
     "BenchmarkServiceApp",
@@ -33,9 +34,12 @@ __all__ = [
     "BenchmarkServiceUnauthenticatedError",
     "BenchmarkServiceClient",
     "BenchmarkServiceError",
+    "ArtifactGradingSubmission",
     "ComposeSource",
     "ComposeSandbox",
     "DaytonaProviderConfig",
+    "EvalMode",
+    "GradingSubmission",
     "ExecResult",
     "ImageSource",
     "InflightMiddleware",
@@ -52,6 +56,7 @@ __all__ = [
     "SandboxQuery",
     "SandboxSource",
     "SnapshotSource",
+    "TextGradingSubmission",
     "sandbox_provider_config_from_mapping",
     "__version__",
 ]

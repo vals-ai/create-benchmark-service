@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shlex
 import uuid
 from collections import deque
@@ -132,6 +133,25 @@ class DaytonaProviderConfig(BaseModel):
             raise MissingSandboxConfigError("Missing required headers: x-api-key, x-api-url, x-target")
         return cls(DAYTONA_API_KEY=api_key, DAYTONA_API_URL=api_url, DAYTONA_TARGET=target)
 
+    @classmethod
+    def from_env(cls) -> "DaytonaProviderConfig":
+        """Build config from the DAYTONA_* environment variables; callers never supply creds."""
+        api_key = os.environ.get("DAYTONA_API_KEY")
+        api_url = os.environ.get("DAYTONA_API_URL")
+        target = os.environ.get("DAYTONA_TARGET")
+        missing = [
+            name
+            for name, value in (
+                ("DAYTONA_API_KEY", api_key),
+                ("DAYTONA_API_URL", api_url),
+                ("DAYTONA_TARGET", target),
+            )
+            if not value
+        ]
+        if missing:
+            raise MissingSandboxConfigError(f"Missing required environment variables: {', '.join(missing)}")
+        return cls(DAYTONA_API_KEY=api_key, DAYTONA_API_URL=api_url, DAYTONA_TARGET=target)  # type: ignore[arg-type]
+
     def create_provider(self) -> SandboxProvider:
         return DaytonaSandboxProvider(self)
 
@@ -228,6 +248,10 @@ def _is_transient_daytona_error(exc: DaytonaError | ClientResponseError) -> bool
     if _provider_status_code(exc) in _RETRYABLE_PROVIDER_STATUSES:
         return True
     return _message_contains(exc, _TRANSPORT_ERROR_MESSAGES)
+
+
+def _is_name_conflict_error(exc: DaytonaError) -> bool:
+    return isinstance(exc, DaytonaConflictError) or exc.status_code == 409 or _message_contains(exc, ("already exists",))
 
 
 def _parse_retry_after_seconds(value: object) -> float | None:
@@ -551,10 +575,6 @@ class DaytonaSandboxProvider(SandboxProvider):
 
     @_PROVIDER_RETRY
     async def create_sandbox(self, request: SandboxCreateRequest) -> DaytonaSandbox:
-        existing = await self._find_reusable_sandbox(request.name)
-        if existing is not None:
-            return DaytonaSandbox(existing)
-
         resources = DaytonaResources(
             cpu=request.resources.vcpu,
             memory=request.resources.memory,
@@ -571,7 +591,7 @@ class DaytonaSandboxProvider(SandboxProvider):
                     name=request.name,
                     labels=request.labels,
                     image=image,
-                    network_block_all=False,
+                    network_block_all=request.network_block_all,
                     resources=resources,
                     env_vars=request.env_vars,
                 )
@@ -585,7 +605,7 @@ class DaytonaSandboxProvider(SandboxProvider):
                     labels=request.labels,
                     snapshot=snapshot,
                     language="python",
-                    network_block_all=False,
+                    network_block_all=request.network_block_all,
                     env_vars=request.env_vars,
                 )
             case _:
@@ -594,11 +614,32 @@ class DaytonaSandboxProvider(SandboxProvider):
         try:
             inner = await self._daytona.create(params, timeout=request.create_timeout)
         except DaytonaError as exc:
+            # A name conflict means an earlier attempt of this same request
+            # created the sandbox but the response was lost (transport retry).
+            # Recover it by name so the retry doesn't strand an orphan and fail
+            # the request on the conflict.
+            if _is_name_conflict_error(exc):
+                existing = await self._find_existing_sandbox(request.name)
+                if existing is not None:
+                    return DaytonaSandbox(existing)
+            elif _is_transient_daytona_error(exc):
+                await self._delete_failed_sandbox(request.name)
             raise self._sandbox_error(exc) from exc
 
         return DaytonaSandbox(inner)
 
-    async def _find_reusable_sandbox(self, name: str) -> AsyncSandbox | None:
+    async def _delete_failed_sandbox(self, name: str) -> None:
+        try:
+            sandbox = await self._daytona.get(name)
+        except DaytonaNotFoundError:
+            return
+        except DaytonaError as exc:
+            raise self._sandbox_error(exc) from exc
+
+        if sandbox.state in _FAILED_SANDBOX_STATES:
+            await self.delete_sandbox(sandbox.id)
+
+    async def _find_existing_sandbox(self, name: str) -> AsyncSandbox | None:
         try:
             sandbox = await self._daytona.get(name)
         except DaytonaNotFoundError:

@@ -19,6 +19,7 @@ from benchmark_service.schemas import (
     EvaluateResponseRequest,
     FinalScoreResponse,
     HealthCheckResponse,
+    JsonValue,
     RetrieveTaskResponse,
     SetupTaskRequest,
     SetupTaskResponse,
@@ -128,7 +129,7 @@ class BenchmarkServiceClient:
         request: BaseModel,
         on_message: Callable[[str], None] | None = None,
         on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
-    ) -> dict[str, Any]:
+    ) -> JsonValue:
         """Send a request over WebSocket and stream the response.
 
         Args:
@@ -327,7 +328,7 @@ class BenchmarkServiceClient:
         dataset: str | None = None,
         on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
         sandbox_provider: SandboxProviderConfig | None = None,
-    ) -> dict[str, Any]:
+    ) -> JsonValue:
         """Resume evaluation from state previously streamed by the benchmark service.
 
         ``sandbox_provider`` is sent only with this request; benchmark-owned
@@ -349,7 +350,7 @@ class BenchmarkServiceClient:
         on_message: Callable[[str], None] | None = None,
         dataset: str | None = None,
         on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
-    ) -> dict[str, Any]:
+    ) -> JsonValue:
         """Evaluate a task instance via WebSocket.
 
         Args:

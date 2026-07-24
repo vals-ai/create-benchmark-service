@@ -23,6 +23,7 @@ from benchmark_service.sandbox import (
     ComposeSandbox,
     ExecResult,
     ImageSource,
+    MissingSandboxConfigError,
     Resources,
     Sandbox,
     SandboxCreateRequest,
@@ -33,6 +34,7 @@ from benchmark_service.sandbox import (
 )
 from benchmark_service.sandbox.daytona import (
     _PTY_STDOUT_TAIL_MAX_BYTES,  # pyright: ignore[reportPrivateUsage]
+    DaytonaProviderConfig,
     _is_transient_daytona_error,  # pyright: ignore[reportPrivateUsage]
     DaytonaSandbox,
     DaytonaSandboxProvider,
@@ -618,10 +620,15 @@ class SysboxRunnerFaultDaytonaClient(DaytonaClient):
         self.sandbox_exists = False
 
 
-class ReusableLookupConnectionDaytonaClient(DaytonaClient):
+class ConflictThenFlakyLookupDaytonaClient(DaytonaClient):
+    """create always name-conflicts; the recovery lookup fails transiently once."""
     def __init__(self, sandbox: InnerSandbox) -> None:
         super().__init__(sandbox)
         self.get_attempts = 0
+
+    async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
+        self.created = True
+        raise DaytonaError(f"Sandbox with name {self.sandbox.name} already exists")
 
     async def get(self, instance_id: str) -> InnerSandbox:
         self.get_attempts += 1
@@ -630,7 +637,7 @@ class ReusableLookupConnectionDaytonaClient(DaytonaClient):
                 "Failed to get sandbox",
                 ClientConnectionError("tcp reset"),
             )
-        raise DaytonaNotFoundError("sandbox not found")
+        return await super().get(instance_id)
 
 
 class UnexpectedGetDaytonaClient(DaytonaClient):
@@ -1306,14 +1313,33 @@ async def test_daytona_command_cleans_up_when_consumer_stops() -> None:
     assert process.killed_session_id is not None
 
 
-async def test_daytona_provider_reuses_started_sandbox() -> None:
+async def test_daytona_provider_creates_fresh_sandbox() -> None:
     inner = InnerSandbox()
     daytona = DaytonaClient(inner)
 
     sandbox = await _provider(daytona).create_sandbox(_request(inner.name))
 
     assert sandbox.id == inner.id
-    assert daytona.created is False
+    assert daytona.created is True
+
+
+async def test_daytona_provider_recovers_existing_sandbox_on_create_conflict() -> None:
+    """A lost create response followed by a retry hits a name conflict; the
+    provider must recover the existing sandbox by name instead of failing and
+    orphaning it."""
+    inner = InnerSandbox()
+
+    class ConflictingCreateClient(DaytonaClient):
+        async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
+            self.created = True
+            raise DaytonaError(f"Sandbox with name {inner.name} already exists")
+
+    daytona = ConflictingCreateClient(inner)
+
+    sandbox = await _provider(daytona).create_sandbox(_request(inner.name))
+
+    assert daytona.created is True
+    assert sandbox.id == inner.id
 
 
 class CapturingCreateDaytonaClient(DaytonaClient):
@@ -1440,7 +1466,7 @@ async def test_daytona_provider_delete_retries_unexpected_remove_errors(monkeypa
 
 async def test_daytona_provider_create_retries_wrapped_lookup_connection_errors() -> None:
     inner = InnerSandbox()
-    daytona = ReusableLookupConnectionDaytonaClient(inner)
+    daytona = ConflictThenFlakyLookupDaytonaClient(inner)
 
     sandbox = await _provider(daytona).create_sandbox(_request(inner.name))
 
@@ -1594,3 +1620,31 @@ async def test_daytona_updates_egress_rules() -> None:
         "network_allow_list": "",
         "domain_allow_list": "",
     }
+
+
+async def test_daytona_create_forwards_network_block_all() -> None:
+    daytona = CapturingCreateDaytonaClient(InnerSandbox())
+    request = _request("grade-sb").model_copy(update={"network_block_all": True})
+
+    await _provider(daytona).create_sandbox(request)
+
+    assert daytona.create_params is not None
+    assert daytona.create_params.network_block_all is True
+
+
+def test_daytona_config_from_env_reads_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DAYTONA_API_KEY", "key-1")
+    monkeypatch.setenv("DAYTONA_API_URL", "https://daytona.example")
+    monkeypatch.setenv("DAYTONA_TARGET", "us")
+    config = DaytonaProviderConfig.from_env()
+    assert config.DAYTONA_API_KEY == "key-1"
+    assert config.DAYTONA_API_URL == "https://daytona.example"
+    assert config.DAYTONA_TARGET == "us"
+
+
+def test_daytona_config_from_env_raises_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("DAYTONA_API_KEY", raising=False)
+    monkeypatch.setenv("DAYTONA_API_URL", "https://daytona.example")
+    monkeypatch.setenv("DAYTONA_TARGET", "us")
+    with pytest.raises(MissingSandboxConfigError, match="DAYTONA_API_KEY"):
+        DaytonaProviderConfig.from_env()

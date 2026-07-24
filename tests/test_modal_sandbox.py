@@ -489,6 +489,25 @@ async def test_create_sandbox_requires_gpu_type_for_gpu(monkeypatch: pytest.Monk
         await provider.create_sandbox(_request(resources=Resources(vcpu=4, memory=8, disk=30, gpu=1)))
 
 
+async def test_create_sandbox_blocks_network_without_conflicting_allowlists(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return FakeInnerSandbox()
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    request = _request().model_copy(update={"network_block_all": True})
+
+    await provider.create_sandbox(request)
+
+    assert captured["block_network"] is True
+    assert captured["outbound_cidr_allowlist"] is None
+    assert captured["outbound_domain_allowlist"] is None
+
+
 async def test_create_sandbox_uses_modal_safe_name(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify Modal receives a safe name while callers keep the requested sandbox name.
 

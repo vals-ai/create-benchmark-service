@@ -11,12 +11,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from cachetools import TTLCache
 from descope.descope_client import DescopeClient
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, PositiveInt
 
 logger = logging.getLogger(__name__)
 
@@ -26,10 +26,18 @@ AUTH_CACHE_MAX_SIZE = 1024
 LEGACY_TENANT_SENTINEL = "_legacy"
 
 
+class EvaluationQuotaConfig(BaseModel):
+    """Per-tenant evaluation request quota."""
+
+    limit: PositiveInt
+    period: Literal["week"]
+
+
 class TenantConfig(BaseModel):
     """Per-tenant access rules within a benchmark service."""
 
     datasets: list[str] = Field(default_factory=list)
+    evaluation_quota: EvaluationQuotaConfig | None = None
     trial_mode: bool = Field(
         default=False,
         description=(

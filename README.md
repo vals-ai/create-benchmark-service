@@ -306,6 +306,9 @@ tenants:
   acme-corp:
     datasets:
       - validation
+    evaluation_quota:
+      limit: 2500
+      period: week
   vals-internal:
     datasets:
       - default
@@ -314,6 +317,10 @@ tenants:
 ```
 
 Malformed configured allowlists raise at app startup when `AUTH_REQUIRED=true`. Unknown tenants receive `401 Unauthorized`. Known tenants requesting a dataset outside their allowlist receive `403 Dataset not allowed`; WebSocket routes close with code `1008`. The tenant ID `"_legacy"` is reserved for compatibility mode and is rejected as a Descope tenant.
+
+**Evaluation quotas.** Add `evaluation_quota` to a tenant entry to cap that tenant's evaluation requests. The current period is a UTC week running Monday 00:00 through the following Monday. `POST /v1/evaluate`, `POST /evaluate-response/`, `/ws/evaluate-response`, and `/ws/evaluate-instance` consume the same quota; task setup, task retrieval, and score aggregation do not. Authentication, request parsing, and dataset authorization happen before the request is counted. Once admitted, the request counts even if evaluation later fails.
+
+Quota-enabled deployments must set `EVALUATION_QUOTA_TABLE_NAME` to a DynamoDB table whose string partition key is `quota_key` and whose TTL attribute is `expires_at`. The task role needs `dynamodb:UpdateItem` on that table. Counter updates are atomic across service processes and return HTTP 429 with `Retry-After`, or WebSocket close code `1008`, after the configured limit is reached. Missing table configuration fails service startup instead of silently disabling enforcement.
 
 For local development or legacy custom services, leave `AUTH_REQUIRED` unset or `false`. In that mode, `BENCHMARK_API_KEY` preserves the previous static-key behavior by requiring `Authorization: Bearer <key>`. If `BENCHMARK_API_KEY` is not set, requests are allowed. Legacy auth uses the `"_legacy"` sentinel and bypasses dataset-level allowlist enforcement because no tenant identity is available.
 

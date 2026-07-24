@@ -53,7 +53,7 @@ from benchmark_service.trial import (
     sanitize_v1_eval_response,
     sanitize_v1_score_response,
 )
-from benchmark_service import submission_artifacts
+from benchmark_service import evaluation_quota, submission_artifacts
 from benchmark_service.v1_schemas import (
     V1DatasetTasksResponse,
     V1EvalRequest,
@@ -296,7 +296,8 @@ class BenchmarkServiceApp(FastAPI):
         @asynccontextmanager
         async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
             if get_auth_settings().auth_required:
-                load_allowlist()
+                allowlist = load_allowlist()
+                evaluation_quota.require_configured(allowlist)
             submission_artifacts.require_configured()
             if not submission_artifacts.is_configured():
                 logger.warning(
@@ -323,8 +324,8 @@ class BenchmarkServiceApp(FastAPI):
         super().__init__(title=service_cls.__name__, lifespan=lifespan)
         self._grading_provider: SandboxProvider | None = None
         self._grading_admission = _GradingAdmission.from_env()
-        service_name = os.getenv("SERVICE_NAME", service_cls.__name__)
-        self.add_middleware(InflightMiddleware, service_name=service_name)
+        self._deployment_name = os.getenv("SERVICE_NAME", service_cls.__name__)
+        self.add_middleware(InflightMiddleware, service_name=self._deployment_name)
         self._register_routes()
 
     def _register_routes(self) -> None:
@@ -405,6 +406,34 @@ class BenchmarkServiceApp(FastAPI):
         websocket.state.tenant = tenant
         return tenant
 
+    async def _consume_evaluation_quota(self, tenant: str) -> None:
+        try:
+            await evaluation_quota.consume_evaluation_request(
+                service_name=self._deployment_name,
+                tenant=tenant,
+            )
+        except evaluation_quota.EvaluationQuotaExceeded as exc:
+            raise HTTPException(
+                status_code=429,
+                detail=str(exc),
+                headers={"Retry-After": str(exc.retry_after_seconds)},
+            ) from exc
+
+    async def _consume_websocket_evaluation_quota(
+        self,
+        websocket: WebSocket,
+        tenant: str,
+    ) -> bool:
+        try:
+            await evaluation_quota.consume_evaluation_request(
+                service_name=self._deployment_name,
+                tenant=tenant,
+            )
+        except evaluation_quota.EvaluationQuotaExceeded as exc:
+            await websocket.close(code=1008, reason=str(exc))
+            return False
+        return True
+
     async def _verify_task_ids(
         self,
         request: Request,
@@ -477,6 +506,7 @@ class BenchmarkServiceApp(FastAPI):
     async def _evaluate_response(self, request: Request, body: EvaluateResponseRequest) -> Any:
         if not await self.service.check_dataset_access(request.state.tenant, body.dataset):
             raise HTTPException(status_code=403, detail="Dataset not allowed")
+        await self._consume_evaluation_quota(cast(str, request.state.tenant))
         return await self.service.evaluate_response(body, dataset=body.dataset)
 
     async def _evaluate_response_stream(self, websocket: WebSocket) -> None:
@@ -492,6 +522,8 @@ class BenchmarkServiceApp(FastAPI):
 
             if not await self.service.check_dataset_access(tenant, request.dataset):
                 await websocket.close(code=1008, reason="Dataset not allowed")
+                return
+            if not await self._consume_websocket_evaluation_quota(websocket, tenant):
                 return
 
             await _forward_stream(
@@ -525,6 +557,8 @@ class BenchmarkServiceApp(FastAPI):
 
             if not await self.service.check_dataset_access(tenant, request.dataset):
                 await websocket.close(code=1008, reason="Dataset not allowed")
+                return
+            if not await self._consume_websocket_evaluation_quota(websocket, tenant):
                 return
 
             async with sandbox_config.create_provider() as provider:
@@ -605,6 +639,7 @@ class BenchmarkServiceApp(FastAPI):
                             schema_id=body.payload.schema_id,
                             text=body.payload.data,
                         )
+                    await self._consume_evaluation_quota(tenant)
                     response = await evaluate_submission(
                         service=self.service,
                         run_id=body.run_id,
@@ -629,6 +664,7 @@ class BenchmarkServiceApp(FastAPI):
                 schema_id=body.payload.schema_id,
                 text=body.payload.data,
             )
+            await self._consume_evaluation_quota(tenant)
             response = await evaluate_submission(
                 service=self.service,
                 run_id=body.run_id,

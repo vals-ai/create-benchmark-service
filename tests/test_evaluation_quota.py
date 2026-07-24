@@ -20,7 +20,7 @@ from starlette.websockets import WebSocketDisconnect
 from benchmark_service import auth as auth_module
 from benchmark_service import evaluation_quota
 from benchmark_service.app import BenchmarkServiceApp
-from benchmark_service.auth import clear_allowlist_cache, clear_auth_cache
+from benchmark_service.auth import EvaluationQuotaPeriod, clear_allowlist_cache, clear_auth_cache
 from benchmark_service.sandbox import SandboxProvider
 from benchmark_service.schemas import EvalMode
 from benchmark_service.submission_artifacts import SubmissionArtifactNotFound
@@ -67,7 +67,11 @@ def _client_error(code: str) -> ClientError:
     )
 
 
-def _set_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
+def _set_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    period: EvaluationQuotaPeriod = "week",
+) -> None:
     monkeypatch.setenv(
         "DESCOPE_TENANT_ALLOWLIST_JSON",
         json.dumps(
@@ -75,7 +79,7 @@ def _set_allowlist(monkeypatch: pytest.MonkeyPatch) -> None:
                 "tenants": {
                     "limited-tenant": {
                         "datasets": ["default"],
-                        "evaluation_quota": {"limit": 1, "period": "week"},
+                        "evaluation_quota": {"limit": 1, "period": period},
                     },
                     "unlimited-tenant": {"datasets": ["default"]},
                 }
@@ -102,10 +106,13 @@ async def test_weekly_counter_uses_conditional_update_and_resets_on_monday(
 
     call = fake.calls[0]
     assert call["TableName"] == "evaluation-quotas"
-    assert call["Key"] == {"quota_key": {"S": '["example-benchmark","limited-tenant","evaluation","2026-07-20"]'}}
+    assert call["Key"] == {
+        "quota_key": {"S": '["example-benchmark","limited-tenant","evaluation","week","2026-07-20"]'}
+    }
     assert call["ConditionExpression"] == ("attribute_not_exists(#request_count) OR #request_count < :limit")
     values = cast(dict[str, dict[str, str]], call["ExpressionAttributeValues"])
     assert values[":limit"] == {"N": "1"}
+    assert values[":period"] == {"S": "week"}
     assert values[":expires_at"] == {"N": str(int(datetime(2026, 7, 27, tzinfo=UTC).timestamp()))}
 
     with pytest.raises(evaluation_quota.EvaluationQuotaExceeded) as exc_info:
@@ -124,9 +131,35 @@ async def test_weekly_counter_uses_conditional_update_and_resets_on_monday(
         now=datetime(2026, 7, 27, tzinfo=UTC),
     )
     assert fake.counts == {
-        '["example-benchmark","limited-tenant","evaluation","2026-07-20"]': 1,
-        '["example-benchmark","limited-tenant","evaluation","2026-07-27"]': 1,
+        '["example-benchmark","limited-tenant","evaluation","week","2026-07-20"]': 1,
+        '["example-benchmark","limited-tenant","evaluation","week","2026-07-27"]': 1,
     }
+
+
+async def test_day_and_month_periods_use_distinct_utc_calendar_windows(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(evaluation_quota.EVALUATION_QUOTA_TABLE_ENV, "evaluation-quotas")
+    fake = _FakeDynamoDB()
+    monkeypatch.setattr(evaluation_quota, "_dynamodb_client", lambda: fake)
+    now = datetime(2026, 12, 1, 12, 0, tzinfo=UTC)
+
+    for period in ("day", "month"):
+        _set_allowlist(monkeypatch, period=period)
+        await evaluation_quota.consume_evaluation_request(
+            service_name="example-benchmark",
+            tenant="limited-tenant",
+            now=now,
+        )
+
+    assert fake.counts == {
+        '["example-benchmark","limited-tenant","evaluation","day","2026-12-01"]': 1,
+        '["example-benchmark","limited-tenant","evaluation","month","2026-12-01"]': 1,
+    }
+    day_values = cast(dict[str, dict[str, str]], fake.calls[0]["ExpressionAttributeValues"])
+    month_values = cast(dict[str, dict[str, str]], fake.calls[1]["ExpressionAttributeValues"])
+    assert day_values[":expires_at"] == {"N": str(int(datetime(2026, 12, 2, tzinfo=UTC).timestamp()))}
+    assert month_values[":expires_at"] == {"N": str(int(datetime(2027, 1, 1, tzinfo=UTC).timestamp()))}
 
 
 async def test_tenant_without_quota_does_not_touch_counter(

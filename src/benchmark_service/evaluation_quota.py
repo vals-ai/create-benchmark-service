@@ -7,18 +7,24 @@ import os
 from datetime import UTC, datetime, timedelta
 from functools import lru_cache, partial
 from math import ceil
-from typing import Protocol, cast
+from typing import Protocol, assert_never, cast
 
 import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
-from benchmark_service.auth import AllowlistConfig, EvaluationQuotaConfig, get_tenant_config
+from benchmark_service.auth import (
+    AllowlistConfig,
+    EvaluationQuotaConfig,
+    EvaluationQuotaPeriod,
+    get_tenant_config,
+)
 from benchmark_service.blocking import run_blocking
 
 EVALUATION_QUOTA_TABLE_ENV = "EVALUATION_QUOTA_TABLE_NAME"
 SERVICE_NAME_ENV = "SERVICE_NAME"
 _EVALUATION_OPERATION = "evaluation"
+_DAY = timedelta(days=1)
 _WEEK = timedelta(days=7)
 
 
@@ -78,15 +84,31 @@ def _dynamodb_client() -> _DynamoDBClient:
     )
 
 
-def _utc_week(now: datetime) -> tuple[datetime, datetime]:
+def _utc_period(now: datetime, period: EvaluationQuotaPeriod) -> tuple[datetime, datetime]:
     current = now.astimezone(UTC)
-    start = datetime(current.year, current.month, current.day, tzinfo=UTC) - timedelta(days=current.weekday())
-    return start, start + _WEEK
+    day_start = datetime(current.year, current.month, current.day, tzinfo=UTC)
+    match period:
+        case "day":
+            return day_start, day_start + _DAY
+        case "week":
+            start = day_start - timedelta(days=current.weekday())
+            return start, start + _WEEK
+        case "month":
+            start = datetime(current.year, current.month, 1, tzinfo=UTC)
+            if current.month == 12:
+                return start, datetime(current.year + 1, 1, 1, tzinfo=UTC)
+            return start, datetime(current.year, current.month + 1, 1, tzinfo=UTC)
+    assert_never(period)
 
 
-def _counter_key(service_name: str, tenant: str, period_start: datetime) -> str:
+def _counter_key(
+    service_name: str,
+    tenant: str,
+    period: EvaluationQuotaPeriod,
+    period_start: datetime,
+) -> str:
     return json.dumps(
-        [service_name, tenant, _EVALUATION_OPERATION, period_start.date().isoformat()],
+        [service_name, tenant, _EVALUATION_OPERATION, period, period_start.date().isoformat()],
         separators=(",", ":"),
     )
 
@@ -106,13 +128,14 @@ def _consume_sync(
             TableName=table_name,
             Key={
                 "quota_key": {
-                    "S": _counter_key(service_name, tenant, period_start),
+                    "S": _counter_key(service_name, tenant, policy.period, period_start),
                 }
             },
             UpdateExpression=(
                 "SET #request_count = if_not_exists(#request_count, :zero) + :one, "
                 "#expires_at = :expires_at, #service_name = :service_name, "
-                "#tenant = :tenant, #operation = :operation, #period_start = :period_start"
+                "#tenant = :tenant, #operation = :operation, #period = :period, "
+                "#period_start = :period_start"
             ),
             ConditionExpression="attribute_not_exists(#request_count) OR #request_count < :limit",
             ExpressionAttributeNames={
@@ -121,6 +144,7 @@ def _consume_sync(
                 "#service_name": "service_name",
                 "#tenant": "tenant",
                 "#operation": "operation",
+                "#period": "period",
                 "#period_start": "period_start",
             },
             ExpressionAttributeValues={
@@ -131,6 +155,7 @@ def _consume_sync(
                 ":service_name": {"S": service_name},
                 ":tenant": {"S": tenant},
                 ":operation": {"S": _EVALUATION_OPERATION},
+                ":period": {"S": policy.period},
                 ":period_start": {"S": period_start.isoformat(timespec="seconds").replace("+00:00", "Z")},
             },
         )
@@ -167,7 +192,7 @@ async def consume_evaluation_request(
         raise RuntimeError(f"{EVALUATION_QUOTA_TABLE_ENV} is required when tenant {tenant!r} has an evaluation quota")
 
     current = (now or datetime.now(UTC)).astimezone(UTC)
-    period_start, period_end = _utc_week(current)
+    period_start, period_end = _utc_period(current, tenant_config.evaluation_quota.period)
     await run_blocking(
         partial(
             _consume_sync,

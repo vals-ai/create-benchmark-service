@@ -56,9 +56,13 @@ class _DynamoDBClient(Protocol):
     def update_item(self, **kwargs: object) -> object: ...
 
 
+def _has_evaluation_quota(allowlist: AllowlistConfig) -> bool:
+    return any(config.evaluation_quota is not None for config in allowlist.tenants.values())
+
+
 def require_configured(allowlist: AllowlistConfig, *, service_name: str) -> None:
     """Fail startup when tenant quotas lack durable counter identity or storage."""
-    if not any(config.evaluation_quota is not None for config in allowlist.tenants.values()):
+    if not _has_evaluation_quota(allowlist):
         return
     if not service_name:
         raise RuntimeError(f"{SERVICE_NAME_ENV} is required when an allowlisted tenant has an evaluation quota")

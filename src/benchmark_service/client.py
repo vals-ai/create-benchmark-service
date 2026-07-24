@@ -300,6 +300,7 @@ class BenchmarkServiceClient:
         result = await self._websocket_request("setup-task", request, on_message)
         return SetupTaskResponse.model_validate(result)
 
+    @_retry_http
     async def evaluate_response(
         self,
         task_id: str,
@@ -307,7 +308,7 @@ class BenchmarkServiceClient:
         dataset: str | None = None,
         sandbox_provider: SandboxProviderConfig | None = None,
     ) -> Any:
-        """Evaluate a text response without retrying a submitted request.
+        """Evaluate a text response without a live sandbox.
 
         Args:
             task_id: The task to evaluate.

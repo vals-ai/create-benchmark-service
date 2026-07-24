@@ -736,13 +736,6 @@ async def test_client_v1_evaluate_raises_on_error_status(
     ("method", "kwargs"),
     [
         (
-            "evaluate_response",
-            {
-                "task_id": "task-1",
-                "response": "answer",
-            },
-        ),
-        (
             "v1_evaluate",
             {
                 "run_id": "run-1",
@@ -761,7 +754,7 @@ async def test_client_v1_evaluate_raises_on_error_status(
         ),
     ],
 )
-async def test_client_mutations_do_not_retry_after_response_transport_failure(
+async def test_client_v1_mutations_do_not_retry_after_response_transport_failure(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
     method: str,
     kwargs: dict[str, Any],

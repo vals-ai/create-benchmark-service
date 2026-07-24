@@ -27,7 +27,17 @@ from benchmark_service.schemas import (
     VerifyTaskIdsResponse,
     VersionResponse,
 )
-from benchmark_service.v1_schemas import V1DatasetTasksResponse
+from benchmark_service.v1_schemas import (
+    V1DatasetTasksResponse,
+    V1EvalRequest,
+    V1EvalResponse,
+    V1Payload,
+    V1PayloadType,
+    V1ScoreItem,
+    V1ScoreRequest,
+    V1ScoreResponse,
+    V1Versions,
+)
 
 _stream_chunk_adapter: TypeAdapter[StreamChunk] = TypeAdapter(StreamChunk)
 
@@ -413,3 +423,64 @@ class BenchmarkServiceClient:
             )
 
         return V1DatasetTasksResponse.model_validate(response.json())
+
+    async def v1_evaluate(
+        self,
+        run_id: str,
+        task_id: str,
+        payload_data: str,
+        payload_schema: str,
+        payload_type: V1PayloadType,
+        dataset: str | None = None,
+        versions: V1Versions | None = None,
+    ) -> V1EvalResponse:
+        """Evaluate via the lab-facing /v1/evaluate surface (Descope-authenticated).
+
+        payload_data is either inline text or an uploaded artifact key, as
+        selected by payload_type. Transport failures are not retried because
+        grading may already have started.
+        """
+        request = V1EvalRequest(
+            run_id=run_id,
+            task_id=task_id,
+            dataset=dataset,
+            payload=V1Payload(type=payload_type, schema=payload_schema, data=payload_data),
+            versions=versions or V1Versions(),
+        )
+        response = await self._http_client.post(
+            f"{self._url}/v1/evaluate",
+            json=request.model_dump(mode="json", by_alias=True, exclude_none=True),
+        )
+
+        if response.status_code == 401:
+            raise _unauthenticated_error(response)
+
+        if response.status_code != 200:
+            raise BenchmarkServiceError(
+                f"v1 evaluate failed with status code {response.status_code}, response: {response.text}"
+            )
+
+        return V1EvalResponse.model_validate(response.json())
+
+    async def v1_score(
+        self,
+        run_id: str,
+        evaluation_results: dict[str, V1ScoreItem | None],
+        dataset: str | None = None,
+    ) -> V1ScoreResponse:
+        """Score via the lab-facing /v1/score surface without retrying a submitted request."""
+        request = V1ScoreRequest(run_id=run_id, dataset=dataset, evaluation_results=evaluation_results)
+        response = await self._http_client.post(
+            f"{self._url}/v1/score",
+            json=request.model_dump(mode="json", exclude_none=True),
+        )
+
+        if response.status_code == 401:
+            raise _unauthenticated_error(response)
+
+        if response.status_code != 200:
+            raise BenchmarkServiceError(
+                f"v1 score failed with status code {response.status_code}, response: {response.text}"
+            )
+
+        return V1ScoreResponse.model_validate(response.json())

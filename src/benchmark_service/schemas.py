@@ -5,6 +5,7 @@ from typing import Annotated, Any, Literal, cast
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
+from benchmark_service.key_segments import KEY_SEGMENT_PATTERN
 from benchmark_service.sandbox import SandboxProviderConfig
 from benchmark_service.sandbox.types import BaseSandboxSource, ImageSource, Resources, SandboxSource, SnapshotSource
 from benchmark_service.submission_artifacts import SubmissionArtifactReference
@@ -154,6 +155,19 @@ class SetupTaskResponse(BaseModel):
     """Response after task setup completion."""
 
     status: str = Field(description="Status of setup operation ('ok' or error message)")
+
+
+class TaskInput(BaseModel):
+    """A file delivered into a task's generation environment."""
+
+    filename: str = Field(
+        pattern=KEY_SEGMENT_PATTERN,
+        description="File name used to download the input from the benchmark service",
+    )
+    dest: str = Field(
+        pattern=r"^/",
+        description="Absolute path where the input is placed in the generation sandbox",
+    )
 
 
 class EvaluateResponseRequest(BaseModel):

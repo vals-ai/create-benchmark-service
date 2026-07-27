@@ -17,6 +17,8 @@ from benchmark_service.v1_schemas import (
     V1PayloadType,
     V1ScoreItem,
     V1ScoreResponse,
+    V1TaskInputsResponse,
+    V1UploadUrlResponse,
     V1Versions,
 )
 
@@ -622,6 +624,76 @@ async def test_client_list_tasks_returns_v1_dataset_tasks_response(
     mock_http.get.assert_called_once_with(f"{BASE_URL}/v1/datasets/default/tasks")
 
 
+async def test_client_lists_and_downloads_task_inputs(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    list_response = _mock_response(
+        json_data={
+            "inputs": [
+                {
+                    "filename": "template.xlsx",
+                    "dest": "/workspace/submission.xlsx",
+                }
+            ]
+        }
+    )
+    download_response = _mock_response()
+    download_response.content = b"workbook"
+    mock_http.get = AsyncMock(side_effect=[list_response, download_response])
+
+    inputs = await client.list_task_inputs(dataset="validation", task_id="task-1")
+    content = await client.download_task_input(
+        dataset="validation",
+        task_id="task-1",
+        filename="template.xlsx",
+    )
+
+    assert isinstance(inputs, V1TaskInputsResponse)
+    assert inputs.inputs[0].dest == "/workspace/submission.xlsx"
+    assert content == b"workbook"
+    assert mock_http.get.await_args_list[0].args == (
+        f"{BASE_URL}/v1/datasets/validation/tasks/task-1/inputs",
+    )
+    assert mock_http.get.await_args_list[1].args == (
+        f"{BASE_URL}/v1/datasets/validation/tasks/task-1/inputs/template.xlsx",
+    )
+
+
+async def test_client_v1_upload_url_posts_artifact_identity_and_returns_upload(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    mock_http.post = AsyncMock(
+        return_value=_mock_response(
+            json_data={
+                "key": "submission-artifacts/acme/validation/run-1/task-1/submission.xlsx",
+                "url": "https://signed.example/upload",
+                "expires_in": 3600,
+            }
+        )
+    )
+
+    result = await client.v1_upload_url(
+        run_id="run-1",
+        task_id="task-1",
+        filename="submission.xlsx",
+        dataset="validation",
+    )
+
+    assert isinstance(result, V1UploadUrlResponse)
+    assert result.key == "submission-artifacts/acme/validation/run-1/task-1/submission.xlsx"
+    mock_http.post.assert_awaited_once_with(
+        f"{BASE_URL}/v1/submissions/upload-url",
+        json={
+            "run_id": "run-1",
+            "task_id": "task-1",
+            "dataset": "validation",
+            "filename": "submission.xlsx",
+        },
+    )
+
+
 async def test_client_v1_evaluate_posts_payload_and_returns_v1_eval_response(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
@@ -706,6 +778,14 @@ async def test_client_v1_evaluate_raises_on_error_status(
 @pytest.mark.parametrize(
     ("method", "kwargs"),
     [
+        (
+            "v1_upload_url",
+            {
+                "run_id": "run-1",
+                "task_id": "task-1",
+                "filename": "submission.xlsx",
+            },
+        ),
         (
             "v1_evaluate",
             {

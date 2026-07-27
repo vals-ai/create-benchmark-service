@@ -12,10 +12,11 @@ from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
-# One rule for every value that becomes an S3 object-key segment: rules out
-# separators, `.`/`..`, empties, and unbounded length (S3 keys cap at 1024
-# bytes) at the schema boundary instead of inside key construction.
-KEY_SEGMENT_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+from benchmark_service.key_segments import KEY_SEGMENT_PATTERN
+from benchmark_service.schemas import TaskInput
+
+# Rules out separators, `.`/`..`, empties, and unbounded values before they
+# become S3 object-key segments.
 KeySegment = Annotated[str, StringConstraints(pattern=KEY_SEGMENT_PATTERN)]
 
 
@@ -121,6 +122,10 @@ class V1DatasetTasksResponse(BaseModel):
     tasks: list[V1Task]
 
 
+class V1TaskInputsResponse(BaseModel):
+    inputs: list[TaskInput]
+
+
 __all__ = [
     "V1DatasetTasksResponse",
     "V1EvalRequest",
@@ -132,6 +137,7 @@ __all__ = [
     "V1ScoreRequest",
     "V1ScoreResponse",
     "V1Task",
+    "V1TaskInputsResponse",
     "V1UploadUrlRequest",
     "V1UploadUrlResponse",
     "V1Versions",

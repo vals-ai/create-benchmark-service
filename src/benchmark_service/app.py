@@ -13,7 +13,7 @@ from typing import Any, cast
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from starlette.websockets import WebSocketDisconnect
 from uvicorn.protocols.utils import ClientDisconnected
 from websockets.exceptions import ConnectionClosed
@@ -62,6 +62,7 @@ from benchmark_service.v1_schemas import (
     V1ScoreItem,
     V1ScoreRequest,
     V1ScoreResponse,
+    V1TaskInputsResponse,
     V1UploadUrlRequest,
     V1UploadUrlResponse,
 )
@@ -367,6 +368,17 @@ class BenchmarkServiceApp(FastAPI):
             self._v1_list_dataset_tasks,
             methods=["GET"],
             response_model=V1DatasetTasksResponse,
+        )
+        self.add_api_route(
+            "/v1/datasets/{dataset}/tasks/{task_id}/inputs",
+            self._v1_task_inputs,
+            methods=["GET"],
+            response_model=V1TaskInputsResponse,
+        )
+        self.add_api_route(
+            "/v1/datasets/{dataset}/tasks/{task_id}/inputs/{filename}",
+            self._v1_download_task_input,
+            methods=["GET"],
         )
 
     async def _value_error_handler(self, _request: Request, exc: Exception) -> Response:
@@ -712,6 +724,37 @@ class BenchmarkServiceApp(FastAPI):
         if _is_trial_tenant(request.state.tenant):
             return sanitize_v1_dataset_tasks_response(response)
         return response
+
+    async def _require_v1_task_access(self, request: Request, dataset: str, task_id: str) -> None:
+        _require_descope_tenant(request.state.tenant)
+        if not await self.service.check_dataset_access(request.state.tenant, dataset):
+            raise HTTPException(status_code=403, detail=f"Dataset={dataset} access not allowed")
+        try:
+            self.service.get_dataset(dataset)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=f"Dataset not found: {dataset}") from exc
+        try:
+            await self.service.validate_task_ids([task_id], dataset=dataset)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=f"Task not found: {task_id}") from exc
+
+    async def _v1_task_inputs(self, request: Request, dataset: str, task_id: str) -> V1TaskInputsResponse:
+        await self._require_v1_task_access(request, dataset, task_id)
+        return V1TaskInputsResponse(inputs=await self.service.list_task_inputs(task_id, dataset=dataset))
+
+    async def _v1_download_task_input(
+        self,
+        request: Request,
+        dataset: str,
+        task_id: str,
+        filename: str,
+    ) -> FileResponse:
+        await self._require_v1_task_access(request, dataset, task_id)
+        inputs = await self.service.list_task_inputs(task_id, dataset=dataset)
+        if filename not in {item.filename for item in inputs}:
+            raise HTTPException(status_code=404, detail=f"Task input not found: {filename}")
+        path = self.service.task_input_path(task_id, filename, dataset=dataset)
+        return FileResponse(path, media_type="application/octet-stream", filename=filename)
 
     async def _final_score(self, request: Request, body: FinalScoreRequest) -> FinalScoreResponse:
         if not await self.service.check_dataset_access(request.state.tenant, body.dataset):

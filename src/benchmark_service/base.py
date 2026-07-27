@@ -29,6 +29,7 @@ from benchmark_service.schemas import (
     StreamChunk,
     StreamResultChunk,
     TaskFilter,
+    TaskInput,
 )
 from benchmark_service.v1_schemas import V1PayloadType, V1Task
 
@@ -188,6 +189,14 @@ class BenchmarkService(ABC):
         raise NotImplementedError(
             f"{type(self).__name__}.list_tasks must explicitly map internal tasks to V1Task"
         )
+
+    async def list_task_inputs(self, task_id: str, dataset: str | None = None) -> list[TaskInput]:
+        """Return files delivered into the generation environment for a task."""
+        return []
+
+    def task_input_path(self, task_id: str, filename: str, dataset: str | None = None) -> Path:
+        """Return the local path for a file declared by `list_task_inputs`."""
+        raise KeyError(filename)
 
     def project_trial_result(self, result: Any) -> Any:
         """Trial-safe projection of a per-task eval result.

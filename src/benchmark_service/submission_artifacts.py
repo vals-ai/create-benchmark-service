@@ -12,7 +12,7 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
-from benchmark_service.v1_schemas import KEY_SEGMENT_PATTERN
+from benchmark_service.key_segments import KEY_SEGMENT_PATTERN
 
 DEFAULT_UPLOAD_EXPIRY_S = 3600
 SUBMISSION_ARTIFACT_BUCKET_ENV = "SUBMISSION_ARTIFACT_BUCKET"

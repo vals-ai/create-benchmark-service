@@ -36,6 +36,9 @@ from benchmark_service.v1_schemas import (
     V1ScoreItem,
     V1ScoreRequest,
     V1ScoreResponse,
+    V1TaskInputsResponse,
+    V1UploadUrlRequest,
+    V1UploadUrlResponse,
     V1Versions,
 )
 
@@ -423,6 +426,69 @@ class BenchmarkServiceClient:
             )
 
         return V1DatasetTasksResponse.model_validate(response.json())
+
+    @_retry_http
+    async def list_task_inputs(self, dataset: str, task_id: str) -> V1TaskInputsResponse:
+        """Fetch the files declared for a task via the lab-facing /v1/ surface."""
+        response = await self._http_client.get(
+            f"{self._url}/v1/datasets/{dataset}/tasks/{task_id}/inputs"
+        )
+
+        if response.status_code == 401:
+            raise _unauthenticated_error(response)
+
+        if response.status_code != 200:
+            raise BenchmarkServiceError(
+                f"List task inputs failed with status code {response.status_code}, response: {response.text}"
+            )
+
+        return V1TaskInputsResponse.model_validate(response.json())
+
+    @_retry_http
+    async def download_task_input(self, dataset: str, task_id: str, filename: str) -> bytes:
+        """Download one file declared by `list_task_inputs`."""
+        response = await self._http_client.get(
+            f"{self._url}/v1/datasets/{dataset}/tasks/{task_id}/inputs/{filename}"
+        )
+
+        if response.status_code == 401:
+            raise _unauthenticated_error(response)
+
+        if response.status_code != 200:
+            raise BenchmarkServiceError(
+                f"Download task input failed with status code {response.status_code}, response: {response.text}"
+            )
+
+        return response.content
+
+    async def v1_upload_url(
+        self,
+        run_id: str,
+        task_id: str,
+        filename: str,
+        dataset: str | None = None,
+    ) -> V1UploadUrlResponse:
+        """Request an upload URL for one generated task artifact."""
+        request = V1UploadUrlRequest(
+            run_id=run_id,
+            task_id=task_id,
+            dataset=dataset,
+            filename=filename,
+        )
+        response = await self._http_client.post(
+            f"{self._url}/v1/submissions/upload-url",
+            json=request.model_dump(mode="json", exclude_none=True),
+        )
+
+        if response.status_code == 401:
+            raise _unauthenticated_error(response)
+
+        if response.status_code != 200:
+            raise BenchmarkServiceError(
+                f"v1 upload URL request failed with status code {response.status_code}, response: {response.text}"
+            )
+
+        return V1UploadUrlResponse.model_validate(response.json())
 
     async def v1_evaluate(
         self,

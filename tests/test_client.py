@@ -627,12 +627,13 @@ async def test_client_list_tasks_returns_v1_dataset_tasks_response(
 async def test_client_lists_and_downloads_task_inputs(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
+    filename = "Management Purchase Assumptions & Data.xlsx"
     client, mock_http = benchmark_client
     list_response = _mock_response(
         json_data={
             "inputs": [
                 {
-                    "filename": "template.xlsx",
+                    "filename": filename,
                     "dest": "/workspace/submission.xlsx",
                 }
             ]
@@ -646,7 +647,7 @@ async def test_client_lists_and_downloads_task_inputs(
     content = await client.download_task_input(
         dataset="validation",
         task_id="task-1",
-        filename="template.xlsx",
+        filename=filename,
     )
 
     assert isinstance(inputs, V1TaskInputsResponse)
@@ -656,7 +657,8 @@ async def test_client_lists_and_downloads_task_inputs(
         f"{BASE_URL}/v1/datasets/validation/tasks/task-1/inputs",
     )
     assert mock_http.get.await_args_list[1].args == (
-        f"{BASE_URL}/v1/datasets/validation/tasks/task-1/inputs/template.xlsx",
+        f"{BASE_URL}/v1/datasets/validation/tasks/task-1/inputs/"
+        "Management%20Purchase%20Assumptions%20%26%20Data.xlsx",
     )
 
 

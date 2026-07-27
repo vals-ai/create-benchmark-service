@@ -1,16 +1,18 @@
 """Request and response models for the benchmark service API."""
 
+import unicodedata
 from enum import StrEnum
+from pathlib import PurePosixPath
 from typing import Annotated, Any, Literal, cast
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, field_validator, model_validator
 
-from benchmark_service.key_segments import KEY_SEGMENT_PATTERN
 from benchmark_service.sandbox import SandboxProviderConfig
 from benchmark_service.sandbox.types import BaseSandboxSource, ImageSource, Resources, SandboxSource, SnapshotSource
 from benchmark_service.submission_artifacts import SubmissionArtifactReference
 
 _COMPOSE_LEGACY_DOCKER_IMAGE = "compose+source-required"
+_TASK_INPUT_FILENAME_MAX_BYTES = 255
 
 type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 
@@ -160,14 +162,38 @@ class SetupTaskResponse(BaseModel):
 class TaskInput(BaseModel):
     """A file delivered into a task's generation environment."""
 
-    filename: str = Field(
-        pattern=KEY_SEGMENT_PATTERN,
-        description="File name used to download the input from the benchmark service",
-    )
-    dest: str = Field(
-        pattern=r"^/",
-        description="Absolute path where the input is placed in the generation sandbox",
-    )
+    filename: str = Field(description="File name used to download the input from the benchmark service")
+    dest: str = Field(description="Absolute path where the input is placed in the generation sandbox")
+
+    @field_validator("filename")
+    @classmethod
+    def validate_filename(cls, filename: str) -> str:
+        if not filename or filename in {".", ".."}:
+            raise ValueError("Task input filename must be a non-empty file name")
+        if "/" in filename or "\\" in filename:
+            raise ValueError("Task input filename must not contain path separators")
+        if any(unicodedata.category(character) == "Cc" for character in filename):
+            raise ValueError("Task input filename must not contain control characters")
+        if len(filename.encode("utf-8")) > _TASK_INPUT_FILENAME_MAX_BYTES:
+            raise ValueError(
+                f"Task input filename must be at most {_TASK_INPUT_FILENAME_MAX_BYTES} UTF-8 bytes"
+            )
+        return filename
+
+    @field_validator("dest")
+    @classmethod
+    def validate_dest(cls, dest: str) -> str:
+        if any(unicodedata.category(character) == "Cc" for character in dest):
+            raise ValueError("Task input destination must not contain control characters")
+
+        path = PurePosixPath(dest)
+        if not path.is_absolute() or dest.startswith("//"):
+            raise ValueError("Task input destination must be an absolute POSIX file path")
+        if ".." in path.parts:
+            raise ValueError("Task input destination must not contain parent traversal")
+        if str(path) != dest or dest.endswith("/") or not path.name:
+            raise ValueError("Task input destination must be a normalized POSIX file path")
+        return dest
 
 
 class EvaluateResponseRequest(BaseModel):

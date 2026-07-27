@@ -2,6 +2,7 @@
 
 from collections.abc import Callable
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 import websockets
@@ -447,8 +448,9 @@ class BenchmarkServiceClient:
     @_retry_http
     async def download_task_input(self, dataset: str, task_id: str, filename: str) -> bytes:
         """Download one file declared by `list_task_inputs`."""
+        encoded_filename = quote(filename, safe="")
         response = await self._http_client.get(
-            f"{self._url}/v1/datasets/{dataset}/tasks/{task_id}/inputs/{filename}"
+            f"{self._url}/v1/datasets/{dataset}/tasks/{task_id}/inputs/{encoded_filename}"
         )
 
         if response.status_code == 401:

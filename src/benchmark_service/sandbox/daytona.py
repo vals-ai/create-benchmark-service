@@ -609,11 +609,41 @@ class DaytonaSandboxProvider(SandboxProvider):
             source = source.outer
         if self._organization_id is None or not isinstance(source, ImageSource) or resources.gpu:
             return True
+        demand = (resources.vcpu, resources.memory, resources.disk)
+        if any(requested <= 0 for requested in demand):
+            raise SandboxError("Daytona admission demand must be positive")
 
         try:
             configuration = Configuration(host=self._api_url.rstrip("/"), access_token=self._api_key)
             async with asyncio.timeout(_ADMISSION_TIMEOUT_SECONDS), ApiClient(configuration) as api_client:
-                overview = await OrganizationsApi(api_client).get_organization_usage_overview(self._organization_id)
+                organizations_api = OrganizationsApi(api_client)
+                overview = await organizations_api.get_organization_usage_overview(self._organization_id)
+                matches = [
+                    usage
+                    for usage in overview.region_usage
+                    if usage.region_id == self._target and usage.sandbox_class == SandboxClass.CONTAINER
+                ]
+                if len(matches) != 1:
+                    raise SandboxError(
+                        f"Expected one Daytona capacity row for target {self._target!r}, found {len(matches)}"
+                    )
+                usage = matches[0]
+                per_sandbox_limit = (
+                    usage.max_cpu_per_sandbox,
+                    usage.max_memory_per_sandbox,
+                    usage.max_disk_per_sandbox,
+                )
+                if any(limit is None for limit in per_sandbox_limit):
+                    organization = await organizations_api.get_organization(self._organization_id)
+                    organization_limit = (
+                        organization.max_cpu_per_sandbox,
+                        organization.max_memory_per_sandbox,
+                        organization.max_disk_per_sandbox,
+                    )
+                    per_sandbox_limit = tuple(
+                        region_limit if region_limit is not None else fallback
+                        for region_limit, fallback in zip(per_sandbox_limit, organization_limit, strict=True)
+                    )
         except (ApiException, ClientResponseError) as exc:
             status = cast(int | None, exc.status)
             if status in (408, 429) or (status is not None and 500 <= status <= 599):
@@ -624,22 +654,8 @@ class DaytonaSandboxProvider(SandboxProvider):
         except (ConnectionError, TimeoutError, ClientError):
             return True
 
-        matches = [
-            usage
-            for usage in overview.region_usage
-            if usage.region_id == self._target and usage.sandbox_class == SandboxClass.CONTAINER
-        ]
-        if len(matches) != 1:
-            raise SandboxError(f"Expected one Daytona capacity row for target {self._target!r}, found {len(matches)}")
-        usage = matches[0]
-        demand = (resources.vcpu, resources.memory, resources.disk)
         total = (usage.total_cpu_quota, usage.total_memory_quota, usage.total_disk_quota)
         used = (usage.current_cpu_usage, usage.current_memory_usage, usage.current_disk_usage)
-        per_sandbox_limit = (
-            usage.max_cpu_per_sandbox,
-            usage.max_memory_per_sandbox,
-            usage.max_disk_per_sandbox,
-        )
         if any(requested > quota for requested, quota in zip(demand, total, strict=True)) or any(
             limit is not None and requested > limit
             for requested, limit in zip(demand, per_sandbox_limit, strict=True)

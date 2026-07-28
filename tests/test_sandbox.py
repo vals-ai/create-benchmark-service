@@ -717,6 +717,7 @@ def _admission_provider(
     monkeypatch: pytest.MonkeyPatch,
     result: Exception | SimpleNamespace,
     organization_id: str | None = "org-1",
+    organization_limits: tuple[int, int, int] | Exception = (8, 32, 100),
 ) -> tuple[DaytonaSandboxProvider, list[str]]:
     requested: list[str] = []
 
@@ -726,11 +727,23 @@ def _admission_provider(
             raise result
         return result
 
+    async def get_organization(_organization: str) -> SimpleNamespace:
+        if isinstance(organization_limits, Exception):
+            raise organization_limits
+        return SimpleNamespace(
+            max_cpu_per_sandbox=organization_limits[0],
+            max_memory_per_sandbox=organization_limits[1],
+            max_disk_per_sandbox=organization_limits[2],
+        )
+
     def api_client(_value: object) -> nullcontext[None]:
         return nullcontext()
 
     def organizations_api(_value: object) -> SimpleNamespace:
-        return SimpleNamespace(get_organization_usage_overview=observe)
+        return SimpleNamespace(
+            get_organization=get_organization,
+            get_organization_usage_overview=observe,
+        )
 
     monkeypatch.setattr("benchmark_service.sandbox.daytona.ApiClient", api_client)
     monkeypatch.setattr("benchmark_service.sandbox.daytona.OrganizationsApi", organizations_api)
@@ -766,6 +779,8 @@ _ADMISSION_RESOURCES = Resources(vcpu=2, memory=4, disk=10)
         (None, _ADMISSION_IMAGE, _ADMISSION_RESOURCES, {}, True, False),
         ("org-1", SnapshotSource(snapshot="snap"), _ADMISSION_RESOURCES, {}, True, False),
         ("org-1", _ADMISSION_IMAGE, Resources(vcpu=2, memory=4, disk=10, gpu=1), {}, True, False),
+        ("org-1", _ADMISSION_IMAGE, Resources(vcpu=0, memory=1, disk=1), {}, SandboxError, False),
+        ("org-1", _ADMISSION_IMAGE, Resources(vcpu=1, memory=1, disk=-1), {}, SandboxError, False),
         ("org-1", _ADMISSION_IMAGE, _ADMISSION_RESOURCES, {}, True, True),
         ("org-1", ComposeSource(outer=_ADMISSION_IMAGE), Resources(vcpu=7, memory=4, disk=10), {}, False, True),
         ("org-1", _ADMISSION_IMAGE, _ADMISSION_RESOURCES, {"current_memory_usage": 29}, False, True),
@@ -799,6 +814,28 @@ async def test_daytona_admission_decisions(
     else:
         assert await provider.check_admission(source, resources) is expected
     assert requested == (["org-1"] if observed else [])
+
+
+async def test_daytona_admission_uses_organization_limits_only_for_null_region_limits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, _ = _admission_provider(
+        monkeypatch,
+        SimpleNamespace(region_usage=[_usage_row()]),
+        organization_limits=(1, 32, 100),
+    )
+
+    with pytest.raises(SandboxError):
+        await provider.check_admission(_ADMISSION_IMAGE, _ADMISSION_RESOURCES)
+
+    provider, _ = _admission_provider(
+        monkeypatch,
+        SimpleNamespace(
+            region_usage=[_usage_row(max_cpu_per_sandbox=8, max_memory_per_sandbox=32, max_disk_per_sandbox=100)]
+        ),
+        organization_limits=AssertionError("organization limits should not be fetched"),
+    )
+    assert await provider.check_admission(_ADMISSION_IMAGE, _ADMISSION_RESOURCES)
 
 
 @pytest.mark.parametrize(

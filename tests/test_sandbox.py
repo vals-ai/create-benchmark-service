@@ -1420,7 +1420,7 @@ def test_daytona_sandbox_rejects_invalid_creation_timestamp(created_at: str) -> 
     inner.created_at = created_at
 
     with pytest.raises(SandboxError):
-        _ = DaytonaSandbox(cast(Any, inner)).created_at
+        DaytonaSandbox(cast(Any, inner))
 
 
 async def test_daytona_provider_recovers_existing_sandbox_on_create_conflict() -> None:
@@ -1685,25 +1685,38 @@ async def test_daytona_provider_lists_sandboxes_with_canonical_target(
             SimpleNamespace(id=canonical_target, name="configured-target"),
         ],
     )
+    query = SandboxQuery(labels={"Benchmark": "vcb"}, page_size=25, created_at_lte=cutoff)
+    resolution_started = asyncio.Event()
+    release_resolution = asyncio.Event()
+    list_available_regions = regions_client.list_available_regions
 
-    sandboxes = [
-        sandbox
-        async for sandbox in provider.list_sandboxes(
-            SandboxQuery(labels={"Benchmark": "vcb"}, page_size=25, created_at_lte=cutoff)
-        )
-    ]
-    assert daytona.listed_query is not None
-    first_query = daytona.listed_query
-    _ = [sandbox async for sandbox in provider.list_sandboxes(SandboxQuery(labels={"Benchmark": "vcb"}))]
+    async def gated_list_available_regions() -> list[SimpleNamespace]:
+        resolution_started.set()
+        await release_resolution.wait()
+        return await list_available_regions()
 
-    assert [sandbox.id for sandbox in sandboxes] == ["sandbox-id"]
+    async def list_once(started: asyncio.Event | None = None) -> list[DaytonaSandbox]:
+        if started is not None:
+            started.set()
+        return [sandbox async for sandbox in provider.list_sandboxes(query)]
+
+    monkeypatch.setattr(regions_client, "list_available_regions", gated_list_available_regions)
+    first_list = asyncio.create_task(list_once())
+    await resolution_started.wait()
+    second_started = asyncio.Event()
+    second_list = asyncio.create_task(list_once(second_started))
+    await second_started.wait()
+    release_resolution.set()
+    sandboxes = await asyncio.gather(first_list, second_list)
+
+    assert [[sandbox.id for sandbox in result] for result in sandboxes] == [["sandbox-id"], ["sandbox-id"]]
     assert regions_client.list_attempts == 1
     assert regions_client.close_attempts == 1
     assert daytona.listed_query is not None
     assert daytona.listed_query.labels == {"Benchmark": "vcb"}
     assert daytona.listed_query.targets == [canonical_target]
-    assert first_query.limit == 25
-    assert first_query.created_at_before == cutoff
+    assert daytona.listed_query.limit == 25
+    assert daytona.listed_query.created_at_before == cutoff
 
 
 async def test_daytona_target_resolution_preserves_provider_error(monkeypatch: pytest.MonkeyPatch) -> None:

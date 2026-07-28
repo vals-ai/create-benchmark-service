@@ -139,12 +139,27 @@ def _require_tenant_key(key: str, tenant: str) -> None:
         raise ValueError("tenant is not a valid object-key segment")
     segments = key.split("/")
     if (
-        len(segments) < 3
+        len(segments) != 6
         or segments[0] != SUBMISSION_ARTIFACT_KEY_PREFIX
         or segments[1] != tenant
         or not all(_KEY_SEGMENT_RE.fullmatch(s) for s in segments[1:])
     ):
         raise ValueError("key does not name an artifact submitted by this tenant")
+
+
+def validate_submission_key(
+    key: str,
+    *,
+    tenant: str,
+    dataset: str,
+    run_id: str,
+    task_id: str,
+) -> None:
+    """Require a key minted for this authenticated evaluation request."""
+    _require_tenant_key(key, tenant)
+    segments = key.split("/")
+    if segments[2:5] != [dataset, run_id, task_id]:
+        raise ValueError("key does not name the artifact uploaded for this evaluation")
 
 
 def _max_download_bytes() -> int:

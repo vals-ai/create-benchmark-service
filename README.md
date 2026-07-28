@@ -159,7 +159,23 @@ Yield these from your generator methods; the framework serialises and forwards t
 
 ### v1 Eval API (lab-facing)
 
-`/v1/evaluate` and `/v1/score` are the lab-facing surface. Text-mode evaluation reuses `evaluate_response`, while sandbox-mode evaluation runs `evaluate_instance`; scoring reuses `calculate_final_score` for both modes.
+`/v1/evaluate` and `/v1/score` are the lab-facing surface. Text-mode evaluation reuses `evaluate_response`, in-process artifact evaluation passes admitted bytes to `evaluate_artifact`, and sandbox-mode evaluation runs `evaluate_instance`. Scoring reuses `calculate_final_score` for every mode.
+
+### In-process artifact evaluation (`eval_mode = IN_PROCESS_ARTIFACT`)
+
+Benchmarks that grade an uploaded file inside the service process declare
+`eval_mode = EvalMode.IN_PROCESS_ARTIFACT`, declare only the artifact schema
+IDs they accept, and implement
+`evaluate_artifact(task_id, schema_id, artifact, dataset)`. The framework
+validates the authenticated tenant, dataset, task, schema, and upload key,
+captures the artifact's size and ETag, and downloads that admitted version
+before invoking benchmark code. The hook receives bytes and never receives an
+object key, bucket, or tenant credential.
+
+These deployments require `SUBMISSION_ARTIFACT_BUCKET` and `AWS_REGION`.
+Artifact admission and evaluation share the normal grading concurrency and
+duplicate-request limits. Text evaluation and the websocket resume endpoints
+remain unchanged.
 
 ### Sandbox-based evaluation (`eval_mode = SANDBOX`)
 

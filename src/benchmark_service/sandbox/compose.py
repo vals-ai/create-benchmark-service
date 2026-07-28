@@ -20,6 +20,8 @@ class ComposeSandbox(Sandbox):
         self._outer = outer
         self._service = source.service
         self._compose_command_prefix = source.compose_command
+        self.labels = outer.labels
+        self.created_at = outer.created_at
 
     @property
     def id(self) -> str:

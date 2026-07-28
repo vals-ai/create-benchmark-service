@@ -127,6 +127,7 @@ Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` 
 
 Provider compatibility notes:
 
+- `Sandbox.labels` and `Sandbox.created_at` expose provider inventory metadata when available; unsupported metadata is `None`, and creation times are timezone-aware UTC. `SandboxQuery.created_at_lte` is an inclusive creation-time bound. Daytona supports it and always limits listing to the provider's configured target, which may be a Daytona region name or ID. Modal rejects creation-time-bounded listing.
 - Modal supports both `ImageSource` (registry pull) and `SnapshotSource` (a Modal filesystem snapshot created via `Sandbox.snapshot_filesystem()`, restored by image id). `TargetedSnapshotSource` is Daytona-only.
 - Daytona uses `TargetedSnapshotSource(snapshot=..., target=...)` to select a target only when creating that sandbox. Its legacy `docker_image` value is intentionally invalid because that field cannot preserve the target.
 - Modal sandboxes do not expose a disk-size parameter; `Resources.disk` is accepted for schema compatibility but not enforced.
@@ -158,7 +159,23 @@ Yield these from your generator methods; the framework serialises and forwards t
 
 ### v1 Eval API (lab-facing)
 
-`/v1/evaluate` and `/v1/score` are the lab-facing surface. Text-mode evaluation reuses `evaluate_response`, while sandbox-mode evaluation runs `evaluate_instance`; scoring reuses `calculate_final_score` for both modes.
+`/v1/evaluate` and `/v1/score` are the lab-facing surface. Text-mode evaluation reuses `evaluate_response`, in-process artifact evaluation passes admitted bytes to `evaluate_artifact`, and sandbox-mode evaluation runs `evaluate_instance`. Scoring reuses `calculate_final_score` for every mode.
+
+### In-process artifact evaluation (`eval_mode = IN_PROCESS_ARTIFACT`)
+
+Benchmarks that grade an uploaded file inside the service process declare
+`eval_mode = EvalMode.IN_PROCESS_ARTIFACT`, declare only the artifact schema
+IDs they accept, and implement
+`evaluate_artifact(task_id, schema_id, artifact, dataset)`. The framework
+validates the authenticated tenant, dataset, task, schema, and upload key,
+captures the artifact's size and ETag, and downloads that admitted version
+before invoking benchmark code. The hook receives bytes and never receives an
+object key, bucket, or tenant credential.
+
+These deployments require `SUBMISSION_ARTIFACT_BUCKET` and `AWS_REGION`.
+Artifact admission and evaluation share the normal grading concurrency and
+duplicate-request limits. Text evaluation and the websocket resume endpoints
+remain unchanged.
 
 ### Sandbox-based evaluation (`eval_mode = SANDBOX`)
 

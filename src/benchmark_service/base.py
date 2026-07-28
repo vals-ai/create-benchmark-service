@@ -322,12 +322,13 @@ class BenchmarkService(ABC):
 
     def evaluate_artifact(
         self,
+        run_id: str,
         task_id: str,
         schema_id: str,
         artifact: bytes,
         dataset: str | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
-        """Grade framework-admitted artifact bytes in the service process."""
+        """Grade framework-admitted artifact bytes for one run in the service process."""
         raise NotImplementedError(
             f"{type(self).__name__}.evaluate_artifact must be implemented for "
             "eval_mode == EvalMode.IN_PROCESS_ARTIFACT"

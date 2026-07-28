@@ -650,6 +650,7 @@ class BenchmarkServiceApp(FastAPI):
                             raise HTTPException(status_code=413, detail=str(exc)) from exc
                         response = await collapse_stream(
                             self.service.evaluate_artifact(
+                                run_id=body.run_id,
                                 task_id=body.task_id,
                                 schema_id=body.payload.schema_id,
                                 artifact=artifact,

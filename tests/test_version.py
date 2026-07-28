@@ -155,6 +155,7 @@ class _InProcessArtifactModeService(_FakeService):
 
     async def evaluate_artifact(
         self,
+        run_id: str,
         task_id: str,
         schema_id: str,
         artifact: bytes,

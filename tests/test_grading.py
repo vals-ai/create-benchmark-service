@@ -453,16 +453,17 @@ class InProcessArtifactStub(StubBenchmark):
     accepted_submission_schemas = {
         V1PayloadType.ARTIFACT: frozenset({"stub.workbook.v1"}),
     }
-    artifact_call: tuple[str, str, bytes, str | None] | None = None
+    artifact_call: tuple[str, str, str, bytes, str | None] | None = None
 
     async def evaluate_artifact(
         self,
+        run_id: str,
         task_id: str,
         schema_id: str,
         artifact: bytes,
         dataset: str | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
-        self.artifact_call = (task_id, schema_id, artifact, dataset)
+        self.artifact_call = (run_id, task_id, schema_id, artifact, dataset)
         yield StreamResultChunk(
             type="result",
             data={"resolved": artifact == b"workbook-bytes"},
@@ -869,6 +870,7 @@ def test_in_process_artifact_mode_rejects_non_artifact_schemas() -> None:
 
             async def evaluate_artifact(
                 self,
+                run_id: str,
                 task_id: str,
                 schema_id: str,
                 artifact: bytes,
@@ -1148,7 +1150,13 @@ def test_v1_evaluate_passes_only_admitted_bytes_to_in_process_benchmark(
     assert response.json()["result"] == {"resolved": True}
     app = cast(BenchmarkServiceApp, in_process_artifact_client.app)
     service = cast(InProcessArtifactStub, app.service)
-    assert service.artifact_call == ("task-1", "stub.workbook.v1", b"workbook-bytes", "default")
+    assert service.artifact_call == (
+        "external-run-1",
+        "task-1",
+        "stub.workbook.v1",
+        b"workbook-bytes",
+        "default",
+    )
     assert _FakeDaytonaConfig.provider.created == []
 
 

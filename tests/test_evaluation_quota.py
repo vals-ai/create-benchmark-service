@@ -136,7 +136,7 @@ async def test_weekly_counter_uses_conditional_update_and_resets_on_monday(
     }
 
 
-async def test_day_and_month_periods_use_distinct_utc_calendar_windows(
+async def test_day_month_and_year_periods_use_distinct_utc_calendar_windows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv(evaluation_quota.EVALUATION_QUOTA_TABLE_ENV, "evaluation-quotas")
@@ -144,7 +144,7 @@ async def test_day_and_month_periods_use_distinct_utc_calendar_windows(
     monkeypatch.setattr(evaluation_quota, "_dynamodb_client", lambda: fake)
     now = datetime(2026, 12, 1, 12, 0, tzinfo=UTC)
 
-    for period in ("day", "month"):
+    for period in ("day", "month", "year"):
         _set_allowlist(monkeypatch, period=period)
         await evaluation_quota.consume_evaluation_request(
             service_name="example-benchmark",
@@ -155,11 +155,14 @@ async def test_day_and_month_periods_use_distinct_utc_calendar_windows(
     assert fake.counts == {
         '["example-benchmark","limited-tenant","evaluation","day","2026-12-01"]': 1,
         '["example-benchmark","limited-tenant","evaluation","month","2026-12-01"]': 1,
+        '["example-benchmark","limited-tenant","evaluation","year","2026-01-01"]': 1,
     }
     day_values = cast(dict[str, dict[str, str]], fake.calls[0]["ExpressionAttributeValues"])
     month_values = cast(dict[str, dict[str, str]], fake.calls[1]["ExpressionAttributeValues"])
+    year_values = cast(dict[str, dict[str, str]], fake.calls[2]["ExpressionAttributeValues"])
     assert day_values[":expires_at"] == {"N": str(int(datetime(2026, 12, 2, tzinfo=UTC).timestamp()))}
     assert month_values[":expires_at"] == {"N": str(int(datetime(2027, 1, 1, tzinfo=UTC).timestamp()))}
+    assert year_values[":expires_at"] == {"N": str(int(datetime(2027, 1, 1, tzinfo=UTC).timestamp()))}
 
 
 async def test_tenant_without_quota_does_not_touch_counter(

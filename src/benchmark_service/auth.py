@@ -24,7 +24,7 @@ DESCOPE_API_KEY_HEADER = "x-descope-api-key"
 DEFAULT_AUTH_CACHE_TTL_SECONDS = 300
 AUTH_CACHE_MAX_SIZE = 1024
 LEGACY_TENANT_SENTINEL = "_legacy"
-EvaluationQuotaPeriod = Literal["day", "week", "month"]
+EvaluationQuotaPeriod = Literal["day", "week", "month", "year"]
 
 
 class EvaluationQuotaConfig(BaseModel):

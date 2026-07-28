@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections.abc import AsyncGenerator
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -26,6 +27,7 @@ from benchmark_service.sandbox.types import (
     SandboxNotFoundError,
     SandboxQuery,
     SnapshotSource,
+    TargetedSnapshotSource,
 )
 
 
@@ -162,7 +164,7 @@ class FlakyExecSandbox(FakeInnerSandbox):
 
 
 def _request(
-    source: ImageSource | SnapshotSource | None = None,
+    source: ImageSource | SnapshotSource | TargetedSnapshotSource | None = None,
     resources: Resources | None = None,
 ) -> SandboxCreateRequest:
     return SandboxCreateRequest(
@@ -593,6 +595,18 @@ async def test_create_sandbox_restores_snapshot_source(monkeypatch: pytest.Monke
     assert captured["image"] == ("snapshot", "im-123")
 
 
+async def test_create_sandbox_rejects_targeted_snapshot_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        raise AssertionError("create should not be called")
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    with pytest.raises(SandboxError, match="does not support source type: targeted_snapshot"):
+        await provider.create_sandbox(
+            _request(source=TargetedSnapshotSource(snapshot="masscan-snapshot", target="us-west-3"))
+        )
+
+
 async def test_get_sandbox_raises_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
     async def from_id(instance_id: str, **kwargs: Any) -> Any:
         raise ModalNotFoundError(f"missing {instance_id}")
@@ -667,6 +681,17 @@ async def test_list_sandboxes_filters_by_labels(monkeypatch: pytest.MonkeyPatch)
     assert [sandbox.id for sandbox in sandboxes] == ["sb-123"]
     assert captured["app_id"] == "ap-1"
     assert captured["tags"] == {"run_id": "r1"}
+
+
+async def test_list_sandboxes_rejects_creation_time_filter(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = _provider(monkeypatch, SimpleNamespace())
+    query = SandboxQuery(
+        labels={},
+        created_at_lte=datetime(2026, 7, 24, 12, 30, tzinfo=UTC),
+    )
+
+    with pytest.raises(SandboxError, match="does not support filtering by creation time"):
+        _ = [sandbox async for sandbox in provider.list_sandboxes(query)]
 
 
 async def test_create_sandbox_reuses_running_sandbox_with_same_name(monkeypatch: pytest.MonkeyPatch) -> None:

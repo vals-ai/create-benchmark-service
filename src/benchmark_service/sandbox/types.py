@@ -3,9 +3,10 @@ from __future__ import annotations
 import re
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, Mapping
+from datetime import datetime
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, Field, model_validator
 
 
 class ImageSource(BaseModel):
@@ -18,6 +19,12 @@ class SnapshotSource(BaseModel):
     snapshot: str
 
 
+class TargetedSnapshotSource(BaseModel):
+    type: Literal["targeted_snapshot"] = "targeted_snapshot"
+    snapshot: str
+    target: str = Field(min_length=1)
+
+
 BaseSandboxSource = Annotated[ImageSource | SnapshotSource, Field(discriminator="type")]
 
 
@@ -28,7 +35,10 @@ class ComposeSource(BaseModel):
     compose_command: str = "docker compose"
 
 
-SandboxSource = Annotated[ImageSource | SnapshotSource | ComposeSource, Field(discriminator="type")]
+SandboxSource = Annotated[
+    ImageSource | SnapshotSource | TargetedSnapshotSource | ComposeSource,
+    Field(discriminator="type"),
+]
 
 _ENV_VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _RESERVED_COMMAND_ENV_NAMES = frozenset({"LANG", "TERM"})
@@ -73,6 +83,10 @@ class SandboxCreateRequest(BaseModel):
 class SandboxQuery(BaseModel):
     labels: dict[str, str]
     page_size: int = 10
+    created_at_lte: AwareDatetime | None = Field(
+        default=None,
+        description="Inclusive creation-time upper bound; providers must apply it or raise SandboxError",
+    )
 
 
 class MissingSandboxConfigError(ValueError):
@@ -118,6 +132,24 @@ class Sandbox(ABC):
     @property
     @abstractmethod
     def state(self) -> str: ...
+
+    @property
+    def labels(self) -> Mapping[str, str] | None:
+        """Provider-reported labels, or None when unavailable."""
+        return getattr(self, "_labels", None)
+
+    @labels.setter
+    def labels(self, value: Mapping[str, str] | None) -> None:
+        self._labels = value
+
+    @property
+    def created_at(self) -> datetime | None:
+        """Provider-reported creation time in UTC, or None when unavailable."""
+        return getattr(self, "_created_at", None)
+
+    @created_at.setter
+    def created_at(self, value: datetime | None) -> None:
+        self._created_at = value
 
     @abstractmethod
     async def exec(

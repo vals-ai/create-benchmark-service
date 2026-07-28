@@ -127,9 +127,11 @@ Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` 
 
 Provider compatibility notes:
 
-- Modal supports both `ImageSource` (registry pull) and `SnapshotSource` (a Modal filesystem snapshot created via `Sandbox.snapshot_filesystem()`, restored by image id).
+- `Sandbox.labels` and `Sandbox.created_at` expose provider inventory metadata when available; unsupported metadata is `None`, and creation times are timezone-aware UTC. `SandboxQuery.created_at_lte` is an inclusive creation-time bound. Daytona supports it and always limits listing to the provider's configured target, which may be a Daytona region name or ID. Modal rejects creation-time-bounded listing.
+- Modal supports both `ImageSource` (registry pull) and `SnapshotSource` (a Modal filesystem snapshot created via `Sandbox.snapshot_filesystem()`, restored by image id). `TargetedSnapshotSource` is Daytona-only.
+- Daytona uses `TargetedSnapshotSource(snapshot=..., target=...)` to select a target only when creating that sandbox. Its legacy `docker_image` value is intentionally invalid because that field cannot preserve the target.
 - Modal sandboxes do not expose a disk-size parameter; `Resources.disk` is accepted for schema compatibility but not enforced.
-- GPUs are requested via `Resources.gpu` (count) and `Resources.gpu_type`. Modal requires `gpu_type` (any Modal GPU name, e.g. `H100`, `A100-80GB`, `T4`) and passes `"<type>:<count>"` to the sandbox. Daytona accepts a count with an optional type restricted to its `GpuType` enum (`H100`, `H200`, `RTX-PRO-6000`, `RTX-4090`, `RTX-5090`); GPU requests are rejected for Daytona `SnapshotSource` sandboxes because snapshot resources are fixed at snapshot creation.
+- GPUs are requested via `Resources.gpu` (count) and `Resources.gpu_type`. Modal requires `gpu_type` (any Modal GPU name, e.g. `H100`, `A100-80GB`, `T4`) and passes `"<type>:<count>"` to the sandbox. Daytona accepts a count with an optional type restricted to its `GpuType` enum (`H100`, `H200`, `RTX-PRO-6000`, `RTX-4090`, `RTX-5090`); GPU requests are rejected for Daytona snapshot sandboxes because snapshot resources are fixed at snapshot creation.
 - Nested Docker (Docker-in-Docker) capability is granted on every sandbox for both providers — Daytona supports it natively and the Modal adapter requests it unconditionally — so benchmarks never configure it. The benchmark service still owns the Docker-capable image, dockerd startup flags, compose workflow, and cleanup.
 - Transient Modal connection errors are retried up to three attempts, matching the Daytona adapter's provider-level retry shape. Non-transient command failures still surface as `SandboxCommandError` with the command exit code.
 
@@ -157,7 +159,23 @@ Yield these from your generator methods; the framework serialises and forwards t
 
 ### v1 Eval API (lab-facing)
 
-`/v1/evaluate` and `/v1/score` are the lab-facing surface. Text-mode evaluation reuses `evaluate_response`, while sandbox-mode evaluation runs `evaluate_instance`; scoring reuses `calculate_final_score` for both modes.
+`/v1/evaluate` and `/v1/score` are the lab-facing surface. Text-mode evaluation reuses `evaluate_response`, in-process artifact evaluation passes admitted bytes to `evaluate_artifact`, and sandbox-mode evaluation runs `evaluate_instance`. Scoring reuses `calculate_final_score` for every mode.
+
+### In-process artifact evaluation (`eval_mode = IN_PROCESS_ARTIFACT`)
+
+Benchmarks that grade an uploaded file inside the service process declare
+`eval_mode = EvalMode.IN_PROCESS_ARTIFACT`, declare only the artifact schema
+IDs they accept, and implement
+`evaluate_artifact(task_id, schema_id, artifact, dataset)`. The framework
+validates the authenticated tenant, dataset, task, schema, and upload key,
+captures the artifact's size and ETag, and downloads that admitted version
+before invoking benchmark code. The hook receives bytes and never receives an
+object key, bucket, or tenant credential.
+
+These deployments require `SUBMISSION_ARTIFACT_BUCKET` and `AWS_REGION`.
+Artifact admission and evaluation share the normal grading concurrency and
+duplicate-request limits. Text evaluation and the websocket resume endpoints
+remain unchanged.
 
 ### Sandbox-based evaluation (`eval_mode = SANDBOX`)
 
@@ -269,7 +287,7 @@ Status codes: 403 if the tenant isn't allowed the dataset *or* if the caller use
 Pydantic models used across requests and responses:
 
 - **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `resources`, optional non-secret `eval_sandbox`
-- **`SandboxSource`** — `ImageSource`, `SnapshotSource`, or `ComposeSource` with an outer image/snapshot
+- **`SandboxSource`** — `ImageSource`, `SnapshotSource`, top-level Daytona-only `TargetedSnapshotSource`, or `ComposeSource` with an outer image/snapshot
 - **`EvalSandboxSpec`** — grading overrides whose optional `source` is an image or snapshot, never `ComposeSource`
 - **`GradingSubmission`** — typed `TextGradingSubmission` or `ArtifactGradingSubmission` passed only to the sandbox-grading hook
 - **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; currently `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET)` or `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)`
@@ -318,7 +336,7 @@ tenants:
 
 Malformed configured allowlists raise at app startup. Unknown tenants receive `401 Unauthorized`. Known tenants requesting a dataset outside their allowlist receive `403 Dataset not allowed`; WebSocket routes close with code `1008`. The tenant ID `"_legacy"` is reserved for compatibility mode and is rejected as a Descope tenant.
 
-**Evaluation quotas.** Add `evaluation_quota` to a tenant entry to cap that tenant's evaluation requests. Set `period` to `day`, `week`, or `month`. Periods use UTC calendar boundaries: days start at 00:00, weeks start Monday at 00:00, and months start on the first day at 00:00. Changing a tenant's period selects a separate counter namespace. `POST /v1/evaluate`, `POST /evaluate-response/`, `/ws/evaluate-response`, and `/ws/evaluate-instance` consume the same quota; task setup, task retrieval, and score aggregation do not. Authentication, request parsing, dataset authorization, and payload compatibility checks happen before the request is counted. Sandbox duplicate and immediate-capacity checks also happen first. Accepted sandbox requests then consume quota before waiting for an active grading slot or accessing submission storage. Once counted, a request still consumes quota if evaluation or another later step fails.
+**Evaluation quotas.** Add `evaluation_quota` to a tenant entry to cap that tenant's evaluation requests. Set `period` to `day`, `week`, `month`, or `year`. Periods use UTC calendar boundaries: days start at 00:00, weeks start Monday at 00:00, months start on the first day at 00:00, and years start January 1 at 00:00. Changing a tenant's period selects a separate counter namespace. `POST /v1/evaluate`, `POST /evaluate-response/`, `/ws/evaluate-response`, and `/ws/evaluate-instance` consume the same quota; task setup, task retrieval, and score aggregation do not. Authentication, request parsing, dataset authorization, and payload compatibility checks happen before the request is counted. Duplicate and immediate-capacity checks for admitted grading requests also happen first. Accepted requests then consume quota before waiting for an active grading slot or accessing submission storage. Once counted, a request still consumes quota if evaluation or another later step fails.
 
 Quota-enabled deployments must set a stable, non-empty `SERVICE_NAME` and set `EVALUATION_QUOTA_TABLE_NAME` to a DynamoDB table whose string partition key is `quota_key` and whose TTL attribute is `expires_at`. `SERVICE_NAME` separates each benchmark service's counters when the table is shared and must not change during a quota period. The task role needs `dynamodb:UpdateItem` on the table.
 

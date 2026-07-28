@@ -19,6 +19,7 @@ from benchmark_service.v1_schemas import (
     V1PayloadType,
     V1ScoreItem,
     V1ScoreResponse,
+    V1UploadUrlResponse,
     V1Versions,
 )
 
@@ -168,6 +169,36 @@ async def test_retrieve_task_serializes_snapshot_source_for_legacy_clients(
     result = await client.retrieve_task("task-1")
 
     assert result.model_dump()["docker_image"] == "snapshot:vcb1-openhands-abc123"
+
+
+async def test_retrieve_task_serializes_targeted_snapshot_as_invalid_legacy_image(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    mock_http.get = AsyncMock(
+        return_value=_mock_response(
+            json_data={
+                "source": {
+                    "type": "targeted_snapshot",
+                    "snapshot": "programbench-masscan",
+                    "target": "us-west-3",
+                },
+                "problem_path": "/tmp/problem_statement.txt",
+                "cwd": "/work",
+                "resources": {"vcpu": 4, "memory": 16, "disk": 30},
+                "agent_timeout": None,
+            }
+        )
+    )
+
+    result = await client.retrieve_task("task-1")
+
+    assert result.model_dump()["docker_image"] == "targeted-snapshot+source-required"
+    assert result.source.model_dump() == {
+        "type": "targeted_snapshot",
+        "snapshot": "programbench-masscan",
+        "target": "us-west-3",
+    }
 
 
 async def test_retrieve_task_serializes_compose_source_as_invalid_legacy_image(
@@ -691,6 +722,40 @@ async def test_client_v1_evaluate_posts_payload_and_returns_v1_eval_response(
     assert called_kwargs["json"]["versions"] == {"runner": "benchmark-orchestrator-1.2.3"}
 
 
+async def test_client_v1_upload_url_posts_artifact_identity(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    mock_http.post = AsyncMock(
+        return_value=_mock_response(
+            json_data={
+                "key": "submission-artifacts/acme/validation/run-1/task-1/submission.xlsx",
+                "url": "https://uploads.example/presigned",
+                "expires_in": 900,
+            }
+        )
+    )
+
+    result = await client.v1_upload_url(
+        run_id="run-1",
+        task_id="task-1",
+        filename="submission.xlsx",
+        dataset="validation",
+    )
+
+    assert isinstance(result, V1UploadUrlResponse)
+    assert result.expires_in == 900
+    mock_http.post.assert_awaited_once_with(
+        f"{BASE_URL}/v1/submissions/upload-url",
+        json={
+            "run_id": "run-1",
+            "task_id": "task-1",
+            "dataset": "validation",
+            "filename": "submission.xlsx",
+        },
+    )
+
+
 async def test_client_v1_score_posts_results_and_returns_v1_score_response(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
@@ -750,6 +815,14 @@ async def test_client_v1_evaluate_raises_on_error_status(
             {
                 "run_id": "run-1",
                 "evaluation_results": {},
+            },
+        ),
+        (
+            "v1_upload_url",
+            {
+                "run_id": "run-1",
+                "task_id": "task-1",
+                "filename": "submission.xlsx",
             },
         ),
     ],

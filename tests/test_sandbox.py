@@ -1,12 +1,13 @@
 import asyncio
 import shlex
 from collections.abc import AsyncGenerator, Mapping
+from datetime import UTC, datetime
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, cast
 
 import pytest
 from aiohttp import ClientConnectionError, ClientResponseError, RequestInfo
-from daytona import GpuType, SandboxState
+from daytona import DaytonaConfig, GpuType, SandboxState
 from daytona.common.errors import (
     DaytonaConflictError,
     DaytonaConnectionError,
@@ -15,9 +16,12 @@ from daytona.common.errors import (
     DaytonaRateLimitError,
 )
 from daytona.common.pty import PtyResult
+from daytona_api_client_async.exceptions import ApiException
 from multidict import CIMultiDict, CIMultiDictProxy
+from pydantic import TypeAdapter, ValidationError
 from yarl import URL
 
+import benchmark_service.sandbox.daytona as daytona_module
 from benchmark_service.sandbox import (
     ComposeSource,
     ComposeSandbox,
@@ -30,7 +34,9 @@ from benchmark_service.sandbox import (
     SandboxError,
     SandboxNotFoundError,
     SandboxQuery,
+    SandboxSource,
     SnapshotSource,
+    TargetedSnapshotSource,
 )
 from benchmark_service.sandbox.daytona import (
     _PTY_STDOUT_TAIL_MAX_BYTES,  # pyright: ignore[reportPrivateUsage]
@@ -420,6 +426,8 @@ class InnerSandbox:
     state = SandboxState.STARTED
 
     def __init__(self) -> None:
+        self.labels: dict[str, str] = {}
+        self.created_at: str | None = None
         self.process = Process()
         self.fs = Files()
         self.autostop_interval: int | None = None
@@ -541,6 +549,7 @@ class DaytonaClient:
     def __init__(self, sandbox: InnerSandbox) -> None:
         self.sandbox = sandbox
         self.created = False
+        self.closed = False
         self.deleted = False
         self.listed_query: Any | None = None
 
@@ -556,6 +565,9 @@ class DaytonaClient:
         assert sandbox is self.sandbox
         self.deleted = True
 
+    async def close(self) -> None:
+        self.closed = True
+
     def list(self, query: object) -> Any:
         self.listed_query = query
 
@@ -563,6 +575,32 @@ class DaytonaClient:
             yield self.sandbox
 
         return sandboxes()
+
+
+class DaytonaRegionsClient:
+    def __init__(self, regions: list[SimpleNamespace]) -> None:
+        self.regions = regions
+        self.list_attempts = 0
+        self.close_attempts = 0
+
+    def create_api_client(self, configuration: Any) -> "DaytonaRegionsClient":
+        assert configuration.host == "https://daytona.example.test"
+        assert configuration.access_token == "test-key"
+        return self
+
+    def create_organizations_api(self, api_client: object) -> "DaytonaRegionsClient":
+        assert api_client is self
+        return self
+
+    async def __aenter__(self) -> "DaytonaRegionsClient":
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        self.close_attempts += 1
+
+    async def list_available_regions(self) -> list[SimpleNamespace]:
+        self.list_attempts += 1
+        return self.regions
 
 
 class CreateFailureDaytonaClient(DaytonaClient):
@@ -672,10 +710,36 @@ def _provider(daytona: DaytonaClient) -> DaytonaSandboxProvider:
     return provider
 
 
+def _inventory_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    target: str,
+    regions: list[SimpleNamespace],
+) -> tuple[DaytonaSandboxProvider, DaytonaClient, DaytonaRegionsClient]:
+    daytona = DaytonaClient(InnerSandbox())
+    regions_client = DaytonaRegionsClient(regions)
+
+    def create_daytona(*, config: DaytonaConfig) -> DaytonaClient:
+        assert config.target == target
+        return daytona
+
+    monkeypatch.setattr(daytona_module, "AsyncDaytona", create_daytona)
+    monkeypatch.setattr(daytona_module, "DaytonaApiClient", regions_client.create_api_client)
+    monkeypatch.setattr(daytona_module, "OrganizationsApi", regions_client.create_organizations_api)
+    provider = DaytonaSandboxProvider(
+        DaytonaProviderConfig(
+            DAYTONA_API_KEY="test-key",
+            DAYTONA_API_URL="https://daytona.example.test",
+            DAYTONA_TARGET=target,
+        )
+    )
+    return provider, daytona, regions_client
+
+
 def _request(
     name: str,
     resources: Resources | None = None,
-    source: ImageSource | SnapshotSource | None = None,
+    source: SandboxSource | None = None,
 ) -> SandboxCreateRequest:
     return SandboxCreateRequest(
         source=source or ImageSource(image="python:3.12"),
@@ -686,6 +750,24 @@ def _request(
         auto_stop_interval=600,
         create_timeout=360,
     )
+
+
+def test_sandbox_metadata_defaults_are_optional_for_existing_subclasses() -> None:
+    sandbox = RecordingSandbox()
+
+    assert sandbox.labels is None
+    assert sandbox.created_at is None
+
+
+def test_compose_sandbox_delegates_inventory_metadata() -> None:
+    created_at = datetime(2026, 7, 24, 12, 30, tzinfo=UTC)
+    outer = RecordingSandbox()
+    outer.labels = {"run_id": "r1"}
+    outer.created_at = created_at
+    sandbox = ComposeSandbox(outer, ComposeSource(outer=ImageSource(image="docker:28.3.3-dind")))
+
+    assert sandbox.labels == {"run_id": "r1"}
+    assert sandbox.created_at == created_at
 
 
 async def test_compose_sandbox_routes_operations_through_main_service() -> None:
@@ -1323,6 +1405,31 @@ async def test_daytona_provider_creates_fresh_sandbox() -> None:
     assert daytona.created is True
 
 
+def test_daytona_sandbox_exposes_inventory_metadata() -> None:
+    inner = InnerSandbox()
+    inner.labels = {"Benchmark": "vcb", "clean-up": "true"}
+    inner.created_at = "2026-07-24T05:30:00-07:00"
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    assert sandbox.labels == {"Benchmark": "vcb", "clean-up": "true"}
+    assert sandbox.created_at == datetime(2026, 7, 24, 12, 30, tzinfo=UTC)
+
+
+def test_daytona_sandbox_allows_missing_creation_timestamp() -> None:
+    inner = InnerSandbox()
+
+    assert DaytonaSandbox(cast(Any, inner)).created_at is None
+
+
+@pytest.mark.parametrize("created_at", ["not-a-timestamp", "2026-07-24T12:30:00"])
+def test_daytona_sandbox_rejects_invalid_creation_timestamp(created_at: str) -> None:
+    inner = InnerSandbox()
+    inner.created_at = created_at
+
+    with pytest.raises(SandboxError):
+        DaytonaSandbox(cast(Any, inner))
+
+
 async def test_daytona_provider_recovers_existing_sandbox_on_create_conflict() -> None:
     """A lost create response followed by a retry hits a name conflict; the
     provider must recover the existing sandbox by name instead of failing and
@@ -1354,6 +1461,80 @@ class CapturingCreateDaytonaClient(DaytonaClient):
         self.create_params = args[0]
         self.created = True
         return self.sandbox
+
+
+async def test_daytona_provider_uses_target_only_for_targeted_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    clients: dict[str, CapturingCreateDaytonaClient] = {}
+
+    def create_client(*, config: Any) -> CapturingCreateDaytonaClient:
+        client = CapturingCreateDaytonaClient(InnerSandbox())
+        clients[config.target] = client
+        return client
+
+    monkeypatch.setattr(daytona_module, "AsyncDaytona", create_client)
+    provider = DaytonaSandboxProvider(
+        DaytonaProviderConfig(DAYTONA_API_KEY="key", DAYTONA_API_URL="url", DAYTONA_TARGET="us")
+    )
+
+    await provider.create_sandbox(_request("normal", source=SnapshotSource(snapshot="normal-snapshot")))
+    assert list(clients) == ["us"]
+    assert clients["us"].create_params is not None
+    assert clients["us"].create_params.snapshot == "normal-snapshot"
+
+    targeted_request = _request(
+        "targeted",
+        source=TargetedSnapshotSource(snapshot="masscan-snapshot", target="us-west-3"),
+    )
+    await provider.create_sandbox(targeted_request)
+    await provider.create_sandbox(targeted_request)
+    assert list(clients) == ["us", "us-west-3"]
+    assert clients["us-west-3"].create_params is not None
+    assert clients["us-west-3"].create_params.snapshot == "masscan-snapshot"
+
+    await provider.close()
+    assert all(client.closed for client in clients.values())
+
+
+async def test_targeted_snapshot_recovers_name_conflict_with_target_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    default_inner = InnerSandbox()
+    default_inner.name = "default-sandbox"
+    targeted_inner = InnerSandbox()
+    targeted_inner.name = "targeted-sandbox"
+
+    class ConflictClient(DaytonaClient):
+        def __init__(self, sandbox: InnerSandbox) -> None:
+            super().__init__(sandbox)
+            self.lookups: list[str] = []
+
+        async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
+            raise DaytonaError(f"Sandbox with name {self.sandbox.name} already exists")
+
+        async def get(self, instance_id: str) -> InnerSandbox:
+            self.lookups.append(instance_id)
+            return self.sandbox
+
+    default_client = DaytonaClient(default_inner)
+    targeted_client = ConflictClient(targeted_inner)
+
+    def create_client(*, config: Any) -> DaytonaClient:
+        return targeted_client if config.target == "us-west-3" else default_client
+
+    monkeypatch.setattr(daytona_module, "AsyncDaytona", create_client)
+    provider = DaytonaSandboxProvider(
+        DaytonaProviderConfig(DAYTONA_API_KEY="key", DAYTONA_API_URL="url", DAYTONA_TARGET="us")
+    )
+
+    sandbox = await provider.create_sandbox(
+        _request(
+            targeted_inner.name,
+            source=TargetedSnapshotSource(snapshot="masscan-snapshot", target="us-west-3"),
+        )
+    )
+
+    assert sandbox.name == targeted_inner.name
+    assert targeted_client.lookups == [targeted_inner.name]
 
 
 async def test_daytona_provider_maps_gpu_resources() -> None:
@@ -1400,6 +1581,18 @@ async def test_daytona_provider_rejects_gpu_for_snapshot_source() -> None:
 def test_resources_gpu_type_requires_gpu_count() -> None:
     with pytest.raises(ValueError, match="gpu_type requires gpu >= 1"):
         Resources(vcpu=2, memory=4, disk=10, gpu_type="H100")
+
+
+def test_sandbox_source_rejects_unknown_type() -> None:
+    with pytest.raises(ValidationError) as exc_info:
+        TypeAdapter(SandboxSource).validate_python({"type": "unknown", "snapshot": "snap-1"})
+
+    assert exc_info.value.errors()[0]["type"] == "union_tag_invalid"
+
+
+def test_targeted_snapshot_rejects_empty_target() -> None:
+    with pytest.raises(ValidationError, match="at least 1 character"):
+        TargetedSnapshotSource(snapshot="snap-1", target="")
 
 
 async def test_daytona_provider_delete_sets_autostop_before_delete() -> None:
@@ -1565,18 +1758,95 @@ async def test_daytona_provider_delete_waits_for_building_sandbox() -> None:
     assert daytona.deleted is True
 
 
-async def test_daytona_provider_lists_sandboxes_with_query() -> None:
-    inner = InnerSandbox()
-    daytona = DaytonaClient(inner)
+def test_sandbox_query_rejects_naive_creation_cutoff() -> None:
+    with pytest.raises(ValueError):
+        SandboxQuery(labels={"Benchmark": "vcb"}, created_at_lte=datetime(2026, 7, 24, 12, 30))
 
-    sandboxes = [
-        sandbox async for sandbox in _provider(daytona).list_sandboxes(SandboxQuery(labels={"Benchmark": "vcb"}))
-    ]
 
-    assert [sandbox.id for sandbox in sandboxes] == [inner.id]
+@pytest.mark.parametrize("configured_target", ["configured-target", "configured-target_a1b2"])
+async def test_daytona_provider_lists_sandboxes_with_canonical_target(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_target: str,
+) -> None:
+    cutoff = datetime(2026, 7, 24, 12, 30, tzinfo=UTC)
+    canonical_target = "configured-target_a1b2"
+    provider, daytona, regions_client = _inventory_provider(
+        monkeypatch,
+        target=configured_target,
+        regions=[
+            SimpleNamespace(id="configured-target", name="another-target"),
+            SimpleNamespace(id=canonical_target, name="configured-target"),
+        ],
+    )
+    query = SandboxQuery(labels={"Benchmark": "vcb"}, page_size=25, created_at_lte=cutoff)
+    resolution_started = asyncio.Event()
+    release_resolution = asyncio.Event()
+    list_available_regions = regions_client.list_available_regions
+
+    async def gated_list_available_regions() -> list[SimpleNamespace]:
+        resolution_started.set()
+        await release_resolution.wait()
+        return await list_available_regions()
+
+    async def list_once(started: asyncio.Event | None = None) -> list[DaytonaSandbox]:
+        if started is not None:
+            started.set()
+        return [sandbox async for sandbox in provider.list_sandboxes(query)]
+
+    monkeypatch.setattr(regions_client, "list_available_regions", gated_list_available_regions)
+    first_list = asyncio.create_task(list_once())
+    await resolution_started.wait()
+    second_started = asyncio.Event()
+    second_list = asyncio.create_task(list_once(second_started))
+    await second_started.wait()
+    release_resolution.set()
+    sandboxes = await asyncio.gather(first_list, second_list)
+
+    assert [[sandbox.id for sandbox in result] for result in sandboxes] == [["sandbox-id"], ["sandbox-id"]]
+    assert regions_client.list_attempts == 1
+    assert regions_client.close_attempts == 1
     assert daytona.listed_query is not None
     assert daytona.listed_query.labels == {"Benchmark": "vcb"}
-    assert daytona.listed_query.limit == 10
+    assert daytona.listed_query.targets == [canonical_target]
+    assert daytona.listed_query.limit == 25
+    assert daytona.listed_query.created_at_before == cutoff
+
+
+async def test_daytona_target_resolution_preserves_provider_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider, _, regions_client = _inventory_provider(monkeypatch, target="configured-target", regions=[])
+    error = ApiException(status=429, reason="rate limited")
+    error.headers = {"retry-after": "3"}
+
+    async def fail() -> list[SimpleNamespace]:
+        raise error
+
+    monkeypatch.setattr(regions_client, "list_available_regions", fail)
+    with pytest.raises(DaytonaRateLimitError) as exc_info:
+        await provider._resolve_target_id()  # pyright: ignore[reportPrivateUsage]
+
+    assert daytona_retry_after_seconds(exc_info.value) == 3
+    assert regions_client.close_attempts == 1
+
+
+async def test_daytona_provider_rejects_unavailable_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider, daytona, regions_client = _inventory_provider(monkeypatch, target="missing-target", regions=[])
+
+    with pytest.raises(SandboxError, match="Daytona target is not available: 'missing-target'"):
+        _ = [sandbox async for sandbox in provider.list_sandboxes(SandboxQuery(labels={}))]
+
+    assert daytona.listed_query is None
+    assert regions_client.close_attempts == 1
+
+
+def test_daytona_provider_rejects_blank_target() -> None:
+    with pytest.raises(MissingSandboxConfigError, match="DAYTONA_TARGET must not be blank"):
+        DaytonaSandboxProvider(
+            DaytonaProviderConfig(
+                DAYTONA_API_KEY="test-key",
+                DAYTONA_API_URL="https://daytona.example.test",
+                DAYTONA_TARGET="   ",
+            )
+        )
 
 
 async def test_daytona_updates_egress_rules() -> None:

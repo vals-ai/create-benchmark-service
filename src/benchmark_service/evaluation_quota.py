@@ -102,6 +102,9 @@ def _utc_period(now: datetime, period: EvaluationQuotaPeriod) -> tuple[datetime,
             if current.month == 12:
                 return start, datetime(current.year + 1, 1, 1, tzinfo=UTC)
             return start, datetime(current.year, current.month + 1, 1, tzinfo=UTC)
+        case "year":
+            start = datetime(current.year, 1, 1, tzinfo=UTC)
+            return start, datetime(current.year + 1, 1, 1, tzinfo=UTC)
     assert_never(period)
 
 

@@ -137,11 +137,62 @@ async def _read_stream_until_ready(sandbox: Sandbox, ready: asyncio.Event) -> No
 class TestSandboxProviderIntegration:
     """Run the same live contract checks against every configured provider."""
 
-    async def test_provider_contract(self, provider_type: str, sandbox_provider: SandboxProvider) -> None:
+    @pytest.mark.parametrize("provider_type", ["daytona"], indirect=True)
+    async def test_daytona_inventory_metadata_and_filtering(
+        self,
+        sandbox_provider: SandboxProvider,
+    ) -> None:
+        """Verify Daytona inventory metadata and inclusive cutoff filtering."""
+        sandbox_name = f"cbs-daytona-inventory-{uuid4().hex[:10]}"
+        labels = {"ProviderInventoryTest": sandbox_name}
+        query = SandboxQuery(labels=labels)
+        request = SandboxCreateRequest(
+            source=ImageSource(image=_TEST_IMAGE),
+            resources=_TEST_RESOURCES,
+            name=sandbox_name,
+            labels=labels,
+            env_vars={},
+            auto_stop_interval=10,
+            create_timeout=360,
+        )
+
+        sandbox = await sandbox_provider.create_sandbox(request)
+        try:
+            fetched = await sandbox_provider.get_sandbox(sandbox.id)
+            listed = await _wait_until_listed(sandbox_provider, query, sandbox.id)
+
+            created_labels = sandbox.labels
+            created_at = sandbox.created_at
+            assert created_labels is not None
+            assert all(created_labels.get(key) == value for key, value in labels.items())
+            assert created_at is not None
+            assert created_at.utcoffset() == timedelta(0)
+            assert fetched.labels == listed.labels == created_labels
+            assert fetched.created_at == listed.created_at == created_at
+
+            await _wait_until_listed(
+                sandbox_provider,
+                SandboxQuery(labels=labels, created_at_lte=created_at),
+                sandbox.id,
+            )
+            await _wait_until_not_listed(
+                sandbox_provider,
+                SandboxQuery(
+                    labels=labels,
+                    created_at_lte=created_at - timedelta(microseconds=1),
+                ),
+                sandbox.id,
+            )
+        finally:
+            await asyncio.wait_for(
+                sandbox_provider.delete_sandbox(sandbox.id),
+                timeout=_POLL_TIMEOUT_SECONDS,
+            )
+
+    async def test_provider_contract(self, sandbox_provider: SandboxProvider) -> None:
         """Verify each provider implements the shared sandbox lifecycle and operation contract.
 
         Test cases:
-        - Daytona inventory exposes metadata and applies inclusive creation-time filtering.
         - Create-time and command-time environment variables reach sandbox commands.
         - Memory, storage, timeout, and OS-kill faults preserve their command exit codes.
         - Egress rules allow the configured host, block an off-list host, and restore unrestricted access.
@@ -170,28 +221,7 @@ class TestSandboxProviderIntegration:
             fetched = await sandbox_provider.get_sandbox(sandbox.id)
             assert fetched.id == sandbox.id
 
-            listed = await _wait_until_listed(sandbox_provider, query, sandbox.id)
-            if provider_type == "daytona":
-                listed_labels = listed.labels
-                assert listed_labels is not None
-                assert all(listed_labels.get(key) == value for key, value in labels.items())
-                created_at = listed.created_at
-                assert created_at is not None
-                assert created_at.utcoffset() == timedelta(0)
-
-                await _wait_until_listed(
-                    sandbox_provider,
-                    SandboxQuery(labels=labels, created_at_lte=created_at),
-                    sandbox.id,
-                )
-                await _wait_until_not_listed(
-                    sandbox_provider,
-                    SandboxQuery(
-                        labels=labels,
-                        created_at_lte=created_at - timedelta(microseconds=1),
-                    ),
-                    sandbox.id,
-                )
+            await _wait_until_listed(sandbox_provider, query, sandbox.id)
 
             exec_result = await sandbox.exec('printf "$PROVIDER_CREATE_VALUE"', cwd="/tmp")
             assert exec_result.exit_code == 0

@@ -19,6 +19,12 @@ class SnapshotSource(BaseModel):
     snapshot: str
 
 
+class TargetedSnapshotSource(BaseModel):
+    type: Literal["targeted_snapshot"] = "targeted_snapshot"
+    snapshot: str
+    target: str = Field(min_length=1)
+
+
 BaseSandboxSource = Annotated[ImageSource | SnapshotSource, Field(discriminator="type")]
 
 
@@ -29,7 +35,10 @@ class ComposeSource(BaseModel):
     compose_command: str = "docker compose"
 
 
-SandboxSource = Annotated[ImageSource | SnapshotSource | ComposeSource, Field(discriminator="type")]
+SandboxSource = Annotated[
+    ImageSource | SnapshotSource | TargetedSnapshotSource | ComposeSource,
+    Field(discriminator="type"),
+]
 
 _ENV_VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _RESERVED_COMMAND_ENV_NAMES = frozenset({"LANG", "TERM"})

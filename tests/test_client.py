@@ -168,6 +168,36 @@ async def test_retrieve_task_serializes_snapshot_source_for_legacy_clients(
     assert result.model_dump()["docker_image"] == "snapshot:vcb1-openhands-abc123"
 
 
+async def test_retrieve_task_serializes_targeted_snapshot_as_invalid_legacy_image(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    mock_http.get = AsyncMock(
+        return_value=_mock_response(
+            json_data={
+                "source": {
+                    "type": "targeted_snapshot",
+                    "snapshot": "programbench-masscan",
+                    "target": "us-west-3",
+                },
+                "problem_path": "/tmp/problem_statement.txt",
+                "cwd": "/work",
+                "resources": {"vcpu": 4, "memory": 16, "disk": 30},
+                "agent_timeout": None,
+            }
+        )
+    )
+
+    result = await client.retrieve_task("task-1")
+
+    assert result.model_dump()["docker_image"] == "targeted-snapshot+source-required"
+    assert result.source.model_dump() == {
+        "type": "targeted_snapshot",
+        "snapshot": "programbench-masscan",
+        "target": "us-west-3",
+    }
+
+
 async def test_retrieve_task_serializes_compose_source_as_invalid_legacy_image(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:

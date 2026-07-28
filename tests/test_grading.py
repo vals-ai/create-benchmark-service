@@ -22,6 +22,7 @@ from benchmark_service import (
     Resources,
     Sandbox,
     SnapshotSource,
+    TargetedSnapshotSource,
 )
 from benchmark_service import auth as auth_module
 from benchmark_service import grading
@@ -418,6 +419,37 @@ async def test_grade_instance_does_not_apply_generation_gpu_to_default_snapshot(
 
     assert resp.status == V1EvalStatus.EVALUATED
     assert provider.created[0].source == SnapshotSource(snapshot="generation-snapshot")
+    assert provider.created[0].resources.gpu == 0
+    assert provider.created[0].resources.gpu_type is None
+
+
+class TargetedSnapshotGenerationGpuTaskStub(SandboxStub):
+    async def retrieve_task(
+        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+    ) -> Any:
+        task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
+        return task.model_copy(
+            update={
+                "source": TargetedSnapshotSource(
+                    snapshot="generation-snapshot",
+                    target="us-west-3",
+                ),
+                "resources": Resources(vcpu=8, memory=16, disk=50, gpu=1, gpu_type="H100"),
+            }
+        )
+
+
+async def test_grade_instance_preserves_targeted_snapshot_and_removes_gpu() -> None:
+    service = await TargetedSnapshotGenerationGpuTaskStub.create()
+    provider = FakeProvider(FakeSandbox())
+
+    resp = await _grade(service, provider)
+
+    assert resp.status == V1EvalStatus.EVALUATED
+    assert provider.created[0].source == TargetedSnapshotSource(
+        snapshot="generation-snapshot",
+        target="us-west-3",
+    )
     assert provider.created[0].resources.gpu == 0
     assert provider.created[0].resources.gpu_type is None
 

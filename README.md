@@ -128,9 +128,10 @@ Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` 
 Provider compatibility notes:
 
 - `Sandbox.labels` and `Sandbox.created_at` expose provider inventory metadata when available; unsupported metadata is `None`, and creation times are timezone-aware UTC. `SandboxQuery.created_at_lte` is an inclusive creation-time bound. Daytona supports it and always limits listing to the provider's configured target, which may be a Daytona region name or ID. Modal rejects creation-time-bounded listing.
-- Modal supports both `ImageSource` (registry pull) and `SnapshotSource` (a Modal filesystem snapshot created via `Sandbox.snapshot_filesystem()`, restored by image id).
+- Modal supports both `ImageSource` (registry pull) and `SnapshotSource` (a Modal filesystem snapshot created via `Sandbox.snapshot_filesystem()`, restored by image id). `TargetedSnapshotSource` is Daytona-only.
+- Daytona uses `TargetedSnapshotSource(snapshot=..., target=...)` to select a target only when creating that sandbox. Its legacy `docker_image` value is intentionally invalid because that field cannot preserve the target.
 - Modal sandboxes do not expose a disk-size parameter; `Resources.disk` is accepted for schema compatibility but not enforced.
-- GPUs are requested via `Resources.gpu` (count) and `Resources.gpu_type`. Modal requires `gpu_type` (any Modal GPU name, e.g. `H100`, `A100-80GB`, `T4`) and passes `"<type>:<count>"` to the sandbox. Daytona accepts a count with an optional type restricted to its `GpuType` enum (`H100`, `H200`, `RTX-PRO-6000`, `RTX-4090`, `RTX-5090`); GPU requests are rejected for Daytona `SnapshotSource` sandboxes because snapshot resources are fixed at snapshot creation.
+- GPUs are requested via `Resources.gpu` (count) and `Resources.gpu_type`. Modal requires `gpu_type` (any Modal GPU name, e.g. `H100`, `A100-80GB`, `T4`) and passes `"<type>:<count>"` to the sandbox. Daytona accepts a count with an optional type restricted to its `GpuType` enum (`H100`, `H200`, `RTX-PRO-6000`, `RTX-4090`, `RTX-5090`); GPU requests are rejected for Daytona snapshot sandboxes because snapshot resources are fixed at snapshot creation.
 - Nested Docker (Docker-in-Docker) capability is granted on every sandbox for both providers — Daytona supports it natively and the Modal adapter requests it unconditionally — so benchmarks never configure it. The benchmark service still owns the Docker-capable image, dockerd startup flags, compose workflow, and cleanup.
 - Transient Modal connection errors are retried up to three attempts, matching the Daytona adapter's provider-level retry shape. Non-transient command failures still surface as `SandboxCommandError` with the command exit code.
 
@@ -270,7 +271,7 @@ Status codes: 403 if the tenant isn't allowed the dataset *or* if the caller use
 Pydantic models used across requests and responses:
 
 - **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `resources`, optional non-secret `eval_sandbox`
-- **`SandboxSource`** — `ImageSource`, `SnapshotSource`, or `ComposeSource` with an outer image/snapshot
+- **`SandboxSource`** — `ImageSource`, `SnapshotSource`, top-level Daytona-only `TargetedSnapshotSource`, or `ComposeSource` with an outer image/snapshot
 - **`EvalSandboxSpec`** — grading overrides whose optional `source` is an image or snapshot, never `ComposeSource`
 - **`GradingSubmission`** — typed `TextGradingSubmission` or `ArtifactGradingSubmission` passed only to the sandbox-grading hook
 - **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; currently `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET)` or `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)`

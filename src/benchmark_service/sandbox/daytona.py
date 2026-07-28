@@ -659,8 +659,17 @@ class DaytonaSandboxProvider(SandboxProvider):
             return SandboxConnectionError(f"Daytona sandbox provider connection error: {exc}")
         return SandboxError(f"Daytona sandbox provider error: {exc}")
 
-    @_PROVIDER_RETRY
     async def create_sandbox(self, request: SandboxCreateRequest) -> DaytonaSandbox:
+        try:
+            async with asyncio.timeout(request.create_timeout):
+                return await self._create_sandbox_with_retry(request)
+        except TimeoutError as exc:
+            raise SandboxConnectionError(
+                f"Daytona sandbox creation timed out after {request.create_timeout} seconds"
+            ) from exc
+
+    @_PROVIDER_RETRY
+    async def _create_sandbox_with_retry(self, request: SandboxCreateRequest) -> DaytonaSandbox:
         resources = DaytonaResources(
             cpu=request.resources.vcpu,
             memory=request.resources.memory,

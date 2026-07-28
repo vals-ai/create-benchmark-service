@@ -31,6 +31,7 @@ from benchmark_service.sandbox import (
     MissingSandboxConfigError,
     Resources,
     Sandbox,
+    SandboxConnectionError,
     SandboxCreateRequest,
     SandboxError,
     SandboxNotFoundError,
@@ -1480,6 +1481,28 @@ async def test_daytona_provider_recovers_existing_sandbox_on_create_conflict() -
 
     assert daytona.created is True
     assert sandbox.id == inner.id
+
+
+async def test_daytona_provider_times_out_while_recovering_conflicting_sandbox() -> None:
+    """Conflict recovery must use the request's total creation deadline."""
+
+    class NeverStartingSandbox(InnerSandbox):
+        state = SandboxState.BUILDING_SNAPSHOT
+
+        async def wait_for_sandbox_start(self, timeout: int) -> None:
+            assert timeout == 0
+            await asyncio.Event().wait()
+
+    class ConflictingCreateClient(DaytonaClient):
+        async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
+            raise DaytonaConflictError("Sandbox already exists")
+
+    inner = NeverStartingSandbox()
+    request = _request(inner.name).model_copy(update={"create_timeout": 1})
+
+    async with asyncio.timeout(2):
+        with pytest.raises(SandboxConnectionError, match=r"timed out.*1"):
+            await _provider(ConflictingCreateClient(inner)).create_sandbox(request)
 
 
 class CapturingCreateDaytonaClient(DaytonaClient):

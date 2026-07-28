@@ -26,6 +26,7 @@ from benchmark_service.sandbox.types import (
     SandboxNotFoundError,
     SandboxQuery,
     SnapshotSource,
+    TargetedSnapshotSource,
 )
 
 
@@ -162,7 +163,7 @@ class FlakyExecSandbox(FakeInnerSandbox):
 
 
 def _request(
-    source: ImageSource | SnapshotSource | None = None,
+    source: ImageSource | SnapshotSource | TargetedSnapshotSource | None = None,
     resources: Resources | None = None,
 ) -> SandboxCreateRequest:
     return SandboxCreateRequest(
@@ -591,6 +592,18 @@ async def test_create_sandbox_restores_snapshot_source(monkeypatch: pytest.Monke
 
     assert sandbox.id == "sb-123"
     assert captured["image"] == ("snapshot", "im-123")
+
+
+async def test_create_sandbox_rejects_targeted_snapshot_source(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        raise AssertionError("create should not be called")
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    with pytest.raises(SandboxError, match="does not support source type: targeted_snapshot"):
+        await provider.create_sandbox(
+            _request(source=TargetedSnapshotSource(snapshot="masscan-snapshot", target="us-west-3"))
+        )
 
 
 async def test_get_sandbox_raises_not_found(monkeypatch: pytest.MonkeyPatch) -> None:

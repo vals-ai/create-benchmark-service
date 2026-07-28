@@ -48,6 +48,7 @@ from tenacity import (
 
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
+    ComposeSource,
     ExecResult,
     ImageSource,
     MissingSandboxConfigError,
@@ -60,6 +61,7 @@ from benchmark_service.sandbox.types import (
     SandboxProvider,
     SandboxQuery,
     SnapshotSource,
+    TargetedSnapshotSource,
     validate_command_env,
 )
 
@@ -154,6 +156,17 @@ class DaytonaProviderConfig(BaseModel):
 
     def create_provider(self) -> SandboxProvider:
         return DaytonaSandboxProvider(self)
+
+
+def _daytona_client(config: DaytonaProviderConfig, target: str) -> AsyncDaytona:
+    return AsyncDaytona(
+        config=DaytonaConfig(
+            api_key=config.DAYTONA_API_KEY,
+            api_url=config.DAYTONA_API_URL,
+            target=target,
+            connection_pool_maxsize=None,
+        )
+    )
 
 
 def _daytona_gpu_type(gpu_type: str | None) -> GpuType | None:
@@ -557,14 +570,14 @@ class DaytonaSandbox(Sandbox):
 
 class DaytonaSandboxProvider(SandboxProvider):
     def __init__(self, config: DaytonaProviderConfig) -> None:
-        self._daytona = AsyncDaytona(
-            config=DaytonaConfig(
-                api_key=config.DAYTONA_API_KEY,
-                api_url=config.DAYTONA_API_URL,
-                target=config.DAYTONA_TARGET,
-                connection_pool_maxsize=None,
-            )
-        )
+        self._config = config
+        self._daytona = _daytona_client(config, config.DAYTONA_TARGET)
+        self._daytona_by_target = {config.DAYTONA_TARGET: self._daytona}
+
+    def _client_for_target(self, target: str) -> AsyncDaytona:
+        if target not in self._daytona_by_target:
+            self._daytona_by_target[target] = _daytona_client(self._config, target)
+        return self._daytona_by_target[target]
 
     def _sandbox_error(self, exc: DaytonaError) -> SandboxError:
         if _is_not_found_error(exc):
@@ -575,6 +588,7 @@ class DaytonaSandboxProvider(SandboxProvider):
 
     @_PROVIDER_RETRY
     async def create_sandbox(self, request: SandboxCreateRequest) -> DaytonaSandbox:
+        daytona = self._daytona
         resources = DaytonaResources(
             cpu=request.resources.vcpu,
             memory=request.resources.memory,
@@ -595,9 +609,11 @@ class DaytonaSandboxProvider(SandboxProvider):
                     resources=resources,
                     env_vars=request.env_vars,
                 )
-            case SnapshotSource(snapshot=snapshot):
+            case SnapshotSource(snapshot=snapshot) | TargetedSnapshotSource(snapshot=snapshot):
                 if request.resources.gpu:
                     raise SandboxError("Daytona snapshot sandboxes use the snapshot's resources; GPUs cannot be requested")
+                if isinstance(request.source, TargetedSnapshotSource):
+                    daytona = self._client_for_target(request.source.target)
                 params = CreateSandboxFromSnapshotParams(
                     auto_stop_interval=request.auto_stop_interval,
                     auto_delete_interval=0,
@@ -608,29 +624,29 @@ class DaytonaSandboxProvider(SandboxProvider):
                     network_block_all=request.network_block_all,
                     env_vars=request.env_vars,
                 )
-            case _:
+            case ComposeSource():
                 raise SandboxError("ComposeSource must be unwrapped before provider.create_sandbox")
 
         try:
-            inner = await self._daytona.create(params, timeout=request.create_timeout)
+            inner = await daytona.create(params, timeout=request.create_timeout)
         except DaytonaError as exc:
             # A name conflict means an earlier attempt of this same request
             # created the sandbox but the response was lost (transport retry).
             # Recover it by name so the retry doesn't strand an orphan and fail
             # the request on the conflict.
             if _is_name_conflict_error(exc):
-                existing = await self._find_existing_sandbox(request.name)
+                existing = await self._find_existing_sandbox(request.name, daytona)
                 if existing is not None:
                     return DaytonaSandbox(existing)
             elif _is_transient_daytona_error(exc):
-                await self._delete_failed_sandbox(request.name)
+                await self._delete_failed_sandbox(request.name, daytona)
             raise self._sandbox_error(exc) from exc
 
         return DaytonaSandbox(inner)
 
-    async def _delete_failed_sandbox(self, name: str) -> None:
+    async def _delete_failed_sandbox(self, name: str, daytona: AsyncDaytona) -> None:
         try:
-            sandbox = await self._daytona.get(name)
+            sandbox = await daytona.get(name)
         except DaytonaNotFoundError:
             return
         except DaytonaError as exc:
@@ -639,9 +655,9 @@ class DaytonaSandboxProvider(SandboxProvider):
         if sandbox.state in _FAILED_SANDBOX_STATES:
             await self.delete_sandbox(sandbox.id)
 
-    async def _find_existing_sandbox(self, name: str) -> AsyncSandbox | None:
+    async def _find_existing_sandbox(self, name: str, daytona: AsyncDaytona) -> AsyncSandbox | None:
         try:
-            sandbox = await self._daytona.get(name)
+            sandbox = await daytona.get(name)
         except DaytonaNotFoundError:
             return None
         except DaytonaError as exc:
@@ -703,7 +719,8 @@ class DaytonaSandboxProvider(SandboxProvider):
             raise self._sandbox_error(exc) from exc
 
     async def close(self) -> None:
-        await self._daytona.close()
+        for daytona in self._daytona_by_target.values():
+            await daytona.close()
 
 
 def _command(command: str, cwd: str | None, timeout: float | None) -> str:

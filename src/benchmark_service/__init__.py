@@ -24,6 +24,7 @@ from benchmark_service.sandbox import (
     SandboxQuery,
     SandboxSource,
     SnapshotSource,
+    TargetedSnapshotSource,
     sandbox_provider_config_from_mapping,
 )
 from benchmark_service.schemas import ArtifactGradingSubmission, EvalMode, GradingSubmission, TextGradingSubmission
@@ -56,6 +57,7 @@ __all__ = [
     "SandboxQuery",
     "SandboxSource",
     "SnapshotSource",
+    "TargetedSnapshotSource",
     "TextGradingSubmission",
     "sandbox_provider_config_from_mapping",
     "__version__",

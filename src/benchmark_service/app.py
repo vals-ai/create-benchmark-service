@@ -21,7 +21,7 @@ from websockets.exceptions import ConnectionClosed
 from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import LEGACY_TENANT_SENTINEL, get_auth_settings, get_tenant_config, load_allowlist
 from benchmark_service.base import BenchmarkService
-from benchmark_service.grading import SUBMISSION_ARTIFACT_SANDBOX_PATH, evaluate_submission
+from benchmark_service.grading import SUBMISSION_ARTIFACT_SANDBOX_PATH, collapse_stream, evaluate_submission
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.schemas import (
     ArtifactGradingSubmission,
@@ -304,16 +304,17 @@ class BenchmarkServiceApp(FastAPI):
                     "POST /v1/submissions/upload-url will return 503"
                 )
             self.service = await service_cls.create()
+            if (
+                self.service.eval_mode in {EvalMode.IN_PROCESS_ARTIFACT, EvalMode.SANDBOX}
+                and self.service.accepted_submission_schemas.get(V1PayloadType.ARTIFACT)
+                and not submission_artifacts.is_configured()
+            ):
+                raise RuntimeError(
+                    "artifact grading requires submission storage; set "
+                    f"{submission_artifacts.SUBMISSION_ARTIFACT_BUCKET_ENV} and "
+                    f"{submission_artifacts.SUBMISSION_ARTIFACT_REGION_ENV}"
+                )
             if self.service.eval_mode == EvalMode.SANDBOX:
-                if (
-                    self.service.accepted_submission_schemas.get(V1PayloadType.ARTIFACT)
-                    and not submission_artifacts.is_configured()
-                ):
-                    raise RuntimeError(
-                        "artifact sandbox grading requires submission-artifact storage; set "
-                        f"{submission_artifacts.SUBMISSION_ARTIFACT_BUCKET_ENV} and "
-                        f"{submission_artifacts.SUBMISSION_ARTIFACT_REGION_ENV}"
-                    )
                 async with _grading_provider_config().create_provider() as provider:
                     self._grading_provider = provider
                     yield
@@ -553,8 +554,12 @@ class BenchmarkServiceApp(FastAPI):
         _require_descope_tenant(tenant)
         if not await self.service.check_dataset_access(tenant, body.dataset):
             raise HTTPException(status_code=403, detail="Dataset not allowed")
+        try:
+            await self.service.validate_task_ids([body.task_id], dataset=body.dataset)
+        except ValueError as exc:
+            raise HTTPException(status_code=404, detail=f"Task not found: {body.task_id}") from exc
 
-        if self.service.eval_mode == EvalMode.SANDBOX:
+        if self.service.eval_mode in {EvalMode.IN_PROCESS_ARTIFACT, EvalMode.SANDBOX}:
             accepted_schemas = self.service.accepted_submission_schemas.get(body.payload.type)
             if not accepted_schemas:
                 raise HTTPException(
@@ -577,14 +582,24 @@ class BenchmarkServiceApp(FastAPI):
                     detail="Artifact submissions must include the uploaded object's key in payload.data.",
                 )
 
-            provider = self._grading_provider
-            if provider is None:
-                raise HTTPException(
-                    status_code=503,
-                    detail="Grading sandbox is not configured; contact the benchmark service owner.",
-                )
+            if body.payload.type == V1PayloadType.ARTIFACT:
+                try:
+                    submission_artifacts.validate_submission_key(
+                        body.payload.data,
+                        tenant=tenant,
+                        dataset=body.dataset or "default",
+                        run_id=body.run_id,
+                        task_id=body.task_id,
+                    )
+                except ValueError as exc:
+                    raise HTTPException(
+                        status_code=404,
+                        detail="Submission artifact not found for this evaluation.",
+                    ) from exc
+
             try:
                 async with self._grading_admission.acquire((tenant, body.run_id, body.task_id)):
+                    artifact_reference: submission_artifacts.SubmissionArtifactReference | None = None
                     submission: GradingSubmission
                     if body.payload.type == V1PayloadType.ARTIFACT:
                         try:
@@ -605,15 +620,45 @@ class BenchmarkServiceApp(FastAPI):
                             schema_id=body.payload.schema_id,
                             text=body.payload.data,
                         )
-                    response = await evaluate_submission(
-                        service=self.service,
-                        run_id=body.run_id,
-                        tenant=tenant,
-                        submission=submission,
-                        provider=provider,
-                        evaluator_version=self._service_version,
-                        dataset=body.dataset,
-                    )
+
+                    if self.service.eval_mode == EvalMode.SANDBOX:
+                        provider = self._grading_provider
+                        if provider is None:
+                            raise HTTPException(
+                                status_code=503,
+                                detail="Grading sandbox is not configured; contact the benchmark service owner.",
+                            )
+                        response = await evaluate_submission(
+                            service=self.service,
+                            run_id=body.run_id,
+                            tenant=tenant,
+                            submission=submission,
+                            provider=provider,
+                            evaluator_version=self._service_version,
+                            dataset=body.dataset,
+                        )
+                    else:
+                        if artifact_reference is None:
+                            raise RuntimeError("in-process artifact evaluation requires an admitted artifact")
+                        try:
+                            artifact = await submission_artifacts.download(artifact_reference, tenant=tenant)
+                        except submission_artifacts.SubmissionArtifactNotFound as exc:
+                            raise HTTPException(status_code=404, detail=str(exc)) from exc
+                        except submission_artifacts.SubmissionArtifactChanged as exc:
+                            raise HTTPException(status_code=409, detail=str(exc)) from exc
+                        except submission_artifacts.SubmissionArtifactTooLarge as exc:
+                            raise HTTPException(status_code=413, detail=str(exc)) from exc
+                        response = await collapse_stream(
+                            self.service.evaluate_artifact(
+                                task_id=body.task_id,
+                                schema_id=body.payload.schema_id,
+                                artifact=artifact,
+                                dataset=body.dataset,
+                            ),
+                            run_id=body.run_id,
+                            task_id=body.task_id,
+                            evaluator_version=self._service_version,
+                        )
             except _DuplicateGradingRequest as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             except _GradingCapacityExceeded as exc:
@@ -622,7 +667,7 @@ class BenchmarkServiceApp(FastAPI):
             if body.payload.type == V1PayloadType.ARTIFACT:
                 raise HTTPException(
                     status_code=400,
-                    detail="Artifact submissions require a sandbox-grading benchmark.",
+                    detail="This benchmark does not accept artifact submissions.",
                 )
             submission = TextGradingSubmission(
                 task_id=body.task_id,

@@ -7,7 +7,7 @@ import json
 import re
 from collections.abc import AsyncGenerator, Generator, Mapping
 from threading import Event
-from typing import Any
+from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
@@ -50,7 +50,11 @@ from benchmark_service.schemas import (
     StreamResultChunk,
     TextGradingSubmission,
 )
-from benchmark_service.submission_artifacts import SubmissionArtifactNotFound, SubmissionArtifactReference
+from benchmark_service.submission_artifacts import (
+    SubmissionArtifactChanged,
+    SubmissionArtifactNotFound,
+    SubmissionArtifactReference,
+)
 from benchmark_service.v1_schemas import V1EvalRequest, V1EvalStatus, V1Payload, V1PayloadType
 from tests.conftest import StubBenchmark
 
@@ -442,6 +446,29 @@ class ArtifactSandboxStub(SandboxStub):
         await sandbox.upload_file("/workspace/answer.txt", tarball)
 
 
+class InProcessArtifactStub(StubBenchmark):
+    """Grades admitted bytes without creating a grading sandbox."""
+
+    eval_mode = EvalMode.IN_PROCESS_ARTIFACT
+    accepted_submission_schemas = {
+        V1PayloadType.ARTIFACT: frozenset({"stub.workbook.v1"}),
+    }
+    artifact_call: tuple[str, str, bytes, str | None] | None = None
+
+    async def evaluate_artifact(
+        self,
+        task_id: str,
+        schema_id: str,
+        artifact: bytes,
+        dataset: str | None = None,
+    ) -> AsyncGenerator[StreamChunk, None]:
+        self.artifact_call = (task_id, schema_id, artifact, dataset)
+        yield StreamResultChunk(
+            type="result",
+            data={"resolved": artifact == b"workbook-bytes"},
+        )
+
+
 async def test_grade_instance_maps_missing_artifact_to_error(monkeypatch: pytest.MonkeyPatch) -> None:
     artifact_reference = SubmissionArtifactReference(
         key="submission-artifacts/acme/default/run-1/task-1/a.bin",
@@ -821,6 +848,35 @@ def test_sandbox_mode_without_accepted_schemas_fails_at_class_definition() -> No
                 pass
 
 
+def test_in_process_artifact_mode_requires_its_bytes_hook() -> None:
+    with pytest.raises(TypeError, match="evaluate_artifact"):
+
+        class _MissingArtifactHook(StubBenchmark):  # pyright: ignore[reportUnusedClass]
+            eval_mode = EvalMode.IN_PROCESS_ARTIFACT
+            accepted_submission_schemas = {
+                V1PayloadType.ARTIFACT: frozenset({"stub.workbook.v1"}),
+            }
+
+
+def test_in_process_artifact_mode_rejects_non_artifact_schemas() -> None:
+    with pytest.raises(TypeError, match="only non-empty artifact"):
+
+        class _TextSchema(StubBenchmark):  # pyright: ignore[reportUnusedClass]
+            eval_mode = EvalMode.IN_PROCESS_ARTIFACT
+            accepted_submission_schemas = {
+                V1PayloadType.TEXT: frozenset({"stub.text.v1"}),
+            }
+
+            async def evaluate_artifact(
+                self,
+                task_id: str,
+                schema_id: str,
+                artifact: bytes,
+                dataset: str | None = None,
+            ) -> AsyncGenerator[StreamChunk, None]:
+                yield StreamResultChunk(type="result", data={})
+
+
 class FailingDeleteProvider(FakeProvider):
     async def delete_sandbox(self, instance_id: str) -> None:
         raise RuntimeError("delete failed")
@@ -991,9 +1047,32 @@ def test_sandbox_mode_missing_artifact_storage_fails_at_boot(
             pass
 
 
+def test_in_process_artifact_mode_missing_storage_fails_at_boot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = _sandbox_app(monkeypatch, InProcessArtifactStub)
+    monkeypatch.delenv("SUBMISSION_ARTIFACT_BUCKET", raising=False)
+
+    with pytest.raises(RuntimeError, match="SUBMISSION_ARTIFACT_BUCKET"):
+        with TestClient(app):
+            pass
+
+
 @pytest.fixture
 def artifact_descope_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
     app = _sandbox_app(monkeypatch, ArtifactSandboxStub)
+
+    async def _stub_exchange(_project_id: str, _access_key: str) -> dict[str, dict[str, dict[str, str]]]:
+        return {"tenants": {"acme": {}}}
+
+    with patch.object(auth_module, "_exchange_descope_access_key", _stub_exchange):
+        with TestClient(app) as client:
+            yield client
+
+
+@pytest.fixture
+def in_process_artifact_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
+    app = _sandbox_app(monkeypatch, InProcessArtifactStub)
 
     async def _stub_exchange(_project_id: str, _access_key: str) -> dict[str, dict[str, dict[str, str]]]:
         return {"tenants": {"acme": {}}}
@@ -1041,18 +1120,161 @@ def test_v1_evaluate_artifact_payload_grades_from_materialized_artifact(
     assert stat_calls == 1
 
 
+def test_v1_evaluate_passes_only_admitted_bytes_to_in_process_benchmark(
+    in_process_artifact_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = "submission-artifacts/acme/default/external-run-1/task-1/submission.xlsx"
+    reference = SubmissionArtifactReference(key=key, size_bytes=14, etag='"etag-1"')
+
+    async def fake_stat(k: str, *, tenant: str) -> SubmissionArtifactReference:
+        assert (k, tenant) == (key, "acme")
+        return reference
+
+    async def fake_download(admitted: SubmissionArtifactReference, *, tenant: str) -> bytes:
+        assert admitted is reference
+        assert tenant == "acme"
+        return b"workbook-bytes"
+
+    monkeypatch.setattr("benchmark_service.submission_artifacts.stat", fake_stat)
+    monkeypatch.setattr("benchmark_service.submission_artifacts.download", fake_download)
+
+    response = _post_eval(
+        in_process_artifact_client,
+        {"type": "artifact", "schema": "stub.workbook.v1", "data": key},
+    )
+
+    assert response.status_code == 200
+    assert response.json()["result"] == {"resolved": True}
+    app = cast(BenchmarkServiceApp, in_process_artifact_client.app)
+    service = cast(InProcessArtifactStub, app.service)
+    assert service.artifact_call == ("task-1", "stub.workbook.v1", b"workbook-bytes", "default")
+    assert _FakeDaytonaConfig.provider.created == []
+
+
+@pytest.mark.parametrize(
+    "key",
+    [
+        "submission-artifacts/other/default/external-run-1/task-1/submission.xlsx",
+        "submission-artifacts/acme/other/external-run-1/task-1/submission.xlsx",
+        "submission-artifacts/acme/default/other/task-1/submission.xlsx",
+        "submission-artifacts/acme/default/external-run-1/other/submission.xlsx",
+    ],
+)
+def test_v1_evaluate_rejects_artifact_outside_authenticated_request_before_storage(
+    in_process_artifact_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    key: str,
+) -> None:
+    async def unexpected_stat(_key: str, *, tenant: str) -> SubmissionArtifactReference:
+        raise AssertionError(f"storage reached for tenant {tenant}")
+
+    monkeypatch.setattr("benchmark_service.submission_artifacts.stat", unexpected_stat)
+
+    response = _post_eval(
+        in_process_artifact_client,
+        {"type": "artifact", "schema": "stub.workbook.v1", "data": key},
+    )
+
+    assert response.status_code == 404
+    app = cast(BenchmarkServiceApp, in_process_artifact_client.app)
+    assert cast(InProcessArtifactStub, app.service).artifact_call is None
+
+
+def test_v1_evaluate_rejects_in_process_schema_before_storage(
+    in_process_artifact_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def unexpected_stat(_key: str, *, tenant: str) -> SubmissionArtifactReference:
+        raise AssertionError(f"storage reached for tenant {tenant}")
+
+    monkeypatch.setattr("benchmark_service.submission_artifacts.stat", unexpected_stat)
+    response = _post_eval(
+        in_process_artifact_client,
+        {
+            "type": "artifact",
+            "schema": "other.workbook.v1",
+            "data": "submission-artifacts/acme/default/external-run-1/task-1/submission.xlsx",
+        },
+    )
+
+    assert response.status_code == 400
+    assert "Use one of: stub.workbook.v1" in response.json()["detail"]
+
+
+def test_v1_evaluate_rejects_unknown_task_before_artifact_storage(
+    in_process_artifact_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def unexpected_stat(_key: str, *, tenant: str) -> SubmissionArtifactReference:
+        raise AssertionError(f"storage reached for tenant {tenant}")
+
+    monkeypatch.setattr("benchmark_service.submission_artifacts.stat", unexpected_stat)
+    response = in_process_artifact_client.post(
+        "/v1/evaluate",
+        json={
+            "run_id": "external-run-1",
+            "task_id": "unknown-task",
+            "dataset": "default",
+            "payload": {
+                "type": "artifact",
+                "schema": "stub.workbook.v1",
+                "data": "submission-artifacts/acme/default/external-run-1/unknown-task/submission.xlsx",
+            },
+        },
+        headers={"x-descope-api-key": "key-acme"},
+    )
+
+    assert response.status_code == 404
+    assert response.json()["detail"] == "Task not found: unknown-task"
+
+
+def test_v1_evaluate_rejects_changed_artifact_before_in_process_hook(
+    in_process_artifact_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = "submission-artifacts/acme/default/external-run-1/task-1/submission.xlsx"
+    reference = SubmissionArtifactReference(key=key, size_bytes=14, etag='"etag-1"')
+
+    async def fake_stat(_key: str, *, tenant: str) -> SubmissionArtifactReference:
+        assert tenant == "acme"
+        return reference
+
+    async def changed_download(
+        _reference: SubmissionArtifactReference,
+        *,
+        tenant: str,
+    ) -> bytes:
+        assert tenant == "acme"
+        raise SubmissionArtifactChanged("artifact changed after it was accepted")
+
+    monkeypatch.setattr("benchmark_service.submission_artifacts.stat", fake_stat)
+    monkeypatch.setattr("benchmark_service.submission_artifacts.download", changed_download)
+
+    response = _post_eval(
+        in_process_artifact_client,
+        {"type": "artifact", "schema": "stub.workbook.v1", "data": key},
+    )
+
+    assert response.status_code == 409
+    app = cast(BenchmarkServiceApp, in_process_artifact_client.app)
+    assert cast(InProcessArtifactStub, app.service).artifact_call is None
+
+
 async def test_v1_evaluate_bounds_artifact_preflight_with_grading_admission(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    key = "submission-artifacts/acme/default/external-run-1/task-1/answer.bin"
-    artifact_reference = SubmissionArtifactReference(key=key, size_bytes=1, etag='"etag-1"')
+    def key_for(run_id: str) -> str:
+        return f"submission-artifacts/acme/default/{run_id}/task-1/answer.bin"
+
+    artifact_reference = SubmissionArtifactReference(key=key_for("run-1"), size_bytes=1, etag='"etag-1"')
     stat_entered = asyncio.Event()
     release_stat = asyncio.Event()
     stat_calls = 0
 
     async def blocking_stat(k: str, *, tenant: str) -> SubmissionArtifactReference:
         nonlocal stat_calls
-        assert (k, tenant) == (key, "acme")
+        assert (k, tenant) == (key_for("run-1"), "acme")
         stat_calls += 1
         if stat_calls == 1:
             stat_entered.set()
@@ -1083,7 +1305,11 @@ async def test_v1_evaluate_bounds_artifact_preflight_with_grading_admission(
             run_id=run_id,
             task_id="task-1",
             dataset="default",
-            payload=V1Payload(type=V1PayloadType.ARTIFACT, schema="stub.artifact.v1", data=key),
+            payload=V1Payload(
+                type=V1PayloadType.ARTIFACT,
+                schema="stub.artifact.v1",
+                data=key_for(run_id),
+            ),
         )
         return await app._v1_evaluate(request, body)
 
@@ -1187,7 +1413,11 @@ def test_v1_evaluate_artifact_missing_returns_404_before_any_sandbox(
 
     resp = _post_eval(
         artifact_descope_client,
-        {"type": "artifact", "schema": "stub.artifact.v1", "data": "submission-artifacts/acme/default/r/t/a.bin"},
+        {
+            "type": "artifact",
+            "schema": "stub.artifact.v1",
+            "data": "submission-artifacts/acme/default/external-run-1/task-1/a.bin",
+        },
     )
 
     assert resp.status_code == 404
@@ -1206,7 +1436,7 @@ def test_v1_evaluate_artifact_payload_on_text_benchmark_returns_400(monkeypatch:
             resp = _post_eval(client, {"type": "artifact", "schema": "stub.artifact.v1", "data": "some-key"})
 
     assert resp.status_code == 400
-    assert "sandbox-grading" in resp.json()["detail"]
+    assert "does not accept artifact" in resp.json()["detail"]
 
 
 async def test_grading_admission_rejects_duplicate_and_excess_work_while_held() -> None:

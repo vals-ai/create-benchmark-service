@@ -21,10 +21,10 @@ from benchmark_service.auth import (
 from benchmark_service.dataset_versioning import DatasetVersionEntry, load_dataset_versions
 from benchmark_service.sandbox import Sandbox
 from benchmark_service.schemas import (
-    GradingSubmission,
     EvalMode,
     EvaluateResponseRequest,
     FinalScoreResult,
+    GradingSubmission,
     RetrieveTaskResponse,
     StreamChunk,
     StreamResultChunk,
@@ -47,10 +47,8 @@ class BenchmarkService(ABC):
     dataset_versions_file: ClassVar[Path | None] = None
     dataset_versions: dict[str, DatasetVersionEntry]
 
-    # How /v1/evaluate grades this benchmark. Declare EvalMode.SANDBOX for
-    # benchmarks that must execute the submitted artifact in a sandbox; the
-    # framework reads this at boot and per dispatch, so it is class state, not
-    # a per-instance value.
+    # How /v1/evaluate grades this benchmark. The framework reads this at boot
+    # and per dispatch, so it is class state, not a per-instance value.
     eval_mode: ClassVar[EvalMode] = EvalMode.TEXT
     accepted_submission_schemas: ClassVar[dict[V1PayloadType, frozenset[str]]] = {}
 
@@ -67,6 +65,18 @@ class BenchmarkService(ABC):
             raise TypeError(
                 f"{cls.__name__} declares eval_mode = EvalMode.SANDBOX and must declare accepted_submission_schemas"
             )
+        if cls.eval_mode == EvalMode.IN_PROCESS_ARTIFACT:
+            if cls.evaluate_artifact is BenchmarkService.evaluate_artifact:
+                raise TypeError(
+                    f"{cls.__name__} declares eval_mode = EvalMode.IN_PROCESS_ARTIFACT "
+                    "and must implement evaluate_artifact"
+                )
+            artifact_schemas = cls.accepted_submission_schemas.get(V1PayloadType.ARTIFACT)
+            if not artifact_schemas or set(cls.accepted_submission_schemas) != {V1PayloadType.ARTIFACT}:
+                raise TypeError(
+                    f"{cls.__name__} declares eval_mode = EvalMode.IN_PROCESS_ARTIFACT and must declare "
+                    "only non-empty artifact accepted_submission_schemas"
+                )
 
     @classmethod
     async def create(cls) -> Self:
@@ -309,6 +319,19 @@ class BenchmarkService(ABC):
         """
         result = await self.evaluate_response(request, dataset=dataset)
         yield StreamResultChunk(type="result", data=jsonable_encoder(result))
+
+    def evaluate_artifact(
+        self,
+        task_id: str,
+        schema_id: str,
+        artifact: bytes,
+        dataset: str | None = None,
+    ) -> AsyncGenerator[StreamChunk, None]:
+        """Grade framework-admitted artifact bytes in the service process."""
+        raise NotImplementedError(
+            f"{type(self).__name__}.evaluate_artifact must be implemented for "
+            "eval_mode == EvalMode.IN_PROCESS_ARTIFACT"
+        )
 
     @abstractmethod
     def evaluate_instance(

@@ -147,6 +147,23 @@ class _SandboxModeService(_FakeService):
         raise NotImplementedError
 
 
+class _InProcessArtifactModeService(_FakeService):
+    eval_mode = EvalMode.IN_PROCESS_ARTIFACT
+    accepted_submission_schemas = {
+        V1PayloadType.ARTIFACT: frozenset({"fake.workbook.v1"}),
+    }
+
+    async def evaluate_artifact(
+        self,
+        task_id: str,
+        schema_id: str,
+        artifact: bytes,
+        dataset: str | None = None,
+    ) -> AsyncGenerator[StreamChunk, None]:
+        return
+        yield
+
+
 def test_version_reports_text_eval_mode_by_default() -> None:
     app = BenchmarkServiceApp(_FakeService)
     with TestClient(app) as client:
@@ -164,3 +181,13 @@ def test_version_reports_sandbox_eval_mode_when_overridden(monkeypatch: pytest.M
         response = client.get("/version")
     assert response.status_code == 200
     assert response.json()["eval_mode"] == "sandbox"
+
+
+def test_version_reports_in_process_artifact_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SUBMISSION_ARTIFACT_BUCKET", "vals-submission-artifacts")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    app = BenchmarkServiceApp(_InProcessArtifactModeService)
+    with TestClient(app) as client:
+        response = client.get("/version")
+    assert response.status_code == 200
+    assert response.json()["eval_mode"] == "in_process_artifact"

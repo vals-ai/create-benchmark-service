@@ -17,6 +17,7 @@ from benchmark_service.v1_schemas import (
     V1PayloadType,
     V1ScoreItem,
     V1ScoreResponse,
+    V1UploadUrlResponse,
     V1Versions,
 )
 
@@ -662,6 +663,40 @@ async def test_client_v1_evaluate_posts_payload_and_returns_v1_eval_response(
     assert called_kwargs["json"]["versions"] == {"runner": "benchmark-orchestrator-1.2.3"}
 
 
+async def test_client_v1_upload_url_posts_artifact_identity(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    mock_http.post = AsyncMock(
+        return_value=_mock_response(
+            json_data={
+                "key": "submission-artifacts/acme/validation/run-1/task-1/submission.xlsx",
+                "url": "https://uploads.example/presigned",
+                "expires_in": 900,
+            }
+        )
+    )
+
+    result = await client.v1_upload_url(
+        run_id="run-1",
+        task_id="task-1",
+        filename="submission.xlsx",
+        dataset="validation",
+    )
+
+    assert isinstance(result, V1UploadUrlResponse)
+    assert result.expires_in == 900
+    mock_http.post.assert_awaited_once_with(
+        f"{BASE_URL}/v1/submissions/upload-url",
+        json={
+            "run_id": "run-1",
+            "task_id": "task-1",
+            "dataset": "validation",
+            "filename": "submission.xlsx",
+        },
+    )
+
+
 async def test_client_v1_score_posts_results_and_returns_v1_score_response(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
@@ -721,6 +756,14 @@ async def test_client_v1_evaluate_raises_on_error_status(
             {
                 "run_id": "run-1",
                 "evaluation_results": {},
+            },
+        ),
+        (
+            "v1_upload_url",
+            {
+                "run_id": "run-1",
+                "task_id": "task-1",
+                "filename": "submission.xlsx",
             },
         ),
     ],

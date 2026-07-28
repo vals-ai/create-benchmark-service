@@ -233,6 +233,8 @@ class EvalMode(StrEnum):
     """How a benchmark is evaluated on /v1/evaluate.
 
     TEXT: the endpoint calls evaluate_response in-process.
+    IN_PROCESS_ARTIFACT: the framework downloads an admitted artifact and
+    passes its bytes to evaluate_artifact in the service process.
     SANDBOX: the endpoint provisions a fresh grading sandbox, calls
     prepare_grading_sandbox with a typed submission, then runs
     evaluate_instance. Clients never branch on this value — the server picks
@@ -240,6 +242,7 @@ class EvalMode(StrEnum):
     """
 
     TEXT = "text"
+    IN_PROCESS_ARTIFACT = "in_process_artifact"
     SANDBOX = "sandbox"
 
 

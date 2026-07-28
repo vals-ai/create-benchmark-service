@@ -7,6 +7,7 @@ import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import suppress
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from aiohttp import ClientConnectionError, ClientResponseError
@@ -32,9 +33,14 @@ from daytona.common.errors import (
     DaytonaError,
     DaytonaRateLimitError,
     DaytonaTimeoutError,
+    create_daytona_error,
 )
 from daytona.common.pty import PtyResult
 from daytona.handle.async_pty_handle import AsyncPtyHandle
+from daytona_api_client_async import ApiClient as DaytonaApiClient
+from daytona_api_client_async import Configuration as DaytonaApiConfiguration
+from daytona_api_client_async import OrganizationsApi
+from daytona_api_client_async.exceptions import OpenApiException
 from pydantic import BaseModel
 from tenacity import (
     RetryCallState,
@@ -317,6 +323,8 @@ _PROVIDER_RETRY = retry(
 class DaytonaSandbox(Sandbox):
     def __init__(self, sandbox: AsyncSandbox) -> None:
         self._sandbox = sandbox
+        self.labels = dict(sandbox.labels)
+        self.created_at = self._parse_created_at(sandbox.created_at)
 
     @property
     def id(self) -> str:
@@ -329,6 +337,19 @@ class DaytonaSandbox(Sandbox):
     @property
     def state(self) -> str:
         return str(self._sandbox.state)
+
+    def _parse_created_at(self, value: str | None) -> datetime | None:
+        if value is None:
+            return None
+
+        try:
+            created_at = datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise SandboxError(f"Invalid Daytona creation time for {self._sandbox_ref}.") from exc
+
+        if created_at.tzinfo is None or created_at.utcoffset() is None:
+            raise SandboxError(f"Invalid Daytona creation time for {self._sandbox_ref}.")
+        return created_at.astimezone(UTC)
 
     @property
     def _sandbox_ref(self) -> str:
@@ -571,8 +592,17 @@ class DaytonaSandbox(Sandbox):
 class DaytonaSandboxProvider(SandboxProvider):
     def __init__(self, config: DaytonaProviderConfig) -> None:
         self._config = config
-        self._daytona = _daytona_client(config, config.DAYTONA_TARGET)
-        self._daytona_by_target = {config.DAYTONA_TARGET: self._daytona}
+        self._target = config.DAYTONA_TARGET.strip()
+        if not self._target:
+            raise MissingSandboxConfigError("DAYTONA_TARGET must not be blank")
+        self._target_id: str | None = None
+        self._target_id_lock = asyncio.Lock()
+        self._target_api_configuration = DaytonaApiConfiguration(
+            host=config.DAYTONA_API_URL,
+            access_token=config.DAYTONA_API_KEY,
+        )
+        self._daytona = _daytona_client(config, self._target)
+        self._daytona_by_target = {self._target: self._daytona}
 
     def _client_for_target(self, target: str) -> AsyncDaytona:
         if target not in self._daytona_by_target:
@@ -713,10 +743,45 @@ class DaytonaSandboxProvider(SandboxProvider):
     @_PROVIDER_RETRY
     async def _list_sandboxes(self, query: SandboxQuery) -> list[AsyncSandbox]:
         try:
-            daytona_query = ListSandboxesQuery(labels=query.labels, limit=query.page_size)
+            target_id = await self._resolve_target_id()
+            daytona_query = ListSandboxesQuery(
+                labels=query.labels,
+                targets=[target_id],
+                # Daytona applies created_at_before inclusively despite the name.
+                created_at_before=query.created_at_lte,
+                limit=query.page_size,
+            )
             return [sandbox async for sandbox in self._daytona.list(daytona_query)]
         except DaytonaError as exc:
             raise self._sandbox_error(exc) from exc
+
+    async def _resolve_target_id(self) -> str:
+        if self._target_id is not None:
+            return self._target_id
+
+        async with self._target_id_lock:
+            if self._target_id is not None:
+                return self._target_id
+
+            try:
+                async with DaytonaApiClient(self._target_api_configuration) as api_client:
+                    regions = await OrganizationsApi(api_client).list_available_regions()
+            except OpenApiException as exc:
+                raise create_daytona_error(
+                    f"Failed to resolve Daytona target: {exc}",
+                    status_code=getattr(exc, "status", None),
+                    headers=getattr(exc, "headers", None),
+                ) from exc
+            except _RETRYABLE_DAYTONA_CAUSES as exc:
+                raise SandboxConnectionError(f"Daytona sandbox provider connection error: {exc}") from exc
+
+            region = next((region for region in regions if region.name == self._target), None)
+            region = region or next((region for region in regions if region.id == self._target), None)
+            if region is None:
+                raise SandboxError(f"Daytona target is not available: {self._target!r}.")
+
+            self._target_id = region.id
+            return self._target_id
 
     async def close(self) -> None:
         for daytona in self._daytona_by_target.values():

@@ -38,6 +38,7 @@ from benchmark_service.sandbox import (
     SandboxCreateRequest,
     SandboxProvider,
     SnapshotSource,
+    TargetedSnapshotSource,
 )
 from benchmark_service.sandbox.types import BaseSandboxSource
 from benchmark_service.schemas import (
@@ -174,7 +175,7 @@ def _sandbox_name(run_id: str, task_id: str) -> str:
 class _ResolvedSpec:
     """The task's eval-sandbox spec with generation-value fallbacks applied."""
 
-    source: BaseSandboxSource
+    source: BaseSandboxSource | TargetedSnapshotSource
     resources: Resources
     network_block_all: bool
     grade_timeout: float
@@ -187,12 +188,14 @@ def _resolve_grading_spec(task: RetrieveTaskResponse) -> _ResolvedSpec:
         raise ValueError(
             "sandbox grading does not support ComposeSource; set eval_sandbox.source to an image or snapshot"
         )
-    if spec is not None and spec.resources is not None and isinstance(source, SnapshotSource):
+    if spec is not None and spec.resources is not None and isinstance(
+        source, (SnapshotSource, TargetedSnapshotSource)
+    ):
         raise ValueError(
             "eval_sandbox.resources cannot override a snapshot-backed sandbox; use an image source with explicit resources"
         )
     resources = spec.resources if spec is not None and spec.resources is not None else task.resources
-    if isinstance(source, SnapshotSource):
+    if isinstance(source, (SnapshotSource, TargetedSnapshotSource)):
         # The snapshot owns its resources; generation GPU settings cannot be
         # forwarded through the required create-request resources field.
         resources = resources.model_copy(update={"gpu": 0, "gpu_type": None})

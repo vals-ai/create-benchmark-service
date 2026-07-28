@@ -1,15 +1,24 @@
 """Request and response models for the benchmark service API."""
 
 from enum import StrEnum
-from typing import Annotated, Any, Literal, cast
+from typing import Annotated, Any, Literal, assert_never, cast
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 from benchmark_service.sandbox import SandboxProviderConfig
-from benchmark_service.sandbox.types import BaseSandboxSource, ImageSource, Resources, SandboxSource, SnapshotSource
+from benchmark_service.sandbox.types import (
+    BaseSandboxSource,
+    ComposeSource,
+    ImageSource,
+    Resources,
+    SandboxSource,
+    SnapshotSource,
+    TargetedSnapshotSource,
+)
 from benchmark_service.submission_artifacts import SubmissionArtifactReference
 
 _COMPOSE_LEGACY_DOCKER_IMAGE = "compose+source-required"
+_TARGETED_SNAPSHOT_LEGACY_DOCKER_IMAGE = "targeted-snapshot+source-required"
 
 type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 
@@ -52,7 +61,11 @@ def legacy_docker_image(source: SandboxSource) -> str:
         return source.image
     if isinstance(source, SnapshotSource):
         return f"snapshot:{source.snapshot}"
-    return _COMPOSE_LEGACY_DOCKER_IMAGE
+    if isinstance(source, TargetedSnapshotSource):
+        return _TARGETED_SNAPSHOT_LEGACY_DOCKER_IMAGE
+    if isinstance(source, ComposeSource):  # pyright: ignore[reportUnnecessaryIsInstance]
+        return _COMPOSE_LEGACY_DOCKER_IMAGE
+    assert_never(source)
 
 
 class EvalSandboxSpec(BaseModel):
@@ -108,7 +121,7 @@ class RetrieveTaskResponse(BaseModel):
     Customize fields based on what your benchmark tasks need.
     """
 
-    source: SandboxSource = Field(description="Sandbox source image or snapshot")
+    source: SandboxSource = Field(description="Sandbox source")
     problem_path: str = Field(
         description="Path inside the sandbox where the problem statement file will be written during setup"
     )

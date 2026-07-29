@@ -324,6 +324,9 @@ tenants:
   acme-corp:
     datasets:
       - validation
+    evaluation_quota:
+      limit: 2500
+      period: week
   vals-internal:
     datasets:
       - default
@@ -331,7 +334,15 @@ tenants:
       - test
 ```
 
-Malformed configured allowlists raise at app startup when `AUTH_REQUIRED=true`. Unknown tenants receive `401 Unauthorized`. Known tenants requesting a dataset outside their allowlist receive `403 Dataset not allowed`; WebSocket routes close with code `1008`. The tenant ID `"_legacy"` is reserved for compatibility mode and is rejected as a Descope tenant.
+Malformed configured allowlists raise at app startup. Unknown tenants receive `401 Unauthorized`. Known tenants requesting a dataset outside their allowlist receive `403 Dataset not allowed`; WebSocket routes close with code `1008`. The tenant ID `"_legacy"` is reserved for compatibility mode and is rejected as a Descope tenant.
+
+**Evaluation quotas.** Add `evaluation_quota` to a tenant entry to cap that tenant's evaluation requests. Set `period` to `day`, `week`, `month`, or `year`. Periods use UTC calendar boundaries: days start at 00:00, weeks start Monday at 00:00, months start on the first day at 00:00, and years start January 1 at 00:00. Changing a tenant's period selects a separate counter namespace. `POST /v1/evaluate`, `POST /evaluate-response/`, `/ws/evaluate-response`, and `/ws/evaluate-instance` consume the same quota; task setup, task retrieval, and score aggregation do not. Authentication, request parsing, dataset authorization, and payload compatibility checks happen before the request is counted. Duplicate and immediate-capacity checks for admitted grading requests also happen first. Accepted requests then consume quota before waiting for an active grading slot or accessing submission storage. Once counted, a request still consumes quota if evaluation or another later step fails.
+
+Quota-enabled deployments must set a stable, non-empty `SERVICE_NAME` and set `EVALUATION_QUOTA_TABLE_NAME` to a DynamoDB table whose string partition key is `quota_key` and whose TTL attribute is `expires_at`. `SERVICE_NAME` separates each benchmark service's counters when the table is shared and must not change during a quota period. The task role needs `dynamodb:UpdateItem` on the table.
+
+Counter updates are atomic across service processes and are not retried because increments are not idempotent. A write that reaches DynamoDB counts even if its response is lost, so an ambiguous storage failure can return HTTP 503 or WebSocket close code `1011` after consuming one request. This fail-closed behavior prevents one incoming request from consuming multiple units and prevents an unavailable counter from bypassing the limit. Internal AWS errors are logged but not returned to the caller.
+
+After the configured limit is reached, HTTP routes return 429 with `Retry-After` and WebSocket routes close with code `1008`. Missing counter configuration fails service startup instead of silently disabling enforcement.
 
 For local development or legacy custom services, leave `AUTH_REQUIRED` unset or `false`. In that mode, `BENCHMARK_API_KEY` preserves the previous static-key behavior by requiring `Authorization: Bearer <key>`. If `BENCHMARK_API_KEY` is not set, requests are allowed. Legacy auth uses the `"_legacy"` sentinel and bypasses dataset-level allowlist enforcement because no tenant identity is available.
 

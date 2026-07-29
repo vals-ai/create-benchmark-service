@@ -15,7 +15,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 # One rule for every value that becomes an S3 object-key segment: rules out
 # separators, `.`/`..`, empties, and unbounded length (S3 keys cap at 1024
 # bytes) at the schema boundary instead of inside key construction.
-KEY_SEGMENT_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$"
+KEY_SEGMENT_PATTERN = r"^[A-Za-z0-9][A-Za-z0-9._+-]{0,127}$"
 KeySegment = Annotated[str, StringConstraints(pattern=KEY_SEGMENT_PATTERN)]
 
 

@@ -67,11 +67,14 @@ _retry_http = retry(
 )
 
 # v1_evaluate retries only conditions provably safe against double-grading: the connect
-# phase (nothing reached the server) and 429/502 (raised before grading admission, or by a
-# gateway in front of the app). Read/write-phase transport failures and any other status stay
-# unretried because grading may already have started.
+# phase (nothing reached the server) and 429 (grading-admission/quota rejection, raised
+# before any grading work starts). 502 is deliberately excluded even though the app never
+# constructs one itself: the ALB in front of this service can emit a 502 when it deregisters
+# a target mid-request (autoscaling, deploys, crashes), which happens after the request
+# reached the app and grading may already be underway — retrying that risks double-grading.
+# Read/write-phase transport failures and any other status stay unretried for the same reason.
 _CONNECT_PHASE_EXCEPTIONS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
-_RETRYABLE_V1_EVALUATE_STATUSES = (429, 502)
+_RETRYABLE_V1_EVALUATE_STATUSES = (429,)
 # Calibrated to GRADING_QUEUE_TIMEOUT_S (default 30s): grading-capacity pressure clears in
 # seconds as in-flight evals finish, not the minutes-scale Daytona provider outages that
 # _PROVIDER_RETRY_DELAYS_SECONDS covers.
@@ -531,9 +534,12 @@ class BenchmarkServiceClient:
         payload_data is either inline text or an uploaded artifact key, as
         selected by payload_type. Only conditions provably safe against
         double-grading are retried: the connect phase (the request never
-        reached the server) and HTTP 429/502 (raised before grading admission,
-        or by a gateway in front of the app). Every other transport failure or
-        status code is not retried because grading may already have started.
+        reached the server) and HTTP 429 (grading-admission/quota rejection,
+        raised before any grading work starts). 502 is not retried: the ALB in
+        front of this service can emit one when a target is deregistered
+        mid-request, which can happen after grading has already started. Every
+        other transport failure or status code is not retried for the same
+        reason: grading may already have started.
         """
         request = V1EvalRequest(
             run_id=run_id,

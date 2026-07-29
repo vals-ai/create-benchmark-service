@@ -829,15 +829,17 @@ async def test_client_v1_evaluate_raises_on_error_status(
     mock_http.post.assert_awaited_once()
 
 
-@pytest.mark.parametrize("status_code", [400, 403, 404, 409])
+@pytest.mark.parametrize("status_code", [400, 403, 404, 409, 502])
 async def test_client_v1_evaluate_does_not_retry_permanent_statuses(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
     monkeypatch: pytest.MonkeyPatch,
     status_code: int,
 ) -> None:
-    """Statuses outside the retryable 429/502 set raise on the first attempt.
+    """Statuses outside the retryable 429 set raise on the first attempt.
 
     409 is the duplicate-grading-in-progress signal and must never be retried.
+    502 can be emitted by the ALB mid-grading (target deregistration), not just
+    pre-app, so it must never be retried either.
     """
     client, mock_http = benchmark_client
     _patch_v1_evaluate_sleep(monkeypatch)
@@ -855,19 +857,16 @@ async def test_client_v1_evaluate_does_not_retry_permanent_statuses(
     mock_http.post.assert_awaited_once()
 
 
-@pytest.mark.parametrize("status_code", [429, 502])
 async def test_client_v1_evaluate_retries_transient_status_then_succeeds(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
     monkeypatch: pytest.MonkeyPatch,
-    status_code: int,
 ) -> None:
-    """429 (grading-admission throttle, no header) and 502 (gateway, pre-app) are retried.
-
-    Both are provably safe: neither can occur after evaluate_submission() has started.
+    """429 (grading-admission throttle, no header) is retried: it's provably safe,
+    raised before any grading work starts.
     """
     client, mock_http = benchmark_client
     observed_waits = _patch_v1_evaluate_sleep(monkeypatch)
-    mock_http.post = AsyncMock(side_effect=[_mock_response(status_code=status_code), _v1_eval_ok_response()])
+    mock_http.post = AsyncMock(side_effect=[_mock_response(status_code=429), _v1_eval_ok_response()])
 
     result = await client.v1_evaluate(
         run_id="run-1",

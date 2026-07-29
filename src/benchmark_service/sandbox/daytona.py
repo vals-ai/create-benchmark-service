@@ -666,11 +666,19 @@ class DaytonaSandboxProvider(SandboxProvider):
             # the request on the conflict.
             if _is_name_conflict_error(exc):
                 existing = await self._find_existing_sandbox(request.name, daytona)
-                if existing is not None:
-                    return DaytonaSandbox(existing)
-            elif _is_transient_daytona_error(exc):
-                await self._delete_failed_sandbox(request.name, daytona)
-            raise self._sandbox_error(exc) from exc
+                if existing is None:
+                    raise self._sandbox_error(exc) from exc
+                inner = existing
+            else:
+                if _is_transient_daytona_error(exc):
+                    await self._delete_failed_sandbox(request.name, daytona)
+                raise self._sandbox_error(exc) from exc
+
+        if isinstance(request.source, TargetedSnapshotSource) and request.env_vars:
+            try:
+                await inner.update_env(request.env_vars)
+            except DaytonaError as exc:
+                raise self._sandbox_error(exc) from exc
 
         return DaytonaSandbox(inner)
 

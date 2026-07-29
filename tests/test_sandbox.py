@@ -430,9 +430,14 @@ class InnerSandbox:
         self.created_at: str | None = None
         self.process = Process()
         self.fs = Files()
+        self.env_updates: list[dict[str, str]] = []
         self.autostop_interval: int | None = None
         self.network_settings: list[dict[str, str | bool | None]] = []
         self.refresh_count = 0
+
+    async def update_env(self, env: dict[str, str], *, unset: list[str] | None = None) -> None:
+        assert unset is None
+        self.env_updates.append(dict(env))
 
     async def set_autostop_interval(self, interval: int) -> None:
         self.autostop_interval = interval
@@ -740,13 +745,14 @@ def _request(
     name: str,
     resources: Resources | None = None,
     source: SandboxSource | None = None,
+    env_vars: dict[str, str] | None = None,
 ) -> SandboxCreateRequest:
     return SandboxCreateRequest(
         source=source or ImageSource(image="python:3.12"),
         resources=resources or Resources(vcpu=2, memory=4, disk=10),
         name=name,
         labels={},
-        env_vars={},
+        env_vars=env_vars or {},
         auto_stop_interval=600,
         create_timeout=360,
     )
@@ -1399,10 +1405,13 @@ async def test_daytona_provider_creates_fresh_sandbox() -> None:
     inner = InnerSandbox()
     daytona = DaytonaClient(inner)
 
-    sandbox = await _provider(daytona).create_sandbox(_request(inner.name))
+    sandbox = await _provider(daytona).create_sandbox(
+        _request(inner.name, env_vars={"IMAGE_ENV": "preserved-at-create"})
+    )
 
     assert sandbox.id == inner.id
     assert daytona.created is True
+    assert inner.env_updates == []
 
 
 def test_daytona_sandbox_exposes_inventory_metadata() -> None:
@@ -1465,6 +1474,7 @@ class CapturingCreateDaytonaClient(DaytonaClient):
 
 async def test_daytona_provider_uses_target_only_for_targeted_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
     clients: dict[str, CapturingCreateDaytonaClient] = {}
+    targeted_env = {"MODEL_PROXY_SSH_KEY": "surrogate-line-one\nsurrogate-line-two\n"}
 
     def create_client(*, config: Any) -> CapturingCreateDaytonaClient:
         client = CapturingCreateDaytonaClient(InnerSandbox())
@@ -1476,20 +1486,34 @@ async def test_daytona_provider_uses_target_only_for_targeted_snapshot(monkeypat
         DaytonaProviderConfig(DAYTONA_API_KEY="key", DAYTONA_API_URL="url", DAYTONA_TARGET="us")
     )
 
-    await provider.create_sandbox(_request("normal", source=SnapshotSource(snapshot="normal-snapshot")))
+    await provider.create_sandbox(
+        _request(
+            "normal",
+            source=SnapshotSource(snapshot="normal-snapshot"),
+            env_vars={"SNAPSHOT_ENV": "preserved-at-create"},
+        )
+    )
     assert list(clients) == ["us"]
     assert clients["us"].create_params is not None
     assert clients["us"].create_params.snapshot == "normal-snapshot"
+    assert clients["us"].sandbox.env_updates == []
 
     targeted_request = _request(
         "targeted",
         source=TargetedSnapshotSource(snapshot="masscan-snapshot", target="us-west-3"),
+        env_vars=targeted_env,
     )
     await provider.create_sandbox(targeted_request)
-    await provider.create_sandbox(targeted_request)
+    await provider.create_sandbox(
+        _request(
+            "targeted-empty-env",
+            source=TargetedSnapshotSource(snapshot="masscan-snapshot", target="us-west-3"),
+        )
+    )
     assert list(clients) == ["us", "us-west-3"]
     assert clients["us-west-3"].create_params is not None
     assert clients["us-west-3"].create_params.snapshot == "masscan-snapshot"
+    assert clients["us-west-3"].sandbox.env_updates == [targeted_env]
 
     await provider.close()
     assert all(client.closed for client in clients.values())
@@ -1498,9 +1522,22 @@ async def test_daytona_provider_uses_target_only_for_targeted_snapshot(monkeypat
 async def test_targeted_snapshot_recovers_name_conflict_with_target_client(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    targeted_env = {"MODEL_PROXY_SSH_KEY": "surrogate-line-one\nsurrogate-line-two\n"}
     default_inner = InnerSandbox()
     default_inner.name = "default-sandbox"
-    targeted_inner = InnerSandbox()
+
+    class FlakyEnvSandbox(InnerSandbox):
+        def __init__(self) -> None:
+            super().__init__()
+            self.update_attempts = 0
+
+        async def update_env(self, env: dict[str, str], *, unset: list[str] | None = None) -> None:
+            self.update_attempts += 1
+            if self.update_attempts == 1:
+                raise DaytonaConnectionError("targeted sandbox environment update failed")
+            await super().update_env(env, unset=unset)
+
+    targeted_inner = FlakyEnvSandbox()
     targeted_inner.name = "targeted-sandbox"
 
     class ConflictClient(DaytonaClient):
@@ -1526,15 +1563,24 @@ async def test_targeted_snapshot_recovers_name_conflict_with_target_client(
         DaytonaProviderConfig(DAYTONA_API_KEY="key", DAYTONA_API_URL="url", DAYTONA_TARGET="us")
     )
 
+    async def no_wait(_seconds: float) -> None:
+        pass
+
+    retryer = cast(Any, DaytonaSandboxProvider.create_sandbox).retry
+    monkeypatch.setattr(retryer, "sleep", no_wait)
+
     sandbox = await provider.create_sandbox(
         _request(
             targeted_inner.name,
             source=TargetedSnapshotSource(snapshot="masscan-snapshot", target="us-west-3"),
+            env_vars=targeted_env,
         )
     )
 
     assert sandbox.name == targeted_inner.name
-    assert targeted_client.lookups == [targeted_inner.name]
+    assert targeted_client.lookups == [targeted_inner.name, targeted_inner.name]
+    assert targeted_inner.update_attempts == 2
+    assert targeted_inner.env_updates == [targeted_env]
 
 
 async def test_daytona_provider_maps_gpu_resources() -> None:

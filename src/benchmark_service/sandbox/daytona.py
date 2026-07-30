@@ -20,6 +20,7 @@ from daytona import (
     DaytonaNotFoundError,
     ListSandboxesQuery,
     SandboxState,
+    VolumeMount,
 )
 from daytona import (
     GpuType,
@@ -36,11 +37,13 @@ from daytona.common.errors import (
     create_daytona_error,
 )
 from daytona.common.pty import PtyResult
+from daytona.common.volume import Volume as DaytonaVolume
 from daytona.handle.async_pty_handle import AsyncPtyHandle
 from daytona_api_client_async import ApiClient as DaytonaApiClient
 from daytona_api_client_async import Configuration as DaytonaApiConfiguration
 from daytona_api_client_async import OrganizationsApi
-from daytona_api_client_async.exceptions import OpenApiException
+from daytona_api_client_async.exceptions import ConflictException, NotFoundException, OpenApiException
+from daytona_api_client_async.models.volume_state import VolumeState
 from pydantic import BaseModel
 from tenacity import (
     RetryCallState,
@@ -66,6 +69,7 @@ from benchmark_service.sandbox.types import (
     SandboxNotFoundError,
     SandboxProvider,
     SandboxQuery,
+    SandboxVolume,
     SnapshotSource,
     TargetedSnapshotSource,
     validate_command_env,
@@ -90,6 +94,16 @@ _KNOWN_THROTTLERS = ("sandbox-create", "sandbox-lifecycle", "authenticated", "an
 _DELETE_CONFLICT_MESSAGES = ("state change in progress", "modified by another operation")
 _REMOVED_SANDBOX_CLIENT_STATUSES = (404, 502)
 _RETRYABLE_PROVIDER_STATUSES = (408, 429, 500, 502, 503, 504)
+# A freshly provisioned volume reports PENDING_CREATE and becomes mountable a
+# couple of seconds later; mounting before then fails the sandbox create.
+_VOLUME_READY_TIMEOUT_SECONDS = 60
+_VOLUME_READY_POLL_SECONDS = 1
+_UNUSABLE_VOLUME_STATES = (
+    VolumeState.ERROR,
+    VolumeState.PENDING_DELETE,
+    VolumeState.DELETING,
+    VolumeState.DELETED,
+)
 _FAILED_EXECUTE_COMMAND_PREFIX = "failed to execute command:"
 # Daytona sometimes flattens a transport failure into a bare DaytonaError message with no chained
 # cause; these substrings recover those cases by text when no typed cause survives to match.
@@ -105,9 +119,7 @@ _TRANSPORT_ERROR_MESSAGES = (
 )
 _RETRYABLE_DAYTONA_CAUSES = (ClientConnectionError, ConnectionError, TimeoutError)
 _PROVIDER_RETRY_DELAYS_SECONDS = (5, 25, 90, 300, 420)
-_FIXED_PROVIDER_WAIT = wait_chain(
-    *(wait_random(delay * 0.9, delay) for delay in _PROVIDER_RETRY_DELAYS_SECONDS)
-)
+_FIXED_PROVIDER_WAIT = wait_chain(*(wait_random(delay * 0.9, delay) for delay in _PROVIDER_RETRY_DELAYS_SECONDS))
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
 
 
@@ -270,7 +282,9 @@ def _is_transient_daytona_error(exc: DaytonaError | ClientResponseError) -> bool
 
 
 def _is_name_conflict_error(exc: DaytonaError) -> bool:
-    return isinstance(exc, DaytonaConflictError) or exc.status_code == 409 or _message_contains(exc, ("already exists",))
+    return (
+        isinstance(exc, DaytonaConflictError) or exc.status_code == 409 or _message_contains(exc, ("already exists",))
+    )
 
 
 def _parse_retry_after_seconds(value: object) -> float | None:
@@ -616,10 +630,80 @@ class DaytonaSandboxProvider(SandboxProvider):
             return SandboxConnectionError(f"Daytona sandbox provider connection error: {exc}")
         return SandboxError(f"Daytona sandbox provider error: {exc}")
 
+    async def _resolve_volume(self, mount: SandboxVolume, daytona: AsyncDaytona) -> DaytonaVolume:
+        try:
+            volume = await daytona.volume.get(mount.name, create=mount.create_if_missing)
+        except ConflictException:
+            # Two sandbox creates racing on the same create_if_missing volume: the
+            # loser re-reads what the winner provisioned instead of failing.
+            volume = await self._get_volume(mount.name, daytona)
+        except NotFoundException as exc:
+            raise SandboxError(
+                f"Daytona volume {mount.name!r} does not exist; set create_if_missing to provision it"
+            ) from exc
+        except OpenApiException as exc:
+            raise SandboxError(f"Daytona volume lookup failed for {mount.name!r}: {exc}") from exc
+        except DaytonaError as exc:
+            raise self._sandbox_error(exc) from exc
+        return await self._wait_for_volume_ready(mount.name, volume, daytona)
+
+    async def _get_volume(self, name: str, daytona: AsyncDaytona) -> DaytonaVolume:
+        try:
+            return await daytona.volume.get(name)
+        except OpenApiException as exc:
+            raise SandboxError(f"Daytona volume lookup failed for {name!r}: {exc}") from exc
+        except DaytonaError as exc:
+            raise self._sandbox_error(exc) from exc
+
+    async def _wait_for_volume_ready(
+        self,
+        name: str,
+        volume: DaytonaVolume,
+        daytona: AsyncDaytona,
+    ) -> DaytonaVolume:
+        try:
+            async with asyncio.timeout(_VOLUME_READY_TIMEOUT_SECONDS):
+                while volume.state != VolumeState.READY:
+                    if volume.state in _UNUSABLE_VOLUME_STATES:
+                        raise SandboxError(
+                            f"Daytona volume {name!r} is not mountable: state={volume.state}, "
+                            f"error_reason={volume.error_reason}"
+                        )
+                    await asyncio.sleep(_VOLUME_READY_POLL_SECONDS)
+                    volume = await self._get_volume(name, daytona)
+        except TimeoutError as exc:
+            raise SandboxError(
+                f"Daytona volume {name!r} was not ready within {_VOLUME_READY_TIMEOUT_SECONDS}s: state={volume.state}"
+            ) from exc
+        return volume
+
+    async def _volume_mounts(
+        self,
+        request: SandboxCreateRequest,
+        daytona: AsyncDaytona,
+    ) -> list[VolumeMount] | None:
+        if not request.resources.volumes:
+            return None
+        mounts: list[VolumeMount] = []
+        for mount in request.resources.volumes:
+            if mount.read_only:
+                # Daytona mounts every volume read-write; granting write access to a
+                # volume a benchmark asked to protect would be worse than failing.
+                raise SandboxError(
+                    f"Daytona mounts volumes read-write; volume {mount.name!r} cannot be mounted read_only"
+                )
+            volume = await self._resolve_volume(mount, daytona)
+            mounts.append(
+                VolumeMount(
+                    volume_id=volume.id,
+                    mount_path=mount.mount_path,
+                    subpath=mount.resolve_sub_path(request.labels, request.name),
+                )
+            )
+        return mounts
+
     @_PROVIDER_RETRY
     async def create_sandbox(self, request: SandboxCreateRequest) -> DaytonaSandbox:
-        if request.resources.volumes:
-            raise SandboxError("Durable volume mounts are not currently supported by this Daytona adapter")
         daytona = self._daytona
         resources = DaytonaResources(
             cpu=request.resources.vcpu,
@@ -643,7 +727,9 @@ class DaytonaSandboxProvider(SandboxProvider):
                 )
             case SnapshotSource(snapshot=snapshot) | TargetedSnapshotSource(snapshot=snapshot):
                 if request.resources.gpu:
-                    raise SandboxError("Daytona snapshot sandboxes use the snapshot's resources; GPUs cannot be requested")
+                    raise SandboxError(
+                        "Daytona snapshot sandboxes use the snapshot's resources; GPUs cannot be requested"
+                    )
                 if isinstance(request.source, TargetedSnapshotSource):
                     daytona = self._client_for_target(request.source.target)
                 params = CreateSandboxFromSnapshotParams(
@@ -658,6 +744,10 @@ class DaytonaSandboxProvider(SandboxProvider):
                 )
             case ComposeSource():
                 raise SandboxError("ComposeSource must be unwrapped before provider.create_sandbox")
+
+        # Resolved after the match so a targeted snapshot looks its volumes up on
+        # the same target that will create the sandbox.
+        params.volumes = await self._volume_mounts(request, daytona)
 
         try:
             inner = await daytona.create(params, timeout=request.create_timeout)

@@ -16,7 +16,8 @@ from daytona.common.errors import (
     DaytonaRateLimitError,
 )
 from daytona.common.pty import PtyResult
-from daytona_api_client_async.exceptions import ApiException
+from daytona_api_client_async.exceptions import ApiException, ConflictException, NotFoundException
+from daytona_api_client_async.models.volume_state import VolumeState
 from multidict import CIMultiDict, CIMultiDictProxy
 from pydantic import TypeAdapter, ValidationError
 from yarl import URL
@@ -546,21 +547,55 @@ class UnexpectedRefreshSandbox(InnerSandbox):
         await super().refresh_data()
 
 
+class DaytonaVolumeService:
+    """Stand in for `AsyncDaytona.volume`, tracking lookups and provisioning state.
+
+    A volume whose `states` deque is non-empty reports those states in order before
+    settling on READY, which is how a freshly created volume behaves live.
+    """
+
+    def __init__(self, volumes: dict[str, list[Any]] | None = None) -> None:
+        self.volumes = volumes or {}
+        self.lookups: list[tuple[str, bool]] = []
+        self.created: list[str] = []
+
+    def _volume(self, name: str) -> SimpleNamespace:
+        pending = self.volumes[name]
+        state = pending.pop(0) if pending else VolumeState.READY
+        return SimpleNamespace(id=f"vol-{name}", name=name, state=state, error_reason=None)
+
+    async def get(self, name: str, create: bool = False) -> SimpleNamespace:
+        self.lookups.append((name, create))
+        if name not in self.volumes:
+            if not create:
+                raise NotFoundException(status=404, reason="Not Found")
+            self.created.append(name)
+            self.volumes[name] = []
+        return self._volume(name)
+
+
 class DaytonaClient:
-    def __init__(self, sandbox: InnerSandbox) -> None:
+    def __init__(self, sandbox: InnerSandbox, volumes: dict[str, list[Any]] | None = None) -> None:
         self.sandbox = sandbox
         self.created = False
+        self.created_params: Any | None = None
         self.closed = False
         self.deleted = False
         self.listed_query: Any | None = None
+        self.volume = DaytonaVolumeService(volumes)
 
     async def get(self, instance_id: str) -> InnerSandbox:
         assert instance_id == self.sandbox.name
         return self.sandbox
 
-    async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
+    async def create(self, params: Any = None, **_kwargs: object) -> InnerSandbox:
         self.created = True
+        self.created_params = params
         return self.sandbox
+
+    def created_volumes(self) -> Any:
+        assert self.created_params is not None
+        return self.created_params.volumes
 
     async def delete(self, sandbox: InnerSandbox) -> None:
         assert sandbox is self.sandbox
@@ -1000,20 +1035,150 @@ async def test_daytona_provider_rejects_compose_source_before_create() -> None:
         await provider.create_sandbox(request)
 
 
-async def test_daytona_provider_rejects_durable_volumes_before_create() -> None:
+def _volume_resources(*volumes: SandboxVolume) -> Resources:
+    return Resources(vcpu=2, memory=4, disk=10, volumes=list(volumes))
+
+
+async def test_daytona_provider_mounts_durable_volumes() -> None:
+    """Volume specs become Daytona VolumeMounts resolved to concrete volume ids.
+
+    Test cases:
+    - An existing volume is looked up without being created.
+    - A template resolves against the request labels; an absent template mounts the volume root.
+    """
+    daytona = DaytonaClient(InnerSandbox(), volumes={"runs": [], "dataset": []})
+    provider = _provider(daytona)
+    resources = _volume_resources(
+        SandboxVolume(name="runs", mount_path="/workspace", sub_path_template="runs/{benchmark_id}/{task_id}"),
+        SandboxVolume(name="dataset", mount_path="/data"),
+    )
+    request = _request("volume-task", resources=resources)
+    request.labels = {"Id": "run-1", "Task": "task-1"}
+
+    await provider.create_sandbox(request)
+
+    assert daytona.volume.lookups == [("runs", False), ("dataset", False)]
+    assert daytona.volume.created == []
+    mounts = daytona.created_volumes()
+    assert [(m.volume_id, m.mount_path, m.subpath) for m in mounts] == [
+        ("vol-runs", "/workspace", "runs/run-1/task-1"),
+        ("vol-dataset", "/data", None),
+    ]
+
+
+async def test_daytona_provider_omits_volumes_when_none_requested() -> None:
     daytona = DaytonaClient(InnerSandbox())
     provider = _provider(daytona)
-    resources = Resources(
-        vcpu=2,
-        memory=4,
-        disk=10,
-        volumes=[SandboxVolume(name="runs", mount_path="/workspace")],
-    )
 
-    with pytest.raises(SandboxError, match="not currently supported by this Daytona adapter"):
+    await provider.create_sandbox(_request("no-volume-task"))
+
+    assert daytona.created_volumes() is None
+    assert daytona.volume.lookups == []
+
+
+async def test_daytona_provider_rejects_read_only_volumes() -> None:
+    """Daytona has no read-only mount option, so the request must fail rather than mount writable."""
+    daytona = DaytonaClient(InnerSandbox(), volumes={"dataset": []})
+    provider = _provider(daytona)
+    resources = _volume_resources(SandboxVolume(name="dataset", mount_path="/data", read_only=True))
+
+    with pytest.raises(SandboxError, match="cannot be mounted read_only"):
         await provider.create_sandbox(_request("volume-task", resources=resources))
 
     assert daytona.created is False
+
+
+async def test_daytona_provider_rejects_missing_volume_without_create_if_missing() -> None:
+    daytona = DaytonaClient(InnerSandbox())
+    provider = _provider(daytona)
+    resources = _volume_resources(SandboxVolume(name="runs", mount_path="/workspace"))
+
+    with pytest.raises(SandboxError, match="does not exist; set create_if_missing") as exc_info:
+        await provider.create_sandbox(_request("volume-task", resources=resources))
+
+    # A missing volume is not a missing sandbox; callers must not treat it as one.
+    assert not isinstance(exc_info.value, SandboxNotFoundError)
+    assert daytona.created is False
+
+
+async def test_daytona_provider_creates_missing_volume_when_requested() -> None:
+    daytona = DaytonaClient(InnerSandbox())
+    provider = _provider(daytona)
+    resources = _volume_resources(SandboxVolume(name="runs", mount_path="/workspace", create_if_missing=True))
+
+    await provider.create_sandbox(_request("volume-task", resources=resources))
+
+    assert daytona.volume.lookups == [("runs", True)]
+    assert daytona.volume.created == ["runs"]
+    assert daytona.created_volumes()[0].volume_id == "vol-runs"
+
+
+async def test_daytona_provider_waits_for_volume_to_become_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A newly provisioned volume reports PENDING_CREATE; mounting it before READY fails the create."""
+    monkeypatch.setattr(daytona_module, "_VOLUME_READY_POLL_SECONDS", 0)
+    daytona = DaytonaClient(
+        InnerSandbox(),
+        volumes={"runs": [VolumeState.PENDING_CREATE, VolumeState.CREATING]},
+    )
+    provider = _provider(daytona)
+    resources = _volume_resources(SandboxVolume(name="runs", mount_path="/workspace"))
+
+    await provider.create_sandbox(_request("volume-task", resources=resources))
+
+    assert [create for _, create in daytona.volume.lookups] == [False, False, False]
+    assert daytona.created is True
+
+
+async def test_daytona_provider_rejects_unusable_volume(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(daytona_module, "_VOLUME_READY_POLL_SECONDS", 0)
+    daytona = DaytonaClient(InnerSandbox(), volumes={"runs": [VolumeState.ERROR]})
+    provider = _provider(daytona)
+    resources = _volume_resources(SandboxVolume(name="runs", mount_path="/workspace"))
+
+    with pytest.raises(SandboxError, match="is not mountable"):
+        await provider.create_sandbox(_request("volume-task", resources=resources))
+
+    assert daytona.created is False
+
+
+async def test_daytona_provider_rejects_volume_that_never_becomes_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(daytona_module, "_VOLUME_READY_POLL_SECONDS", 0)
+    monkeypatch.setattr(daytona_module, "_VOLUME_READY_TIMEOUT_SECONDS", 0.05)
+    daytona = DaytonaClient(InnerSandbox(), volumes={"runs": []})
+    provider = _provider(daytona)
+
+    # Every poll reports PENDING_CREATE, so the bounded wait must give up.
+    def stuck_volume(name: str) -> SimpleNamespace:
+        return SimpleNamespace(id=f"vol-{name}", name=name, state=VolumeState.PENDING_CREATE, error_reason=None)
+
+    monkeypatch.setattr(daytona.volume, "_volume", stuck_volume)
+    resources = _volume_resources(SandboxVolume(name="runs", mount_path="/workspace"))
+
+    with pytest.raises(SandboxError, match="was not ready within"):
+        await provider.create_sandbox(_request("volume-task", resources=resources))
+
+    assert daytona.created is False
+
+
+async def test_daytona_provider_recovers_from_volume_create_race() -> None:
+    """Two creates racing on one create_if_missing volume: the loser re-reads the winner's volume."""
+    daytona = DaytonaClient(InnerSandbox())
+    provider = _provider(daytona)
+    lookups: list[tuple[str, bool]] = []
+
+    async def get(name: str, create: bool = False) -> SimpleNamespace:
+        lookups.append((name, create))
+        if create:
+            raise ConflictException(status=409, reason="Conflict")
+        return SimpleNamespace(id=f"vol-{name}", name=name, state=VolumeState.READY, error_reason=None)
+
+    daytona.volume.get = get  # pyright: ignore[reportAttributeAccessIssue]
+    resources = _volume_resources(SandboxVolume(name="runs", mount_path="/workspace", create_if_missing=True))
+
+    await provider.create_sandbox(_request("volume-task", resources=resources))
+
+    assert lookups == [("runs", True), ("runs", False)]
+    assert daytona.created_volumes()[0].volume_id == "vol-runs"
 
 
 async def test_daytona_command_applies_timeout_inside_cwd() -> None:

@@ -10,6 +10,7 @@ import shlex
 import time
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
+from typing import Literal
 from uuid import uuid4
 
 import pytest
@@ -20,15 +21,21 @@ from benchmark_service import (
     Sandbox,
     SandboxCommandError,
     SandboxCreateRequest,
+    SandboxError,
     SandboxNotFoundError,
     SandboxProvider,
     SandboxQuery,
+    SandboxVolume,
 )
 
 _POLL_INTERVAL_SECONDS = 2
 _POLL_TIMEOUT_SECONDS = 120
 _TEST_IMAGE = "python:3.12-slim"
 _TEST_RESOURCES = Resources(vcpu=1, memory=2, disk=5)
+# One long-lived volume per provider; runs stay isolated by subpath rather than by
+# provisioning a volume per test, which would leak provider resources on failure.
+_TEST_VOLUME_NAME = "cbs-provider-integration"
+_VOLUME_MOUNT_PATH = "/mnt/durable"
 
 
 def _python_command(script: str) -> str:
@@ -134,8 +141,120 @@ async def _read_stream_until_ready(sandbox: Sandbox, ready: asyncio.Event) -> No
             ready.set()
 
 
+def _volume_request(
+    name: str,
+    labels: dict[str, str],
+    *,
+    read_only: bool = False,
+) -> SandboxCreateRequest:
+    """Build a create request mounting the shared test volume under a per-run subpath."""
+    return SandboxCreateRequest(
+        source=ImageSource(image=_TEST_IMAGE),
+        resources=Resources(
+            vcpu=1,
+            memory=2,
+            disk=5,
+            volumes=[
+                SandboxVolume(
+                    name=_TEST_VOLUME_NAME,
+                    mount_path=_VOLUME_MOUNT_PATH,
+                    create_if_missing=True,
+                    read_only=read_only,
+                    sub_path_template="integration/{benchmark_id}/{task_id}",
+                )
+            ],
+        ),
+        name=name,
+        labels=labels,
+        env_vars={},
+        auto_stop_interval=10,
+        create_timeout=360,
+    )
+
+
 class TestSandboxProviderIntegration:
     """Run the same live contract checks against every configured provider."""
+
+    async def test_durable_volume_persistence_and_subpath_isolation(
+        self,
+        sandbox_provider: SandboxProvider,
+    ) -> None:
+        """Verify a mounted volume outlives its sandbox and that subpaths isolate runs.
+
+        Test cases:
+        - `create_if_missing` provisions the volume on first use and reuses it after.
+        - Data written under a run's subpath is readable from a later sandbox with the same labels.
+        - A sandbox whose labels resolve to a different subpath cannot see that data.
+        """
+        run_id = f"run-{uuid4().hex[:10]}"
+        marker = f"{_VOLUME_MOUNT_PATH}/marker.txt"
+        writer_labels = {"Id": run_id, "Task": "task-a", "ProviderVolumeTest": run_id}
+        isolated_labels = {"Id": run_id, "Task": "task-b", "ProviderVolumeTest": run_id}
+
+        writer = await sandbox_provider.create_sandbox(_volume_request(f"cbs-vol-w-{run_id}", writer_labels))
+        try:
+            written = await writer.exec(f"printf durable-payload > {marker} && cat {marker}")
+            assert written.exit_code == 0, written.stdout
+            assert "durable-payload" in written.stdout
+        finally:
+            await sandbox_provider.delete_sandbox(writer.id)
+        await _wait_until_not_found(sandbox_provider, writer.id)
+
+        reader = await sandbox_provider.create_sandbox(_volume_request(f"cbs-vol-r-{run_id}", writer_labels))
+        try:
+            read_back = await reader.exec(f"cat {marker}")
+            assert read_back.exit_code == 0, read_back.stdout
+            assert "durable-payload" in read_back.stdout
+        finally:
+            await sandbox_provider.delete_sandbox(reader.id)
+
+        isolated = await sandbox_provider.create_sandbox(_volume_request(f"cbs-vol-i-{run_id}", isolated_labels))
+        try:
+            missing = await isolated.exec(f"cat {marker}")
+            assert missing.exit_code != 0
+            assert "durable-payload" not in missing.stdout
+        finally:
+            await sandbox_provider.delete_sandbox(isolated.id)
+
+    async def test_read_only_volume_mounts(
+        self,
+        sandbox_provider: SandboxProvider,
+        provider_type: Literal["daytona", "modal"],
+    ) -> None:
+        """Verify a read-only request is honored, or refused outright where it cannot be.
+
+        Daytona mounts every volume read-write, so it must reject the request instead of
+        silently granting write access. Modal supports read-only mounts and must enforce them.
+
+        A read-only mount cannot create its own subpath, so the subpath is seeded by a
+        writable sandbox first -- which is how a prepared dataset volume is actually used.
+        """
+        run_id = f"run-{uuid4().hex[:10]}"
+        labels = {"Id": run_id, "Task": "task-ro", "ProviderVolumeTest": run_id}
+
+        if provider_type == "daytona":
+            with pytest.raises(SandboxError, match="read_only"):
+                await sandbox_provider.create_sandbox(_volume_request(f"cbs-vol-ro-{run_id}", labels, read_only=True))
+            return
+
+        seeder = await sandbox_provider.create_sandbox(_volume_request(f"cbs-vol-seed-{run_id}", labels))
+        try:
+            seeded = await seeder.exec(f"printf read-only-payload > {_VOLUME_MOUNT_PATH}/marker.txt")
+            assert seeded.exit_code == 0, seeded.stdout
+        finally:
+            await sandbox_provider.delete_sandbox(seeder.id)
+        await _wait_until_not_found(sandbox_provider, seeder.id)
+
+        sandbox = await sandbox_provider.create_sandbox(_volume_request(f"cbs-vol-ro-{run_id}", labels, read_only=True))
+        try:
+            readable = await sandbox.exec(f"cat {_VOLUME_MOUNT_PATH}/marker.txt")
+            assert readable.exit_code == 0, readable.stdout
+            assert "read-only-payload" in readable.stdout
+
+            blocked = await sandbox.exec(f"touch {_VOLUME_MOUNT_PATH}/should-fail")
+            assert blocked.exit_code != 0, blocked.stdout
+        finally:
+            await sandbox_provider.delete_sandbox(sandbox.id)
 
     @pytest.mark.parametrize("provider_type", ["daytona"], indirect=True)
     async def test_daytona_inventory_metadata_and_filtering(

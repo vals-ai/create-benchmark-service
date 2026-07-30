@@ -363,24 +363,6 @@ class ModalSandboxProvider(SandboxProvider):
     @_PROVIDER_RETRY
     async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
         modal_name = _modal_sandbox_name(request.name)
-        mount_paths = [mount.mount_path for mount in request.resources.volumes]
-        if len(mount_paths) != len(set(mount_paths)):
-            raise SandboxError("Modal volume mount paths must be unique")
-        sub_path_values = {"sandbox_name": modal_name}
-        if benchmark_id := request.labels.get("Id") or request.labels.get("run-id"):
-            sub_path_values["benchmark_id"] = benchmark_id
-        if task_id := request.labels.get("Task"):
-            sub_path_values["task_id"] = task_id
-        try:
-            volume_mounts = [
-                (
-                    mount,
-                    mount.sub_path_template.format(**sub_path_values) if mount.sub_path_template else None,
-                )
-                for mount in request.resources.volumes
-            ]
-        except (KeyError, ValueError) as exc:
-            raise SandboxError("Invalid Modal volume subpath template") from exc
 
         client, app = await self._connect()
         existing = await self._find_reusable_sandbox(modal_name, client)
@@ -395,7 +377,18 @@ class ModalSandboxProvider(SandboxProvider):
             gpu = f"{request.resources.gpu_type}:{request.resources.gpu}"
         volumes: dict[str, Volume] = {}
         try:
-            for mount, sub_path in volume_mounts:
+            for mount in request.resources.volumes:
+                if mount.mount_path in volumes:
+                    raise SandboxError("Modal volume mount paths must be unique")
+                sub_path = (
+                    mount.sub_path_template.format(
+                        benchmark_id=request.labels.get("Id") or request.labels.get("run-id"),
+                        task_id=request.labels.get("Task"),
+                        sandbox_name=modal_name,
+                    )
+                    if mount.sub_path_template
+                    else None
+                )
                 volume = Volume.from_name(
                     mount.name,
                     create_if_missing=mount.create_if_missing,

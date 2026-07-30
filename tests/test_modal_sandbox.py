@@ -465,6 +465,7 @@ async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> N
     # sandboxes which always support it.
     assert captured["experimental_options"] == {"enable_docker": True}
     assert captured["gpu"] is None
+    assert captured["volumes"] == {}
 
 
 async def test_create_sandbox_maps_gpu_request(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -525,7 +526,7 @@ async def test_create_sandbox_maps_durable_volumes(monkeypatch: pytest.MonkeyPat
                 name="runs",
                 mount_path="/workspace",
                 create_if_missing=True,
-                sub_path_template="runs/{benchmark_id}/{task_id}",
+                sub_path_template="runs/{run_id}/{task_id}",
             ),
             SandboxVolume(name="dataset", mount_path="/data", read_only=True),
         ],
@@ -545,21 +546,6 @@ async def test_create_sandbox_maps_durable_volumes(monkeypatch: pytest.MonkeyPat
     assert captured["volumes"]["/data"].options == {"read_only": True, "sub_path": None}
 
 
-async def test_create_sandbox_passes_no_volumes_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    inner = FakeInnerSandbox()
-    captured: dict[str, Any] = {}
-
-    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
-        captured.update(kwargs)
-        return inner
-
-    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
-
-    await provider.create_sandbox(_request())
-
-    assert captured["volumes"] == {}
-
-
 async def test_create_sandbox_rejects_template_without_labels(monkeypatch: pytest.MonkeyPatch) -> None:
     """An unresolvable template must fail before create, not mount a run-shared subdirectory."""
     captured: dict[str, Any] = {}
@@ -577,14 +563,14 @@ async def test_create_sandbox_rejects_template_without_labels(monkeypatch: pytes
             SandboxVolume(
                 name="runs",
                 mount_path="/workspace",
-                sub_path_template="runs/{benchmark_id}",
+                sub_path_template="runs/{run_id}",
             )
         ],
     )
     request = _request(resources=resources)
     request.labels = {}
 
-    with pytest.raises(SandboxError, match="benchmark_id"):
+    with pytest.raises(SandboxError, match="run_id"):
         await provider.create_sandbox(request)
 
 

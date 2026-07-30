@@ -4,6 +4,7 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, Mapping, Sequence
 from datetime import datetime
+from pathlib import PurePosixPath
 from string import Formatter
 from typing import Annotated, Literal, Self
 
@@ -57,9 +58,9 @@ def validate_command_env(env_vars: Mapping[str, str] | None) -> dict[str, str]:
 
 
 # Valkyrie labels a run "Id"; this service's own grading path labels it "run-id".
-BENCHMARK_ID_LABELS = ("Id", "run-id")
+RUN_ID_LABELS = ("Id", "run-id")
 TASK_ID_LABELS = ("Task",)
-SUB_PATH_PLACEHOLDERS = ("benchmark_id", "task_id", "sandbox_name")
+SUB_PATH_PLACEHOLDERS = ("run_id", "task_id")
 
 
 def _first_label(labels: Mapping[str, str], keys: Sequence[str]) -> str | None:
@@ -76,13 +77,13 @@ def _template_field_names(template: str) -> list[str]:
 
 class SandboxVolume(BaseModel):
     name: str = Field(min_length=1, description="Provider volume name")
-    mount_path: str = Field(min_length=1, description="Absolute path where the volume is mounted")
+    mount_path: str = Field(description="Absolute path where the volume is mounted")
     read_only: bool = False
     create_if_missing: bool = False
     sub_path_template: str | None = Field(
         default=None,
         min_length=1,
-        description=("Optional provider-volume subdirectory. Supports {benchmark_id}, {task_id}, and {sandbox_name}."),
+        description="Optional provider-volume subdirectory. Supports {run_id} and {task_id}.",
     )
 
     @model_validator(mode="after")
@@ -103,12 +104,11 @@ class SandboxVolume(BaseModel):
             )
         return self
 
-    def resolve_sub_path(self, labels: Mapping[str, str], sandbox_name: str) -> str | None:
-        """Return this volume's per-sandbox subdirectory, or None when unscoped.
+    def resolve_sub_path(self, labels: Mapping[str, str]) -> str | None:
+        """Return this volume's subdirectory for one run, or None when unscoped.
 
         Arguments
         - labels: Sandbox labels carrying the run and task identity.
-        - sandbox_name: Provider-facing sandbox name.
 
         Returns
         The interpolated subdirectory, or None when no template is set.
@@ -121,14 +121,14 @@ class SandboxVolume(BaseModel):
         if self.sub_path_template is None:
             return None
         values = {
-            "benchmark_id": _first_label(labels, BENCHMARK_ID_LABELS),
+            "run_id": _first_label(labels, RUN_ID_LABELS),
             "task_id": _first_label(labels, TASK_ID_LABELS),
-            "sandbox_name": sandbox_name or None,
         }
         missing = sorted({name for name in _template_field_names(self.sub_path_template) if not values[name]})
         if missing:
             raise SandboxError(
-                f"Volume {self.name!r} sub_path_template requires sandbox identity for: {', '.join(missing)}"
+                f"Volume {self.name!r}: this run did not supply {', '.join(missing)}, so sub_path_template "
+                f"{self.sub_path_template!r} cannot be resolved. Remove that placeholder or use a literal subpath."
             )
         return self.sub_path_template.format(**values)
 
@@ -149,8 +149,9 @@ class Resources(BaseModel):
         if self.gpu_type is not None and self.gpu < 1:
             raise ValueError("gpu_type requires gpu >= 1")
         # Modal keys its mounts by path, so a repeated mount_path would silently drop
-        # a volume the benchmark asked for. Rejected here so both adapters agree.
-        mount_paths = [volume.mount_path for volume in self.volumes]
+        # a volume the benchmark asked for. Normalized first so "/data" and "/data/"
+        # cannot slip past as distinct paths. Nesting is a legitimate layout and allowed.
+        mount_paths = [str(PurePosixPath(volume.mount_path)) for volume in self.volumes]
         duplicates = sorted({path for path in mount_paths if mount_paths.count(path) > 1})
         if duplicates:
             raise ValueError(f"Duplicate volume mount_path: {', '.join(duplicates)}")

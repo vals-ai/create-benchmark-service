@@ -385,7 +385,7 @@ class ModalSandboxProvider(SandboxProvider):
                 )
                 volumes[mount.mount_path] = volume.with_mount_options(
                     read_only=mount.read_only,
-                    sub_path=mount.resolve_sub_path(request.labels, modal_name),
+                    sub_path=mount.resolve_sub_path(request.labels),
                 )
         except ModalError as exc:
             raise _sandbox_error(exc) from exc

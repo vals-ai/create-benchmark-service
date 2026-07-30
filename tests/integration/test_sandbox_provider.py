@@ -10,7 +10,6 @@ import shlex
 import time
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
-from typing import Literal
 from uuid import uuid4
 
 import pytest
@@ -21,7 +20,6 @@ from benchmark_service import (
     Sandbox,
     SandboxCommandError,
     SandboxCreateRequest,
-    SandboxError,
     SandboxNotFoundError,
     SandboxProvider,
     SandboxQuery,
@@ -160,7 +158,7 @@ def _volume_request(
                     mount_path=_VOLUME_MOUNT_PATH,
                     create_if_missing=True,
                     read_only=read_only,
-                    sub_path_template="integration/{benchmark_id}/{task_id}",
+                    sub_path_template="integration/{run_id}/{task_id}",
                 )
             ],
         ),
@@ -216,26 +214,18 @@ class TestSandboxProviderIntegration:
         finally:
             await sandbox_provider.delete_sandbox(isolated.id)
 
-    async def test_read_only_volume_mounts(
-        self,
-        sandbox_provider: SandboxProvider,
-        provider_type: Literal["daytona", "modal"],
-    ) -> None:
-        """Verify a read-only request is honored, or refused outright where it cannot be.
+    @pytest.mark.parametrize("provider_type", ["modal"], indirect=True)
+    async def test_read_only_volume_mounts(self, sandbox_provider: SandboxProvider) -> None:
+        """Verify Modal enforces a read-only mount against writes.
 
-        Daytona mounts every volume read-write, so it must reject the request instead of
-        silently granting write access. Modal supports read-only mounts and must enforce them.
+        Daytona's refusal to mount read-only needs no live sandbox, so it is covered by a
+        unit test instead of a provider fixture.
 
         A read-only mount cannot create its own subpath, so the subpath is seeded by a
         writable sandbox first -- which is how a prepared dataset volume is actually used.
         """
         run_id = f"run-{uuid4().hex[:10]}"
         labels = {"Id": run_id, "Task": "task-ro", "ProviderVolumeTest": run_id}
-
-        if provider_type == "daytona":
-            with pytest.raises(SandboxError, match="read_only"):
-                await sandbox_provider.create_sandbox(_volume_request(f"cbs-vol-ro-{run_id}", labels, read_only=True))
-            return
 
         seeder = await sandbox_provider.create_sandbox(_volume_request(f"cbs-vol-seed-{run_id}", labels))
         try:

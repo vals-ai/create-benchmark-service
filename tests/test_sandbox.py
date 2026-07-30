@@ -550,8 +550,9 @@ class UnexpectedRefreshSandbox(InnerSandbox):
 class DaytonaVolumeService:
     """Stand in for `AsyncDaytona.volume`, tracking lookups and provisioning state.
 
-    A volume whose `states` deque is non-empty reports those states in order before
-    settling on READY, which is how a freshly created volume behaves live.
+    Each volume maps to the states it reports on successive lookups. The last state
+    repeats forever, so `[PENDING_CREATE, READY]` settles and `[PENDING_CREATE]` never
+    does -- which is how a volume that hangs mid-provisioning behaves live.
     """
 
     def __init__(self, volumes: dict[str, list[Any]] | None = None) -> None:
@@ -560,8 +561,8 @@ class DaytonaVolumeService:
         self.created: list[str] = []
 
     def _volume(self, name: str) -> SimpleNamespace:
-        pending = self.volumes[name]
-        state = pending.pop(0) if pending else VolumeState.READY
+        states = self.volumes[name] or [VolumeState.READY]
+        state = states.pop(0) if len(states) > 1 else states[0]
         return SimpleNamespace(id=f"vol-{name}", name=name, state=state, error_reason=None)
 
     async def get(self, name: str, create: bool = False) -> SimpleNamespace:
@@ -854,38 +855,30 @@ def test_sandbox_volume_resolves_sub_path_from_labels() -> None:
 
     Test cases:
     - No template resolves to None regardless of labels.
-    - `{benchmark_id}` prefers the Valkyrie `Id` label and falls back to `run-id`.
-    - Only the placeholders a template names have to be resolvable.
+    - `{run_id}` prefers the Valkyrie `Id` label and falls back to `run-id`.
+    - A template with no placeholders is a literal subpath needing no labels.
     """
     unscoped = SandboxVolume(name="runs", mount_path="/workspace")
-    assert unscoped.resolve_sub_path({}, "sandbox-1") is None
+    assert unscoped.resolve_sub_path({}) is None
 
-    scoped = SandboxVolume(
-        name="runs",
-        mount_path="/workspace",
-        sub_path_template="runs/{benchmark_id}/{task_id}/{sandbox_name}",
-    )
-    assert scoped.resolve_sub_path({"Id": "run-1", "Task": "task-1"}, "sandbox-1") == "runs/run-1/task-1/sandbox-1"
-    assert scoped.resolve_sub_path({"run-id": "run-2", "Task": "task-1"}, "sandbox-1") == "runs/run-2/task-1/sandbox-1"
-    assert scoped.resolve_sub_path({"Id": "run-1", "run-id": "ignored", "Task": "t"}, "s") == "runs/run-1/t/s"
+    scoped = SandboxVolume(name="runs", mount_path="/workspace", sub_path_template="runs/{run_id}/{task_id}")
+    assert scoped.resolve_sub_path({"Id": "run-1", "Task": "task-1"}) == "runs/run-1/task-1"
+    assert scoped.resolve_sub_path({"run-id": "run-2", "Task": "task-1"}) == "runs/run-2/task-1"
+    assert scoped.resolve_sub_path({"Id": "run-1", "run-id": "ignored", "Task": "t"}) == "runs/run-1/t"
 
-    partial = SandboxVolume(name="runs", mount_path="/workspace", sub_path_template="runs/{sandbox_name}")
-    assert partial.resolve_sub_path({}, "sandbox-1") == "runs/sandbox-1"
+    literal = SandboxVolume(name="runs", mount_path="/workspace", sub_path_template="shared/reference")
+    assert literal.resolve_sub_path({}) == "shared/reference"
 
 
 def test_sandbox_volume_rejects_sub_path_with_unresolvable_identity() -> None:
     """A missing label must fail loudly; interpolating it would share one subdirectory across runs."""
-    volume = SandboxVolume(
-        name="runs",
-        mount_path="/workspace",
-        sub_path_template="runs/{benchmark_id}/{task_id}",
-    )
+    volume = SandboxVolume(name="runs", mount_path="/workspace", sub_path_template="runs/{run_id}/{task_id}")
 
-    with pytest.raises(SandboxError, match="benchmark_id, task_id"):
-        volume.resolve_sub_path({}, "sandbox-1")
+    with pytest.raises(SandboxError, match="did not supply run_id, task_id"):
+        volume.resolve_sub_path({})
 
-    with pytest.raises(SandboxError, match="task_id"):
-        volume.resolve_sub_path({"Id": "run-1", "Task": ""}, "sandbox-1")
+    with pytest.raises(SandboxError, match="did not supply task_id"):
+        volume.resolve_sub_path({"Id": "run-1", "Task": ""})
 
 
 def test_compose_sandbox_delegates_inventory_metadata() -> None:
@@ -1058,7 +1051,7 @@ async def test_daytona_provider_mounts_durable_volumes() -> None:
     daytona = DaytonaClient(InnerSandbox(), volumes={"runs": [], "dataset": []})
     provider = _provider(daytona)
     resources = _volume_resources(
-        SandboxVolume(name="runs", mount_path="/workspace", sub_path_template="runs/{benchmark_id}/{task_id}"),
+        SandboxVolume(name="runs", mount_path="/workspace", sub_path_template="runs/{run_id}/{task_id}"),
         SandboxVolume(name="dataset", mount_path="/data"),
     )
     request = _request("volume-task", resources=resources)
@@ -1086,15 +1079,24 @@ async def test_daytona_provider_omits_volumes_when_none_requested() -> None:
 
 
 async def test_daytona_provider_rejects_read_only_volumes() -> None:
-    """Daytona has no read-only mount option, so the request must fail rather than mount writable."""
+    """Daytona has no read-only mount option, so the request must fail rather than mount writable.
+
+    The rejection must also precede provisioning: a writable volume listed before the
+    read-only one must not be created on the way to failing.
+    """
     daytona = DaytonaClient(InnerSandbox(), volumes={"dataset": []})
     provider = _provider(daytona)
-    resources = _volume_resources(SandboxVolume(name="dataset", mount_path="/data", read_only=True))
+    resources = _volume_resources(
+        SandboxVolume(name="runs", mount_path="/workspace", create_if_missing=True),
+        SandboxVolume(name="dataset", mount_path="/data", read_only=True),
+    )
 
-    with pytest.raises(SandboxError, match="cannot be mounted read_only"):
+    with pytest.raises(SandboxError, match="cannot be mounted read_only: dataset"):
         await provider.create_sandbox(_request("volume-task", resources=resources))
 
     assert daytona.created is False
+    assert daytona.volume.created == []
+    assert daytona.volume.lookups == []
 
 
 async def test_daytona_provider_rejects_missing_volume_without_create_if_missing() -> None:
@@ -1127,7 +1129,7 @@ async def test_daytona_provider_waits_for_volume_to_become_ready(monkeypatch: py
     monkeypatch.setattr(daytona_module, "_VOLUME_READY_POLL_SECONDS", 0)
     daytona = DaytonaClient(
         InnerSandbox(),
-        volumes={"runs": [VolumeState.PENDING_CREATE, VolumeState.CREATING]},
+        volumes={"runs": [VolumeState.PENDING_CREATE, VolumeState.CREATING, VolumeState.READY]},
     )
     provider = _provider(daytona)
     resources = _volume_resources(SandboxVolume(name="runs", mount_path="/workspace"))
@@ -1138,8 +1140,7 @@ async def test_daytona_provider_waits_for_volume_to_become_ready(monkeypatch: py
     assert daytona.created is True
 
 
-async def test_daytona_provider_rejects_unusable_volume(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(daytona_module, "_VOLUME_READY_POLL_SECONDS", 0)
+async def test_daytona_provider_rejects_unusable_volume() -> None:
     daytona = DaytonaClient(InnerSandbox(), volumes={"runs": [VolumeState.ERROR]})
     provider = _provider(daytona)
     resources = _volume_resources(SandboxVolume(name="runs", mount_path="/workspace"))
@@ -1153,14 +1154,9 @@ async def test_daytona_provider_rejects_unusable_volume(monkeypatch: pytest.Monk
 async def test_daytona_provider_rejects_volume_that_never_becomes_ready(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(daytona_module, "_VOLUME_READY_POLL_SECONDS", 0)
     monkeypatch.setattr(daytona_module, "_VOLUME_READY_TIMEOUT_SECONDS", 0.05)
-    daytona = DaytonaClient(InnerSandbox(), volumes={"runs": []})
+    # A lone pending state repeats forever, so the bounded wait must give up.
+    daytona = DaytonaClient(InnerSandbox(), volumes={"runs": [VolumeState.PENDING_CREATE]})
     provider = _provider(daytona)
-
-    # Every poll reports PENDING_CREATE, so the bounded wait must give up.
-    def stuck_volume(name: str) -> SimpleNamespace:
-        return SimpleNamespace(id=f"vol-{name}", name=name, state=VolumeState.PENDING_CREATE, error_reason=None)
-
-    monkeypatch.setattr(daytona.volume, "_volume", stuck_volume)
     resources = _volume_resources(SandboxVolume(name="runs", mount_path="/workspace"))
 
     with pytest.raises(SandboxError, match="was not ready within"):

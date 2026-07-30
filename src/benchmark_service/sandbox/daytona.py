@@ -98,12 +98,7 @@ _RETRYABLE_PROVIDER_STATUSES = (408, 429, 500, 502, 503, 504)
 # couple of seconds later; mounting before then fails the sandbox create.
 _VOLUME_READY_TIMEOUT_SECONDS = 60
 _VOLUME_READY_POLL_SECONDS = 1
-_UNUSABLE_VOLUME_STATES = (
-    VolumeState.ERROR,
-    VolumeState.PENDING_DELETE,
-    VolumeState.DELETING,
-    VolumeState.DELETED,
-)
+_PENDING_VOLUME_STATES = (VolumeState.PENDING_CREATE, VolumeState.CREATING)
 _FAILED_EXECUTE_COMMAND_PREFIX = "failed to execute command:"
 # Daytona sometimes flattens a transport failure into a bare DaytonaError message with no chained
 # cause; these substrings recover those cases by text when no typed cause survives to match.
@@ -623,7 +618,7 @@ class DaytonaSandboxProvider(SandboxProvider):
             self._daytona_by_target[target] = _daytona_client(self._config, target)
         return self._daytona_by_target[target]
 
-    def _sandbox_error(self, exc: DaytonaError) -> SandboxError:
+    def _sandbox_error(self, exc: DaytonaError | ClientResponseError) -> SandboxError:
         if _is_not_found_error(exc):
             return SandboxNotFoundError(f"Sandbox not found: {exc}")
         if _is_transient_daytona_error(exc):
@@ -643,7 +638,7 @@ class DaytonaSandboxProvider(SandboxProvider):
             ) from exc
         except OpenApiException as exc:
             raise SandboxError(f"Daytona volume lookup failed for {mount.name!r}: {exc}") from exc
-        except DaytonaError as exc:
+        except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
         return await self._wait_for_volume_ready(mount.name, volume, daytona)
 
@@ -652,7 +647,7 @@ class DaytonaSandboxProvider(SandboxProvider):
             return await daytona.volume.get(name)
         except OpenApiException as exc:
             raise SandboxError(f"Daytona volume lookup failed for {name!r}: {exc}") from exc
-        except DaytonaError as exc:
+        except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
 
     async def _wait_for_volume_ready(
@@ -663,18 +658,17 @@ class DaytonaSandboxProvider(SandboxProvider):
     ) -> DaytonaVolume:
         try:
             async with asyncio.timeout(_VOLUME_READY_TIMEOUT_SECONDS):
-                while volume.state != VolumeState.READY:
-                    if volume.state in _UNUSABLE_VOLUME_STATES:
-                        raise SandboxError(
-                            f"Daytona volume {name!r} is not mountable: state={volume.state}, "
-                            f"error_reason={volume.error_reason}"
-                        )
+                while volume.state in _PENDING_VOLUME_STATES:
                     await asyncio.sleep(_VOLUME_READY_POLL_SECONDS)
                     volume = await self._get_volume(name, daytona)
         except TimeoutError as exc:
             raise SandboxError(
                 f"Daytona volume {name!r} was not ready within {_VOLUME_READY_TIMEOUT_SECONDS}s: state={volume.state}"
             ) from exc
+        if volume.state != VolumeState.READY:
+            raise SandboxError(
+                f"Daytona volume {name!r} is not mountable: state={volume.state}, error_reason={volume.error_reason}"
+            )
         return volume
 
     async def _volume_mounts(
@@ -684,20 +678,21 @@ class DaytonaSandboxProvider(SandboxProvider):
     ) -> list[VolumeMount] | None:
         if not request.resources.volumes:
             return None
+        # Checked before provisioning anything: rejecting the request after having
+        # already created an earlier volume would leave a side effect behind.
+        read_only = [mount.name for mount in request.resources.volumes if mount.read_only]
+        if read_only:
+            raise SandboxError(
+                f"Daytona mounts volumes read-write; these cannot be mounted read_only: {', '.join(read_only)}"
+            )
         mounts: list[VolumeMount] = []
         for mount in request.resources.volumes:
-            if mount.read_only:
-                # Daytona mounts every volume read-write; granting write access to a
-                # volume a benchmark asked to protect would be worse than failing.
-                raise SandboxError(
-                    f"Daytona mounts volumes read-write; volume {mount.name!r} cannot be mounted read_only"
-                )
             volume = await self._resolve_volume(mount, daytona)
             mounts.append(
                 VolumeMount(
                     volume_id=volume.id,
                     mount_path=mount.mount_path,
-                    subpath=mount.resolve_sub_path(request.labels, request.name),
+                    subpath=mount.resolve_sub_path(request.labels),
                 )
             )
         return mounts

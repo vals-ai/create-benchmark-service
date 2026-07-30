@@ -8,7 +8,7 @@ import shlex
 from collections.abc import AsyncGenerator, Awaitable, Mapping
 from typing import Any, Literal, cast
 
-from modal import App, Client, Image
+from modal import App, Client, Image, Volume
 from modal import Sandbox as ModalSdkSandbox
 from modal.exception import ConnectionError as ModalConnectionError
 from modal.exception import Error as ModalError
@@ -29,9 +29,11 @@ from benchmark_service.sandbox.types import (
     SandboxError,
     SandboxNotFoundError,
     SandboxProvider,
+    SandboxProviderCapabilities,
     SandboxQuery,
     SandboxSource,
     SnapshotSource,
+    render_volume_sub_path,
     validate_command_env,
 )
 
@@ -312,6 +314,13 @@ for domain in {domains_to_resolve!r}:
 
 
 class ModalSandboxProvider(SandboxProvider):
+    capabilities = SandboxProviderCapabilities(
+        durable_volumes=True,
+        volume_creation=True,
+        volume_subpaths=True,
+        read_only_volume_mounts=True,
+    )
+
     def __init__(self, config: ModalProviderConfig) -> None:
         self._config = config
         self._client: Client | None = None
@@ -362,8 +371,24 @@ class ModalSandboxProvider(SandboxProvider):
 
     @_PROVIDER_RETRY
     async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
-        client, app = await self._connect()
+        self.validate_create_request(request)
         modal_name = _modal_sandbox_name(request.name)
+        volume_names = [mount.name for mount in request.resources.volumes]
+        if len(volume_names) != len(set(volume_names)):
+            raise SandboxError("Modal cannot mount the same volume more than once in a sandbox")
+        volume_mounts = [
+            (
+                mount,
+                render_volume_sub_path(
+                    mount.sub_path_template,
+                    request.labels,
+                    modal_name,
+                ),
+            )
+            for mount in request.resources.volumes
+        ]
+
+        client, app = await self._connect()
         existing = await self._find_reusable_sandbox(modal_name, client)
         if existing is not None:
             return ModalSandbox(existing, name=request.name)
@@ -374,6 +399,20 @@ class ModalSandboxProvider(SandboxProvider):
             if not request.resources.gpu_type:
                 raise SandboxError("Modal sandbox provider requires gpu_type when gpu is requested")
             gpu = f"{request.resources.gpu_type}:{request.resources.gpu}"
+        volumes: dict[str, Volume] = {}
+        try:
+            for mount, sub_path in volume_mounts:
+                volume = Volume.from_name(
+                    mount.name,
+                    create_if_missing=mount.create_if_missing,
+                    client=client,
+                )
+                volumes[mount.mount_path] = volume.with_mount_options(
+                    read_only=mount.read_only,
+                    sub_path=sub_path,
+                )
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
         create_kwargs: dict[str, Any] = {
             "app": app,
             "name": modal_name,
@@ -392,6 +431,8 @@ class ModalSandboxProvider(SandboxProvider):
             # Nested Docker always on, matching Daytona; no disk parameter exists.
             "experimental_options": {"enable_docker": True},
         }
+        if volumes:
+            create_kwargs["volumes"] = volumes
 
         try:
             # No entrypoint args: an argless Modal sandbox idles until timeout.

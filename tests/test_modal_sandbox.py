@@ -26,6 +26,7 @@ from benchmark_service.sandbox.types import (
     SandboxError,
     SandboxNotFoundError,
     SandboxQuery,
+    SandboxVolume,
     SnapshotSource,
     TargetedSnapshotSource,
 )
@@ -479,6 +480,56 @@ async def test_create_sandbox_maps_gpu_request(monkeypatch: pytest.MonkeyPatch) 
     await provider.create_sandbox(_request(resources=Resources(vcpu=4, memory=8, disk=30, gpu=2, gpu_type="H100")))
 
     assert captured["gpu"] == "H100:2"
+
+
+async def test_create_sandbox_maps_durable_volumes(monkeypatch: pytest.MonkeyPatch) -> None:
+    inner = FakeInnerSandbox()
+    captured: dict[str, Any] = {}
+
+    class FakeVolume:
+        def __init__(self, name: str) -> None:
+            self.name = name
+            self.options: dict[str, Any] = {}
+
+        def with_mount_options(self, **kwargs: Any) -> "FakeVolume":
+            self.options = kwargs
+            return self
+
+    def from_name(name: str, **kwargs: Any) -> FakeVolume:
+        captured.setdefault("volume_lookups", []).append((name, kwargs))
+        return FakeVolume(name)
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return inner
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    monkeypatch.setattr(modal_module, "Volume", SimpleNamespace(from_name=from_name))
+    resources = Resources(
+        vcpu=4,
+        memory=8,
+        disk=30,
+        volumes=[
+            SandboxVolume(
+                name="runs",
+                mount_path="/workspace",
+                create_if_missing=True,
+                sub_path_template="runs/{benchmark_id}/{task_id}",
+            ),
+            SandboxVolume(name="dataset", mount_path="/data", read_only=True),
+        ],
+    )
+    request = _request(resources=resources)
+    request.labels = {"Id": "run-1", "Task": "task-1"}
+
+    await provider.create_sandbox(request)
+
+    assert [item[0] for item in captured["volume_lookups"]] == ["runs", "dataset"]
+    assert captured["volumes"]["/workspace"].options == {
+        "read_only": False,
+        "sub_path": "runs/run-1/task-1",
+    }
+    assert captured["volumes"]["/data"].options == {"read_only": True, "sub_path": None}
 
 
 async def test_create_sandbox_requires_gpu_type_for_gpu(monkeypatch: pytest.MonkeyPatch) -> None:

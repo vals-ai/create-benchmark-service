@@ -21,10 +21,13 @@ from benchmark_service.sandbox.types import (
     SandboxError,
     SandboxNotFoundError,
     SandboxProvider,
+    SandboxProviderCapabilities,
     SandboxQuery,
     SandboxSource,
+    SandboxVolume,
     SnapshotSource,
     TargetedSnapshotSource,
+    UnsupportedSandboxCapabilityError,
 )
 
 SandboxProviderConfig = Annotated[DaytonaProviderConfig | ModalProviderConfig, Field(discriminator="type")]
@@ -52,10 +55,13 @@ __all__ = [
     "SandboxError",
     "SandboxNotFoundError",
     "SandboxProvider",
+    "SandboxProviderCapabilities",
     "SandboxProviderConfig",
     "SandboxQuery",
     "SandboxSource",
+    "SandboxVolume",
     "SnapshotSource",
     "TargetedSnapshotSource",
+    "UnsupportedSandboxCapabilityError",
     "sandbox_provider_config_from_mapping",
 ]

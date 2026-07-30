@@ -35,8 +35,10 @@ from benchmark_service.sandbox import (
     SandboxNotFoundError,
     SandboxQuery,
     SandboxSource,
+    SandboxVolume,
     SnapshotSource,
     TargetedSnapshotSource,
+    UnsupportedSandboxCapabilityError,
 )
 from benchmark_service.sandbox.daytona import (
     _PTY_STDOUT_TAIL_MAX_BYTES,  # pyright: ignore[reportPrivateUsage]
@@ -46,6 +48,7 @@ from benchmark_service.sandbox.daytona import (
     DaytonaSandboxProvider,
     daytona_retry_after_seconds,
 )
+from benchmark_service.sandbox.types import render_volume_sub_path
 
 
 def _client_response_error(status: int, message: str) -> ClientResponseError:
@@ -759,6 +762,27 @@ def test_sandbox_metadata_defaults_are_optional_for_existing_subclasses() -> Non
     assert sandbox.created_at is None
 
 
+def test_sandbox_volume_contract() -> None:
+    resources = Resources(vcpu=2, memory=4, disk=10)
+    assert resources.volumes == []
+
+    volume = SandboxVolume(
+        name="runs",
+        mount_path="/workspace",
+        sub_path_template="runs/{benchmark_id}/{task_id}/{sandbox_name}",
+    )
+    assert volume.sub_path_template == "runs/{benchmark_id}/{task_id}/{sandbox_name}"
+
+    with pytest.raises(ValidationError, match="mount_path"):
+        SandboxVolume(name="runs", mount_path="/proc/artifacts")
+    with pytest.raises(ValidationError, match="sub_path_template"):
+        SandboxVolume(name="runs", mount_path="/workspace", sub_path_template="runs/{unknown}")
+
+    slash = render_volume_sub_path("runs/{task_id}", {"Task": "a/b"}, "sandbox")
+    colon = render_volume_sub_path("runs/{task_id}", {"Task": "a:b"}, "sandbox")
+    assert slash != colon
+
+
 def test_compose_sandbox_delegates_inventory_metadata() -> None:
     created_at = datetime(2026, 7, 24, 12, 30, tzinfo=UTC)
     outer = RecordingSandbox()
@@ -913,6 +937,25 @@ async def test_daytona_provider_rejects_compose_source_before_create() -> None:
 
     with pytest.raises(SandboxError, match="ComposeSource must be unwrapped"):
         await provider.create_sandbox(request)
+
+
+async def test_daytona_provider_rejects_durable_volumes_before_create() -> None:
+    daytona = DaytonaClient(InnerSandbox())
+    provider = _provider(daytona)
+    resources = Resources(
+        vcpu=2,
+        memory=4,
+        disk=10,
+        volumes=[SandboxVolume(name="runs", mount_path="/workspace")],
+    )
+
+    with pytest.raises(
+        UnsupportedSandboxCapabilityError,
+        match="DaytonaSandboxProvider does not support durable volume mounts",
+    ):
+        await provider.create_sandbox(_request("volume-task", resources=resources))
+
+    assert daytona.created is False
 
 
 async def test_daytona_command_applies_timeout_inside_cwd() -> None:

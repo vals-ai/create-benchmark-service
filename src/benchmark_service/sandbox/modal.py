@@ -29,11 +29,9 @@ from benchmark_service.sandbox.types import (
     SandboxError,
     SandboxNotFoundError,
     SandboxProvider,
-    SandboxProviderCapabilities,
     SandboxQuery,
     SandboxSource,
     SnapshotSource,
-    render_volume_sub_path,
     validate_command_env,
 )
 
@@ -46,6 +44,7 @@ _ALLOW_ALL_DOMAINS = ("*",)
 _COMMAND_STATUS_POLL_SECONDS = 10
 _MAX_NAME_LENGTH = 64
 _INVALID_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_.-]")
+_INVALID_VOLUME_LABEL_CHARS = re.compile(r"[^A-Za-z0-9_.-]")
 _APP_ID_PATTERN = re.compile(r"^ap-[a-zA-Z0-9]{22}$")
 
 
@@ -115,6 +114,37 @@ def _modal_sandbox_name(name: str) -> str:
         return modal_name
     digest = hashlib.sha1(name.encode()).hexdigest()[:8]
     return f"{modal_name[:55]}-{digest}"
+
+
+def _volume_label_segment(value: str) -> str:
+    sanitized = _INVALID_VOLUME_LABEL_CHARS.sub("_", value)
+    if sanitized == value:
+        return value
+    return f"{sanitized}-{hashlib.sha256(value.encode()).hexdigest()[:10]}"
+
+
+def _render_volume_sub_path(
+    template: str | None,
+    labels: Mapping[str, str],
+    sandbox_name: str,
+) -> str | None:
+    if template is None:
+        return None
+    values = {
+        "benchmark_id": labels.get("Id") or labels.get("run-id"),
+        "task_id": labels.get("Task"),
+        "sandbox_name": sandbox_name,
+    }
+    sanitized = {
+        field: _volume_label_segment(value) for field, value in values.items() if value is not None
+    }
+    try:
+        rendered = template.format(**sanitized)
+    except (KeyError, ValueError) as exc:
+        raise SandboxError("Invalid or unavailable field in Modal volume subpath template") from exc
+    if rendered.startswith("/") or ".." in rendered.split("/"):
+        raise SandboxError("Modal volume subpath must stay within the volume")
+    return rendered
 
 
 class ModalSandbox(Sandbox):
@@ -314,13 +344,6 @@ for domain in {domains_to_resolve!r}:
 
 
 class ModalSandboxProvider(SandboxProvider):
-    capabilities = SandboxProviderCapabilities(
-        durable_volumes=True,
-        volume_creation=True,
-        volume_subpaths=True,
-        read_only_volume_mounts=True,
-    )
-
     def __init__(self, config: ModalProviderConfig) -> None:
         self._config = config
         self._client: Client | None = None
@@ -371,15 +394,17 @@ class ModalSandboxProvider(SandboxProvider):
 
     @_PROVIDER_RETRY
     async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
-        self.validate_create_request(request)
         modal_name = _modal_sandbox_name(request.name)
+        mount_paths = [mount.mount_path for mount in request.resources.volumes]
+        if len(mount_paths) != len(set(mount_paths)):
+            raise SandboxError("Modal volume mount paths must be unique")
         volume_names = [mount.name for mount in request.resources.volumes]
         if len(volume_names) != len(set(volume_names)):
             raise SandboxError("Modal cannot mount the same volume more than once in a sandbox")
         volume_mounts = [
             (
                 mount,
-                render_volume_sub_path(
+                _render_volume_sub_path(
                     mount.sub_path_template,
                     request.labels,
                     modal_name,

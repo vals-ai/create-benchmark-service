@@ -20,14 +20,12 @@ from benchmark_service.sandbox import (
     SandboxError,
     SandboxNotFoundError,
     SandboxProvider,
-    SandboxProviderCapabilities,
     SandboxProviderConfig,
     SandboxQuery,
     SandboxSource,
     SandboxVolume,
     SnapshotSource,
     TargetedSnapshotSource,
-    UnsupportedSandboxCapabilityError,
     sandbox_provider_config_from_mapping,
 )
 from benchmark_service.schemas import ArtifactGradingSubmission, EvalMode, GradingSubmission, TextGradingSubmission
@@ -56,7 +54,6 @@ __all__ = [
     "SandboxError",
     "SandboxNotFoundError",
     "SandboxProvider",
-    "SandboxProviderCapabilities",
     "SandboxProviderConfig",
     "SandboxQuery",
     "SandboxSource",
@@ -64,7 +61,6 @@ __all__ = [
     "SnapshotSource",
     "TargetedSnapshotSource",
     "TextGradingSubmission",
-    "UnsupportedSandboxCapabilityError",
     "sandbox_provider_config_from_mapping",
     "__version__",
 ]

@@ -618,7 +618,8 @@ class DaytonaSandboxProvider(SandboxProvider):
 
     @_PROVIDER_RETRY
     async def create_sandbox(self, request: SandboxCreateRequest) -> DaytonaSandbox:
-        self.validate_create_request(request)
+        if request.resources.volumes:
+            raise SandboxError("Daytona sandbox provider does not support durable volumes")
         daytona = self._daytona
         resources = DaytonaResources(
             cpu=request.resources.vcpu,

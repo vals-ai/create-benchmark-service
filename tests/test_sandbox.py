@@ -943,7 +943,7 @@ async def test_daytona_provider_rejects_durable_volumes_before_create() -> None:
         volumes=[SandboxVolume(name="runs", mount_path="/workspace")],
     )
 
-    with pytest.raises(SandboxError, match="Daytona sandbox provider does not support durable volumes"):
+    with pytest.raises(SandboxError, match="not currently supported by this Daytona adapter"):
         await provider.create_sandbox(_request("volume-task", resources=resources))
 
     assert daytona.created is False

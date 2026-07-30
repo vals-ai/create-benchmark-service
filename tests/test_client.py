@@ -254,8 +254,10 @@ async def test_http_error(
     mock_http.get = AsyncMock(return_value=mock_resp)
     mock_http.post = AsyncMock(return_value=mock_resp)
 
-    with pytest.raises(BenchmarkServiceError):
+    with pytest.raises(BenchmarkServiceError) as exc_info:
         await getattr(client, method)(*args)
+
+    assert exc_info.value.status_code == 500
 
 
 @pytest.mark.parametrize(
@@ -787,7 +789,7 @@ async def test_client_v1_evaluate_raises_on_error_status(
     client, mock_http = benchmark_client
     mock_http.post = AsyncMock(return_value=_mock_response(status_code=500))
 
-    with pytest.raises(BenchmarkServiceError, match="v1 evaluate failed"):
+    with pytest.raises(BenchmarkServiceError, match="v1 evaluate failed") as exc_info:
         await client.v1_evaluate(
             run_id="run-1",
             task_id="task-1",
@@ -795,6 +797,12 @@ async def test_client_v1_evaluate_raises_on_error_status(
             payload_schema="s.text.v1",
             payload_type=V1PayloadType.TEXT,
         )
+
+    assert exc_info.value.status_code == 500
+
+
+def test_non_http_service_error_has_no_status_code() -> None:
+    assert BenchmarkServiceError("websocket failed").status_code is None
 
 
 @pytest.mark.parametrize(

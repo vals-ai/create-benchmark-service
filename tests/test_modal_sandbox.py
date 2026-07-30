@@ -482,29 +482,40 @@ async def test_create_sandbox_maps_gpu_request(monkeypatch: pytest.MonkeyPatch) 
     assert captured["gpu"] == "H100:2"
 
 
-async def test_create_sandbox_maps_durable_volumes(monkeypatch: pytest.MonkeyPatch) -> None:
-    inner = FakeInnerSandbox()
-    captured: dict[str, Any] = {}
+class FakeVolume:
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.options: dict[str, Any] = {}
 
-    class FakeVolume:
-        def __init__(self, name: str) -> None:
-            self.name = name
-            self.options: dict[str, Any] = {}
+    def with_mount_options(self, **kwargs: Any) -> FakeVolume:
+        self.options = kwargs
+        return self
 
-        def with_mount_options(self, **kwargs: Any) -> "FakeVolume":
-            self.options = kwargs
-            return self
 
+def _fake_volumes(monkeypatch: pytest.MonkeyPatch, captured: dict[str, Any]) -> None:
     def from_name(name: str, **kwargs: Any) -> FakeVolume:
         captured.setdefault("volume_lookups", []).append((name, kwargs))
         return FakeVolume(name)
+
+    monkeypatch.setattr(modal_module, "Volume", SimpleNamespace(from_name=from_name))
+
+
+async def test_create_sandbox_maps_durable_volumes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Volume specs become Modal mounts keyed by mount path.
+
+    Test cases:
+    - `create_if_missing` and the request-scoped client reach `Volume.from_name`.
+    - A template resolves against the sandbox labels; an absent template mounts the volume root.
+    """
+    inner = FakeInnerSandbox()
+    captured: dict[str, Any] = {}
 
     async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
         captured.update(kwargs)
         return inner
 
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
-    monkeypatch.setattr(modal_module, "Volume", SimpleNamespace(from_name=from_name))
+    _fake_volumes(monkeypatch, captured)
     resources = Resources(
         vcpu=4,
         memory=8,
@@ -524,12 +535,98 @@ async def test_create_sandbox_maps_durable_volumes(monkeypatch: pytest.MonkeyPat
 
     await provider.create_sandbox(request)
 
-    assert [item[0] for item in captured["volume_lookups"]] == ["runs", "dataset"]
+    assert [name for name, _ in captured["volume_lookups"]] == ["runs", "dataset"]
+    assert [kwargs["create_if_missing"] for _, kwargs in captured["volume_lookups"]] == [True, False]
+    assert all(kwargs["client"] is not None for _, kwargs in captured["volume_lookups"])
     assert captured["volumes"]["/workspace"].options == {
         "read_only": False,
         "sub_path": "runs/run-1/task-1",
     }
     assert captured["volumes"]["/data"].options == {"read_only": True, "sub_path": None}
+
+
+async def test_create_sandbox_passes_no_volumes_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    inner = FakeInnerSandbox()
+    captured: dict[str, Any] = {}
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return inner
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    await provider.create_sandbox(_request())
+
+    assert captured["volumes"] == {}
+
+
+async def test_create_sandbox_rejects_template_without_labels(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unresolvable template must fail before create, not mount a run-shared subdirectory."""
+    captured: dict[str, Any] = {}
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        raise AssertionError("create should not be called")
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    _fake_volumes(monkeypatch, captured)
+    resources = Resources(
+        vcpu=4,
+        memory=8,
+        disk=30,
+        volumes=[
+            SandboxVolume(
+                name="runs",
+                mount_path="/workspace",
+                sub_path_template="runs/{benchmark_id}",
+            )
+        ],
+    )
+    request = _request(resources=resources)
+    request.labels = {}
+
+    with pytest.raises(SandboxError, match="benchmark_id"):
+        await provider.create_sandbox(request)
+
+
+async def test_create_sandbox_maps_volume_lookup_failure(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        raise AssertionError("create should not be called")
+
+    def from_name(name: str, **kwargs: Any) -> FakeVolume:
+        raise ModalInvalidError(f"Invalid Volume name: {name!r}")
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    monkeypatch.setattr(modal_module, "Volume", SimpleNamespace(from_name=from_name))
+    resources = Resources(
+        vcpu=4,
+        memory=8,
+        disk=30,
+        volumes=[SandboxVolume(name="bad name", mount_path="/workspace")],
+    )
+
+    with pytest.raises(SandboxError, match="Invalid Volume name"):
+        await provider.create_sandbox(_request(resources=resources))
+
+
+async def test_create_sandbox_reports_missing_volume_as_sandbox_error(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A volume missing with create_if_missing=False must not read as a missing sandbox."""
+    captured: dict[str, Any] = {}
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        raise ModalNotFoundError("Volume 'runs' not found")
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    _fake_volumes(monkeypatch, captured)
+    resources = Resources(
+        vcpu=4,
+        memory=8,
+        disk=30,
+        volumes=[SandboxVolume(name="runs", mount_path="/workspace")],
+    )
+
+    with pytest.raises(SandboxError, match="Volume 'runs' not found") as exc_info:
+        await provider.create_sandbox(_request(resources=resources))
+    assert not isinstance(exc_info.value, SandboxNotFoundError)
 
 
 async def test_create_sandbox_requires_gpu_type_for_gpu(monkeypatch: pytest.MonkeyPatch) -> None:

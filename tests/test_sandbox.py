@@ -661,6 +661,7 @@ class SysboxRunnerFaultDaytonaClient(DaytonaClient):
 
 class ConflictThenFlakyLookupDaytonaClient(DaytonaClient):
     """create always name-conflicts; the recovery lookup fails transiently once."""
+
     def __init__(self, sandbox: InnerSandbox) -> None:
         super().__init__(sandbox)
         self.get_attempts = 0
@@ -765,16 +766,82 @@ def test_sandbox_create_request_requires_nonempty_name() -> None:
         _request("")
 
 
-def test_sandbox_volume_contract() -> None:
-    resources = Resources(vcpu=2, memory=4, disk=10)
-    assert resources.volumes == []
+def test_sandbox_volume_defaults_to_a_writable_unscoped_mount() -> None:
+    assert Resources(vcpu=2, memory=4, disk=10).volumes == []
 
-    volume = SandboxVolume(
+    volume = SandboxVolume(name="runs", mount_path="/workspace")
+
+    assert volume.read_only is False
+    assert volume.create_if_missing is False
+    assert volume.sub_path_template is None
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"name": "", "mount_path": "/workspace"},
+        {"name": "runs", "mount_path": ""},
+        {"name": "runs", "mount_path": "workspace"},
+        {"name": "runs", "mount_path": "/workspace", "sub_path_template": ""},
+        {"name": "runs", "mount_path": "/workspace", "sub_path_template": "runs/{run}"},
+        {"name": "runs", "mount_path": "/workspace", "sub_path_template": "runs/{task_id"},
+    ],
+    ids=["empty-name", "empty-mount", "relative-mount", "empty-template", "unknown-field", "malformed-template"],
+)
+def test_sandbox_volume_rejects_invalid_specs(kwargs: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        SandboxVolume(**kwargs)
+
+
+@pytest.mark.parametrize(
+    "mount_paths",
+    [("/workspace", "/workspace"), ("/workspace", "/workspace/"), ("/workspace", "/workspace/data")],
+    ids=["identical", "trailing-slash", "nested"],
+)
+def test_resources_reject_overlapping_volume_mount_paths(mount_paths: tuple[str, str]) -> None:
+    volumes = [SandboxVolume(name=f"vol-{index}", mount_path=path) for index, path in enumerate(mount_paths)]
+
+    with pytest.raises(ValidationError, match="overlaps"):
+        Resources(vcpu=2, memory=4, disk=10, volumes=volumes)
+
+
+def test_sandbox_volume_resolves_sub_path_from_labels() -> None:
+    """Templates interpolate run identity so one named volume can hold many runs.
+
+    Test cases:
+    - No template resolves to None regardless of labels.
+    - `{benchmark_id}` prefers the Valkyrie `Id` label and falls back to `run-id`.
+    - Only the placeholders a template names have to be resolvable.
+    """
+    unscoped = SandboxVolume(name="runs", mount_path="/workspace")
+    assert unscoped.resolve_sub_path({}, "sandbox-1") is None
+
+    scoped = SandboxVolume(
         name="runs",
         mount_path="/workspace",
         sub_path_template="runs/{benchmark_id}/{task_id}/{sandbox_name}",
     )
-    assert volume.sub_path_template == "runs/{benchmark_id}/{task_id}/{sandbox_name}"
+    assert scoped.resolve_sub_path({"Id": "run-1", "Task": "task-1"}, "sandbox-1") == "runs/run-1/task-1/sandbox-1"
+    assert scoped.resolve_sub_path({"run-id": "run-2", "Task": "task-1"}, "sandbox-1") == "runs/run-2/task-1/sandbox-1"
+    assert scoped.resolve_sub_path({"Id": "run-1", "run-id": "ignored", "Task": "t"}, "s") == "runs/run-1/t/s"
+
+    partial = SandboxVolume(name="runs", mount_path="/workspace", sub_path_template="runs/{sandbox_name}")
+    assert partial.resolve_sub_path({}, "sandbox-1") == "runs/sandbox-1"
+
+
+def test_sandbox_volume_rejects_sub_path_with_unresolvable_identity() -> None:
+    """A missing label must fail loudly; interpolating it would share one subdirectory across runs."""
+    volume = SandboxVolume(
+        name="runs",
+        mount_path="/workspace",
+        sub_path_template="runs/{benchmark_id}/{task_id}",
+    )
+
+    with pytest.raises(SandboxError, match="benchmark_id, task_id"):
+        volume.resolve_sub_path({}, "sandbox-1")
+
+    with pytest.raises(SandboxError, match="task_id"):
+        volume.resolve_sub_path({"Id": "run-1", "Task": ""}, "sandbox-1")
 
 
 def test_compose_sandbox_delegates_inventory_metadata() -> None:
@@ -976,7 +1043,9 @@ async def test_daytona_command_wraps_shell_pipelines_when_timeout_is_set() -> No
     inner = InnerSandbox()
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    await sandbox.exec("container_id=$(docker compose ps -q main); cat /tmp/file | docker exec -i \"$container_id\" cat", timeout=60)
+    await sandbox.exec(
+        'container_id=$(docker compose ps -q main); cat /tmp/file | docker exec -i "$container_id" cat', timeout=60
+    )
 
     assert inner.process.command == (
         "timeout 60 sh -c "

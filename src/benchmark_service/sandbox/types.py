@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Mapping, Sequence
 from datetime import datetime
+from pathlib import PurePosixPath
+from string import Formatter
 from typing import Annotated, Literal, Self
 
 from pydantic import AwareDatetime, BaseModel, Field, model_validator
@@ -55,15 +57,82 @@ def validate_command_env(env_vars: Mapping[str, str] | None) -> dict[str, str]:
     return env
 
 
+# Valkyrie labels a run "Id"; this service's own grading path labels it "run-id".
+BENCHMARK_ID_LABELS = ("Id", "run-id")
+TASK_ID_LABELS = ("Task",)
+SUB_PATH_PLACEHOLDERS = ("benchmark_id", "task_id", "sandbox_name")
+
+
+def _first_label(labels: Mapping[str, str], keys: Sequence[str]) -> str | None:
+    for key in keys:
+        value = labels.get(key)
+        if value:
+            return value
+    return None
+
+
+def _template_field_names(template: str) -> list[str]:
+    return [field for _, field, _, _ in Formatter().parse(template) if field is not None]
+
+
 class SandboxVolume(BaseModel):
     name: str = Field(min_length=1, description="Provider volume name")
-    mount_path: str = Field(description="Absolute path where the volume is mounted")
+    mount_path: str = Field(min_length=1, description="Absolute path where the volume is mounted")
     read_only: bool = False
     create_if_missing: bool = False
     sub_path_template: str | None = Field(
         default=None,
+        min_length=1,
         description=("Optional provider-volume subdirectory. Supports {benchmark_id}, {task_id}, and {sandbox_name}."),
     )
+
+    @model_validator(mode="after")
+    def _validate_volume(self) -> Self:
+        if not self.mount_path.startswith("/"):
+            raise ValueError(f"mount_path must be absolute: {self.mount_path}")
+        if self.sub_path_template is None:
+            return self
+        try:
+            fields = _template_field_names(self.sub_path_template)
+        except ValueError as exc:
+            raise ValueError(f"Malformed sub_path_template {self.sub_path_template!r}: {exc}") from exc
+        unknown = sorted(set(fields) - set(SUB_PATH_PLACEHOLDERS))
+        if unknown:
+            raise ValueError(
+                f"Unknown sub_path_template placeholders: {', '.join(unknown)}; "
+                f"supported: {', '.join(SUB_PATH_PLACEHOLDERS)}"
+            )
+        return self
+
+    def resolve_sub_path(self, labels: Mapping[str, str], sandbox_name: str) -> str | None:
+        """Return this volume's per-sandbox subdirectory, or None when unscoped.
+
+        Arguments
+        - labels: Sandbox labels carrying the run and task identity.
+        - sandbox_name: Provider-facing sandbox name.
+
+        Returns
+        The interpolated subdirectory, or None when no template is set.
+
+        Raises
+        SandboxError when the template references identity the labels do not
+        carry. Interpolating a missing value would collapse distinct runs onto
+        one shared subdirectory, which is the opposite of what a template is for.
+        """
+        if self.sub_path_template is None:
+            return None
+        values = {
+            "benchmark_id": _first_label(labels, BENCHMARK_ID_LABELS),
+            "task_id": _first_label(labels, TASK_ID_LABELS),
+            "sandbox_name": sandbox_name or None,
+        }
+        missing = sorted({name for name in _template_field_names(self.sub_path_template) if not values[name]})
+        if missing:
+            raise SandboxError(
+                f"Volume {self.name!r} sub_path_template requires sandbox identity for: {', '.join(missing)}"
+            )
+        return self.sub_path_template.format(**values)
+
 
 class Resources(BaseModel):
     vcpu: int = Field(description="Logical sandbox CPU count")
@@ -80,6 +149,15 @@ class Resources(BaseModel):
     def _validate_resources(self) -> Self:
         if self.gpu_type is not None and self.gpu < 1:
             raise ValueError("gpu_type requires gpu >= 1")
+        # Overlapping mounts (identical, or one nested under another) are rejected
+        # here rather than per-provider so every adapter gets the same contract.
+        mounted: list[PurePosixPath] = []
+        for volume in self.volumes:
+            path = PurePosixPath(volume.mount_path)
+            conflict = next((p for p in mounted if path.is_relative_to(p) or p.is_relative_to(path)), None)
+            if conflict is not None:
+                raise ValueError(f"Volume mount_path {volume.mount_path} overlaps {conflict}")
+            mounted.append(path)
         return self
 
 

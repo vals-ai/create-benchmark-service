@@ -378,17 +378,6 @@ class ModalSandboxProvider(SandboxProvider):
         volumes: dict[str, Volume] = {}
         try:
             for mount in request.resources.volumes:
-                if mount.mount_path in volumes:
-                    raise SandboxError("Modal volume mount paths must be unique")
-                sub_path = (
-                    mount.sub_path_template.format(
-                        benchmark_id=request.labels.get("Id") or request.labels.get("run-id"),
-                        task_id=request.labels.get("Task"),
-                        sandbox_name=modal_name,
-                    )
-                    if mount.sub_path_template
-                    else None
-                )
                 volume = Volume.from_name(
                     mount.name,
                     create_if_missing=mount.create_if_missing,
@@ -396,7 +385,7 @@ class ModalSandboxProvider(SandboxProvider):
                 )
                 volumes[mount.mount_path] = volume.with_mount_options(
                     read_only=mount.read_only,
-                    sub_path=sub_path,
+                    sub_path=mount.resolve_sub_path(request.labels, modal_name),
                 )
         except ModalError as exc:
             raise _sandbox_error(exc) from exc
@@ -415,11 +404,10 @@ class ModalSandboxProvider(SandboxProvider):
             "outbound_cidr_allowlist": list(_ALLOW_ALL_CIDRS) if allow_all_egress else None,
             "outbound_domain_allowlist": list(_ALLOW_ALL_DOMAINS) if allow_all_egress else None,
             "client": client,
+            "volumes": volumes,
             # Nested Docker always on, matching Daytona; no disk parameter exists.
             "experimental_options": {"enable_docker": True},
         }
-        if volumes:
-            create_kwargs["volumes"] = volumes
 
         try:
             # No entrypoint args: an argless Modal sandbox idles until timeout.

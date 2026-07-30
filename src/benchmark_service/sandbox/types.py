@@ -86,7 +86,7 @@ class Resources(BaseModel):
 class SandboxCreateRequest(BaseModel):
     source: SandboxSource
     resources: Resources
-    name: str
+    name: str = Field(min_length=1)
     labels: dict[str, str]
     env_vars: dict[str, str]
     auto_stop_interval: int

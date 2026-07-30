@@ -760,6 +760,11 @@ def test_sandbox_metadata_defaults_are_optional_for_existing_subclasses() -> Non
     assert sandbox.created_at is None
 
 
+def test_sandbox_create_request_requires_nonempty_name() -> None:
+    with pytest.raises(ValueError):
+        _request("")
+
+
 def test_sandbox_volume_contract() -> None:
     resources = Resources(vcpu=2, memory=4, disk=10)
     assert resources.volumes == []

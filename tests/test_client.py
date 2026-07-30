@@ -1,7 +1,7 @@
 """Tests for BenchmarkServiceClient."""
 
 import json
-from typing import Any
+from typing import Any, cast
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
@@ -28,12 +28,40 @@ HEADERS = {"Authorization": "Bearer token"}
 DAYTONA_CONFIG = DaytonaProviderConfig(DAYTONA_API_KEY="key", DAYTONA_API_URL="url", DAYTONA_TARGET="target")
 
 
-def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "error") -> MagicMock:
+def _mock_response(
+    status_code: int = 200, json_data: Any = None, text: str = "error", headers: dict[str, str] | None = None
+) -> MagicMock:
     resp = MagicMock()
     resp.status_code = status_code
     resp.json.return_value = json_data
     resp.text = text
+    resp.headers = httpx.Headers(headers or {})
     return resp
+
+
+def _v1_eval_ok_response() -> MagicMock:
+    return _mock_response(
+        json_data={
+            "run_id": "run-1",
+            "task_id": "task-1",
+            "status": "evaluated",
+            "evaluator_version": "stub-1.0",
+            "result": {"resolved": True},
+            "errors": [],
+        }
+    )
+
+
+def _patch_v1_evaluate_sleep(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Replace v1_evaluate's tenacity sleep with a recorder so retry tests run instantly."""
+    observed_waits: list[float] = []
+
+    async def record_wait(seconds: float) -> None:
+        observed_waits.append(seconds)
+
+    retryer = cast(Any, BenchmarkServiceClient.v1_evaluate).retry
+    monkeypatch.setattr(retryer, "sleep", record_wait)
+    return observed_waits
 
 
 @pytest.mark.parametrize(
@@ -783,8 +811,10 @@ async def test_client_v1_score_posts_results_and_returns_v1_score_response(
 
 async def test_client_v1_evaluate_raises_on_error_status(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client, mock_http = benchmark_client
+    _patch_v1_evaluate_sleep(monkeypatch)
     mock_http.post = AsyncMock(return_value=_mock_response(status_code=500))
 
     with pytest.raises(BenchmarkServiceError, match="v1 evaluate failed"):
@@ -795,6 +825,134 @@ async def test_client_v1_evaluate_raises_on_error_status(
             payload_schema="s.text.v1",
             payload_type=V1PayloadType.TEXT,
         )
+
+    mock_http.post.assert_awaited_once()
+
+
+@pytest.mark.parametrize("status_code", [400, 403, 404, 409, 502])
+async def test_client_v1_evaluate_does_not_retry_permanent_statuses(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+    status_code: int,
+) -> None:
+    """Statuses outside the retryable 429 set raise on the first attempt.
+
+    409 is the duplicate-grading-in-progress signal and must never be retried.
+    502 can be emitted by the ALB mid-grading (target deregistration), not just
+    pre-app, so it must never be retried either.
+    """
+    client, mock_http = benchmark_client
+    _patch_v1_evaluate_sleep(monkeypatch)
+    mock_http.post = AsyncMock(return_value=_mock_response(status_code=status_code))
+
+    with pytest.raises(BenchmarkServiceError, match="v1 evaluate failed"):
+        await client.v1_evaluate(
+            run_id="run-1",
+            task_id="task-1",
+            payload_data="x",
+            payload_schema="s.text.v1",
+            payload_type=V1PayloadType.TEXT,
+        )
+
+    mock_http.post.assert_awaited_once()
+
+
+async def test_client_v1_evaluate_retries_transient_status_then_succeeds(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """429 (grading-admission throttle, no header) is retried: it's provably safe,
+    raised before any grading work starts.
+    """
+    client, mock_http = benchmark_client
+    observed_waits = _patch_v1_evaluate_sleep(monkeypatch)
+    mock_http.post = AsyncMock(side_effect=[_mock_response(status_code=429), _v1_eval_ok_response()])
+
+    result = await client.v1_evaluate(
+        run_id="run-1",
+        task_id="task-1",
+        payload_data="x",
+        payload_schema="s.text.v1",
+        payload_type=V1PayloadType.TEXT,
+    )
+
+    assert isinstance(result, V1EvalResponse)
+    assert mock_http.post.await_count == 2
+    assert len(observed_waits) == 1
+    assert 5 * 0.9 <= observed_waits[0] <= 5
+
+
+async def test_client_v1_evaluate_raises_after_exhausting_retries(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 429 that never clears exhausts the retry budget and surfaces as BenchmarkServiceError."""
+    client, mock_http = benchmark_client
+    observed_waits = _patch_v1_evaluate_sleep(monkeypatch)
+    mock_http.post = AsyncMock(return_value=_mock_response(status_code=429))
+
+    with pytest.raises(BenchmarkServiceError, match="v1 evaluate failed"):
+        await client.v1_evaluate(
+            run_id="run-1",
+            task_id="task-1",
+            payload_data="x",
+            payload_schema="s.text.v1",
+            payload_type=V1PayloadType.TEXT,
+        )
+
+    assert mock_http.post.await_count == 4
+    assert len(observed_waits) == 3
+    for observed, expected in zip(observed_waits, (5, 25, 90), strict=True):
+        assert expected * 0.9 <= observed <= expected
+
+
+async def test_client_v1_evaluate_honors_retry_after_header(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 429 carrying Retry-After (the evaluation-quota path) waits that exact value,
+    not the staged backoff — this is what keeps a quota retry from being either a wasted
+    short sleep or (see the sibling test) a multi-day one.
+    """
+    client, mock_http = benchmark_client
+    observed_waits = _patch_v1_evaluate_sleep(monkeypatch)
+    mock_http.post = AsyncMock(
+        side_effect=[_mock_response(status_code=429, headers={"retry-after": "2"}), _v1_eval_ok_response()]
+    )
+
+    result = await client.v1_evaluate(
+        run_id="run-1",
+        task_id="task-1",
+        payload_data="x",
+        payload_schema="s.text.v1",
+        payload_type=V1PayloadType.TEXT,
+    )
+
+    assert isinstance(result, V1EvalResponse)
+    assert observed_waits == [2.0]
+
+
+async def test_client_v1_evaluate_does_not_retry_quota_exhausted_429(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A 429 whose Retry-After exceeds the staged backoff (yearly quota exhaustion) is not
+    retried — honoring it verbatim would sleep for the remainder of the quota window.
+    """
+    client, mock_http = benchmark_client
+    _patch_v1_evaluate_sleep(monkeypatch)
+    mock_http.post = AsyncMock(return_value=_mock_response(status_code=429, headers={"retry-after": "31536000"}))
+
+    with pytest.raises(BenchmarkServiceError, match="v1 evaluate failed"):
+        await client.v1_evaluate(
+            run_id="run-1",
+            task_id="task-1",
+            payload_data="x",
+            payload_schema="s.text.v1",
+            payload_type=V1PayloadType.TEXT,
+        )
+
+    mock_http.post.assert_awaited_once()
 
 
 @pytest.mark.parametrize(

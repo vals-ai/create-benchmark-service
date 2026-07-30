@@ -52,6 +52,7 @@ from tenacity import (
     wait_random,
 )
 
+from benchmark_service.retry_after import parse_retry_after_seconds
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
     ComposeSource,
@@ -273,18 +274,6 @@ def _is_name_conflict_error(exc: DaytonaError) -> bool:
     return isinstance(exc, DaytonaConflictError) or exc.status_code == 409 or _message_contains(exc, ("already exists",))
 
 
-def _parse_retry_after_seconds(value: object) -> float | None:
-    try:
-        seconds = float(str(value))
-    except ValueError:
-        return None
-
-    if seconds < 0:
-        return None
-
-    return seconds
-
-
 def _get_header(headers: dict[str, Any], header_name: str) -> object | None:
     header_name = header_name.lower()
     for key, value in headers.items():
@@ -295,17 +284,17 @@ def _get_header(headers: dict[str, Any], header_name: str) -> object | None:
 
 def daytona_retry_after_seconds(exc: DaytonaRateLimitError) -> float | None:
     for throttler in _KNOWN_THROTTLERS:
-        seconds = _parse_retry_after_seconds(_get_header(exc.headers, f"retry-after-{throttler}"))
+        seconds = parse_retry_after_seconds(_get_header(exc.headers, f"retry-after-{throttler}"))
         if seconds is not None:
             return seconds
 
-    seconds = _parse_retry_after_seconds(_get_header(exc.headers, "retry-after"))
+    seconds = parse_retry_after_seconds(_get_header(exc.headers, "retry-after"))
     if seconds is not None:
         return seconds
 
     for key, value in exc.headers.items():
         if str(key).lower().startswith(_RETRY_AFTER_PREFIX):
-            seconds = _parse_retry_after_seconds(value)
+            seconds = parse_retry_after_seconds(value)
             if seconds is not None:
                 return seconds
 

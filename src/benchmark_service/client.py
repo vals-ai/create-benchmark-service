@@ -7,13 +7,17 @@ import httpx
 import websockets
 from pydantic import BaseModel, TypeAdapter
 from tenacity import (
+    RetryCallState,
     retry,
+    retry_if_exception,
     retry_if_exception_type,
     stop_after_attempt,
+    wait_chain,
     wait_random,
 )
 from websockets.exceptions import ConnectionClosed
 
+from benchmark_service.retry_after import parse_retry_after_seconds
 from benchmark_service.sandbox import SandboxProvider, SandboxProviderConfig
 from benchmark_service.schemas import (
     EvaluateInstanceRequest,
@@ -62,11 +66,62 @@ _retry_http = retry(
     reraise=True,
 )
 
+# v1_evaluate retries only conditions provably safe against double-grading: the connect
+# phase (nothing reached the server) and 429 (grading-admission/quota rejection, raised
+# before any grading work starts). 502 and 504 are deliberately excluded even though the
+# app never constructs either itself: the ALB in front of this service can emit a 502 when
+# it deregisters a target mid-request (autoscaling, deploys, crashes), or a 504 when it
+# times out waiting for a response to a long-running grading request — both happen after
+# the request reached the app and grading may already be underway, so retrying risks
+# double-grading. Read/write-phase transport failures and any other status stay unretried
+# for the same reason.
+_CONNECT_PHASE_EXCEPTIONS = (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout)
+_RETRYABLE_V1_EVALUATE_STATUSES = (429,)
+# Calibrated to GRADING_QUEUE_TIMEOUT_S (default 30s): grading-capacity pressure clears in
+# seconds as in-flight evals finish, not the minutes-scale Daytona provider outages that
+# _PROVIDER_RETRY_DELAYS_SECONDS covers.
+_V1_EVALUATE_RETRY_DELAYS_SECONDS = (5, 25, 90)
+_V1_EVALUATE_RETRY_WAIT = wait_chain(*(wait_random(delay * 0.9, delay) for delay in _V1_EVALUATE_RETRY_DELAYS_SECONDS))
+# A 429 whose Retry-After exceeds every staged delay is the yearly-quota-exhausted case, not a
+# short-lived admission throttle — the server is telling us this won't clear soon, so don't retry it.
+_MAX_HONORED_RETRY_AFTER_SECONDS = float(_V1_EVALUATE_RETRY_DELAYS_SECONDS[-1])
+
+
+def _is_retryable_v1_evaluate_status(exc: BaseException) -> bool:
+    if not isinstance(exc, BenchmarkServiceError) or exc.status_code not in _RETRYABLE_V1_EVALUATE_STATUSES:
+        return False
+    return exc.retry_after_seconds is None or exc.retry_after_seconds <= _MAX_HONORED_RETRY_AFTER_SECONDS
+
+
+def _v1_evaluate_retry_wait(retry_state: RetryCallState) -> float:
+    assert retry_state.outcome is not None
+    exc = retry_state.outcome.exception()
+    if isinstance(exc, BenchmarkServiceError) and exc.retry_after_seconds is not None:
+        return exc.retry_after_seconds
+    return _V1_EVALUATE_RETRY_WAIT(retry_state)
+
+
+_retry_v1_evaluate = retry(
+    retry=retry_if_exception_type(_CONNECT_PHASE_EXCEPTIONS) | retry_if_exception(_is_retryable_v1_evaluate_status),
+    stop=stop_after_attempt(len(_V1_EVALUATE_RETRY_DELAYS_SECONDS) + 1),
+    wait=_v1_evaluate_retry_wait,
+    reraise=True,
+)
+
 
 class BenchmarkServiceError(Exception):
     """Exception raised for benchmark service communication errors."""
 
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        status_code: int | None = None,
+        retry_after_seconds: float | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.retry_after_seconds = retry_after_seconds
 
 
 class BenchmarkServiceUnauthenticatedError(BenchmarkServiceError):
@@ -465,6 +520,7 @@ class BenchmarkServiceClient:
 
         return V1UploadUrlResponse.model_validate(response.json())
 
+    @_retry_v1_evaluate
     async def v1_evaluate(
         self,
         run_id: str,
@@ -478,8 +534,16 @@ class BenchmarkServiceClient:
         """Evaluate via the lab-facing /v1/evaluate surface (Descope-authenticated).
 
         payload_data is either inline text or an uploaded artifact key, as
-        selected by payload_type. Transport failures are not retried because
-        grading may already have started.
+        selected by payload_type. Only conditions provably safe against
+        double-grading are retried: the connect phase (the request never
+        reached the server) and HTTP 429 (grading-admission/quota rejection,
+        raised before any grading work starts). 502 and 504 are not retried:
+        the ALB in front of this service can emit a 502 when a target is
+        deregistered mid-request, or a 504 when it times out waiting on a
+        long-running grading request, either of which can happen after
+        grading has already started. Every other transport failure or status
+        code is not retried for the same reason: grading may already have
+        started.
         """
         request = V1EvalRequest(
             run_id=run_id,
@@ -498,7 +562,9 @@ class BenchmarkServiceClient:
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
-                f"v1 evaluate failed with status code {response.status_code}, response: {response.text}"
+                f"v1 evaluate failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
+                retry_after_seconds=parse_retry_after_seconds(response.headers.get("retry-after")),
             )
 
         return V1EvalResponse.model_validate(response.json())

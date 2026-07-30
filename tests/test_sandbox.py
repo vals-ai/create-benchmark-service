@@ -828,16 +828,25 @@ def test_sandbox_volume_rejects_invalid_specs(kwargs: dict[str, Any]) -> None:
         SandboxVolume(**kwargs)
 
 
-@pytest.mark.parametrize(
-    "mount_paths",
-    [("/workspace", "/workspace"), ("/workspace", "/workspace/"), ("/workspace", "/workspace/data")],
-    ids=["identical", "trailing-slash", "nested"],
-)
-def test_resources_reject_overlapping_volume_mount_paths(mount_paths: tuple[str, str]) -> None:
-    volumes = [SandboxVolume(name=f"vol-{index}", mount_path=path) for index, path in enumerate(mount_paths)]
+def test_resources_reject_duplicate_volume_mount_paths() -> None:
+    """A repeated mount path would silently drop a volume on providers that key mounts by path."""
+    volumes = [
+        SandboxVolume(name="runs", mount_path="/workspace"),
+        SandboxVolume(name="other", mount_path="/workspace"),
+    ]
 
-    with pytest.raises(ValidationError, match="overlaps"):
+    with pytest.raises(ValidationError, match="Duplicate volume mount_path: /workspace"):
         Resources(vcpu=2, memory=4, disk=10, volumes=volumes)
+
+
+def test_resources_allow_nested_volume_mount_paths() -> None:
+    """Nesting one volume under another is a legitimate layout, not a conflict."""
+    volumes = [
+        SandboxVolume(name="runs", mount_path="/workspace"),
+        SandboxVolume(name="cache", mount_path="/workspace/cache"),
+    ]
+
+    assert len(Resources(vcpu=2, memory=4, disk=10, volumes=volumes).volumes) == 2
 
 
 def test_sandbox_volume_resolves_sub_path_from_labels() -> None:

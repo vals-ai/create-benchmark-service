@@ -4,7 +4,6 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, Mapping, Sequence
 from datetime import datetime
-from pathlib import PurePosixPath
 from string import Formatter
 from typing import Annotated, Literal, Self
 
@@ -149,15 +148,12 @@ class Resources(BaseModel):
     def _validate_resources(self) -> Self:
         if self.gpu_type is not None and self.gpu < 1:
             raise ValueError("gpu_type requires gpu >= 1")
-        # Overlapping mounts (identical, or one nested under another) are rejected
-        # here rather than per-provider so every adapter gets the same contract.
-        mounted: list[PurePosixPath] = []
-        for volume in self.volumes:
-            path = PurePosixPath(volume.mount_path)
-            conflict = next((p for p in mounted if path.is_relative_to(p) or p.is_relative_to(path)), None)
-            if conflict is not None:
-                raise ValueError(f"Volume mount_path {volume.mount_path} overlaps {conflict}")
-            mounted.append(path)
+        # Modal keys its mounts by path, so a repeated mount_path would silently drop
+        # a volume the benchmark asked for. Rejected here so both adapters agree.
+        mount_paths = [volume.mount_path for volume in self.volumes]
+        duplicates = sorted({path for path in mount_paths if mount_paths.count(path) > 1})
+        if duplicates:
+            raise ValueError(f"Duplicate volume mount_path: {', '.join(duplicates)}")
         return self
 
 

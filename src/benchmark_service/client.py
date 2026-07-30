@@ -66,7 +66,11 @@ _retry_http = retry(
 class BenchmarkServiceError(Exception):
     """Exception raised for benchmark service communication errors."""
 
-    pass
+    status_code: int | None
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class BenchmarkServiceUnauthenticatedError(BenchmarkServiceError):
@@ -84,7 +88,7 @@ def _unauthenticated_error(response: httpx.Response) -> "BenchmarkServiceUnauthe
     except Exception:
         detail = response.text
 
-    return BenchmarkServiceUnauthenticatedError(detail)
+    return BenchmarkServiceUnauthenticatedError(detail, status_code=response.status_code)
 
 
 class BenchmarkServiceClient:
@@ -202,7 +206,8 @@ class BenchmarkServiceClient:
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
-                f"Health check failed with status code {response.status_code}, response: {response.text}"
+                f"Health check failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
             )
 
         return HealthCheckResponse.model_validate(response.json())
@@ -217,7 +222,8 @@ class BenchmarkServiceClient:
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
-                f"Version check failed with status code {response.status_code}, response: {response.text}"
+                f"Version check failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
             )
 
         return VersionResponse.model_validate(response.json())
@@ -247,7 +253,8 @@ class BenchmarkServiceClient:
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
-                f"Verify task ids failed with status code {response.status_code}, response: {response.text}"
+                f"Verify task ids failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
             )
 
         return VerifyTaskIdsResponse.model_validate(response.json())
@@ -272,7 +279,8 @@ class BenchmarkServiceClient:
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
-                f"Retrieve task failed with status code {response.status_code}, response: {response.text}"
+                f"Retrieve task failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
             )
 
         return RetrieveTaskResponse.model_validate(response.json())
@@ -337,7 +345,8 @@ class BenchmarkServiceClient:
 
         if resp.status_code != 200:
             raise BenchmarkServiceError(
-                f"Evaluate response failed with status code {resp.status_code}, response: {resp.text}"
+                f"Evaluate response failed with status code {resp.status_code}, response: {resp.text}",
+                status_code=resp.status_code,
             )
 
         return resp.json()
@@ -410,7 +419,8 @@ class BenchmarkServiceClient:
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
-                f"Final score failed with status code {response.status_code}, response: {response.text}"
+                f"Final score failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
             )
 
         return FinalScoreResponse.model_validate(response.json())
@@ -431,7 +441,8 @@ class BenchmarkServiceClient:
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
-                f"List tasks failed with status code {response.status_code}, response: {response.text}"
+                f"List tasks failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
             )
 
         return V1DatasetTasksResponse.model_validate(response.json())
@@ -460,7 +471,8 @@ class BenchmarkServiceClient:
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
-                f"v1 upload URL request failed with status code {response.status_code}, response: {response.text}"
+                f"v1 upload URL request failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
             )
 
         return V1UploadUrlResponse.model_validate(response.json())
@@ -498,7 +510,8 @@ class BenchmarkServiceClient:
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
-                f"v1 evaluate failed with status code {response.status_code}, response: {response.text}"
+                f"v1 evaluate failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
             )
 
         return V1EvalResponse.model_validate(response.json())
@@ -521,7 +534,8 @@ class BenchmarkServiceClient:
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
-                f"v1 score failed with status code {response.status_code}, response: {response.text}"
+                f"v1 score failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
             )
 
         return V1ScoreResponse.model_validate(response.json())

@@ -69,6 +69,32 @@ class Resources(BaseModel):
         return self
 
 
+class VolumeMount(BaseModel):
+    """A named, persistent volume attached to a sandbox at a fixed path.
+
+    Distinct from the ephemeral disk in Resources: a volume outlives the sandbox
+    and is shared by every sandbox that mounts it. Benchmarks whose fixture is
+    far larger than their code need this — baking multi-gigabyte assets into an
+    image makes every cold start pay for them, and rebuilding the image on any
+    change is slow enough to discourage changing them at all.
+    """
+
+    name: str = Field(min_length=1, description="Provider-side volume name")
+    mount_path: str = Field(min_length=1, description="Absolute path inside the sandbox")
+    read_only: bool = Field(default=False, description="Mount without write access")
+    create_if_missing: bool = Field(
+        default=False,
+        description="Create the volume when absent rather than failing; leave off for "
+        "fixtures a run must not silently start without",
+    )
+
+    @model_validator(mode="after")
+    def _validate_mount_path(self) -> Self:
+        if not self.mount_path.startswith("/"):
+            raise ValueError(f"mount_path must be absolute, got {self.mount_path!r}")
+        return self
+
+
 class SandboxCreateRequest(BaseModel):
     source: SandboxSource
     resources: Resources
@@ -78,6 +104,19 @@ class SandboxCreateRequest(BaseModel):
     auto_stop_interval: int
     create_timeout: int
     network_block_all: bool = False
+    volumes: list[VolumeMount] = Field(
+        default_factory=list,
+        description="Persistent volumes to attach; empty keeps existing behaviour",
+    )
+
+    @model_validator(mode="after")
+    def _validate_volumes(self) -> Self:
+        seen: set[str] = set()
+        for volume in self.volumes:
+            if volume.mount_path in seen:
+                raise ValueError(f"duplicate volume mount_path: {volume.mount_path}")
+            seen.add(volume.mount_path)
+        return self
 
 
 class SandboxQuery(BaseModel):

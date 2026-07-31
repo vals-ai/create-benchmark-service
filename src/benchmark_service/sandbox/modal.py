@@ -8,7 +8,7 @@ import shlex
 from collections.abc import AsyncGenerator, Awaitable, Mapping
 from typing import Any, Literal, cast
 
-from modal import App, Client, Image
+from modal import App, Client, Image, Volume
 from modal import Sandbox as ModalSdkSandbox
 from modal.exception import ConnectionError as ModalConnectionError
 from modal.exception import Error as ModalError
@@ -32,6 +32,7 @@ from benchmark_service.sandbox.types import (
     SandboxQuery,
     SandboxSource,
     SnapshotSource,
+    VolumeMount,
     validate_command_env,
 )
 
@@ -331,6 +332,32 @@ class ModalSandboxProvider(SandboxProvider):
                 raise _sandbox_error(exc) from exc
         return self._client, self._app
 
+    def _resolve_volumes(self, mounts: list[VolumeMount], client: Client) -> dict[str, Volume]:
+        """Look up each named volume, keyed by the path it mounts at.
+
+        create_if_missing is off by default and deliberately not inferred: a
+        benchmark whose fixture volume is missing should fail loudly at creation
+        rather than start a sandbox with an empty directory where its data
+        should be, which surfaces much later as a confusing benchmark failure.
+        """
+        resolved: dict[str, Volume] = {}
+        for mount in mounts:
+            try:
+                volume = Volume.from_name(
+                    mount.name,
+                    create_if_missing=mount.create_if_missing,
+                    client=client,
+                )
+            except ModalNotFoundError as exc:
+                raise SandboxError(
+                    f"Modal volume {mount.name!r} does not exist (mount {mount.mount_path}); "
+                    "create it or set create_if_missing"
+                ) from exc
+            except ModalError as exc:
+                raise _sandbox_error(exc) from exc
+            resolved[mount.mount_path] = volume
+        return resolved
+
     def _resolve_image(self, source: SandboxSource, client: Client) -> Image:
         # A snapshot is a Modal filesystem snapshot, referenced by its Image id.
         match source:
@@ -392,6 +419,8 @@ class ModalSandboxProvider(SandboxProvider):
             # Nested Docker always on, matching Daytona; no disk parameter exists.
             "experimental_options": {"enable_docker": True},
         }
+        if request.volumes:
+            create_kwargs["volumes"] = self._resolve_volumes(request.volumes, client)
 
         try:
             # No entrypoint args: an argless Modal sandbox idles until timeout.

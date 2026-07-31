@@ -1918,3 +1918,46 @@ def test_daytona_config_from_env_raises_when_missing(monkeypatch: pytest.MonkeyP
     monkeypatch.setenv("DAYTONA_TARGET", "us")
     with pytest.raises(MissingSandboxConfigError, match="DAYTONA_API_KEY"):
         DaytonaProviderConfig.from_env()
+
+
+def test_volume_mount_requires_an_absolute_path() -> None:
+    """A relative mount path silently lands somewhere provider-defined."""
+    from benchmark_service.sandbox import VolumeMount
+
+    with pytest.raises(ValidationError):
+        VolumeMount(name="fixtures", mount_path="vol")
+
+
+def test_volume_mounts_reject_duplicate_paths() -> None:
+    """Two volumes on one path is a config error, not a last-one-wins race."""
+    from benchmark_service.sandbox import VolumeMount
+
+    with pytest.raises(ValidationError):
+        SandboxCreateRequest(
+            source=ImageSource(image="python:3.12"),
+            resources=Resources(vcpu=2, memory=4, disk=10),
+            name="dup",
+            labels={},
+            env_vars={},
+            auto_stop_interval=600,
+            create_timeout=360,
+            volumes=[
+                VolumeMount(name="a", mount_path="/vol"),
+                VolumeMount(name="b", mount_path="/vol"),
+            ],
+        )
+
+
+def test_requests_default_to_no_volumes() -> None:
+    """Every existing caller keeps its current behaviour."""
+    request = SandboxCreateRequest(
+        source=ImageSource(image="python:3.12"),
+        resources=Resources(vcpu=2, memory=4, disk=10),
+        name="plain",
+        labels={},
+        env_vars={},
+        auto_stop_interval=600,
+        create_timeout=360,
+    )
+
+    assert request.volumes == []

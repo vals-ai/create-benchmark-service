@@ -28,6 +28,7 @@ from benchmark_service.sandbox.types import (
     SandboxQuery,
     SnapshotSource,
     TargetedSnapshotSource,
+    VolumeMount,
 )
 
 
@@ -166,6 +167,7 @@ class FlakyExecSandbox(FakeInnerSandbox):
 def _request(
     source: ImageSource | SnapshotSource | TargetedSnapshotSource | None = None,
     resources: Resources | None = None,
+    volumes: list[VolumeMount] | None = None,
 ) -> SandboxCreateRequest:
     return SandboxCreateRequest(
         source=source or ImageSource(image="python:3.12"),
@@ -175,6 +177,7 @@ def _request(
         env_vars={"FOO": "bar"},
         auto_stop_interval=30,
         create_timeout=120,
+        volumes=volumes or [],
     )
 
 
@@ -729,3 +732,59 @@ async def test_create_sandbox_ignores_finished_sandbox_with_same_name(monkeypatc
     sandbox = await provider.create_sandbox(_request())
 
     assert sandbox.id == "sb-new"
+
+
+async def test_create_sandbox_without_volumes_passes_none(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The default stays byte-identical to pre-volume behaviour."""
+    captured: dict[str, Any] = {}
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return FakeInnerSandbox()
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    await provider.create_sandbox(_request())
+
+    assert "volumes" not in captured
+
+
+async def test_create_sandbox_mounts_named_volumes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A fixture too large to bake into an image is mounted, keyed by path."""
+    captured: dict[str, Any] = {}
+    looked_up: list[tuple[str, bool]] = []
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return FakeInnerSandbox()
+
+    def from_name(name: str, create_if_missing: bool = False, client: Any = None) -> str:
+        looked_up.append((name, create_if_missing))
+        return f"vol::{name}"
+
+    monkeypatch.setattr(modal_module, "Volume", SimpleNamespace(from_name=from_name))
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    await provider.create_sandbox(
+        _request(volumes=[VolumeMount(name="kspbench-steam", mount_path="/vol")])
+    )
+
+    assert captured["volumes"] == {"/vol": "vol::kspbench-steam"}
+    assert looked_up == [("kspbench-steam", False)]
+
+
+async def test_create_sandbox_reports_a_missing_volume_clearly(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run must not start with an empty directory where its fixture belongs."""
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        return FakeInnerSandbox()
+
+    def from_name(name: str, create_if_missing: bool = False, client: Any = None) -> str:
+        raise ModalNotFoundError(f"no such volume: {name}")
+
+    monkeypatch.setattr(modal_module, "Volume", SimpleNamespace(from_name=from_name))
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    with pytest.raises(SandboxError, match="does not exist"):
+        await provider.create_sandbox(
+            _request(volumes=[VolumeMount(name="absent", mount_path="/vol")])
+        )

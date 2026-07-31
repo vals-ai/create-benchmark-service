@@ -25,6 +25,9 @@ from daytona import (
     GpuType,
 )
 from daytona import (
+    VolumeMount as DaytonaVolumeMount,
+)
+from daytona import (
     Resources as DaytonaResources,
 )
 from daytona.common.errors import (
@@ -67,6 +70,7 @@ from benchmark_service.sandbox.types import (
     SandboxProvider,
     SandboxQuery,
     SnapshotSource,
+    VolumeMount,
     TargetedSnapshotSource,
     validate_command_env,
 )
@@ -616,6 +620,27 @@ class DaytonaSandboxProvider(SandboxProvider):
             return SandboxConnectionError(f"Daytona sandbox provider connection error: {exc}")
         return SandboxError(f"Daytona sandbox provider error: {exc}")
 
+    def _resolve_volumes(self, daytona: Any, mounts: list[VolumeMount]) -> list[DaytonaVolumeMount]:
+        """Map named volumes to Daytona mounts, resolving each name to its id.
+
+        Daytona mounts by volume id rather than name, so a benchmark that only
+        knows the name would otherwise have to resolve it itself and every
+        caller would reimplement this.
+        """
+        resolved: list[DaytonaVolumeMount] = []
+        for mount in mounts:
+            try:
+                volume = daytona.volume.get(mount.name, create=mount.create_if_missing)
+            except DaytonaNotFoundError as exc:
+                raise SandboxError(
+                    f"Daytona volume {mount.name!r} does not exist (mount {mount.mount_path}); "
+                    "create it or set create_if_missing"
+                ) from exc
+            except DaytonaError as exc:
+                raise self._sandbox_error(exc) from exc
+            resolved.append(DaytonaVolumeMount(volume_id=volume.id, mount_path=mount.mount_path))
+        return resolved
+
     @_PROVIDER_RETRY
     async def create_sandbox(self, request: SandboxCreateRequest) -> DaytonaSandbox:
         daytona = self._daytona
@@ -626,6 +651,8 @@ class DaytonaSandboxProvider(SandboxProvider):
             gpu=request.resources.gpu or None,
             gpu_type=_daytona_gpu_type(request.resources.gpu_type),
         )
+
+        volume_mounts = self._resolve_volumes(daytona, request.volumes) if request.volumes else None
 
         match request.source:
             case ImageSource(image=image):
@@ -638,6 +665,7 @@ class DaytonaSandboxProvider(SandboxProvider):
                     network_block_all=request.network_block_all,
                     resources=resources,
                     env_vars=request.env_vars,
+                    volumes=volume_mounts,
                 )
             case SnapshotSource(snapshot=snapshot) | TargetedSnapshotSource(snapshot=snapshot):
                 if request.resources.gpu:
@@ -653,6 +681,7 @@ class DaytonaSandboxProvider(SandboxProvider):
                     language="python",
                     network_block_all=request.network_block_all,
                     env_vars=request.env_vars,
+                    volumes=volume_mounts,
                 )
             case ComposeSource():
                 raise SandboxError("ComposeSource must be unwrapped before provider.create_sandbox")

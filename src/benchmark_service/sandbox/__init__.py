@@ -24,6 +24,7 @@ from benchmark_service.sandbox.types import (
     SandboxQuery,
     SandboxSource,
     SnapshotSource,
+    VolumeMount,
     TargetedSnapshotSource,
 )
 
@@ -56,6 +57,7 @@ __all__ = [
     "SandboxQuery",
     "SandboxSource",
     "SnapshotSource",
+    "VolumeMount",
     "TargetedSnapshotSource",
     "sandbox_provider_config_from_mapping",
 ]

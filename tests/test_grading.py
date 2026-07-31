@@ -23,6 +23,7 @@ from benchmark_service import (
     Sandbox,
     SnapshotSource,
     TargetedSnapshotSource,
+    VolumeMount,
 )
 from benchmark_service import auth as auth_module
 from benchmark_service import grading
@@ -265,6 +266,38 @@ async def test_grade_instance_creates_isolated_sandbox_from_task_source_and_dele
     assert create.labels["tenant"] == "acme"
     assert create.labels["run-id"] == "run-1"
     assert provider.deleted == ["fake-sandbox"]
+
+
+class VolumeStub(SandboxStub):
+    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> Any:
+        task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
+        return task.model_copy(
+            update={
+                "volumes": [
+                    VolumeMount(
+                        name="fixtures",
+                        mount_path="/fixtures",
+                        subpath="runs/{run_id}",
+                    )
+                ]
+            }
+        )
+
+
+async def test_grade_instance_forwards_benchmark_declared_volumes() -> None:
+    service = await VolumeStub.create()
+    provider = FakeProvider(FakeSandbox())
+
+    await _grade(service, provider)
+
+    assert provider.created[0].volumes == [
+        VolumeMount(
+            name="fixtures",
+            mount_path="/fixtures",
+            subpath="runs/{run_id}",
+        )
+    ]
+    assert provider.created[0].labels["run-id"] == "run-1"
 
 
 class SpecStub(SandboxStub):

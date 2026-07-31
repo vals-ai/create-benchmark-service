@@ -39,6 +39,7 @@ from benchmark_service.sandbox import (
     SandboxProvider,
     SnapshotSource,
     TargetedSnapshotSource,
+    VolumeMount,
 )
 from benchmark_service.sandbox.types import BaseSandboxSource
 from benchmark_service.schemas import (
@@ -177,6 +178,7 @@ class _ResolvedSpec:
 
     source: BaseSandboxSource | TargetedSnapshotSource
     resources: Resources
+    volumes: list[VolumeMount]
     network_block_all: bool
     grade_timeout: float
 
@@ -200,10 +202,17 @@ def _resolve_grading_spec(task: RetrieveTaskResponse) -> _ResolvedSpec:
         # forwarded through the required create-request resources field.
         resources = resources.model_copy(update={"gpu": 0, "gpu_type": None})
     if spec is None:
-        return _ResolvedSpec(source, resources, True, DEFAULT_GRADE_TIMEOUT_S)
+        return _ResolvedSpec(
+            source=source,
+            resources=resources,
+            volumes=task.volumes,
+            network_block_all=True,
+            grade_timeout=DEFAULT_GRADE_TIMEOUT_S,
+        )
     return _ResolvedSpec(
         source=source,
         resources=resources,
+        volumes=task.volumes,
         network_block_all=spec.network_block_all,
         grade_timeout=spec.timeout_s if spec.timeout_s is not None else DEFAULT_GRADE_TIMEOUT_S,
     )
@@ -253,6 +262,7 @@ class _GradeRun:
             auto_stop_interval=_auto_stop_minutes(budget_s),
             create_timeout=_GRADING_CREATE_TIMEOUT_S,
             network_block_all=spec.network_block_all,
+            volumes=spec.volumes,
         )
 
     async def create_sandbox(self, spec: _ResolvedSpec, budget_s: float) -> Sandbox:

@@ -16,7 +16,8 @@ from daytona.common.errors import (
     DaytonaRateLimitError,
 )
 from daytona.common.pty import PtyResult
-from daytona_api_client_async.exceptions import ApiException
+from daytona_api_client import VolumeState
+from daytona_api_client_async.exceptions import ApiException, NotFoundException
 from multidict import CIMultiDict, CIMultiDictProxy
 from pydantic import TypeAdapter, ValidationError
 from yarl import URL
@@ -37,6 +38,7 @@ from benchmark_service.sandbox import (
     SandboxSource,
     SnapshotSource,
     TargetedSnapshotSource,
+    VolumeMount,
 )
 from benchmark_service.sandbox.daytona import (
     _PTY_STDOUT_TAIL_MAX_BYTES,  # pyright: ignore[reportPrivateUsage]
@@ -740,15 +742,18 @@ def _request(
     name: str,
     resources: Resources | None = None,
     source: SandboxSource | None = None,
+    labels: dict[str, str] | None = None,
+    volumes: list[VolumeMount] | None = None,
 ) -> SandboxCreateRequest:
     return SandboxCreateRequest(
         source=source or ImageSource(image="python:3.12"),
         resources=resources or Resources(vcpu=2, memory=4, disk=10),
         name=name,
-        labels={},
+        labels=labels or {},
         env_vars={},
         auto_stop_interval=600,
         create_timeout=360,
+        volumes=volumes or [],
     )
 
 
@@ -1463,6 +1468,25 @@ class CapturingCreateDaytonaClient(DaytonaClient):
         return self.sandbox
 
 
+class RecordingVolumeService:
+    def __init__(self, results: list[Any]) -> None:
+        self.results = results
+        self.calls: list[tuple[str, bool]] = []
+
+    async def get(self, name: str, create: bool = False) -> Any:
+        self.calls.append((name, create))
+        result = self.results.pop(0) if len(self.results) > 1 else self.results[0]
+        if isinstance(result, BaseException):
+            raise result
+        return result
+
+
+class VolumeCapturingDaytonaClient(CapturingCreateDaytonaClient):
+    def __init__(self, sandbox: InnerSandbox, volume_results: list[Any]) -> None:
+        super().__init__(sandbox)
+        self.volume = RecordingVolumeService(volume_results)
+
+
 async def test_daytona_provider_uses_target_only_for_targeted_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
     clients: dict[str, CapturingCreateDaytonaClient] = {}
 
@@ -1902,6 +1926,129 @@ async def test_daytona_create_forwards_network_block_all() -> None:
     assert daytona.create_params.network_block_all is True
 
 
+async def test_daytona_create_awaits_volume_and_waits_until_ready(monkeypatch: pytest.MonkeyPatch) -> None:
+    pending = SimpleNamespace(
+        id="volume-id",
+        name="fixtures",
+        state=VolumeState.PENDING_CREATE,
+        error_reason=None,
+    )
+    ready = SimpleNamespace(
+        id="volume-id",
+        name="fixtures",
+        state=VolumeState.READY,
+        error_reason=None,
+    )
+    daytona = VolumeCapturingDaytonaClient(InnerSandbox(), [pending, ready])
+    monkeypatch.setattr(daytona_module, "_VOLUME_READY_POLL_SECONDS", 0)
+
+    await _provider(daytona).create_sandbox(
+        _request(
+            "grade-sb",
+            labels={"run-id": "run-123"},
+            volumes=[
+                VolumeMount(
+                    name="fixtures",
+                    mount_path="/fixtures",
+                    create_if_missing=True,
+                    subpath="runs/{run_id}",
+                )
+            ],
+        )
+    )
+
+    assert daytona.volume.calls == [("fixtures", True), ("fixtures", False)]
+    assert daytona.create_params is not None
+    mount = daytona.create_params.volumes[0]
+    assert mount.volume_id == "volume-id"
+    assert mount.mount_path == "/fixtures"
+    assert mount.subpath == "runs/run-123"
+
+
+async def test_daytona_create_bounds_volume_readiness_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    pending = SimpleNamespace(
+        id="volume-id",
+        name="fixtures",
+        state=VolumeState.PENDING_CREATE,
+        error_reason=None,
+    )
+    daytona = VolumeCapturingDaytonaClient(InnerSandbox(), [pending])
+    monkeypatch.setattr(daytona_module, "_VOLUME_READY_POLL_SECONDS", 60)
+    monkeypatch.setattr(daytona_module, "_VOLUME_READY_TIMEOUT_SECONDS", 0.01)
+
+    with pytest.raises(SandboxError, match="did not become ready within 0.01s"):
+        await _provider(daytona).create_sandbox(
+            _request(
+                "grade-sb",
+                volumes=[VolumeMount(name="fixtures", mount_path="/fixtures")],
+            )
+        )
+
+    assert daytona.create_params is None
+
+
+async def test_daytona_create_reports_missing_volume_as_sandbox_error() -> None:
+    missing = NotFoundException(status=404, reason="volume not found")
+    daytona = VolumeCapturingDaytonaClient(InnerSandbox(), [missing])
+
+    with pytest.raises(SandboxError, match="does not exist") as raised:
+        await _provider(daytona).create_sandbox(
+            _request(
+                "grade-sb",
+                volumes=[VolumeMount(name="missing", mount_path="/fixtures")],
+            )
+        )
+
+    assert type(raised.value) is SandboxError
+
+
+async def test_daytona_create_rejects_read_only_volume_before_lookup() -> None:
+    ready = SimpleNamespace(
+        id="volume-id",
+        name="fixtures",
+        state=VolumeState.READY,
+        error_reason=None,
+    )
+    daytona = VolumeCapturingDaytonaClient(InnerSandbox(), [ready])
+
+    with pytest.raises(SandboxError, match="does not support read-only"):
+        await _provider(daytona).create_sandbox(
+            _request(
+                "grade-sb",
+                volumes=[VolumeMount(name="fixtures", mount_path="/fixtures", read_only=True)],
+            )
+        )
+
+    assert daytona.volume.calls == []
+    assert daytona.create_params is None
+
+
+async def test_volume_run_subpath_requires_run_label_before_lookup() -> None:
+    ready = SimpleNamespace(
+        id="volume-id",
+        name="fixtures",
+        state=VolumeState.READY,
+        error_reason=None,
+    )
+    daytona = VolumeCapturingDaytonaClient(InnerSandbox(), [ready])
+
+    with pytest.raises(SandboxError, match="requires a non-empty"):
+        await _provider(daytona).create_sandbox(
+            _request(
+                "grade-sb",
+                volumes=[
+                    VolumeMount(
+                        name="fixtures",
+                        mount_path="/fixtures",
+                        subpath="runs/{run_id}",
+                    )
+                ],
+            )
+        )
+
+    assert daytona.volume.calls == []
+
+
 def test_daytona_config_from_env_reads_environment(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("DAYTONA_API_KEY", "key-1")
     monkeypatch.setenv("DAYTONA_API_URL", "https://daytona.example")
@@ -1918,3 +2065,48 @@ def test_daytona_config_from_env_raises_when_missing(monkeypatch: pytest.MonkeyP
     monkeypatch.setenv("DAYTONA_TARGET", "us")
     with pytest.raises(MissingSandboxConfigError, match="DAYTONA_API_KEY"):
         DaytonaProviderConfig.from_env()
+
+
+def test_volume_mount_requires_an_absolute_path() -> None:
+    """A relative mount path silently lands somewhere provider-defined."""
+    with pytest.raises(ValidationError):
+        VolumeMount(name="fixtures", mount_path="vol")
+
+
+def test_volume_mounts_reject_duplicate_paths() -> None:
+    """Two volumes on one path is a config error, not a last-one-wins race."""
+    with pytest.raises(ValidationError):
+        SandboxCreateRequest(
+            source=ImageSource(image="python:3.12"),
+            resources=Resources(vcpu=2, memory=4, disk=10),
+            name="dup",
+            labels={},
+            env_vars={},
+            auto_stop_interval=600,
+            create_timeout=360,
+            volumes=[
+                VolumeMount(name="a", mount_path="/vol"),
+                VolumeMount(name="b", mount_path="/vol"),
+            ],
+        )
+
+
+def test_requests_default_to_no_volumes() -> None:
+    """Every existing caller keeps its current behaviour."""
+    request = SandboxCreateRequest(
+        source=ImageSource(image="python:3.12"),
+        resources=Resources(vcpu=2, memory=4, disk=10),
+        name="plain",
+        labels={},
+        env_vars={},
+        auto_stop_interval=600,
+        create_timeout=360,
+    )
+
+    assert request.volumes == []
+
+
+@pytest.mark.parametrize("subpath", ["/absolute", "../escape", "runs/{missing_label}"])
+def test_volume_mount_rejects_invalid_subpath(subpath: str) -> None:
+    with pytest.raises(ValidationError):
+        VolumeMount(name="fixtures", mount_path="/fixtures", subpath=subpath)

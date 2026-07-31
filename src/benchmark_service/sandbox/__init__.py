@@ -25,6 +25,7 @@ from benchmark_service.sandbox.types import (
     SandboxSource,
     SnapshotSource,
     TargetedSnapshotSource,
+    VolumeMount,
 )
 
 SandboxProviderConfig = Annotated[DaytonaProviderConfig | ModalProviderConfig, Field(discriminator="type")]
@@ -57,5 +58,6 @@ __all__ = [
     "SandboxSource",
     "SnapshotSource",
     "TargetedSnapshotSource",
+    "VolumeMount",
     "sandbox_provider_config_from_mapping",
 ]

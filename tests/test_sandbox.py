@@ -7,7 +7,7 @@ from typing import Any, Awaitable, Callable, cast
 
 import pytest
 from aiohttp import ClientConnectionError, ClientResponseError, RequestInfo
-from daytona import DaytonaConfig, GpuType, SandboxState
+from daytona import CreateSandboxFromSnapshotParams, DaytonaConfig, GpuType, SandboxState
 from daytona.common.errors import (
     DaytonaConflictError,
     DaytonaConnectionError,
@@ -1066,6 +1066,26 @@ async def test_daytona_provider_mounts_durable_volumes() -> None:
         ("vol-runs", "/workspace", "runs/run-1/task-1"),
         ("vol-dataset", "/data", None),
     ]
+
+
+async def test_daytona_provider_mounts_volumes_on_snapshot_sandboxes() -> None:
+    """A snapshot fixes sizing, not mounts, so volumes must reach the snapshot params too.
+
+    Verified live against a real Daytona snapshot: the volume mounts and is writable.
+    """
+    daytona = DaytonaClient(InnerSandbox(), volumes={"reference": []})
+    provider = _provider(daytona)
+    resources = _volume_resources(SandboxVolume(name="reference", mount_path="/reference"))
+    request = _request(
+        "snapshot-volume-task",
+        resources=resources,
+        source=SnapshotSource(snapshot="grader-snapshot"),
+    )
+
+    await provider.create_sandbox(request)
+
+    assert isinstance(daytona.created_params, CreateSandboxFromSnapshotParams)
+    assert [(v.volume_id, v.mount_path) for v in daytona.created_volumes()] == [("vol-reference", "/reference")]
 
 
 async def test_daytona_provider_omits_volumes_when_none_requested() -> None:

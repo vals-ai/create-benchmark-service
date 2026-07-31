@@ -63,6 +63,9 @@ DEFAULT_GRADE_TIMEOUT_S = 1800.0
 SUBMISSION_ARTIFACT_SANDBOX_PATH = "/tmp/submission-artifact"
 _GRADING_CREATE_TIMEOUT_S = 600
 _PREPARATION_TIMEOUT_S = 600.0
+# Resources fields a snapshot-backed grading sandbox may still declare, because a
+# snapshot fixes its sizing but says nothing about what is mounted into it.
+_SNAPSHOT_OVERRIDABLE_RESOURCES = frozenset({"volumes"})
 _TEARDOWN_TIMEOUT_S = 120.0
 _STREAM_CLOSE_TIMEOUT_S = 10.0
 _COLLAPSE_CLOSE_TIMEOUT_S = _STREAM_CLOSE_TIMEOUT_S
@@ -188,12 +191,20 @@ def _resolve_grading_spec(task: RetrieveTaskResponse) -> _ResolvedSpec:
         raise ValueError(
             "sandbox grading does not support ComposeSource; set eval_sandbox.source to an image or snapshot"
         )
-    if spec is not None and spec.resources is not None and isinstance(
-        source, (SnapshotSource, TargetedSnapshotSource)
-    ):
-        raise ValueError(
-            "eval_sandbox.resources cannot override a snapshot-backed sandbox; use an image source with explicit resources"
+    if spec is not None and spec.resources is not None and isinstance(source, (SnapshotSource, TargetedSnapshotSource)):
+        # Only sizing is fixed at snapshot creation. Volumes are mounts, not size, so a
+        # grading sandbox may declare its own without switching to an image source.
+        overridden = sorted(
+            field
+            for field in type(task.resources).model_fields
+            if field not in _SNAPSHOT_OVERRIDABLE_RESOURCES
+            and getattr(spec.resources, field) != getattr(task.resources, field)
         )
+        if overridden:
+            raise ValueError(
+                f"eval_sandbox.resources cannot override a snapshot-backed sandbox's {', '.join(overridden)}; "
+                "use an image source with explicit resources"
+            )
     resources = spec.resources if spec is not None and spec.resources is not None else task.resources
     if isinstance(source, (SnapshotSource, TargetedSnapshotSource)):
         # The snapshot owns its resources; generation GPU settings cannot be
@@ -397,9 +408,7 @@ async def grade_instance_stream(
                     evaluation_task = None
                     chunk = completed_task.result()
                 except StopAsyncIteration:
-                    terminal = StreamErrorChunk(
-                        type="error", data="evaluate_instance completed without a result chunk"
-                    )
+                    terminal = StreamErrorChunk(type="error", data="evaluate_instance completed without a result chunk")
                     break
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("grading failed run_id=%s task_id=%s", run_id, run.task_id)

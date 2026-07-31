@@ -39,7 +39,12 @@ from benchmark_service.grading import (
     collapse_stream,
     evaluate_submission,
 )
-from benchmark_service.sandbox import MissingSandboxConfigError, SandboxCreateRequest, SandboxProvider
+from benchmark_service.sandbox import (
+    MissingSandboxConfigError,
+    SandboxCreateRequest,
+    SandboxProvider,
+    SandboxVolume,
+)
 from benchmark_service.sandbox.types import ExecResult
 from benchmark_service.schemas import (
     ArtifactGradingSubmission,
@@ -300,9 +305,7 @@ async def test_grade_instance_applies_benchmark_declared_eval_sandbox_spec() -> 
 
 
 class ComposeGenerationSourceStub(SandboxStub):
-    async def retrieve_task(
-        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
-    ) -> Any:
+    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> Any:
         task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
         return task.model_copy(
             update={
@@ -315,9 +318,7 @@ class ComposeGenerationSourceStub(SandboxStub):
 
 
 class ComposeGenerationWithEvalOverrideStub(ComposeGenerationSourceStub):
-    async def retrieve_task(
-        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
-    ) -> Any:
+    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> Any:
         task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
         return task.model_copy(
             update={
@@ -352,9 +353,7 @@ async def test_grade_instance_rejects_compose_generation_source_without_eval_ove
 
 
 class SnapshotResourceSpecStub(SandboxStub):
-    async def retrieve_task(
-        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
-    ) -> Any:
+    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> Any:
         task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
         return task.model_copy(
             update={
@@ -373,14 +372,80 @@ async def test_grade_instance_rejects_snapshot_resource_override_before_create()
     resp = await _grade(service, provider)
 
     assert resp.status == V1EvalStatus.ERROR
-    assert "cannot override a snapshot-backed sandbox" in resp.errors[0]
+    assert "cannot override a snapshot-backed sandbox's disk, memory, vcpu" in resp.errors[0]
+    assert provider.created == []
+
+
+class SnapshotVolumeSpecStub(SandboxStub):
+    """A snapshot grading sandbox mounting a reference dataset, keeping the snapshot's sizing."""
+
+    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> Any:
+        task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
+        return task.model_copy(
+            update={
+                "eval_sandbox": EvalSandboxSpec(
+                    source=SnapshotSource(snapshot="grader-snapshot"),
+                    resources=task.resources.model_copy(
+                        update={
+                            "volumes": [
+                                SandboxVolume(name="reference", mount_path="/reference", read_only=True),
+                            ]
+                        }
+                    ),
+                )
+            }
+        )
+
+
+async def test_grade_instance_allows_snapshot_to_declare_volumes() -> None:
+    """A snapshot fixes sizing, not mounts, so a grading sandbox may still declare volumes."""
+    service = await SnapshotVolumeSpecStub.create()
+    provider = FakeProvider(FakeSandbox())
+
+    resp = await _grade(service, provider)
+
+    assert resp.status == V1EvalStatus.EVALUATED
+    create = provider.created[0]
+    assert create.source == SnapshotSource(snapshot="grader-snapshot")
+    assert [(v.name, v.mount_path, v.read_only) for v in create.resources.volumes] == [
+        ("reference", "/reference", True)
+    ]
+    # Sizing still comes from the snapshot's own values, unchanged by the override.
+    assert (create.resources.vcpu, create.resources.memory, create.resources.disk) == (2, 4, 10)
+
+
+class SnapshotVolumeAndSizingSpecStub(SandboxStub):
+    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> Any:
+        task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
+        return task.model_copy(
+            update={
+                "eval_sandbox": EvalSandboxSpec(
+                    source=SnapshotSource(snapshot="grader-snapshot"),
+                    resources=Resources(
+                        vcpu=8,
+                        memory=4,
+                        disk=10,
+                        volumes=[SandboxVolume(name="reference", mount_path="/reference")],
+                    ),
+                )
+            }
+        )
+
+
+async def test_grade_instance_rejects_snapshot_sizing_change_alongside_volumes() -> None:
+    """Adding volumes must not smuggle a sizing override past the snapshot check."""
+    service = await SnapshotVolumeAndSizingSpecStub.create()
+    provider = FakeProvider(FakeSandbox())
+
+    resp = await _grade(service, provider)
+
+    assert resp.status == V1EvalStatus.ERROR
+    assert "cannot override a snapshot-backed sandbox's vcpu" in resp.errors[0]
     assert provider.created == []
 
 
 class SnapshotEvalForGpuTaskStub(SandboxStub):
-    async def retrieve_task(
-        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
-    ) -> Any:
+    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> Any:
         task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
         return task.model_copy(
             update={
@@ -403,9 +468,7 @@ async def test_grade_instance_does_not_apply_generation_gpu_to_snapshot_override
 
 
 class SnapshotGenerationGpuTaskStub(SandboxStub):
-    async def retrieve_task(
-        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
-    ) -> Any:
+    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> Any:
         task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
         return task.model_copy(
             update={
@@ -428,9 +491,7 @@ async def test_grade_instance_does_not_apply_generation_gpu_to_default_snapshot(
 
 
 class TargetedSnapshotGenerationGpuTaskStub(SandboxStub):
-    async def retrieve_task(
-        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
-    ) -> Any:
+    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> Any:
         task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
         return task.model_copy(
             update={
@@ -571,9 +632,7 @@ class BlockingCleanupStub(SandboxStub):
     cleanup_finished: asyncio.Event
     release_cleanup: asyncio.Event
 
-    async def retrieve_task(
-        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
-    ) -> Any:
+    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> Any:
         task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
         return task.model_copy(update={"eval_sandbox": EvalSandboxSpec(timeout_s=0.01)})
 
@@ -729,9 +788,7 @@ async def test_request_cancellation_keeps_admission_until_sandbox_deletion() -> 
 
 
 class SlowRetrieveStub(SandboxStub):
-    async def retrieve_task(
-        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
-    ) -> Any:
+    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> Any:
         await asyncio.sleep(0.1)
         return await super().retrieve_task(task_id, skip_validation, dataset=dataset)
 
@@ -971,7 +1028,9 @@ def test_grading_provider_config_does_not_render_present_modal_secret(
     assert "must-not-appear" not in str(exc_info.value)
 
 
-def _sandbox_app(monkeypatch: pytest.MonkeyPatch, service_cls: type[StubBenchmark] = SandboxStub) -> BenchmarkServiceApp:
+def _sandbox_app(
+    monkeypatch: pytest.MonkeyPatch, service_cls: type[StubBenchmark] = SandboxStub
+) -> BenchmarkServiceApp:
     clear_allowlist_cache()
     clear_auth_cache()
     monkeypatch.setenv("AUTH_REQUIRED", "true")

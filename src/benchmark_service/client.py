@@ -1,7 +1,10 @@
 """HTTP/WebSocket client for communicating with a benchmark service."""
 
-from collections.abc import Callable
-from typing import Any
+import asyncio
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import Any, TypeVar
 
 import httpx
 import websockets
@@ -14,7 +17,7 @@ from tenacity import (
 )
 from websockets.exceptions import ConnectionClosed
 
-from benchmark_service.sandbox import SandboxProvider, SandboxProviderConfig
+from benchmark_service.sandbox import SandboxNotFoundError, SandboxProvider, SandboxProviderConfig
 from benchmark_service.schemas import (
     EvaluateInstanceRequest,
     EvaluateResponseRequest,
@@ -43,6 +46,10 @@ from benchmark_service.v1_schemas import (
 )
 
 _stream_chunk_adapter: TypeAdapter[StreamChunk] = TypeAdapter(StreamChunk)
+_RecoveryResult = TypeVar("_RecoveryResult")
+
+_OUTAGE_ID_ENV = "VALKYRIE_SANDBOX_OUTAGE_ID"
+_OUTAGE_STARTED_ENV = "VALKYRIE_SANDBOX_OUTAGE_STARTED_EPOCH"
 
 _retry_http = retry(
     retry=retry_if_exception_type(
@@ -89,6 +96,75 @@ def _unauthenticated_error(response: httpx.Response) -> "BenchmarkServiceUnauthe
         detail = response.text
 
     return BenchmarkServiceUnauthenticatedError(detail, status_code=response.status_code)
+
+
+@dataclass(frozen=True)
+class SandboxRecoveryAttempt:
+    """One bounded invocation of a durable sandbox-backed task.
+
+    ``environment`` is empty for the initial attempt. After a provider-confirmed
+    sandbox loss it carries stable outage metadata until the replacement has
+    completed benchmark setup and calls ``mark_replacement_ready``. If that
+    setup fails, the next replacement receives the same outage identity rather
+    than double-crediting one interruption.
+    """
+
+    number: int
+    max_attempts: int
+    outage_id: str | None
+    outage_started_epoch: float | None
+    sandbox_loss_retry_available: bool
+    _mark_ready: Callable[[str | None], None] = field(repr=False, compare=False)
+
+    @property
+    def environment(self) -> dict[str, str]:
+        """Environment metadata to add to this attempt's sandbox."""
+        if self.outage_id is None or self.outage_started_epoch is None:
+            return {}
+        return {
+            _OUTAGE_ID_ENV: self.outage_id,
+            _OUTAGE_STARTED_ENV: str(self.outage_started_epoch),
+        }
+
+    def mark_replacement_ready(self) -> None:
+        """Acknowledge that benchmark setup persisted this outage metadata."""
+        self._mark_ready(self.outage_id)
+
+
+@dataclass
+class _SandboxRecoveryState:
+    run_id: str
+    task_id: str
+    outage_id: str | None = None
+    outage_started_epoch: float | None = None
+
+    def attempt(
+        self,
+        number: int,
+        max_attempts: int,
+        *,
+        recover_sandbox_loss: bool,
+    ) -> SandboxRecoveryAttempt:
+        return SandboxRecoveryAttempt(
+            number=number,
+            max_attempts=max_attempts,
+            outage_id=self.outage_id,
+            outage_started_epoch=self.outage_started_epoch,
+            sandbox_loss_retry_available=recover_sandbox_loss and number < max_attempts,
+            _mark_ready=self.mark_ready,
+        )
+
+    def record_loss(self, attempt_number: int) -> None:
+        if self.outage_id is not None:
+            return
+        self.outage_id = f"{self.run_id}:{self.task_id}:{attempt_number}"
+        self.outage_started_epoch = time.time()
+
+    def mark_ready(self, outage_id: str | None) -> None:
+        if outage_id is None or outage_id != self.outage_id:
+            return
+        self.outage_id = None
+        self.outage_started_epoch = None
 
 
 class BenchmarkServiceClient:
@@ -284,6 +360,67 @@ class BenchmarkServiceClient:
             )
 
         return RetrieveTaskResponse.model_validate(response.json())
+
+    async def run_with_sandbox_recovery(
+        self,
+        task_id: str,
+        run_id: str,
+        operation: Callable[[RetrieveTaskResponse, SandboxRecoveryAttempt], Awaitable[_RecoveryResult]],
+        *,
+        dataset: str | None = None,
+        retryable_attempt_errors: tuple[type[Exception], ...] = (),
+        default_max_attempts: int = 1,
+        retry_delay_s: float = 2.0,
+        on_retry: Callable[[SandboxRecoveryAttempt, Exception], None] | None = None,
+    ) -> _RecoveryResult:
+        """Run a task attempt with benchmark-declared sandbox-loss recovery.
+
+        The task payload is loaded once so its recovery policy and sandbox
+        configuration cannot drift between attempts. ``SandboxNotFoundError``
+        is retried only when the benchmark explicitly opts in. Callers may
+        additionally name setup errors that require a fresh sandbox; these use
+        ``default_max_attempts`` for benchmarks without a recovery policy and
+        count against the declared cap when a policy is present.
+
+        The final exception is re-raised unchanged when the applicable attempt
+        budget is exhausted.
+        """
+        if not run_id:
+            raise ValueError("run_id must be non-empty")
+        if not 1 <= default_max_attempts <= 20:
+            raise ValueError("default_max_attempts must be between 1 and 20")
+        if retry_delay_s < 0:
+            raise ValueError("retry_delay_s must be non-negative")
+
+        task = await self.retrieve_task(task_id=task_id, dataset=dataset)
+        policy = task.sandbox_recovery
+        max_attempts = policy.max_sandbox_attempts if policy is not None else default_max_attempts
+        state = _SandboxRecoveryState(run_id=run_id, task_id=task_id)
+
+        for attempt_number in range(1, max_attempts + 1):
+            attempt = state.attempt(
+                attempt_number,
+                max_attempts,
+                recover_sandbox_loss=policy is not None,
+            )
+            try:
+                return await operation(task, attempt)
+            except SandboxNotFoundError as exc:
+                if not attempt.sandbox_loss_retry_available:
+                    raise
+                state.record_loss(attempt_number)
+                retry_error: Exception = exc
+            except Exception as exc:
+                if not isinstance(exc, retryable_attempt_errors) or attempt_number >= max_attempts:
+                    raise
+                retry_error = exc
+
+            if on_retry is not None:
+                on_retry(attempt, retry_error)
+            if retry_delay_s:
+                await asyncio.sleep(retry_delay_s)
+
+        raise AssertionError("sandbox recovery loop exited without a result")
 
     async def setup_task(
         self,

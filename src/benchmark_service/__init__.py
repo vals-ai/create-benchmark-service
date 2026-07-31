@@ -3,7 +3,12 @@
 from benchmark_service._version import __version__
 from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.base import BenchmarkService
-from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError, BenchmarkServiceUnauthenticatedError
+from benchmark_service.client import (
+    BenchmarkServiceClient,
+    BenchmarkServiceError,
+    BenchmarkServiceUnauthenticatedError,
+    SandboxRecoveryAttempt,
+)
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.sandbox import (
     ComposeSource,
@@ -42,6 +47,7 @@ __all__ = [
     "BenchmarkServiceUnauthenticatedError",
     "BenchmarkServiceClient",
     "BenchmarkServiceError",
+    "SandboxRecoveryAttempt",
     "ArtifactGradingSubmission",
     "ComposeSource",
     "ComposeSandbox",

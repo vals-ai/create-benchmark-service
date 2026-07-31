@@ -282,6 +282,32 @@ Status codes: 403 if the tenant isn't allowed the dataset *or* if the caller use
 
 **Deferred to follow-on plans.** `GET /v1/schema`, `GET /v1/tasks/{task_id}` (single-task lookup), `/ws/v1/evaluate` (streamed judges), async/`poll_url` response shape, idempotency on `(run_id, task_id)`.
 
+### Client-owned sandbox recovery
+
+`BenchmarkServiceClient.run_with_sandbox_recovery(...)` owns the bounded loop for tasks that opt in with `SandboxRecoveryPolicy`. It loads the task once, retries only provider-confirmed `SandboxNotFoundError` losses, and counts every fresh-sandbox attempt against one cap. Callers can explicitly include setup errors that also require a fresh sandbox; those retain the legacy caller-supplied default cap for benchmarks without a recovery policy.
+
+The operation receives a `SandboxRecoveryAttempt`. Merge its `environment` into the sandbox environment, then call `mark_replacement_ready()` only after benchmark setup has durably recorded the outage. A failed replacement setup therefore carries the same outage ID into the next sandbox, while a later provider loss gets a distinct ID. `sandbox_loss_retry_available` lets a runner persist its normal terminal task error without duplicating the policy calculation.
+
+```python
+async def run_attempt(task, attempt):
+    async with create_sandbox(
+        source=task.source,
+        env_vars={**base_environment, **attempt.environment},
+    ) as sandbox:
+        await client.setup_task(task_id, sandbox.id)
+        attempt.mark_replacement_ready()
+        return await run_agent(sandbox)
+
+
+result = await client.run_with_sandbox_recovery(
+    task_id,
+    run_id,
+    run_attempt,
+    retryable_attempt_errors=(TransientSandboxSetupError,),
+    default_max_attempts=2,
+)
+```
+
 ### Schemas (`schemas.py`)
 
 Pydantic models used across requests and responses:

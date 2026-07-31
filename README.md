@@ -289,7 +289,8 @@ Status codes: 403 if the tenant isn't allowed the dataset *or* if the caller use
 The operation receives a `SandboxRecoveryAttempt`. Merge its `environment` into the sandbox environment, then call `mark_replacement_ready()` only after benchmark setup has durably recorded the outage. A failed replacement setup therefore carries the same outage ID into the next sandbox, while a later provider loss gets a distinct ID. `sandbox_loss_retry_available` lets a runner persist its normal terminal task error without duplicating the policy calculation.
 
 ```python
-async def run_attempt(task, attempt):
+async def run_attempt(attempt):
+    task = await attempt.retrieve_task()
     async with create_sandbox(
         source=task.source,
         env_vars={**base_environment, **attempt.environment},

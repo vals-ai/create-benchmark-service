@@ -177,6 +177,28 @@ def test_sandbox_recovery_policy_rejects_out_of_range_attempts(max_sandbox_attem
         SandboxRecoveryPolicy(max_sandbox_attempts=max_sandbox_attempts)
 
 
+async def test_client_keeps_task_loading_lazy_when_initial_operation_completes(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _mock_http = benchmark_client
+    retrieve_task = AsyncMock(return_value=_task_response(3))
+    monkeypatch.setattr(client, "retrieve_task", retrieve_task)
+
+    async def operation(attempt: SandboxRecoveryAttempt) -> int:
+        return attempt.number
+
+    result = await client.run_with_sandbox_recovery(
+        "task-1",
+        "run-1",
+        operation,
+        retry_delay_s=0,
+    )
+
+    assert result == 1
+    retrieve_task.assert_not_awaited()
+
+
 async def test_client_recovers_consecutive_losses_with_distinct_outage_identity(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
     monkeypatch: pytest.MonkeyPatch,
@@ -189,7 +211,6 @@ async def test_client_recovers_consecutive_losses_with_distinct_outage_identity(
     retry_errors: list[Exception] = []
 
     async def operation(
-        _task: RetrieveTaskResponse,
         attempt: SandboxRecoveryAttempt,
     ) -> str:
         attempts.append(attempt)
@@ -235,7 +256,6 @@ async def test_client_preserves_outage_identity_when_replacement_setup_retries(
     environments: list[dict[str, str]] = []
 
     async def operation(
-        _task: RetrieveTaskResponse,
         attempt: SandboxRecoveryAttempt,
     ) -> str:
         environments.append(attempt.environment)
@@ -279,7 +299,6 @@ async def test_client_does_not_recover_lost_sandbox_without_policy(
     attempts: list[SandboxRecoveryAttempt] = []
 
     async def operation(
-        _task: RetrieveTaskResponse,
         attempt: SandboxRecoveryAttempt,
     ) -> None:
         nonlocal calls
@@ -309,7 +328,6 @@ async def test_client_applies_default_attempt_cap_to_caller_setup_errors(
     calls = 0
 
     async def operation(
-        _task: RetrieveTaskResponse,
         attempt: SandboxRecoveryAttempt,
     ) -> int:
         nonlocal calls
@@ -340,9 +358,9 @@ async def test_client_keeps_setup_retry_cap_with_larger_recovery_policy(
     attempts: list[int] = []
 
     async def operation(
-        _task: RetrieveTaskResponse,
         attempt: SandboxRecoveryAttempt,
     ) -> None:
+        await attempt.retrieve_task()
         attempts.append(attempt.number)
         raise RetryableSetupError("setup failed")
 
@@ -368,7 +386,6 @@ async def test_client_reraises_provider_error_when_policy_cap_is_exhausted(
     attempts: list[int] = []
 
     async def operation(
-        _task: RetrieveTaskResponse,
         attempt: SandboxRecoveryAttempt,
     ) -> None:
         attempts.append(attempt.number)

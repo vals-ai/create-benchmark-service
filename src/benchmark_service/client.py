@@ -1,5 +1,7 @@
 """HTTP/WebSocket client for communicating with a benchmark service."""
 
+from __future__ import annotations
+
 import asyncio
 import time
 from collections.abc import Awaitable, Callable
@@ -110,11 +112,19 @@ class SandboxRecoveryAttempt:
     """
 
     number: int
-    max_attempts: int
     outage_id: str | None
     outage_started_epoch: float | None
-    sandbox_loss_retry_available: bool
-    _mark_ready: Callable[[str | None], None] = field(repr=False, compare=False)
+    _state: _SandboxRecoveryState = field(repr=False, compare=False)
+
+    @property
+    def max_attempts(self) -> int:
+        """Current overall cap after applying the cached benchmark policy."""
+        return self._state.max_attempts
+
+    @property
+    def sandbox_loss_retry_available(self) -> bool:
+        """Whether this attempt may recover a typed provider sandbox loss."""
+        return self._state.recover_sandbox_loss and self.number < self._state.max_attempts
 
     @property
     def environment(self) -> dict[str, str]:
@@ -128,32 +138,45 @@ class SandboxRecoveryAttempt:
 
     def mark_replacement_ready(self) -> None:
         """Acknowledge that benchmark setup persisted this outage metadata."""
-        self._mark_ready(self.outage_id)
+        self._state.mark_ready(self.outage_id)
+
+    async def retrieve_task(self) -> RetrieveTaskResponse:
+        """Load and cache the task payload and its recovery policy."""
+        return await self._state.retrieve_task()
 
 
 @dataclass
 class _SandboxRecoveryState:
     run_id: str
     task_id: str
+    load_task: Callable[[], Awaitable[RetrieveTaskResponse]] = field(repr=False)
+    default_max_attempts: int
     outage_id: str | None = None
     outage_started_epoch: float | None = None
     consecutive_attempt_errors: int = 0
+    task: RetrieveTaskResponse | None = None
+    recover_sandbox_loss: bool = False
+    max_attempts: int = field(init=False)
 
-    def attempt(
-        self,
-        number: int,
-        max_attempts: int,
-        *,
-        recover_sandbox_loss: bool,
-    ) -> SandboxRecoveryAttempt:
+    def __post_init__(self) -> None:
+        self.max_attempts = self.default_max_attempts
+
+    def attempt(self, number: int) -> SandboxRecoveryAttempt:
         return SandboxRecoveryAttempt(
             number=number,
-            max_attempts=max_attempts,
             outage_id=self.outage_id,
             outage_started_epoch=self.outage_started_epoch,
-            sandbox_loss_retry_available=recover_sandbox_loss and number < max_attempts,
-            _mark_ready=self.mark_ready,
+            _state=self,
         )
+
+    async def retrieve_task(self) -> RetrieveTaskResponse:
+        if self.task is None:
+            self.task = await self.load_task()
+            policy = self.task.sandbox_recovery
+            self.recover_sandbox_loss = policy is not None
+            if policy is not None:
+                self.max_attempts = policy.max_sandbox_attempts
+        return self.task
 
     def record_loss(self, attempt_number: int) -> None:
         self.consecutive_attempt_errors = 0
@@ -370,7 +393,7 @@ class BenchmarkServiceClient:
         self,
         task_id: str,
         run_id: str,
-        operation: Callable[[RetrieveTaskResponse, SandboxRecoveryAttempt], Awaitable[_RecoveryResult]],
+        operation: Callable[[SandboxRecoveryAttempt], Awaitable[_RecoveryResult]],
         *,
         dataset: str | None = None,
         retryable_attempt_errors: tuple[type[Exception], ...] = (),
@@ -380,9 +403,10 @@ class BenchmarkServiceClient:
     ) -> _RecoveryResult:
         """Run a task attempt with benchmark-declared sandbox-loss recovery.
 
-        The task payload is loaded once so its recovery policy and sandbox
-        configuration cannot drift between attempts. ``SandboxNotFoundError``
-        is retried only when the benchmark explicitly opts in. Callers may
+        ``SandboxRecoveryAttempt.retrieve_task`` lazily loads and caches the
+        task payload so successful durable evaluation resumes need no task
+        request. ``SandboxNotFoundError`` is retried only when the benchmark
+        explicitly opts in. Callers may
         additionally name setup errors that require a fresh sandbox. These use
         ``default_max_attempts`` both as the fallback total cap for benchmarks
         without a recovery policy and as their consecutive-attempt cap. Every
@@ -398,20 +422,21 @@ class BenchmarkServiceClient:
         if retry_delay_s < 0:
             raise ValueError("retry_delay_s must be non-negative")
 
-        task = await self.retrieve_task(task_id=task_id, dataset=dataset)
-        policy = task.sandbox_recovery
-        max_attempts = policy.max_sandbox_attempts if policy is not None else default_max_attempts
-        state = _SandboxRecoveryState(run_id=run_id, task_id=task_id)
+        state = _SandboxRecoveryState(
+            run_id=run_id,
+            task_id=task_id,
+            load_task=lambda: self.retrieve_task(task_id=task_id, dataset=dataset),
+            default_max_attempts=default_max_attempts,
+        )
 
-        for attempt_number in range(1, max_attempts + 1):
-            attempt = state.attempt(
-                attempt_number,
-                max_attempts,
-                recover_sandbox_loss=policy is not None,
-            )
+        attempt_number = 1
+        while attempt_number <= state.max_attempts:
+            attempt = state.attempt(attempt_number)
             try:
-                return await operation(task, attempt)
+                return await operation(attempt)
             except SandboxNotFoundError as exc:
+                if state.task is None:
+                    await state.retrieve_task()
                 if not attempt.sandbox_loss_retry_available:
                     raise
                 state.record_loss(attempt_number)
@@ -419,7 +444,7 @@ class BenchmarkServiceClient:
             except Exception as exc:
                 if (
                     not isinstance(exc, retryable_attempt_errors)
-                    or attempt_number >= max_attempts
+                    or attempt_number >= state.max_attempts
                     or state.consecutive_attempt_errors >= default_max_attempts - 1
                 ):
                     raise
@@ -430,6 +455,7 @@ class BenchmarkServiceClient:
                 on_retry(attempt, retry_error)
             if retry_delay_s:
                 await asyncio.sleep(retry_delay_s)
+            attempt_number += 1
 
         raise AssertionError("sandbox recovery loop exited without a result")
 

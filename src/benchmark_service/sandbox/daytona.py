@@ -678,21 +678,22 @@ class DaytonaSandboxProvider(SandboxProvider):
     ) -> list[VolumeMount] | None:
         if not request.resources.volumes:
             return None
-        # Checked before provisioning anything: rejecting the request after having
-        # already created an earlier volume would leave a side effect behind.
+        # Everything that can reject the request runs before anything is provisioned:
+        # failing partway through would leave already-created volumes behind.
         read_only = [mount.name for mount in request.resources.volumes if mount.read_only]
         if read_only:
             raise SandboxError(
                 f"Daytona mounts volumes read-write; these cannot be mounted read_only: {', '.join(read_only)}"
             )
+        sub_paths = [mount.resolve_sub_path(request.labels) for mount in request.resources.volumes]
         mounts: list[VolumeMount] = []
-        for mount in request.resources.volumes:
+        for mount, sub_path in zip(request.resources.volumes, sub_paths, strict=True):
             volume = await self._resolve_volume(mount, daytona)
             mounts.append(
                 VolumeMount(
                     volume_id=volume.id,
                     mount_path=mount.mount_path,
-                    subpath=mount.resolve_sub_path(request.labels),
+                    subpath=sub_path,
                 )
             )
         return mounts

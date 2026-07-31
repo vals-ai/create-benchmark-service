@@ -1119,6 +1119,29 @@ async def test_daytona_provider_rejects_read_only_volumes() -> None:
     assert daytona.volume.lookups == []
 
 
+async def test_daytona_provider_rejects_unresolvable_template_before_provisioning() -> None:
+    """An unresolvable subpath must be caught before any earlier volume is created."""
+    daytona = DaytonaClient(InnerSandbox())
+    provider = _provider(daytona)
+    resources = _volume_resources(
+        SandboxVolume(name="runs", mount_path="/workspace", create_if_missing=True),
+        SandboxVolume(
+            name="scoped",
+            mount_path="/scoped",
+            create_if_missing=True,
+            sub_path_template="scoped/{run_id}",
+        ),
+    )
+    request = _request("volume-task", resources=resources)
+    request.labels = {}
+
+    with pytest.raises(SandboxError, match="did not supply run_id"):
+        await provider.create_sandbox(request)
+
+    assert daytona.created is False
+    assert daytona.volume.created == []
+
+
 async def test_daytona_provider_rejects_missing_volume_without_create_if_missing() -> None:
     daytona = DaytonaClient(InnerSandbox())
     provider = _provider(daytona)

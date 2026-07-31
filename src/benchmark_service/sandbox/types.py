@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator, Mapping, Sequence
+from collections.abc import AsyncGenerator, Mapping
 from datetime import datetime
 from pathlib import PurePosixPath
 from string import Formatter
@@ -57,18 +57,7 @@ def validate_command_env(env_vars: Mapping[str, str] | None) -> dict[str, str]:
     return env
 
 
-# Valkyrie labels a run "Id"; this service's own grading path labels it "run-id".
-RUN_ID_LABELS = ("Id", "run-id")
-TASK_ID_LABELS = ("Task",)
 SUB_PATH_PLACEHOLDERS = ("run_id", "task_id")
-
-
-def _first_label(labels: Mapping[str, str], keys: Sequence[str]) -> str | None:
-    for key in keys:
-        value = labels.get(key)
-        if value:
-            return value
-    return None
 
 
 def _template_field_names(template: str) -> list[str]:
@@ -92,11 +81,7 @@ class SandboxVolume(BaseModel):
             raise ValueError(f"mount_path must be absolute: {self.mount_path}")
         if self.sub_path_template is None:
             return self
-        try:
-            fields = _template_field_names(self.sub_path_template)
-        except ValueError as exc:
-            raise ValueError(f"Malformed sub_path_template {self.sub_path_template!r}: {exc}") from exc
-        unknown = sorted(set(fields) - set(SUB_PATH_PLACEHOLDERS))
+        unknown = sorted(set(_template_field_names(self.sub_path_template)) - set(SUB_PATH_PLACEHOLDERS))
         if unknown:
             raise ValueError(
                 f"Unknown sub_path_template placeholders: {', '.join(unknown)}; "
@@ -105,24 +90,17 @@ class SandboxVolume(BaseModel):
         return self
 
     def resolve_sub_path(self, labels: Mapping[str, str]) -> str | None:
-        """Return this volume's subdirectory for one run, or None when unscoped.
+        """Interpolate `sub_path_template` against a run's labels, or None when unscoped.
 
-        Arguments
-        - labels: Sandbox labels carrying the run and task identity.
-
-        Returns
-        The interpolated subdirectory, or None when no template is set.
-
-        Raises
-        SandboxError when the template references identity the labels do not
-        carry. Interpolating a missing value would collapse distinct runs onto
-        one shared subdirectory, which is the opposite of what a template is for.
+        Raises SandboxError rather than interpolating a blank for identity the labels do
+        not carry, which would collapse distinct runs onto one shared subdirectory.
         """
         if self.sub_path_template is None:
             return None
+        # Valkyrie labels a run "Id"; this service's own grading path labels it "run-id".
         values = {
-            "run_id": _first_label(labels, RUN_ID_LABELS),
-            "task_id": _first_label(labels, TASK_ID_LABELS),
+            "run_id": labels.get("Id") or labels.get("run-id"),
+            "task_id": labels.get("Task"),
         }
         missing = sorted({name for name in _template_field_names(self.sub_path_template) if not values[name]})
         if missing:

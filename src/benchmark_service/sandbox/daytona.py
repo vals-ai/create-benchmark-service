@@ -27,9 +27,12 @@ from daytona_api_client_async import (
     OrganizationsApi,
     SandboxClass,
 )
-from daytona_api_client_async.exceptions import ApiException, OpenApiException
+from daytona_api_client_async.exceptions import ApiException, NotFoundException, OpenApiException
 from daytona import (
     GpuType,
+)
+from daytona import (
+    VolumeMount as DaytonaVolumeMount,
 )
 from daytona import (
     Resources as DaytonaResources,
@@ -73,6 +76,8 @@ from benchmark_service.sandbox.types import (
     SandboxSource,
     SnapshotSource,
     TargetedSnapshotSource,
+    VolumeMount,
+    resolve_volume_subpath,
     validate_command_env,
 )
 
@@ -96,6 +101,9 @@ _DELETE_CONFLICT_MESSAGES = ("state change in progress", "modified by another op
 _REMOVED_SANDBOX_CLIENT_STATUSES = (404, 502)
 _RETRYABLE_PROVIDER_STATUSES = (408, 429, 500, 502, 503, 504)
 _FAILED_EXECUTE_COMMAND_PREFIX = "failed to execute command:"
+_VOLUME_READY_POLL_SECONDS = 0.5
+_VOLUME_READY_TIMEOUT_SECONDS = 30.0
+_VOLUME_PENDING_STATES = frozenset({"creating", "pending_create"})
 # Daytona sometimes flattens a transport failure into a bare DaytonaError message with no chained
 # cause; these substrings recover those cases by text when no typed cause survives to match.
 _TRANSPORT_ERROR_MESSAGES = (
@@ -718,6 +726,68 @@ class DaytonaSandboxProvider(SandboxProvider):
             return SandboxConnectionError(f"Daytona sandbox provider connection error: {exc}")
         return SandboxError(f"Daytona sandbox provider error: {exc}")
 
+    async def _resolve_volumes(
+        self,
+        daytona: AsyncDaytona,
+        mounts: list[VolumeMount],
+        labels: Mapping[str, str],
+    ) -> list[DaytonaVolumeMount]:
+        """Map named volumes to Daytona mounts, resolving each name to its id.
+
+        Daytona mounts by volume id rather than name, so a benchmark that only
+        knows the name would otherwise have to resolve it itself and every
+        caller would reimplement this.
+        """
+        resolved: list[DaytonaVolumeMount] = []
+        for mount in mounts:
+            if mount.read_only:
+                raise SandboxError(
+                    f"Daytona does not support read-only volume mounts; volume {mount.name!r} "
+                    f"at {mount.mount_path!r} would be writable"
+                )
+            subpath = resolve_volume_subpath(mount, labels)
+            try:
+                volume = await daytona.volume.get(mount.name, create=mount.create_if_missing)
+                state = volume.state.value
+                try:
+                    async with asyncio.timeout(_VOLUME_READY_TIMEOUT_SECONDS):
+                        while volume.state != "ready":
+                            if state not in _VOLUME_PENDING_STATES:
+                                detail = f": {volume.error_reason}" if volume.error_reason else ""
+                                raise SandboxError(
+                                    f"Daytona volume {mount.name!r} is not ready (state={state!r}){detail}"
+                                )
+                            await asyncio.sleep(_VOLUME_READY_POLL_SECONDS)
+                            volume = await daytona.volume.get(mount.name)
+                            state = volume.state.value
+                except TimeoutError as exc:
+                    raise SandboxError(
+                        f"Daytona volume {mount.name!r} did not become ready within "
+                        f"{_VOLUME_READY_TIMEOUT_SECONDS:g}s (state={state!r})"
+                    ) from exc
+            except NotFoundException as exc:
+                raise SandboxError(
+                    f"Daytona volume {mount.name!r} does not exist (mount {mount.mount_path}); "
+                    "create it or set create_if_missing"
+                ) from exc
+            except OpenApiException as exc:
+                daytona_error = create_daytona_error(
+                    f"Failed to resolve Daytona volume {mount.name!r}: {exc}",
+                    status_code=getattr(exc, "status", None),
+                    headers=getattr(exc, "headers", None),
+                )
+                raise self._sandbox_error(daytona_error) from exc
+            except DaytonaError as exc:
+                raise self._sandbox_error(exc) from exc
+            resolved.append(
+                DaytonaVolumeMount(
+                    volume_id=volume.id,
+                    mount_path=mount.mount_path,
+                    subpath=subpath,
+                )
+            )
+        return resolved
+
     async def create_sandbox(self, request: SandboxCreateRequest) -> DaytonaSandbox:
         try:
             async with asyncio.timeout(request.create_timeout):
@@ -730,12 +800,18 @@ class DaytonaSandboxProvider(SandboxProvider):
     @_PROVIDER_RETRY
     async def _create_sandbox_with_retry(self, request: SandboxCreateRequest) -> DaytonaSandbox:
         daytona = self._daytona
+        if isinstance(request.source, TargetedSnapshotSource):
+            daytona = self._client_for_target(request.source.target)
         resources = DaytonaResources(
             cpu=request.resources.vcpu,
             memory=request.resources.memory,
             disk=request.resources.disk,
             gpu=request.resources.gpu or None,
             gpu_type=_daytona_gpu_type(request.resources.gpu_type),
+        )
+
+        volume_mounts = (
+            await self._resolve_volumes(daytona, request.volumes, request.labels) if request.volumes else None
         )
 
         match request.source:
@@ -749,14 +825,13 @@ class DaytonaSandboxProvider(SandboxProvider):
                     network_block_all=request.network_block_all,
                     resources=resources,
                     env_vars=request.env_vars,
+                    volumes=volume_mounts,
                 )
             case SnapshotSource(snapshot=snapshot) | TargetedSnapshotSource(snapshot=snapshot):
                 if request.resources.gpu:
                     raise SandboxError(
                         "Daytona snapshot sandboxes use the snapshot's resources; GPUs cannot be requested"
                     )
-                if isinstance(request.source, TargetedSnapshotSource):
-                    daytona = self._client_for_target(request.source.target)
                 params = CreateSandboxFromSnapshotParams(
                     auto_stop_interval=request.auto_stop_interval,
                     auto_delete_interval=0,
@@ -766,6 +841,7 @@ class DaytonaSandboxProvider(SandboxProvider):
                     language="python",
                     network_block_all=request.network_block_all,
                     env_vars=request.env_vars,
+                    volumes=volume_mounts,
                 )
             case ComposeSource():
                 raise SandboxError("ComposeSource must be unwrapped before provider.create_sandbox")

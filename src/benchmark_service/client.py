@@ -12,6 +12,7 @@ from tenacity import (
     stop_after_attempt,
     wait_random,
 )
+from websockets.exceptions import ConnectionClosed
 
 from benchmark_service.sandbox import SandboxProvider, SandboxProviderConfig
 from benchmark_service.schemas import (
@@ -65,7 +66,11 @@ _retry_http = retry(
 class BenchmarkServiceError(Exception):
     """Exception raised for benchmark service communication errors."""
 
-    pass
+    status_code: int | None
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class BenchmarkServiceUnauthenticatedError(BenchmarkServiceError):
@@ -83,7 +88,7 @@ def _unauthenticated_error(response: httpx.Response) -> "BenchmarkServiceUnauthe
     except Exception:
         detail = response.text
 
-    return BenchmarkServiceUnauthenticatedError(detail)
+    return BenchmarkServiceUnauthenticatedError(detail, status_code=response.status_code)
 
 
 class BenchmarkServiceClient:
@@ -156,29 +161,38 @@ class BenchmarkServiceClient:
             BenchmarkServiceError: If an "error" chunk is received or the connection
                 closes without a result.
         """
-        async with websockets.connect(
-            f"{self._ws_url}/ws/{path}",
-            additional_headers=self._headers,
-            open_timeout=60,
-            ping_timeout=None,
-            max_size=10 * 1024 * 1024,  # 10MB
-        ) as websocket:
-            await websocket.send(request.model_dump_json())
+        try:
+            async with websockets.connect(
+                f"{self._ws_url}/ws/{path}",
+                additional_headers=self._headers,
+                open_timeout=60,
+                ping_timeout=None,
+                max_size=10 * 1024 * 1024,  # 10MB
+            ) as websocket:
+                await websocket.send(request.model_dump_json())
 
-            async for message in websocket:
-                chunk: StreamChunk = _stream_chunk_adapter.validate_json(message)
+                async for message in websocket:
+                    chunk: StreamChunk = _stream_chunk_adapter.validate_json(message)
 
-                match chunk.type:
-                    case "error":
-                        raise BenchmarkServiceError(chunk.data)
-                    case "result":
-                        return chunk.data
-                    case "message":
-                        if on_message:
-                            on_message(chunk.data)
-                    case "eval_resume_state":
-                        if on_eval_resume_state:
-                            on_eval_resume_state(chunk.data)
+                    match chunk.type:
+                        case "error":
+                            raise BenchmarkServiceError(chunk.data)
+                        case "result":
+                            return chunk.data
+                        case "message":
+                            if on_message:
+                                on_message(chunk.data)
+                        case "eval_resume_state":
+                            if on_eval_resume_state:
+                                on_eval_resume_state(chunk.data)
+        except ConnectionClosed as exc:
+            close_frame = exc.rcvd or exc.sent
+            if close_frame is None:
+                detail = "without a close code"
+            else:
+                reason = f": {close_frame.reason}" if close_frame.reason else ""
+                detail = f"with code {close_frame.code}{reason}"
+            raise BenchmarkServiceError(f"WebSocket closed {detail}") from exc
 
         raise BenchmarkServiceError("Exited websocket without returning final result")
 
@@ -192,7 +206,8 @@ class BenchmarkServiceClient:
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
-                f"Health check failed with status code {response.status_code}, response: {response.text}"
+                f"Health check failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
             )
 
         return HealthCheckResponse.model_validate(response.json())
@@ -207,7 +222,8 @@ class BenchmarkServiceClient:
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
-                f"Version check failed with status code {response.status_code}, response: {response.text}"
+                f"Version check failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
             )
 
         return VersionResponse.model_validate(response.json())
@@ -237,7 +253,8 @@ class BenchmarkServiceClient:
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
-                f"Verify task ids failed with status code {response.status_code}, response: {response.text}"
+                f"Verify task ids failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
             )
 
         return VerifyTaskIdsResponse.model_validate(response.json())
@@ -262,7 +279,8 @@ class BenchmarkServiceClient:
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
-                f"Retrieve task failed with status code {response.status_code}, response: {response.text}"
+                f"Retrieve task failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
             )
 
         return RetrieveTaskResponse.model_validate(response.json())
@@ -327,7 +345,8 @@ class BenchmarkServiceClient:
 
         if resp.status_code != 200:
             raise BenchmarkServiceError(
-                f"Evaluate response failed with status code {resp.status_code}, response: {resp.text}"
+                f"Evaluate response failed with status code {resp.status_code}, response: {resp.text}",
+                status_code=resp.status_code,
             )
 
         return resp.json()
@@ -400,7 +419,8 @@ class BenchmarkServiceClient:
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
-                f"Final score failed with status code {response.status_code}, response: {response.text}"
+                f"Final score failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
             )
 
         return FinalScoreResponse.model_validate(response.json())
@@ -421,7 +441,8 @@ class BenchmarkServiceClient:
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
-                f"List tasks failed with status code {response.status_code}, response: {response.text}"
+                f"List tasks failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
             )
 
         return V1DatasetTasksResponse.model_validate(response.json())
@@ -450,7 +471,8 @@ class BenchmarkServiceClient:
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
-                f"v1 upload URL request failed with status code {response.status_code}, response: {response.text}"
+                f"v1 upload URL request failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
             )
 
         return V1UploadUrlResponse.model_validate(response.json())
@@ -488,7 +510,8 @@ class BenchmarkServiceClient:
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
-                f"v1 evaluate failed with status code {response.status_code}, response: {response.text}"
+                f"v1 evaluate failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
             )
 
         return V1EvalResponse.model_validate(response.json())
@@ -511,7 +534,8 @@ class BenchmarkServiceClient:
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
-                f"v1 score failed with status code {response.status_code}, response: {response.text}"
+                f"v1 score failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
             )
 
         return V1ScoreResponse.model_validate(response.json())

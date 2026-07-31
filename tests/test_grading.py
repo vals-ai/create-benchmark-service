@@ -23,6 +23,7 @@ from benchmark_service import (
     Sandbox,
     SnapshotSource,
     TargetedSnapshotSource,
+    VolumeMount,
 )
 from benchmark_service import auth as auth_module
 from benchmark_service import grading
@@ -265,6 +266,38 @@ async def test_grade_instance_creates_isolated_sandbox_from_task_source_and_dele
     assert create.labels["tenant"] == "acme"
     assert create.labels["run-id"] == "run-1"
     assert provider.deleted == ["fake-sandbox"]
+
+
+class VolumeStub(SandboxStub):
+    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> Any:
+        task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
+        return task.model_copy(
+            update={
+                "volumes": [
+                    VolumeMount(
+                        name="fixtures",
+                        mount_path="/fixtures",
+                        subpath="runs/{run_id}",
+                    )
+                ]
+            }
+        )
+
+
+async def test_grade_instance_forwards_benchmark_declared_volumes() -> None:
+    service = await VolumeStub.create()
+    provider = FakeProvider(FakeSandbox())
+
+    await _grade(service, provider)
+
+    assert provider.created[0].volumes == [
+        VolumeMount(
+            name="fixtures",
+            mount_path="/fixtures",
+            subpath="runs/{run_id}",
+        )
+    ]
+    assert provider.created[0].labels["run-id"] == "run-1"
 
 
 class SpecStub(SandboxStub):
@@ -1301,7 +1334,7 @@ def test_v1_evaluate_rejects_changed_artifact_before_in_process_hook(
     assert cast(InProcessArtifactStub, app.service).artifact_call is None
 
 
-async def test_v1_evaluate_bounds_artifact_preflight_with_grading_admission(
+async def test_v1_evaluate_orders_reservation_quota_queue_and_artifact_preflight(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     def key_for(run_id: str) -> str:
@@ -1310,7 +1343,9 @@ async def test_v1_evaluate_bounds_artifact_preflight_with_grading_admission(
     artifact_reference = SubmissionArtifactReference(key=key_for("run-1"), size_bytes=1, etag='"etag-1"')
     stat_entered = asyncio.Event()
     release_stat = asyncio.Event()
+    queued_quota_consumed = asyncio.Event()
     stat_calls = 0
+    quota_calls = 0
 
     async def blocking_stat(k: str, *, tenant: str) -> SubmissionArtifactReference:
         nonlocal stat_calls
@@ -1333,10 +1368,19 @@ async def test_v1_evaluate_bounds_artifact_preflight_with_grading_admission(
     app._grading_provider = FakeProvider(FakeSandbox())
     app._grading_admission = _GradingAdmission(
         max_concurrency=1,
-        max_queued=0,
-        max_admitted_per_tenant=1,
-        queue_timeout_s=0.01,
+        max_queued=1,
+        max_admitted_per_tenant=2,
+        queue_timeout_s=0.05,
     )
+
+    async def consume_quota(tenant: str) -> None:
+        nonlocal quota_calls
+        assert tenant == "acme"
+        quota_calls += 1
+        if quota_calls == 2:
+            queued_quota_consumed.set()
+
+    app._consume_evaluation_quota = consume_quota  # pyright: ignore[reportPrivateUsage]
 
     async def evaluate(run_id: str) -> Any:
         request = Request({"type": "http"})
@@ -1354,14 +1398,29 @@ async def test_v1_evaluate_bounds_artifact_preflight_with_grading_admission(
         return await app._v1_evaluate(request, body)
 
     first_evaluation = asyncio.create_task(evaluate("run-1"))
+    queued_evaluation: asyncio.Task[Any] | None = None
     try:
         assert await _event_set(stat_entered)
+        queued_evaluation = asyncio.create_task(evaluate("run-2"))
+        assert await _event_set(queued_quota_consumed)
+        assert not queued_evaluation.done()
+
         with pytest.raises(HTTPException) as exc_info:
-            await evaluate("run-2")
+            await evaluate("run-3")
         assert exc_info.value.status_code == 429
+        assert stat_calls == 1
+        assert quota_calls == 2
+
+        with pytest.raises(HTTPException) as queued_exc_info:
+            await queued_evaluation
+        assert queued_exc_info.value.status_code == 429
+        assert quota_calls == 2
         assert stat_calls == 1
     finally:
         release_stat.set()
+        if queued_evaluation is not None and not queued_evaluation.done():
+            queued_evaluation.cancel()
+            await asyncio.gather(queued_evaluation, return_exceptions=True)
         first_response = await first_evaluation
     assert first_response.status == V1EvalStatus.EVALUATED
     assert first_response.result == {"resolved": True, "weighted_pass_percentage": 100.0}

@@ -8,7 +8,7 @@ import shlex
 from collections.abc import AsyncGenerator, Awaitable, Mapping
 from typing import Any, Literal, cast
 
-from modal import App, Client, Image
+from modal import App, Client, Image, Volume
 from modal import Sandbox as ModalSdkSandbox
 from modal.exception import ConnectionError as ModalConnectionError
 from modal.exception import Error as ModalError
@@ -32,6 +32,8 @@ from benchmark_service.sandbox.types import (
     SandboxQuery,
     SandboxSource,
     SnapshotSource,
+    VolumeMount,
+    resolve_volume_subpath,
     validate_command_env,
 )
 
@@ -86,6 +88,11 @@ def _sandbox_error(exc: ModalError) -> SandboxError:
     if isinstance(exc, ModalConnectionError):
         return SandboxConnectionError(str(exc))
     return SandboxError(str(exc))
+
+
+def _is_missing_volume_error(exc: ModalNotFoundError) -> bool:
+    message = str(exc).lower()
+    return "volume" in message and ("not found" in message or "does not exist" in message)
 
 
 def _command(command: str, cwd: str | None, timeout: float | None) -> str:
@@ -331,6 +338,43 @@ class ModalSandboxProvider(SandboxProvider):
                 raise _sandbox_error(exc) from exc
         return self._client, self._app
 
+    def _resolve_volumes(
+        self,
+        mounts: list[VolumeMount],
+        client: Client,
+        labels: Mapping[str, str],
+    ) -> dict[str, Volume]:
+        """Look up each named volume, keyed by the path it mounts at.
+
+        create_if_missing is off by default and deliberately not inferred: a
+        benchmark whose fixture volume is missing should fail loudly at creation
+        rather than start a sandbox with an empty directory where its data
+        should be, which surfaces much later as a confusing benchmark failure.
+        """
+        resolved: dict[str, Volume] = {}
+        for mount in mounts:
+            subpath = resolve_volume_subpath(mount, labels)
+            try:
+                volume = Volume.from_name(
+                    mount.name,
+                    create_if_missing=mount.create_if_missing,
+                    client=client,
+                )
+                if mount.read_only or subpath is not None:
+                    volume = volume.with_mount_options(
+                        read_only=mount.read_only,
+                        sub_path=subpath,
+                    )
+            except ModalNotFoundError as exc:
+                raise SandboxError(
+                    f"Modal volume {mount.name!r} does not exist (mount {mount.mount_path}); "
+                    "create it or set create_if_missing"
+                ) from exc
+            except ModalError as exc:
+                raise _sandbox_error(exc) from exc
+            resolved[mount.mount_path] = volume
+        return resolved
+
     def _resolve_image(self, source: SandboxSource, client: Client) -> Image:
         # A snapshot is a Modal filesystem snapshot, referenced by its Image id.
         match source:
@@ -392,6 +436,8 @@ class ModalSandboxProvider(SandboxProvider):
             # Nested Docker always on, matching Daytona; no disk parameter exists.
             "experimental_options": {"enable_docker": True},
         }
+        if request.volumes:
+            create_kwargs["volumes"] = self._resolve_volumes(request.volumes, client, request.labels)
 
         try:
             # No entrypoint args: an argless Modal sandbox idles until timeout.
@@ -401,6 +447,10 @@ class ModalSandboxProvider(SandboxProvider):
             )
         except TimeoutError as exc:
             raise SandboxError(f"Failed to create Modal sandbox within {request.create_timeout}s") from exc
+        except ModalNotFoundError as exc:
+            if request.volumes and _is_missing_volume_error(exc):
+                raise SandboxError(f"Modal volume mount failed: {exc}") from exc
+            raise _sandbox_error(exc) from exc
         except ModalError as exc:
             raise _sandbox_error(exc) from exc
         return ModalSandbox(inner, name=request.name)

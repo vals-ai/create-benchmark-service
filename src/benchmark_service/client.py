@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
+from uuid import uuid4
 
 import httpx
 import websockets
@@ -182,7 +184,7 @@ class _SandboxRecoveryState:
         self.consecutive_attempt_errors = 0
         if self.outage_id is not None:
             return
-        self.outage_id = f"{self.run_id}:{self.task_id}:{attempt_number}"
+        self.outage_id = f"{self.run_id}:{self.task_id}:{attempt_number}:{uuid4().hex}"
         self.outage_started_epoch = time.time()
 
     def record_attempt_error(self) -> None:
@@ -399,7 +401,7 @@ class BenchmarkServiceClient:
         retryable_attempt_errors: tuple[type[Exception], ...] = (),
         default_max_attempts: int = 1,
         retry_delay_s: float = 2.0,
-        on_retry: Callable[[SandboxRecoveryAttempt, Exception], None] | None = None,
+        on_retry: Callable[[SandboxRecoveryAttempt, Exception], Awaitable[None] | None] | None = None,
     ) -> _RecoveryResult:
         """Run a task attempt with benchmark-declared sandbox-loss recovery.
 
@@ -411,16 +413,22 @@ class BenchmarkServiceClient:
         ``default_max_attempts`` both as the fallback total cap for benchmarks
         without a recovery policy and as their consecutive-attempt cap. Every
         attempt still counts against the benchmark's declared overall cap.
+        Synchronous and asynchronous ``on_retry`` callbacks are both
+        supported and complete before the retry delay begins.
 
         The final exception is re-raised unchanged when the applicable attempt
         budget is exhausted.
         """
         if not run_id:
             raise ValueError("run_id must be non-empty")
+        if not task_id:
+            raise ValueError("task_id must be non-empty")
         if not 1 <= default_max_attempts <= 20:
             raise ValueError("default_max_attempts must be between 1 and 20")
         if retry_delay_s < 0:
             raise ValueError("retry_delay_s must be non-negative")
+        if any(issubclass(error_type, SandboxNotFoundError) for error_type in retryable_attempt_errors):
+            raise ValueError("SandboxNotFoundError is controlled only by SandboxRecoveryPolicy")
 
         state = _SandboxRecoveryState(
             run_id=run_id,
@@ -452,7 +460,9 @@ class BenchmarkServiceClient:
                 retry_error = exc
 
             if on_retry is not None:
-                on_retry(attempt, retry_error)
+                callback_result = on_retry(attempt, retry_error)
+                if inspect.isawaitable(callback_result):
+                    await callback_result
             if retry_delay_s:
                 await asyncio.sleep(retry_delay_s)
             attempt_number += 1

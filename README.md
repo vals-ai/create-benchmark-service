@@ -286,7 +286,7 @@ Status codes: 403 if the tenant isn't allowed the dataset *or* if the caller use
 
 `BenchmarkServiceClient.run_with_sandbox_recovery(...)` owns the bounded loop for tasks that opt in with `SandboxRecoveryPolicy`. It loads the task once, retries only provider-confirmed `SandboxNotFoundError` losses, and counts every fresh-sandbox attempt against one overall cap. Callers can explicitly include setup errors that also require a fresh sandbox; `default_max_attempts` retains the legacy fallback cap for benchmarks without a recovery policy and bounds consecutive setup attempts when a policy is present.
 
-The operation receives a `SandboxRecoveryAttempt`. Merge its `environment` into the sandbox environment, then call `mark_replacement_ready()` only after benchmark setup has durably recorded the outage. A failed replacement setup therefore carries the same outage ID into the next sandbox, while a later provider loss gets a distinct ID. `sandbox_loss_retry_available` lets a runner persist its normal terminal task error without duplicating the policy calculation.
+The operation receives a `SandboxRecoveryAttempt`. Merge its `environment` into the sandbox environment, then call `mark_replacement_ready()` only after benchmark setup has durably recorded the outage. A failed replacement setup therefore carries the same outage ID into the next sandbox, while a later provider loss gets a globally unique ID that cannot collide after a runner restart. `sandbox_loss_retry_available` lets a runner persist its normal terminal task error without duplicating the policy calculation.
 
 ```python
 async def run_attempt(attempt):

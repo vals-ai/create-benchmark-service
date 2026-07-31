@@ -3,6 +3,7 @@
 import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
 
 import httpx
 import pytest
@@ -199,6 +200,93 @@ async def test_client_keeps_task_loading_lazy_when_initial_operation_completes(
     retrieve_task.assert_not_awaited()
 
 
+@pytest.mark.parametrize(
+    ("task_id", "run_id", "message"),
+    [
+        ("", "run-1", "task_id must be non-empty"),
+        ("task-1", "", "run_id must be non-empty"),
+    ],
+)
+async def test_client_rejects_empty_recovery_identity(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    task_id: str,
+    run_id: str,
+    message: str,
+) -> None:
+    client, _mock_http = benchmark_client
+
+    with pytest.raises(ValueError, match=message):
+        await client.run_with_sandbox_recovery(
+            task_id,
+            run_id,
+            AsyncMock(),
+            retry_delay_s=0,
+        )
+
+
+async def test_client_rejects_sandbox_loss_in_caller_retry_types(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, _mock_http = benchmark_client
+
+    with pytest.raises(ValueError, match="controlled only by SandboxRecoveryPolicy"):
+        await client.run_with_sandbox_recovery(
+            "task-1",
+            "run-1",
+            AsyncMock(),
+            retryable_attempt_errors=(SandboxNotFoundError,),
+            retry_delay_s=0,
+        )
+
+
+async def test_client_awaits_async_retry_callback(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _mock_http = benchmark_client
+    monkeypatch.setattr(client, "retrieve_task", AsyncMock(return_value=_task_response(2)))
+    on_retry = AsyncMock()
+
+    async def operation(attempt: SandboxRecoveryAttempt) -> str:
+        if attempt.number == 1:
+            raise SandboxNotFoundError("sandbox disappeared")
+        return "finished"
+
+    result = await client.run_with_sandbox_recovery(
+        "task-1",
+        "run-1",
+        operation,
+        retry_delay_s=0,
+        on_retry=on_retry,
+    )
+
+    assert result == "finished"
+    on_retry.assert_awaited_once()
+
+
+async def test_client_outage_ids_are_unique_across_invocations(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _mock_http = benchmark_client
+    monkeypatch.setattr(client, "retrieve_task", AsyncMock(return_value=_task_response(2)))
+    identifiers = iter((UUID(int=1), UUID(int=2)))
+    monkeypatch.setattr("benchmark_service.client.uuid4", lambda: next(identifiers))
+
+    async def operation(attempt: SandboxRecoveryAttempt) -> str:
+        if attempt.number == 1:
+            raise SandboxNotFoundError("sandbox disappeared")
+        assert attempt.outage_id is not None
+        return attempt.outage_id
+
+    first = await client.run_with_sandbox_recovery("task-1", "run-1", operation, retry_delay_s=0)
+    second = await client.run_with_sandbox_recovery("task-1", "run-1", operation, retry_delay_s=0)
+
+    assert first != second
+    assert first.endswith("00000000000000000000000000000001")
+    assert second.endswith("00000000000000000000000000000002")
+
+
 async def test_client_recovers_consecutive_losses_with_distinct_outage_identity(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
     monkeypatch: pytest.MonkeyPatch,
@@ -206,6 +294,7 @@ async def test_client_recovers_consecutive_losses_with_distinct_outage_identity(
     client, _mock_http = benchmark_client
     monkeypatch.setattr(client, "retrieve_task", AsyncMock(return_value=_task_response(3)))
     monkeypatch.setattr("benchmark_service.client.time.time", lambda: 1_234.5)
+    monkeypatch.setattr("benchmark_service.client.uuid4", lambda: UUID(int=1))
 
     attempts: list[SandboxRecoveryAttempt] = []
     retry_errors: list[Exception] = []
@@ -234,11 +323,11 @@ async def test_client_recovers_consecutive_losses_with_distinct_outage_identity(
     assert [attempt.environment for attempt in attempts] == [
         {},
         {
-            "VALKYRIE_SANDBOX_OUTAGE_ID": "run-1:task-1:1",
+            "VALKYRIE_SANDBOX_OUTAGE_ID": "run-1:task-1:1:00000000000000000000000000000001",
             "VALKYRIE_SANDBOX_OUTAGE_STARTED_EPOCH": "1234.5",
         },
         {
-            "VALKYRIE_SANDBOX_OUTAGE_ID": "run-1:task-1:2",
+            "VALKYRIE_SANDBOX_OUTAGE_ID": "run-1:task-1:2:00000000000000000000000000000001",
             "VALKYRIE_SANDBOX_OUTAGE_STARTED_EPOCH": "1234.5",
         },
     ]
@@ -252,6 +341,7 @@ async def test_client_preserves_outage_identity_when_replacement_setup_retries(
     client, _mock_http = benchmark_client
     monkeypatch.setattr(client, "retrieve_task", AsyncMock(return_value=_task_response(3)))
     monkeypatch.setattr("benchmark_service.client.time.time", lambda: 1_234.5)
+    monkeypatch.setattr("benchmark_service.client.uuid4", lambda: UUID(int=1))
 
     environments: list[dict[str, str]] = []
 
@@ -279,11 +369,11 @@ async def test_client_preserves_outage_identity_when_replacement_setup_retries(
     assert environments == [
         {},
         {
-            "VALKYRIE_SANDBOX_OUTAGE_ID": "run-1:task-1:1",
+            "VALKYRIE_SANDBOX_OUTAGE_ID": "run-1:task-1:1:00000000000000000000000000000001",
             "VALKYRIE_SANDBOX_OUTAGE_STARTED_EPOCH": "1234.5",
         },
         {
-            "VALKYRIE_SANDBOX_OUTAGE_ID": "run-1:task-1:1",
+            "VALKYRIE_SANDBOX_OUTAGE_ID": "run-1:task-1:1:00000000000000000000000000000001",
             "VALKYRIE_SANDBOX_OUTAGE_STARTED_EPOCH": "1234.5",
         },
     ]

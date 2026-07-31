@@ -3,9 +3,12 @@ from __future__ import annotations
 import re
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, Mapping
+from datetime import datetime
+from pathlib import PurePosixPath
+from string import Formatter
 from typing import Annotated, Literal, Self
 
-from pydantic import BaseModel, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, Field, model_validator
 
 
 class ImageSource(BaseModel):
@@ -18,6 +21,12 @@ class SnapshotSource(BaseModel):
     snapshot: str
 
 
+class TargetedSnapshotSource(BaseModel):
+    type: Literal["targeted_snapshot"] = "targeted_snapshot"
+    snapshot: str
+    target: str = Field(min_length=1)
+
+
 BaseSandboxSource = Annotated[ImageSource | SnapshotSource, Field(discriminator="type")]
 
 
@@ -28,10 +37,15 @@ class ComposeSource(BaseModel):
     compose_command: str = "docker compose"
 
 
-SandboxSource = Annotated[ImageSource | SnapshotSource | ComposeSource, Field(discriminator="type")]
+SandboxSource = Annotated[
+    ImageSource | SnapshotSource | TargetedSnapshotSource | ComposeSource,
+    Field(discriminator="type"),
+]
 
 _ENV_VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _RESERVED_COMMAND_ENV_NAMES = frozenset({"LANG", "TERM"})
+_VOLUME_SUBPATH_FORMATTER = Formatter()
+_VOLUME_SUBPATH_RUN_ID_FIELD = "run_id"
 
 
 def validate_command_env(env_vars: Mapping[str, str] | None) -> dict[str, str]:
@@ -43,6 +57,27 @@ def validate_command_env(env_vars: Mapping[str, str] | None) -> dict[str, str]:
     if reserved_names:
         raise ValueError(f"Reserved command environment variable names: {', '.join(reserved_names)}")
     return env
+
+
+def _validate_rendered_volume_subpath(subpath: str) -> None:
+    path = PurePosixPath(subpath)
+    if path.is_absolute() or str(path) == "." or ".." in path.parts:
+        raise ValueError(f"subpath must be a non-empty relative path without '..', got {subpath!r}")
+
+
+def _volume_subpath_fields(template: str) -> list[str]:
+    fields: list[str] = []
+    try:
+        parsed = _VOLUME_SUBPATH_FORMATTER.parse(template)
+        for _, field_name, format_spec, conversion in parsed:
+            if field_name is None:
+                continue
+            if field_name != _VOLUME_SUBPATH_RUN_ID_FIELD or format_spec or conversion:
+                raise ValueError("subpath supports only the {run_id} placeholder")
+            fields.append(field_name)
+    except ValueError as exc:
+        raise ValueError(f"invalid volume subpath template: {exc}") from exc
+    return fields
 
 
 class Resources(BaseModel):
@@ -59,6 +94,41 @@ class Resources(BaseModel):
         return self
 
 
+class VolumeMount(BaseModel):
+    """A named, persistent volume attached to a sandbox at a fixed path.
+
+    Distinct from the ephemeral disk in Resources: a volume outlives the sandbox
+    and is shared by every sandbox that mounts it. Benchmarks whose fixture is
+    far larger than their code need this — baking multi-gigabyte assets into an
+    image makes every cold start pay for them, and rebuilding the image on any
+    change is slow enough to discourage changing them at all.
+    """
+
+    name: str = Field(min_length=1, description="Provider-side volume name")
+    mount_path: str = Field(min_length=1, description="Absolute path inside the sandbox")
+    read_only: bool = Field(default=False, description="Mount without write access")
+    create_if_missing: bool = Field(
+        default=False,
+        description="Create the volume when absent rather than failing; leave off for "
+        "fixtures a run must not silently start without",
+    )
+    subpath: str | None = Field(
+        default=None,
+        min_length=1,
+        description="Relative directory within the volume to mount; {run_id} is resolved from "
+        "the sandbox run-id or run_id label. A read-only subpath must already exist.",
+    )
+
+    @model_validator(mode="after")
+    def _validate_paths(self) -> Self:
+        if not self.mount_path.startswith("/"):
+            raise ValueError(f"mount_path must be absolute, got {self.mount_path!r}")
+        if self.subpath is not None:
+            _volume_subpath_fields(self.subpath)
+            _validate_rendered_volume_subpath(self.subpath.format(run_id="run"))
+        return self
+
+
 class SandboxCreateRequest(BaseModel):
     source: SandboxSource
     resources: Resources
@@ -67,11 +137,29 @@ class SandboxCreateRequest(BaseModel):
     env_vars: dict[str, str]
     auto_stop_interval: int
     create_timeout: int
+    network_block_all: bool = False
+    volumes: list[VolumeMount] = Field(
+        default_factory=list,
+        description="Persistent volumes to attach; empty keeps existing behaviour",
+    )
+
+    @model_validator(mode="after")
+    def _validate_volumes(self) -> Self:
+        seen: set[str] = set()
+        for volume in self.volumes:
+            if volume.mount_path in seen:
+                raise ValueError(f"duplicate volume mount_path: {volume.mount_path}")
+            seen.add(volume.mount_path)
+        return self
 
 
 class SandboxQuery(BaseModel):
     labels: dict[str, str]
     page_size: int = 10
+    created_at_lte: AwareDatetime | None = Field(
+        default=None,
+        description="Inclusive creation-time upper bound; providers must apply it or raise SandboxError",
+    )
 
 
 class MissingSandboxConfigError(ValueError):
@@ -80,6 +168,24 @@ class MissingSandboxConfigError(ValueError):
 
 class SandboxError(Exception):
     pass
+
+
+def resolve_volume_subpath(mount: VolumeMount, labels: Mapping[str, str]) -> str | None:
+    """Resolve a mount's run-scoped subpath without silently sharing unlabeled runs."""
+    if mount.subpath is None:
+        return None
+
+    fields = _volume_subpath_fields(mount.subpath)
+    run_id = labels.get("run-id") or labels.get("run_id")
+    if _VOLUME_SUBPATH_RUN_ID_FIELD in fields and not run_id:
+        raise SandboxError(f"Volume {mount.name!r} subpath requires a non-empty 'run-id' or 'run_id' sandbox label")
+
+    rendered = mount.subpath.format(run_id=run_id)
+    try:
+        _validate_rendered_volume_subpath(rendered)
+    except ValueError as exc:
+        raise SandboxError(f"Invalid resolved subpath for volume {mount.name!r}: {exc}") from exc
+    return rendered
 
 
 class SandboxNotFoundError(SandboxError):
@@ -117,6 +223,24 @@ class Sandbox(ABC):
     @property
     @abstractmethod
     def state(self) -> str: ...
+
+    @property
+    def labels(self) -> Mapping[str, str] | None:
+        """Provider-reported labels, or None when unavailable."""
+        return getattr(self, "_labels", None)
+
+    @labels.setter
+    def labels(self, value: Mapping[str, str] | None) -> None:
+        self._labels = value
+
+    @property
+    def created_at(self) -> datetime | None:
+        """Provider-reported creation time in UTC, or None when unavailable."""
+        return getattr(self, "_created_at", None)
+
+    @created_at.setter
+    def created_at(self, value: datetime | None) -> None:
+        self._created_at = value
 
     @abstractmethod
     async def exec(

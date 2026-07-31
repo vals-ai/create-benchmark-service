@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import re
 import shlex
 from collections.abc import AsyncGenerator, Awaitable, Mapping
 from typing import Any, Literal, cast
 
-from modal import App, Client, Image
+from modal import App, Client, Image, Volume
 from modal import Sandbox as ModalSdkSandbox
 from modal.exception import ConnectionError as ModalConnectionError
 from modal.exception import Error as ModalError
@@ -20,6 +21,7 @@ from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
     ExecResult,
     ImageSource,
+    MissingSandboxConfigError,
     Sandbox,
     SandboxCommandError,
     SandboxConnectionError,
@@ -30,6 +32,8 @@ from benchmark_service.sandbox.types import (
     SandboxQuery,
     SandboxSource,
     SnapshotSource,
+    VolumeMount,
+    resolve_volume_subpath,
     validate_command_env,
 )
 
@@ -39,6 +43,7 @@ _APP_NAME = "benchmark-service"
 _MAX_LIFETIME_SECONDS = 24 * 60 * 60
 _ALLOW_ALL_CIDRS = ("0.0.0.0/0",)
 _ALLOW_ALL_DOMAINS = ("*",)
+_COMMAND_STATUS_POLL_SECONDS = 10
 _MAX_NAME_LENGTH = 64
 _INVALID_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_.-]")
 _APP_ID_PATTERN = re.compile(r"^ap-[a-zA-Z0-9]{22}$")
@@ -57,6 +62,22 @@ class ModalProviderConfig(BaseModel):
     MODAL_TOKEN_ID: str
     MODAL_TOKEN_SECRET: str
 
+    @classmethod
+    def from_env(cls) -> "ModalProviderConfig":
+        token_id = os.environ.get("MODAL_TOKEN_ID")
+        token_secret = os.environ.get("MODAL_TOKEN_SECRET")
+        missing = [
+            name
+            for name, value in (
+                ("MODAL_TOKEN_ID", token_id),
+                ("MODAL_TOKEN_SECRET", token_secret),
+            )
+            if not value
+        ]
+        if missing:
+            raise MissingSandboxConfigError(f"Missing required environment variables: {', '.join(missing)}")
+        return cls(MODAL_TOKEN_ID=token_id, MODAL_TOKEN_SECRET=token_secret)  # type: ignore[arg-type]
+
     def create_provider(self) -> SandboxProvider:
         return ModalSandboxProvider(self)
 
@@ -67,6 +88,11 @@ def _sandbox_error(exc: ModalError) -> SandboxError:
     if isinstance(exc, ModalConnectionError):
         return SandboxConnectionError(str(exc))
     return SandboxError(str(exc))
+
+
+def _is_missing_volume_error(exc: ModalNotFoundError) -> bool:
+    message = str(exc).lower()
+    return "volume" in message and ("not found" in message or "does not exist" in message)
 
 
 def _command(command: str, cwd: str | None, timeout: float | None) -> str:
@@ -114,6 +140,7 @@ class ModalSandbox(Sandbox):
         # Modal does not expose a cached lifecycle state on the sandbox handle.
         return "unknown"
 
+    @_PROVIDER_RETRY
     async def _raise_if_finished(self, *, attempts: int = 1, wait_seconds: float = 0) -> None:
         try:
             for attempt in range(attempts):
@@ -177,13 +204,33 @@ class ModalSandbox(Sandbox):
         env = validate_command_env(env_vars) if env_vars is not None else None
         await self._raise_if_finished()
         process = await self._start_process(command, cwd=cwd, timeout=timeout, env_vars=env)
+        output_iterator = process.stdout.__aiter__()
+        next_chunk_task = asyncio.create_task(anext(output_iterator))
 
         try:
-            async for chunk in process.stdout:
+            while True:
+                completed, _ = await asyncio.wait(
+                    {next_chunk_task},
+                    timeout=_COMMAND_STATUS_POLL_SECONDS,
+                )
+                if not completed:
+                    await self._raise_if_finished()
+                    continue
+
+                try:
+                    chunk = next_chunk_task.result()
+                except StopAsyncIteration:
+                    break
+
                 yield str(chunk)
+                next_chunk_task = asyncio.create_task(anext(output_iterator))
             exit_code = await process.wait.aio()
         except ModalError as exc:
             raise _sandbox_error(exc) from exc
+        finally:
+            if not next_chunk_task.done():
+                next_chunk_task.cancel()
+                await asyncio.gather(next_chunk_task, return_exceptions=True)
 
         if exit_code != 0:
             await self._raise_if_finished(attempts=6, wait_seconds=0.5)
@@ -291,6 +338,43 @@ class ModalSandboxProvider(SandboxProvider):
                 raise _sandbox_error(exc) from exc
         return self._client, self._app
 
+    def _resolve_volumes(
+        self,
+        mounts: list[VolumeMount],
+        client: Client,
+        labels: Mapping[str, str],
+    ) -> dict[str, Volume]:
+        """Look up each named volume, keyed by the path it mounts at.
+
+        create_if_missing is off by default and deliberately not inferred: a
+        benchmark whose fixture volume is missing should fail loudly at creation
+        rather than start a sandbox with an empty directory where its data
+        should be, which surfaces much later as a confusing benchmark failure.
+        """
+        resolved: dict[str, Volume] = {}
+        for mount in mounts:
+            subpath = resolve_volume_subpath(mount, labels)
+            try:
+                volume = Volume.from_name(
+                    mount.name,
+                    create_if_missing=mount.create_if_missing,
+                    client=client,
+                )
+                if mount.read_only or subpath is not None:
+                    volume = volume.with_mount_options(
+                        read_only=mount.read_only,
+                        sub_path=subpath,
+                    )
+            except ModalNotFoundError as exc:
+                raise SandboxError(
+                    f"Modal volume {mount.name!r} does not exist (mount {mount.mount_path}); "
+                    "create it or set create_if_missing"
+                ) from exc
+            except ModalError as exc:
+                raise _sandbox_error(exc) from exc
+            resolved[mount.mount_path] = volume
+        return resolved
+
     def _resolve_image(self, source: SandboxSource, client: Client) -> Image:
         # A snapshot is a Modal filesystem snapshot, referenced by its Image id.
         match source:
@@ -328,6 +412,7 @@ class ModalSandboxProvider(SandboxProvider):
         if existing is not None:
             return ModalSandbox(existing, name=request.name)
         image = self._resolve_image(request.source, client)
+        allow_all_egress = not request.network_block_all
         gpu: str | None = None
         if request.resources.gpu:
             if not request.resources.gpu_type:
@@ -344,13 +429,15 @@ class ModalSandboxProvider(SandboxProvider):
             "gpu": gpu,
             "idle_timeout": request.auto_stop_interval * 60 if request.auto_stop_interval else None,
             "timeout": _MAX_LIFETIME_SECONDS,
-            "block_network": False,
-            "outbound_cidr_allowlist": list(_ALLOW_ALL_CIDRS),
-            "outbound_domain_allowlist": list(_ALLOW_ALL_DOMAINS),
+            "block_network": request.network_block_all,
+            "outbound_cidr_allowlist": list(_ALLOW_ALL_CIDRS) if allow_all_egress else None,
+            "outbound_domain_allowlist": list(_ALLOW_ALL_DOMAINS) if allow_all_egress else None,
             "client": client,
             # Nested Docker always on, matching Daytona; no disk parameter exists.
             "experimental_options": {"enable_docker": True},
         }
+        if request.volumes:
+            create_kwargs["volumes"] = self._resolve_volumes(request.volumes, client, request.labels)
 
         try:
             # No entrypoint args: an argless Modal sandbox idles until timeout.
@@ -360,6 +447,10 @@ class ModalSandboxProvider(SandboxProvider):
             )
         except TimeoutError as exc:
             raise SandboxError(f"Failed to create Modal sandbox within {request.create_timeout}s") from exc
+        except ModalNotFoundError as exc:
+            if request.volumes and _is_missing_volume_error(exc):
+                raise SandboxError(f"Modal volume mount failed: {exc}") from exc
+            raise _sandbox_error(exc) from exc
         except ModalError as exc:
             raise _sandbox_error(exc) from exc
         return ModalSandbox(inner, name=request.name)
@@ -394,6 +485,9 @@ class ModalSandboxProvider(SandboxProvider):
 
     @_PROVIDER_RETRY
     async def _list_sandboxes(self, query: SandboxQuery) -> list[ModalSdkSandbox]:
+        if query.created_at_lte is not None:
+            raise SandboxError("Modal sandbox provider does not support filtering by creation time")
+
         client, app = await self._connect()
         try:
             sandboxes: list[ModalSdkSandbox] = []

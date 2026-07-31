@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import pytest
 from fastapi.testclient import TestClient
 
 import benchmark_service
@@ -13,11 +14,14 @@ from benchmark_service import Sandbox
 from benchmark_service.app import BenchmarkServiceApp, _get_service_metadata  # pyright: ignore[reportPrivateUsage]
 from benchmark_service.base import BenchmarkService
 from benchmark_service.schemas import (
+    EvalMode,
     EvaluateResponseRequest,
     FinalScoreResult,
+    GradingSubmission,
     RetrieveTaskResponse,
     StreamChunk,
 )
+from benchmark_service.v1_schemas import V1PayloadType
 
 from tests.test_dataset_versioning import _write_fixture  # pyright: ignore[reportPrivateUsage]
 
@@ -126,3 +130,65 @@ def test_version_endpoint_reports_tracked_dataset_version(tmp_path: Path) -> Non
 
     assert response.status_code == 200
     assert response.json()["dataset_version"] == "1.0.0"
+
+
+class _SandboxModeService(_FakeService):
+    eval_mode = EvalMode.SANDBOX
+    accepted_submission_schemas = {
+        V1PayloadType.TEXT: frozenset({"fake.text.v1"}),
+    }
+
+    async def prepare_grading_sandbox(
+        self,
+        sandbox: Sandbox,
+        submission: GradingSubmission,
+        dataset: str | None = None,
+    ) -> None:
+        raise NotImplementedError
+
+
+class _InProcessArtifactModeService(_FakeService):
+    eval_mode = EvalMode.IN_PROCESS_ARTIFACT
+    accepted_submission_schemas = {
+        V1PayloadType.ARTIFACT: frozenset({"fake.workbook.v1"}),
+    }
+
+    async def evaluate_artifact(
+        self,
+        run_id: str,
+        task_id: str,
+        schema_id: str,
+        artifact: bytes,
+        dataset: str | None = None,
+    ) -> AsyncGenerator[StreamChunk, None]:
+        return
+        yield
+
+
+def test_version_reports_text_eval_mode_by_default() -> None:
+    app = BenchmarkServiceApp(_FakeService)
+    with TestClient(app) as client:
+        response = client.get("/version")
+    assert response.status_code == 200
+    assert response.json()["eval_mode"] == "text"
+
+
+def test_version_reports_sandbox_eval_mode_when_overridden(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("DAYTONA_API_KEY", "k")
+    monkeypatch.setenv("DAYTONA_API_URL", "https://daytona.example")
+    monkeypatch.setenv("DAYTONA_TARGET", "us")
+    app = BenchmarkServiceApp(_SandboxModeService)
+    with TestClient(app) as client:
+        response = client.get("/version")
+    assert response.status_code == 200
+    assert response.json()["eval_mode"] == "sandbox"
+
+
+def test_version_reports_in_process_artifact_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SUBMISSION_ARTIFACT_BUCKET", "vals-submission-artifacts")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    app = BenchmarkServiceApp(_InProcessArtifactModeService)
+    with TestClient(app) as client:
+        response = client.get("/version")
+    assert response.status_code == 200
+    assert response.json()["eval_mode"] == "in_process_artifact"

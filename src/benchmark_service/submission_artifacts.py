@@ -1,16 +1,16 @@
 """Submission artifact object-storage helpers."""
 
-import asyncio
 import os
 import re
 from dataclasses import dataclass
-from functools import lru_cache
+from functools import lru_cache, partial
 from typing import Protocol, cast
 
 import boto3
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+from benchmark_service.blocking import run_blocking
 from benchmark_service.v1_schemas import KEY_SEGMENT_PATTERN
 
 DEFAULT_UPLOAD_EXPIRY_S = 3600
@@ -137,12 +137,27 @@ def _require_tenant_key(key: str, tenant: str) -> None:
         raise ValueError("tenant is not a valid object-key segment")
     segments = key.split("/")
     if (
-        len(segments) < 3
+        len(segments) != 6
         or segments[0] != SUBMISSION_ARTIFACT_KEY_PREFIX
         or segments[1] != tenant
         or not all(_KEY_SEGMENT_RE.fullmatch(s) for s in segments[1:])
     ):
         raise ValueError("key does not name an artifact submitted by this tenant")
+
+
+def validate_submission_key(
+    key: str,
+    *,
+    tenant: str,
+    dataset: str,
+    run_id: str,
+    task_id: str,
+) -> None:
+    """Require a key minted for this authenticated evaluation request."""
+    _require_tenant_key(key, tenant)
+    segments = key.split("/")
+    if segments[2:5] != [dataset, run_id, task_id]:
+        raise ValueError("key does not name the artifact uploaded for this evaluation")
 
 
 def _max_download_bytes() -> int:
@@ -224,9 +239,9 @@ async def stat(key: str, *, tenant: str) -> SubmissionArtifactReference:
 
     This admission check runs before any expensive grading work is provisioned.
     """
-    return await asyncio.to_thread(_stat_sync, key, tenant)
+    return await run_blocking(partial(_stat_sync, key, tenant))
 
 
 async def download(reference: SubmissionArtifactReference, *, tenant: str) -> bytes:
     """Fetch the admitted artifact version for server-side grading."""
-    return await asyncio.to_thread(_download_sync, reference, tenant)
+    return await run_blocking(partial(_download_sync, reference, tenant))

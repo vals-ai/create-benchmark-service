@@ -1,13 +1,27 @@
 """Request and response models for the benchmark service API."""
 
-from typing import Any, Literal, cast
+from enum import StrEnum
+from typing import Annotated, Any, Literal, assert_never, cast
 
-from pydantic import BaseModel, Field, computed_field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
 from benchmark_service.sandbox import SandboxProviderConfig
-from benchmark_service.sandbox.types import ImageSource, Resources, SandboxSource, SnapshotSource
+from benchmark_service.sandbox.types import (
+    BaseSandboxSource,
+    ComposeSource,
+    ImageSource,
+    Resources,
+    SandboxSource,
+    SnapshotSource,
+    TargetedSnapshotSource,
+    VolumeMount,
+)
+from benchmark_service.submission_artifacts import SubmissionArtifactReference
 
 _COMPOSE_LEGACY_DOCKER_IMAGE = "compose+source-required"
+_TARGETED_SNAPSHOT_LEGACY_DOCKER_IMAGE = "targeted-snapshot+source-required"
+
+type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 
 
 class TaskFilter(BaseModel):
@@ -48,7 +62,57 @@ def legacy_docker_image(source: SandboxSource) -> str:
         return source.image
     if isinstance(source, SnapshotSource):
         return f"snapshot:{source.snapshot}"
-    return _COMPOSE_LEGACY_DOCKER_IMAGE
+    if isinstance(source, TargetedSnapshotSource):
+        return _TARGETED_SNAPSHOT_LEGACY_DOCKER_IMAGE
+    if isinstance(source, ComposeSource):  # pyright: ignore[reportUnnecessaryIsInstance]
+        return _COMPOSE_LEGACY_DOCKER_IMAGE
+    assert_never(source)
+
+
+class EvalSandboxSpec(BaseModel):
+    """Benchmark-declared grading-sandbox overrides for eval_mode == SANDBOX.
+
+    Unset fields fall back to the task's generation values; network access is
+    blocked unless the benchmark explicitly opens it.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    source: BaseSandboxSource | None = Field(
+        default=None,
+        description="Grading sandbox image or snapshot; ComposeSource is not supported for grading",
+    )
+    resources: Resources | None = Field(
+        default=None,
+        description="Grading sandbox resources; snapshot-backed sandboxes do not support overrides",
+    )
+    timeout_s: float | None = Field(default=None, gt=0, description="Wall-clock bound for the grading step in seconds")
+    network_block_all: bool = Field(default=True, description="Block all network egress from the grading sandbox")
+
+
+class TextGradingSubmission(BaseModel):
+    """Inline text submitted for sandbox grading."""
+
+    type: Literal["text"] = "text"
+    task_id: str
+    schema_id: str
+    text: str
+
+
+class ArtifactGradingSubmission(BaseModel):
+    """Uploaded artifact submitted for sandbox grading."""
+
+    type: Literal["artifact"] = "artifact"
+    task_id: str
+    schema_id: str
+    artifact_reference: SubmissionArtifactReference
+    sandbox_path: str
+
+
+GradingSubmission = Annotated[
+    TextGradingSubmission | ArtifactGradingSubmission,
+    Field(discriminator="type"),
+]
 
 
 class RetrieveTaskResponse(BaseModel):
@@ -58,7 +122,7 @@ class RetrieveTaskResponse(BaseModel):
     Customize fields based on what your benchmark tasks need.
     """
 
-    source: SandboxSource = Field(description="Sandbox source image or snapshot")
+    source: SandboxSource = Field(description="Sandbox source")
     problem_path: str = Field(
         description="Path inside the sandbox where the problem statement file will be written during setup"
     )
@@ -67,6 +131,13 @@ class RetrieveTaskResponse(BaseModel):
         default=None, description="Agent execution max time in seconds (None for no timeout)"
     )
     resources: Resources = Field(description="Computational resources needed")
+    volumes: list[VolumeMount] = Field(
+        default_factory=list,
+        description="Persistent volumes to attach to generation and default grading sandboxes",
+    )
+    eval_sandbox: EvalSandboxSpec | None = Field(
+        default=None, description="Grading-sandbox overrides for eval_mode == SANDBOX; None uses generation values"
+    )
 
     @computed_field(description="Legacy sandbox image field for older Valkyrie clients")
     @property
@@ -176,6 +247,23 @@ class HealthCheckResponse(BaseModel):
     status: str = Field(description="Status of the service ('ok' if running)")
 
 
+class EvalMode(StrEnum):
+    """How a benchmark is evaluated on /v1/evaluate.
+
+    TEXT: the endpoint calls evaluate_response in-process.
+    IN_PROCESS_ARTIFACT: the framework downloads an admitted artifact and
+    passes its bytes to evaluate_artifact in the service process.
+    SANDBOX: the endpoint provisions a fresh grading sandbox, calls
+    prepare_grading_sandbox with a typed submission, then runs
+    evaluate_instance. Clients never branch on this value — the server picks
+    the grading path itself; /version reports it for visibility.
+    """
+
+    TEXT = "text"
+    IN_PROCESS_ARTIFACT = "in_process_artifact"
+    SANDBOX = "sandbox"
+
+
 class VersionResponse(BaseModel):
     """Response for GET /version reporting framework + deployed-service version."""
 
@@ -183,6 +271,7 @@ class VersionResponse(BaseModel):
     service_name: str | None = None
     service_version: str | None = None
     dataset_version: str | None = None
+    eval_mode: EvalMode = EvalMode.TEXT
 
 
 class StreamMessageChunk(BaseModel):
@@ -196,7 +285,7 @@ class StreamResultChunk(BaseModel):
     """Streaming chunk for final results."""
 
     type: Literal["result"] = Field(description="Chunk type identifier")
-    data: dict[str, Any] = Field(description="Final result data (benchmark-specific structure)")
+    data: JsonValue = Field(description="Final JSON-compatible result data")
 
 
 class StreamErrorChunk(BaseModel):

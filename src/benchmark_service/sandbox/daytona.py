@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import os
 import shlex
 import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import suppress
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from aiohttp import ClientConnectionError, ClientResponseError
@@ -23,6 +25,9 @@ from daytona import (
     GpuType,
 )
 from daytona import (
+    VolumeMount as DaytonaVolumeMount,
+)
+from daytona import (
     Resources as DaytonaResources,
 )
 from daytona.common.errors import (
@@ -31,14 +36,28 @@ from daytona.common.errors import (
     DaytonaError,
     DaytonaRateLimitError,
     DaytonaTimeoutError,
+    create_daytona_error,
 )
 from daytona.common.pty import PtyResult
 from daytona.handle.async_pty_handle import AsyncPtyHandle
+from daytona_api_client_async import ApiClient as DaytonaApiClient
+from daytona_api_client_async import Configuration as DaytonaApiConfiguration
+from daytona_api_client_async import OrganizationsApi
+from daytona_api_client_async.exceptions import NotFoundException, OpenApiException
 from pydantic import BaseModel
-from tenacity import RetryCallState, retry, retry_if_exception_type, stop_after_attempt, wait_exponential, wait_fixed
+from tenacity import (
+    RetryCallState,
+    retry,
+    retry_if_exception_type,
+    stop_after_attempt,
+    wait_chain,
+    wait_exponential,
+    wait_random,
+)
 
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
+    ComposeSource,
     ExecResult,
     ImageSource,
     MissingSandboxConfigError,
@@ -51,6 +70,9 @@ from benchmark_service.sandbox.types import (
     SandboxProvider,
     SandboxQuery,
     SnapshotSource,
+    TargetedSnapshotSource,
+    VolumeMount,
+    resolve_volume_subpath,
     validate_command_env,
 )
 
@@ -72,6 +94,7 @@ _RETRY_AFTER_PREFIX = "retry-after-"
 _KNOWN_THROTTLERS = ("sandbox-create", "sandbox-lifecycle", "authenticated", "anonymous")
 _DELETE_CONFLICT_MESSAGES = ("state change in progress", "modified by another operation")
 _REMOVED_SANDBOX_CLIENT_STATUSES = (404, 502)
+_RETRYABLE_PROVIDER_STATUSES = (408, 429, 500, 502, 503, 504)
 _FAILED_EXECUTE_COMMAND_PREFIX = "failed to execute command:"
 # Daytona's runner responds with a generic 400 ("bad request") when the container backing the
 # sandbox is already gone -- the toolbox cannot route to a container that no longer has an IP.
@@ -81,6 +104,9 @@ _REMOVED_CONTAINER_MESSAGES = (
     "failed to resolve container ip",
     "no ip address found",
 )
+_VOLUME_READY_POLL_SECONDS = 0.5
+_VOLUME_READY_TIMEOUT_SECONDS = 30.0
+_VOLUME_PENDING_STATES = frozenset({"creating", "pending_create"})
 # Daytona sometimes flattens a transport failure into a bare DaytonaError message with no chained
 # cause; these substrings recover those cases by text when no typed cause survives to match.
 _TRANSPORT_ERROR_MESSAGES = (
@@ -88,12 +114,16 @@ _TRANSPORT_ERROR_MESSAGES = (
     "[errno 32] broken pipe",
     "[errno 9] bad file descriptor",
     "502 bad gateway",
-    "failed to create sandbox: an unexpected error occurred.",
+    "an unexpected error occurred.",
     "failed to register with sysbox-mgr",
     "server disconnected",
+    "temporary authentication service error",
 )
 _RETRYABLE_DAYTONA_CAUSES = (ClientConnectionError, ConnectionError, TimeoutError)
-_FIXED_PROVIDER_WAIT = wait_fixed(2)
+_PROVIDER_RETRY_DELAYS_SECONDS = (5, 25, 90, 300, 420)
+_FIXED_PROVIDER_WAIT = wait_chain(
+    *(wait_random(delay * 0.9, delay) for delay in _PROVIDER_RETRY_DELAYS_SECONDS)
+)
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
 
 
@@ -127,8 +157,38 @@ class DaytonaProviderConfig(BaseModel):
             raise MissingSandboxConfigError("Missing required headers: x-api-key, x-api-url, x-target")
         return cls(DAYTONA_API_KEY=api_key, DAYTONA_API_URL=api_url, DAYTONA_TARGET=target)
 
+    @classmethod
+    def from_env(cls) -> "DaytonaProviderConfig":
+        """Build config from the DAYTONA_* environment variables; callers never supply creds."""
+        api_key = os.environ.get("DAYTONA_API_KEY")
+        api_url = os.environ.get("DAYTONA_API_URL")
+        target = os.environ.get("DAYTONA_TARGET")
+        missing = [
+            name
+            for name, value in (
+                ("DAYTONA_API_KEY", api_key),
+                ("DAYTONA_API_URL", api_url),
+                ("DAYTONA_TARGET", target),
+            )
+            if not value
+        ]
+        if missing:
+            raise MissingSandboxConfigError(f"Missing required environment variables: {', '.join(missing)}")
+        return cls(DAYTONA_API_KEY=api_key, DAYTONA_API_URL=api_url, DAYTONA_TARGET=target)  # type: ignore[arg-type]
+
     def create_provider(self) -> SandboxProvider:
         return DaytonaSandboxProvider(self)
+
+
+def _daytona_client(config: DaytonaProviderConfig, target: str) -> AsyncDaytona:
+    return AsyncDaytona(
+        config=DaytonaConfig(
+            api_key=config.DAYTONA_API_KEY,
+            api_url=config.DAYTONA_API_URL,
+            target=target,
+            connection_pool_maxsize=None,
+        )
+    )
 
 
 def _daytona_gpu_type(gpu_type: str | None) -> GpuType | None:
@@ -213,10 +273,22 @@ def _has_retryable_cause(exc: BaseException) -> bool:
     return False
 
 
+def _provider_status_code(exc: DaytonaError | ClientResponseError) -> int | None:
+    if isinstance(exc, ClientResponseError):
+        return exc.status
+    return exc.status_code
+
+
 def _is_transient_daytona_error(exc: DaytonaError | ClientResponseError) -> bool:
     if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS) or _has_retryable_cause(exc):
         return True
+    if _provider_status_code(exc) in _RETRYABLE_PROVIDER_STATUSES:
+        return True
     return _message_contains(exc, _TRANSPORT_ERROR_MESSAGES)
+
+
+def _is_name_conflict_error(exc: DaytonaError) -> bool:
+    return isinstance(exc, DaytonaConflictError) or exc.status_code == 409 or _message_contains(exc, ("already exists",))
 
 
 def _parse_retry_after_seconds(value: object) -> float | None:
@@ -260,7 +332,7 @@ def daytona_retry_after_seconds(exc: DaytonaRateLimitError) -> float | None:
 
 _PROVIDER_RETRY = retry(
     retry=retry_if_exception_type(SandboxConnectionError),
-    stop=stop_after_attempt(3),
+    stop=stop_after_attempt(len(_PROVIDER_RETRY_DELAYS_SECONDS) + 1),
     wait=_provider_retry_wait,
     reraise=True,
 )
@@ -269,6 +341,8 @@ _PROVIDER_RETRY = retry(
 class DaytonaSandbox(Sandbox):
     def __init__(self, sandbox: AsyncSandbox) -> None:
         self._sandbox = sandbox
+        self.labels = dict(sandbox.labels)
+        self.created_at = self._parse_created_at(sandbox.created_at)
 
     @property
     def id(self) -> str:
@@ -281,6 +355,19 @@ class DaytonaSandbox(Sandbox):
     @property
     def state(self) -> str:
         return str(self._sandbox.state)
+
+    def _parse_created_at(self, value: str | None) -> datetime | None:
+        if value is None:
+            return None
+
+        try:
+            created_at = datetime.fromisoformat(value)
+        except ValueError as exc:
+            raise SandboxError(f"Invalid Daytona creation time for {self._sandbox_ref}.") from exc
+
+        if created_at.tzinfo is None or created_at.utcoffset() is None:
+            raise SandboxError(f"Invalid Daytona creation time for {self._sandbox_ref}.")
+        return created_at.astimezone(UTC)
 
     @property
     def _sandbox_ref(self) -> str:
@@ -522,14 +609,23 @@ class DaytonaSandbox(Sandbox):
 
 class DaytonaSandboxProvider(SandboxProvider):
     def __init__(self, config: DaytonaProviderConfig) -> None:
-        self._daytona = AsyncDaytona(
-            config=DaytonaConfig(
-                api_key=config.DAYTONA_API_KEY,
-                api_url=config.DAYTONA_API_URL,
-                target=config.DAYTONA_TARGET,
-                connection_pool_maxsize=None,
-            )
+        self._config = config
+        self._target = config.DAYTONA_TARGET.strip()
+        if not self._target:
+            raise MissingSandboxConfigError("DAYTONA_TARGET must not be blank")
+        self._target_id: str | None = None
+        self._target_id_lock = asyncio.Lock()
+        self._target_api_configuration = DaytonaApiConfiguration(
+            host=config.DAYTONA_API_URL,
+            access_token=config.DAYTONA_API_KEY,
         )
+        self._daytona = _daytona_client(config, self._target)
+        self._daytona_by_target = {self._target: self._daytona}
+
+    def _client_for_target(self, target: str) -> AsyncDaytona:
+        if target not in self._daytona_by_target:
+            self._daytona_by_target[target] = _daytona_client(self._config, target)
+        return self._daytona_by_target[target]
 
     def _sandbox_error(self, exc: DaytonaError) -> SandboxError:
         if _is_not_found_error(exc):
@@ -538,12 +634,73 @@ class DaytonaSandboxProvider(SandboxProvider):
             return SandboxConnectionError(f"Daytona sandbox provider connection error: {exc}")
         return SandboxError(f"Daytona sandbox provider error: {exc}")
 
+    async def _resolve_volumes(
+        self,
+        daytona: AsyncDaytona,
+        mounts: list[VolumeMount],
+        labels: Mapping[str, str],
+    ) -> list[DaytonaVolumeMount]:
+        """Map named volumes to Daytona mounts, resolving each name to its id.
+
+        Daytona mounts by volume id rather than name, so a benchmark that only
+        knows the name would otherwise have to resolve it itself and every
+        caller would reimplement this.
+        """
+        resolved: list[DaytonaVolumeMount] = []
+        for mount in mounts:
+            if mount.read_only:
+                raise SandboxError(
+                    f"Daytona does not support read-only volume mounts; volume {mount.name!r} "
+                    f"at {mount.mount_path!r} would be writable"
+                )
+            subpath = resolve_volume_subpath(mount, labels)
+            try:
+                volume = await daytona.volume.get(mount.name, create=mount.create_if_missing)
+                state = volume.state.value
+                try:
+                    async with asyncio.timeout(_VOLUME_READY_TIMEOUT_SECONDS):
+                        while volume.state != "ready":
+                            if state not in _VOLUME_PENDING_STATES:
+                                detail = f": {volume.error_reason}" if volume.error_reason else ""
+                                raise SandboxError(
+                                    f"Daytona volume {mount.name!r} is not ready (state={state!r}){detail}"
+                                )
+                            await asyncio.sleep(_VOLUME_READY_POLL_SECONDS)
+                            volume = await daytona.volume.get(mount.name)
+                            state = volume.state.value
+                except TimeoutError as exc:
+                    raise SandboxError(
+                        f"Daytona volume {mount.name!r} did not become ready within "
+                        f"{_VOLUME_READY_TIMEOUT_SECONDS:g}s (state={state!r})"
+                    ) from exc
+            except NotFoundException as exc:
+                raise SandboxError(
+                    f"Daytona volume {mount.name!r} does not exist (mount {mount.mount_path}); "
+                    "create it or set create_if_missing"
+                ) from exc
+            except OpenApiException as exc:
+                daytona_error = create_daytona_error(
+                    f"Failed to resolve Daytona volume {mount.name!r}: {exc}",
+                    status_code=getattr(exc, "status", None),
+                    headers=getattr(exc, "headers", None),
+                )
+                raise self._sandbox_error(daytona_error) from exc
+            except DaytonaError as exc:
+                raise self._sandbox_error(exc) from exc
+            resolved.append(
+                DaytonaVolumeMount(
+                    volume_id=volume.id,
+                    mount_path=mount.mount_path,
+                    subpath=subpath,
+                )
+            )
+        return resolved
+
     @_PROVIDER_RETRY
     async def create_sandbox(self, request: SandboxCreateRequest) -> DaytonaSandbox:
-        existing = await self._find_reusable_sandbox(request.name)
-        if existing is not None:
-            return DaytonaSandbox(existing)
-
+        daytona = self._daytona
+        if isinstance(request.source, TargetedSnapshotSource):
+            daytona = self._client_for_target(request.source.target)
         resources = DaytonaResources(
             cpu=request.resources.vcpu,
             memory=request.resources.memory,
@@ -551,6 +708,8 @@ class DaytonaSandboxProvider(SandboxProvider):
             gpu=request.resources.gpu or None,
             gpu_type=_daytona_gpu_type(request.resources.gpu_type),
         )
+
+        volume_mounts = await self._resolve_volumes(daytona, request.volumes, request.labels) if request.volumes else None
 
         match request.source:
             case ImageSource(image=image):
@@ -560,11 +719,12 @@ class DaytonaSandboxProvider(SandboxProvider):
                     name=request.name,
                     labels=request.labels,
                     image=image,
-                    network_block_all=False,
+                    network_block_all=request.network_block_all,
                     resources=resources,
                     env_vars=request.env_vars,
+                    volumes=volume_mounts,
                 )
-            case SnapshotSource(snapshot=snapshot):
+            case SnapshotSource(snapshot=snapshot) | TargetedSnapshotSource(snapshot=snapshot):
                 if request.resources.gpu:
                     raise SandboxError("Daytona snapshot sandboxes use the snapshot's resources; GPUs cannot be requested")
                 params = CreateSandboxFromSnapshotParams(
@@ -574,22 +734,44 @@ class DaytonaSandboxProvider(SandboxProvider):
                     labels=request.labels,
                     snapshot=snapshot,
                     language="python",
-                    network_block_all=False,
+                    network_block_all=request.network_block_all,
                     env_vars=request.env_vars,
+                    volumes=volume_mounts,
                 )
-            case _:
+            case ComposeSource():
                 raise SandboxError("ComposeSource must be unwrapped before provider.create_sandbox")
 
         try:
-            inner = await self._daytona.create(params, timeout=request.create_timeout)
+            inner = await daytona.create(params, timeout=request.create_timeout)
         except DaytonaError as exc:
+            # A name conflict means an earlier attempt of this same request
+            # created the sandbox but the response was lost (transport retry).
+            # Recover it by name so the retry doesn't strand an orphan and fail
+            # the request on the conflict.
+            if _is_name_conflict_error(exc):
+                existing = await self._find_existing_sandbox(request.name, daytona)
+                if existing is not None:
+                    return DaytonaSandbox(existing)
+            elif _is_transient_daytona_error(exc):
+                await self._delete_failed_sandbox(request.name, daytona)
             raise self._sandbox_error(exc) from exc
 
         return DaytonaSandbox(inner)
 
-    async def _find_reusable_sandbox(self, name: str) -> AsyncSandbox | None:
+    async def _delete_failed_sandbox(self, name: str, daytona: AsyncDaytona) -> None:
         try:
-            sandbox = await self._daytona.get(name)
+            sandbox = await daytona.get(name)
+        except DaytonaNotFoundError:
+            return
+        except DaytonaError as exc:
+            raise self._sandbox_error(exc) from exc
+
+        if sandbox.state in _FAILED_SANDBOX_STATES:
+            await self.delete_sandbox(sandbox.id)
+
+    async def _find_existing_sandbox(self, name: str, daytona: AsyncDaytona) -> AsyncSandbox | None:
+        try:
+            sandbox = await daytona.get(name)
         except DaytonaNotFoundError:
             return None
         except DaytonaError as exc:
@@ -645,13 +827,49 @@ class DaytonaSandboxProvider(SandboxProvider):
     @_PROVIDER_RETRY
     async def _list_sandboxes(self, query: SandboxQuery) -> list[AsyncSandbox]:
         try:
-            daytona_query = ListSandboxesQuery(labels=query.labels, limit=query.page_size)
+            target_id = await self._resolve_target_id()
+            daytona_query = ListSandboxesQuery(
+                labels=query.labels,
+                targets=[target_id],
+                # Daytona applies created_at_before inclusively despite the name.
+                created_at_before=query.created_at_lte,
+                limit=query.page_size,
+            )
             return [sandbox async for sandbox in self._daytona.list(daytona_query)]
         except DaytonaError as exc:
             raise self._sandbox_error(exc) from exc
 
+    async def _resolve_target_id(self) -> str:
+        if self._target_id is not None:
+            return self._target_id
+
+        async with self._target_id_lock:
+            if self._target_id is not None:
+                return self._target_id
+
+            try:
+                async with DaytonaApiClient(self._target_api_configuration) as api_client:
+                    regions = await OrganizationsApi(api_client).list_available_regions()
+            except OpenApiException as exc:
+                raise create_daytona_error(
+                    f"Failed to resolve Daytona target: {exc}",
+                    status_code=getattr(exc, "status", None),
+                    headers=getattr(exc, "headers", None),
+                ) from exc
+            except _RETRYABLE_DAYTONA_CAUSES as exc:
+                raise SandboxConnectionError(f"Daytona sandbox provider connection error: {exc}") from exc
+
+            region = next((region for region in regions if region.name == self._target), None)
+            region = region or next((region for region in regions if region.id == self._target), None)
+            if region is None:
+                raise SandboxError(f"Daytona target is not available: {self._target!r}.")
+
+            self._target_id = region.id
+            return self._target_id
+
     async def close(self) -> None:
-        await self._daytona.close()
+        for daytona in self._daytona_by_target.values():
+            await daytona.close()
 
 
 def _command(command: str, cwd: str | None, timeout: float | None) -> str:

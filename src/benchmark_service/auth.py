@@ -11,12 +11,12 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from cachetools import TTLCache
 from descope.descope_client import DescopeClient
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, PositiveInt
 
 logger = logging.getLogger(__name__)
 
@@ -24,12 +24,25 @@ DESCOPE_API_KEY_HEADER = "x-descope-api-key"
 DEFAULT_AUTH_CACHE_TTL_SECONDS = 300
 AUTH_CACHE_MAX_SIZE = 1024
 LEGACY_TENANT_SENTINEL = "_legacy"
+EvaluationQuotaPeriod = Literal["day", "week", "month", "year"]
+
+
+class EvaluationQuotaConfig(BaseModel):
+    """Per-tenant evaluation request quota."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    limit: PositiveInt
+    period: EvaluationQuotaPeriod
 
 
 class TenantConfig(BaseModel):
     """Per-tenant access rules within a benchmark service."""
 
+    model_config = ConfigDict(extra="forbid")
+
     datasets: list[str] = Field(default_factory=list)
+    evaluation_quota: EvaluationQuotaConfig | None = None
     trial_mode: bool = Field(
         default=False,
         description=(
@@ -46,6 +59,8 @@ class AllowlistConfig(BaseModel):
     slice is delivered to each container as JSON via `DESCOPE_TENANT_ALLOWLIST_JSON`,
     or as a YAML file via `DESCOPE_ALLOWLIST_PATH` for local dev.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     tenants: dict[str, TenantConfig] = Field(default_factory=dict)
 
@@ -111,7 +126,7 @@ def load_allowlist() -> AllowlistConfig:
 
     config = AllowlistConfig()
     _allowlist_cache = config
-    if not _allowlist_warned:
+    if get_auth_settings().auth_required and not _allowlist_warned:
         logger.warning(
             "No tenant allowlist configured (set %s or %s). All Descope-authenticated "
             "requests will be rejected when AUTH_REQUIRED=true.",

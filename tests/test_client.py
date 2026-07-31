@@ -4,12 +4,24 @@ import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
+from websockets.exceptions import ConnectionClosedError
+from websockets.frames import Close
 
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
-from benchmark_service.v1_schemas import V1DatasetTasksResponse
+from benchmark_service.v1_schemas import (
+    V1DatasetTasksResponse,
+    V1EvalResponse,
+    V1EvalStatus,
+    V1PayloadType,
+    V1ScoreItem,
+    V1ScoreResponse,
+    V1UploadUrlResponse,
+    V1Versions,
+)
 
 BASE_URL = "http://localhost:8000"
 HEADERS = {"Authorization": "Bearer token"}
@@ -42,6 +54,7 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
                 "service_name": "legal-research-benchmark-service",
                 "service_version": "1.2.3",
                 "dataset_version": "3.0.0",
+                "eval_mode": "text",
             },
         ),
         (
@@ -61,6 +74,8 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
                 "cwd": "/work",
                 "resources": {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None},
                 "agent_timeout": None,
+                "eval_sandbox": None,
+                "volumes": [],
             },
         ),
         (
@@ -157,6 +172,36 @@ async def test_retrieve_task_serializes_snapshot_source_for_legacy_clients(
     assert result.model_dump()["docker_image"] == "snapshot:vcb1-openhands-abc123"
 
 
+async def test_retrieve_task_serializes_targeted_snapshot_as_invalid_legacy_image(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    mock_http.get = AsyncMock(
+        return_value=_mock_response(
+            json_data={
+                "source": {
+                    "type": "targeted_snapshot",
+                    "snapshot": "programbench-masscan",
+                    "target": "us-west-3",
+                },
+                "problem_path": "/tmp/problem_statement.txt",
+                "cwd": "/work",
+                "resources": {"vcpu": 4, "memory": 16, "disk": 30},
+                "agent_timeout": None,
+            }
+        )
+    )
+
+    result = await client.retrieve_task("task-1")
+
+    assert result.model_dump()["docker_image"] == "targeted-snapshot+source-required"
+    assert result.source.model_dump() == {
+        "type": "targeted_snapshot",
+        "snapshot": "programbench-masscan",
+        "target": "us-west-3",
+    }
+
+
 async def test_retrieve_task_serializes_compose_source_as_invalid_legacy_image(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
@@ -210,8 +255,10 @@ async def test_http_error(
     mock_http.get = AsyncMock(return_value=mock_resp)
     mock_http.post = AsyncMock(return_value=mock_resp)
 
-    with pytest.raises(BenchmarkServiceError):
+    with pytest.raises(BenchmarkServiceError) as exc_info:
         await getattr(client, method)(*args)
+
+    assert exc_info.value.status_code == 500
 
 
 @pytest.mark.parametrize(
@@ -431,8 +478,9 @@ async def test_verify_task_ids_no_dataset_omitted(
 class _AsyncIterator:
     """Async iterator over a list of strings."""
 
-    def __init__(self, items: list[str]) -> None:
+    def __init__(self, items: list[str], terminal_error: Exception | None = None) -> None:
         self._items = iter(items)
+        self._terminal_error = terminal_error
 
     def __aiter__(self) -> "_AsyncIterator":
         return self
@@ -441,12 +489,16 @@ class _AsyncIterator:
         try:
             return next(self._items)
         except StopIteration:
+            if self._terminal_error is not None:
+                error = self._terminal_error
+                self._terminal_error = None
+                raise error
             raise StopAsyncIteration
 
 
-def _ws_mock(messages: list[str]) -> AsyncMock:
+def _ws_mock(messages: list[str], terminal_error: Exception | None = None) -> AsyncMock:
     """Create a mock websockets.connect context manager yielding messages."""
-    ws = _AsyncIterator(messages)
+    ws = _AsyncIterator(messages, terminal_error)
     ws.send = AsyncMock()  # type: ignore[attr-defined]
 
     mock_connect = AsyncMock()
@@ -586,6 +638,28 @@ async def test_ws_connection_closed_without_result(method: str, args: list[str])
             await getattr(client, method)(*args)
 
 
+@pytest.mark.parametrize(
+    ("code", "reason"),
+    [
+        (1008, "Evaluation quota reached; retry after 2026-07-27T00:00:00Z."),
+        (1011, "Evaluation quota enforcement is temporarily unavailable; try again later."),
+    ],
+)
+async def test_ws_quota_close_is_reported_as_benchmark_service_error(
+    code: int,
+    reason: str,
+) -> None:
+    close_frame = Close(code, reason)
+    mock_connect = _ws_mock([], ConnectionClosedError(close_frame, None))
+    client = _make_client()
+
+    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+        with pytest.raises(BenchmarkServiceError) as exc_info:
+            await client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG)
+
+    assert str(exc_info.value) == f"WebSocket closed with code {code}: {reason}"
+
+
 async def test_client_list_tasks_returns_v1_dataset_tasks_response(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
@@ -609,3 +683,173 @@ async def test_client_list_tasks_returns_v1_dataset_tasks_response(
     assert result.dataset == "default"
     assert {t.id for t in result.tasks} == {"task-1", "task-2", "task-3"}
     mock_http.get.assert_called_once_with(f"{BASE_URL}/v1/datasets/default/tasks")
+
+
+async def test_client_v1_evaluate_posts_payload_and_returns_v1_eval_response(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    mock_resp = _mock_response(
+        json_data={
+            "run_id": "run-1",
+            "task_id": "task-1",
+            "status": "evaluated",
+            "evaluator_version": "stub-1.0",
+            "result": {"resolved": True},
+            "errors": [],
+        }
+    )
+    mock_http.post = AsyncMock(return_value=mock_resp)
+
+    result = await client.v1_evaluate(
+        run_id="run-1",
+        task_id="task-1",
+        payload_data="abc-key",
+        payload_schema="code-migration.workspace-tar.v1",
+        payload_type=V1PayloadType.ARTIFACT,
+        dataset="validation",
+        versions=V1Versions(runner="benchmark-orchestrator-1.2.3"),
+    )
+
+    assert isinstance(result, V1EvalResponse)
+    assert result.status == "evaluated"
+    assert result.result == {"resolved": True}
+    called_url, called_kwargs = mock_http.post.call_args
+    assert called_url[0] == f"{BASE_URL}/v1/evaluate"
+    assert called_kwargs["json"]["payload"] == {
+        "type": "artifact",
+        "schema": "code-migration.workspace-tar.v1",
+        "data": "abc-key",
+    }
+    assert called_kwargs["json"]["dataset"] == "validation"
+    assert called_kwargs["json"]["versions"] == {"runner": "benchmark-orchestrator-1.2.3"}
+
+
+async def test_client_v1_upload_url_posts_artifact_identity(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    mock_http.post = AsyncMock(
+        return_value=_mock_response(
+            json_data={
+                "key": "submission-artifacts/acme/validation/run-1/task-1/submission.xlsx",
+                "url": "https://uploads.example/presigned",
+                "expires_in": 900,
+            }
+        )
+    )
+
+    result = await client.v1_upload_url(
+        run_id="run-1",
+        task_id="task-1",
+        filename="submission.xlsx",
+        dataset="validation",
+    )
+
+    assert isinstance(result, V1UploadUrlResponse)
+    assert result.expires_in == 900
+    mock_http.post.assert_awaited_once_with(
+        f"{BASE_URL}/v1/submissions/upload-url",
+        json={
+            "run_id": "run-1",
+            "task_id": "task-1",
+            "dataset": "validation",
+            "filename": "submission.xlsx",
+        },
+    )
+
+
+async def test_client_v1_score_posts_results_and_returns_v1_score_response(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    mock_resp = _mock_response(
+        json_data={"run_id": "run-1", "tasks_evaluated": ["task-1"], "final_score": 100.0, "metadata": {}}
+    )
+    mock_http.post = AsyncMock(return_value=mock_resp)
+
+    result = await client.v1_score(
+        run_id="run-1",
+        evaluation_results={
+            "task-1": V1ScoreItem(status=V1EvalStatus.EVALUATED, result={"resolved": True}, errors=[]),
+            "task-2": None,
+        },
+        dataset="validation",
+    )
+
+    assert isinstance(result, V1ScoreResponse)
+    assert result.final_score == 100.0
+    called_url, called_kwargs = mock_http.post.call_args
+    assert called_url[0] == f"{BASE_URL}/v1/score"
+    assert called_kwargs["json"]["evaluation_results"]["task-2"] is None
+
+
+async def test_client_v1_evaluate_raises_on_error_status(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    mock_http.post = AsyncMock(return_value=_mock_response(status_code=500))
+
+    with pytest.raises(BenchmarkServiceError, match="v1 evaluate failed") as exc_info:
+        await client.v1_evaluate(
+            run_id="run-1",
+            task_id="task-1",
+            payload_data="x",
+            payload_schema="s.text.v1",
+            payload_type=V1PayloadType.TEXT,
+        )
+
+    assert exc_info.value.status_code == 500
+
+
+def test_non_http_service_error_has_no_status_code() -> None:
+    assert BenchmarkServiceError("websocket failed").status_code is None
+
+
+@pytest.mark.parametrize(
+    ("method", "kwargs"),
+    [
+        (
+            "v1_evaluate",
+            {
+                "run_id": "run-1",
+                "task_id": "task-1",
+                "payload_data": "answer",
+                "payload_schema": "s.text.v1",
+                "payload_type": V1PayloadType.TEXT,
+            },
+        ),
+        (
+            "v1_score",
+            {
+                "run_id": "run-1",
+                "evaluation_results": {},
+            },
+        ),
+        (
+            "v1_upload_url",
+            {
+                "run_id": "run-1",
+                "task_id": "task-1",
+                "filename": "submission.xlsx",
+            },
+        ),
+    ],
+)
+async def test_client_v1_mutations_do_not_retry_after_response_transport_failure(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    method: str,
+    kwargs: dict[str, Any],
+) -> None:
+    client, mock_http = benchmark_client
+    mock_http.post = AsyncMock(
+        side_effect=httpx.ReadTimeout(
+            "response connection closed",
+            request=httpx.Request("POST", f"{BASE_URL}/v1"),
+        )
+    )
+
+    with pytest.raises(httpx.ReadTimeout):
+        await getattr(client, method)(**kwargs)
+
+    mock_http.post.assert_awaited_once()

@@ -204,6 +204,36 @@ async def test_download_rejects_keys_outside_tenant_namespace(monkeypatch: pytes
     assert fake.calls == []
 
 
+@pytest.mark.parametrize(
+    "key",
+    [
+        "submission-artifacts/other/default/run-1/task-9/submission.xlsx",
+        "submission-artifacts/acme/other/run-1/task-9/submission.xlsx",
+        "submission-artifacts/acme/default/other/task-9/submission.xlsx",
+        "submission-artifacts/acme/default/run-1/other/submission.xlsx",
+    ],
+)
+def test_validate_submission_key_binds_the_authenticated_evaluation(key: str) -> None:
+    with pytest.raises(ValueError):
+        submission_artifacts.validate_submission_key(
+            key,
+            tenant="acme",
+            dataset="default",
+            run_id="run-1",
+            task_id="task-9",
+        )
+
+
+def test_validate_submission_key_accepts_the_minted_evaluation_key() -> None:
+    submission_artifacts.validate_submission_key(
+        _TENANT_KEY,
+        tenant="acme",
+        dataset="default",
+        run_id="run-1",
+        task_id="task-9",
+    )
+
+
 async def test_stat_maps_missing_object_to_not_found(monkeypatch: pytest.MonkeyPatch) -> None:
     _install_fake_s3(monkeypatch, _FakeS3(error_code="404"))
     with pytest.raises(submission_artifacts.SubmissionArtifactNotFound, match="upload-url"):

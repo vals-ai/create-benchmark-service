@@ -90,6 +90,24 @@ class EvalSandboxSpec(BaseModel):
     network_block_all: bool = Field(default=True, description="Block all network egress from the grading sandbox")
 
 
+class SandboxRecoveryPolicy(BaseModel):
+    """Opt-in policy for recreating a generation sandbox after provider loss.
+
+    Recovery reruns task setup and the agent command with the same run identity,
+    environment, and persistent volumes. Benchmarks enabling it must therefore
+    make those operations idempotent and keep all continuation state outside the
+    sandbox's ephemeral filesystem.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_sandbox_attempts: int = Field(
+        ge=2,
+        le=20,
+        description="Maximum generation-sandbox attempts, including the initial sandbox",
+    )
+
+
 class TextGradingSubmission(BaseModel):
     """Inline text submitted for sandbox grading."""
 
@@ -134,6 +152,12 @@ class RetrieveTaskResponse(BaseModel):
     volumes: list[VolumeMount] = Field(
         default_factory=list,
         description="Persistent volumes to attach to generation and default grading sandboxes",
+    )
+    sandbox_recovery: SandboxRecoveryPolicy | None = Field(
+        default=None,
+        description=(
+            "Opt in to bounded recreation when the generation sandbox disappears; None preserves fail-fast behavior"
+        ),
     )
     eval_sandbox: EvalSandboxSpec | None = Field(
         default=None, description="Grading-sandbox overrides for eval_mode == SANDBOX; None uses generation values"

@@ -167,13 +167,14 @@ class FlakyExecSandbox(FakeInnerSandbox):
 def _request(
     source: ImageSource | SnapshotSource | TargetedSnapshotSource | None = None,
     resources: Resources | None = None,
+    labels: dict[str, str] | None = None,
     volumes: list[VolumeMount] | None = None,
 ) -> SandboxCreateRequest:
     return SandboxCreateRequest(
         source=source or ImageSource(image="python:3.12"),
         resources=resources or Resources(vcpu=4, memory=8, disk=30),
         name="task-1",
-        labels={"run_id": "r1"},
+        labels={"run_id": "r1"} if labels is None else labels,
         env_vars={"FOO": "bar"},
         auto_stop_interval=30,
         create_timeout=120,
@@ -772,19 +773,62 @@ async def test_create_sandbox_mounts_named_volumes(monkeypatch: pytest.MonkeyPat
     assert looked_up == [("kspbench-steam", False)]
 
 
-async def test_create_sandbox_reports_a_missing_volume_clearly(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A run must not start with an empty directory where its fixture belongs."""
+async def test_create_sandbox_applies_read_only_and_run_scoped_subpath(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+    mount_options: list[tuple[bool | None, str | None]] = []
+    volume = SimpleNamespace()
 
     async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
         return FakeInnerSandbox()
 
-    def from_name(name: str, create_if_missing: bool = False, client: Any = None) -> str:
-        raise ModalNotFoundError(f"no such volume: {name}")
+    def with_mount_options(*, read_only: bool | None = None, sub_path: str | None = None) -> Any:
+        mount_options.append((read_only, sub_path))
+        return ("configured-volume", read_only, sub_path)
+
+    volume.with_mount_options = with_mount_options
+
+    def from_name(name: str, create_if_missing: bool = False, client: Any = None) -> Any:
+        return volume
 
     monkeypatch.setattr(modal_module, "Volume", SimpleNamespace(from_name=from_name))
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
 
-    with pytest.raises(SandboxError, match="does not exist"):
-        await provider.create_sandbox(
-            _request(volumes=[VolumeMount(name="absent", mount_path="/vol")])
+    await provider.create_sandbox(
+        _request(
+            labels={"run-id": "run-123"},
+            volumes=[
+                VolumeMount(
+                    name="fixtures",
+                    mount_path="/fixtures",
+                    read_only=True,
+                    subpath="runs/{run_id}",
+                )
+            ],
         )
+    )
+
+    assert mount_options == [(True, "runs/run-123")]
+    assert captured["volumes"] == {
+        "/fixtures": ("configured-volume", True, "runs/run-123"),
+    }
+
+
+async def test_create_sandbox_reports_a_missing_volume_clearly(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A run must not start with an empty directory where its fixture belongs."""
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        raise ModalNotFoundError("Volume 'absent' not found")
+
+    def from_name(name: str, create_if_missing: bool = False, client: Any = None) -> str:
+        return f"vol::{name}"
+
+    monkeypatch.setattr(modal_module, "Volume", SimpleNamespace(from_name=from_name))
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    with pytest.raises(SandboxError, match="volume mount failed") as raised:
+        await provider.create_sandbox(_request(volumes=[VolumeMount(name="absent", mount_path="/vol")]))
+
+    assert type(raised.value) is SandboxError

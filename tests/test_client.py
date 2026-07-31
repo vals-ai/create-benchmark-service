@@ -75,6 +75,7 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
                 "resources": {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None},
                 "agent_timeout": None,
                 "eval_sandbox": None,
+                "volumes": [],
             },
         ),
         (

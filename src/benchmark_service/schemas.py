@@ -14,6 +14,7 @@ from benchmark_service.sandbox.types import (
     SandboxSource,
     SnapshotSource,
     TargetedSnapshotSource,
+    VolumeMount,
 )
 from benchmark_service.submission_artifacts import SubmissionArtifactReference
 
@@ -130,6 +131,10 @@ class RetrieveTaskResponse(BaseModel):
         default=None, description="Agent execution max time in seconds (None for no timeout)"
     )
     resources: Resources = Field(description="Computational resources needed")
+    volumes: list[VolumeMount] = Field(
+        default_factory=list,
+        description="Persistent volumes to attach to generation and default grading sandboxes",
+    )
     eval_sandbox: EvalSandboxSpec | None = Field(
         default=None, description="Grading-sandbox overrides for eval_mode == SANDBOX; None uses generation values"
     )

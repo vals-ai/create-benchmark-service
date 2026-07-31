@@ -6,9 +6,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
+from pydantic import ValidationError
 from websockets.exceptions import ConnectionClosedError
 from websockets.frames import Close
 
+from benchmark_service import SandboxRecoveryPolicy
 from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
@@ -149,6 +151,12 @@ async def test_retrieve_task_accepts_sandbox_recovery_policy(
 
     assert result.sandbox_recovery is not None
     assert result.sandbox_recovery.max_sandbox_attempts == 10
+
+
+@pytest.mark.parametrize("max_sandbox_attempts", [1, 21])
+def test_sandbox_recovery_policy_rejects_out_of_range_attempts(max_sandbox_attempts: int) -> None:
+    with pytest.raises(ValidationError):
+        SandboxRecoveryPolicy(max_sandbox_attempts=max_sandbox_attempts)
 
 
 async def test_retrieve_task_tolerates_legacy_enable_docker_field(

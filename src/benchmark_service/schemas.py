@@ -156,8 +156,7 @@ class RetrieveTaskResponse(BaseModel):
     sandbox_recovery: SandboxRecoveryPolicy | None = Field(
         default=None,
         description=(
-            "Opt in to bounded recreation when the generation sandbox disappears; "
-            "None preserves fail-fast behavior"
+            "Opt in to bounded recreation when the generation sandbox disappears; None preserves fail-fast behavior"
         ),
     )
     eval_sandbox: EvalSandboxSpec | None = Field(

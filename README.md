@@ -287,7 +287,7 @@ Status codes: 403 if the tenant isn't allowed the dataset *or* if the caller use
 Pydantic models used across requests and responses:
 
 - **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `resources`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
-- **`SandboxRecoveryPolicy`** — explicit opt-in to recreate a lost generation sandbox with the same run identity and volumes; `max_sandbox_attempts` includes the initial sandbox
+- **`SandboxRecoveryPolicy`** — explicit opt-in to recreate a lost generation sandbox with the same run identity and volumes; `max_sandbox_attempts` (2–20, inclusive) includes the initial sandbox
 - **`SandboxSource`** — `ImageSource`, `SnapshotSource`, top-level Daytona-only `TargetedSnapshotSource`, or `ComposeSource` with an outer image/snapshot
 - **`EvalSandboxSpec`** — grading overrides whose optional `source` is an image or snapshot, never `ComposeSource`
 - **`GradingSubmission`** — typed `TextGradingSubmission` or `ArtifactGradingSubmission` passed only to the sandbox-grading hook

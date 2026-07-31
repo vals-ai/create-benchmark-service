@@ -28,7 +28,13 @@ from benchmark_service.sandbox import (
     VolumeMount,
     sandbox_provider_config_from_mapping,
 )
-from benchmark_service.schemas import ArtifactGradingSubmission, EvalMode, GradingSubmission, TextGradingSubmission
+from benchmark_service.schemas import (
+    ArtifactGradingSubmission,
+    EvalMode,
+    GradingSubmission,
+    SandboxRecoveryPolicy,
+    TextGradingSubmission,
+)
 
 __all__ = [
     "BenchmarkServiceApp",
@@ -56,6 +62,7 @@ __all__ = [
     "SandboxProvider",
     "SandboxProviderConfig",
     "SandboxQuery",
+    "SandboxRecoveryPolicy",
     "SandboxSource",
     "SnapshotSource",
     "TargetedSnapshotSource",

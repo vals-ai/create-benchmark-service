@@ -75,6 +75,7 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
                 "resources": {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None},
                 "agent_timeout": None,
                 "eval_sandbox": None,
+                "sandbox_recovery": None,
                 "volumes": [],
             },
         ),
@@ -125,6 +126,29 @@ async def test_retrieve_task_accepts_legacy_shape(
     assert result.source.model_dump() == {"type": "image", "image": "python:3.12"}
     assert result.model_dump()["docker_image"] == "python:3.12"
     assert result.resources.model_dump() == {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None}
+
+
+async def test_retrieve_task_accepts_sandbox_recovery_policy(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    mock_http.get = AsyncMock(
+        return_value=_mock_response(
+            json_data={
+                "source": {"type": "image", "image": "python:3.12"},
+                "problem_path": "/tmp/problem_statement.txt",
+                "cwd": "/work",
+                "resources": {"vcpu": 2, "memory": 4, "disk": 10},
+                "agent_timeout": 432_000,
+                "sandbox_recovery": {"max_sandbox_attempts": 10},
+            }
+        )
+    )
+
+    result = await client.retrieve_task("task-1")
+
+    assert result.sandbox_recovery is not None
+    assert result.sandbox_recovery.max_sandbox_attempts == 10
 
 
 async def test_retrieve_task_tolerates_legacy_enable_docker_field(

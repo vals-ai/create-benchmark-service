@@ -137,6 +137,7 @@ class _SandboxRecoveryState:
     task_id: str
     outage_id: str | None = None
     outage_started_epoch: float | None = None
+    consecutive_attempt_errors: int = 0
 
     def attempt(
         self,
@@ -155,10 +156,14 @@ class _SandboxRecoveryState:
         )
 
     def record_loss(self, attempt_number: int) -> None:
+        self.consecutive_attempt_errors = 0
         if self.outage_id is not None:
             return
         self.outage_id = f"{self.run_id}:{self.task_id}:{attempt_number}"
         self.outage_started_epoch = time.time()
+
+    def record_attempt_error(self) -> None:
+        self.consecutive_attempt_errors += 1
 
     def mark_ready(self, outage_id: str | None) -> None:
         if outage_id is None or outage_id != self.outage_id:
@@ -378,9 +383,10 @@ class BenchmarkServiceClient:
         The task payload is loaded once so its recovery policy and sandbox
         configuration cannot drift between attempts. ``SandboxNotFoundError``
         is retried only when the benchmark explicitly opts in. Callers may
-        additionally name setup errors that require a fresh sandbox; these use
-        ``default_max_attempts`` for benchmarks without a recovery policy and
-        count against the declared cap when a policy is present.
+        additionally name setup errors that require a fresh sandbox. These use
+        ``default_max_attempts`` both as the fallback total cap for benchmarks
+        without a recovery policy and as their consecutive-attempt cap. Every
+        attempt still counts against the benchmark's declared overall cap.
 
         The final exception is re-raised unchanged when the applicable attempt
         budget is exhausted.
@@ -411,8 +417,13 @@ class BenchmarkServiceClient:
                 state.record_loss(attempt_number)
                 retry_error: Exception = exc
             except Exception as exc:
-                if not isinstance(exc, retryable_attempt_errors) or attempt_number >= max_attempts:
+                if (
+                    not isinstance(exc, retryable_attempt_errors)
+                    or attempt_number >= max_attempts
+                    or state.consecutive_attempt_errors >= default_max_attempts - 1
+                ):
                     raise
+                state.record_attempt_error()
                 retry_error = exc
 
             if on_retry is not None:

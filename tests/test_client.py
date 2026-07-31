@@ -251,6 +251,7 @@ async def test_client_preserves_outage_identity_when_replacement_setup_retries(
         "run-1",
         operation,
         retryable_attempt_errors=(RetryableSetupError,),
+        default_max_attempts=2,
         retry_delay_s=0,
     )
 
@@ -328,6 +329,34 @@ async def test_client_applies_default_attempt_cap_to_caller_setup_errors(
 
     assert result == 2
     assert calls == 2
+
+
+async def test_client_keeps_setup_retry_cap_with_larger_recovery_policy(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _mock_http = benchmark_client
+    monkeypatch.setattr(client, "retrieve_task", AsyncMock(return_value=_task_response(10)))
+    attempts: list[int] = []
+
+    async def operation(
+        _task: RetrieveTaskResponse,
+        attempt: SandboxRecoveryAttempt,
+    ) -> None:
+        attempts.append(attempt.number)
+        raise RetryableSetupError("setup failed")
+
+    with pytest.raises(RetryableSetupError, match="setup failed"):
+        await client.run_with_sandbox_recovery(
+            "task-1",
+            "run-1",
+            operation,
+            retryable_attempt_errors=(RetryableSetupError,),
+            default_max_attempts=2,
+            retry_delay_s=0,
+        )
+
+    assert attempts == [1, 2]
 
 
 async def test_client_reraises_provider_error_when_policy_cap_is_exhausted(

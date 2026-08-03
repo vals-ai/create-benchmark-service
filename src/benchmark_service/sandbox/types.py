@@ -138,13 +138,27 @@ class SandboxCreateRequest(BaseModel):
     auto_stop_interval: int
     create_timeout: int
     network_block_all: bool = False
+    sandbox_secrets: dict[str, str] = Field(
+        default_factory=dict,
+        description="Provider-managed secret references keyed by environment variable name",
+    )
     volumes: list[VolumeMount] = Field(
         default_factory=list,
         description="Persistent volumes to attach; empty keeps existing behaviour",
     )
 
     @model_validator(mode="after")
-    def _validate_volumes(self) -> Self:
+    def _validate_request(self) -> Self:
+        validate_command_env(self.sandbox_secrets)
+        blank_secret_names = sorted(name for name, reference in self.sandbox_secrets.items() if not reference.strip())
+        if blank_secret_names:
+            raise ValueError(f"provider secret references cannot be blank: {', '.join(blank_secret_names)}")
+        overlapping_env = sorted(self.env_vars.keys() & self.sandbox_secrets.keys())
+        if overlapping_env:
+            raise ValueError(
+                f"environment variables cannot be both plaintext and provider-managed secrets: {', '.join(overlapping_env)}"
+            )
+
         seen: set[str] = set()
         for volume in self.volumes:
             if volume.mount_path in seen:

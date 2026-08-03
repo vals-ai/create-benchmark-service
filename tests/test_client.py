@@ -97,6 +97,7 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
                 "agent_timeout": None,
                 "eval_sandbox": None,
                 "sandbox_recovery": None,
+                "sandbox_secrets": {},
                 "volumes": [],
             },
         ),

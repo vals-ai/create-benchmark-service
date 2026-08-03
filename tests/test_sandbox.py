@@ -2091,7 +2091,7 @@ def test_volume_mounts_reject_duplicate_paths() -> None:
         )
 
 
-def test_requests_default_to_no_volumes() -> None:
+def test_requests_default_to_no_volumes_or_provider_secrets() -> None:
     """Every existing caller keeps its current behaviour."""
     request = SandboxCreateRequest(
         source=ImageSource(image="python:3.12"),
@@ -2104,6 +2104,35 @@ def test_requests_default_to_no_volumes() -> None:
     )
 
     assert request.volumes == []
+    assert request.sandbox_secrets == {}
+
+
+def test_provider_secret_references_cannot_overlap_plaintext_environment() -> None:
+    request = _request("overlap").model_dump()
+    request["env_vars"] = {"API_KEY": "plaintext"}
+    request["sandbox_secrets"] = {"API_KEY": "provider-secret"}
+
+    with pytest.raises(ValidationError, match="both plaintext and provider-managed secrets"):
+        SandboxCreateRequest.model_validate(request)
+
+
+@pytest.mark.parametrize(
+    ("sandbox_secrets", "message"),
+    [
+        ({"BAD-NAME": "provider-secret"}, "Invalid environment variable names: BAD-NAME"),
+        ({"TERM": "provider-secret"}, "Reserved command environment variable names: TERM"),
+        ({"API_KEY": "   "}, "provider secret references cannot be blank: API_KEY"),
+    ],
+)
+def test_provider_secret_references_reject_invalid_configuration(
+    sandbox_secrets: dict[str, str],
+    message: str,
+) -> None:
+    request = _request("invalid-secret").model_dump()
+    request["sandbox_secrets"] = sandbox_secrets
+
+    with pytest.raises(ValidationError, match=message):
+        SandboxCreateRequest.model_validate(request)
 
 
 @pytest.mark.parametrize("subpath", ["/absolute", "../escape", "runs/{missing_label}"])

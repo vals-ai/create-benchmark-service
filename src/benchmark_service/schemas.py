@@ -153,6 +153,13 @@ class RetrieveTaskResponse(BaseModel):
         default_factory=list,
         description="Persistent volumes to attach to generation and default grading sandboxes",
     )
+    sandbox_secrets: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Provider-managed secret references for the generation sandbox, keyed by environment variable name; "
+            "values are secret identifiers, never secret material"
+        ),
+    )
     sandbox_recovery: SandboxRecoveryPolicy | None = Field(
         default=None,
         description=(

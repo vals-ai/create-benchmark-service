@@ -406,6 +406,9 @@ class ModalSandboxProvider(SandboxProvider):
 
     @_PROVIDER_RETRY
     async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
+        if request.sandbox_secrets:
+            raise SandboxError("Modal sandbox provider does not support sandbox_secrets")
+
         client, app = await self._connect()
         modal_name = _modal_sandbox_name(request.name)
         existing = await self._find_reusable_sandbox(modal_name, client)

@@ -10,9 +10,11 @@ import shlex
 import time
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
+from typing import cast
 from uuid import uuid4
 
 import pytest
+from daytona import CreateSecretParams
 
 from benchmark_service import (
     ImageSource,
@@ -23,7 +25,9 @@ from benchmark_service import (
     SandboxNotFoundError,
     SandboxProvider,
     SandboxQuery,
+    VolumeMount,
 )
+from benchmark_service.sandbox.daytona import DaytonaSandboxProvider
 
 _POLL_INTERVAL_SECONDS = 2
 _POLL_TIMEOUT_SECONDS = 120
@@ -188,6 +192,89 @@ class TestSandboxProviderIntegration:
                 sandbox_provider.delete_sandbox(sandbox.id),
                 timeout=_POLL_TIMEOUT_SECONDS,
             )
+
+    @pytest.mark.parametrize("provider_type", ["daytona"], indirect=True)
+    async def test_daytona_native_secret_and_volume_persistence(
+        self,
+        sandbox_provider: SandboxProvider,
+    ) -> None:
+        provider = cast(DaytonaSandboxProvider, sandbox_provider)
+        daytona = provider._daytona  # pyright: ignore[reportPrivateUsage]
+        probe_id = uuid4().hex[:10]
+        secret_name = f"cbs-secret-{probe_id}"
+        # Shared long-lived volume: Daytona rejects deleting volumes that have
+        # not settled to ready/error, so runs isolate by subpath instead of
+        # provisioning ad-hoc volumes that cleanup would race against.
+        volume_name = "cbs-provider-integration"
+        run_id = f"cbs-run-{probe_id}"
+        labels = {"ProviderIntegrationTest": probe_id, "run-id": run_id}
+        writer: Sandbox | None = None
+        reader: Sandbox | None = None
+        secret_id: str | None = None
+
+        try:
+            await daytona.volume.get(volume_name, create=True)
+            secret = await daytona.secret.create(
+                CreateSecretParams(
+                    name=secret_name,
+                    value=uuid4().hex,
+                    description="Ephemeral CBS provider integration secret",
+                    hosts=["example.com"],
+                )
+            )
+            secret_id = secret.id
+            mount = VolumeMount(
+                name=volume_name,
+                mount_path="/workspace/artifacts",
+                subpath="runs/{run_id}",
+            )
+            writer = await provider.create_sandbox(
+                SandboxCreateRequest(
+                    source=ImageSource(image=_TEST_IMAGE),
+                    resources=_TEST_RESOURCES,
+                    name=f"cbs-secret-writer-{probe_id}",
+                    labels=labels,
+                    env_vars={},
+                    sandbox_secrets={"CBS_SECRET_TEST": secret_name},
+                    volumes=[mount],
+                    auto_stop_interval=10,
+                    create_timeout=360,
+                )
+            )
+
+            secret_check = await writer.exec(
+                f'test -n "$CBS_SECRET_TEST" && test "$CBS_SECRET_TEST" != {shlex.quote(secret_name)}'
+            )
+            assert secret_check.exit_code == 0
+            write_result = await writer.exec("printf provider-volume-persistence > /workspace/artifacts/proof.txt")
+            assert write_result.exit_code == 0
+            await provider.delete_sandbox(writer.id)
+            writer = None
+
+            reader = await provider.create_sandbox(
+                SandboxCreateRequest(
+                    source=ImageSource(image=_TEST_IMAGE),
+                    resources=_TEST_RESOURCES,
+                    name=f"cbs-volume-reader-{probe_id}",
+                    labels=labels,
+                    env_vars={},
+                    volumes=[mount],
+                    auto_stop_interval=10,
+                    create_timeout=360,
+                )
+            )
+
+            read_result = await reader.exec("cat /workspace/artifacts/proof.txt")
+            assert read_result.stdout == "provider-volume-persistence"
+            secret_absence = await reader.exec('test -z "${CBS_SECRET_TEST+x}"')
+            assert secret_absence.exit_code == 0
+        finally:
+            if reader is not None:
+                await provider.delete_sandbox(reader.id)
+            if writer is not None:
+                await provider.delete_sandbox(writer.id)
+            if secret_id is not None:
+                await daytona.secret.delete(secret_id)
 
     async def test_provider_contract(self, sandbox_provider: SandboxProvider) -> None:
         """Verify each provider implements the shared sandbox lifecycle and operation contract.

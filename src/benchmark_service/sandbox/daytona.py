@@ -825,6 +825,7 @@ class DaytonaSandboxProvider(SandboxProvider):
                     network_block_all=request.network_block_all,
                     resources=resources,
                     env_vars=request.env_vars,
+                    secrets=request.sandbox_secrets or None,
                     volumes=volume_mounts,
                 )
             case SnapshotSource(snapshot=snapshot) | TargetedSnapshotSource(snapshot=snapshot):
@@ -841,6 +842,7 @@ class DaytonaSandboxProvider(SandboxProvider):
                     language="python",
                     network_block_all=request.network_block_all,
                     env_vars=request.env_vars,
+                    secrets=request.sandbox_secrets or None,
                     volumes=volume_mounts,
                 )
             case ComposeSource():

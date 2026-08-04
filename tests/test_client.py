@@ -3,15 +3,19 @@
 import json
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
+from uuid import UUID
 
 import httpx
 import pytest
+from pydantic import ValidationError
 from websockets.exceptions import ConnectionClosedError
 from websockets.frames import Close
 
-from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError
+from benchmark_service import SandboxNotFoundError, SandboxRecoveryPolicy
+from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError, SandboxRecoveryAttempt
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
+from benchmark_service.schemas import RetrieveTaskResponse
 from benchmark_service.v1_schemas import (
     V1DatasetTasksResponse,
     V1EvalResponse,
@@ -26,6 +30,23 @@ from benchmark_service.v1_schemas import (
 BASE_URL = "http://localhost:8000"
 HEADERS = {"Authorization": "Bearer token"}
 DAYTONA_CONFIG = DaytonaProviderConfig(DAYTONA_API_KEY="key", DAYTONA_API_URL="url", DAYTONA_TARGET="target")
+
+
+class RetryableSetupError(Exception):
+    """Test-only error representing a fresh-sandbox setup retry."""
+
+
+def _task_response(max_sandbox_attempts: int | None = None) -> RetrieveTaskResponse:
+    policy = {"max_sandbox_attempts": max_sandbox_attempts} if max_sandbox_attempts is not None else None
+    return RetrieveTaskResponse.model_validate(
+        {
+            "source": {"type": "image", "image": "python:3.12"},
+            "problem_path": "/tmp/problem_statement.txt",
+            "cwd": "/work",
+            "resources": {"vcpu": 2, "memory": 4, "disk": 10},
+            "sandbox_recovery": policy,
+        }
+    )
 
 
 def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "error") -> MagicMock:
@@ -75,6 +96,8 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
                 "resources": {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None},
                 "agent_timeout": None,
                 "eval_sandbox": None,
+                "sandbox_recovery": None,
+                "sandbox_secrets": {},
                 "volumes": [],
             },
         ),
@@ -125,6 +148,350 @@ async def test_retrieve_task_accepts_legacy_shape(
     assert result.source.model_dump() == {"type": "image", "image": "python:3.12"}
     assert result.model_dump()["docker_image"] == "python:3.12"
     assert result.resources.model_dump() == {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None}
+
+
+async def test_retrieve_task_accepts_sandbox_recovery_policy(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    mock_http.get = AsyncMock(
+        return_value=_mock_response(
+            json_data={
+                "source": {"type": "image", "image": "python:3.12"},
+                "problem_path": "/tmp/problem_statement.txt",
+                "cwd": "/work",
+                "resources": {"vcpu": 2, "memory": 4, "disk": 10},
+                "agent_timeout": 432_000,
+                "sandbox_recovery": {"max_sandbox_attempts": 10},
+            }
+        )
+    )
+
+    result = await client.retrieve_task("task-1")
+
+    assert result.sandbox_recovery is not None
+    assert result.sandbox_recovery.max_sandbox_attempts == 10
+
+
+@pytest.mark.parametrize("max_sandbox_attempts", [1, 21])
+def test_sandbox_recovery_policy_rejects_out_of_range_attempts(max_sandbox_attempts: int) -> None:
+    with pytest.raises(ValidationError):
+        SandboxRecoveryPolicy(max_sandbox_attempts=max_sandbox_attempts)
+
+
+async def test_client_keeps_task_loading_lazy_when_initial_operation_completes(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _mock_http = benchmark_client
+    retrieve_task = AsyncMock(return_value=_task_response(3))
+    monkeypatch.setattr(client, "retrieve_task", retrieve_task)
+
+    async def operation(attempt: SandboxRecoveryAttempt) -> int:
+        return attempt.number
+
+    result = await client.run_with_sandbox_recovery(
+        "task-1",
+        "run-1",
+        operation,
+        retry_delay_s=0,
+    )
+
+    assert result == 1
+    retrieve_task.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("task_id", "run_id", "message"),
+    [
+        ("", "run-1", "task_id must be non-empty"),
+        ("task-1", "", "run_id must be non-empty"),
+    ],
+)
+async def test_client_rejects_empty_recovery_identity(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    task_id: str,
+    run_id: str,
+    message: str,
+) -> None:
+    client, _mock_http = benchmark_client
+
+    with pytest.raises(ValueError, match=message):
+        await client.run_with_sandbox_recovery(
+            task_id,
+            run_id,
+            AsyncMock(),
+            retry_delay_s=0,
+        )
+
+
+async def test_client_rejects_sandbox_loss_in_caller_retry_types(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, _mock_http = benchmark_client
+
+    with pytest.raises(ValueError, match="controlled only by SandboxRecoveryPolicy"):
+        await client.run_with_sandbox_recovery(
+            "task-1",
+            "run-1",
+            AsyncMock(),
+            retryable_attempt_errors=(SandboxNotFoundError,),
+            retry_delay_s=0,
+        )
+
+
+async def test_client_awaits_async_retry_callback(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _mock_http = benchmark_client
+    monkeypatch.setattr(client, "retrieve_task", AsyncMock(return_value=_task_response(2)))
+    on_retry = AsyncMock()
+
+    async def operation(attempt: SandboxRecoveryAttempt) -> str:
+        if attempt.number == 1:
+            raise SandboxNotFoundError("sandbox disappeared")
+        return "finished"
+
+    result = await client.run_with_sandbox_recovery(
+        "task-1",
+        "run-1",
+        operation,
+        retry_delay_s=0,
+        on_retry=on_retry,
+    )
+
+    assert result == "finished"
+    on_retry.assert_awaited_once()
+
+
+async def test_client_outage_ids_are_unique_across_invocations(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _mock_http = benchmark_client
+    monkeypatch.setattr(client, "retrieve_task", AsyncMock(return_value=_task_response(2)))
+    identifiers = iter((UUID(int=1), UUID(int=2)))
+    monkeypatch.setattr("benchmark_service.client.uuid4", lambda: next(identifiers))
+
+    async def operation(attempt: SandboxRecoveryAttempt) -> str:
+        if attempt.number == 1:
+            raise SandboxNotFoundError("sandbox disappeared")
+        assert attempt.outage_id is not None
+        return attempt.outage_id
+
+    first = await client.run_with_sandbox_recovery("task-1", "run-1", operation, retry_delay_s=0)
+    second = await client.run_with_sandbox_recovery("task-1", "run-1", operation, retry_delay_s=0)
+
+    assert first != second
+    assert first.endswith("00000000000000000000000000000001")
+    assert second.endswith("00000000000000000000000000000002")
+
+
+async def test_client_recovers_consecutive_losses_with_distinct_outage_identity(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _mock_http = benchmark_client
+    monkeypatch.setattr(client, "retrieve_task", AsyncMock(return_value=_task_response(3)))
+    monkeypatch.setattr("benchmark_service.client.time.time", lambda: 1_234.5)
+    monkeypatch.setattr("benchmark_service.client.uuid4", lambda: UUID(int=1))
+
+    attempts: list[SandboxRecoveryAttempt] = []
+    retry_errors: list[Exception] = []
+
+    async def operation(
+        attempt: SandboxRecoveryAttempt,
+    ) -> str:
+        attempts.append(attempt)
+        attempt.mark_replacement_ready()
+        if attempt.number < 3:
+            raise SandboxNotFoundError("sandbox disappeared")
+        return "finished"
+
+    result = await client.run_with_sandbox_recovery(
+        "task-1",
+        "run-1",
+        operation,
+        retry_delay_s=0,
+        on_retry=lambda _attempt, error: retry_errors.append(error),
+    )
+
+    assert result == "finished"
+    assert [attempt.number for attempt in attempts] == [1, 2, 3]
+    assert [attempt.max_attempts for attempt in attempts] == [3, 3, 3]
+    assert [attempt.sandbox_loss_retry_available for attempt in attempts] == [True, True, False]
+    assert [attempt.environment for attempt in attempts] == [
+        {},
+        {
+            "VALKYRIE_SANDBOX_OUTAGE_ID": "run-1:task-1:1:00000000000000000000000000000001",
+            "VALKYRIE_SANDBOX_OUTAGE_STARTED_EPOCH": "1234.5",
+        },
+        {
+            "VALKYRIE_SANDBOX_OUTAGE_ID": "run-1:task-1:2:00000000000000000000000000000001",
+            "VALKYRIE_SANDBOX_OUTAGE_STARTED_EPOCH": "1234.5",
+        },
+    ]
+    assert len(retry_errors) == 2
+
+
+async def test_client_preserves_outage_identity_when_replacement_setup_retries(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _mock_http = benchmark_client
+    monkeypatch.setattr(client, "retrieve_task", AsyncMock(return_value=_task_response(3)))
+    monkeypatch.setattr("benchmark_service.client.time.time", lambda: 1_234.5)
+    monkeypatch.setattr("benchmark_service.client.uuid4", lambda: UUID(int=1))
+
+    environments: list[dict[str, str]] = []
+
+    async def operation(
+        attempt: SandboxRecoveryAttempt,
+    ) -> str:
+        environments.append(attempt.environment)
+        if attempt.number == 1:
+            raise SandboxNotFoundError("sandbox disappeared")
+        if attempt.number == 2:
+            raise RetryableSetupError("replacement setup failed")
+        attempt.mark_replacement_ready()
+        return "finished"
+
+    result = await client.run_with_sandbox_recovery(
+        "task-1",
+        "run-1",
+        operation,
+        retryable_attempt_errors=(RetryableSetupError,),
+        default_max_attempts=2,
+        retry_delay_s=0,
+    )
+
+    assert result == "finished"
+    assert environments == [
+        {},
+        {
+            "VALKYRIE_SANDBOX_OUTAGE_ID": "run-1:task-1:1:00000000000000000000000000000001",
+            "VALKYRIE_SANDBOX_OUTAGE_STARTED_EPOCH": "1234.5",
+        },
+        {
+            "VALKYRIE_SANDBOX_OUTAGE_ID": "run-1:task-1:1:00000000000000000000000000000001",
+            "VALKYRIE_SANDBOX_OUTAGE_STARTED_EPOCH": "1234.5",
+        },
+    ]
+
+
+async def test_client_does_not_recover_lost_sandbox_without_policy(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _mock_http = benchmark_client
+    monkeypatch.setattr(client, "retrieve_task", AsyncMock(return_value=_task_response()))
+    calls = 0
+    attempts: list[SandboxRecoveryAttempt] = []
+
+    async def operation(
+        attempt: SandboxRecoveryAttempt,
+    ) -> None:
+        nonlocal calls
+        calls += 1
+        attempts.append(attempt)
+        raise SandboxNotFoundError("sandbox disappeared")
+
+    with pytest.raises(SandboxNotFoundError, match="sandbox disappeared"):
+        await client.run_with_sandbox_recovery(
+            "task-1",
+            "run-1",
+            operation,
+            default_max_attempts=2,
+            retry_delay_s=0,
+        )
+
+    assert calls == 1
+    assert attempts[0].sandbox_loss_retry_available is False
+
+
+async def test_client_applies_default_attempt_cap_to_caller_setup_errors(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _mock_http = benchmark_client
+    monkeypatch.setattr(client, "retrieve_task", AsyncMock(return_value=_task_response()))
+    calls = 0
+
+    async def operation(
+        attempt: SandboxRecoveryAttempt,
+    ) -> int:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RetryableSetupError("setup failed")
+        return attempt.number
+
+    result = await client.run_with_sandbox_recovery(
+        "task-1",
+        "run-1",
+        operation,
+        retryable_attempt_errors=(RetryableSetupError,),
+        default_max_attempts=2,
+        retry_delay_s=0,
+    )
+
+    assert result == 2
+    assert calls == 2
+
+
+async def test_client_keeps_setup_retry_cap_with_larger_recovery_policy(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _mock_http = benchmark_client
+    monkeypatch.setattr(client, "retrieve_task", AsyncMock(return_value=_task_response(10)))
+    attempts: list[int] = []
+
+    async def operation(
+        attempt: SandboxRecoveryAttempt,
+    ) -> None:
+        await attempt.retrieve_task()
+        attempts.append(attempt.number)
+        raise RetryableSetupError("setup failed")
+
+    with pytest.raises(RetryableSetupError, match="setup failed"):
+        await client.run_with_sandbox_recovery(
+            "task-1",
+            "run-1",
+            operation,
+            retryable_attempt_errors=(RetryableSetupError,),
+            default_max_attempts=2,
+            retry_delay_s=0,
+        )
+
+    assert attempts == [1, 2]
+
+
+async def test_client_reraises_provider_error_when_policy_cap_is_exhausted(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _mock_http = benchmark_client
+    monkeypatch.setattr(client, "retrieve_task", AsyncMock(return_value=_task_response(2)))
+    attempts: list[int] = []
+
+    async def operation(
+        attempt: SandboxRecoveryAttempt,
+    ) -> None:
+        attempts.append(attempt.number)
+        attempt.mark_replacement_ready()
+        raise SandboxNotFoundError(f"loss-{attempt.number}")
+
+    with pytest.raises(SandboxNotFoundError, match="loss-2"):
+        await client.run_with_sandbox_recovery(
+            "task-1",
+            "run-1",
+            operation,
+            retry_delay_s=0,
+        )
+
+    assert attempts == [1, 2]
 
 
 async def test_retrieve_task_tolerates_legacy_enable_docker_field(

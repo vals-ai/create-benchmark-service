@@ -282,11 +282,39 @@ Status codes: 403 if the tenant isn't allowed the dataset *or* if the caller use
 
 **Deferred to follow-on plans.** `GET /v1/schema`, `GET /v1/tasks/{task_id}` (single-task lookup), `/ws/v1/evaluate` (streamed judges), async/`poll_url` response shape, idempotency on `(run_id, task_id)`.
 
+### Client-owned sandbox recovery
+
+`BenchmarkServiceClient.run_with_sandbox_recovery(...)` owns the bounded loop for tasks that opt in with `SandboxRecoveryPolicy`. It loads the task once, retries only provider-confirmed `SandboxNotFoundError` losses, and counts every fresh-sandbox attempt against one overall cap. Callers can explicitly include setup errors that also require a fresh sandbox; `default_max_attempts` retains the legacy fallback cap for benchmarks without a recovery policy and bounds consecutive setup attempts when a policy is present.
+
+The operation receives a `SandboxRecoveryAttempt`. Merge its `environment` into the sandbox environment, then call `mark_replacement_ready()` only after benchmark setup has durably recorded the outage. A failed replacement setup therefore carries the same outage ID into the next sandbox, while a later provider loss gets a globally unique ID that cannot collide after a runner restart. `sandbox_loss_retry_available` lets a runner persist its normal terminal task error without duplicating the policy calculation.
+
+```python
+async def run_attempt(attempt):
+    task = await attempt.retrieve_task()
+    async with create_sandbox(
+        source=task.source,
+        env_vars={**base_environment, **attempt.environment},
+    ) as sandbox:
+        await client.setup_task(task_id, sandbox.id)
+        attempt.mark_replacement_ready()
+        return await run_agent(sandbox)
+
+
+result = await client.run_with_sandbox_recovery(
+    task_id,
+    run_id,
+    run_attempt,
+    retryable_attempt_errors=(TransientSandboxSetupError,),
+    default_max_attempts=2,
+)
+```
+
 ### Schemas (`schemas.py`)
 
 Pydantic models used across requests and responses:
 
-- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `resources`, optional persistent `volumes`, optional non-secret `eval_sandbox`
+- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `resources`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
+- **`SandboxRecoveryPolicy`** — explicit opt-in to recreate a lost generation sandbox with the same run identity and volumes; `max_sandbox_attempts` (2–20, inclusive) includes the initial sandbox
 - **`SandboxSource`** — `ImageSource`, `SnapshotSource`, top-level Daytona-only `TargetedSnapshotSource`, or `ComposeSource` with an outer image/snapshot
 - **`EvalSandboxSpec`** — grading overrides whose optional `source` is an image or snapshot, never `ComposeSource`
 - **`GradingSubmission`** — typed `TextGradingSubmission` or `ArtifactGradingSubmission` passed only to the sandbox-grading hook

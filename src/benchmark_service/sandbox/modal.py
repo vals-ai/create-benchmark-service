@@ -206,31 +206,26 @@ class ModalSandbox(Sandbox):
         env = validate_command_env(env_vars) if env_vars is not None else None
         await self._raise_if_finished()
         process = await self._start_process(command, cwd=cwd, timeout=timeout, env_vars=env)
+        try:
+            async for chunk in self._stream_command(process):
+                yield chunk
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
+
+    async def _stream_command(self, process: Any) -> AsyncGenerator[str, None]:
         output_iterator = process.stdout.__aiter__()
         next_chunk_task = asyncio.create_task(anext(output_iterator))
         wait_task: asyncio.Task[Any] | None = asyncio.create_task(process.wait.aio())
         exit_code: int | None = None
         drain_deadline: float | None = None
-        termination_checked = False
         loop = asyncio.get_running_loop()
 
         try:
             while True:
-                tasks: set[asyncio.Task[Any]] = {next_chunk_task}
-                if wait_task is not None:
-                    tasks.add(wait_task)
-                timeout = _COMMAND_STATUS_POLL_SECONDS
-                if drain_deadline is not None:
-                    remaining = drain_deadline - loop.time()
-                    if remaining <= 0:
-                        break
-                    timeout = min(timeout, remaining)
+                completed = await self._wait_for_command_progress(next_chunk_task, wait_task, drain_deadline)
+                if completed is None:
+                    break
 
-                completed, _ = await asyncio.wait(
-                    tasks,
-                    timeout=timeout,
-                    return_when=asyncio.FIRST_COMPLETED,
-                )
                 if wait_task is not None and wait_task in completed:
                     exit_code = wait_task.result()
                     wait_task = None
@@ -242,38 +237,60 @@ class ModalSandbox(Sandbox):
                     except StopAsyncIteration:
                         if wait_task is not None:
                             exit_code = await wait_task
-                            if exit_code != 0:
-                                await self._raise_if_finished(attempts=6, wait_seconds=0.5)
-                                termination_checked = True
                         break
 
                     yield str(chunk)
                     next_chunk_task = asyncio.create_task(anext(output_iterator))
                     continue
 
-                if drain_deadline is not None and wait_task is None:
-                    continue
-
                 if drain_deadline is not None:
-                    break
+                    continue
                 await self._raise_if_finished()
-        except ModalError as exc:
-            raise _sandbox_error(exc) from exc
         finally:
-            tasks_to_cancel = [next_chunk_task]
-            if wait_task is not None:
-                tasks_to_cancel.append(wait_task)
-            for task in tasks_to_cancel:
-                if not task.done():
-                    task.cancel()
-            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
+            await self._cancel_command_tasks(next_chunk_task, wait_task)
 
         if exit_code is None:
             raise RuntimeError("Modal command completed without an exit code")
         if exit_code != 0:
-            if not termination_checked:
-                await self._raise_if_finished(attempts=6, wait_seconds=0.5)
+            await self._raise_if_finished(attempts=6, wait_seconds=0.5)
             raise SandboxCommandError(exit_code)
+
+    async def _wait_for_command_progress(
+        self,
+        next_chunk_task: asyncio.Task[Any],
+        wait_task: asyncio.Task[Any] | None,
+        drain_deadline: float | None,
+    ) -> set[asyncio.Task[Any]] | None:
+        tasks: set[asyncio.Task[Any]] = {next_chunk_task}
+        if wait_task is not None:
+            tasks.add(wait_task)
+
+        poll_timeout = _COMMAND_STATUS_POLL_SECONDS
+        if drain_deadline is not None:
+            remaining = drain_deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return None
+            poll_timeout = min(poll_timeout, remaining)
+
+        completed, _ = await asyncio.wait(
+            tasks,
+            timeout=poll_timeout,
+            return_when=asyncio.FIRST_COMPLETED,
+        )
+        return completed
+
+    @staticmethod
+    async def _cancel_command_tasks(
+        next_chunk_task: asyncio.Task[Any],
+        wait_task: asyncio.Task[Any] | None,
+    ) -> None:
+        tasks_to_cancel = [next_chunk_task]
+        if wait_task is not None:
+            tasks_to_cancel.append(wait_task)
+        for task in tasks_to_cancel:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
 
     @_PROVIDER_RETRY
     async def upload_file(self, remote_path: str, content: bytes) -> None:

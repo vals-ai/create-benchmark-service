@@ -8,9 +8,9 @@ from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from contextlib import suppress
 from datetime import UTC, datetime
-from typing import Any, Literal, cast
+from typing import Any, Literal
 
-from aiohttp import ClientConnectionError, ClientError, ClientResponseError, InvalidURL
+from aiohttp import ClientConnectionError, ClientResponseError
 from daytona import (
     AsyncDaytona,
     AsyncSandbox,
@@ -21,13 +21,6 @@ from daytona import (
     ListSandboxesQuery,
     SandboxState,
 )
-from daytona_api_client_async import (
-    ApiClient as DaytonaApiClient,
-    Configuration as DaytonaApiConfiguration,
-    OrganizationsApi,
-    SandboxClass,
-)
-from daytona_api_client_async.exceptions import ApiException, NotFoundException, OpenApiException
 from daytona import (
     GpuType,
 )
@@ -47,7 +40,11 @@ from daytona.common.errors import (
 )
 from daytona.common.pty import PtyResult
 from daytona.handle.async_pty_handle import AsyncPtyHandle
-from pydantic import BaseModel, Field
+from daytona_api_client_async import ApiClient as DaytonaApiClient
+from daytona_api_client_async import Configuration as DaytonaApiConfiguration
+from daytona_api_client_async import OrganizationsApi
+from daytona_api_client_async.exceptions import NotFoundException, OpenApiException
+from pydantic import BaseModel
 from tenacity import (
     RetryCallState,
     retry,
@@ -64,7 +61,6 @@ from benchmark_service.sandbox.types import (
     ExecResult,
     ImageSource,
     MissingSandboxConfigError,
-    Resources,
     Sandbox,
     SandboxCommandError,
     SandboxConnectionError,
@@ -73,7 +69,6 @@ from benchmark_service.sandbox.types import (
     SandboxNotFoundError,
     SandboxProvider,
     SandboxQuery,
-    SandboxSource,
     SnapshotSource,
     TargetedSnapshotSource,
     VolumeMount,
@@ -118,9 +113,10 @@ _TRANSPORT_ERROR_MESSAGES = (
 )
 _RETRYABLE_DAYTONA_CAUSES = (ClientConnectionError, ConnectionError, TimeoutError)
 _PROVIDER_RETRY_DELAYS_SECONDS = (5, 25, 90, 300, 420)
-_FIXED_PROVIDER_WAIT = wait_chain(*(wait_random(delay * 0.9, delay) for delay in _PROVIDER_RETRY_DELAYS_SECONDS))
+_FIXED_PROVIDER_WAIT = wait_chain(
+    *(wait_random(delay * 0.9, delay) for delay in _PROVIDER_RETRY_DELAYS_SECONDS)
+)
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
-_ADMISSION_TIMEOUT_SECONDS = 30
 
 
 def _pty_result_summary(result: PtyResult | None) -> str:
@@ -143,7 +139,6 @@ class DaytonaProviderConfig(BaseModel):
     DAYTONA_API_KEY: str
     DAYTONA_API_URL: str
     DAYTONA_TARGET: str
-    DAYTONA_ORGANIZATION_ID: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
     @classmethod
     def from_headers(cls, headers: Mapping[str, str]) -> "DaytonaProviderConfig":
@@ -160,7 +155,6 @@ class DaytonaProviderConfig(BaseModel):
         api_key = os.environ.get("DAYTONA_API_KEY")
         api_url = os.environ.get("DAYTONA_API_URL")
         target = os.environ.get("DAYTONA_TARGET")
-        organization_id = os.environ.get("DAYTONA_ORGANIZATION_ID")
         missing = [
             name
             for name, value in (
@@ -172,12 +166,7 @@ class DaytonaProviderConfig(BaseModel):
         ]
         if missing:
             raise MissingSandboxConfigError(f"Missing required environment variables: {', '.join(missing)}")
-        return cls(
-            DAYTONA_API_KEY=cast(str, api_key),
-            DAYTONA_API_URL=cast(str, api_url),
-            DAYTONA_TARGET=cast(str, target),
-            DAYTONA_ORGANIZATION_ID=organization_id,
-        )
+        return cls(DAYTONA_API_KEY=api_key, DAYTONA_API_URL=api_url, DAYTONA_TARGET=target)  # type: ignore[arg-type]
 
     def create_provider(self) -> SandboxProvider:
         return DaytonaSandboxProvider(self)
@@ -214,11 +203,6 @@ def _get_config_header(headers: Mapping[str, str], *names: str) -> str | None:
         if value:
             return value
     return None
-
-
-def _admission_pool_id(*, organization_id: str, target: str, api_url: str) -> str:
-    scope = "\0".join((api_url.rstrip("/"), organization_id, target))
-    return f"daytona:{uuid.uuid5(uuid.NAMESPACE_URL, scope)}"
 
 
 def _provider_retry_wait(retry_state: RetryCallState) -> float:
@@ -294,9 +278,7 @@ def _is_transient_daytona_error(exc: DaytonaError | ClientResponseError) -> bool
 
 
 def _is_name_conflict_error(exc: DaytonaError) -> bool:
-    return (
-        isinstance(exc, DaytonaConflictError) or exc.status_code == 409 or _message_contains(exc, ("already exists",))
-    )
+    return isinstance(exc, DaytonaConflictError) or exc.status_code == 409 or _message_contains(exc, ("already exists",))
 
 
 def _parse_retry_after_seconds(value: object) -> float | None:
@@ -621,21 +603,10 @@ class DaytonaSandboxProvider(SandboxProvider):
         self._target = config.DAYTONA_TARGET.strip()
         if not self._target:
             raise MissingSandboxConfigError("DAYTONA_TARGET must not be blank")
-        self._organization_id = config.DAYTONA_ORGANIZATION_ID or None
-        self._api_url = config.DAYTONA_API_URL
-        self._admission_pool = (
-            _admission_pool_id(
-                organization_id=self._organization_id,
-                target=self._target,
-                api_url=self._api_url,
-            )
-            if self._organization_id is not None
-            else None
-        )
         self._target_id: str | None = None
         self._target_id_lock = asyncio.Lock()
         self._target_api_configuration = DaytonaApiConfiguration(
-            host=self._api_url.rstrip("/"),
+            host=config.DAYTONA_API_URL,
             access_token=config.DAYTONA_API_KEY,
         )
         self._daytona = _daytona_client(config, self._target)
@@ -645,79 +616,6 @@ class DaytonaSandboxProvider(SandboxProvider):
         if target not in self._daytona_by_target:
             self._daytona_by_target[target] = _daytona_client(self._config, target)
         return self._daytona_by_target[target]
-
-    @property
-    def admission_pool_id(self) -> str | None:
-        return self._admission_pool
-
-    async def check_admission(
-        self,
-        source: SandboxSource,
-        resources: Resources,
-    ) -> bool:
-        if isinstance(source, ComposeSource):
-            source = source.outer
-        if self._organization_id is None or not isinstance(source, ImageSource) or resources.gpu:
-            return True
-        demand = (resources.vcpu, resources.memory, resources.disk)
-        if any(requested <= 0 for requested in demand):
-            raise SandboxError("Daytona admission demand must be positive")
-
-        try:
-            async with (
-                asyncio.timeout(_ADMISSION_TIMEOUT_SECONDS),
-                DaytonaApiClient(self._target_api_configuration) as api_client,
-            ):
-                organizations_api = OrganizationsApi(api_client)
-                overview = await organizations_api.get_organization_usage_overview(self._organization_id)
-                matches = [
-                    usage
-                    for usage in overview.region_usage
-                    if usage.region_id == self._target and usage.sandbox_class == SandboxClass.CONTAINER
-                ]
-                if len(matches) != 1:
-                    raise SandboxError(
-                        f"Expected one Daytona capacity row for target {self._target!r}, found {len(matches)}"
-                    )
-                usage = matches[0]
-                per_sandbox_limit = (
-                    usage.max_cpu_per_sandbox,
-                    usage.max_memory_per_sandbox,
-                    usage.max_disk_per_sandbox,
-                )
-                if any(limit is None for limit in per_sandbox_limit):
-                    organization = await organizations_api.get_organization(self._organization_id)
-                    organization_limit = (
-                        organization.max_cpu_per_sandbox,
-                        organization.max_memory_per_sandbox,
-                        organization.max_disk_per_sandbox,
-                    )
-                    per_sandbox_limit = tuple(
-                        region_limit if region_limit is not None else fallback
-                        for region_limit, fallback in zip(per_sandbox_limit, organization_limit, strict=True)
-                    )
-        except (ApiException, ClientResponseError) as exc:
-            status = cast(int | None, exc.status)
-            if status in (408, 429) or (status is not None and 500 <= status <= 599):
-                return True
-            raise SandboxError("Daytona rejected the admission capacity request") from exc
-        except InvalidURL as exc:
-            raise SandboxError("Daytona admission URL is invalid") from exc
-        except (ConnectionError, TimeoutError, ClientError):
-            return True
-
-        total = (usage.total_cpu_quota, usage.total_memory_quota, usage.total_disk_quota)
-        used = (usage.current_cpu_usage, usage.current_memory_usage, usage.current_disk_usage)
-        if any(requested > quota for requested, quota in zip(demand, total, strict=True)) or any(
-            limit is not None and requested > limit for requested, limit in zip(demand, per_sandbox_limit, strict=True)
-        ):
-            raise SandboxError("Daytona admission demand exceeds capacity")
-        available = (
-            total[0] - used[0],
-            total[1] - used[1],
-            total[2] - used[2],
-        )
-        return all(requested <= capacity for requested, capacity in zip(demand, available, strict=True))
 
     def _sandbox_error(self, exc: DaytonaError) -> SandboxError:
         if _is_not_found_error(exc):
@@ -788,17 +686,8 @@ class DaytonaSandboxProvider(SandboxProvider):
             )
         return resolved
 
-    async def create_sandbox(self, request: SandboxCreateRequest) -> DaytonaSandbox:
-        try:
-            async with asyncio.timeout(request.create_timeout):
-                return await self._create_sandbox_with_retry(request)
-        except TimeoutError as exc:
-            raise SandboxConnectionError(
-                f"Daytona sandbox creation timed out after {request.create_timeout} seconds"
-            ) from exc
-
     @_PROVIDER_RETRY
-    async def _create_sandbox_with_retry(self, request: SandboxCreateRequest) -> DaytonaSandbox:
+    async def create_sandbox(self, request: SandboxCreateRequest) -> DaytonaSandbox:
         daytona = self._daytona
         if isinstance(request.source, TargetedSnapshotSource):
             daytona = self._client_for_target(request.source.target)
@@ -810,9 +699,7 @@ class DaytonaSandboxProvider(SandboxProvider):
             gpu_type=_daytona_gpu_type(request.resources.gpu_type),
         )
 
-        volume_mounts = (
-            await self._resolve_volumes(daytona, request.volumes, request.labels) if request.volumes else None
-        )
+        volume_mounts = await self._resolve_volumes(daytona, request.volumes, request.labels) if request.volumes else None
 
         match request.source:
             case ImageSource(image=image):
@@ -830,9 +717,7 @@ class DaytonaSandboxProvider(SandboxProvider):
                 )
             case SnapshotSource(snapshot=snapshot) | TargetedSnapshotSource(snapshot=snapshot):
                 if request.resources.gpu:
-                    raise SandboxError(
-                        "Daytona snapshot sandboxes use the snapshot's resources; GPUs cannot be requested"
-                    )
+                    raise SandboxError("Daytona snapshot sandboxes use the snapshot's resources; GPUs cannot be requested")
                 params = CreateSandboxFromSnapshotParams(
                     auto_stop_interval=request.auto_stop_interval,
                     auto_delete_interval=0,

@@ -793,6 +793,8 @@ def _admission_provider(
     result: Exception | SimpleNamespace,
     organization_id: str | None = "org-1",
     organization_limits: tuple[int, int, int] | Exception = (8, 32, 100),
+    regions: Exception | list[SimpleNamespace] | None = None,
+    region_requests: list[str] | None = None,
 ) -> tuple[DaytonaSandboxProvider, list[str]]:
     requested: list[str] = []
 
@@ -811,6 +813,13 @@ def _admission_provider(
             max_disk_per_sandbox=organization_limits[2],
         )
 
+    async def list_available_regions() -> list[SimpleNamespace]:
+        if region_requests is not None:
+            region_requests.append("list_available_regions")
+        if isinstance(regions, Exception):
+            raise regions
+        return [SimpleNamespace(id="us", name="us")] if regions is None else regions
+
     def api_client(_value: object) -> nullcontext[None]:
         return nullcontext()
 
@@ -818,6 +827,7 @@ def _admission_provider(
         return SimpleNamespace(
             get_organization=get_organization,
             get_organization_usage_overview=observe,
+            list_available_regions=list_available_regions,
         )
 
     monkeypatch.setattr("benchmark_service.sandbox.daytona.DaytonaApiClient", api_client)
@@ -849,6 +859,34 @@ def test_daytona_pool_id_is_stable_nonsecret_and_configuration_scoped() -> None:
 
 _ADMISSION_IMAGE = ImageSource(image="img")
 _ADMISSION_RESOURCES = Resources(vcpu=2, memory=4, disk=10)
+
+
+async def test_daytona_admission_resolves_named_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    region_requests: list[str] = []
+    provider, requested = _admission_provider(
+        monkeypatch,
+        SimpleNamespace(region_usage=[_usage_row(region_id="region-id")]),
+        regions=[SimpleNamespace(id="region-id", name="us")],
+        region_requests=region_requests,
+    )
+
+    assert await provider.check_admission(_ADMISSION_IMAGE, _ADMISSION_RESOURCES)
+    assert requested == ["org-1"]
+    assert region_requests == ["list_available_regions"]
+
+
+async def test_daytona_admission_accepts_target_id_without_region_lookup(monkeypatch: pytest.MonkeyPatch) -> None:
+    region_requests: list[str] = []
+    provider, requested = _admission_provider(
+        monkeypatch,
+        SimpleNamespace(region_usage=[_usage_row(region_id="us")]),
+        regions=AssertionError("canonical target IDs should not require a region lookup"),
+        region_requests=region_requests,
+    )
+
+    assert await provider.check_admission(_ADMISSION_IMAGE, _ADMISSION_RESOURCES)
+    assert requested == ["org-1"]
+    assert region_requests == []
 
 
 @pytest.mark.parametrize(
@@ -940,6 +978,38 @@ async def test_daytona_admission_observation_outcomes(
     else:
         assert await decision is expected
     assert requested == ["org-1"]
+
+
+@pytest.mark.parametrize(
+    ("regions", "expected"),
+    [
+        (TimeoutError(), True),
+        (ApiException(status=503), True),
+        (ApiException(status=401), SandboxError),
+        ([], SandboxError),
+    ],
+)
+async def test_daytona_admission_target_resolution_outcomes(
+    monkeypatch: pytest.MonkeyPatch,
+    regions: Exception | list[SimpleNamespace],
+    expected: bool | type[SandboxError],
+) -> None:
+    region_requests: list[str] = []
+    provider, requested = _admission_provider(
+        monkeypatch,
+        SimpleNamespace(region_usage=[_usage_row(region_id="region-id")]),
+        regions=regions,
+        region_requests=region_requests,
+    )
+    decision = provider.check_admission(_ADMISSION_IMAGE, _ADMISSION_RESOURCES)
+
+    if expected is SandboxError:
+        with pytest.raises(SandboxError):
+            await decision
+    else:
+        assert await decision is expected
+    assert requested == ["org-1"]
+    assert region_requests == ["list_available_regions"]
 
 
 def test_sandbox_metadata_defaults_are_optional_for_existing_subclasses() -> None:
@@ -2256,6 +2326,53 @@ async def test_volume_run_subpath_requires_run_label_before_lookup() -> None:
         )
 
     assert daytona.volume.calls == []
+
+
+@pytest.mark.parametrize(
+    ("organization_headers", "expected"),
+    [
+        ({"x-organization-id": "org-primary"}, "org-primary"),
+        ({"daytona_organization_id": "org-legacy"}, "org-legacy"),
+        ({}, None),
+    ],
+)
+def test_daytona_config_from_headers_reads_optional_organization_id(
+    organization_headers: dict[str, str],
+    expected: str | None,
+) -> None:
+    config = DaytonaProviderConfig.from_headers(
+        {
+            "x-api-key": "key-1",
+            "x-api-url": "https://daytona.example",
+            "x-target": "us",
+            **organization_headers,
+        }
+    )
+
+    assert (
+        config.DAYTONA_API_KEY,
+        config.DAYTONA_API_URL,
+        config.DAYTONA_TARGET,
+        config.DAYTONA_ORGANIZATION_ID,
+    ) == ("key-1", "https://daytona.example", "us", expected)
+
+
+def test_daytona_config_from_headers_reads_legacy_required_fields() -> None:
+    config = DaytonaProviderConfig.from_headers(
+        {
+            "daytona_api_key": "legacy-key",
+            "daytona_api_url": "https://legacy.daytona.example",
+            "daytona_target": "legacy-target",
+            "daytona_organization_id": "legacy-org",
+        }
+    )
+
+    assert (
+        config.DAYTONA_API_KEY,
+        config.DAYTONA_API_URL,
+        config.DAYTONA_TARGET,
+        config.DAYTONA_ORGANIZATION_ID,
+    ) == ("legacy-key", "https://legacy.daytona.example", "legacy-target", "legacy-org")
 
 
 def test_daytona_config_from_env_reads_environment(monkeypatch: pytest.MonkeyPatch) -> None:

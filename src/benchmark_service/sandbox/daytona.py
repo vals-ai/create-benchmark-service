@@ -27,7 +27,7 @@ from daytona_api_client_async import (
     OrganizationsApi,
     SandboxClass,
 )
-from daytona_api_client_async.exceptions import ApiException, NotFoundException, OpenApiException
+from daytona_api_client_async.exceptions import NotFoundException, OpenApiException
 from daytona import (
     GpuType,
 )
@@ -150,9 +150,15 @@ class DaytonaProviderConfig(BaseModel):
         api_key = _get_config_header(headers, "x-api-key", "daytona_api_key")
         api_url = _get_config_header(headers, "x-api-url", "daytona_api_url")
         target = _get_config_header(headers, "x-target", "daytona_target")
+        organization_id = _get_config_header(headers, "x-organization-id", "daytona_organization_id")
         if not api_key or not api_url or not target:
             raise MissingSandboxConfigError("Missing required headers: x-api-key, x-api-url, x-target")
-        return cls(DAYTONA_API_KEY=api_key, DAYTONA_API_URL=api_url, DAYTONA_TARGET=target)
+        return cls(
+            DAYTONA_API_KEY=api_key,
+            DAYTONA_API_URL=api_url,
+            DAYTONA_TARGET=target,
+            DAYTONA_ORGANIZATION_ID=organization_id,
+        )
 
     @classmethod
     def from_env(cls) -> "DaytonaProviderConfig":
@@ -675,6 +681,13 @@ class DaytonaSandboxProvider(SandboxProvider):
                     for usage in overview.region_usage
                     if usage.region_id == self._target and usage.sandbox_class == SandboxClass.CONTAINER
                 ]
+                if not matches:
+                    target_id = await self._resolve_target_id_using(organizations_api.list_available_regions)
+                    matches = [
+                        usage
+                        for usage in overview.region_usage
+                        if usage.region_id == target_id and usage.sandbox_class == SandboxClass.CONTAINER
+                    ]
                 if len(matches) != 1:
                     raise SandboxError(
                         f"Expected one Daytona capacity row for target {self._target!r}, found {len(matches)}"
@@ -696,8 +709,8 @@ class DaytonaSandboxProvider(SandboxProvider):
                         region_limit if region_limit is not None else fallback
                         for region_limit, fallback in zip(per_sandbox_limit, organization_limit, strict=True)
                     )
-        except (ApiException, ClientResponseError) as exc:
-            status = cast(int | None, exc.status)
+        except (OpenApiException, ClientResponseError) as exc:
+            status = cast(int | None, getattr(exc, "status", None))
             if status in (408, 429) or (status is not None and 500 <= status <= 599):
                 return True
             raise SandboxError("Daytona rejected the admission capacity request") from exc
@@ -947,6 +960,25 @@ class DaytonaSandboxProvider(SandboxProvider):
             raise self._sandbox_error(exc) from exc
 
     async def _resolve_target_id(self) -> str:
+        async def list_available_regions() -> list[Any]:
+            async with DaytonaApiClient(self._target_api_configuration) as api_client:
+                return await OrganizationsApi(api_client).list_available_regions()
+
+        try:
+            return await self._resolve_target_id_using(list_available_regions)
+        except OpenApiException as exc:
+            raise create_daytona_error(
+                f"Failed to resolve Daytona target: {exc}",
+                status_code=getattr(exc, "status", None),
+                headers=getattr(exc, "headers", None),
+            ) from exc
+        except _RETRYABLE_DAYTONA_CAUSES as exc:
+            raise SandboxConnectionError(f"Daytona sandbox provider connection error: {exc}") from exc
+
+    async def _resolve_target_id_using(
+        self,
+        list_available_regions: Callable[[], Awaitable[list[Any]]],
+    ) -> str:
         if self._target_id is not None:
             return self._target_id
 
@@ -954,25 +986,15 @@ class DaytonaSandboxProvider(SandboxProvider):
             if self._target_id is not None:
                 return self._target_id
 
-            try:
-                async with DaytonaApiClient(self._target_api_configuration) as api_client:
-                    regions = await OrganizationsApi(api_client).list_available_regions()
-            except OpenApiException as exc:
-                raise create_daytona_error(
-                    f"Failed to resolve Daytona target: {exc}",
-                    status_code=getattr(exc, "status", None),
-                    headers=getattr(exc, "headers", None),
-                ) from exc
-            except _RETRYABLE_DAYTONA_CAUSES as exc:
-                raise SandboxConnectionError(f"Daytona sandbox provider connection error: {exc}") from exc
-
+            regions = await list_available_regions()
             region = next((region for region in regions if region.name == self._target), None)
             region = region or next((region for region in regions if region.id == self._target), None)
             if region is None:
                 raise SandboxError(f"Daytona target is not available: {self._target!r}.")
 
-            self._target_id = region.id
-            return self._target_id
+            target_id = cast(str, region.id)
+            self._target_id = target_id
+            return target_id
 
     async def close(self) -> None:
         for daytona in self._daytona_by_target.values():

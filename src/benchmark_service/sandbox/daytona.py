@@ -286,7 +286,7 @@ def _is_not_found_error(exc: DaytonaError | ClientResponseError) -> bool:
     return (
         isinstance(exc, DaytonaNotFoundError)
         or exc.status_code == 404
-        or (exc.error_code is not None and exc.error_code.upper() == "NOT_FOUND")
+        or (exc.code is not None and exc.code.upper() == "NOT_FOUND")
     )
 
 
@@ -544,6 +544,7 @@ class DaytonaSandbox(Sandbox):
         stdout_bytes = 0
         handle: AsyncPtyHandle | None = None
         wait_task: asyncio.Task[PtyResult] | None = None
+        owns_session = False
 
         async def on_data(data: bytes) -> None:
             nonlocal stdout_bytes
@@ -556,6 +557,7 @@ class DaytonaSandbox(Sandbox):
 
         try:
             handle = await self._create_pty_session(session_id, on_data, env_vars)
+            owns_session = True
             await _bounded("handle.send_input", handle.send_input("stty -echo\n"), _TOOLBOX_CALL_TIMEOUT_SECONDS)
             await _bounded(
                 "handle.send_input",
@@ -612,14 +614,15 @@ class DaytonaSandbox(Sandbox):
             if handle:
                 with suppress(Exception):
                     await _bounded("handle.disconnect", handle.disconnect(), _TOOLBOX_CALL_TIMEOUT_SECONDS)
-            with suppress(Exception):
-                await _bounded(
-                    "process.kill_pty_session",
-                    self._sandbox.process.kill_pty_session(session_id),
-                    _TOOLBOX_CALL_TIMEOUT_SECONDS,
-                )
-            with suppress(Exception):
-                await self._control_exec(f"rm -f {shlex.quote(status_path)}")
+            if owns_session:
+                with suppress(Exception):
+                    await _bounded(
+                        "process.kill_pty_session",
+                        self._sandbox.process.kill_pty_session(session_id),
+                        _TOOLBOX_CALL_TIMEOUT_SECONDS,
+                    )
+                with suppress(Exception):
+                    await self._control_exec(f"rm -f {shlex.quote(status_path)}")
 
     @_PROVIDER_RETRY
     async def _create_pty_session(
@@ -638,6 +641,8 @@ class DaytonaSandbox(Sandbox):
                 ),
                 _TOOLBOX_CALL_TIMEOUT_SECONDS,
             )
+        except DaytonaConflictError as exc:
+            raise self._sandbox_error(exc) from exc
         except _SANDBOX_OPERATION_ERRORS as exc:
             await self._check_sandbox_alive()
             raise self._sandbox_error(exc) from exc

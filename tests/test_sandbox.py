@@ -44,6 +44,7 @@ from benchmark_service.sandbox import (
 from benchmark_service.sandbox.daytona import (
     _PTY_STDOUT_TAIL_MAX_BYTES,  # pyright: ignore[reportPrivateUsage]
     DaytonaProviderConfig,
+    _is_not_found_error,  # pyright: ignore[reportPrivateUsage]
     _is_transient_daytona_error,  # pyright: ignore[reportPrivateUsage]
     DaytonaSandbox,
     DaytonaSandboxProvider,
@@ -318,6 +319,37 @@ class CreatePtyFailureProcess(Process):
         envs: dict[str, str],
     ) -> PtyHandle:
         raise DaytonaConnectionError("toolbox unreachable")
+
+
+class CreatePtyConflictProcess(Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.create_attempts = 0
+        self.reconnect_attempts = 0
+        self.killed_session_ids: list[str] = []
+
+    async def create_pty_session(
+        self,
+        *,
+        id: str,
+        on_data: Callable[[bytes], None | Awaitable[None]],
+        envs: dict[str, str],
+    ) -> PtyHandle:
+        self.create_attempts += 1
+        raise DaytonaConflictError("PTY session already exists")
+
+    async def get_pty_session_info(self, session_id: str) -> SimpleNamespace:
+        self.reconnect_attempts += 1
+        raise AssertionError(f"must not inspect conflicting PTY session: {session_id}")
+
+    async def connect_pty_session(
+        self, session_id: str, on_data: Callable[[bytes], None | Awaitable[None]]
+    ) -> PtyHandle:
+        self.reconnect_attempts += 1
+        raise AssertionError(f"must not connect conflicting PTY session: {session_id}")
+
+    async def kill_pty_session(self, session_id: str) -> None:
+        self.killed_session_ids.append(session_id)
 
 
 class CrashingReconnectProcess(ReconnectingProcess):
@@ -1116,6 +1148,11 @@ def test_daytona_permanent_http_statuses_are_not_transient(status_code: int) -> 
     assert not _is_transient_daytona_error(DaytonaError("provider request failed", status_code=status_code))
 
 
+def test_daytona_not_found_classification_uses_structured_code_and_status_fallback() -> None:
+    assert _is_not_found_error(DaytonaError("sandbox missing", code="NOT_FOUND"))
+    assert _is_not_found_error(DaytonaError("sandbox missing", status_code=404))
+
+
 @pytest.mark.parametrize(
     "message",
     [
@@ -1601,6 +1638,27 @@ async def test_daytona_command_checks_sandbox_health_after_pty_create_failure() 
         _ = [chunk async for chunk in sandbox.command("printf hello")]
 
     assert inner.refresh_count == 1
+
+
+@pytest.mark.parametrize("inner_type", [InnerSandbox, BareHtml502RefreshSandbox])
+async def test_daytona_command_keeps_pty_create_conflicts_terminal(inner_type: type[InnerSandbox]) -> None:
+    inner = inner_type()
+    process = CreatePtyConflictProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxError, match="PTY session already exists") as exc_info:
+        _ = [chunk async for chunk in sandbox.command("printf hello")]
+
+    assert type(exc_info.value) is SandboxError
+    assert process.create_attempts == 1
+    assert process.reconnect_attempts == 0
+    assert process.pty_handle is None
+    assert process.killed_session_ids == []
+    assert process.command is None
+    assert inner.refresh_count == 0
+    if isinstance(inner, BareHtml502RefreshSandbox):
+        assert inner.refresh_attempts == 0
 
 
 async def test_daytona_command_checks_sandbox_health_after_reconnect_failure() -> None:

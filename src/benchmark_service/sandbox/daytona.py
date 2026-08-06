@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import math
 import os
 import shlex
 import uuid
@@ -31,6 +33,9 @@ from daytona import (
     Resources as DaytonaResources,
 )
 from daytona.common.errors import (
+    SOURCE_API,
+    SOURCE_DAEMON,
+    SOURCE_PROXY,
     DaytonaConflictError,
     DaytonaConnectionError,
     DaytonaError,
@@ -76,6 +81,13 @@ from benchmark_service.sandbox.types import (
     validate_command_env,
 )
 
+logger = logging.getLogger(__name__)
+
+_SOURCE_NAMES: Mapping[str | None, str] = {
+    SOURCE_API: "api",
+    SOURCE_DAEMON: "daemon",
+    SOURCE_PROXY: "proxy",
+}
 _PTY_STATUS_CHECK_ATTEMPTS = 30
 _PTY_STATUS_POLL_SECONDS = 5
 _PTY_STDOUT_TAIL_MAX_BYTES = 64 * 1024
@@ -329,7 +341,7 @@ def _parse_retry_after_seconds(value: object) -> float | None:
     except ValueError:
         return None
 
-    if seconds < 0:
+    if seconds < 0 or not math.isfinite(seconds):
         return None
 
     return seconds
@@ -362,10 +374,55 @@ def daytona_retry_after_seconds(exc: DaytonaRateLimitError) -> float | None:
     return None
 
 
+def _provider_retry_before_sleep(retry_state: RetryCallState) -> None:
+    try:
+        outcome = retry_state.outcome
+        next_action = retry_state.next_action
+        fn = retry_state.fn
+        assert outcome is not None
+        assert next_action is not None
+        assert fn is not None
+        exc = outcome.exception()
+        assert exc is not None
+
+        delay = next_action.sleep
+        status_code: int | None = None
+        source: str | None = None
+        provider_error = exc.__cause__
+        if isinstance(provider_error, DaytonaError):
+            status_code = provider_error.status_code
+            source = _SOURCE_NAMES.get(provider_error.source)
+        elif isinstance(provider_error, ClientResponseError):
+            status_code = provider_error.status
+        elif isinstance(provider_error, OpenApiException):
+            raw_status = getattr(provider_error, "status", None)
+            if type(raw_status) is int:
+                status_code = raw_status
+
+        category = "rate_limit" if _rate_limit_error(exc) is not None or status_code == 429 else "transient"
+        fields: dict[str, object] = {
+            "sandbox_provider": "daytona",
+            "daytona_step": fn.__name__,
+            "daytona_retry_attempt": retry_state.attempt_number,
+            "daytona_retry_delay_s": delay,
+            "daytona_retry_category": category,
+        }
+        if status_code is not None:
+            fields["daytona_status_code"] = status_code
+        if source is not None:
+            fields["daytona_source"] = source
+
+        message = "daytona.retry " + " ".join(f"{key}={value}" for key, value in fields.items())
+        logger.warning(message, extra=fields)
+    except Exception:
+        pass
+
+
 _PROVIDER_RETRY = retry(
     retry=retry_if_exception_type(SandboxConnectionError),
     stop=stop_after_attempt(len(_PROVIDER_RETRY_DELAYS_SECONDS) + 1),
     wait=_provider_retry_wait,
+    before_sleep=_provider_retry_before_sleep,
     reraise=True,
 )
 

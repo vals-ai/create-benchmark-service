@@ -10,6 +10,7 @@ from typing import Any, Literal, cast
 
 from modal import App, Client, Image
 from modal import Sandbox as ModalSdkSandbox
+from modal.exception import ConflictError as ModalConflictError
 from modal.exception import ConnectionError as ModalConnectionError
 from modal.exception import Error as ModalError
 from modal.exception import InvalidError as ModalInvalidError
@@ -83,6 +84,8 @@ class ModalProviderConfig(BaseModel):
 def _sandbox_error(exc: ModalError) -> SandboxError:
     if isinstance(exc, ModalNotFoundError):
         return SandboxNotFoundError(str(exc))
+    if isinstance(exc, ModalConflictError) and "shutting down" in str(exc).lower():
+        return SandboxNotFoundError(str(exc))
     if isinstance(exc, ModalConnectionError):
         return SandboxConnectionError(str(exc))
     return SandboxError(str(exc))
@@ -116,9 +119,15 @@ def _modal_sandbox_name(name: str) -> str:
 
 
 class ModalSandbox(Sandbox):
-    def __init__(self, sandbox: ModalSdkSandbox, name: str | None = None) -> None:
+    def __init__(
+        self,
+        sandbox: ModalSdkSandbox,
+        name: str | None = None,
+        labels: Mapping[str, str] | None = None,
+    ) -> None:
         self._sandbox = sandbox
         self._name = name
+        self.labels = dict(labels) if labels is not None else None
 
     @property
     def id(self) -> str:
@@ -199,34 +208,71 @@ class ModalSandbox(Sandbox):
         process = await self._start_process(command, cwd=cwd, timeout=timeout, env_vars=env)
         output_iterator = process.stdout.__aiter__()
         next_chunk_task = asyncio.create_task(anext(output_iterator))
+        wait_task: asyncio.Task[Any] | None = asyncio.create_task(process.wait.aio())
+        exit_code: int | None = None
+        drain_deadline: float | None = None
+        termination_checked = False
+        loop = asyncio.get_running_loop()
 
         try:
             while True:
+                tasks: set[asyncio.Task[Any]] = {next_chunk_task}
+                if wait_task is not None:
+                    tasks.add(wait_task)
+                timeout = _COMMAND_STATUS_POLL_SECONDS
+                if drain_deadline is not None:
+                    remaining = drain_deadline - loop.time()
+                    if remaining <= 0:
+                        break
+                    timeout = min(timeout, remaining)
+
                 completed, _ = await asyncio.wait(
-                    {next_chunk_task},
-                    timeout=_COMMAND_STATUS_POLL_SECONDS,
+                    tasks,
+                    timeout=timeout,
+                    return_when=asyncio.FIRST_COMPLETED,
                 )
-                if not completed:
-                    await self._raise_if_finished()
+                if wait_task is not None and wait_task in completed:
+                    exit_code = wait_task.result()
+                    wait_task = None
+                    drain_deadline = loop.time() + _COMMAND_STATUS_POLL_SECONDS
+
+                if next_chunk_task in completed:
+                    try:
+                        chunk = next_chunk_task.result()
+                    except StopAsyncIteration:
+                        if wait_task is not None:
+                            exit_code = await wait_task
+                            if exit_code != 0:
+                                await self._raise_if_finished(attempts=6, wait_seconds=0.5)
+                                termination_checked = True
+                        break
+
+                    yield str(chunk)
+                    next_chunk_task = asyncio.create_task(anext(output_iterator))
                     continue
 
-                try:
-                    chunk = next_chunk_task.result()
-                except StopAsyncIteration:
-                    break
+                if drain_deadline is not None and wait_task is None:
+                    continue
 
-                yield str(chunk)
-                next_chunk_task = asyncio.create_task(anext(output_iterator))
-            exit_code = await process.wait.aio()
+                if drain_deadline is not None:
+                    break
+                await self._raise_if_finished()
         except ModalError as exc:
             raise _sandbox_error(exc) from exc
         finally:
-            if not next_chunk_task.done():
-                next_chunk_task.cancel()
-                await asyncio.gather(next_chunk_task, return_exceptions=True)
+            tasks_to_cancel = [next_chunk_task]
+            if wait_task is not None:
+                tasks_to_cancel.append(wait_task)
+            for task in tasks_to_cancel:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks_to_cancel, return_exceptions=True)
 
+        if exit_code is None:
+            raise RuntimeError("Modal command completed without an exit code")
         if exit_code != 0:
-            await self._raise_if_finished(attempts=6, wait_seconds=0.5)
+            if not termination_checked:
+                await self._raise_if_finished(attempts=6, wait_seconds=0.5)
             raise SandboxCommandError(exit_code)
 
     @_PROVIDER_RETRY
@@ -341,6 +387,13 @@ class ModalSandboxProvider(SandboxProvider):
             case _:
                 raise SandboxError(f"Modal sandbox provider does not support source type: {source.type}")
 
+    @_PROVIDER_RETRY
+    async def _fetch_labels(self, sandbox: ModalSdkSandbox) -> dict[str, str]:
+        try:
+            return await cast(Any, sandbox.get_tags).aio()
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
+
     async def _find_reusable_sandbox(self, name: str, client: Client) -> ModalSdkSandbox | None:
         # Match Daytona: task retry/resume reuses a still-running sandbox by
         # name (Modal names are unique per app, so a blind create would raise).
@@ -366,7 +419,7 @@ class ModalSandboxProvider(SandboxProvider):
         modal_name = _modal_sandbox_name(request.name)
         existing = await self._find_reusable_sandbox(modal_name, client)
         if existing is not None:
-            return ModalSandbox(existing, name=request.name)
+            return ModalSandbox(existing, name=request.name, labels=request.labels)
         image = self._resolve_image(request.source, client)
         allow_all_egress = not request.network_block_all
         gpu: str | None = None
@@ -403,7 +456,7 @@ class ModalSandboxProvider(SandboxProvider):
             raise SandboxError(f"Failed to create Modal sandbox within {request.create_timeout}s") from exc
         except ModalError as exc:
             raise _sandbox_error(exc) from exc
-        return ModalSandbox(inner, name=request.name)
+        return ModalSandbox(inner, name=request.name, labels=request.labels)
 
     @_PROVIDER_RETRY
     async def get_sandbox(self, instance_id: str) -> Sandbox:
@@ -416,14 +469,14 @@ class ModalSandboxProvider(SandboxProvider):
             raise SandboxNotFoundError(f"Sandbox not found: id={instance_id}.") from exc
         except ModalError as exc:
             raise _sandbox_error(exc) from exc
-        return ModalSandbox(inner)
+        return ModalSandbox(inner, labels=await self._fetch_labels(inner))
 
     @_PROVIDER_RETRY
     async def delete_sandbox(self, instance_id: str) -> None:
         client, _ = await self._connect()
         try:
             inner = await ModalSdkSandbox.from_id.aio(instance_id, client=client)
-            await inner.terminate.aio()
+            await inner.terminate.aio(wait=True)
         except ModalNotFoundError:
             return
         except ModalError as exc:
@@ -431,7 +484,7 @@ class ModalSandboxProvider(SandboxProvider):
 
     async def list_sandboxes(self, query: SandboxQuery) -> AsyncGenerator[Sandbox, None]:
         for inner in await self._list_sandboxes(query):
-            yield ModalSandbox(inner)
+            yield ModalSandbox(inner, labels=await self._fetch_labels(inner))
 
     @_PROVIDER_RETRY
     async def _list_sandboxes(self, query: SandboxQuery) -> list[ModalSdkSandbox]:

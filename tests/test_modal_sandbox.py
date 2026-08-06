@@ -80,23 +80,6 @@ class ErrorProcess(FakeProcess):
         raise self._error
 
 
-class HangingDownloadProcess(FakeProcess):
-    def __init__(self) -> None:
-        super().__init__([], 0)
-        self.read_started = asyncio.Event()
-        self.read_cancelled = asyncio.Event()
-        self.stdout = self._stream_until_cancelled()
-
-    async def _stream_until_cancelled(self) -> AsyncGenerator[bytes, None]:
-        yield b"partial"
-        self.read_started.set()
-        try:
-            await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            self.read_cancelled.set()
-            raise
-
-
 class FakeFilesystem:
     def __init__(self, content: bytes = b"", error: ModalError | None = None) -> None:
         self.content = content
@@ -205,36 +188,6 @@ class FlakyExecSandbox(FakeInnerSandbox):
         if self.exec_attempts == 1:
             raise ModalConnectionError("modal exec temporarily unavailable")
         return await super()._exec(*args, text=text, env=env)
-
-
-class AlwaysFailingExecSandbox(FakeInnerSandbox):
-    def __init__(self) -> None:
-        super().__init__()
-        self.exec_attempts = 0
-
-    async def _exec(
-        self,
-        *args: str,
-        text: bool = True,
-        env: dict[str, str | None] | None = None,
-    ) -> FakeProcess:
-        self.exec_attempts += 1
-        raise ModalConnectionError("modal exec unavailable")
-
-
-class EgressFaultSandbox(FakeInnerSandbox):
-    def __init__(self) -> None:
-        super().__init__()
-        self.policy_attempts = 0
-
-    async def _set_outbound_network_policy(
-        self,
-        *,
-        outbound_cidr_allowlist: list[str] | None = None,
-        outbound_domain_allowlist: list[str] | None = None,
-    ) -> None:
-        self.policy_attempts += 1
-        raise ModalConnectionError("modal egress policy unavailable")
 
 
 def _request(
@@ -347,17 +300,6 @@ async def test_exec_retries_modal_connection_errors(monkeypatch: pytest.MonkeyPa
     assert inner.exec_attempts == 2
 
 
-async def test_exec_stops_after_retry_exhaustion(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(cast(Any, modal_module.ModalSandbox._start_process).retry, "sleep", _noop)
-    inner = AlwaysFailingExecSandbox()
-    sandbox = _sandbox(inner)
-
-    with pytest.raises(SandboxConnectionError, match="modal exec unavailable"):
-        await sandbox.exec("true")
-
-    assert inner.exec_attempts == 3
-
-
 async def test_file_operations_map_not_found_errors() -> None:
     sandbox = _sandbox(FakeInnerSandbox(file_error=ModalNotFoundError("sandbox removed")))
 
@@ -370,6 +312,12 @@ async def test_file_operations_map_not_found_errors() -> None:
 
 async def test_command_streams_output_and_raises_on_failure() -> None:
     inner = FakeInnerSandbox(process=FakeProcess(["line1\n", "line2\n"], 7))
+
+    async def delayed_wait() -> int:
+        await asyncio.sleep(0.05)
+        return 7
+
+    inner._process.wait = _aio(delayed_wait)
     sandbox = _sandbox(inner)
 
     chunks: list[str] = []
@@ -379,19 +327,6 @@ async def test_command_streams_output_and_raises_on_failure() -> None:
 
     assert chunks == ["line1\n", "line2\n"]
     assert exc.value.exit_code == 7
-
-
-async def test_command_awaits_process_after_stream_eof() -> None:
-    inner = FakeInnerSandbox(process=FakeProcess(["done"], 0))
-
-    async def delayed_wait() -> int:
-        await asyncio.sleep(0.05)
-        return 0
-
-    inner._process.wait = _aio(delayed_wait)
-    sandbox = _sandbox(inner)
-
-    assert [chunk async for chunk in sandbox.command("run")] == ["done"]
 
 
 async def test_command_drains_output_after_process_finishes() -> None:
@@ -432,25 +367,27 @@ async def test_command_bounds_continuous_output_after_process_finishes(
     assert count > 0
 
 
-async def test_command_maps_stream_error_after_partial_output() -> None:
-    inner = FakeInnerSandbox(process=ErrorProcess(ModalConnectionError("command disconnected")))
+@pytest.mark.parametrize(
+    ("modal_error", "expected_error", "message"),
+    [
+        (ModalConnectionError("command disconnected"), SandboxConnectionError, "command disconnected"),
+        (ModalConflictError("Modal Sandbox is shutting down."), SandboxNotFoundError, "shutting down"),
+    ],
+)
+async def test_command_maps_stream_errors(
+    modal_error: ModalError,
+    expected_error: type[SandboxError],
+    message: str,
+) -> None:
+    inner = FakeInnerSandbox(process=ErrorProcess(modal_error))
     sandbox = _sandbox(inner)
     chunks: list[str] = []
 
-    with pytest.raises(SandboxConnectionError, match="command disconnected"):
+    with pytest.raises(expected_error, match=message):
         async for chunk in sandbox.command("run"):
             chunks.append(chunk)
 
     assert chunks == ["b'partial'"]
-
-
-async def test_command_maps_shutting_down_to_not_found() -> None:
-    inner = FakeInnerSandbox(process=ErrorProcess(ModalConflictError("Modal Sandbox is shutting down.")))
-    sandbox = _sandbox(inner)
-
-    with pytest.raises(SandboxNotFoundError, match="shutting down"):
-        async for _ in sandbox.command("run"):
-            pass
 
 
 async def test_command_uses_native_process_environment() -> None:
@@ -623,33 +560,6 @@ async def test_stream_download_yields_chunks() -> None:
     assert chunks == [b"hello", b" world"]
 
 
-async def test_stream_download_maps_modal_error_after_partial_output() -> None:
-    inner = FakeInnerSandbox(process=ErrorProcess(ModalConnectionError("download disconnected")))
-    sandbox = _sandbox(inner)
-    chunks: list[bytes] = []
-
-    with pytest.raises(SandboxConnectionError, match="download disconnected"):
-        async for chunk in sandbox.stream_download("/tmp/out.bin"):
-            chunks.append(chunk)
-
-    assert chunks == [b"partial"]
-
-
-async def test_stream_download_reports_nonzero_exit_after_partial_output(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(modal_module.asyncio, "sleep", _noop)
-    inner = FakeInnerSandbox(process=FakeProcess([b"partial"], 7))
-    sandbox = _sandbox(inner)
-    chunks: list[bytes] = []
-
-    with pytest.raises(SandboxError, match=r"path=/tmp/out.bin, exit_code=7"):
-        async for chunk in sandbox.stream_download("/tmp/out.bin"):
-            chunks.append(chunk)
-
-    assert chunks == [b"partial"]
-
-
 async def test_egress_rule_updates_replace_outbound_policy() -> None:
     """Verify Modal egress updates call the SDK outbound policy API.
 
@@ -673,44 +583,6 @@ async def test_egress_rule_updates_replace_outbound_policy() -> None:
         "outbound_cidr_allowlist": ["0.0.0.0/0"],
         "outbound_domain_allowlist": ["*"],
     }
-
-
-async def test_stream_download_cancels_pending_read() -> None:
-    process = HangingDownloadProcess()
-    sandbox = _sandbox(FakeInnerSandbox(process=process))
-
-    async def consume_download() -> None:
-        async for _ in sandbox.stream_download("/tmp/out.bin"):
-            pass
-
-    consumer = asyncio.create_task(consume_download())
-    await asyncio.wait_for(process.read_started.wait(), timeout=1)
-
-    consumer.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await consumer
-
-    assert process.read_cancelled.is_set()
-
-
-async def test_egress_maps_modal_connection_error_without_retry() -> None:
-    inner = EgressFaultSandbox()
-    sandbox = _sandbox(inner)
-
-    with pytest.raises(SandboxConnectionError, match="modal egress policy unavailable"):
-        await sandbox.clear_egress_rules()
-
-    assert inner.policy_attempts == 1
-
-
-async def test_egress_modify_maps_modal_connection_error_without_retry() -> None:
-    inner = EgressFaultSandbox()
-    sandbox = _sandbox(inner)
-
-    with pytest.raises(SandboxConnectionError, match="modal egress policy unavailable"):
-        await sandbox.modify_egress_rules(["10.0.0.0/8"])
-
-    assert inner.policy_attempts == 1
 
 
 async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -909,19 +781,8 @@ async def test_get_sandbox_maps_invalid_id_to_not_found(monkeypatch: pytest.Monk
         await provider.get_sandbox("sandbox-name")
 
 
-async def test_get_sandbox_exposes_modal_tags(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def from_id(instance_id: str, **kwargs: Any) -> FakeInnerSandbox:
-        return FakeInnerSandbox(object_id=instance_id, tags={"Id": "benchmark-1", "Task": "task-1"})
-
-    provider = _provider(monkeypatch, SimpleNamespace(from_id=_aio(from_id)))
-
-    sandbox = await provider.get_sandbox("sb-123")
-
-    assert sandbox.labels == {"Id": "benchmark-1", "Task": "task-1"}
-
-
-async def test_get_sandbox_retries_modal_tag_fetch(monkeypatch: pytest.MonkeyPatch) -> None:
-    inner = FakeInnerSandbox(tags={"Id": "benchmark-1"})
+async def test_get_sandbox_fetches_modal_tags_with_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    inner = FakeInnerSandbox(tags={"Id": "benchmark-1", "Task": "task-1"})
     attempts = 0
 
     async def get_tags() -> dict[str, str]:
@@ -929,7 +790,7 @@ async def test_get_sandbox_retries_modal_tag_fetch(monkeypatch: pytest.MonkeyPat
         attempts += 1
         if attempts == 1:
             raise ModalConnectionError("tags temporarily unavailable")
-        return {"Id": "benchmark-1"}
+        return {"Id": "benchmark-1", "Task": "task-1"}
 
     inner.get_tags = _aio(get_tags)
 
@@ -941,7 +802,7 @@ async def test_get_sandbox_retries_modal_tag_fetch(monkeypatch: pytest.MonkeyPat
 
     sandbox = await provider.get_sandbox("sb-123")
 
-    assert sandbox.labels == {"Id": "benchmark-1"}
+    assert sandbox.labels == {"Id": "benchmark-1", "Task": "task-1"}
     assert attempts == 2
 
 

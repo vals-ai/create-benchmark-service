@@ -13,7 +13,7 @@ from typing import Any, ClassVar, Self
 from benchmark_service.auth import (
     LEGACY_TENANT_SENTINEL,
     check_benchmark_service_auth,
-    load_allowlist,
+    get_tenant_config,
     resolve_caller_tenant,
 )
 from benchmark_service.dataset_versioning import DatasetVersionEntry, load_dataset_versions
@@ -100,8 +100,7 @@ class BenchmarkService(ABC):
         """Return True if `tenant` may use `dataset` on this service."""
         if tenant == LEGACY_TENANT_SENTINEL:
             return True
-        allowlist = load_allowlist()
-        entry = allowlist.tenants.get(tenant)
+        entry = get_tenant_config(tenant)
         if entry is None:
             return False
         return (dataset or "default") in entry.datasets

@@ -12,11 +12,13 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 
+import httpx
 import yaml
 from cachetools import TTLCache
 from descope.descope_client import DescopeClient
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 logger = logging.getLogger(__name__)
 
@@ -52,30 +54,109 @@ class AllowlistConfig(BaseModel):
 
 _DESCOPE_ALLOWLIST_JSON_ENV = "DESCOPE_TENANT_ALLOWLIST_JSON"
 _DESCOPE_ALLOWLIST_PATH_ENV = "DESCOPE_ALLOWLIST_PATH"
+_BENCHMARK_CATALOG_API_URL_ENV = "BENCHMARK_CATALOG_API_URL"
+_SERVICE_NAME_ENV = "SERVICE_NAME"
+
+
+class _CatalogAllowlistResponse(BaseModel):
+    """Strict response contract for the service-specific catalog endpoint."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    name: str
+    datasets: list[str]
+    trial_mode: bool
+
 
 _allowlist_cache: AllowlistConfig | None = None
 _allowlist_warned: bool = False
+_api_allowlist_cache: TTLCache[tuple[str, str], TenantConfig] = TTLCache(
+    maxsize=AUTH_CACHE_MAX_SIZE,
+    ttl=DEFAULT_AUTH_CACHE_TTL_SECONDS,
+)
+
+
+def _catalog_api_url() -> str | None:
+    value = os.environ.get(_BENCHMARK_CATALOG_API_URL_ENV, "").strip()
+    return value.rstrip("/") or None
+
+
+def _catalog_service_name() -> str | None:
+    value = os.environ.get(_SERVICE_NAME_ENV, "").strip()
+    return value or None
 
 
 def clear_allowlist_cache() -> None:
-    """Reset module-level allowlist state. Intended for tests."""
+    """Reset module-level legacy and catalog allowlist state. Intended for tests."""
     global _allowlist_cache, _allowlist_warned
     _allowlist_cache = None
     _allowlist_warned = False
+    _api_allowlist_cache.clear()
+
+
+async def _fetch_api_tenant_config(access_key: str, tenant: str) -> TenantConfig | None:
+    """Fetch and cache one tenant's service policy from the catalog API."""
+    api_url = _catalog_api_url()
+    service_name = _catalog_service_name()
+    if api_url is None or service_name is None:
+        logger.warning(
+            "%s requires both %s and %s",
+            _BENCHMARK_CATALOG_API_URL_ENV,
+            _BENCHMARK_CATALOG_API_URL_ENV,
+            _SERVICE_NAME_ENV,
+        )
+        return None
+
+    cache_key = (service_name, tenant)
+    cached = _api_allowlist_cache.get(cache_key)
+    if cached is not None:
+        return cached
+
+    endpoint = f"{api_url}/benchmark-services/{quote(service_name, safe='')}"
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            response = await client.get(endpoint, headers={DESCOPE_API_KEY_HEADER: access_key})
+    except Exception:
+        logger.warning("Failed to fetch tenant policy from benchmark catalog API", exc_info=True)
+        return None
+
+    if response.status_code != 200:
+        logger.warning("Benchmark catalog API returned status %s", response.status_code)
+        return None
+
+    try:
+        payload = _CatalogAllowlistResponse.model_validate(response.json())
+    except Exception:
+        logger.warning("Benchmark catalog API returned a malformed tenant policy", exc_info=True)
+        return None
+
+    if payload.name != service_name:
+        logger.warning("Benchmark catalog API returned policy for unexpected service %s", payload.name)
+        return None
+
+    config = TenantConfig(datasets=payload.datasets, trial_mode=payload.trial_mode)
+    _api_allowlist_cache[cache_key] = config
+    return config
 
 
 def load_allowlist() -> AllowlistConfig:
     """Load the tenant + dataset allowlist for this service.
 
     Resolution order:
-      1. `DESCOPE_TENANT_ALLOWLIST_JSON` env var (production via CDK).
-      2. `DESCOPE_ALLOWLIST_PATH` env var pointing at a YAML file (local dev).
-      3. Empty config (legal: fails closed when AUTH_REQUIRED=true; logs once).
+      1. The catalog API when `BENCHMARK_CATALOG_API_URL` is configured.
+      2. `DESCOPE_TENANT_ALLOWLIST_JSON` env var (legacy rollout fallback).
+      3. `DESCOPE_ALLOWLIST_PATH` env var pointing at a YAML file (local dev).
+      4. Empty config (legal: fails closed when AUTH_REQUIRED=true; logs once).
 
     Raises:
         ValueError: if the configured source exists but is malformed.
     """
     global _allowlist_cache, _allowlist_warned
+
+    # API mode is caller-scoped. Startup validation must not make a caller-less
+    # request, and legacy policy must never override an explicitly configured API.
+    if _catalog_api_url() is not None:
+        return AllowlistConfig()
 
     if _allowlist_cache is not None:
         return _allowlist_cache
@@ -124,6 +205,11 @@ def load_allowlist() -> AllowlistConfig:
 
 def get_tenant_config(tenant: str) -> TenantConfig | None:
     """Return the TenantConfig for `tenant`, or None if not allowlisted."""
+    if _catalog_api_url() is not None:
+        service_name = _catalog_service_name()
+        if service_name is None:
+            return None
+        return _api_allowlist_cache.get((service_name, tenant))
     return load_allowlist().tenants.get(tenant)
 
 
@@ -203,15 +289,18 @@ async def resolve_descope_tenant(headers: Mapping[str, str]) -> str | None:
     cache_key = (settings.descope_project_id, access_key)
     cached = _auth_cache.get(cache_key)
     if cached is not None:
-        return cached
+        if _catalog_api_url() is None:
+            return cached
+        return cached if await _fetch_api_tenant_config(access_key, cached) is not None else None
 
     try:
         jwt_response = await _exchange_descope_access_key(settings.descope_project_id, access_key)
+        tenants_claim = jwt_response.get("tenants", {})
+        tenants = list(tenants_claim.keys())
     except Exception:
-        logger.warning("Failed to exchange Descope access key", exc_info=True)
+        logger.warning("Failed to resolve tenant from Descope access key", exc_info=True)
         return None
 
-    tenants = list(jwt_response.get("tenants", {}).keys())
     if len(tenants) != 1:
         logger.warning("Descope access key must be scoped to exactly one tenant, got %s", len(tenants))
         return None
@@ -221,10 +310,15 @@ async def resolve_descope_tenant(headers: Mapping[str, str]) -> str | None:
         logger.info("Descope tenant %s is reserved for legacy auth compatibility", tenant)
         return None
 
-    allowlist = load_allowlist()
-    if tenant not in allowlist.tenants:
-        logger.info("Descope tenant %s is not in the service allowlist", tenant)
-        return None
+    if _catalog_api_url() is not None:
+        if await _fetch_api_tenant_config(access_key, tenant) is None:
+            logger.info("Descope tenant %s is not in the service allowlist", tenant)
+            return None
+    else:
+        allowlist = load_allowlist()
+        if tenant not in allowlist.tenants:
+            logger.info("Descope tenant %s is not in the service allowlist", tenant)
+            return None
 
     _auth_cache[cache_key] = tenant
     return tenant

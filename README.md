@@ -221,9 +221,19 @@ For hosted Valkyrie benchmark services, set `AUTH_REQUIRED=true`, `DESCOPE_PROJE
 
 The allowlist is loaded in this order:
 
-1. `DESCOPE_TENANT_ALLOWLIST_JSON` — JSON payload injected by production deployment.
-2. `DESCOPE_ALLOWLIST_PATH` — path to a local YAML file, useful for development.
-3. Empty config — allowed at startup, but Descope-authenticated requests fail closed when `AUTH_REQUIRED=true`.
+1. `BENCHMARK_CATALOG_API_URL` plus `SERVICE_NAME` — the service-specific catalog API fetches the authenticated tenant policy. The framework caches positive policies for 300 seconds, refreshes an unknown tenant immediately, and fails closed when the API is unavailable or returns invalid data.
+2. `DESCOPE_TENANT_ALLOWLIST_JSON` — JSON payload retained during the staged production rollout.
+3. `DESCOPE_ALLOWLIST_PATH` — path to a local YAML file, useful for development.
+4. Empty config — allowed at startup, but Descope-authenticated requests fail closed when `AUTH_REQUIRED=true`.
+
+Enable catalog mode by setting both variables in the service container:
+
+```text
+BENCHMARK_CATALOG_API_URL=https://<catalog-api-host>
+SERVICE_NAME=<registered-service-name>
+```
+
+Catalog requests use the authenticated `x-descope-api-key` header. The service never reads the catalog bucket directly. Leave `BENCHMARK_CATALOG_API_URL` unset to retain the JSON/YAML behavior during rollout.
 
 Example allowlist:
 

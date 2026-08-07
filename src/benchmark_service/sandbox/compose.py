@@ -2,9 +2,15 @@ from __future__ import annotations
 
 import shlex
 import uuid
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Mapping
 
-from benchmark_service.sandbox.types import ComposeSource, ExecResult, Sandbox, SandboxError
+from benchmark_service.sandbox.types import (
+    ComposeSource,
+    ExecResult,
+    Sandbox,
+    SandboxError,
+    validate_command_env,
+)
 
 _COMPOSE_EXEC_ENV_ARGS = r"$(env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/-e \1/p')"
 
@@ -14,6 +20,8 @@ class ComposeSandbox(Sandbox):
         self._outer = outer
         self._service = source.service
         self._compose_command_prefix = source.compose_command
+        self.labels = outer.labels
+        self.created_at = outer.created_at
 
     @property
     def id(self) -> str:
@@ -62,8 +70,10 @@ class ComposeSandbox(Sandbox):
         *,
         cwd: str | None = None,
         timeout: float | None = None,
+        env_vars: Mapping[str, str] | None = None,
     ) -> AsyncGenerator[str, None]:
-        async for chunk in self._outer.command(self._exec_command(command, cwd), timeout=timeout):
+        env = validate_command_env(env_vars) if env_vars is not None else None
+        async for chunk in self._outer.command(self._exec_command(command, cwd), timeout=timeout, env_vars=env):
             yield chunk
 
     async def upload_file(self, remote_path: str, content: bytes) -> None:
@@ -100,6 +110,24 @@ class ComposeSandbox(Sandbox):
             if result.exit_code != 0:
                 raise SandboxError(f"compose download failed: {result.output}")
             return await self._outer.download_file(temp)
+        finally:
+            await self._outer.exec(shlex.join(["rm", "-f", temp]), timeout=10)
+
+    async def stream_download(self, remote_path: str) -> AsyncGenerator[bytes, None]:
+        temp = self._temp_path("compose-download", remote_path)
+        try:
+            read_file = shlex.quote(f"cat {shlex.quote(remote_path)}")
+            result = await self._outer.exec(
+                (
+                    f"{self._container_lookup()}; "
+                    f"docker exec \"$container_id\" sh -lc {read_file} > {shlex.quote(temp)}"
+                ),
+                timeout=60,
+            )
+            if result.exit_code != 0:
+                raise SandboxError(f"compose download failed: {result.output}")
+            async for chunk in self._outer.stream_download(temp):
+                yield chunk
         finally:
             await self._outer.exec(shlex.join(["rm", "-f", temp]), timeout=10)
 

@@ -1,7 +1,14 @@
 """HTTP/WebSocket client for communicating with a benchmark service."""
 
-from collections.abc import Callable
-from typing import Any
+from __future__ import annotations
+
+import asyncio
+import inspect
+import time
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
+from typing import Any, TypeVar
+from uuid import uuid4
 
 import httpx
 import websockets
@@ -12,13 +19,15 @@ from tenacity import (
     stop_after_attempt,
     wait_random,
 )
+from websockets.exceptions import ConnectionClosed
 
-from benchmark_service.sandbox import SandboxProvider, SandboxProviderConfig
+from benchmark_service.sandbox import SandboxNotFoundError, SandboxProvider, SandboxProviderConfig
 from benchmark_service.schemas import (
     EvaluateInstanceRequest,
     EvaluateResponseRequest,
     FinalScoreResponse,
     HealthCheckResponse,
+    JsonValue,
     RetrieveTaskResponse,
     SetupTaskRequest,
     SetupTaskResponse,
@@ -26,9 +35,25 @@ from benchmark_service.schemas import (
     VerifyTaskIdsResponse,
     VersionResponse,
 )
-from benchmark_service.v1_schemas import V1DatasetTasksResponse
+from benchmark_service.v1_schemas import (
+    V1DatasetTasksResponse,
+    V1EvalRequest,
+    V1EvalResponse,
+    V1Payload,
+    V1PayloadType,
+    V1ScoreItem,
+    V1ScoreRequest,
+    V1ScoreResponse,
+    V1UploadUrlRequest,
+    V1UploadUrlResponse,
+    V1Versions,
+)
 
 _stream_chunk_adapter: TypeAdapter[StreamChunk] = TypeAdapter(StreamChunk)
+_RecoveryResult = TypeVar("_RecoveryResult")
+
+_OUTAGE_ID_ENV = "VALKYRIE_SANDBOX_OUTAGE_ID"
+_OUTAGE_STARTED_ENV = "VALKYRIE_SANDBOX_OUTAGE_STARTED_EPOCH"
 
 _retry_http = retry(
     retry=retry_if_exception_type(
@@ -52,7 +77,11 @@ _retry_http = retry(
 class BenchmarkServiceError(Exception):
     """Exception raised for benchmark service communication errors."""
 
-    pass
+    status_code: int | None
+
+    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 class BenchmarkServiceUnauthenticatedError(BenchmarkServiceError):
@@ -70,7 +99,102 @@ def _unauthenticated_error(response: httpx.Response) -> "BenchmarkServiceUnauthe
     except Exception:
         detail = response.text
 
-    return BenchmarkServiceUnauthenticatedError(detail)
+    return BenchmarkServiceUnauthenticatedError(detail, status_code=response.status_code)
+
+
+@dataclass(frozen=True)
+class SandboxRecoveryAttempt:
+    """One bounded invocation of a durable sandbox-backed task.
+
+    ``environment`` is empty for the initial attempt. After a provider-confirmed
+    sandbox loss it carries stable outage metadata until the replacement has
+    completed benchmark setup and calls ``mark_replacement_ready``. If that
+    setup fails, the next replacement receives the same outage identity rather
+    than double-crediting one interruption.
+    """
+
+    number: int
+    outage_id: str | None
+    outage_started_epoch: float | None
+    _state: _SandboxRecoveryState = field(repr=False, compare=False)
+
+    @property
+    def max_attempts(self) -> int:
+        """Current overall cap after applying the cached benchmark policy."""
+        return self._state.max_attempts
+
+    @property
+    def sandbox_loss_retry_available(self) -> bool:
+        """Whether this attempt may recover a typed provider sandbox loss."""
+        return self._state.recover_sandbox_loss and self.number < self._state.max_attempts
+
+    @property
+    def environment(self) -> dict[str, str]:
+        """Environment metadata to add to this attempt's sandbox."""
+        if self.outage_id is None or self.outage_started_epoch is None:
+            return {}
+        return {
+            _OUTAGE_ID_ENV: self.outage_id,
+            _OUTAGE_STARTED_ENV: str(self.outage_started_epoch),
+        }
+
+    def mark_replacement_ready(self) -> None:
+        """Acknowledge that benchmark setup persisted this outage metadata."""
+        self._state.mark_ready(self.outage_id)
+
+    async def retrieve_task(self) -> RetrieveTaskResponse:
+        """Load and cache the task payload and its recovery policy."""
+        return await self._state.retrieve_task()
+
+
+@dataclass
+class _SandboxRecoveryState:
+    run_id: str
+    task_id: str
+    load_task: Callable[[], Awaitable[RetrieveTaskResponse]] = field(repr=False)
+    default_max_attempts: int
+    outage_id: str | None = None
+    outage_started_epoch: float | None = None
+    consecutive_attempt_errors: int = 0
+    task: RetrieveTaskResponse | None = None
+    recover_sandbox_loss: bool = False
+    max_attempts: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.max_attempts = self.default_max_attempts
+
+    def attempt(self, number: int) -> SandboxRecoveryAttempt:
+        return SandboxRecoveryAttempt(
+            number=number,
+            outage_id=self.outage_id,
+            outage_started_epoch=self.outage_started_epoch,
+            _state=self,
+        )
+
+    async def retrieve_task(self) -> RetrieveTaskResponse:
+        if self.task is None:
+            self.task = await self.load_task()
+            policy = self.task.sandbox_recovery
+            self.recover_sandbox_loss = policy is not None
+            if policy is not None:
+                self.max_attempts = policy.max_sandbox_attempts
+        return self.task
+
+    def record_loss(self, attempt_number: int) -> None:
+        self.consecutive_attempt_errors = 0
+        if self.outage_id is not None:
+            return
+        self.outage_id = f"{self.run_id}:{self.task_id}:{attempt_number}:{uuid4().hex}"
+        self.outage_started_epoch = time.time()
+
+    def record_attempt_error(self) -> None:
+        self.consecutive_attempt_errors += 1
+
+    def mark_ready(self, outage_id: str | None) -> None:
+        if outage_id is None or outage_id != self.outage_id:
+            return
+        self.outage_id = None
+        self.outage_started_epoch = None
 
 
 class BenchmarkServiceClient:
@@ -128,7 +252,7 @@ class BenchmarkServiceClient:
         request: BaseModel,
         on_message: Callable[[str], None] | None = None,
         on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
-    ) -> dict[str, Any]:
+    ) -> JsonValue:
         """Send a request over WebSocket and stream the response.
 
         Args:
@@ -143,29 +267,38 @@ class BenchmarkServiceClient:
             BenchmarkServiceError: If an "error" chunk is received or the connection
                 closes without a result.
         """
-        async with websockets.connect(
-            f"{self._ws_url}/ws/{path}",
-            additional_headers=self._headers,
-            open_timeout=60,
-            ping_timeout=None,
-            max_size=10 * 1024 * 1024,  # 10MB
-        ) as websocket:
-            await websocket.send(request.model_dump_json())
+        try:
+            async with websockets.connect(
+                f"{self._ws_url}/ws/{path}",
+                additional_headers=self._headers,
+                open_timeout=60,
+                ping_timeout=None,
+                max_size=10 * 1024 * 1024,  # 10MB
+            ) as websocket:
+                await websocket.send(request.model_dump_json())
 
-            async for message in websocket:
-                chunk: StreamChunk = _stream_chunk_adapter.validate_json(message)
+                async for message in websocket:
+                    chunk: StreamChunk = _stream_chunk_adapter.validate_json(message)
 
-                match chunk.type:
-                    case "error":
-                        raise BenchmarkServiceError(chunk.data)
-                    case "result":
-                        return chunk.data
-                    case "message":
-                        if on_message:
-                            on_message(chunk.data)
-                    case "eval_resume_state":
-                        if on_eval_resume_state:
-                            on_eval_resume_state(chunk.data)
+                    match chunk.type:
+                        case "error":
+                            raise BenchmarkServiceError(chunk.data)
+                        case "result":
+                            return chunk.data
+                        case "message":
+                            if on_message:
+                                on_message(chunk.data)
+                        case "eval_resume_state":
+                            if on_eval_resume_state:
+                                on_eval_resume_state(chunk.data)
+        except ConnectionClosed as exc:
+            close_frame = exc.rcvd or exc.sent
+            if close_frame is None:
+                detail = "without a close code"
+            else:
+                reason = f": {close_frame.reason}" if close_frame.reason else ""
+                detail = f"with code {close_frame.code}{reason}"
+            raise BenchmarkServiceError(f"WebSocket closed {detail}") from exc
 
         raise BenchmarkServiceError("Exited websocket without returning final result")
 
@@ -179,7 +312,8 @@ class BenchmarkServiceClient:
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
-                f"Health check failed with status code {response.status_code}, response: {response.text}"
+                f"Health check failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
             )
 
         return HealthCheckResponse.model_validate(response.json())
@@ -194,7 +328,8 @@ class BenchmarkServiceClient:
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
-                f"Version check failed with status code {response.status_code}, response: {response.text}"
+                f"Version check failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
             )
 
         return VersionResponse.model_validate(response.json())
@@ -224,7 +359,8 @@ class BenchmarkServiceClient:
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
-                f"Verify task ids failed with status code {response.status_code}, response: {response.text}"
+                f"Verify task ids failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
             )
 
         return VerifyTaskIdsResponse.model_validate(response.json())
@@ -249,10 +385,89 @@ class BenchmarkServiceClient:
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
-                f"Retrieve task failed with status code {response.status_code}, response: {response.text}"
+                f"Retrieve task failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
             )
 
         return RetrieveTaskResponse.model_validate(response.json())
+
+    async def run_with_sandbox_recovery(
+        self,
+        task_id: str,
+        run_id: str,
+        operation: Callable[[SandboxRecoveryAttempt], Awaitable[_RecoveryResult]],
+        *,
+        dataset: str | None = None,
+        retryable_attempt_errors: tuple[type[Exception], ...] = (),
+        default_max_attempts: int = 1,
+        retry_delay_s: float = 2.0,
+        on_retry: Callable[[SandboxRecoveryAttempt, Exception], Awaitable[None] | None] | None = None,
+    ) -> _RecoveryResult:
+        """Run a task attempt with benchmark-declared sandbox-loss recovery.
+
+        ``SandboxRecoveryAttempt.retrieve_task`` lazily loads and caches the
+        task payload so successful durable evaluation resumes need no task
+        request. ``SandboxNotFoundError`` is retried only when the benchmark
+        explicitly opts in. Callers may
+        additionally name setup errors that require a fresh sandbox. These use
+        ``default_max_attempts`` both as the fallback total cap for benchmarks
+        without a recovery policy and as their consecutive-attempt cap. Every
+        attempt still counts against the benchmark's declared overall cap.
+        Synchronous and asynchronous ``on_retry`` callbacks are both
+        supported and complete before the retry delay begins.
+
+        The final exception is re-raised unchanged when the applicable attempt
+        budget is exhausted.
+        """
+        if not run_id:
+            raise ValueError("run_id must be non-empty")
+        if not task_id:
+            raise ValueError("task_id must be non-empty")
+        if not 1 <= default_max_attempts <= 20:
+            raise ValueError("default_max_attempts must be between 1 and 20")
+        if retry_delay_s < 0:
+            raise ValueError("retry_delay_s must be non-negative")
+        if any(issubclass(error_type, SandboxNotFoundError) for error_type in retryable_attempt_errors):
+            raise ValueError("SandboxNotFoundError is controlled only by SandboxRecoveryPolicy")
+
+        state = _SandboxRecoveryState(
+            run_id=run_id,
+            task_id=task_id,
+            load_task=lambda: self.retrieve_task(task_id=task_id, dataset=dataset),
+            default_max_attempts=default_max_attempts,
+        )
+
+        attempt_number = 1
+        while attempt_number <= state.max_attempts:
+            attempt = state.attempt(attempt_number)
+            try:
+                return await operation(attempt)
+            except SandboxNotFoundError as exc:
+                if state.task is None:
+                    await state.retrieve_task()
+                if not attempt.sandbox_loss_retry_available:
+                    raise
+                state.record_loss(attempt_number)
+                retry_error: Exception = exc
+            except Exception as exc:
+                if (
+                    not isinstance(exc, retryable_attempt_errors)
+                    or attempt_number >= state.max_attempts
+                    or state.consecutive_attempt_errors >= default_max_attempts - 1
+                ):
+                    raise
+                state.record_attempt_error()
+                retry_error = exc
+
+            if on_retry is not None:
+                callback_result = on_retry(attempt, retry_error)
+                if inspect.isawaitable(callback_result):
+                    await callback_result
+            if retry_delay_s:
+                await asyncio.sleep(retry_delay_s)
+            attempt_number += 1
+
+        raise AssertionError("sandbox recovery loop exited without a result")
 
     async def setup_task(
         self,
@@ -314,7 +529,8 @@ class BenchmarkServiceClient:
 
         if resp.status_code != 200:
             raise BenchmarkServiceError(
-                f"Evaluate response failed with status code {resp.status_code}, response: {resp.text}"
+                f"Evaluate response failed with status code {resp.status_code}, response: {resp.text}",
+                status_code=resp.status_code,
             )
 
         return resp.json()
@@ -327,7 +543,7 @@ class BenchmarkServiceClient:
         dataset: str | None = None,
         on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
         sandbox_provider: SandboxProviderConfig | None = None,
-    ) -> dict[str, Any]:
+    ) -> JsonValue:
         """Resume evaluation from state previously streamed by the benchmark service.
 
         ``sandbox_provider`` is sent only with this request; benchmark-owned
@@ -349,7 +565,7 @@ class BenchmarkServiceClient:
         on_message: Callable[[str], None] | None = None,
         dataset: str | None = None,
         on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
-    ) -> dict[str, Any]:
+    ) -> JsonValue:
         """Evaluate a task instance via WebSocket.
 
         Args:
@@ -387,7 +603,8 @@ class BenchmarkServiceClient:
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
-                f"Final score failed with status code {response.status_code}, response: {response.text}"
+                f"Final score failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
             )
 
         return FinalScoreResponse.model_validate(response.json())
@@ -408,7 +625,101 @@ class BenchmarkServiceClient:
 
         if response.status_code != 200:
             raise BenchmarkServiceError(
-                f"List tasks failed with status code {response.status_code}, response: {response.text}"
+                f"List tasks failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
             )
 
         return V1DatasetTasksResponse.model_validate(response.json())
+
+    async def v1_upload_url(
+        self,
+        run_id: str,
+        task_id: str,
+        filename: str,
+        dataset: str | None = None,
+    ) -> V1UploadUrlResponse:
+        """Request an upload URL for one generated task artifact."""
+        request = V1UploadUrlRequest(
+            run_id=run_id,
+            task_id=task_id,
+            dataset=dataset,
+            filename=filename,
+        )
+        response = await self._http_client.post(
+            f"{self._url}/v1/submissions/upload-url",
+            json=request.model_dump(mode="json", exclude_none=True),
+        )
+
+        if response.status_code == 401:
+            raise _unauthenticated_error(response)
+
+        if response.status_code != 200:
+            raise BenchmarkServiceError(
+                f"v1 upload URL request failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
+            )
+
+        return V1UploadUrlResponse.model_validate(response.json())
+
+    async def v1_evaluate(
+        self,
+        run_id: str,
+        task_id: str,
+        payload_data: str,
+        payload_schema: str,
+        payload_type: V1PayloadType,
+        dataset: str | None = None,
+        versions: V1Versions | None = None,
+    ) -> V1EvalResponse:
+        """Evaluate via the lab-facing /v1/evaluate surface (Descope-authenticated).
+
+        payload_data is either inline text or an uploaded artifact key, as
+        selected by payload_type. Transport failures are not retried because
+        grading may already have started.
+        """
+        request = V1EvalRequest(
+            run_id=run_id,
+            task_id=task_id,
+            dataset=dataset,
+            payload=V1Payload(type=payload_type, schema=payload_schema, data=payload_data),
+            versions=versions or V1Versions(),
+        )
+        response = await self._http_client.post(
+            f"{self._url}/v1/evaluate",
+            json=request.model_dump(mode="json", by_alias=True, exclude_none=True),
+        )
+
+        if response.status_code == 401:
+            raise _unauthenticated_error(response)
+
+        if response.status_code != 200:
+            raise BenchmarkServiceError(
+                f"v1 evaluate failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
+            )
+
+        return V1EvalResponse.model_validate(response.json())
+
+    async def v1_score(
+        self,
+        run_id: str,
+        evaluation_results: dict[str, V1ScoreItem | None],
+        dataset: str | None = None,
+    ) -> V1ScoreResponse:
+        """Score via the lab-facing /v1/score surface without retrying a submitted request."""
+        request = V1ScoreRequest(run_id=run_id, dataset=dataset, evaluation_results=evaluation_results)
+        response = await self._http_client.post(
+            f"{self._url}/v1/score",
+            json=request.model_dump(mode="json", exclude_none=True),
+        )
+
+        if response.status_code == 401:
+            raise _unauthenticated_error(response)
+
+        if response.status_code != 200:
+            raise BenchmarkServiceError(
+                f"v1 score failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
+            )
+
+        return V1ScoreResponse.model_validate(response.json())

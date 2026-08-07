@@ -2,6 +2,7 @@
 
 import json
 from collections.abc import Generator
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -33,6 +34,7 @@ def _descope_client(
     *,
     tenant: str,
     tenant_config: dict[str, object],
+    service_cls: type[StubBenchmark] = StubBenchmark,
 ) -> Generator[TestClient, None, None]:
     clear_allowlist_cache()
     clear_auth_cache()
@@ -43,7 +45,7 @@ def _descope_client(
         json.dumps({"tenants": {tenant: tenant_config}}),
     )
     _install_signed_url_stub(monkeypatch)
-    app = BenchmarkServiceApp(StubBenchmark)
+    app = BenchmarkServiceApp(service_cls)
 
     async def _stub_exchange(_project_id: str, _access_key: str) -> dict[str, dict[str, dict[str, str]]]:
         return {"tenants": {tenant: {}}}
@@ -71,6 +73,22 @@ def trial_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None,
     )
 
 
+@pytest.fixture
+def plus_task_descope_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
+    class PlusTaskBenchmark(StubBenchmark):
+        async def load_datasets(self) -> dict[str, dict[str, Any]]:
+            datasets = await super().load_datasets()
+            datasets["default"]["example__C++"] = {"problem": "What is 4+4?", "answer": "8"}
+            return datasets
+
+    yield from _descope_client(
+        monkeypatch,
+        tenant="acme",
+        tenant_config={"datasets": ["default"]},
+        service_cls=PlusTaskBenchmark,
+    )
+
+
 def test_upload_url_returns_namespaced_key_and_signed_url(descope_client: TestClient) -> None:
     resp = descope_client.post(
         "/v1/submissions/upload-url",
@@ -82,6 +100,21 @@ def test_upload_url_returns_namespaced_key_and_signed_url(descope_client: TestCl
     assert body["key"] == "submission-artifacts/acme/default/run-1/task-1/submission.xlsx"
     assert body["url"] == "https://signed.example/submission-artifacts/acme/default/run-1/task-1/submission.xlsx?expires=3600"
     assert body["expires_in"] == submission_artifacts.DEFAULT_UPLOAD_EXPIRY_S
+
+
+def test_upload_url_accepts_a_plus_sign_in_an_existing_task_id(plus_task_descope_client: TestClient) -> None:
+    resp = plus_task_descope_client.post(
+        "/v1/submissions/upload-url",
+        json={
+            "run_id": "run-1",
+            "task_id": "example__C++",
+            "dataset": "default",
+            "filename": "submission.tar.gz",
+        },
+        headers={"x-descope-api-key": "key-acme"},
+    )
+    assert resp.status_code == 200
+    assert resp.json()["key"] == "submission-artifacts/acme/default/run-1/example__C++/submission.tar.gz"
 
 
 def test_upload_url_rejects_unauthorized_dataset(descope_client: TestClient) -> None:

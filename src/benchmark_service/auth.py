@@ -8,20 +8,23 @@ import json
 import logging
 import os
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
+
 import yaml
 from cachetools import TTLCache
 from descope.descope_client import DescopeClient
-from pydantic import BaseModel, Field
-
+from pydantic import BaseModel, ConfigDict, Field
 
 from benchmark_service.allowlist import (
     ALLOWLIST_CACHE_MAX_SIZE,
     DESCOPE_API_KEY_HEADER,
     CatalogAllowlistClient,
+    EvaluationQuotaConfig as EvaluationQuotaConfig,
+    EvaluationQuotaPeriod as EvaluationQuotaPeriod,
     TenantConfig,
 )
 
@@ -33,6 +36,8 @@ class AllowlistConfig(BaseModel):
     slice is delivered to each container as JSON via `DESCOPE_TENANT_ALLOWLIST_JSON`,
     or as a YAML file via `DESCOPE_ALLOWLIST_PATH` for local dev.
     """
+
+    model_config = ConfigDict(extra="forbid")
 
     tenants: dict[str, TenantConfig] = Field(default_factory=dict)
 
@@ -53,6 +58,10 @@ _SERVICE_NAME_ENV = "SERVICE_NAME"
 _allowlist_cache: AllowlistConfig | None = None
 _allowlist_warned: bool = False
 _catalog_client: CatalogAllowlistClient | None = None
+_request_tenant_config: ContextVar[tuple[str, TenantConfig] | None] = ContextVar(
+    "request_tenant_config",
+    default=None,
+)
 
 
 def _catalog_api_url() -> str | None:
@@ -71,6 +80,20 @@ def clear_allowlist_cache() -> None:
     _allowlist_cache = None
     _allowlist_warned = False
     _catalog_client = None
+    clear_request_tenant_config()
+
+
+def clear_request_tenant_config() -> None:
+    """Clear the tenant policy snapshot associated with the current request."""
+    _request_tenant_config.set(None)
+
+
+async def close_catalog_client() -> None:
+    """Close the process-level catalog HTTP client."""
+    global _catalog_client
+    if _catalog_client is not None:
+        await _catalog_client.aclose()
+        _catalog_client = None
 
 
 def _get_catalog_client() -> CatalogAllowlistClient | None:
@@ -97,7 +120,10 @@ async def _fetch_api_tenant_config(access_key: str, tenant: str) -> TenantConfig
     client = _get_catalog_client()
     if client is None:
         return None
-    return await client.get_tenant_config(access_key, tenant)
+    config = await client.get_tenant_config(access_key, tenant)
+    if config is not None:
+        _request_tenant_config.set((tenant, config))
+    return config
 
 
 def load_allowlist() -> AllowlistConfig:
@@ -153,7 +179,7 @@ def load_allowlist() -> AllowlistConfig:
 
     config = AllowlistConfig()
     _allowlist_cache = config
-    if not _allowlist_warned:
+    if get_auth_settings().auth_required and not _allowlist_warned:
         logger.warning(
             "No tenant allowlist configured (set %s or %s). All Descope-authenticated "
             "requests will be rejected when AUTH_REQUIRED=true.",
@@ -166,6 +192,9 @@ def load_allowlist() -> AllowlistConfig:
 
 def get_tenant_config(tenant: str) -> TenantConfig | None:
     """Return the TenantConfig for `tenant`, or None if not allowlisted."""
+    request_config = _request_tenant_config.get()
+    if request_config is not None and request_config[0] == tenant:
+        return request_config[1]
     if _catalog_api_url() is not None:
         client = _get_catalog_client()
         return client.cached_tenant_config(tenant) if client is not None else None

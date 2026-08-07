@@ -14,6 +14,20 @@ def _response(payload: object, status_code: int = 200) -> httpx.Response:
     return httpx.Response(status_code, json=payload)
 
 
+class _ReusableTransport(httpx.AsyncBaseTransport):
+    def __init__(self, responses: list[httpx.Response]) -> None:
+        self.responses = responses
+        self.closed = False
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if self.closed:
+            raise RuntimeError("transport is closed")
+        return self.responses.pop(0)
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
 def _transport(
     responses: list[httpx.Response | Exception],
 ) -> tuple[httpx.MockTransport, list[httpx.Request]]:
@@ -46,6 +60,24 @@ async def test_fetches_and_validates_tenant_policy() -> None:
     assert len(requests) == 1
     assert str(requests[0].url) == "https://catalog.example.test/benchmark-services/example-service"
     assert requests[0].headers["x-descope-api-key"] == "key-acme"
+
+
+@pytest.mark.asyncio
+async def test_reuses_transport_until_client_is_closed() -> None:
+    transport = _ReusableTransport(
+        [
+            _response({}, status_code=404),
+            _response({"name": "example-service", "datasets": ["default"], "trial_mode": False}),
+        ]
+    )
+    client = CatalogAllowlistClient("https://catalog.example.test", "example-service", transport=transport)
+
+    assert await client.get_tenant_config("key-acme", "acme") is None
+    assert await client.get_tenant_config("key-acme", "acme") is not None
+    assert transport.closed is False
+
+    await client.aclose()
+    assert transport.closed is True
 
 
 @pytest.mark.asyncio

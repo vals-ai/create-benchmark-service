@@ -10,6 +10,8 @@ from collections.abc import AsyncGenerator
 from pathlib import Path
 from typing import Any, ClassVar, Self
 
+from fastapi.encoders import jsonable_encoder
+
 from benchmark_service.auth import (
     LEGACY_TENANT_SENTINEL,
     check_benchmark_service_auth,
@@ -19,14 +21,16 @@ from benchmark_service.auth import (
 from benchmark_service.dataset_versioning import DatasetVersionEntry, load_dataset_versions
 from benchmark_service.sandbox import Sandbox
 from benchmark_service.schemas import (
+    EvalMode,
     EvaluateResponseRequest,
     FinalScoreResult,
+    GradingSubmission,
     RetrieveTaskResponse,
     StreamChunk,
     StreamResultChunk,
     TaskFilter,
 )
-from benchmark_service.v1_schemas import V1Task
+from benchmark_service.v1_schemas import V1PayloadType, V1Task
 
 
 class BenchmarkService(ABC):
@@ -42,6 +46,37 @@ class BenchmarkService(ABC):
     # by get_dataset_version(). Version label only — content is not verified.
     dataset_versions_file: ClassVar[Path | None] = None
     dataset_versions: dict[str, DatasetVersionEntry]
+
+    # How /v1/evaluate grades this benchmark. The framework reads this at boot
+    # and per dispatch, so it is class state, not a per-instance value.
+    eval_mode: ClassVar[EvalMode] = EvalMode.TEXT
+    accepted_submission_schemas: ClassVar[dict[V1PayloadType, frozenset[str]]] = {}
+
+    def __init_subclass__(cls, **kwargs: Any) -> None:
+        super().__init_subclass__(**kwargs)
+        if (
+            cls.eval_mode == EvalMode.SANDBOX
+            and cls.prepare_grading_sandbox is BenchmarkService.prepare_grading_sandbox
+        ):
+            raise TypeError(
+                f"{cls.__name__} declares eval_mode = EvalMode.SANDBOX and must implement prepare_grading_sandbox"
+            )
+        if cls.eval_mode == EvalMode.SANDBOX and not cls.accepted_submission_schemas:
+            raise TypeError(
+                f"{cls.__name__} declares eval_mode = EvalMode.SANDBOX and must declare accepted_submission_schemas"
+            )
+        if cls.eval_mode == EvalMode.IN_PROCESS_ARTIFACT:
+            if cls.evaluate_artifact is BenchmarkService.evaluate_artifact:
+                raise TypeError(
+                    f"{cls.__name__} declares eval_mode = EvalMode.IN_PROCESS_ARTIFACT "
+                    "and must implement evaluate_artifact"
+                )
+            artifact_schemas = cls.accepted_submission_schemas.get(V1PayloadType.ARTIFACT)
+            if not artifact_schemas or set(cls.accepted_submission_schemas) != {V1PayloadType.ARTIFACT}:
+                raise TypeError(
+                    f"{cls.__name__} declares eval_mode = EvalMode.IN_PROCESS_ARTIFACT and must declare "
+                    "only non-empty artifact accepted_submission_schemas"
+                )
 
     @classmethod
     async def create(cls) -> Self:
@@ -276,9 +311,27 @@ class BenchmarkService(ABC):
     async def stream_evaluate_response(
         self, request: EvaluateResponseRequest, dataset: str | None = None
     ) -> AsyncGenerator[StreamChunk, None]:
-        """Evaluate without a sandbox and stream the result."""
+        """Evaluate without a sandbox and stream the result.
+
+        evaluate_response may return any JSON-encodable object; the chunk
+        carries its JSON form.
+        """
         result = await self.evaluate_response(request, dataset=dataset)
-        yield StreamResultChunk(type="result", data=result)
+        yield StreamResultChunk(type="result", data=jsonable_encoder(result))
+
+    def evaluate_artifact(
+        self,
+        run_id: str,
+        task_id: str,
+        schema_id: str,
+        artifact: bytes,
+        dataset: str | None = None,
+    ) -> AsyncGenerator[StreamChunk, None]:
+        """Grade framework-admitted artifact bytes for one run in the service process."""
+        raise NotImplementedError(
+            f"{type(self).__name__}.evaluate_artifact must be implemented for "
+            "eval_mode == EvalMode.IN_PROCESS_ARTIFACT"
+        )
 
     @abstractmethod
     def evaluate_instance(
@@ -296,6 +349,9 @@ class BenchmarkService(ABC):
         4. Yield error messages: yield StreamErrorChunk(type="error", data="error message")
         5. Yield final result: yield StreamResultChunk(type="result", data=evaluation_result)
 
+        Generator cleanup must remain cancellation-cooperative. Finalizers must
+        not catch and suppress asyncio.CancelledError indefinitely.
+
         Args:
             task_id: The task identifier
             sandbox: Connected sandbox instance
@@ -305,6 +361,24 @@ class BenchmarkService(ABC):
             StreamChunk - one of StreamMessageChunk, StreamResultChunk, or StreamErrorChunk
         """
         ...
+
+    async def prepare_grading_sandbox(
+        self,
+        sandbox: Sandbox,
+        submission: GradingSubmission,
+        dataset: str | None = None,
+    ) -> None:
+        """Place a typed submission where evaluate_instance expects it.
+
+        Artifact submissions have already been downloaded to
+        submission.sandbox_path. Their artifact_reference is the immutable
+        key, size, and ETag captured during preflight and used for that exact
+        download. Evaluator secrets must come from private deployment config
+        or server-side benchmark code, never task metadata.
+        """
+        raise NotImplementedError(
+            f"{type(self).__name__}.prepare_grading_sandbox must be implemented for eval_mode == EvalMode.SANDBOX"
+        )
 
     @abstractmethod
     async def calculate_final_score(

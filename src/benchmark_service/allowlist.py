@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import logging
 from collections.abc import Callable
+from typing import Literal
 from urllib.parse import quote
 
 import httpx
 from cachetools import TTLCache
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PositiveInt
 
 logger = logging.getLogger(__name__)
 
@@ -18,10 +19,25 @@ ALLOWLIST_CACHE_MAX_SIZE = 1024
 DEFAULT_CATALOG_REQUEST_TIMEOUT_SECONDS = 5.0
 
 
+EvaluationQuotaPeriod = Literal["day", "week", "month", "year"]
+
+
+class EvaluationQuotaConfig(BaseModel):
+    """Per-tenant evaluation request quota."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    limit: PositiveInt
+    period: EvaluationQuotaPeriod
+
+
 class TenantConfig(BaseModel):
     """Per-tenant access rules within a benchmark service."""
 
+    model_config = ConfigDict(extra="forbid")
+
     datasets: list[str] = Field(default_factory=list)
+    evaluation_quota: EvaluationQuotaConfig | None = None
     trial_mode: bool = Field(
         default=False,
         description=(
@@ -38,6 +54,7 @@ class _CatalogAllowlistResponse(BaseModel):
 
     name: str
     datasets: list[str]
+    evaluation_quota: EvaluationQuotaConfig | None = None
     trial_mode: bool
 
 
@@ -60,8 +77,7 @@ class CatalogAllowlistClient:
         if not self.service_name:
             raise ValueError("Catalog service name must not be empty")
 
-        self._timeout = timeout
-        self._transport = transport
+        self._client = httpx.AsyncClient(timeout=timeout, transport=transport)
         if cache_timer is None:
             self._cache = TTLCache[str, TenantConfig](
                 maxsize=ALLOWLIST_CACHE_MAX_SIZE,
@@ -79,6 +95,10 @@ class CatalogAllowlistClient:
         """Return the service-specific catalog endpoint."""
         return f"{self.base_url}/benchmark-services/{quote(self.service_name, safe='')}"
 
+    async def aclose(self) -> None:
+        """Close the underlying HTTP client and transport."""
+        await self._client.aclose()
+
     def clear_cache(self) -> None:
         """Clear successful tenant policies."""
         self._cache.clear()
@@ -94,11 +114,10 @@ class CatalogAllowlistClient:
             return cached
 
         try:
-            async with httpx.AsyncClient(timeout=self._timeout, transport=self._transport) as client:
-                response = await client.get(
-                    self.endpoint,
-                    headers={DESCOPE_API_KEY_HEADER: access_key},
-                )
+            response = await self._client.get(
+                self.endpoint,
+                headers={DESCOPE_API_KEY_HEADER: access_key},
+            )
         except Exception:
             logger.warning("Failed to fetch tenant policy from benchmark catalog API", exc_info=True)
             return None
@@ -117,6 +136,10 @@ class CatalogAllowlistClient:
             logger.warning("Benchmark catalog API returned policy for unexpected service %s", payload.name)
             return None
 
-        config = TenantConfig(datasets=payload.datasets, trial_mode=payload.trial_mode)
+        config = TenantConfig(
+            datasets=payload.datasets,
+            evaluation_quota=payload.evaluation_quota,
+            trial_mode=payload.trial_mode,
+        )
         self._cache[tenant] = config
         return config

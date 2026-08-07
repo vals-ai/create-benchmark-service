@@ -1,4 +1,4 @@
-.PHONY: install dev run format lint clean help
+.PHONY: install dev run format lint test test-provider-integration clean help
 
 PYTHON_VERSION := 3.12
 
@@ -29,7 +29,10 @@ typecheck: ## Type check code with basedpyright
 	uv run basedpyright .
 
 test: ## Run tests
-	uv run pytest
+	uv run pytest --ignore=tests/integration
+
+test-provider-integration:
+	uv run pytest tests/integration
 
 docker-build: ## Build Docker image
 	docker build -t benchmark-service:latest .

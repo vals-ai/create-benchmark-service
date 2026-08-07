@@ -4,7 +4,12 @@ from benchmark_service._version import __version__
 from benchmark_service.allowlist import CatalogAllowlistClient
 from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.base import BenchmarkService
-from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError, BenchmarkServiceUnauthenticatedError
+from benchmark_service.client import (
+    BenchmarkServiceClient,
+    BenchmarkServiceError,
+    BenchmarkServiceUnauthenticatedError,
+    SandboxRecoveryAttempt,
+)
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.sandbox import (
     ComposeSource,
@@ -25,7 +30,16 @@ from benchmark_service.sandbox import (
     SandboxQuery,
     SandboxSource,
     SnapshotSource,
+    TargetedSnapshotSource,
+    VolumeMount,
     sandbox_provider_config_from_mapping,
+)
+from benchmark_service.schemas import (
+    ArtifactGradingSubmission,
+    EvalMode,
+    GradingSubmission,
+    SandboxRecoveryPolicy,
+    TextGradingSubmission,
 )
 
 __all__ = [
@@ -35,9 +49,13 @@ __all__ = [
     "BenchmarkServiceUnauthenticatedError",
     "BenchmarkServiceClient",
     "BenchmarkServiceError",
+    "SandboxRecoveryAttempt",
+    "ArtifactGradingSubmission",
     "ComposeSource",
     "ComposeSandbox",
     "DaytonaProviderConfig",
+    "EvalMode",
+    "GradingSubmission",
     "ExecResult",
     "ImageSource",
     "InflightMiddleware",
@@ -52,8 +70,12 @@ __all__ = [
     "SandboxProvider",
     "SandboxProviderConfig",
     "SandboxQuery",
+    "SandboxRecoveryPolicy",
     "SandboxSource",
     "SnapshotSource",
+    "TargetedSnapshotSource",
+    "TextGradingSubmission",
+    "VolumeMount",
     "sandbox_provider_config_from_mapping",
     "__version__",
 ]

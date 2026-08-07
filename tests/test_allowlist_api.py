@@ -13,6 +13,7 @@ from benchmark_service.allowlist import CatalogAllowlistClient
 from benchmark_service.auth import (
     clear_allowlist_cache,
     clear_auth_cache,
+    clear_request_tenant_config,
     get_tenant_config,
     load_allowlist,
     resolve_descope_tenant,
@@ -78,6 +79,41 @@ async def test_catalog_policy_reaches_auth_and_dataset_authorization(
     assert await service.check_dataset_access("acme", "default") is True
     assert await service.check_dataset_access("acme", "alt") is False
     assert requests[0].headers["x-descope-api-key"] == "key-acme"
+
+
+@pytest.mark.asyncio
+async def test_authenticated_request_keeps_policy_snapshot_after_cache_expiry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = [0.0]
+    transport, _ = _transport(
+        httpx.Response(200, json={"name": "example-service", "datasets": ["default"], "trial_mode": True})
+    )
+    _configure_api(monkeypatch)
+    monkeypatch.setattr(
+        auth_module,
+        "_catalog_client",
+        CatalogAllowlistClient(
+            "https://catalog.example.test",
+            "example-service",
+            transport=transport,
+            cache_timer=lambda: clock[0],
+        ),
+    )
+
+    with patch.object(
+        auth_module,
+        "_exchange_descope_access_key",
+        new=AsyncMock(return_value={"tenants": {"acme": {}}}),
+    ):
+        assert await resolve_descope_tenant({"x-descope-api-key": "key-acme"}) == "acme"
+
+    clock[0] = 301.0
+    config = get_tenant_config("acme")
+    assert config is not None and config.trial_mode is True
+
+    clear_request_tenant_config()
+    assert get_tenant_config("acme") is None
 
 
 @pytest.mark.asyncio

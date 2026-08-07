@@ -97,7 +97,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/health` | Returns `{"status": "ok"}` |
-| `GET` | `/version` | Returns `{"framework_version": "...", "service_name": "...", "service_version": "..."}` |
+| `GET` | `/version` | Returns framework, service, and dataset versions plus the benchmark's `eval_mode` |
 | `GET` | `/verify-task-ids` | Return task IDs filtered by `?task_ids=…` or `?slice=start:stop:step` (optional `?dataset=…`) |
 | `GET` | `/retrieve-task/?task_id=…` | Return task metadata for a given task ID (optional `?dataset=…`) |
 | `POST` | `/evaluate-response/` | Evaluate without a sandbox and return one final response |
@@ -115,6 +115,25 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | `/ws/evaluate-instance` | Evaluate a live sandbox solution; streams progress, errors, and a final result |
 
 Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` config so one hosted service can use different sandbox providers per request. Eval-only retry uses `/ws/evaluate-response` with `{"task_id": "…", "eval_resume_state": {...}, "sandbox_provider": {...}, "dataset": "…"}`. The provider config is optional because many benchmarks resume without a sandbox; include it when the benchmark must create one for evaluation. It is request-only and must not be embedded in persisted `eval_resume_state`.
+
+#### Sandbox providers
+
+`sandbox_provider` is selected per setup/evaluate-instance request and carries the provider credentials. The tracker resolves it from AWS Secrets Manager (`sandbox_provider_secret_name`); the secret's keys are the config fields:
+
+```json
+{"type": "daytona", "api_key": "...", "api_url": "...", "target": "..."}
+{"type": "modal", "MODAL_TOKEN_ID": "...", "MODAL_TOKEN_SECRET": "..."}
+```
+
+Provider compatibility notes:
+
+- `Sandbox.labels` and `Sandbox.created_at` expose provider inventory metadata when available; unsupported metadata is `None`, and creation times are timezone-aware UTC. `SandboxQuery.created_at_lte` is an inclusive creation-time bound. Daytona supports it and always limits listing to the provider's configured target, which may be a Daytona region name or ID. Modal rejects creation-time-bounded listing.
+- Modal supports both `ImageSource` (registry pull) and `SnapshotSource` (a Modal filesystem snapshot created via `Sandbox.snapshot_filesystem()`, restored by image id). `TargetedSnapshotSource` is Daytona-only.
+- Daytona uses `TargetedSnapshotSource(snapshot=..., target=...)` to select a target only when creating that sandbox. Its legacy `docker_image` value is intentionally invalid because that field cannot preserve the target.
+- Modal sandboxes do not expose a disk-size parameter; `Resources.disk` is accepted for schema compatibility but not enforced.
+- GPUs are requested via `Resources.gpu` (count) and `Resources.gpu_type`. Modal requires `gpu_type` (any Modal GPU name, e.g. `H100`, `A100-80GB`, `T4`) and passes `"<type>:<count>"` to the sandbox. Daytona accepts a count with an optional type restricted to its `GpuType` enum (`H100`, `H200`, `RTX-PRO-6000`, `RTX-4090`, `RTX-5090`); GPU requests are rejected for Daytona snapshot sandboxes because snapshot resources are fixed at snapshot creation.
+- Nested Docker (Docker-in-Docker) capability is granted on every sandbox for both providers — Daytona supports it natively and the Modal adapter requests it unconditionally — so benchmarks never configure it. The benchmark service still owns the Docker-capable image, dockerd startup flags, compose workflow, and cleanup.
+- Transient Modal connection errors are retried up to three attempts, matching the Daytona adapter's provider-level retry shape. Non-transient command failures still surface as `SandboxCommandError` with the command exit code.
 
 Benchmark services can send `eval_resume_state` updates to the tracker while evaluation is running. The tracker stores the latest value and sends it back on eval-only retry, so the benchmark service can continue evaluation without recreating the original agent sandbox.
 
@@ -140,7 +159,74 @@ Yield these from your generator methods; the framework serialises and forwards t
 
 ### v1 Eval API (lab-facing)
 
-`/v1/evaluate` and `/v1/score` are the lab-facing surface. They share scoring handlers with the internal `/evaluate-response/` and `/final-score/` endpoints — a benchmark implements `evaluate_response` and `calculate_final_score` once and inherits both surfaces.
+`/v1/evaluate` and `/v1/score` are the lab-facing surface. Text-mode evaluation reuses `evaluate_response`, in-process artifact evaluation passes admitted bytes to `evaluate_artifact`, and sandbox-mode evaluation runs `evaluate_instance`. Scoring reuses `calculate_final_score` for every mode.
+
+### In-process artifact evaluation (`eval_mode = IN_PROCESS_ARTIFACT`)
+
+Benchmarks that grade an uploaded file inside the service process declare
+`eval_mode = EvalMode.IN_PROCESS_ARTIFACT`, declare only the artifact schema
+IDs they accept, and implement
+`evaluate_artifact(task_id, schema_id, artifact, dataset)`. The framework
+validates the authenticated tenant, dataset, task, schema, and upload key,
+captures the artifact's size and ETag, and downloads that admitted version
+before invoking benchmark code. The hook receives bytes and never receives an
+object key, bucket, or tenant credential.
+
+These deployments require `SUBMISSION_ARTIFACT_BUCKET` and `AWS_REGION`.
+Artifact admission and evaluation share the normal grading concurrency and
+duplicate-request limits. Text evaluation and the websocket resume endpoints
+remain unchanged.
+
+### Sandbox-based evaluation (`eval_mode = SANDBOX`)
+
+Benchmarks that must execute the submitted artifact to grade it (run a test
+suite, compile a proof) declare `eval_mode = EvalMode.SANDBOX` on the service
+class, declare the exact payload schemas they accept, and implement
+`prepare_grading_sandbox(sandbox, submission)`. On
+`POST /v1/evaluate` the service then provisions a fresh, network-isolated
+sandbox, materializes the submission, runs `evaluate_instance`, and deletes
+the sandbox. Text benchmarks (`eval_mode == TEXT`, the default) are
+unaffected, and the websocket endpoints (including `/ws/evaluate-response`
+resume) keep their sandbox-less service-owned paths.
+
+Submissions arrive either inline (`payload.type == "text"`) or by reference
+(`payload.type == "artifact"`, where `payload.data` is the object key returned
+by `/v1/submissions/upload-url`). For artifact submissions the endpoint
+reserves grading capacity, then captures an immutable `artifact_reference`
+containing the key, size, and ETag before any sandbox is provisioned. The same
+reference binds the download to that admitted object version, which is placed
+at `submission.sandbox_path` before the hook runs. Admission remains held
+through bounded sandbox cleanup. The hook receives `TextGradingSubmission` or
+`ArtifactGradingSubmission`, including the payload schema and semantic
+`text`/`artifact_reference` field, so it never has to infer the submission type.
+
+Daytona is the default grading provider and reads `DAYTONA_API_KEY`,
+`DAYTONA_API_URL`, and `DAYTONA_TARGET`. Set
+`GRADING_SANDBOX_PROVIDER=modal` to use Modal with `MODAL_TOKEN_ID` and
+`MODAL_TOKEN_SECRET`. Artifact-capable benchmarks also require
+`SUBMISSION_ARTIFACT_BUCKET` and `AWS_REGION`; missing server configuration
+fails at startup. The task's `eval_sandbox` spec can override the grading
+source, image-backed resources, timeout, and network policy. Evaluator secrets
+must stay in private deployment configuration or benchmark-owned server code;
+they are never returned in `RetrieveTaskResponse` or persisted with a
+submission.
+
+Grading sandboxes can use an image or snapshot, not `ComposeSource`. A task
+whose generation environment uses `ComposeSource` must set
+`eval_sandbox.source` to an image or snapshot because the grading service does
+not start Docker and Compose services in a fresh outer sandbox.
+
+Task retrieval, sandbox creation, submission materialization, and the setup
+hook share a 600-second preparation bound. `eval_sandbox.timeout_s` (1800
+seconds by default) starts fresh immediately before `evaluate_instance`, and
+sandbox teardown has its own bound. Benchmark-owned generator cleanup must not
+catch and suppress `asyncio.CancelledError`; Python cannot forcibly stop
+in-process code that ignores cancellation. Each service process caps active grades
+with `GRADING_MAX_CONCURRENCY` (default 4), queued grades with
+`GRADING_MAX_QUEUED` (default equal to concurrency), and admitted work per
+tenant with `GRADING_MAX_ADMITTED_PER_TENANT` (also default equal to
+concurrency). Queue waits longer than `GRADING_QUEUE_TIMEOUT_S` (default 30)
+return 429; duplicate `(tenant, run_id, task_id)` requests return 409.
 
 **`POST /v1/evaluate`** — grade one task. Request:
 
@@ -167,11 +253,13 @@ Response:
 }
 ```
 
-`status` is one of `evaluated`, `did_not_complete`, `generation_error`, `error`. `result` is the benchmark-specific JSON-compatible value your `evaluate_response` returns, passed through. Only `payload.type == "text"` is implemented today; artifact rehydration is a follow-on.
+`status` is one of `evaluated`, `did_not_complete`, `generation_error`, `error`. `result` is the benchmark-specific JSON-compatible value returned by `evaluate_response` in text mode or by the terminal result chunk from `evaluate_instance` in sandbox mode. `payload.type` is `"text"` for inline submissions; `"artifact"` (sandbox-grading benchmarks only) carries the uploaded submission's object key in `data`.
 
 **`POST /v1/score`** — aggregate across a run. Request `{run_id, dataset, evaluation_results: {task_id: {"status": "evaluated", "result": {...}} | {"status": "did_not_complete"} | null}}`. Before calling `calculate_final_score`, the framework converts every non-null item to the same eval-result envelope shape used by the runner and internal `/final-score/` path: `{"task_id": task_id, "status": status, "result": result}` plus `error` when the v1 item carries errors. Multiple v1 errors are collapsed into that single `error` string; callers should leave `errors` empty for successful `evaluated` items. `null` still represents a missing task and is passed through as `null`. Response `{run_id, tasks_evaluated, final_score, metadata}`.
 
-**`POST /v1/submissions/upload-url`** — mint a presigned S3 PUT URL for a submission artifact (e.g. an agent workspace tarball the eval side later rehydrates). Request `{run_id, task_id, dataset?, filename}`; every field must be a plain key segment (`[A-Za-z0-9][A-Za-z0-9._-]{0,127}`) and `task_id` must exist in the dataset. Response `{key, url, expires_in}`: the caller PUTs the artifact bytes to `url`, then reports `key` as the task's generation output. Deployments serving uploads must set `SUBMISSION_ARTIFACT_BUCKET` (the receiving S3 bucket) and `AWS_REGION` (the bucket's region — presigned URLs are signed per region). Without the bucket the endpoint returns 503; a bucket without a region fails at startup. Not available to trial tenants.
+**`POST /v1/submissions/upload-url`** — mint a presigned S3 PUT URL for a submission artifact (e.g. an agent workspace tarball the eval side later rehydrates). Request `{run_id, task_id, dataset?, filename}`; every field must be a plain key segment (`[A-Za-z0-9][A-Za-z0-9._-]{0,127}`) and `task_id` must exist in the dataset. Response `{key, url, expires_in}`: the caller PUTs the artifact bytes to `url`, then reports `key` as the task's generation output. Deployments serving uploads must set `SUBMISSION_ARTIFACT_BUCKET` (the receiving S3 bucket) and `AWS_REGION` (the bucket's region — presigned URLs are signed per region). Without the bucket the endpoint returns 503; a bucket without a region fails at startup. Server-side reads default to a 64 MiB limit; set `SUBMISSION_ARTIFACT_MAX_DOWNLOAD_BYTES` to a smaller positive byte count when the deployment needs a tighter bound. Invalid configured limits fail at startup. Not available to trial tenants.
+
+The service role needs `s3:PutObject` and `s3:GetObject` on `arn:aws:s3:::BUCKET/submission-artifacts/*`, plus `s3:ListBucket` on `arn:aws:s3:::BUCKET` limited to the `submission-artifacts/*` namespace in the deployment policy. The list permission is part of the missing-object contract: [S3 returns 404 for a missing object only when the caller has `s3:ListBucket`](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html#API_HeadObject_Permissions); without it S3 returns 403, which the framework leaves as a permission failure rather than misreporting the object as missing.
 
 **Auth.** `/v1/*` is Descope-only. Callers using the legacy `BENCHMARK_API_KEY` bearer (i.e. those that resolve to the `_legacy` tenant sentinel) get 403. Migrate the deploy to Descope (`AUTH_REQUIRED=true` + `DESCOPE_PROJECT_ID` + allowlist) before opening `/v1/` to external traffic.
 
@@ -192,17 +280,48 @@ Status codes: 403 if the tenant isn't allowed the dataset *or* if the caller use
 
 **Trial mode.** A tenant with `trial_mode: true` in its allowlist entry receives score-only responses on `/v1/evaluate` and `/v1/score`. Benchmarks enabling trial mode must implement `project_trial_result(result)` to return the audited per-task fields trial callers may see and resubmit to `/v1/score`; include any field `calculate_final_score` needs for aggregation. The framework still removes `evaluator_version` and error text from `/v1/evaluate` (the error *count* survives as generic `"error"` entries), and `/v1/score` `metadata` is emptied while `final_score` and `tasks_evaluated` remain. The sanitizer builds fresh response objects from allowlisted fields, so fields added later do not leak to trial callers by default. Unhandled server errors return a generic `{"detail": "Internal server error"}` 500 (no traceback) for every caller, not just trial tenants. Trial tenants may access only `/v1/evaluate`, `/v1/score`, and `GET /v1/datasets/{dataset}/tasks`; other `/v1/*`, internal `/evaluate-response/`, `/final-score/`, and `/ws/*` endpoints are denied (403). For trial tenants, the dataset task list is projected to `id`, `question`, and `timeout` even if the benchmark's normal `V1Task` includes extras.
 
-**Deferred to follow-on plans.** `GET /v1/schema`, `GET /v1/tasks/{task_id}` (single-task lookup), `/ws/v1/evaluate` (streamed judges), artifact payloads, async/`poll_url` response shape, idempotency on `(run_id, task_id)`.
+**Deferred to follow-on plans.** `GET /v1/schema`, `GET /v1/tasks/{task_id}` (single-task lookup), `/ws/v1/evaluate` (streamed judges), async/`poll_url` response shape, idempotency on `(run_id, task_id)`.
+
+### Client-owned sandbox recovery
+
+`BenchmarkServiceClient.run_with_sandbox_recovery(...)` owns the bounded loop for tasks that opt in with `SandboxRecoveryPolicy`. It loads the task once, retries only provider-confirmed `SandboxNotFoundError` losses, and counts every fresh-sandbox attempt against one overall cap. Callers can explicitly include setup errors that also require a fresh sandbox; `default_max_attempts` retains the legacy fallback cap for benchmarks without a recovery policy and bounds consecutive setup attempts when a policy is present.
+
+The operation receives a `SandboxRecoveryAttempt`. Merge its `environment` into the sandbox environment, then call `mark_replacement_ready()` only after benchmark setup has durably recorded the outage. A failed replacement setup therefore carries the same outage ID into the next sandbox, while a later provider loss gets a globally unique ID that cannot collide after a runner restart. `sandbox_loss_retry_available` lets a runner persist its normal terminal task error without duplicating the policy calculation.
+
+```python
+async def run_attempt(attempt):
+    task = await attempt.retrieve_task()
+    async with create_sandbox(
+        source=task.source,
+        env_vars={**base_environment, **attempt.environment},
+    ) as sandbox:
+        await client.setup_task(task_id, sandbox.id)
+        attempt.mark_replacement_ready()
+        return await run_agent(sandbox)
+
+
+result = await client.run_with_sandbox_recovery(
+    task_id,
+    run_id,
+    run_attempt,
+    retryable_attempt_errors=(TransientSandboxSetupError,),
+    default_max_attempts=2,
+)
+```
 
 ### Schemas (`schemas.py`)
 
 Pydantic models used across requests and responses:
 
-- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `Resources`
-- **`SandboxSource`** — `ImageSource(type="image", image=...)` or `SnapshotSource(type="snapshot", snapshot=...)`
-- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; currently `DaytonaProviderConfig(type="daytona", api_key, api_url, target)` or `ModalProviderConfig(type="modal")` (adapter not implemented yet)
-- **`Resources`** — `vcpu`, `memory`, `disk`
-- **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, required `sandbox_provider`, `dataset`
+- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `resources`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
+- **`SandboxRecoveryPolicy`** — explicit opt-in to recreate a lost generation sandbox with the same run identity and volumes; `max_sandbox_attempts` (2–20, inclusive) includes the initial sandbox
+- **`SandboxSource`** — `ImageSource`, `SnapshotSource`, top-level Daytona-only `TargetedSnapshotSource`, or `ComposeSource` with an outer image/snapshot
+- **`EvalSandboxSpec`** — grading overrides whose optional `source` is an image or snapshot, never `ComposeSource`
+- **`GradingSubmission`** — typed `TextGradingSubmission` or `ArtifactGradingSubmission` passed only to the sandbox-grading hook
+- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; currently `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET)` or `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)`
+- **`Resources`** — `vcpu`, `memory`, `disk`, optional `gpu` (count, default 0) and `gpu_type` (requires `gpu >= 1`)
+- **`VolumeMount`** — named persistent volume, absolute `mount_path`, optional `read_only`, `create_if_missing`, and relative `subpath`; `{run_id}` in a subpath resolves from the sandbox's `run-id` or `run_id` label and fails when that label is absent
+- **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, optional `sandbox_provider` with Daytona header fallback, `dataset`
 - **`EvaluateResponseRequest`** — `task_id`, `response` or `eval_resume_state`, optional `sandbox_provider`, `dataset`
 - **`FinalScoreResult`** / **`FinalScoreResponse`** — `score` (float), `metadata`, `tasks_evaluated`
 - **`TaskFilter`** — `task_ids` list or `slice_str`; `parse_slice()` converts `"start:stop:step"` to a Python `slice`
@@ -212,6 +331,8 @@ Pydantic models used across requests and responses:
 **`stream_command(sandbox, command, cwd, ignore_error=False)`**
 
 Runs a shell command inside a sandbox and yields output in real time. Checks the exit code after the command finishes. Use it inside `setup_task` and `evaluate_instance` to run commands and forward output as `StreamMessageChunk`s.
+
+For process-scoped credentials, call `sandbox.command(..., env_vars={...})`. Providers pass these values through their native process environment channel; Compose forwards only variable names in its command line, so values are not shell-interpolated.
 
 ### Authentication
 
@@ -242,6 +363,9 @@ tenants:
   acme-corp:
     datasets:
       - validation
+    evaluation_quota:
+      limit: 2500
+      period: week
   vals-internal:
     datasets:
       - default
@@ -249,7 +373,15 @@ tenants:
       - test
 ```
 
-Malformed configured allowlists raise at app startup when `AUTH_REQUIRED=true`. Unknown tenants receive `401 Unauthorized`. Known tenants requesting a dataset outside their allowlist receive `403 Dataset not allowed`; WebSocket routes close with code `1008`. The tenant ID `"_legacy"` is reserved for compatibility mode and is rejected as a Descope tenant.
+Malformed configured allowlists raise at app startup. Unknown tenants receive `401 Unauthorized`. Known tenants requesting a dataset outside their allowlist receive `403 Dataset not allowed`; WebSocket routes close with code `1008`. The tenant ID `"_legacy"` is reserved for compatibility mode and is rejected as a Descope tenant.
+
+**Evaluation quotas.** Add `evaluation_quota` to a tenant entry to cap that tenant's evaluation requests. Set `period` to `day`, `week`, `month`, or `year`. Periods use UTC calendar boundaries: days start at 00:00, weeks start Monday at 00:00, months start on the first day at 00:00, and years start January 1 at 00:00. Changing a tenant's period selects a separate counter namespace. `POST /v1/evaluate`, `POST /evaluate-response/`, `/ws/evaluate-response`, and `/ws/evaluate-instance` consume the same quota; task setup, task retrieval, and score aggregation do not. Authentication, request parsing, dataset authorization, and payload compatibility checks happen before the request is counted. Duplicate and immediate-capacity checks for admitted grading requests also happen first. Accepted requests then consume quota before waiting for an active grading slot or accessing submission storage. Once counted, a request still consumes quota if evaluation or another later step fails.
+
+Quota-enabled deployments must set a stable, non-empty `SERVICE_NAME` and set `EVALUATION_QUOTA_TABLE_NAME` to a DynamoDB table whose string partition key is `quota_key` and whose TTL attribute is `expires_at`. `SERVICE_NAME` separates each benchmark service's counters when the table is shared and must not change during a quota period. The task role needs `dynamodb:UpdateItem` on the table.
+
+Counter updates are atomic across service processes and are not retried because increments are not idempotent. A write that reaches DynamoDB counts even if its response is lost, so an ambiguous storage failure can return HTTP 503 or WebSocket close code `1011` after consuming one request. This fail-closed behavior prevents one incoming request from consuming multiple units and prevents an unavailable counter from bypassing the limit. Internal AWS errors are logged but not returned to the caller.
+
+After the configured limit is reached, HTTP routes return 429 with `Retry-After` and WebSocket routes close with code `1008`. Missing counter configuration fails service startup instead of silently disabling enforcement.
 
 For local development or legacy custom services, leave `AUTH_REQUIRED` unset or `false`. In that mode, `BENCHMARK_API_KEY` preserves the previous static-key behavior by requiring `Authorization: Bearer <key>`. If `BENCHMARK_API_KEY` is not set, requests are allowed. Legacy auth uses the `"_legacy"` sentinel and bypasses dataset-level allowlist enforcement because no tenant identity is available.
 

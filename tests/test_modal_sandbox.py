@@ -343,28 +343,22 @@ async def test_command_drains_output_after_process_finishes() -> None:
     assert [chunk async for chunk in sandbox.command("run")] == ["first", "late"]
 
 
-async def test_command_bounds_continuous_output_after_process_finishes(
+async def test_command_drains_continuous_output_after_process_finishes(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setattr(modal_module, "_COMMAND_STATUS_POLL_SECONDS", 0.01)
+    monkeypatch.setattr(modal_module, "_COMMAND_STATUS_POLL_SECONDS", 0.05)
     inner = FakeInnerSandbox(process=FakeProcess([], 0))
+    expected_chunks = [f"chunk-{index}" for index in range(20)]
 
     async def continuous_output() -> AsyncGenerator[str, None]:
-        while True:
-            yield "chunk"
-            await asyncio.sleep(0)
+        for chunk in expected_chunks:
+            yield chunk
+            await asyncio.sleep(0.01)
 
     inner._process.stdout = continuous_output()
     sandbox = _sandbox(inner)
 
-    async def consume_command() -> int:
-        count = 0
-        async for _ in sandbox.command("run"):
-            count += 1
-        return count
-
-    count = await asyncio.wait_for(consume_command(), timeout=1)
-    assert count > 0
+    assert [chunk async for chunk in sandbox.command("run")] == expected_chunks
 
 
 @pytest.mark.parametrize(

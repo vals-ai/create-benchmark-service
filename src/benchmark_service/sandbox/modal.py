@@ -240,6 +240,8 @@ class ModalSandbox(Sandbox):
                         break
 
                     yield str(chunk)
+                    if wait_task is None:
+                        drain_deadline = loop.time() + _COMMAND_STATUS_POLL_SECONDS
                     next_chunk_task = asyncio.create_task(anext(output_iterator))
                     continue
 

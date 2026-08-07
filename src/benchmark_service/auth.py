@@ -12,33 +12,18 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
-
-import httpx
 import yaml
 from cachetools import TTLCache
 from descope.descope_client import DescopeClient
-from pydantic import BaseModel, ConfigDict, Field
-
-logger = logging.getLogger(__name__)
-
-DESCOPE_API_KEY_HEADER = "x-descope-api-key"
-DEFAULT_AUTH_CACHE_TTL_SECONDS = 300
-AUTH_CACHE_MAX_SIZE = 1024
-LEGACY_TENANT_SENTINEL = "_legacy"
+from pydantic import BaseModel, Field
 
 
-class TenantConfig(BaseModel):
-    """Per-tenant access rules within a benchmark service."""
-
-    datasets: list[str] = Field(default_factory=list)
-    trial_mode: bool = Field(
-        default=False,
-        description=(
-            "If true, responses on /v1/evaluate and /v1/score are sanitized to "
-            "score-only fields. Set this on prospects' tenants in allowlist.yaml."
-        ),
-    )
+from benchmark_service.allowlist import (
+    ALLOWLIST_CACHE_MAX_SIZE,
+    DESCOPE_API_KEY_HEADER,
+    CatalogAllowlistClient,
+    TenantConfig,
+)
 
 
 class AllowlistConfig(BaseModel):
@@ -52,28 +37,22 @@ class AllowlistConfig(BaseModel):
     tenants: dict[str, TenantConfig] = Field(default_factory=dict)
 
 
+logger = logging.getLogger(__name__)
+
+DEFAULT_AUTH_CACHE_TTL_SECONDS = 300
+AUTH_CACHE_MAX_SIZE = ALLOWLIST_CACHE_MAX_SIZE
+LEGACY_TENANT_SENTINEL = "_legacy"
+
+
 _DESCOPE_ALLOWLIST_JSON_ENV = "DESCOPE_TENANT_ALLOWLIST_JSON"
 _DESCOPE_ALLOWLIST_PATH_ENV = "DESCOPE_ALLOWLIST_PATH"
 _BENCHMARK_CATALOG_API_URL_ENV = "BENCHMARK_CATALOG_API_URL"
 _SERVICE_NAME_ENV = "SERVICE_NAME"
 
 
-class _CatalogAllowlistResponse(BaseModel):
-    """Strict response contract for the service-specific catalog endpoint."""
-
-    model_config = ConfigDict(extra="forbid", strict=True)
-
-    name: str
-    datasets: list[str]
-    trial_mode: bool
-
-
 _allowlist_cache: AllowlistConfig | None = None
 _allowlist_warned: bool = False
-_api_allowlist_cache: TTLCache[tuple[str, str], TenantConfig] = TTLCache(
-    maxsize=AUTH_CACHE_MAX_SIZE,
-    ttl=DEFAULT_AUTH_CACHE_TTL_SECONDS,
-)
+_catalog_client: CatalogAllowlistClient | None = None
 
 
 def _catalog_api_url() -> str | None:
@@ -88,14 +67,15 @@ def _catalog_service_name() -> str | None:
 
 def clear_allowlist_cache() -> None:
     """Reset module-level legacy and catalog allowlist state. Intended for tests."""
-    global _allowlist_cache, _allowlist_warned
+    global _allowlist_cache, _allowlist_warned, _catalog_client
     _allowlist_cache = None
     _allowlist_warned = False
-    _api_allowlist_cache.clear()
+    _catalog_client = None
 
 
-async def _fetch_api_tenant_config(access_key: str, tenant: str) -> TenantConfig | None:
-    """Fetch and cache one tenant's service policy from the catalog API."""
+def _get_catalog_client() -> CatalogAllowlistClient | None:
+    global _catalog_client
+
     api_url = _catalog_api_url()
     service_name = _catalog_service_name()
     if api_url is None or service_name is None:
@@ -107,36 +87,17 @@ async def _fetch_api_tenant_config(access_key: str, tenant: str) -> TenantConfig
         )
         return None
 
-    cache_key = (service_name, tenant)
-    cached = _api_allowlist_cache.get(cache_key)
-    if cached is not None:
-        return cached
+    if _catalog_client is None:
+        _catalog_client = CatalogAllowlistClient(api_url, service_name)
+    return _catalog_client
 
-    endpoint = f"{api_url}/benchmark-services/{quote(service_name, safe='')}"
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            response = await client.get(endpoint, headers={DESCOPE_API_KEY_HEADER: access_key})
-    except Exception:
-        logger.warning("Failed to fetch tenant policy from benchmark catalog API", exc_info=True)
+
+async def _fetch_api_tenant_config(access_key: str, tenant: str) -> TenantConfig | None:
+    """Fetch and cache one tenant's service policy from the catalog API."""
+    client = _get_catalog_client()
+    if client is None:
         return None
-
-    if response.status_code != 200:
-        logger.warning("Benchmark catalog API returned status %s", response.status_code)
-        return None
-
-    try:
-        payload = _CatalogAllowlistResponse.model_validate(response.json())
-    except Exception:
-        logger.warning("Benchmark catalog API returned a malformed tenant policy", exc_info=True)
-        return None
-
-    if payload.name != service_name:
-        logger.warning("Benchmark catalog API returned policy for unexpected service %s", payload.name)
-        return None
-
-    config = TenantConfig(datasets=payload.datasets, trial_mode=payload.trial_mode)
-    _api_allowlist_cache[cache_key] = config
-    return config
+    return await client.get_tenant_config(access_key, tenant)
 
 
 def load_allowlist() -> AllowlistConfig:
@@ -206,10 +167,8 @@ def load_allowlist() -> AllowlistConfig:
 def get_tenant_config(tenant: str) -> TenantConfig | None:
     """Return the TenantConfig for `tenant`, or None if not allowlisted."""
     if _catalog_api_url() is not None:
-        service_name = _catalog_service_name()
-        if service_name is None:
-            return None
-        return _api_allowlist_cache.get((service_name, tenant))
+        client = _get_catalog_client()
+        return client.cached_tenant_config(tenant) if client is not None else None
     return load_allowlist().tenants.get(tenant)
 
 

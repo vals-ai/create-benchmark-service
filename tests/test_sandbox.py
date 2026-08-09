@@ -2124,6 +2124,64 @@ async def test_daytona_target_resolution_preserves_provider_error(monkeypatch: p
     assert regions_client.close_attempts == 1
 
 
+async def test_daytona_list_bounds_each_page_not_the_whole_drain(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A healthy listing must not be killed for having more pages than the bound covers.
+
+    AsyncDaytona.list is cursor-paginated, so bounding the drain caps total pagination time and a
+    retry restarts from page one -- a long-but-progressing listing could then never complete.
+    """
+    provider, daytona, _ = _inventory_provider(
+        monkeypatch,
+        target="configured-target",
+        regions=[SimpleNamespace(id="configured-target", name="configured-target")],
+    )
+    page_delay = 0.1
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", page_delay * 2.5)
+    # Without this, a regression here retries through the real backoff ladder before failing.
+    _skip_retry_sleep(monkeypatch, DaytonaSandboxProvider._list_sandboxes)  # pyright: ignore[reportPrivateUsage]
+
+    def paginated(query: object) -> Any:
+        daytona.listed_query = query
+
+        async def pages() -> Any:
+            for _ in range(5):
+                await asyncio.sleep(page_delay)
+                yield daytona.sandbox
+
+        return pages()
+
+    monkeypatch.setattr(daytona, "list", paginated)
+
+    # Five pages cost 5 * page_delay in total, well past the bound; each page stays inside it.
+    sandboxes = [sandbox async for sandbox in provider.list_sandboxes(SandboxQuery(labels={}))]
+
+    assert len(sandboxes) == 5
+
+
+async def test_daytona_list_still_bounds_a_stalled_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider, daytona, _ = _inventory_provider(
+        monkeypatch,
+        target="configured-target",
+        regions=[SimpleNamespace(id="configured-target", name="configured-target")],
+    )
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", 0.05)
+    _skip_retry_sleep(monkeypatch, DaytonaSandboxProvider._list_sandboxes)  # pyright: ignore[reportPrivateUsage]
+
+    def stalled(query: object) -> Any:
+        daytona.listed_query = query
+
+        async def pages() -> Any:
+            await asyncio.Event().wait()
+            yield daytona.sandbox
+
+        return pages()
+
+    monkeypatch.setattr(daytona, "list", stalled)
+
+    with pytest.raises(SandboxConnectionError, match="daytona.list timed out"):
+        _ = [sandbox async for sandbox in provider.list_sandboxes(SandboxQuery(labels={}))]
+
+
 async def test_daytona_provider_rejects_unavailable_target(monkeypatch: pytest.MonkeyPatch) -> None:
     provider, daytona, regions_client = _inventory_provider(monkeypatch, target="missing-target", regions=[])
 

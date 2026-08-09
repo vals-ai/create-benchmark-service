@@ -146,8 +146,19 @@ async def _bounded(operation: str, awaitable: Awaitable[_T], timeout: float | No
         raise SandboxConnectionError(f"Daytona {operation} timed out after {timeout:g}s") from exc
 
 
-async def _collect_sandboxes(sandboxes: AsyncIterator[AsyncSandbox]) -> list[AsyncSandbox]:
-    return [sandbox async for sandbox in sandboxes]
+async def _collect_sandboxes(sandboxes: AsyncIterator[AsyncSandbox], timeout: float) -> list[AsyncSandbox]:
+    """Drain a paginated listing, bounding each page fetch rather than the whole drain.
+
+    Bounding the drain would cap total pagination time, so a healthy listing with enough pages
+    fails once its cumulative time crosses the bound, and every retry restarts from page one.
+    """
+    collected: list[AsyncSandbox] = []
+    pages = sandboxes.__aiter__()
+    while True:
+        try:
+            collected.append(await _bounded("daytona.list", anext(pages), timeout))
+        except StopAsyncIteration:
+            return collected
 
 
 def _pty_result_summary(result: PtyResult | None) -> str:
@@ -918,11 +929,7 @@ class DaytonaSandboxProvider(SandboxProvider):
                 created_at_before=query.created_at_lte,
                 limit=query.page_size,
             )
-            return await _bounded(
-                "daytona.list",
-                _collect_sandboxes(self._daytona.list(daytona_query)),
-                _TOOLBOX_CALL_TIMEOUT_SECONDS,
-            )
+            return await _collect_sandboxes(self._daytona.list(daytona_query), _TOOLBOX_CALL_TIMEOUT_SECONDS)
         except DaytonaError as exc:
             raise self._sandbox_error(exc) from exc
 

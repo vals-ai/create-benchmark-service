@@ -1031,7 +1031,9 @@ async def test_ws_connection_closed_without_result(method: str, args: list[str])
             await getattr(client, method)(*args)
 
     assert exc_info.value.close_code == 1000
-    assert re.fullmatch(r"WebSocket closed with code 1000 after \d+\.\ds without an application message", str(exc_info.value))
+    assert re.fullmatch(
+        r"WebSocket closed with code 1000 after \d+\.\ds without an application message", str(exc_info.value)
+    )
 
 
 @pytest.mark.parametrize(
@@ -1088,9 +1090,7 @@ async def test_ws_close_silence_is_measured_from_last_application_message() -> N
     """
     messages = [json.dumps({"type": "message", "data": "still grading"})]
     close_frame = Close(1011, "keepalive ping timeout")
-    mock_connect = _ws_mock(
-        messages, ConnectionClosedError(close_frame, None), delay_s=0.3
-    )
+    mock_connect = _ws_mock(messages, ConnectionClosedError(close_frame, None), delay_s=0.3)
     client = _make_client()
 
     with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
@@ -1115,14 +1115,11 @@ async def test_ws_preconnection_failure_propagates_as_transport_error() -> None:
     client = _make_client()
 
     with patch("benchmark_service.client.websockets.connect", side_effect=socket.gaierror("Name or service not known")):
-        with pytest.raises(socket.gaierror):
-            await client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG)
-
-        # Verify it's not wrapped in a BenchmarkServiceError
         with pytest.raises(socket.gaierror) as exc_info:
             await client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG)
 
-        assert not isinstance(exc_info.value, BenchmarkServiceError)
+    # Not wrapped in BenchmarkServiceError/BenchmarkServiceStreamClosedError.
+    assert not isinstance(exc_info.value, BenchmarkServiceError)
 
 
 async def test_stream_closed_error_is_exported_from_package_root() -> None:

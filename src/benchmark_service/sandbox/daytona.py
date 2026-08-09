@@ -119,19 +119,13 @@ _FIXED_PROVIDER_WAIT = wait_chain(
 )
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
 
-# Hard ceiling for a single Daytona toolbox or control-plane HTTP round trip. The SDK forwards
-# timeout=None to aiohttp, which reads an explicit None as "no timeout at all", so a stalled
-# connection hangs the await forever: no exception ever reaches _PROVIDER_RETRY and the task sits
-# IN_PROGRESS for hours. Bounding each call turns that silent hang into a retryable error.
-# 120s is far above any healthy round trip yet keeps a worst-case pass through the full
-# _PROVIDER_RETRY_DELAYS_SECONDS ladder under half an hour, instead of hanging indefinitely.
+# Far above a healthy round trip, but low enough that a worst-case pass through the full
+# _PROVIDER_RETRY_DELAYS_SECONDS ladder stays under half an hour.
 _TOOLBOX_CALL_TIMEOUT_SECONDS = 120.0
 
-# Ceiling for waiting on a sandbox to reach the started state. The SDK reads
-# wait_for_sandbox_start(timeout=0) as "wait forever", so a sandbox wedged short of STARTED would
-# stall reuse and deletion; provisioning is far slower than a toolbox call, hence its own bound.
-# 600s matches the largest create budget in this service (grading's _GRADING_CREATE_TIMEOUT_S), so
-# a start that a concurrent create is still legitimately waiting on is never aborted early.
+# The SDK reads wait_for_sandbox_start(timeout=0) as "wait forever". 600s matches the largest
+# create budget in this service (grading's _GRADING_CREATE_TIMEOUT_S), so a start that a concurrent
+# create is still legitimately waiting on is never aborted early.
 _SANDBOX_START_TIMEOUT_SECONDS = 600.0
 
 _T = TypeVar("_T")
@@ -418,9 +412,9 @@ class DaytonaSandbox(Sandbox):
         cwd: str | None = None,
         timeout: float | None = None,
     ) -> ExecResult:
-        # An explicit deadline is enforced inside the sandbox by _command, so the transport gets
-        # that budget plus a margin. An untimed command stays transport-unbounded: process.exec
-        # holds the request open for the whole command, so a ceiling would abort long installs.
+        # _command enforces an explicit deadline in-sandbox, so the transport gets that budget plus
+        # a margin. Untimed stays unbounded: process.exec holds the request open for the whole
+        # command, so a ceiling would abort long installs.
         transport_timeout = None if timeout is None else timeout + _TOOLBOX_CALL_TIMEOUT_SECONDS
         return await self._run_exec(_command(command, cwd, timeout), transport_timeout)
 

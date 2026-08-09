@@ -397,13 +397,17 @@ class StalledSendProcess(BlockingProcess):
 
 
 class StalledDisconnectPtyHandle(PtyHandle):
+    disconnect_started = False
+
     async def disconnect(self) -> None:
+        self.disconnect_started = True
         await asyncio.Event().wait()
 
 
 class StalledDisconnectProcess(Process):
     def __init__(self) -> None:
         super().__init__()
+        self.handle: StalledDisconnectPtyHandle | None = None
         self.killed_session_id: str | None = None
 
     async def create_pty_session(
@@ -412,9 +416,9 @@ class StalledDisconnectProcess(Process):
         id: str,
         on_data: Callable[[bytes], None | Awaitable[None]],
         envs: dict[str, str],
-    ) -> PtyHandle:
-        self.pty_handle = StalledDisconnectPtyHandle(on_data)
-        return self.pty_handle
+    ) -> StalledDisconnectPtyHandle:
+        self.handle = StalledDisconnectPtyHandle(on_data)
+        return self.handle
 
     async def kill_pty_session(self, session_id: str) -> None:
         self.killed_session_id = session_id
@@ -1534,6 +1538,8 @@ async def test_daytona_command_continues_cleanup_when_disconnect_stalls(monkeypa
         output = [chunk async for chunk in sandbox.command("printf hello")]
 
     assert output == ["hello"]
+    assert process.handle is not None
+    assert process.handle.disconnect_started is True
     assert process.killed_session_id is not None
 
 

@@ -24,5 +24,7 @@ RUN uv sync
 # Expose port
 EXPOSE 8001
 
-# Run the application
+# Run the application. The --ws-ping-* values are the server half of the keepalive
+# contract mirrored by BenchmarkServiceClient (_WS_PING_* in client.py): ping every
+# 30s, close 1011 ("keepalive ping timeout") when a pong takes longer than 10s.
 CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001", "--ws-ping-interval", "30", "--ws-ping-timeout", "10"]

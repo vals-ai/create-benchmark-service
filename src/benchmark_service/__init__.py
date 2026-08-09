@@ -6,6 +6,7 @@ from benchmark_service.base import BenchmarkService
 from benchmark_service.client import (
     BenchmarkServiceClient,
     BenchmarkServiceError,
+    BenchmarkServiceStreamClosedError,
     BenchmarkServiceUnauthenticatedError,
     SandboxRecoveryAttempt,
 )
@@ -44,9 +45,10 @@ from benchmark_service.schemas import (
 __all__ = [
     "BenchmarkServiceApp",
     "BenchmarkService",
-    "BenchmarkServiceUnauthenticatedError",
     "BenchmarkServiceClient",
     "BenchmarkServiceError",
+    "BenchmarkServiceStreamClosedError",
+    "BenchmarkServiceUnauthenticatedError",
     "SandboxRecoveryAttempt",
     "ArtifactGradingSubmission",
     "ComposeSource",

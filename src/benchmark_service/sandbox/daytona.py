@@ -9,6 +9,7 @@ import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, TypeVar
 
@@ -43,12 +44,13 @@ from daytona.common.errors import (
     DaytonaTimeoutError,
     create_daytona_error,
 )
-from daytona.common.pty import PtyResult
+from daytona.common.pty import PtyResult, PtySize
 from daytona.handle.async_pty_handle import AsyncPtyHandle
 from daytona_api_client_async import ApiClient as DaytonaApiClient
 from daytona_api_client_async import Configuration as DaytonaApiConfiguration
 from daytona_api_client_async import OrganizationsApi
 from daytona_api_client_async.exceptions import NotFoundException, OpenApiException
+from daytona_toolbox_api_client_async.models.pty_session_info import PtySessionInfo
 from pydantic import BaseModel
 from tenacity import (
     RetryCallState,
@@ -91,6 +93,10 @@ _SOURCE_NAMES: Mapping[str | None, str] = {
 _PTY_STATUS_CHECK_ATTEMPTS = 30
 _PTY_STATUS_POLL_SECONDS = 5
 _PTY_STDOUT_TAIL_MAX_BYTES = 64 * 1024
+_PTY_CREATE_MARKER_ENV = "_CBS_PTY_CREATE_MARKER"
+_PTY_ROWS = 24
+_PTY_COLS = 80
+_AMBIGUOUS_PTY_CREATE_STATUSES = (408, 500, 502, 503, 504)
 _STATUS_DIR = "/tmp/.sandbox-provider"
 _REMOVED_SANDBOX_STATES = (SandboxState.DESTROYING, SandboxState.DESTROYED)
 _FAILED_SANDBOX_STATES = (SandboxState.ERROR, SandboxState.BUILD_FAILED)
@@ -126,9 +132,7 @@ _TRANSPORT_ERROR_MESSAGES = (
 )
 _RETRYABLE_DAYTONA_CAUSES = (ClientConnectionError, ClientPayloadError, ConnectionError, TimeoutError)
 _PROVIDER_RETRY_DELAYS_SECONDS = (5, 25, 90, 300, 420)
-_FIXED_PROVIDER_WAIT = wait_chain(
-    *(wait_random(delay * 0.9, delay) for delay in _PROVIDER_RETRY_DELAYS_SECONDS)
-)
+_FIXED_PROVIDER_WAIT = wait_chain(*(wait_random(delay * 0.9, delay) for delay in _PROVIDER_RETRY_DELAYS_SECONDS))
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
 
 # Far above a healthy round trip, but low enough that a worst-case pass through the full
@@ -171,6 +175,13 @@ async def _collect_sandboxes(sandboxes: AsyncIterator[AsyncSandbox], timeout: fl
             collected.append(await _bounded("daytona.list", anext(pages), timeout))
         except StopAsyncIteration:
             return collected
+
+
+@dataclass
+class _PtyCreateState:
+    marker: str
+    saw_ambiguous_create: bool = False
+    owns_session: bool = False
 
 
 def _pty_result_summary(result: PtyResult | None) -> str:
@@ -332,7 +343,20 @@ def _is_transient_daytona_error(exc: DaytonaError | ClientResponseError) -> bool
 
 
 def _is_name_conflict_error(exc: DaytonaError) -> bool:
-    return isinstance(exc, DaytonaConflictError) or exc.status_code == 409 or _message_contains(exc, ("already exists",))
+    return (
+        isinstance(exc, DaytonaConflictError) or exc.status_code == 409 or _message_contains(exc, ("already exists",))
+    )
+
+
+def _is_ambiguous_pty_create_error(exc: DaytonaError | ClientResponseError) -> bool:
+    status_code = _provider_status_code(exc)
+    if isinstance(exc, DaytonaRateLimitError) or status_code == 429:
+        return False
+    if isinstance(exc, (DaytonaConnectionError, DaytonaTimeoutError)):
+        return True
+    if status_code in _AMBIGUOUS_PTY_CREATE_STATUSES:
+        return True
+    return _has_retryable_cause(exc)
 
 
 def _parse_retry_after_seconds(value: object) -> float | None:
@@ -601,7 +625,13 @@ class DaytonaSandbox(Sandbox):
         stdout_bytes = 0
         handle: AsyncPtyHandle | None = None
         wait_task: asyncio.Task[PtyResult] | None = None
-        owns_session = False
+        create_state = _PtyCreateState(marker=uuid.uuid4().hex)
+        pty_envs = {
+            "TERM": "dumb",
+            "LANG": "C.UTF-8",
+            **env_vars,
+            _PTY_CREATE_MARKER_ENV: create_state.marker,
+        }
 
         async def on_data(data: bytes) -> None:
             nonlocal stdout_bytes
@@ -613,9 +643,32 @@ class DaytonaSandbox(Sandbox):
             output.put_nowait(text)
 
         try:
-            handle = await self._create_pty_session(session_id, on_data, env_vars)
-            owns_session = True
-            await _bounded("handle.send_input", handle.send_input("stty -echo\n"), _TOOLBOX_CALL_TIMEOUT_SECONDS)
+            handle = await self._create_pty_session(session_id, on_data, pty_envs, create_state)
+            if handle is None:
+                session_info = await self._get_pty_create_session_info(session_id)
+                expected_environment_matches = all(
+                    session_info.envs.get(key) == value for key, value in pty_envs.items()
+                )
+                if (
+                    session_info.id != session_id
+                    or session_info.rows != _PTY_ROWS
+                    or session_info.cols != _PTY_COLS
+                    or not expected_environment_matches
+                ):
+                    raise SandboxError(
+                        f"Daytona PTY create reconciliation did not match the attempted session for "
+                        f"{self._sandbox_ref}: session_id={session_id}"
+                    )
+                create_state.owns_session = True
+                handle = await self._connect_created_pty(session_id, on_data)
+            else:
+                create_state.owns_session = True
+
+            await _bounded(
+                "handle.send_input",
+                handle.send_input(f"stty -echo; unset {_PTY_CREATE_MARKER_ENV}\n"),
+                _TOOLBOX_CALL_TIMEOUT_SECONDS,
+            )
             await _bounded(
                 "handle.send_input",
                 handle.send_input(
@@ -671,7 +724,7 @@ class DaytonaSandbox(Sandbox):
             if handle:
                 with suppress(Exception):
                     await _bounded("handle.disconnect", handle.disconnect(), _TOOLBOX_CALL_TIMEOUT_SECONDS)
-            if owns_session:
+            if create_state.owns_session:
                 with suppress(Exception):
                     await _bounded(
                         "process.kill_pty_session",
@@ -686,22 +739,58 @@ class DaytonaSandbox(Sandbox):
         self,
         session_id: str,
         on_data: Callable[[bytes], Awaitable[None]],
-        env_vars: dict[str, str],
-    ) -> AsyncPtyHandle:
+        envs: dict[str, str],
+        state: _PtyCreateState,
+    ) -> AsyncPtyHandle | None:
         try:
             return await _bounded(
                 "process.create_pty_session",
                 self._sandbox.process.create_pty_session(
                     id=session_id,
                     on_data=on_data,
-                    envs={"TERM": "dumb", "LANG": "C.UTF-8", **env_vars},
+                    envs=envs,
+                    pty_size=PtySize(rows=_PTY_ROWS, cols=_PTY_COLS),
                 ),
                 _TOOLBOX_CALL_TIMEOUT_SECONDS,
             )
         except DaytonaConflictError as exc:
+            if state.saw_ambiguous_create:
+                return None
             raise self._sandbox_error(exc) from exc
         except _SANDBOX_OPERATION_ERRORS as exc:
+            if _is_ambiguous_pty_create_error(exc):
+                state.saw_ambiguous_create = True
             await self._check_sandbox_alive()
+            raise self._sandbox_error(exc) from exc
+
+    @_PROVIDER_RETRY
+    async def _get_pty_create_session_info(self, session_id: str) -> PtySessionInfo:
+        try:
+            return await self._sandbox.process.get_pty_session_info(session_id)
+        except _SANDBOX_OPERATION_ERRORS as exc:
+            await self._check_sandbox_alive()
+            if isinstance(exc, DaytonaNotFoundError) or _provider_status_code(exc) == 404:
+                raise SandboxError(
+                    f"Daytona PTY session disappeared during create reconciliation for {self._sandbox_ref}: "
+                    f"session_id={session_id}"
+                ) from exc
+            raise self._sandbox_error(exc) from exc
+
+    @_PROVIDER_RETRY
+    async def _connect_created_pty(
+        self,
+        session_id: str,
+        on_data: Callable[[bytes], Awaitable[None]],
+    ) -> AsyncPtyHandle:
+        try:
+            return await self._sandbox.process.connect_pty_session(session_id, on_data)
+        except _SANDBOX_OPERATION_ERRORS as exc:
+            await self._check_sandbox_alive()
+            if isinstance(exc, DaytonaNotFoundError) or _provider_status_code(exc) == 404:
+                raise SandboxError(
+                    f"Daytona PTY session disappeared before create reconciliation connected for "
+                    f"{self._sandbox_ref}: session_id={session_id}"
+                ) from exc
             raise self._sandbox_error(exc) from exc
 
     @_PROVIDER_RETRY
@@ -849,7 +938,9 @@ class DaytonaSandboxProvider(SandboxProvider):
             gpu_type=_daytona_gpu_type(request.resources.gpu_type),
         )
 
-        volume_mounts = await self._resolve_volumes(daytona, request.volumes, request.labels) if request.volumes else None
+        volume_mounts = (
+            await self._resolve_volumes(daytona, request.volumes, request.labels) if request.volumes else None
+        )
 
         match request.source:
             case ImageSource(image=image):
@@ -867,7 +958,9 @@ class DaytonaSandboxProvider(SandboxProvider):
                 )
             case SnapshotSource(snapshot=snapshot) | TargetedSnapshotSource(snapshot=snapshot):
                 if request.resources.gpu:
-                    raise SandboxError("Daytona snapshot sandboxes use the snapshot's resources; GPUs cannot be requested")
+                    raise SandboxError(
+                        "Daytona snapshot sandboxes use the snapshot's resources; GPUs cannot be requested"
+                    )
                 params = CreateSandboxFromSnapshotParams(
                     auto_stop_interval=request.auto_stop_interval,
                     auto_delete_interval=0,

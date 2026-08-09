@@ -59,12 +59,14 @@ _OUTAGE_STARTED_ENV = "VALKYRIE_SANDBOX_OUTAGE_STARTED_EPOCH"
 # uvicorn --ws-ping-interval 30 --ws-ping-timeout 10.
 _SERVER_PING_INTERVAL_S = 30
 _SERVER_PING_TIMEOUT_S = 10
-# Client half: same cadence, but a full server cycle per pong, keeping the client the more lenient
-# side, so the only live peers this can close are ones whose event loop stalls past 40s while TCP
-# stays up. websockets pings again only after a pong lands, so a timeout above the interval simply
-# stretches the period.
+# The client pings on the server's cadence but never times a pong out. A blocked server event loop
+# cannot run its own keepalive, so any client pong deadline makes the client the sole and strictest
+# actor: measured end-to-end, a 40s deadline turned a 180s loop stall that previously returned a
+# correct result into a hard failure, discarding work the server went on to finish. Detecting a
+# genuinely dead peer needs a deadline, but it is only safe once evaluation can resume from a
+# checkpoint after the close, so it belongs with the reconnect work rather than here.
 _WS_PING_INTERVAL_S = _SERVER_PING_INTERVAL_S
-_WS_PING_TIMEOUT_S = _SERVER_PING_INTERVAL_S + _SERVER_PING_TIMEOUT_S
+_WS_PING_TIMEOUT_S = None
 
 _retry_http = retry(
     retry=retry_if_exception_type(

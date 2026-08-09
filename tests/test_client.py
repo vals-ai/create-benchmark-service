@@ -1,8 +1,8 @@
 """Tests for BenchmarkServiceClient."""
 
-import asyncio
 import json
 import socket
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
@@ -14,7 +14,13 @@ from websockets.exceptions import ConnectionClosedError
 from websockets.frames import Close
 
 from benchmark_service import BenchmarkServiceStreamClosedError, SandboxNotFoundError, SandboxRecoveryPolicy
-from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError, SandboxRecoveryAttempt
+from benchmark_service.client import (
+    _SERVER_PING_INTERVAL_S,  # pyright: ignore[reportPrivateUsage]
+    _SERVER_PING_TIMEOUT_S,  # pyright: ignore[reportPrivateUsage]
+    BenchmarkServiceClient,
+    BenchmarkServiceError,
+    SandboxRecoveryAttempt,
+)
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
 from benchmark_service.schemas import RetrieveTaskResponse
@@ -847,10 +853,9 @@ async def test_verify_task_ids_no_dataset_omitted(
 class _AsyncIterator:
     """Async iterator over a list of strings."""
 
-    def __init__(self, items: list[str], terminal_error: Exception | None = None, delay_s: float = 0.0) -> None:
+    def __init__(self, items: list[str], terminal_error: Exception | None = None) -> None:
         self._items = iter(items)
         self._terminal_error = terminal_error
-        self._delay_s = delay_s
         # Post-close attributes the client reads when the stream ends without a terminal chunk.
         self.close_code = 1000
         self.close_reason = ""
@@ -860,9 +865,7 @@ class _AsyncIterator:
 
     async def __anext__(self) -> str:
         try:
-            item = next(self._items)
-            await asyncio.sleep(self._delay_s)
-            return item
+            return next(self._items)
         except StopIteration:
             if self._terminal_error is not None:
                 error = self._terminal_error
@@ -871,9 +874,9 @@ class _AsyncIterator:
             raise StopAsyncIteration
 
 
-def _ws_mock(messages: list[str], terminal_error: Exception | None = None, delay_s: float = 0.0) -> AsyncMock:
+def _ws_mock(messages: list[str], terminal_error: Exception | None = None) -> AsyncMock:
     """Create a mock websockets.connect context manager yielding messages."""
-    ws = _AsyncIterator(messages, terminal_error, delay_s=delay_s)
+    ws = _AsyncIterator(messages, terminal_error)
     ws.send = AsyncMock()  # type: ignore[attr-defined]
 
     mock_connect = AsyncMock()
@@ -1024,7 +1027,7 @@ async def test_ws_connection_closed_without_result(method: str, args: list[str])
         (1011, "Evaluation quota enforcement is temporarily unavailable; try again later."),
     ],
 )
-async def test_ws_quota_close_is_reported_as_benchmark_service_error(
+async def test_ws_quota_close_is_reported_as_stream_closed_error(
     code: int,
     reason: str,
 ) -> None:
@@ -1070,25 +1073,42 @@ async def test_ws_connect_uses_the_server_keepalive_contract() -> None:
     assert connect.call_args.kwargs["ping_timeout"] == 40
 
 
+def test_dockerfile_template_matches_the_client_keepalive_constants() -> None:
+    """The uvicorn --ws-ping-* flags and the client's _SERVER_PING_* constants must not drift.
+
+    test_ws_connect_uses_the_server_keepalive_contract pins the client half to 30/40, so
+    whichever side of the contract is edited alone, one of the two tests fails.
+    """
+    dockerfile = Path(__file__).resolve().parents[1] / "templates" / "Dockerfile"
+    cmd_line = next(line for line in dockerfile.read_text().splitlines() if line.startswith("CMD "))
+    cmd: list[str] = json.loads(cmd_line.removeprefix("CMD "))
+
+    assert cmd[cmd.index("--ws-ping-interval") + 1] == str(_SERVER_PING_INTERVAL_S)
+    assert cmd[cmd.index("--ws-ping-timeout") + 1] == str(_SERVER_PING_TIMEOUT_S)
+
+
 async def test_ws_close_silence_is_measured_from_last_application_message() -> None:
     """idle_s counts from the last application message, not from connection establishment."""
     close_frame = Close(1011, "keepalive ping timeout")
     mock_connect = _ws_mock(
         [json.dumps({"type": "message", "data": "still grading"})],
         ConnectionClosedError(close_frame, None),
-        delay_s=0.2,
     )
     client = _make_client()
+    # The client stamps time.monotonic() three times on this path: connection establishment,
+    # the application message, and the close.
+    fake_time = MagicMock()
+    fake_time.monotonic.side_effect = [100.0, 250.0, 251.5]
 
     with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
-        with pytest.raises(BenchmarkServiceStreamClosedError) as exc_info:
-            await client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG)
+        with patch("benchmark_service.client.time", fake_time):
+            with pytest.raises(BenchmarkServiceStreamClosedError) as exc_info:
+                await client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG)
 
     assert exc_info.value.close_code == 1011
     assert exc_info.value.close_reason == "keepalive ping timeout"
-    # The message arrives 0.2s in and the close follows immediately, so timing the silence
-    # from connection establishment instead would report at least 0.2s.
-    assert exc_info.value.idle_s < 0.2
+    # 251.5 - 250.0, from the message; measured from connection establishment it would be 151.5.
+    assert exc_info.value.idle_s == 1.5
 
 
 async def test_ws_preconnection_failure_propagates_as_transport_error() -> None:

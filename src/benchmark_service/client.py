@@ -57,10 +57,17 @@ _OUTAGE_STARTED_ENV = "VALKYRIE_SANDBOX_OUTAGE_STARTED_EPOCH"
 
 # Server half of the keepalive contract, set in templates/Dockerfile:
 # uvicorn --ws-ping-interval 30 --ws-ping-timeout 10.
+# tests/test_client.py fails if the Dockerfile flags and these constants drift apart.
 _SERVER_PING_INTERVAL_S = 30
 _SERVER_PING_TIMEOUT_S = 10
-# The client pings on the server's cadence but waits one full server keepalive cycle before
-# giving up on a pong, so it never drops a socket the server itself would have tolerated.
+# Client half: ping on the same cadence, but wait one full server keepalive cycle
+# (interval + timeout) for each pong before declaring the peer dead. ping_timeout=None
+# used to leave a dead or unreachable peer undetected here forever. The 40s budget keeps
+# the client the more lenient side of the contract (the server allows its peer only 10s
+# per pong), so the only *live* connections this deadline can close are peers whose event
+# loop stalls for over 40s while TCP stays up. websockets sends the next ping only after
+# the previous pong arrives, so a timeout larger than the interval is well-defined: the
+# ping period just stretches.
 _WS_PING_INTERVAL_S = _SERVER_PING_INTERVAL_S
 _WS_PING_TIMEOUT_S = _SERVER_PING_INTERVAL_S + _SERVER_PING_TIMEOUT_S
 
@@ -103,8 +110,10 @@ class BenchmarkServiceUnauthenticatedError(BenchmarkServiceError):
 class BenchmarkServiceStreamClosedError(BenchmarkServiceError):
     """Exception raised when an established evaluation WebSocket closes without a terminal chunk.
 
-    ``idle_s`` is the silence since the last application message, not since the last ping, so a
-    server keepalive close reads as "code 1011: keepalive ping timeout after 783.0s".
+    ``idle_s`` is the seconds of silence since the last application message (or since connection
+    establishment, if none arrived), not since the last ping, so a server keepalive close reads as
+    "WebSocket closed with code 1011: keepalive ping timeout after 783.0s without an application
+    message".
     """
 
     close_code: int | None

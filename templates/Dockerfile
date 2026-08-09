@@ -24,7 +24,6 @@ RUN uv sync
 # Expose port
 EXPOSE 8001
 
-# Run the application. The --ws-ping-* values are the server half of the keepalive
-# contract; BenchmarkServiceClient derives its own from them (_WS_PING_* in client.py),
-# and tests/test_client.py fails if these flags and the client constants drift apart.
+# Run the application. The --ws-ping-* flags are the server half of the client keepalive
+# contract (_SERVER_PING_* in client.py); tests/test_client.py fails if they drift apart.
 CMD ["uv", "run", "uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8001", "--ws-ping-interval", "30", "--ws-ping-timeout", "10"]

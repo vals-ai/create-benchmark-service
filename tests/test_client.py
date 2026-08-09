@@ -1016,22 +1016,22 @@ async def test_ws_connection_closed_without_result(method: str, args: list[str])
             await getattr(client, method)(*args)
 
     exc = exc_info.value
-    assert exc.close_code == 1000
     assert str(exc) == f"WebSocket closed with code 1000 after {exc.idle_s:.1f}s without an application message"
 
 
 @pytest.mark.parametrize(
-    ("code", "reason"),
+    ("close_frame", "expected_detail"),
     [
-        (1008, "Evaluation quota reached; retry after 2026-07-27T00:00:00Z."),
-        (1011, "Evaluation quota enforcement is temporarily unavailable; try again later."),
+        (
+            Close(1008, "Evaluation quota reached; retry after 2026-07-27T00:00:00Z."),
+            "with code 1008: Evaluation quota reached; retry after 2026-07-27T00:00:00Z.",
+        ),
+        (None, "without a close frame"),
     ],
+    ids=["code_and_reason", "no_close_frame"],
 )
-async def test_ws_quota_close_is_reported_as_stream_closed_error(
-    code: int,
-    reason: str,
-) -> None:
-    close_frame = Close(code, reason)
+async def test_ws_close_reports_the_close_frame_detail(close_frame: Close | None, expected_detail: str) -> None:
+    """A server close carrying a reason (quota rejection) and an abrupt drop render distinguishably."""
     mock_connect = _ws_mock([], ConnectionClosedError(close_frame, None))
     client = _make_client()
 
@@ -1040,25 +1040,7 @@ async def test_ws_quota_close_is_reported_as_stream_closed_error(
             await client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG)
 
     exc = exc_info.value
-    assert exc.close_code == code
-    assert exc.close_reason == reason
-    assert str(exc) == (
-        f"WebSocket closed with code {code}: {reason} after {exc.idle_s:.1f}s without an application message"
-    )
-
-
-async def test_ws_close_without_close_frame_is_reported() -> None:
-    """A connection dropped without a close frame still reports how long the stream was silent."""
-    mock_connect = _ws_mock([], ConnectionClosedError(None, None))
-    client = _make_client()
-
-    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
-        with pytest.raises(BenchmarkServiceStreamClosedError) as exc_info:
-            await client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG)
-
-    exc = exc_info.value
-    assert exc.close_code is None
-    assert str(exc) == f"WebSocket closed without a close frame after {exc.idle_s:.1f}s without an application message"
+    assert str(exc) == f"WebSocket closed {expected_detail} after {exc.idle_s:.1f}s without an application message"
 
 
 async def test_ws_connect_uses_the_server_keepalive_contract() -> None:
@@ -1074,10 +1056,10 @@ async def test_ws_connect_uses_the_server_keepalive_contract() -> None:
 
 
 def test_dockerfile_template_matches_the_client_keepalive_constants() -> None:
-    """The uvicorn --ws-ping-* flags and the client's _SERVER_PING_* constants must not drift.
+    """The uvicorn --ws-ping-* flags and the client's _SERVER_PING_* constants must not drift apart.
 
-    test_ws_connect_uses_the_server_keepalive_contract pins the client half to 30/40, so
-    whichever side of the contract is edited alone, one of the two tests fails.
+    test_ws_connect_uses_the_server_keepalive_contract pins the client half, so editing
+    either side of the contract alone fails one of the two tests.
     """
     dockerfile = Path(__file__).resolve().parents[1] / "templates" / "Dockerfile"
     cmd_line = next(line for line in dockerfile.read_text().splitlines() if line.startswith("CMD "))

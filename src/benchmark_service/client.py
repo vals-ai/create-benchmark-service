@@ -57,7 +57,6 @@ _OUTAGE_STARTED_ENV = "VALKYRIE_SANDBOX_OUTAGE_STARTED_EPOCH"
 
 # Server half of the keepalive contract, set in templates/Dockerfile:
 # uvicorn --ws-ping-interval 30 --ws-ping-timeout 10.
-# tests/test_client.py fails if the Dockerfile flags and these constants drift apart.
 _SERVER_PING_INTERVAL_S = 30
 _SERVER_PING_TIMEOUT_S = 10
 # Client half: ping on the same cadence, but wait one full server keepalive cycle

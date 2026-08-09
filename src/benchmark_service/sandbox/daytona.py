@@ -119,39 +119,25 @@ _FIXED_PROVIDER_WAIT = wait_chain(
 )
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
 
-# Hard ceiling for a single Daytona toolbox / control-plane HTTP round trip. The daytona SDK
-# forwards timeout=None to aiohttp when no timeout is supplied, and aiohttp treats an explicit
-# None as ClientTimeout(total=None) — disabling the timeout entirely. A stalled connection to
-# the Daytona toolbox then hangs the coroutine forever (no exception is raised, so _PROVIDER_RETRY
-# never fires and the run stalls IN_PROGRESS). Bounding each individual call turns that silent hang
-# into a retryable SandboxConnectionError. This bounds ONE round trip, not a whole command, so
-# long-running agent PTY streaming (polled via handle.wait()) is unaffected.
+# Hard ceiling for a single Daytona toolbox or control-plane HTTP round trip. The SDK forwards
+# timeout=None to aiohttp, which reads an explicit None as "no timeout at all", so a stalled
+# connection hangs the await forever: no exception ever reaches _PROVIDER_RETRY and the task sits
+# IN_PROGRESS for hours. Bounding each call turns that silent hang into a retryable error.
 _TOOLBOX_CALL_TIMEOUT_SECONDS = 120.0
 
-# Ceiling for waiting on a sandbox to reach the "started" state. Sandbox START is provisioning
-# (snapshot pull + container create) and legitimately takes far longer than a normal toolbox round
-# trip, so it gets its own, much larger bound rather than reusing _TOOLBOX_CALL_TIMEOUT_SECONDS
-# (which would abort healthy slow snapshot pulls). It still must be FINITE: the Daytona SDK's
-# wait_for_sandbox_start(timeout=0) means "no timeout" and polls refresh_data() forever, so a
-# sandbox wedged in a non-started / non-error state would otherwise hang delete_sandbox /
-# _find_existing_sandbox indefinitely — and because those run inside _PROVIDER_RETRY, tenacity
-# never fires. Bounding the wait converts a wedged start into a retryable SandboxConnectionError.
+# Ceiling for waiting on a sandbox to reach the started state. The SDK reads
+# wait_for_sandbox_start(timeout=0) as "wait forever", so a sandbox wedged short of STARTED would
+# stall reuse and deletion; provisioning is far slower than a toolbox call, hence its own bound.
 _SANDBOX_START_TIMEOUT_SECONDS = 600.0
 
 _T = TypeVar("_T")
 
 
-async def _bounded(description: str, awaitable: Awaitable[_T], timeout: float | None) -> _T:
-    """Await awaitable with a hard timeout, converting a stall into a retryable error.
+async def _bounded(operation: str, awaitable: Awaitable[_T], timeout: float | None) -> _T:
+    """Await `awaitable` under a hard timeout, reporting expiry as a retryable connection error.
 
-    A numeric timeout bounds one HTTP round trip: on expiry the resulting TimeoutError is
-    converted to SandboxConnectionError so the enclosing _PROVIDER_RETRY retries the call
-    instead of the coroutine hanging forever. A timeout of None means "no bound" — the
-    awaitable runs to completion. This is used only for command-carrying process.exec calls with
-    no caller-supplied command timeout, where the HTTP request legitimately stays open for the
-    whole (potentially very long) in-sandbox command runtime; capping those would abort
-    legitimate long builds/installs/tests. Short control-plane / toolbox / poll-loop calls always
-    pass a numeric timeout and therefore stay bounded.
+    A `timeout` of None means unbounded, and is used only where the request legitimately stays
+    open for as long as the in-sandbox command runs (see DaytonaSandbox.exec).
     """
     if timeout is None:
         return await awaitable
@@ -159,35 +145,11 @@ async def _bounded(description: str, awaitable: Awaitable[_T], timeout: float | 
         async with asyncio.timeout(timeout):
             return await awaitable
     except TimeoutError as exc:
-        raise SandboxConnectionError(f"Daytona call timed out after {timeout:g}s: {description}") from exc
+        raise SandboxConnectionError(f"Daytona {operation} timed out after {timeout:g}s") from exc
 
 
 async def _collect_sandboxes(sandboxes: AsyncIterator[AsyncSandbox]) -> list[AsyncSandbox]:
-    """Collect all sandboxes from an async iterator so list iteration can be wrapped by _bounded."""
     return [sandbox async for sandbox in sandboxes]
-
-
-def _exec_transport_timeout(command_timeout: float | None) -> float | None:
-    """Transport ceiling for a command-carrying process.exec call.
-
-    Daytona's process.exec holds the HTTP request open for the entire in-sandbox command runtime,
-    so the transport bound effectively bounds the command itself. Two cases:
-
-    * command_timeout supplied -> the in-sandbox timeout shell wrapper (see _command) enforces the
-      real limit, so we allow that runtime plus a generous network margin.
-    * command_timeout is None (the public Sandbox.exec default) -> the command is intentionally
-      unbounded, so we return None (no transport bound). Returning a fixed ceiling here would
-      silently abort and retry a legitimately long setup/build/test command after the ceiling
-      elapsed.
-
-    Short control-plane probes (test -e / cat / rm in the PTY poll loop, egress updates,
-    refresh_data, PTY session setup, etc.) do NOT go through this helper: they pass
-    _TOOLBOX_CALL_TIMEOUT_SECONDS to _bounded directly and stay bounded, because a stalled
-    control-plane call is the silent-stall vector this fix targets.
-    """
-    if command_timeout is None:
-        return None
-    return command_timeout + _TOOLBOX_CALL_TIMEOUT_SECONDS
 
 
 def _pty_result_summary(result: PtyResult | None) -> str:
@@ -452,20 +414,18 @@ class DaytonaSandbox(Sandbox):
         cwd: str | None = None,
         timeout: float | None = None,
     ) -> ExecResult:
-        # An untimed command is intentionally unbounded at the transport layer (timeout=None ->
-        # _exec_transport_timeout returns None) so long builds/installs/tests can run to
-        # completion; an explicit timeout bounds the round trip at that runtime plus a margin.
-        return await self._run_exec(_command(command, cwd, timeout), _exec_transport_timeout(timeout))
+        # An explicit deadline is enforced inside the sandbox by _command, so the transport gets
+        # that budget plus a margin. An untimed command stays transport-unbounded: process.exec
+        # holds the request open for the whole command, so a ceiling would abort long installs.
+        transport_timeout = None if timeout is None else timeout + _TOOLBOX_CALL_TIMEOUT_SECONDS
+        return await self._run_exec(_command(command, cwd, timeout), transport_timeout)
 
     @_PROVIDER_RETRY
     async def _control_exec(self, command: str) -> ExecResult:
-        """Run a short internal control-plane probe (test -e / cat / rm in the PTY poll loop)
-        with a hard transport bound.
+        """Run a short internal probe (test -e / cat / rm) under the toolbox bound.
 
-        Unlike the public exec — which leaves an untimed command unbounded so long agent commands
-        are not cut off — these probes MUST stay bounded at _TOOLBOX_CALL_TIMEOUT_SECONDS: they
-        fire every _PTY_STATUS_POLL_SECONDS and a stalled probe is exactly the silent IN_PROGRESS
-        hang this fix targets.
+        Unlike the public exec these must stay bounded: they run in the PTY poll loop, where a
+        stalled probe is exactly the hang the bound exists to break.
         """
         return await self._run_exec(_command(command, None, None), _TOOLBOX_CALL_TIMEOUT_SECONDS)
 
@@ -523,8 +483,7 @@ class DaytonaSandbox(Sandbox):
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
         except _RETRYABLE_DAYTONA_CAUSES as exc:
-            # Transport errors raised while consuming the stream surface raw (outside the SDK
-            # call) and must stay retryable so the provider retry decorator can handle them.
+            # Failures while consuming the stream surface raw, outside the SDK's error wrapping.
             raise SandboxConnectionError(f"Sandbox connection error for {self._sandbox_ref}: {exc}") from exc
 
     async def stream_download(self, remote_path: str) -> AsyncGenerator[bytes, None]:
@@ -588,9 +547,9 @@ class DaytonaSandbox(Sandbox):
 
         try:
             handle = await self._create_pty_session(session_id, on_data, env_vars)
-            await _bounded("pty.send_input", handle.send_input("stty -echo\n"), _TOOLBOX_CALL_TIMEOUT_SECONDS)
+            await _bounded("handle.send_input", handle.send_input("stty -echo\n"), _TOOLBOX_CALL_TIMEOUT_SECONDS)
             await _bounded(
-                "pty.send_input",
+                "handle.send_input",
                 handle.send_input(
                     f"mkdir -p {shlex.quote(_STATUS_DIR)}; {command}; echo $? > {shlex.quote(status_path)}; exit\n"
                 ),
@@ -624,7 +583,7 @@ class DaytonaSandbox(Sandbox):
                         f"Daytona PTY exited before writing command status for {self._sandbox_ref}: "
                         f"session_id={session_id}, {_pty_result_summary(wait_result)}"
                     )
-                await _bounded("pty.disconnect", handle.disconnect(), _TOOLBOX_CALL_TIMEOUT_SECONDS)
+                await _bounded("handle.disconnect", handle.disconnect(), _TOOLBOX_CALL_TIMEOUT_SECONDS)
                 handle = await self._reconnect_pty(session_id, on_data, wait_result)
                 wait_task = asyncio.create_task(handle.wait())
 
@@ -643,10 +602,10 @@ class DaytonaSandbox(Sandbox):
                     await wait_task
             if handle:
                 with suppress(Exception):
-                    await _bounded("pty.disconnect", handle.disconnect(), _TOOLBOX_CALL_TIMEOUT_SECONDS)
+                    await _bounded("handle.disconnect", handle.disconnect(), _TOOLBOX_CALL_TIMEOUT_SECONDS)
             with suppress(Exception):
                 await _bounded(
-                    "pty.kill_pty_session",
+                    "process.kill_pty_session",
                     self._sandbox.process.kill_pty_session(session_id),
                     _TOOLBOX_CALL_TIMEOUT_SECONDS,
                 )

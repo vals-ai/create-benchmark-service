@@ -121,6 +121,7 @@ class FailedExecuteCommandProcess(Process):
 
 class ContainerIpProcess(Process):
     """Process that fails with container IP resolution error once, then succeeds."""
+
     def __init__(self) -> None:
         super().__init__()
         self.attempts = 0
@@ -171,6 +172,7 @@ class MisclassifiedTransportProcess(Process):
 
 class HangingProcess(Process):
     """Process that stalls forever on exec, simulating unbounded timeout=None."""
+
     def __init__(self) -> None:
         super().__init__()
         self.attempts = 0
@@ -183,6 +185,7 @@ class HangingProcess(Process):
 
 class SlowSuccessProcess(Process):
     """Process that succeeds after a delay, longer than tool-call timeout."""
+
     def __init__(self, delay: float) -> None:
         super().__init__()
         self.attempts = 0
@@ -382,6 +385,7 @@ class BlockingProcess(Process):
 
 class StalledSendPtyHandle(PtyHandle):
     """PTY handle that stalls on send_input and tracks cleanup."""
+
     def __init__(self, on_data: Callable[[bytes], None | Awaitable[None]]) -> None:
         super().__init__(on_data)
         self.send_started = False
@@ -399,6 +403,7 @@ class StalledSendPtyHandle(PtyHandle):
 
 class StalledSendProcess(Process):
     """Process that creates a stalled PTY handle."""
+
     def __init__(self) -> None:
         super().__init__()
         self.handle: StalledSendPtyHandle | None = None
@@ -422,6 +427,7 @@ class StalledSendProcess(Process):
 
 class StalledDisconnectPtyHandle(PtyHandle):
     """PTY handle that stalls on disconnect but command completes."""
+
     def __init__(self, on_data: Callable[[bytes], None | Awaitable[None]]) -> None:
         super().__init__(on_data)
         self.disconnect_started = False
@@ -441,6 +447,7 @@ class StalledDisconnectPtyHandle(PtyHandle):
 
 class StalledDisconnectProcess(Process):
     """Process that creates a disconnect-stalled PTY handle."""
+
     def __init__(self) -> None:
         super().__init__()
         self.killed_session_id: str | None = None
@@ -489,6 +496,7 @@ class RemovedSandboxFiles(Files):
 
 class FlakyStreamingFiles(Files):
     """Files service that streams errors transiently, then succeeds."""
+
     def __init__(self, error: Exception) -> None:
         self._error = error
         self.attempts = 0
@@ -661,6 +669,7 @@ class HungStartInnerSandbox(InnerSandbox):
 
     The SDK's wait_for_sandbox_start(timeout=0) means "no timeout" and polls forever.
     """
+
     def __init__(self) -> None:
         super().__init__()
         self.start_attempts = 0
@@ -691,6 +700,7 @@ class BareHtml502RefreshSandbox(InnerSandbox):
 
 class HangingRefreshSandbox(InnerSandbox):
     """Sandbox that stalls forever on refresh_data."""
+
     def __init__(self) -> None:
         super().__init__()
         self.refresh_attempts = 0
@@ -1598,10 +1608,7 @@ async def test_daytona_command_bounds_stalled_pty_send(monkeypatch: pytest.Monke
 
     with pytest.raises(SandboxConnectionError, match="timed out"):
         async with asyncio.timeout(5):
-            _ = [
-                chunk
-                async for chunk in sandbox.command("printf hello")
-            ]
+            _ = [chunk async for chunk in sandbox.command("printf hello")]
 
     assert process.handle is not None
     assert process.handle.send_started is True
@@ -1625,10 +1632,7 @@ async def test_daytona_command_continues_cleanup_when_disconnect_stalls(monkeypa
     monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", 0.05)
 
     async with asyncio.timeout(5):
-        output = [
-            chunk
-            async for chunk in sandbox.command("printf hello")
-        ]
+        output = [chunk async for chunk in sandbox.command("printf hello")]
 
     assert output == ["hello"]
     assert process.killed_session_id is not None

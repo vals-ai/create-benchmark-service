@@ -45,10 +45,10 @@ from benchmark_service.schemas import (
 __all__ = [
     "BenchmarkServiceApp",
     "BenchmarkService",
+    "BenchmarkServiceUnauthenticatedError",
     "BenchmarkServiceClient",
     "BenchmarkServiceError",
     "BenchmarkServiceStreamClosedError",
-    "BenchmarkServiceUnauthenticatedError",
     "SandboxRecoveryAttempt",
     "ArtifactGradingSubmission",
     "ComposeSource",

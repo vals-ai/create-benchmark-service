@@ -55,17 +55,12 @@ _RecoveryResult = TypeVar("_RecoveryResult")
 _OUTAGE_ID_ENV = "VALKYRIE_SANDBOX_OUTAGE_ID"
 _OUTAGE_STARTED_ENV = "VALKYRIE_SANDBOX_OUTAGE_STARTED_EPOCH"
 
-# Keepalive contract with the service. The server half lives in templates/Dockerfile:
-# uvicorn --ws-ping-interval 30 --ws-ping-timeout 10, i.e. the server pings every 30s
-# and closes 1011 ("keepalive ping timeout") when a pong takes longer than 10s — a
-# service event loop blocked past that grace closes established evaluation sockets.
+# Server half of the keepalive contract, set in templates/Dockerfile:
+# uvicorn --ws-ping-interval 30 --ws-ping-timeout 10.
 _SERVER_PING_INTERVAL_S = 30
 _SERVER_PING_TIMEOUT_S = 10
-# The client pings on the same cadence but waits one full server keepalive cycle
-# before declaring the peer dead: grading routinely blocks the service event loop
-# past the server's 10s pong grace, and any socket that silent is already condemned
-# by the server's own contract. Bounded, unlike the previous ping_timeout=None,
-# which never detected a dead peer.
+# The client pings on the server's cadence but waits one full server keepalive cycle before
+# giving up on a pong, so it never drops a socket the server itself would have tolerated.
 _WS_PING_INTERVAL_S = _SERVER_PING_INTERVAL_S
 _WS_PING_TIMEOUT_S = _SERVER_PING_INTERVAL_S + _SERVER_PING_TIMEOUT_S
 
@@ -108,11 +103,8 @@ class BenchmarkServiceUnauthenticatedError(BenchmarkServiceError):
 class BenchmarkServiceStreamClosedError(BenchmarkServiceError):
     """Exception raised when an established evaluation WebSocket closes without a terminal chunk.
 
-    Raised only after the connection is established, so it is distinguishable from
-    pre-connection failures (DNS resolution, connect, handshake), which surface as
-    the transport's own errors from ``websockets.connect``. ``idle_s`` measures
-    silence since the last application message (not since the last ping), so a
-    server keepalive close is self-evident from the error alone.
+    ``idle_s`` is the silence since the last application message, not since the last ping, so a
+    server keepalive close reads as "code 1011: keepalive ping timeout after 783.0s".
     """
 
     close_code: int | None
@@ -305,14 +297,10 @@ class BenchmarkServiceClient:
 
         Raises:
             BenchmarkServiceError: If an "error" chunk is received.
-            BenchmarkServiceStreamClosedError: When the established socket closes
-                without a terminal chunk.
-            Transport errors: Pre-connection failures (DNS resolution, connect,
-                handshake) propagate as the transport's own errors from
-                websockets.connect.
+            BenchmarkServiceStreamClosedError: If the established socket closes without a
+                terminal chunk. Pre-connection failures (DNS, connect, handshake) stay
+                distinguishable: they propagate unwrapped from websockets.connect.
         """
-        # Pre-connection failures (DNS/connect/handshake) propagate as transport
-        # errors from websockets.connect and are not converted to BenchmarkServiceStreamClosedError.
         async with websockets.connect(
             f"{self._ws_url}/ws/{path}",
             additional_headers=self._headers,
@@ -349,8 +337,7 @@ class BenchmarkServiceClient:
                     idle_s=time.monotonic() - last_message_at,
                 ) from exc
 
-            # Iterator ended without ConnectionClosed; a clean close without a
-            # terminal chunk is still a broken stream.
+            # The socket closed cleanly, but a stream without a terminal chunk is still broken.
             raise BenchmarkServiceStreamClosedError(
                 close_code=websocket.close_code,
                 close_reason=websocket.close_reason,

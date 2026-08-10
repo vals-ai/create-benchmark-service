@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, cast
 
 import pytest
-from aiohttp import ClientConnectionError, ClientResponseError, RequestInfo
+from aiohttp import ClientConnectionError, ClientPayloadError, ClientResponseError, RequestInfo
 from daytona import DaytonaConfig, GpuType, SandboxState
 from daytona.common.errors import (
     DaytonaConflictError,
@@ -31,6 +31,7 @@ from benchmark_service.sandbox import (
     MissingSandboxConfigError,
     Resources,
     Sandbox,
+    SandboxConnectionError,
     SandboxCreateRequest,
     SandboxError,
     SandboxNotFoundError,
@@ -55,6 +56,15 @@ def _client_response_error(status: int, message: str) -> ClientResponseError:
     headers: CIMultiDict[str] = CIMultiDict()
     request_info = RequestInfo(url=url, method="GET", headers=CIMultiDictProxy(headers), real_url=url)
     return ClientResponseError(request_info, (), status=status, message=message)
+
+
+def _skip_retry_sleep(monkeypatch: pytest.MonkeyPatch, method: object) -> None:
+    """Run a tenacity-wrapped method's retries without their real backoff delays."""
+
+    async def no_wait(_seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr(cast(Any, method).retry, "sleep", no_wait)
 
 
 def _unwrap_shell_command(command: str) -> str:
@@ -118,6 +128,18 @@ class FailedExecuteCommandProcess(Process):
         return await super().exec(command)
 
 
+class ContainerIpProcess(Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        self.attempts += 1
+        if self.attempts == 1:
+            raise DaytonaError("Failed to execute command: failed to resolve container IP after 3 attempts")
+        return await super().exec(command)
+
+
 def _daytona_error_with_cause(message: str, cause: BaseException) -> DaytonaError:
     try:
         raise DaytonaError(message) from cause
@@ -155,6 +177,29 @@ class MisclassifiedTransportProcess(Process):
         return await super().exec(command)
 
 
+class HangingProcess(Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        self.attempts += 1
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+class SlowSuccessProcess(Process):
+    def __init__(self, delay: float) -> None:
+        super().__init__()
+        self.attempts = 0
+        self._delay = delay
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        self.attempts += 1
+        await asyncio.sleep(self._delay)
+        return await super().exec(command)
+
+
 class DetailedFailedExecuteCommandProcess(Process):
     def __init__(self) -> None:
         super().__init__()
@@ -174,6 +219,7 @@ class PtyHandle:
     def __init__(self, on_data: Callable[[bytes], None | Awaitable[None]]) -> None:
         self._on_data = on_data
         self.inputs: list[str] = []
+        self.disconnected = False
 
     async def send_input(self, data: str) -> None:
         self.inputs.append(data)
@@ -187,7 +233,7 @@ class PtyHandle:
         pass
 
     async def disconnect(self) -> None:
-        pass
+        self.disconnected = True
 
 
 class DisconnectedPtyHandle(PtyHandle):
@@ -310,19 +356,16 @@ class FloodingProcess(Process):
 
 
 class BlockingPtyHandle(PtyHandle):
-    disconnected = False
-
     async def wait(self) -> None:
         await asyncio.Event().wait()
 
-    async def disconnect(self) -> None:
-        self.disconnected = True
-
 
 class BlockingProcess(Process):
+    handle_cls: type[PtyHandle] = BlockingPtyHandle
+
     def __init__(self) -> None:
         super().__init__()
-        self.handle: BlockingPtyHandle | None = None
+        self.handle: PtyHandle | None = None
         self.killed_session_id: str | None = None
 
     async def create_pty_session(
@@ -331,14 +374,36 @@ class BlockingProcess(Process):
         id: str,
         on_data: Callable[[bytes], None | Awaitable[None]],
         envs: dict[str, str],
-    ) -> BlockingPtyHandle:
+    ) -> PtyHandle:
         assert id
         assert envs == {"TERM": "dumb", "LANG": "C.UTF-8"}
-        self.handle = BlockingPtyHandle(on_data)
+        self.handle = self.handle_cls(on_data)
         return self.handle
 
     async def kill_pty_session(self, session_id: str) -> None:
         self.killed_session_id = session_id
+
+
+class StalledSendPtyHandle(BlockingPtyHandle):
+    async def send_input(self, data: str) -> None:
+        # Let the stty prologue through so the stall lands on the command send itself.
+        if data.startswith("stty"):
+            return
+        await asyncio.Event().wait()
+
+
+class StalledSendProcess(BlockingProcess):
+    handle_cls = StalledSendPtyHandle
+
+
+class StalledDisconnectPtyHandle(PtyHandle):
+    async def disconnect(self) -> None:
+        await super().disconnect()
+        await asyncio.Event().wait()
+
+
+class StalledDisconnectProcess(BlockingProcess):
+    handle_cls = StalledDisconnectPtyHandle
 
 
 class Files:
@@ -364,6 +429,25 @@ class RemovedSandboxFiles(Files):
         async def chunks() -> Any:
             raise _client_response_error(status=502, message="Bad Gateway")
             yield b""
+
+        return chunks()
+
+
+class FlakyStreamingFiles(Files):
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+        self.attempts = 0
+
+    async def download_file_stream(self, remote_path: str) -> Any:
+        assert remote_path == "/tmp/result.txt"
+        self.attempts += 1
+        fails = self.attempts == 1
+
+        async def chunks() -> Any:
+            yield b"hello"
+            if fails:
+                raise self._error
+            yield b" world"
 
         return chunks()
 
@@ -517,6 +601,17 @@ class BuildingSandbox(InnerSandbox):
         self.state = SandboxState.STARTED
 
 
+class HungStartInnerSandbox(InnerSandbox):
+    def __init__(self) -> None:
+        super().__init__()
+        self.start_attempts = 0
+
+    async def wait_for_sandbox_start(self, timeout: int) -> None:
+        assert timeout == 0
+        self.start_attempts += 1
+        await asyncio.Event().wait()
+
+
 class RefreshToErrorSandbox(InnerSandbox):
     async def refresh_data(self) -> None:
         await super().refresh_data()
@@ -533,6 +628,16 @@ class BareHtml502RefreshSandbox(InnerSandbox):
         if self.refresh_attempts == 1:
             raise DaytonaError("Failed to refresh sandbox data: <html><h1>502 Bad Gateway</h1></html>")
         await super().refresh_data()
+
+
+class HangingRefreshSandbox(InnerSandbox):
+    def __init__(self) -> None:
+        super().__init__()
+        self.refresh_attempts = 0
+
+    async def refresh_data(self) -> None:
+        self.refresh_attempts += 1
+        await asyncio.Event().wait()
 
 
 class UnexpectedRefreshSandbox(InnerSandbox):
@@ -1094,6 +1199,85 @@ async def test_daytona_exec_retries_misclassified_transport_errors() -> None:
     assert process.attempts == 2
 
 
+async def test_daytona_exec_with_timeout_bounds_hanging_toolbox_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A toolbox call that never returns must surface as a retryable error rather than hang."""
+    inner = InnerSandbox()
+    process = HangingProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", 0.05)
+
+    _skip_retry_sleep(monkeypatch, DaytonaSandbox.exec)
+
+    with pytest.raises(SandboxConnectionError, match="timed out"):
+        await asyncio.wait_for(sandbox.exec("pytest", timeout=0.01), timeout=5)
+
+    assert process.attempts == 6
+
+
+async def test_daytona_exec_does_not_cap_untimed_long_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An untimed command must outlive the toolbox bound.
+
+    Capping it would abort long installs and re-run non-idempotent commands on the retry.
+    """
+    inner = InnerSandbox()
+    process = SlowSuccessProcess(delay=0.2)
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", 0.02)
+
+    result = await asyncio.wait_for(sandbox.exec("sleep 999"), timeout=5)
+
+    assert result.exit_code == 0
+    assert process.attempts == 1
+
+
+async def test_daytona_control_exec_bounds_hanging_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Internal probes stay bounded even though an untimed public exec does not."""
+    inner = InnerSandbox()
+    process = HangingProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", 0.05)
+
+    _skip_retry_sleep(monkeypatch, DaytonaSandbox._control_exec)  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(SandboxConnectionError, match="timed out"):
+        await asyncio.wait_for(sandbox._control_exec("test -e /tmp/x"), timeout=5)  # pyright: ignore[reportPrivateUsage]
+
+    assert process.attempts == 6
+
+
+async def test_daytona_check_sandbox_alive_bounds_hanging_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The liveness check runs inside the PTY poll loop, so a stalled refresh must not hang it."""
+    inner = HangingRefreshSandbox()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", 0.05)
+
+    _skip_retry_sleep(monkeypatch, DaytonaSandbox._check_sandbox_alive)  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(SandboxConnectionError, match="timed out"):
+        await asyncio.wait_for(sandbox._check_sandbox_alive(), timeout=5)  # pyright: ignore[reportPrivateUsage]
+
+    assert inner.refresh_attempts == 6
+
+
+async def test_daytona_exec_retries_container_ip_resolution_failures() -> None:
+    inner = InnerSandbox()
+    process = ContainerIpProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    result = await sandbox.exec("pytest")
+
+    assert result.exit_code == 0
+    assert process.attempts == 2
+
+
 async def test_daytona_exec_does_not_retry_detailed_execute_command_errors() -> None:
     """Detailed Daytona exec failures should not be retried as transient blank errors.
 
@@ -1181,6 +1365,31 @@ async def test_daytona_stream_download_raises_sandbox_not_found_when_removed() -
         _ = [chunk async for chunk in sandbox.stream_download("/tmp/result.txt")]
 
 
+@pytest.mark.parametrize(
+    "stream_error",
+    [
+        ConnectionResetError("connection reset"),
+        ClientPayloadError("response truncated"),
+    ],
+)
+async def test_daytona_download_retries_stream_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    stream_error: Exception,
+) -> None:
+    """Transport errors raised mid-stream escape the SDK untyped, so they need their own retry."""
+    inner = InnerSandbox()
+    files = FlakyStreamingFiles(stream_error)
+    inner.fs = files
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    _skip_retry_sleep(monkeypatch, DaytonaSandbox.download_file)
+
+    result = await sandbox.download_file("/tmp/result.txt")
+
+    assert result == b"hello world"
+    assert files.attempts == 2
+
+
 async def test_daytona_pty_caps_result_output_without_dropping_streamed_chunks() -> None:
     """The PTY exec result should retain only a bounded output tail.
 
@@ -1258,6 +1467,42 @@ async def test_daytona_command_finishes_when_pty_close_never_arrives(monkeypatch
     sandbox = DaytonaSandbox(cast(Any, inner))
 
     async with asyncio.timeout(1):
+        output = [chunk async for chunk in sandbox.command("printf hello")]
+
+    assert output == ["hello"]
+    assert process.handle is not None
+    assert process.handle.disconnected is True
+    assert process.killed_session_id is not None
+
+
+async def test_daytona_command_bounds_stalled_pty_send(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A PTY that never accepts input must fail the command and still release the session."""
+    inner = InnerSandbox()
+    process = StalledSendProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", 0.05)
+
+    with pytest.raises(SandboxConnectionError, match="timed out"):
+        async with asyncio.timeout(5):
+            _ = [chunk async for chunk in sandbox.command("printf hello")]
+
+    assert process.handle is not None
+    assert process.handle.disconnected is True
+    assert process.killed_session_id is not None
+
+
+async def test_daytona_command_continues_cleanup_when_disconnect_stalls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stalled disconnect must not strand cleanup after the command already succeeded."""
+    inner = InnerSandbox()
+    process = StalledDisconnectProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", 0.05)
+
+    async with asyncio.timeout(5):
         output = [chunk async for chunk in sandbox.command("printf hello")]
 
     assert output == ["hello"]
@@ -1452,6 +1697,26 @@ async def test_daytona_provider_recovers_existing_sandbox_on_create_conflict() -
 
     assert daytona.created is True
     assert sandbox.id == inner.id
+
+
+async def test_daytona_provider_create_conflict_bounds_hung_sandbox_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Recovering a conflicting sandbox must not block forever on a start that never lands."""
+    inner = HungStartInnerSandbox()
+
+    class ConflictingHungStartClient(DaytonaClient):
+        async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
+            raise DaytonaError(f"Sandbox with name {inner.name} already exists")
+
+    daytona = ConflictingHungStartClient(inner)
+
+    monkeypatch.setattr(daytona_module, "_SANDBOX_START_TIMEOUT_SECONDS", 0.05)
+
+    _skip_retry_sleep(monkeypatch, DaytonaSandboxProvider.create_sandbox)
+
+    with pytest.raises(SandboxConnectionError, match="timed out"):
+        await asyncio.wait_for(_provider(daytona).create_sandbox(_request(inner.name)), timeout=5)
+
+    assert inner.start_attempts == 6
 
 
 class CapturingCreateDaytonaClient(DaytonaClient):
@@ -1649,15 +1914,26 @@ async def test_daytona_provider_delete_retries_bare_html_502_refresh_errors() ->
     assert daytona.deleted is True
 
 
+async def test_daytona_provider_delete_bounds_hung_sandbox_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Deleting a sandbox stuck short of STARTED must not block on the SDK's infinite start wait."""
+    inner = HungStartInnerSandbox()
+    daytona = DaytonaClient(inner)
+
+    monkeypatch.setattr(daytona_module, "_SANDBOX_START_TIMEOUT_SECONDS", 0.05)
+
+    _skip_retry_sleep(monkeypatch, DaytonaSandboxProvider.delete_sandbox)
+
+    with pytest.raises(SandboxConnectionError, match="timed out"):
+        await asyncio.wait_for(_provider(daytona).delete_sandbox(inner.name), timeout=5)
+
+    assert inner.start_attempts == 6
+
+
 async def test_daytona_provider_get_retries_unexpected_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     inner = InnerSandbox()
     daytona = UnexpectedGetDaytonaClient(inner)
 
-    async def no_wait(_seconds: float) -> None:
-        pass
-
-    retryer = cast(Any, DaytonaSandboxProvider.get_sandbox).retry
-    monkeypatch.setattr(retryer, "sleep", no_wait)
+    _skip_retry_sleep(monkeypatch, DaytonaSandboxProvider.get_sandbox)
 
     sandbox = await _provider(daytona).get_sandbox(inner.name)
 
@@ -1669,11 +1945,7 @@ async def test_daytona_provider_delete_retries_unexpected_remove_errors(monkeypa
     inner = InnerSandbox()
     daytona = UnexpectedRemoveDaytonaClient(inner)
 
-    async def no_wait(_seconds: float) -> None:
-        pass
-
-    retryer = cast(Any, DaytonaSandboxProvider.delete_sandbox).retry
-    monkeypatch.setattr(retryer, "sleep", no_wait)
+    _skip_retry_sleep(monkeypatch, DaytonaSandboxProvider.delete_sandbox)
 
     await _provider(daytona).delete_sandbox(inner.name)
 
@@ -1850,6 +2122,64 @@ async def test_daytona_target_resolution_preserves_provider_error(monkeypatch: p
 
     assert daytona_retry_after_seconds(exc_info.value) == 3
     assert regions_client.close_attempts == 1
+
+
+async def test_daytona_list_bounds_each_page_not_the_whole_drain(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A healthy listing must not be killed for having more pages than the bound covers.
+
+    AsyncDaytona.list is cursor-paginated, so bounding the drain caps total pagination time and a
+    retry restarts from page one -- a long-but-progressing listing could then never complete.
+    """
+    provider, daytona, _ = _inventory_provider(
+        monkeypatch,
+        target="configured-target",
+        regions=[SimpleNamespace(id="configured-target", name="configured-target")],
+    )
+    page_delay = 0.1
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", page_delay * 2.5)
+    # Without this, a regression here retries through the real backoff ladder before failing.
+    _skip_retry_sleep(monkeypatch, DaytonaSandboxProvider._list_sandboxes)  # pyright: ignore[reportPrivateUsage]
+
+    def paginated(query: object) -> Any:
+        daytona.listed_query = query
+
+        async def pages() -> Any:
+            for _ in range(5):
+                await asyncio.sleep(page_delay)
+                yield daytona.sandbox
+
+        return pages()
+
+    monkeypatch.setattr(daytona, "list", paginated)
+
+    # Five pages cost 5 * page_delay in total, well past the bound; each page stays inside it.
+    sandboxes = [sandbox async for sandbox in provider.list_sandboxes(SandboxQuery(labels={}))]
+
+    assert len(sandboxes) == 5
+
+
+async def test_daytona_list_still_bounds_a_stalled_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider, daytona, _ = _inventory_provider(
+        monkeypatch,
+        target="configured-target",
+        regions=[SimpleNamespace(id="configured-target", name="configured-target")],
+    )
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", 0.05)
+    _skip_retry_sleep(monkeypatch, DaytonaSandboxProvider._list_sandboxes)  # pyright: ignore[reportPrivateUsage]
+
+    def stalled(query: object) -> Any:
+        daytona.listed_query = query
+
+        async def pages() -> Any:
+            await asyncio.Event().wait()
+            yield daytona.sandbox
+
+        return pages()
+
+    monkeypatch.setattr(daytona, "list", stalled)
+
+    with pytest.raises(SandboxConnectionError, match="daytona.list timed out"):
+        _ = [sandbox async for sandbox in provider.list_sandboxes(SandboxQuery(labels={}))]
 
 
 async def test_daytona_provider_rejects_unavailable_target(monkeypatch: pytest.MonkeyPatch) -> None:

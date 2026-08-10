@@ -678,7 +678,17 @@ class DaytonaSandbox(Sandbox):
                 if result.exit_code == 0:
                     break
 
-                await self._check_sandbox_alive()
+                try:
+                    await self._check_sandbox_alive()
+                except SandboxError:
+                    status_exists = False
+                    with suppress(SandboxError):
+                        result = await self._control_exec(f"test -e {shlex.quote(status_path)}")
+                        status_exists = result.exit_code == 0
+                    if not status_exists:
+                        raise
+                    break
+
                 if not done:
                     continue
 

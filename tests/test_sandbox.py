@@ -863,6 +863,34 @@ class PersistentBareHtml502RefreshSandbox(InnerSandbox):
         raise DaytonaError("Failed to refresh sandbox data: <html><h1>502 Bad Gateway</h1></html>")
 
 
+class StatusDuringFailedRefreshProcess(Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.status_exists = False
+        self.status_probe_command: str | None = None
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        evaluated_command = _unwrap_shell_command(command)
+        if evaluated_command.startswith("test -e "):
+            if self.status_probe_command is None:
+                self.status_probe_command = evaluated_command
+            else:
+                assert evaluated_command == self.status_probe_command
+            return SimpleNamespace(exit_code=0 if self.status_exists else 1, result="")
+        return await super().exec(command)
+
+
+class StatusDuringFailedRefreshSandbox(InnerSandbox):
+    def __init__(self) -> None:
+        super().__init__()
+        self.status_process = StatusDuringFailedRefreshProcess()
+        self.process = self.status_process
+
+    async def refresh_data(self) -> None:
+        self.status_process.status_exists = True
+        raise DaytonaError("Failed to refresh sandbox data: <html><h1>502 Bad Gateway</h1></html>")
+
+
 class HangingRefreshSandbox(InnerSandbox):
     def __init__(self) -> None:
         super().__init__()
@@ -1944,6 +1972,16 @@ async def test_daytona_command_returns_completed_status_before_later_health_502(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     inner = PersistentBareHtml502RefreshSandbox()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+    _skip_retry_sleep(monkeypatch, DaytonaSandbox._check_sandbox_alive)  # pyright: ignore[reportPrivateUsage]
+
+    assert [chunk async for chunk in sandbox.command("printf hello")] == ["hello"]
+
+
+async def test_daytona_command_rechecks_status_written_during_failed_health_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inner = StatusDuringFailedRefreshSandbox()
     sandbox = DaytonaSandbox(cast(Any, inner))
     _skip_retry_sleep(monkeypatch, DaytonaSandbox._check_sandbox_alive)  # pyright: ignore[reportPrivateUsage]
 

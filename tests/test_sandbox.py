@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import shlex
 from collections.abc import AsyncGenerator, Mapping
 from datetime import UTC, datetime
@@ -9,6 +10,9 @@ import pytest
 from aiohttp import ClientConnectionError, ClientPayloadError, ClientResponseError, RequestInfo
 from daytona import DaytonaConfig, GpuType, SandboxState
 from daytona.common.errors import (
+    SOURCE_API,
+    SOURCE_DAEMON,
+    SOURCE_PROXY,
     DaytonaConflictError,
     DaytonaConnectionError,
     DaytonaError,
@@ -52,11 +56,52 @@ from benchmark_service.sandbox.daytona import (
 )
 
 
-def _client_response_error(status: int, message: str) -> ClientResponseError:
-    url = URL("https://daytona.example.test")
-    headers: CIMultiDict[str] = CIMultiDict()
-    request_info = RequestInfo(url=url, method="GET", headers=CIMultiDictProxy(headers), real_url=url)
-    return ClientResponseError(request_info, (), status=status, message=message)
+_SENSITIVE_RETRY_SENTINEL = "SENSITIVE_RETRY_SENTINEL"
+_STANDARD_LOG_RECORD_KEYS = frozenset(vars(logging.LogRecord("", logging.WARNING, "", 0, "", (), None)))
+
+
+def _client_response_error(
+    status: int,
+    message: str,
+    *,
+    url: str = "https://daytona.example.test",
+    headers: Mapping[str, str] | None = None,
+) -> ClientResponseError:
+    request_url = URL(url)
+    header_values: CIMultiDict[str] = CIMultiDict(headers or {})
+    header_proxy = CIMultiDictProxy(header_values)
+    request_info = RequestInfo(url=request_url, method="GET", headers=header_proxy, real_url=request_url)
+    return ClientResponseError(request_info, (), status=status, message=message, headers=header_proxy)
+
+
+def _callback_extra(record: logging.LogRecord) -> dict[str, object]:
+    return {
+        key: value
+        for key, value in vars(record).items()
+        if key not in _STANDARD_LOG_RECORD_KEYS and key not in {"asctime", "message"}
+    }
+
+
+def _retry_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        record
+        for record in caplog.records
+        if record.name == daytona_module.__name__ and record.getMessage().startswith("daytona.retry ")
+    ]
+
+
+def _assert_safe_retry_record(
+    record: logging.LogRecord,
+    expected_message: str,
+    expected_fields: Mapping[str, object],
+) -> None:
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == expected_message
+    assert _callback_extra(record) == expected_fields
+    assert record.exc_info is None
+    assert record.exc_text is None
+    assert record.stack_info is None
+    assert _SENSITIVE_RETRY_SENTINEL not in repr((record.getMessage(), vars(record)))
 
 
 def _skip_retry_sleep(monkeypatch: pytest.MonkeyPatch, method: object) -> None:
@@ -105,16 +150,38 @@ class Process:
         assert session_id
 
 
-class RateLimitedProcess(Process):
-    def __init__(self) -> None:
+class RetryingProcess(Process):
+    def __init__(self, errors: list[BaseException]) -> None:
         super().__init__()
+        self._errors = list(errors)
         self.attempts = 0
 
     async def exec(self, command: str) -> SimpleNamespace:
         self.attempts += 1
-        if self.attempts == 1:
-            raise DaytonaRateLimitError("rate limited", headers={"retry-after-sandbox-create": "0"})
+        if self._errors:
+            raise self._errors.pop(0)
         return await super().exec(command)
+
+
+async def _run_retrying_exec(
+    process: RetryingProcess,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> tuple[ExecResult, list[float], list[logging.LogRecord]]:
+    inner = InnerSandbox()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+    observed_waits: list[float] = []
+
+    async def record_wait(seconds: float) -> None:
+        observed_waits.append(seconds)
+
+    retryer = cast(Any, DaytonaSandbox.exec).retry
+    monkeypatch.setattr(retryer, "sleep", record_wait)
+    with caplog.at_level(logging.WARNING, logger=daytona_module.__name__):
+        result = await sandbox.exec(_SENSITIVE_RETRY_SENTINEL)
+
+    return result, observed_waits, _retry_records(caplog)
 
 
 class FailedExecuteCommandProcess(Process):
@@ -1108,6 +1175,21 @@ def test_daytona_retry_after_uses_any_retry_after_header() -> None:
 
 
 @pytest.mark.parametrize(
+    "invalid_delay",
+    [
+        pytest.param(-1, id="negative"),
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="positive-infinity"),
+        pytest.param(float("-inf"), id="negative-infinity"),
+    ],
+)
+def test_daytona_retry_after_rejects_negative_and_non_finite_values(invalid_delay: float) -> None:
+    exc = DaytonaRateLimitError("rate limited", headers={"retry-after": invalid_delay})
+
+    assert daytona_retry_after_seconds(exc) is None
+
+
+@pytest.mark.parametrize(
     "message",
     [
         "Failed to get sandbox: An unexpected error occurred.",
@@ -1183,15 +1265,135 @@ async def test_daytona_unexpected_refresh_uses_staged_backoff(monkeypatch: pytes
         assert expected * 0.9 <= observed <= expected
 
 
-async def test_daytona_exec_retries_rate_limits() -> None:
+async def test_daytona_exec_logs_each_rate_limit_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sensitive_message = f"rate limited {_SENSITIVE_RETRY_SENTINEL}"
+    sensitive_code = f"CODE_{_SENSITIVE_RETRY_SENTINEL}"
+    errors: list[BaseException] = [
+        DaytonaRateLimitError(sensitive_message, 429, {"retry-after": "nan"}, sensitive_code, SOURCE_API),
+        DaytonaRateLimitError(
+            sensitive_message, 429, {"retry-after-sandbox-create": "0.25"}, sensitive_code, SOURCE_PROXY
+        ),
+        DaytonaRateLimitError(
+            sensitive_message, 429, {"retry-after-sandbox-create": "0.5"}, sensitive_code, SOURCE_DAEMON
+        ),
+    ]
+    process = RetryingProcess(errors)
+
+    result, observed_waits, records = await _run_retrying_exec(process, monkeypatch, caplog)
+
+    assert result.exit_code == 0
+    assert process.attempts == 4
+    assert observed_waits == [1.0, 0.25, 0.5]
+    assert len(records) == 3
+
+    expected_messages = [
+        "daytona.retry sandbox_provider=daytona daytona_step=exec daytona_retry_attempt=1 "
+        "daytona_retry_delay_s=1.0 daytona_retry_category=rate_limit daytona_status_code=429 daytona_source=api",
+        "daytona.retry sandbox_provider=daytona daytona_step=exec daytona_retry_attempt=2 "
+        "daytona_retry_delay_s=0.25 daytona_retry_category=rate_limit daytona_status_code=429 daytona_source=proxy",
+        "daytona.retry sandbox_provider=daytona daytona_step=exec daytona_retry_attempt=3 "
+        "daytona_retry_delay_s=0.5 daytona_retry_category=rate_limit daytona_status_code=429 daytona_source=daemon",
+    ]
+    for attempt, (record, delay, source, expected_message) in enumerate(
+        zip(records, observed_waits, ("api", "proxy", "daemon"), expected_messages, strict=True),
+        start=1,
+    ):
+        expected_fields = {
+            "sandbox_provider": "daytona",
+            "daytona_step": "exec",
+            "daytona_retry_attempt": attempt,
+            "daytona_retry_delay_s": delay,
+            "daytona_retry_category": "rate_limit",
+            "daytona_status_code": 429,
+            "daytona_source": source,
+        }
+        _assert_safe_retry_record(record, expected_message, expected_fields)
+
+
+@pytest.mark.parametrize(
+    ("provider_error", "status_code"),
+    [
+        pytest.param(
+            DaytonaError(
+                f"provider message {_SENSITIVE_RETRY_SENTINEL}",
+                status_code=502,
+                headers={"x-sensitive": _SENSITIVE_RETRY_SENTINEL},
+                code=f"CODE_{_SENSITIVE_RETRY_SENTINEL}",
+                source=_SENSITIVE_RETRY_SENTINEL,
+            ),
+            502,
+            id="daytona-error",
+        ),
+        pytest.param(
+            _client_response_error(
+                503,
+                f"provider message {_SENSITIVE_RETRY_SENTINEL}",
+                url=f"https://daytona.example.test/{_SENSITIVE_RETRY_SENTINEL}",
+                headers={"x-sensitive": _SENSITIVE_RETRY_SENTINEL},
+            ),
+            503,
+            id="client-response-error",
+        ),
+    ],
+)
+async def test_daytona_exec_logs_typed_status_without_sensitive_details(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    provider_error: DaytonaError | ClientResponseError,
+    status_code: int,
+) -> None:
+    process = RetryingProcess([provider_error])
+
+    result, observed_waits, records = await _run_retrying_exec(process, monkeypatch, caplog)
+
+    assert result.exit_code == 0
+    assert process.attempts == 2
+    assert len(observed_waits) == 1
+    expected_fields = {
+        "sandbox_provider": "daytona",
+        "daytona_step": "exec",
+        "daytona_retry_attempt": 1,
+        "daytona_retry_delay_s": observed_waits[0],
+        "daytona_retry_category": "transient",
+        "daytona_status_code": status_code,
+    }
+    expected_message = (
+        "daytona.retry sandbox_provider=daytona daytona_step=exec daytona_retry_attempt=1 "
+        f"daytona_retry_delay_s={observed_waits[0]} daytona_retry_category=transient "
+        f"daytona_status_code={status_code}"
+    )
+    _assert_safe_retry_record(records[0], expected_message, expected_fields)
+
+
+async def test_daytona_retry_logging_failure_preserves_retry_behavior(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = RetryingProcess([DaytonaError("provider unavailable", status_code=503)])
     inner = InnerSandbox()
-    process = RateLimitedProcess()
     inner.process = process
     sandbox = DaytonaSandbox(cast(Any, inner))
+    observed_waits: list[float] = []
+    warning_calls = 0
 
-    await sandbox.exec("pytest")
+    async def record_wait(seconds: float) -> None:
+        observed_waits.append(seconds)
 
+    def fail_warning(_message: str, **_kwargs: object) -> None:
+        nonlocal warning_calls
+        warning_calls += 1
+        raise RuntimeError("logging unavailable")
+
+    retryer = cast(Any, DaytonaSandbox.exec).retry
+    monkeypatch.setattr(retryer, "sleep", record_wait)
+    monkeypatch.setattr(daytona_module.logger, "warning", fail_warning)
+
+    result = await sandbox.exec("pytest")
+
+    assert result.exit_code == 0
     assert process.attempts == 2
+    assert warning_calls == 1
+    assert len(observed_waits) == 1
 
 
 async def test_daytona_exec_retries_failed_execute_command_errors() -> None:
@@ -2312,6 +2514,56 @@ async def test_daytona_create_forwards_network_block_all() -> None:
 
     assert daytona.create_params is not None
     assert daytona.create_params.network_block_all is True
+
+
+async def test_daytona_create_retries_rate_limited_volume_lookup_safely(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    error = ApiException(
+        status=429,
+        reason=f"rate limited {_SENSITIVE_RETRY_SENTINEL}",
+        body=f"body {_SENSITIVE_RETRY_SENTINEL}",
+        data={"secret": _SENSITIVE_RETRY_SENTINEL},
+    )
+    error.headers = {"x-sensitive": _SENSITIVE_RETRY_SENTINEL}
+    ready = SimpleNamespace(id="volume-id", name="fixtures", state=VolumeState.READY, error_reason=None)
+    daytona = VolumeCapturingDaytonaClient(InnerSandbox(), [error, ready])
+    observed_waits: list[float] = []
+
+    async def record_wait(seconds: float) -> None:
+        observed_waits.append(seconds)
+
+    retryer = cast(Any, DaytonaSandboxProvider.create_sandbox).retry
+    monkeypatch.setattr(retryer, "sleep", record_wait)
+    with caplog.at_level(logging.WARNING, logger=daytona_module.__name__):
+        sandbox = await _provider(daytona).create_sandbox(
+            _request(
+                "grade-sb",
+                volumes=[VolumeMount(name="fixtures", mount_path="/fixtures")],
+            )
+        )
+
+    assert sandbox.id == "sandbox-id"
+    assert daytona.volume.calls == [("fixtures", False), ("fixtures", False)]
+    assert daytona.created is True
+    assert len(observed_waits) == 1
+    assert 4.5 <= observed_waits[0] <= 5
+    records = _retry_records(caplog)
+    assert len(records) == 1
+    expected_fields = {
+        "sandbox_provider": "daytona",
+        "daytona_step": "create_sandbox",
+        "daytona_retry_attempt": 1,
+        "daytona_retry_delay_s": observed_waits[0],
+        "daytona_retry_category": "rate_limit",
+        "daytona_status_code": 429,
+    }
+    expected_message = (
+        "daytona.retry sandbox_provider=daytona daytona_step=create_sandbox daytona_retry_attempt=1 "
+        f"daytona_retry_delay_s={observed_waits[0]} daytona_retry_category=rate_limit daytona_status_code=429"
+    )
+    _assert_safe_retry_record(records[0], expected_message, expected_fields)
 
 
 async def test_daytona_create_awaits_volume_and_waits_until_ready(monkeypatch: pytest.MonkeyPatch) -> None:

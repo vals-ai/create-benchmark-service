@@ -96,7 +96,6 @@ _PTY_STDOUT_TAIL_MAX_BYTES = 64 * 1024
 _PTY_CREATE_MARKER_ENV = "_CBS_PTY_CREATE_MARKER"
 _PTY_ROWS = 24
 _PTY_COLS = 80
-_AMBIGUOUS_PTY_CREATE_STATUSES = (408, 500, 502, 503, 504)
 _STATUS_DIR = "/tmp/.sandbox-provider"
 _REMOVED_SANDBOX_STATES = (SandboxState.DESTROYING, SandboxState.DESTROYED)
 _FAILED_SANDBOX_STATES = (SandboxState.ERROR, SandboxState.BUILD_FAILED)
@@ -349,14 +348,9 @@ def _is_name_conflict_error(exc: DaytonaError) -> bool:
 
 
 def _is_ambiguous_pty_create_error(exc: DaytonaError | ClientResponseError) -> bool:
-    status_code = _provider_status_code(exc)
-    if isinstance(exc, DaytonaRateLimitError) or status_code == 429:
+    if isinstance(exc, DaytonaRateLimitError) or _provider_status_code(exc) == 429:
         return False
-    if isinstance(exc, (DaytonaConnectionError, DaytonaTimeoutError)):
-        return True
-    if status_code in _AMBIGUOUS_PTY_CREATE_STATUSES:
-        return True
-    return _has_retryable_cause(exc)
+    return _is_transient_daytona_error(exc)
 
 
 def _parse_retry_after_seconds(value: object) -> float | None:

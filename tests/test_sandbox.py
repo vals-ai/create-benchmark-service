@@ -2047,6 +2047,11 @@ async def test_daytona_command_keeps_pty_create_conflicts_terminal(inner_type: t
             id="timeout",
         ),
         pytest.param(
+            [DaytonaError("server disconnected"), DaytonaConflictError("already exists")],
+            2,
+            id="flattened-transport-message",
+        ),
+        pytest.param(
             [
                 _daytona_error_with_cause("create failed", ClientConnectionError("tcp reset")),
                 DaytonaConflictError("already exists"),

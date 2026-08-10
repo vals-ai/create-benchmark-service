@@ -10,6 +10,7 @@ from typing import Any, cast
 
 import pytest
 from modal import Sandbox as ModalSdkSandbox
+from modal.exception import ConflictError as ModalConflictError
 from modal.exception import ConnectionError as ModalConnectionError
 from modal.exception import Error as ModalError
 from modal.exception import InvalidError as ModalInvalidError
@@ -22,6 +23,7 @@ from benchmark_service.sandbox.types import (
     ImageSource,
     Resources,
     SandboxCommandError,
+    SandboxConnectionError,
     SandboxCreateRequest,
     SandboxError,
     SandboxNotFoundError,
@@ -54,11 +56,29 @@ class FakeProcess:
 class HangingProcess(FakeProcess):
     def __init__(self) -> None:
         super().__init__([], 137)
+        self.read_started = asyncio.Event()
+        self.read_cancelled = asyncio.Event()
         self.stdout = self._stream_until_cancelled()
 
     async def _stream_until_cancelled(self) -> AsyncGenerator[str, None]:
         yield "line1\n"
-        await asyncio.Event().wait()
+        self.read_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            self.read_cancelled.set()
+            raise
+
+
+class ErrorProcess(FakeProcess):
+    def __init__(self, error: ModalError) -> None:
+        super().__init__([], 1)
+        self._error = error
+        self.stdout = self._stream_until_error()
+
+    async def _stream_until_error(self) -> AsyncGenerator[bytes, None]:
+        yield b"partial"
+        raise self._error
 
 
 class FakeFilesystem:
@@ -93,6 +113,7 @@ class FakeInnerSandbox:
         file_error: ModalError | None = None,
         poll_result: int | None = None,
         poll_results: list[int | ModalError | None] | None = None,
+        tags: dict[str, str] | None = None,
     ) -> None:
         self.object_id = object_id
         self.commands: list[tuple[str, ...]] = []
@@ -102,11 +123,13 @@ class FakeInnerSandbox:
         self._exec_error = exec_error
         self._poll_result = poll_result
         self._poll_results = poll_results or []
+        self._tags = dict(tags or {})
         self.filesystem = FakeFilesystem(file_content, file_error)
         self.outbound_policies: list[dict[str, list[str] | None]] = []
         self.exec = _aio(self._exec)
         self.terminate = _aio(self._terminate)
         self.poll = _aio(self._poll)
+        self.get_tags = _aio(self._get_tags)
         self._experimental_set_outbound_network_policy = _aio(self._set_outbound_network_policy)
 
     async def _exec(
@@ -121,8 +144,12 @@ class FakeInnerSandbox:
         self.command_envs.append(env)
         return self._process
 
-    async def _terminate(self) -> None:
+    async def _terminate(self, *, wait: bool = False) -> None:
         self.terminated = True
+        self.terminate_wait = wait
+
+    async def _get_tags(self) -> dict[str, str]:
+        return dict(self._tags)
 
     async def _poll(self) -> int | None:
         # None means still running, mirroring modal.Sandbox.poll().
@@ -289,6 +316,12 @@ async def test_file_operations_map_not_found_errors() -> None:
 
 async def test_command_streams_output_and_raises_on_failure() -> None:
     inner = FakeInnerSandbox(process=FakeProcess(["line1\n", "line2\n"], 7))
+
+    async def delayed_wait() -> int:
+        await asyncio.sleep(0.05)
+        return 7
+
+    inner._process.wait = _aio(delayed_wait)
     sandbox = _sandbox(inner)
 
     chunks: list[str] = []
@@ -298,6 +331,61 @@ async def test_command_streams_output_and_raises_on_failure() -> None:
 
     assert chunks == ["line1\n", "line2\n"]
     assert exc.value.exit_code == 7
+
+
+async def test_command_drains_output_after_process_finishes() -> None:
+    inner = FakeInnerSandbox(process=FakeProcess([], 0))
+
+    async def delayed_output() -> AsyncGenerator[str, None]:
+        yield "first"
+        await asyncio.sleep(0.05)
+        yield "late"
+
+    inner._process.stdout = delayed_output()
+    sandbox = _sandbox(inner)
+
+    assert [chunk async for chunk in sandbox.command("run")] == ["first", "late"]
+
+
+async def test_command_drains_continuous_output_after_process_finishes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(modal_module, "_COMMAND_STATUS_POLL_SECONDS", 0.05)
+    inner = FakeInnerSandbox(process=FakeProcess([], 0))
+    expected_chunks = [f"chunk-{index}" for index in range(20)]
+
+    async def continuous_output() -> AsyncGenerator[str, None]:
+        for chunk in expected_chunks:
+            yield chunk
+            await asyncio.sleep(0.01)
+
+    inner._process.stdout = continuous_output()
+    sandbox = _sandbox(inner)
+
+    assert [chunk async for chunk in sandbox.command("run")] == expected_chunks
+
+
+@pytest.mark.parametrize(
+    ("modal_error", "expected_error", "message"),
+    [
+        (ModalConnectionError("command disconnected"), SandboxConnectionError, "command disconnected"),
+        (ModalConflictError("Modal Sandbox is shutting down."), SandboxNotFoundError, "shutting down"),
+    ],
+)
+async def test_command_maps_stream_errors(
+    modal_error: ModalError,
+    expected_error: type[SandboxError],
+    message: str,
+) -> None:
+    inner = FakeInnerSandbox(process=ErrorProcess(modal_error))
+    sandbox = _sandbox(inner)
+    chunks: list[str] = []
+
+    with pytest.raises(expected_error, match=message):
+        async for chunk in sandbox.command("run"):
+            chunks.append(chunk)
+
+    assert chunks == ["b'partial'"]
 
 
 async def test_command_uses_native_process_environment() -> None:
@@ -343,9 +431,16 @@ async def test_command_detects_termination_while_output_stalls(monkeypatch: pyte
     """
     monkeypatch.setattr(modal_module, "_COMMAND_STATUS_POLL_SECONDS", 0.01)
     monkeypatch.setattr(cast(Any, modal_module.ModalSandbox._raise_if_finished).retry, "sleep", _noop)
+    process = HangingProcess()
+
+    async def pending_wait() -> int:
+        await asyncio.Event().wait()
+        return 137
+
+    process.wait = _aio(pending_wait)
     sandbox = _sandbox(
         FakeInnerSandbox(
-            process=HangingProcess(),
+            process=process,
             poll_results=[None, ModalConnectionError("temporary poll failure"), 137],
         )
     )
@@ -355,6 +450,57 @@ async def test_command_detects_termination_while_output_stalls(monkeypatch: pyte
 
     with pytest.raises(SandboxNotFoundError, match="poll_result=137"):
         await asyncio.wait_for(consume_command(), timeout=1)
+
+
+async def test_command_unblocks_when_process_finishes_before_stream(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(modal_module, "_COMMAND_STATUS_POLL_SECONDS", 0.01)
+    process = HangingProcess()
+
+    async def finished_wait() -> int:
+        return 137
+
+    process.wait = _aio(finished_wait)
+    sandbox = _sandbox(FakeInnerSandbox(process=process, poll_results=[None, 137]))
+
+    async def consume_command() -> list[str]:
+        return [chunk async for chunk in sandbox.command("run")]
+
+    with pytest.raises(SandboxNotFoundError):
+        await asyncio.wait_for(consume_command(), timeout=1)
+
+    assert process.read_cancelled.is_set()
+
+
+async def test_command_cancels_pending_stream_read() -> None:
+    process = HangingProcess()
+    wait_cancelled = asyncio.Event()
+
+    async def pending_wait() -> int:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            wait_cancelled.set()
+            raise
+        return 137
+
+    process.wait = _aio(pending_wait)
+    sandbox = _sandbox(FakeInnerSandbox(process=process))
+
+    async def consume_command() -> None:
+        async for _ in sandbox.command("run"):
+            pass
+
+    consumer = asyncio.create_task(consume_command())
+    await asyncio.wait_for(process.read_started.wait(), timeout=1)
+
+    consumer.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await consumer
+
+    assert process.read_cancelled.is_set()
+    assert wait_cancelled.is_set()
 
 
 async def test_command_reports_modal_poll_result_when_sandbox_finished() -> None:
@@ -546,6 +692,7 @@ async def test_create_sandbox_uses_modal_safe_name(monkeypatch: pytest.MonkeyPat
     sandbox = await provider.create_sandbox(request)
 
     assert sandbox.name == request.name
+    assert sandbox.labels == request.labels
     assert captured["lookups"] == [captured["name"]]
     assert "/" not in captured["name"]
     assert ":" not in captured["name"]
@@ -580,6 +727,7 @@ async def test_create_sandbox_retries_modal_connection_errors(monkeypatch: pytes
     sandbox = await provider.create_sandbox(_request())
 
     assert sandbox.id == "sb-123"
+    assert sandbox.labels == _request().labels
     assert attempts == 2
 
 
@@ -631,6 +779,31 @@ async def test_get_sandbox_maps_invalid_id_to_not_found(monkeypatch: pytest.Monk
         await provider.get_sandbox("sandbox-name")
 
 
+async def test_get_sandbox_fetches_modal_tags_with_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+    inner = FakeInnerSandbox(tags={"Id": "benchmark-1", "Task": "task-1"})
+    attempts = 0
+
+    async def get_tags() -> dict[str, str]:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise ModalConnectionError("tags temporarily unavailable")
+        return {"Id": "benchmark-1", "Task": "task-1"}
+
+    inner.get_tags = _aio(get_tags)
+
+    async def from_id(instance_id: str, **kwargs: Any) -> FakeInnerSandbox:
+        return inner
+
+    monkeypatch.setattr(cast(Any, ModalSandboxProvider._fetch_labels).retry, "sleep", _noop)
+    provider = _provider(monkeypatch, SimpleNamespace(from_id=_aio(from_id)))
+
+    sandbox = await provider.get_sandbox("sb-123")
+
+    assert sandbox.labels == {"Id": "benchmark-1", "Task": "task-1"}
+    assert attempts == 2
+
+
 async def test_get_sandbox_raises_not_found_for_finished_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
     async def from_id(instance_id: str, **kwargs: Any) -> Any:
         return FakeInnerSandbox(object_id=instance_id, poll_result=137)
@@ -662,10 +835,11 @@ async def test_delete_sandbox_terminates(monkeypatch: pytest.MonkeyPatch) -> Non
     await provider.delete_sandbox("sb-123")
 
     assert inner.terminated
+    assert inner.terminate_wait is True
 
 
 async def test_list_sandboxes_filters_by_labels(monkeypatch: pytest.MonkeyPatch) -> None:
-    inner = FakeInnerSandbox()
+    inner = FakeInnerSandbox(tags={"run_id": "r1", "Task": "task-1"})
     finished = FakeInnerSandbox(object_id="sb-finished", poll_result=137)
     captured: dict[str, Any] = {}
 
@@ -683,6 +857,7 @@ async def test_list_sandboxes_filters_by_labels(monkeypatch: pytest.MonkeyPatch)
     sandboxes = [sandbox async for sandbox in provider.list_sandboxes(SandboxQuery(labels={"run_id": "r1"}))]
 
     assert [sandbox.id for sandbox in sandboxes] == ["sb-123"]
+    assert sandboxes[0].labels == {"run_id": "r1", "Task": "task-1"}
     assert captured["app_id"] == "ap-1"
     assert captured["tags"] == {"run_id": "r1"}
 
@@ -716,6 +891,7 @@ async def test_create_sandbox_reuses_running_sandbox_with_same_name(monkeypatch:
 
     assert sandbox.id == "sb-existing"
     assert sandbox.name == "task-1"
+    assert sandbox.labels == _request().labels
     assert created == []
 
 

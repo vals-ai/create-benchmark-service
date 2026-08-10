@@ -809,18 +809,6 @@ class RemovedInnerSandbox(InnerSandbox):
         raise DaytonaNotFoundError("sandbox not found")
 
 
-class DeleteConflictSandbox(InnerSandbox):
-    def __init__(self) -> None:
-        super().__init__()
-        self.autostop_attempts = 0
-
-    async def set_autostop_interval(self, interval: int) -> None:
-        self.autostop_attempts += 1
-        if self.autostop_attempts == 1:
-            raise DaytonaConflictError("Failed to set auto-stop interval: Sandbox was modified by another operation")
-        await super().set_autostop_interval(interval)
-
-
 class ErrorStateSandbox(InnerSandbox):
     state = SandboxState.ERROR
 
@@ -832,32 +820,19 @@ class RecreatedInnerSandbox(InnerSandbox):
     id = "recreated-sandbox-id"
 
 
-class InactiveSandbox(InnerSandbox):
+class DeleteWithoutPreparationSandbox(InnerSandbox):
     def __init__(self, state: SandboxState) -> None:
         super().__init__()
         self.state = state
 
     async def wait_for_sandbox_start(self, timeout: int) -> None:
-        raise AssertionError("inactive sandbox deletion must not wait for startup")
+        raise AssertionError("sandbox deletion must not wait for startup")
 
     async def refresh_data(self) -> None:
-        raise AssertionError("inactive sandbox deletion must not refresh before deletion")
+        raise AssertionError("sandbox deletion must not refresh before deletion")
 
     async def set_autostop_interval(self, interval: int) -> None:
-        raise AssertionError("inactive sandbox deletion must not update autostop")
-
-
-class BuildingSandbox(InnerSandbox):
-    state = SandboxState.BUILDING_SNAPSHOT
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.waited_for_start = False
-
-    async def wait_for_sandbox_start(self, timeout: int) -> None:
-        assert timeout == 0
-        self.waited_for_start = True
-        self.state = SandboxState.STARTED
+        raise AssertionError("sandbox deletion must not update autostop")
 
 
 class HungStartInnerSandbox(InnerSandbox):
@@ -871,12 +846,6 @@ class HungStartInnerSandbox(InnerSandbox):
         await asyncio.Event().wait()
 
 
-class RefreshToErrorSandbox(InnerSandbox):
-    async def refresh_data(self) -> None:
-        await super().refresh_data()
-        self.state = SandboxState.ERROR
-
-
 class BareHtml502RefreshSandbox(InnerSandbox):
     def __init__(self) -> None:
         super().__init__()
@@ -887,6 +856,11 @@ class BareHtml502RefreshSandbox(InnerSandbox):
         if self.refresh_attempts == 1:
             raise DaytonaError("Failed to refresh sandbox data: <html><h1>502 Bad Gateway</h1></html>")
         await super().refresh_data()
+
+
+class PersistentBareHtml502RefreshSandbox(InnerSandbox):
+    async def refresh_data(self) -> None:
+        raise DaytonaError("Failed to refresh sandbox data: <html><h1>502 Bad Gateway</h1></html>")
 
 
 class HangingRefreshSandbox(InnerSandbox):
@@ -941,6 +915,25 @@ class DaytonaClient:
             yield self.sandbox
 
         return sandboxes()
+
+
+class DeleteConflictDaytonaClient(DaytonaClient):
+    def __init__(self, sandbox: InnerSandbox) -> None:
+        super().__init__(sandbox)
+        self.delete_attempts = 0
+
+    async def delete(self, sandbox: InnerSandbox) -> None:
+        assert sandbox is self.sandbox
+        self.delete_attempts += 1
+        if self.delete_attempts == 1:
+            raise DaytonaConflictError("Sandbox was modified by another operation")
+        await super().delete(sandbox)
+
+
+class DeleteNotFoundDaytonaClient(DaytonaClient):
+    async def delete(self, sandbox: InnerSandbox) -> None:
+        assert sandbox is self.sandbox
+        raise DaytonaNotFoundError("sandbox not found")
 
 
 class DaytonaRegionsClient:
@@ -1947,6 +1940,16 @@ async def test_daytona_command_prefers_status_over_pty_exit() -> None:
     assert process.checked_session_id is None
 
 
+async def test_daytona_command_returns_completed_status_before_later_health_502(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inner = PersistentBareHtml502RefreshSandbox()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+    _skip_retry_sleep(monkeypatch, DaytonaSandbox._check_sandbox_alive)  # pyright: ignore[reportPrivateUsage]
+
+    assert [chunk async for chunk in sandbox.command("printf hello")] == ["hello"]
+
+
 async def test_daytona_command_reports_pty_exit_before_status() -> None:
     inner = InnerSandbox()
     process = LostPtyProcess(
@@ -2686,49 +2689,44 @@ def test_targeted_snapshot_rejects_empty_target() -> None:
         TargetedSnapshotSource(snapshot="snap-1", target="")
 
 
-async def test_daytona_provider_delete_sets_autostop_before_delete() -> None:
+@pytest.mark.parametrize(
+    "state",
+    [
+        SandboxState.CREATING,
+        SandboxState.STARTED,
+        SandboxState.BUILDING_SNAPSHOT,
+        SandboxState.ERROR,
+        SandboxState.STOPPED,
+        SandboxState.ARCHIVED,
+    ],
+)
+async def test_daytona_provider_delete_does_not_prepare_sandbox(state: SandboxState) -> None:
+    inner = DeleteWithoutPreparationSandbox(state)
+    daytona = DaytonaClient(inner)
+
+    await _provider(daytona).delete_sandbox(inner.name)
+
+    assert daytona.deleted is True
+
+
+async def test_daytona_provider_delete_retries_state_conflicts(monkeypatch: pytest.MonkeyPatch) -> None:
     inner = InnerSandbox()
-    daytona = DaytonaClient(inner)
-
-    await _provider(daytona).delete_sandbox(inner.name)
-
-    assert inner.autostop_interval == 1
-    assert daytona.deleted is True
-
-
-async def test_daytona_provider_delete_retries_state_conflicts() -> None:
-    inner = DeleteConflictSandbox()
-    daytona = DaytonaClient(inner)
-
-    await _provider(daytona).delete_sandbox(inner.name)
-
-    assert inner.autostop_attempts == 2
-    assert daytona.deleted is True
-
-
-async def test_daytona_provider_delete_retries_bare_html_502_refresh_errors() -> None:
-    inner = BareHtml502RefreshSandbox()
-    daytona = DaytonaClient(inner)
-
-    await _provider(daytona).delete_sandbox(inner.name)
-
-    assert inner.refresh_attempts == 2
-    assert daytona.deleted is True
-
-
-async def test_daytona_provider_delete_bounds_hung_sandbox_start(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Deleting a sandbox stuck short of STARTED must not block on the SDK's infinite start wait."""
-    inner = HungStartInnerSandbox()
-    daytona = DaytonaClient(inner)
-
-    monkeypatch.setattr(daytona_module, "_SANDBOX_START_TIMEOUT_SECONDS", 0.05)
-
+    daytona = DeleteConflictDaytonaClient(inner)
     _skip_retry_sleep(monkeypatch, DaytonaSandboxProvider.delete_sandbox)
 
-    with pytest.raises(SandboxConnectionError, match="timed out"):
-        await asyncio.wait_for(_provider(daytona).delete_sandbox(inner.name), timeout=5)
+    await _provider(daytona).delete_sandbox(inner.name)
 
-    assert inner.start_attempts == 6
+    assert daytona.delete_attempts == 2
+    assert daytona.deleted is True
+
+
+async def test_daytona_provider_delete_treats_final_not_found_as_absent() -> None:
+    inner = InnerSandbox()
+    daytona = DeleteNotFoundDaytonaClient(inner)
+
+    await _provider(daytona).delete_sandbox(inner.name)
+
+    assert daytona.deleted is False
 
 
 async def test_daytona_provider_get_retries_unexpected_errors(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -2802,58 +2800,6 @@ async def test_daytona_provider_create_maps_not_found_errors() -> None:
 
     with pytest.raises(SandboxNotFoundError, match="Sandbox not found: sandbox not found"):
         await _provider(daytona).create_sandbox(_request("sandbox-name"))
-
-
-async def test_daytona_provider_delete_removes_error_state_sandbox() -> None:
-    """Failed-state sandboxes should be deletable without waiting for startup.
-
-    Test cases:
-    - A sandbox in SandboxState.ERROR is deleted even though waiting for startup fails.
-    """
-    inner = ErrorStateSandbox()
-    daytona = DaytonaClient(inner)
-
-    await _provider(daytona).delete_sandbox(inner.name)
-
-    assert daytona.deleted is True
-
-
-async def test_daytona_provider_delete_removes_sandbox_that_fails_after_refresh() -> None:
-    """Sandbox state can change after the initial get and still be deletable.
-
-    Test cases:
-    - A sandbox that refreshes into SandboxState.ERROR is deleted without setting autostop.
-    """
-    inner = RefreshToErrorSandbox()
-    daytona = DaytonaClient(inner)
-
-    await _provider(daytona).delete_sandbox(inner.name)
-
-    assert inner.refresh_count == 1
-    assert inner.autostop_interval is None
-    assert daytona.deleted is True
-
-
-@pytest.mark.parametrize("state", [SandboxState.STOPPED, SandboxState.ARCHIVED])
-async def test_daytona_provider_delete_removes_inactive_sandbox_without_starting(state: SandboxState) -> None:
-    inner = InactiveSandbox(state)
-    daytona = DaytonaClient(inner)
-
-    await _provider(daytona).delete_sandbox(inner.name)
-
-    assert daytona.deleted is True
-
-
-async def test_daytona_provider_delete_waits_for_building_sandbox() -> None:
-    inner = BuildingSandbox()
-    daytona = DaytonaClient(inner)
-
-    await _provider(daytona).delete_sandbox(inner.name)
-
-    assert inner.waited_for_start is True
-    assert inner.refresh_count == 1
-    assert inner.autostop_interval == 1
-    assert daytona.deleted is True
 
 
 def test_sandbox_query_rejects_naive_creation_cutoff() -> None:

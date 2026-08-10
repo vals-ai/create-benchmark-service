@@ -104,7 +104,6 @@ _DEAD_SANDBOX_STATES = (
     SandboxState.STOPPED,
     *_FAILED_SANDBOX_STATES,
 )
-_DELETE_WITHOUT_START_STATES = (*_DEAD_SANDBOX_STATES, SandboxState.ARCHIVED)
 _SANDBOX_OPERATION_ERRORS = (DaytonaError, ClientResponseError)
 _TRANSIENT_DAYTONA_ERRORS = (DaytonaConnectionError, DaytonaRateLimitError, DaytonaTimeoutError)
 _RETRY_AFTER_PREFIX = "retry-after-"
@@ -675,11 +674,11 @@ class DaytonaSandbox(Sandbox):
             reconnect_attempts = 0
             while True:
                 done, _ = await asyncio.wait({wait_task}, timeout=_PTY_STATUS_POLL_SECONDS)
-                await self._check_sandbox_alive()
                 result = await self._control_exec(f"test -e {shlex.quote(status_path)}")
                 if result.exit_code == 0:
                     break
 
+                await self._check_sandbox_alive()
                 if not done:
                     continue
 
@@ -1044,21 +1043,8 @@ class DaytonaSandboxProvider(SandboxProvider):
     async def delete_sandbox(self, instance_id: str) -> None:
         try:
             sandbox = await _bounded("daytona.get", self._daytona.get(instance_id), _TOOLBOX_CALL_TIMEOUT_SECONDS)
-            if sandbox.state not in _DELETE_WITHOUT_START_STATES:
-                await _bounded(
-                    "wait_for_sandbox_start",
-                    sandbox.wait_for_sandbox_start(timeout=0),
-                    _SANDBOX_START_TIMEOUT_SECONDS,
-                )
-                await _bounded("refresh_data", sandbox.refresh_data(), _TOOLBOX_CALL_TIMEOUT_SECONDS)
             if sandbox.state in _REMOVED_SANDBOX_STATES:
                 return
-            if sandbox.state not in _DELETE_WITHOUT_START_STATES:
-                await _bounded(
-                    "set_autostop_interval",
-                    sandbox.set_autostop_interval(interval=1),
-                    _TOOLBOX_CALL_TIMEOUT_SECONDS,
-                )
             await self._daytona.delete(sandbox)
         except DaytonaNotFoundError:
             return

@@ -2344,6 +2344,38 @@ async def test_daytona_command_applies_reconciliation_ownership_to_terminal_fail
     assert process.status_cleanup_calls == expected_kills
 
 
+@pytest.mark.parametrize(
+    ("blocked_stage", "operation", "expected_kills"),
+    [
+        ("get", "process.get_pty_session_info", 0),
+        ("connect", "process.connect_pty_session", 1),
+    ],
+)
+async def test_daytona_command_bounds_stalled_pty_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+    blocked_stage: str,
+    operation: str,
+    expected_kills: int,
+) -> None:
+    await _disable_pty_retry_waits(monkeypatch)
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", 0.01)
+    process = BlockingReconciliationProcess(blocked_stage)
+    inner = InnerSandbox()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+    generator = sandbox.command("printf hello")
+
+    with pytest.raises(SandboxConnectionError, match=rf"Daytona {operation} timed out"):
+        await asyncio.wait_for(anext(generator), timeout=2)
+    await generator.aclose()
+
+    assert all(handle.inputs == [] for handle in process.handles)
+    assert len(process.get_session_ids) == (6 if blocked_stage == "get" else 1)
+    assert len(process.connect_session_ids) == (0 if blocked_stage == "get" else 6)
+    assert len(process.killed_session_ids) == expected_kills
+    assert process.status_cleanup_calls == expected_kills
+
+
 @pytest.mark.parametrize(("blocked_stage", "expected_kills"), [("get", 0), ("connect", 1)])
 async def test_daytona_command_cancellation_respects_reconciliation_ownership(
     monkeypatch: pytest.MonkeyPatch,

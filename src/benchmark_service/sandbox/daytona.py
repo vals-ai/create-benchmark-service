@@ -760,7 +760,11 @@ class DaytonaSandbox(Sandbox):
     @_PROVIDER_RETRY
     async def _get_pty_create_session_info(self, session_id: str) -> PtySessionInfo:
         try:
-            return await self._sandbox.process.get_pty_session_info(session_id)
+            return await _bounded(
+                "process.get_pty_session_info",
+                self._sandbox.process.get_pty_session_info(session_id),
+                _TOOLBOX_CALL_TIMEOUT_SECONDS,
+            )
         except _SANDBOX_OPERATION_ERRORS as exc:
             await self._check_sandbox_alive()
             if isinstance(exc, DaytonaNotFoundError) or _provider_status_code(exc) == 404:
@@ -777,7 +781,11 @@ class DaytonaSandbox(Sandbox):
         on_data: Callable[[bytes], Awaitable[None]],
     ) -> AsyncPtyHandle:
         try:
-            return await self._sandbox.process.connect_pty_session(session_id, on_data)
+            return await _bounded(
+                "process.connect_pty_session",
+                self._sandbox.process.connect_pty_session(session_id, on_data),
+                _TOOLBOX_CALL_TIMEOUT_SECONDS,
+            )
         except _SANDBOX_OPERATION_ERRORS as exc:
             await self._check_sandbox_alive()
             if isinstance(exc, DaytonaNotFoundError) or _provider_status_code(exc) == 404:

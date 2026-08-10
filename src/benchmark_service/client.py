@@ -59,12 +59,9 @@ _OUTAGE_STARTED_ENV = "VALKYRIE_SANDBOX_OUTAGE_STARTED_EPOCH"
 # uvicorn --ws-ping-interval 30 --ws-ping-timeout 10.
 _SERVER_PING_INTERVAL_S = 30
 _SERVER_PING_TIMEOUT_S = 10
-# The client pings on the server's cadence but never times a pong out. A blocked server event loop
-# cannot run its own keepalive, so any client pong deadline makes the client the sole and strictest
-# actor: measured end-to-end, a 40s deadline turned a 180s loop stall that previously returned a
-# correct result into a hard failure, discarding work the server went on to finish. Detecting a
-# genuinely dead peer needs a deadline, but it is only safe once evaluation can resume from a
-# checkpoint after the close, so it belongs with the reconnect work rather than here.
+# The client pings on that cadence but never times a pong out: a blocked server event loop runs no
+# keepalive of its own, so a client deadline would make it the sole actor and fail evaluations the
+# server goes on to complete.
 _WS_PING_INTERVAL_S = _SERVER_PING_INTERVAL_S
 _WS_PING_TIMEOUT_S = None
 
@@ -105,12 +102,9 @@ class BenchmarkServiceUnauthenticatedError(BenchmarkServiceError):
 
 
 class BenchmarkServiceStreamClosedError(BenchmarkServiceError):
-    """Exception raised when an established evaluation WebSocket closes without a terminal chunk.
+    """Raised when an established evaluation WebSocket closes without a terminal chunk.
 
-    ``idle_s`` is the seconds of silence since the last application message (or since connection
-    establishment, if none arrived), not since the last ping, so a server keepalive close reads as
-    "WebSocket closed with code 1011: keepalive ping timeout after 783.0s without an application
-    message".
+    ``idle_s`` counts silence since the last application message, or since connect if none arrived.
     """
 
     close_code: int | None

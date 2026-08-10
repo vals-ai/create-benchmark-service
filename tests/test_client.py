@@ -1044,11 +1044,7 @@ async def test_ws_close_reports_the_close_frame_detail(close_frame: Close | None
 
 
 async def test_ws_connect_pings_on_the_server_cadence_without_a_pong_deadline() -> None:
-    """The client pings on the server's 30s cadence but never closes a socket for a missing pong.
-
-    A blocked server event loop runs no keepalive of its own, so a client pong deadline would make
-    the client the sole actor and fail evaluations the server goes on to complete.
-    """
+    """The client pings on the server's 30s cadence but never closes a socket for a missing pong."""
     mock_connect = _ws_mock([json.dumps({"type": "result", "data": {"score": 1.0}})])
     client = _make_client()
 
@@ -1060,11 +1056,7 @@ async def test_ws_connect_pings_on_the_server_cadence_without_a_pong_deadline() 
 
 
 def test_dockerfile_template_matches_the_client_keepalive_constants() -> None:
-    """The uvicorn --ws-ping-* flags and the client's _SERVER_PING_* constants must not drift apart.
-
-    test_ws_connect_pings_on_the_server_cadence_without_a_pong_deadline pins the client half, so editing
-    either side of the contract alone fails one of the two tests.
-    """
+    """The uvicorn --ws-ping-* flags and the client's _SERVER_PING_* constants must not drift apart."""
     dockerfile = Path(__file__).resolve().parents[1] / "templates" / "Dockerfile"
     cmd_line = next(line for line in dockerfile.read_text().splitlines() if line.startswith("CMD "))
     cmd: list[str] = json.loads(cmd_line.removeprefix("CMD "))

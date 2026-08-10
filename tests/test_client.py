@@ -1,6 +1,8 @@
 """Tests for BenchmarkServiceClient."""
 
 import json
+import socket
+from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import UUID
@@ -11,8 +13,14 @@ from pydantic import ValidationError
 from websockets.exceptions import ConnectionClosedError
 from websockets.frames import Close
 
-from benchmark_service import SandboxNotFoundError, SandboxRecoveryPolicy
-from benchmark_service.client import BenchmarkServiceClient, BenchmarkServiceError, SandboxRecoveryAttempt
+from benchmark_service import BenchmarkServiceStreamClosedError, SandboxNotFoundError, SandboxRecoveryPolicy
+from benchmark_service.client import (
+    _SERVER_PING_INTERVAL_S,  # pyright: ignore[reportPrivateUsage]
+    _SERVER_PING_TIMEOUT_S,  # pyright: ignore[reportPrivateUsage]
+    BenchmarkServiceClient,
+    BenchmarkServiceError,
+    SandboxRecoveryAttempt,
+)
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
 from benchmark_service.schemas import RetrieveTaskResponse
@@ -848,6 +856,9 @@ class _AsyncIterator:
     def __init__(self, items: list[str], terminal_error: Exception | None = None) -> None:
         self._items = iter(items)
         self._terminal_error = terminal_error
+        # Post-close attributes the client reads when the stream ends without a terminal chunk.
+        self.close_code = 1000
+        self.close_reason = ""
 
     def __aiter__(self) -> "_AsyncIterator":
         return self
@@ -1001,30 +1012,90 @@ async def test_ws_connection_closed_without_result(method: str, args: list[str])
 
     client = _make_client()
     with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
-        with pytest.raises(BenchmarkServiceError, match="without returning final result"):
+        with pytest.raises(BenchmarkServiceStreamClosedError) as exc_info:
             await getattr(client, method)(*args)
+
+    exc = exc_info.value
+    assert str(exc) == f"WebSocket closed with code 1000 after {exc.idle_s:.1f}s without an application message"
 
 
 @pytest.mark.parametrize(
-    ("code", "reason"),
+    ("close_frame", "expected_detail"),
     [
-        (1008, "Evaluation quota reached; retry after 2026-07-27T00:00:00Z."),
-        (1011, "Evaluation quota enforcement is temporarily unavailable; try again later."),
+        (
+            Close(1008, "Evaluation quota reached; retry after 2026-07-27T00:00:00Z."),
+            "with code 1008: Evaluation quota reached; retry after 2026-07-27T00:00:00Z.",
+        ),
+        (None, "without a close frame"),
     ],
+    ids=["code_and_reason", "no_close_frame"],
 )
-async def test_ws_quota_close_is_reported_as_benchmark_service_error(
-    code: int,
-    reason: str,
-) -> None:
-    close_frame = Close(code, reason)
+async def test_ws_close_reports_the_close_frame_detail(close_frame: Close | None, expected_detail: str) -> None:
+    """A server close carrying a reason (quota rejection) and an abrupt drop render distinguishably."""
     mock_connect = _ws_mock([], ConnectionClosedError(close_frame, None))
     client = _make_client()
 
     with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
-        with pytest.raises(BenchmarkServiceError) as exc_info:
+        with pytest.raises(BenchmarkServiceStreamClosedError) as exc_info:
             await client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG)
 
-    assert str(exc_info.value) == f"WebSocket closed with code {code}: {reason}"
+    exc = exc_info.value
+    assert str(exc) == f"WebSocket closed {expected_detail} after {exc.idle_s:.1f}s without an application message"
+
+
+async def test_ws_connect_pings_on_the_server_cadence_without_a_pong_deadline() -> None:
+    """The client pings on the server's 30s cadence but never closes a socket for a missing pong."""
+    mock_connect = _ws_mock([json.dumps({"type": "result", "data": {"score": 1.0}})])
+    client = _make_client()
+
+    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect) as connect:
+        await client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG)
+
+    assert connect.call_args.kwargs["ping_interval"] == 30
+    assert connect.call_args.kwargs["ping_timeout"] is None
+
+
+def test_dockerfile_template_matches_the_client_keepalive_constants() -> None:
+    """The uvicorn --ws-ping-* flags and the client's _SERVER_PING_* constants must not drift apart."""
+    dockerfile = Path(__file__).resolve().parents[1] / "templates" / "Dockerfile"
+    cmd_line = next(line for line in dockerfile.read_text().splitlines() if line.startswith("CMD "))
+    cmd: list[str] = json.loads(cmd_line.removeprefix("CMD "))
+
+    assert cmd[cmd.index("--ws-ping-interval") + 1] == str(_SERVER_PING_INTERVAL_S)
+    assert cmd[cmd.index("--ws-ping-timeout") + 1] == str(_SERVER_PING_TIMEOUT_S)
+
+
+async def test_ws_close_silence_is_measured_from_last_application_message() -> None:
+    """idle_s counts from the last application message, not from connection establishment."""
+    close_frame = Close(1011, "keepalive ping timeout")
+    mock_connect = _ws_mock(
+        [json.dumps({"type": "message", "data": "still grading"})],
+        ConnectionClosedError(close_frame, None),
+    )
+    client = _make_client()
+    # The client stamps time.monotonic() three times on this path: connection establishment,
+    # the application message, and the close.
+    fake_time = MagicMock()
+    fake_time.monotonic.side_effect = [100.0, 250.0, 251.5]
+
+    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+        with patch("benchmark_service.client.time", fake_time):
+            with pytest.raises(BenchmarkServiceStreamClosedError) as exc_info:
+                await client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG)
+
+    assert exc_info.value.close_code == 1011
+    assert exc_info.value.close_reason == "keepalive ping timeout"
+    # 251.5 - 250.0, from the message; measured from connection establishment it would be 151.5.
+    assert exc_info.value.idle_s == 1.5
+
+
+async def test_ws_preconnection_failure_propagates_as_transport_error() -> None:
+    """DNS/connect/handshake failures stay distinguishable: they are never wrapped in a service error."""
+    client = _make_client()
+
+    with patch("benchmark_service.client.websockets.connect", side_effect=socket.gaierror("Name or service not known")):
+        with pytest.raises(socket.gaierror):
+            await client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG)
 
 
 async def test_client_list_tasks_returns_v1_dataset_tasks_response(

@@ -55,6 +55,16 @@ _RecoveryResult = TypeVar("_RecoveryResult")
 _OUTAGE_ID_ENV = "VALKYRIE_SANDBOX_OUTAGE_ID"
 _OUTAGE_STARTED_ENV = "VALKYRIE_SANDBOX_OUTAGE_STARTED_EPOCH"
 
+# Server half of the keepalive contract, set in templates/Dockerfile:
+# uvicorn --ws-ping-interval 30 --ws-ping-timeout 10.
+_SERVER_PING_INTERVAL_S = 30
+_SERVER_PING_TIMEOUT_S = 10
+# The client pings on that cadence but never times a pong out: a blocked server event loop runs no
+# keepalive of its own, so a client deadline would make it the sole actor and fail evaluations the
+# server goes on to complete.
+_WS_PING_INTERVAL_S = _SERVER_PING_INTERVAL_S
+_WS_PING_TIMEOUT_S = None
+
 _retry_http = retry(
     retry=retry_if_exception_type(
         (
@@ -89,6 +99,28 @@ class BenchmarkServiceUnauthenticatedError(BenchmarkServiceError):
 
     def __str__(self) -> str:
         return "Authentication failed: " + super().__str__()
+
+
+class BenchmarkServiceStreamClosedError(BenchmarkServiceError):
+    """Raised when an established evaluation WebSocket closes without a terminal chunk.
+
+    ``idle_s`` counts silence since the last application message, or since connect if none arrived.
+    """
+
+    close_code: int | None
+    close_reason: str | None
+    idle_s: float
+
+    def __init__(self, *, close_code: int | None, close_reason: str | None, idle_s: float) -> None:
+        if close_code is None:
+            detail = "without a close frame"
+        else:
+            reason = f": {close_reason}" if close_reason else ""
+            detail = f"with code {close_code}{reason}"
+        super().__init__(f"WebSocket closed {detail} after {idle_s:.1f}s without an application message")
+        self.close_code = close_code
+        self.close_reason = close_reason
+        self.idle_s = idle_s
 
 
 def _unauthenticated_error(response: httpx.Response) -> "BenchmarkServiceUnauthenticatedError":
@@ -264,20 +296,26 @@ class BenchmarkServiceClient:
             The data payload from the final "result" chunk.
 
         Raises:
-            BenchmarkServiceError: If an "error" chunk is received or the connection
-                closes without a result.
+            BenchmarkServiceError: If an "error" chunk is received.
+            BenchmarkServiceStreamClosedError: If the established socket closes without a
+                terminal chunk. Pre-connection failures (DNS, connect, handshake) stay
+                distinguishable: they propagate unwrapped from websockets.connect.
         """
-        try:
-            async with websockets.connect(
-                f"{self._ws_url}/ws/{path}",
-                additional_headers=self._headers,
-                open_timeout=60,
-                ping_timeout=None,
-                max_size=10 * 1024 * 1024,  # 10MB
-            ) as websocket:
+        async with websockets.connect(
+            f"{self._ws_url}/ws/{path}",
+            additional_headers=self._headers,
+            open_timeout=60,
+            ping_interval=_WS_PING_INTERVAL_S,
+            ping_timeout=_WS_PING_TIMEOUT_S,
+            max_size=10 * 1024 * 1024,  # 10MB
+        ) as websocket:
+            last_message_at = time.monotonic()
+
+            try:
                 await websocket.send(request.model_dump_json())
 
                 async for message in websocket:
+                    last_message_at = time.monotonic()
                     chunk: StreamChunk = _stream_chunk_adapter.validate_json(message)
 
                     match chunk.type:
@@ -291,16 +329,20 @@ class BenchmarkServiceClient:
                         case "eval_resume_state":
                             if on_eval_resume_state:
                                 on_eval_resume_state(chunk.data)
-        except ConnectionClosed as exc:
-            close_frame = exc.rcvd or exc.sent
-            if close_frame is None:
-                detail = "without a close code"
-            else:
-                reason = f": {close_frame.reason}" if close_frame.reason else ""
-                detail = f"with code {close_frame.code}{reason}"
-            raise BenchmarkServiceError(f"WebSocket closed {detail}") from exc
+            except ConnectionClosed as exc:
+                close_frame = exc.rcvd or exc.sent
+                raise BenchmarkServiceStreamClosedError(
+                    close_code=close_frame.code if close_frame else None,
+                    close_reason=close_frame.reason if close_frame else None,
+                    idle_s=time.monotonic() - last_message_at,
+                ) from exc
 
-        raise BenchmarkServiceError("Exited websocket without returning final result")
+            # The socket closed cleanly, but a stream without a terminal chunk is still broken.
+            raise BenchmarkServiceStreamClosedError(
+                close_code=websocket.close_code,
+                close_reason=websocket.close_reason,
+                idle_s=time.monotonic() - last_message_at,
+            )
 
     @_retry_http
     async def health_check(self) -> HealthCheckResponse:

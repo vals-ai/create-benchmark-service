@@ -6,6 +6,7 @@ from benchmark_service.base import BenchmarkService
 from benchmark_service.client import (
     BenchmarkServiceClient,
     BenchmarkServiceError,
+    BenchmarkServiceStreamClosedError,
     BenchmarkServiceUnauthenticatedError,
     SandboxRecoveryAttempt,
 )
@@ -47,6 +48,7 @@ __all__ = [
     "BenchmarkServiceUnauthenticatedError",
     "BenchmarkServiceClient",
     "BenchmarkServiceError",
+    "BenchmarkServiceStreamClosedError",
     "SandboxRecoveryAttempt",
     "ArtifactGradingSubmission",
     "ComposeSource",

@@ -104,7 +104,6 @@ _DEAD_SANDBOX_STATES = (
     SandboxState.STOPPED,
     *_FAILED_SANDBOX_STATES,
 )
-_DELETE_WITHOUT_START_STATES = (*_DEAD_SANDBOX_STATES, SandboxState.ARCHIVED)
 _SANDBOX_OPERATION_ERRORS = (DaytonaError, ClientResponseError)
 _TRANSIENT_DAYTONA_ERRORS = (DaytonaConnectionError, DaytonaRateLimitError, DaytonaTimeoutError)
 _RETRY_AFTER_PREFIX = "retry-after-"
@@ -612,6 +611,7 @@ class DaytonaSandbox(Sandbox):
     async def _exec_pty(self, command: str, output: asyncio.Queue[str], env_vars: dict[str, str]) -> ExecResult:
         session_id = f"{self.id}:exec-{uuid.uuid4().hex}"
         status_path = f"{_STATUS_DIR}/{uuid.uuid4().hex}.status"
+        status_temp_path = f"{status_path}.tmp"
         # Keep only a bounded tail of the output for the ExecResult; the full stream is
         # forwarded through the queue, so retaining it all would grow without limit on
         # long-running, chatty commands.
@@ -666,7 +666,9 @@ class DaytonaSandbox(Sandbox):
             await _bounded(
                 "handle.send_input",
                 handle.send_input(
-                    f"mkdir -p {shlex.quote(_STATUS_DIR)}; {command}; echo $? > {shlex.quote(status_path)}; exit\n"
+                    f"mkdir -p {shlex.quote(_STATUS_DIR)}; {command}; "
+                    f"printf '%s\\n' \"$?\" > {shlex.quote(status_temp_path)} "
+                    f"&& mv {shlex.quote(status_temp_path)} {shlex.quote(status_path)}; exit\n"
                 ),
                 _TOOLBOX_CALL_TIMEOUT_SECONDS,
             )
@@ -675,9 +677,28 @@ class DaytonaSandbox(Sandbox):
             reconnect_attempts = 0
             while True:
                 done, _ = await asyncio.wait({wait_task}, timeout=_PTY_STATUS_POLL_SECONDS)
-                await self._check_sandbox_alive()
-                result = await self._control_exec(f"test -e {shlex.quote(status_path)}")
+                try:
+                    result = await self._control_exec(f"test -e {shlex.quote(status_path)}")
+                except SandboxError:
+                    status_exists = False
+                    with suppress(SandboxError):
+                        result = await self._control_exec(f"test -e {shlex.quote(status_path)}")
+                        status_exists = result.exit_code == 0
+                    if not status_exists:
+                        raise
+                    break
                 if result.exit_code == 0:
+                    break
+
+                try:
+                    await self._check_sandbox_alive()
+                except SandboxError:
+                    status_exists = False
+                    with suppress(SandboxError):
+                        result = await self._control_exec(f"test -e {shlex.quote(status_path)}")
+                        status_exists = result.exit_code == 0
+                    if not status_exists:
+                        raise
                     break
 
                 if not done:
@@ -726,7 +747,7 @@ class DaytonaSandbox(Sandbox):
                         _TOOLBOX_CALL_TIMEOUT_SECONDS,
                     )
                 with suppress(Exception):
-                    await self._control_exec(f"rm -f {shlex.quote(status_path)}")
+                    await self._control_exec(f"rm -f {shlex.quote(status_path)} {shlex.quote(status_temp_path)}")
 
     @_PROVIDER_RETRY
     async def _create_pty_session(
@@ -1044,21 +1065,8 @@ class DaytonaSandboxProvider(SandboxProvider):
     async def delete_sandbox(self, instance_id: str) -> None:
         try:
             sandbox = await _bounded("daytona.get", self._daytona.get(instance_id), _TOOLBOX_CALL_TIMEOUT_SECONDS)
-            if sandbox.state not in _DELETE_WITHOUT_START_STATES:
-                await _bounded(
-                    "wait_for_sandbox_start",
-                    sandbox.wait_for_sandbox_start(timeout=0),
-                    _SANDBOX_START_TIMEOUT_SECONDS,
-                )
-                await _bounded("refresh_data", sandbox.refresh_data(), _TOOLBOX_CALL_TIMEOUT_SECONDS)
             if sandbox.state in _REMOVED_SANDBOX_STATES:
                 return
-            if sandbox.state not in _DELETE_WITHOUT_START_STATES:
-                await _bounded(
-                    "set_autostop_interval",
-                    sandbox.set_autostop_interval(interval=1),
-                    _TOOLBOX_CALL_TIMEOUT_SECONDS,
-                )
             await self._daytona.delete(sandbox)
         except DaytonaNotFoundError:
             return

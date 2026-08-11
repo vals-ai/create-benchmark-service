@@ -891,6 +891,28 @@ class StatusDuringFailedRefreshSandbox(InnerSandbox):
         raise DaytonaError("Failed to refresh sandbox data: <html><h1>502 Bad Gateway</h1></html>")
 
 
+class StatusDuringFailedProbeProcess(Process):
+    def __init__(self, *, publish_status_on_failure: bool = True, fail_reprobe: bool = False) -> None:
+        super().__init__()
+        self.publish_status_on_failure = publish_status_on_failure
+        self.fail_reprobe = fail_reprobe
+        self.status_exists = False
+        self.status_probe_commands: list[str] = []
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        evaluated_command = _unwrap_shell_command(command)
+        if evaluated_command.startswith("test -e "):
+            self.status_probe_commands.append(evaluated_command)
+            if len(self.status_probe_commands) == 1:
+                self.status_exists = self.publish_status_on_failure
+                raise DaytonaError("Failed to execute command: initial status probe failed")
+            assert evaluated_command == self.status_probe_commands[0]
+            if self.fail_reprobe:
+                raise DaytonaError("Failed to execute command: reconciliation status probe failed")
+            return SimpleNamespace(exit_code=0 if self.status_exists else 1, result="")
+        return await super().exec(command)
+
+
 class HangingRefreshSandbox(InnerSandbox):
     def __init__(self) -> None:
         super().__init__()
@@ -2004,6 +2026,30 @@ async def test_daytona_command_rechecks_status_written_during_failed_health_refr
     _skip_retry_sleep(monkeypatch, DaytonaSandbox._check_sandbox_alive)  # pyright: ignore[reportPrivateUsage]
 
     assert [chunk async for chunk in sandbox.command("printf hello")] == ["hello"]
+
+
+async def test_daytona_command_rechecks_status_after_initial_probe_failure() -> None:
+    inner = InnerSandbox()
+    process = StatusDuringFailedProbeProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    assert [chunk async for chunk in sandbox.command("printf hello")] == ["hello"]
+    assert len(process.status_probe_commands) == 2
+
+
+@pytest.mark.parametrize("fail_reprobe", [False, True], ids=["status-absent", "reprobe-failed"])
+async def test_daytona_command_preserves_initial_probe_error_without_completed_status(fail_reprobe: bool) -> None:
+    inner = InnerSandbox()
+    process = StatusDuringFailedProbeProcess(publish_status_on_failure=False, fail_reprobe=fail_reprobe)
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxError, match="initial status probe failed"):
+        _ = [chunk async for chunk in sandbox.command("printf hello")]
+
+    assert len(process.status_probe_commands) == 2
+    assert inner.refresh_count == 0
 
 
 async def test_daytona_command_reports_pty_exit_before_status() -> None:

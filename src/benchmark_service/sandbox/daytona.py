@@ -677,7 +677,16 @@ class DaytonaSandbox(Sandbox):
             reconnect_attempts = 0
             while True:
                 done, _ = await asyncio.wait({wait_task}, timeout=_PTY_STATUS_POLL_SECONDS)
-                result = await self._control_exec(f"test -e {shlex.quote(status_path)}")
+                try:
+                    result = await self._control_exec(f"test -e {shlex.quote(status_path)}")
+                except SandboxError:
+                    status_exists = False
+                    with suppress(SandboxError):
+                        result = await self._control_exec(f"test -e {shlex.quote(status_path)}")
+                        status_exists = result.exit_code == 0
+                    if not status_exists:
+                        raise
+                    break
                 if result.exit_code == 0:
                     break
 

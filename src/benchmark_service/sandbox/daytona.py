@@ -611,6 +611,7 @@ class DaytonaSandbox(Sandbox):
     async def _exec_pty(self, command: str, output: asyncio.Queue[str], env_vars: dict[str, str]) -> ExecResult:
         session_id = f"{self.id}:exec-{uuid.uuid4().hex}"
         status_path = f"{_STATUS_DIR}/{uuid.uuid4().hex}.status"
+        status_temp_path = f"{status_path}.tmp"
         # Keep only a bounded tail of the output for the ExecResult; the full stream is
         # forwarded through the queue, so retaining it all would grow without limit on
         # long-running, chatty commands.
@@ -665,7 +666,9 @@ class DaytonaSandbox(Sandbox):
             await _bounded(
                 "handle.send_input",
                 handle.send_input(
-                    f"mkdir -p {shlex.quote(_STATUS_DIR)}; {command}; echo $? > {shlex.quote(status_path)}; exit\n"
+                    f"mkdir -p {shlex.quote(_STATUS_DIR)}; {command}; "
+                    f"printf '%s\\n' \"$?\" > {shlex.quote(status_temp_path)} "
+                    f"&& mv {shlex.quote(status_temp_path)} {shlex.quote(status_path)}; exit\n"
                 ),
                 _TOOLBOX_CALL_TIMEOUT_SECONDS,
             )
@@ -735,7 +738,7 @@ class DaytonaSandbox(Sandbox):
                         _TOOLBOX_CALL_TIMEOUT_SECONDS,
                     )
                 with suppress(Exception):
-                    await self._control_exec(f"rm -f {shlex.quote(status_path)}")
+                    await self._control_exec(f"rm -f {shlex.quote(status_path)} {shlex.quote(status_temp_path)}")
 
     @_PROVIDER_RETRY
     async def _create_pty_session(

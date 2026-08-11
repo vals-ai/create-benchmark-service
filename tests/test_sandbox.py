@@ -1845,6 +1845,24 @@ async def test_daytona_command_streams_output() -> None:
     assert output == ["hello"]
 
 
+async def test_daytona_command_publishes_status_atomically_and_cleans_temp() -> None:
+    inner = InnerSandbox()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    assert [chunk async for chunk in sandbox.command("printf hello")] == ["hello"]
+
+    assert inner.process.pty_handle is not None
+    publish_input = inner.process.pty_handle.inputs[1]
+    write_command, move_command = publish_input.split(" && mv ", maxsplit=1)
+    temp_path = shlex.split(write_command.rsplit(">", maxsplit=1)[1])[0]
+    move_args = shlex.split(move_command.removesuffix("; exit\n"))
+    assert move_args == [temp_path, temp_path.removesuffix(".tmp")]
+
+    assert inner.process.command is not None
+    cleanup_args = shlex.split(_unwrap_shell_command(inner.process.command))
+    assert cleanup_args == ["rm", "-f", temp_path.removesuffix(".tmp"), temp_path]
+
+
 async def test_daytona_command_uses_native_process_environment() -> None:
     secret = "value with spaces; $(touch /tmp/leaked)"
     inner = InnerSandbox()

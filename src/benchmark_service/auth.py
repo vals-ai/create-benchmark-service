@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import asyncio
-import hmac
 import json
 import logging
 import os
@@ -23,7 +22,9 @@ logger = logging.getLogger(__name__)
 DESCOPE_API_KEY_HEADER = "x-descope-api-key"
 DEFAULT_AUTH_CACHE_TTL_SECONDS = 300
 AUTH_CACHE_MAX_SIZE = 1024
-LEGACY_TENANT_SENTINEL = "_legacy"
+UNAUTHENTICATED_TENANT_SENTINEL = "_unauthenticated"
+AUTH_DISABLED_ENV = "AUTH_DISABLED"
+_REMOVED_AUTH_REQUIRED_ENV = "AUTH_REQUIRED"
 EvaluationQuotaPeriod = Literal["day", "week", "month", "year"]
 
 
@@ -85,7 +86,7 @@ def load_allowlist() -> AllowlistConfig:
     Resolution order:
       1. `DESCOPE_TENANT_ALLOWLIST_JSON` env var (production via CDK).
       2. `DESCOPE_ALLOWLIST_PATH` env var pointing at a YAML file (local dev).
-      3. Empty config (legal: fails closed when AUTH_REQUIRED=true; logs once).
+      3. Empty config (legal: fails closed for Descope callers; logs once).
 
     Raises:
         ValueError: if the configured source exists but is malformed.
@@ -126,10 +127,10 @@ def load_allowlist() -> AllowlistConfig:
 
     config = AllowlistConfig()
     _allowlist_cache = config
-    if get_auth_settings().auth_required and not _allowlist_warned:
+    if not get_auth_settings().auth_disabled and not _allowlist_warned:
         logger.warning(
             "No tenant allowlist configured (set %s or %s). All Descope-authenticated "
-            "requests will be rejected when AUTH_REQUIRED=true.",
+            "requests will be rejected.",
             _DESCOPE_ALLOWLIST_JSON_ENV,
             _DESCOPE_ALLOWLIST_PATH_ENV,
         )
@@ -160,9 +161,8 @@ _auth_cache: TTLCache[tuple[str, str], str] = TTLCache(
 class AuthSettings:
     """Runtime auth settings loaded from environment variables."""
 
-    auth_required: bool
+    auth_disabled: bool
     descope_project_id: str
-    benchmark_api_key: str | None
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -175,10 +175,25 @@ def _env_bool(name: str, default: bool = False) -> bool:
 def get_auth_settings() -> AuthSettings:
     """Load auth settings from the current process environment."""
     return AuthSettings(
-        auth_required=_env_bool("AUTH_REQUIRED"),
+        auth_disabled=_env_bool(AUTH_DISABLED_ENV),
         descope_project_id=os.environ.get("DESCOPE_PROJECT_ID", ""),
-        benchmark_api_key=os.environ.get("BENCHMARK_API_KEY"),
     )
+
+
+def require_supported_auth_config() -> None:
+    """Fail startup for deploys still configured for the removed bearer auth mode.
+
+    `AUTH_REQUIRED=false` used to select static `BENCHMARK_API_KEY` bearer auth.
+    Honouring it now would serve the deployment with no credential check at all,
+    so such a container refuses to boot until it is migrated to Descope.
+    """
+    value = os.environ.get(_REMOVED_AUTH_REQUIRED_ENV)
+    if value is not None and not _env_bool(_REMOVED_AUTH_REQUIRED_ENV):
+        raise RuntimeError(
+            f"{_REMOVED_AUTH_REQUIRED_ENV}={value!r} is no longer supported: static bearer "
+            "auth was removed. Configure Descope (DESCOPE_PROJECT_ID plus a tenant "
+            f"allowlist), or set {AUTH_DISABLED_ENV}=true for local development."
+        )
 
 
 def clear_auth_cache() -> None:
@@ -195,20 +210,11 @@ async def _exchange_descope_access_key(project_id: str, access_key: str) -> Mapp
     return await asyncio.to_thread(_get_descope_client(project_id).exchange_access_key, access_key)  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
 
 
-def _check_legacy_benchmark_api_key(headers: Mapping[str, str], settings: AuthSettings) -> bool:
-    if not settings.benchmark_api_key:
-        return True
-
-    authorization = headers.get("authorization", "")
-    expected = f"Bearer {settings.benchmark_api_key}"
-    return hmac.compare_digest(authorization, expected)
-
-
 async def resolve_descope_tenant(headers: Mapping[str, str]) -> str | None:
     """Validate a Descope access key and resolve a single allowlisted tenant."""
     settings = get_auth_settings()
     if not settings.descope_project_id:
-        logger.warning("AUTH_REQUIRED is true but DESCOPE_PROJECT_ID is not configured")
+        logger.warning("DESCOPE_PROJECT_ID is not configured, so no caller can authenticate")
         return None
 
     access_key = headers.get(DESCOPE_API_KEY_HEADER)
@@ -232,8 +238,8 @@ async def resolve_descope_tenant(headers: Mapping[str, str]) -> str | None:
         return None
 
     tenant = tenants[0]
-    if tenant == LEGACY_TENANT_SENTINEL:
-        logger.info("Descope tenant %s is reserved for legacy auth compatibility", tenant)
+    if tenant == UNAUTHENTICATED_TENANT_SENTINEL:
+        logger.info("Descope tenant %s is reserved for the local development sentinel", tenant)
         return None
 
     allowlist = load_allowlist()
@@ -246,13 +252,13 @@ async def resolve_descope_tenant(headers: Mapping[str, str]) -> str | None:
 
 
 async def resolve_caller_tenant(headers: Mapping[str, str]) -> str | None:
-    """Return the caller tenant id, "_legacy" sentinel, or None to reject."""
-    settings = get_auth_settings()
-    if settings.auth_required:
-        return await resolve_descope_tenant(headers)
-    return LEGACY_TENANT_SENTINEL if _check_legacy_benchmark_api_key(headers, settings) else None
+    """Return the caller tenant id, the local-dev sentinel, or None to reject.
 
-
-async def check_benchmark_service_auth(headers: Mapping[str, str]) -> bool:
-    """Validate benchmark-service auth headers using the configured auth mode."""
-    return await resolve_caller_tenant(headers) is not None
+    Descope access keys are the only accepted credential. `AUTH_DISABLED=true`
+    switches authentication off for local development; deployed services must
+    never set it, so a deploy that lacks Descope configuration rejects every
+    request instead of serving unauthenticated traffic.
+    """
+    if get_auth_settings().auth_disabled:
+        return UNAUTHENTICATED_TENANT_SENTINEL
+    return await resolve_descope_tenant(headers)

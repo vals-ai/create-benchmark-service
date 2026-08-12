@@ -13,8 +13,7 @@ from typing import Any, ClassVar, Self
 from fastapi.encoders import jsonable_encoder
 
 from benchmark_service.auth import (
-    LEGACY_TENANT_SENTINEL,
-    check_benchmark_service_auth,
+    UNAUTHENTICATED_TENANT_SENTINEL,
     load_allowlist,
     resolve_caller_tenant,
 )
@@ -116,35 +115,20 @@ class BenchmarkService(ABC):
         """
         ...
 
-    async def check_auth(self, headers: dict[str, str]) -> bool:
-        """Validate request authorization.
-
-        Defaults to the env-driven behavior in `benchmark_service.auth`.
-        Override to implement custom authentication.
-
-        Args:
-            headers: Request headers (keys are lowercase per HTTP convention).
-
-        Returns:
-            True to allow the request, False to reject with 401.
-        """
-        return await check_benchmark_service_auth(headers)
-
     async def resolve_tenant(self, headers: dict[str, str]) -> str | None:
         """Authenticate the caller and return their tenant id, or None to reject.
 
-        Subclasses with a legacy `check_auth` override keep their existing boolean
-        behavior. A successful legacy check returns the "_legacy" sentinel, which
-        skips dataset-level allowlist enforcement.
+        Defaults to Descope access-key resolution. Override for custom auth that
+        needs to derive a tenant some other way.
+
+        Args:
+            headers: Request headers (keys are lowercase per HTTP convention).
         """
-        if type(self).check_auth is not BenchmarkService.check_auth:
-            ok = await self.check_auth(headers)
-            return LEGACY_TENANT_SENTINEL if ok else None
         return await resolve_caller_tenant(headers)
 
     async def check_dataset_access(self, tenant: str, dataset: str | None) -> bool:
         """Return True if `tenant` may use `dataset` on this service."""
-        if tenant == LEGACY_TENANT_SENTINEL:
+        if tenant == UNAUTHENTICATED_TENANT_SENTINEL:
             return True
         allowlist = load_allowlist()
         entry = allowlist.tenants.get(tenant)

@@ -19,7 +19,12 @@ from uvicorn.protocols.utils import ClientDisconnected
 from websockets.exceptions import ConnectionClosed
 
 from benchmark_service._version import __version__ as _framework_version
-from benchmark_service.auth import LEGACY_TENANT_SENTINEL, get_tenant_config, load_allowlist
+from benchmark_service.auth import (
+    UNAUTHENTICATED_TENANT_SENTINEL,
+    get_tenant_config,
+    load_allowlist,
+    require_supported_auth_config,
+)
 from benchmark_service.base import BenchmarkService
 from benchmark_service.grading import SUBMISSION_ARTIFACT_SANDBOX_PATH, collapse_stream, evaluate_submission
 from benchmark_service.inflight import InflightMiddleware
@@ -100,16 +105,16 @@ _PUBLIC_PATHS = frozenset({"/health", "/version"})
 
 
 def _require_descope_tenant(tenant: str | None) -> None:
-    """Raise 403 when the resolved tenant is the legacy bearer sentinel.
+    """Raise 403 when the request was not authenticated against a Descope tenant.
 
-    The /v1/ surface requires Descope auth; legacy bearer callers resolve to
-    LEGACY_TENANT_SENTINEL and must be rejected even though they are technically
-    authenticated against the legacy key.
+    The /v1/ surface is tenant-scoped, so requests served with auth disabled
+    (local development) resolve to UNAUTHENTICATED_TENANT_SENTINEL and carry no
+    tenant identity to authorize against.
     """
-    if tenant == LEGACY_TENANT_SENTINEL:
+    if tenant == UNAUTHENTICATED_TENANT_SENTINEL:
         raise HTTPException(
             status_code=403,
-            detail="The /v1/ surface requires Descope authentication; legacy bearer auth is not accepted.",
+            detail="The /v1/ surface requires Descope authentication.",
         )
 
 
@@ -312,6 +317,7 @@ class BenchmarkServiceApp(FastAPI):
 
         @asynccontextmanager
         async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
+            require_supported_auth_config()
             allowlist = load_allowlist()
             evaluation_quota.require_configured(allowlist, service_name=configured_deployment_name)
             submission_artifacts.require_configured()

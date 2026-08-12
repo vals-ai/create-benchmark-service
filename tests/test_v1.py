@@ -56,7 +56,6 @@ def descope_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, Non
     """A client with a Descope tenant 'acme' allowed to see the 'default' dataset."""
     clear_allowlist_cache()
     clear_auth_cache()
-    monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
     monkeypatch.setenv(
         "DESCOPE_TENANT_ALLOWLIST_JSON",
@@ -77,7 +76,6 @@ def descope_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, Non
 def task_listing_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
     clear_allowlist_cache()
     clear_auth_cache()
-    monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
     monkeypatch.setenv(
         "DESCOPE_TENANT_ALLOWLIST_JSON",
@@ -97,7 +95,6 @@ def task_listing_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient
 def scoring_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
     clear_allowlist_cache()
     clear_auth_cache()
-    monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
     monkeypatch.setenv(
         "DESCOPE_TENANT_ALLOWLIST_JSON",
@@ -335,11 +332,10 @@ def test_v1_score_rejects_unauthorized_dataset_with_403(descope_client: TestClie
     assert resp.status_code == 403
 
 
-def test_v1_evaluate_rejects_legacy_bearer_with_403(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_v1_evaluate_rejects_unauthenticated_mode_with_403(monkeypatch: pytest.MonkeyPatch) -> None:
     clear_allowlist_cache()
     clear_auth_cache()
-    monkeypatch.setenv("AUTH_REQUIRED", "false")
-    monkeypatch.setenv("BENCHMARK_API_KEY", "legacy-key")
+    monkeypatch.setenv("AUTH_DISABLED", "true")
     app = BenchmarkServiceApp(StubBenchmark)
     with TestClient(app) as client:
         resp = client.post(
@@ -350,26 +346,23 @@ def test_v1_evaluate_rejects_legacy_bearer_with_403(monkeypatch: pytest.MonkeyPa
                 "dataset": "default",
                 "payload": {"type": "text", "schema": "stub.text.v1", "data": "2"},
             },
-            headers={"Authorization": "Bearer legacy-key"},
         )
     assert resp.status_code == 403
-    assert "legacy" in resp.json()["detail"].lower()
+    assert "descope" in resp.json()["detail"].lower()
 
 
-def test_v1_score_rejects_legacy_bearer_with_403(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_v1_score_rejects_unauthenticated_mode_with_403(monkeypatch: pytest.MonkeyPatch) -> None:
     clear_allowlist_cache()
     clear_auth_cache()
-    monkeypatch.setenv("AUTH_REQUIRED", "false")
-    monkeypatch.setenv("BENCHMARK_API_KEY", "legacy-key")
+    monkeypatch.setenv("AUTH_DISABLED", "true")
     app = BenchmarkServiceApp(StubBenchmark)
     with TestClient(app) as client:
         resp = client.post(
             "/v1/score",
             json={"run_id": "r", "dataset": "default", "evaluation_results": {}},
-            headers={"Authorization": "Bearer legacy-key"},
         )
     assert resp.status_code == 403
-    assert "legacy" in resp.json()["detail"].lower()
+    assert "descope" in resp.json()["detail"].lower()
 
 
 def test_v1_task_allows_benchmark_specific_extras() -> None:
@@ -447,17 +440,13 @@ def test_v1_list_dataset_tasks_unauthorized_nonexistent_dataset_gets_403_not_404
     assert resp.status_code == 403
 
 
-def test_v1_list_dataset_tasks_rejects_legacy_bearer_with_403(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_v1_list_dataset_tasks_rejects_unauthenticated_mode_with_403(monkeypatch: pytest.MonkeyPatch) -> None:
     clear_allowlist_cache()
     clear_auth_cache()
-    monkeypatch.setenv("AUTH_REQUIRED", "false")
-    monkeypatch.setenv("BENCHMARK_API_KEY", "legacy-key")
+    monkeypatch.setenv("AUTH_DISABLED", "true")
     app = BenchmarkServiceApp(StubBenchmark)
     with TestClient(app) as client:
-        resp = client.get(
-            "/v1/datasets/default/tasks",
-            headers={"Authorization": "Bearer legacy-key"},
-        )
+        resp = client.get("/v1/datasets/default/tasks")
     assert resp.status_code == 403
 
 
@@ -466,7 +455,6 @@ def test_v1_list_dataset_tasks_404_for_unknown_dataset_in_allowlist(monkeypatch:
     return 404 rather than leaking the difference between 'not allowed' and 'doesn't exist'."""
     clear_allowlist_cache()
     clear_auth_cache()
-    monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
     monkeypatch.setenv(
         "DESCOPE_TENANT_ALLOWLIST_JSON",

@@ -6,6 +6,8 @@ import asyncio
 import json
 import re
 from collections.abc import AsyncGenerator, Generator, Mapping
+from contextlib import asynccontextmanager
+from pathlib import Path
 from threading import Event
 from typing import Any, cast
 from unittest.mock import patch
@@ -18,6 +20,7 @@ from pydantic import ValidationError
 from benchmark_service import (
     ComposeSource,
     ImageSource,
+    MaterializedSubmissionArtifact,
     ModalProviderConfig,
     Resources,
     Sandbox,
@@ -535,6 +538,37 @@ class InProcessArtifactStub(StubBenchmark):
         )
 
 
+class MaterializedArtifactStub(StubBenchmark):
+    """Grades an admitted local artifact without creating a grading sandbox."""
+
+    eval_mode = EvalMode.IN_PROCESS_MATERIALIZED_ARTIFACT
+    accepted_submission_schemas = {
+        V1PayloadType.ARTIFACT: frozenset({"stub.workbook.v1"}),
+    }
+    artifact_call: tuple[str, str, str, str, bytes, str | None] | None = None
+    artifact_path: Path | None = None
+    artifact_reference: SubmissionArtifactReference | None = None
+
+    async def evaluate_materialized_artifact(
+        self,
+        *,
+        tenant: str,
+        run_id: str,
+        task_id: str,
+        schema_id: str,
+        artifact: MaterializedSubmissionArtifact,
+        dataset: str | None = None,
+    ) -> AsyncGenerator[StreamChunk, None]:
+        contents = artifact.path.read_bytes()
+        self.artifact_call = (tenant, run_id, task_id, schema_id, contents, dataset)
+        self.artifact_path = artifact.path
+        self.artifact_reference = artifact.reference
+        yield StreamResultChunk(
+            type="result",
+            data={"resolved": contents == b"workbook-bytes"},
+        )
+
+
 async def test_grade_instance_maps_missing_artifact_to_error(monkeypatch: pytest.MonkeyPatch) -> None:
     artifact_reference = SubmissionArtifactReference(
         key="submission-artifacts/acme/default/run-1/task-1/a.bin",
@@ -914,7 +948,7 @@ def test_sandbox_mode_without_accepted_schemas_fails_at_class_definition() -> No
                 pass
 
 
-def test_in_process_artifact_mode_requires_its_bytes_hook() -> None:
+def test_in_process_artifact_mode_requires_its_artifact_hook() -> None:
     with pytest.raises(TypeError, match="evaluate_artifact"):
 
         class _MissingArtifactHook(StubBenchmark):  # pyright: ignore[reportUnusedClass]
@@ -939,6 +973,38 @@ def test_in_process_artifact_mode_rejects_non_artifact_schemas() -> None:
                 task_id: str,
                 schema_id: str,
                 artifact: bytes,
+                dataset: str | None = None,
+            ) -> AsyncGenerator[StreamChunk, None]:
+                yield StreamResultChunk(type="result", data={})
+
+
+def test_materialized_artifact_mode_requires_its_artifact_hook() -> None:
+    with pytest.raises(TypeError, match="evaluate_materialized_artifact"):
+
+        class _MissingMaterializedArtifactHook(StubBenchmark):  # pyright: ignore[reportUnusedClass]
+            eval_mode = EvalMode.IN_PROCESS_MATERIALIZED_ARTIFACT
+            accepted_submission_schemas = {
+                V1PayloadType.ARTIFACT: frozenset({"stub.workbook.v1"}),
+            }
+
+
+def test_materialized_artifact_mode_rejects_non_artifact_schemas() -> None:
+    with pytest.raises(TypeError, match="only non-empty artifact"):
+
+        class _TextSchema(StubBenchmark):  # pyright: ignore[reportUnusedClass]
+            eval_mode = EvalMode.IN_PROCESS_MATERIALIZED_ARTIFACT
+            accepted_submission_schemas = {
+                V1PayloadType.TEXT: frozenset({"stub.text.v1"}),
+            }
+
+            async def evaluate_materialized_artifact(
+                self,
+                *,
+                tenant: str,
+                run_id: str,
+                task_id: str,
+                schema_id: str,
+                artifact: MaterializedSubmissionArtifact,
                 dataset: str | None = None,
             ) -> AsyncGenerator[StreamChunk, None]:
                 yield StreamResultChunk(type="result", data={})
@@ -1114,10 +1180,12 @@ def test_sandbox_mode_missing_artifact_storage_fails_at_boot(
             pass
 
 
+@pytest.mark.parametrize("service_cls", [InProcessArtifactStub, MaterializedArtifactStub])
 def test_in_process_artifact_mode_missing_storage_fails_at_boot(
     monkeypatch: pytest.MonkeyPatch,
+    service_cls: type[StubBenchmark],
 ) -> None:
-    app = _sandbox_app(monkeypatch, InProcessArtifactStub)
+    app = _sandbox_app(monkeypatch, service_cls)
     monkeypatch.delenv("SUBMISSION_ARTIFACT_BUCKET", raising=False)
 
     with pytest.raises(RuntimeError, match="SUBMISSION_ARTIFACT_BUCKET"):
@@ -1139,7 +1207,7 @@ def artifact_descope_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestCl
 
 @pytest.fixture
 def in_process_artifact_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
-    app = _sandbox_app(monkeypatch, InProcessArtifactStub)
+    app = _sandbox_app(monkeypatch, MaterializedArtifactStub)
 
     async def _stub_exchange(_project_id: str, _access_key: str) -> dict[str, dict[str, dict[str, str]]]:
         return {"tenants": {"acme": {}}}
@@ -1154,6 +1222,49 @@ def _post_eval(client: TestClient, payload: dict[str, Any]) -> Any:
         "/v1/evaluate",
         json={"run_id": "external-run-1", "task_id": "task-1", "dataset": "default", "payload": payload},
         headers={"x-descope-api-key": "key-acme"},
+    )
+
+
+def test_v1_evaluate_preserves_byte_backed_in_process_artifact_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = "submission-artifacts/acme/default/external-run-1/task-1/submission.xlsx"
+    reference = SubmissionArtifactReference(key=key, size_bytes=14, etag='"etag-1"')
+
+    async def fake_stat(k: str, *, tenant: str) -> SubmissionArtifactReference:
+        assert (k, tenant) == (key, "acme")
+        return reference
+
+    async def fake_download(admitted: SubmissionArtifactReference, *, tenant: str) -> bytes:
+        assert admitted is reference
+        assert tenant == "acme"
+        return b"workbook-bytes"
+
+    async def stub_exchange(_project_id: str, _access_key: str) -> dict[str, dict[str, dict[str, str]]]:
+        return {"tenants": {"acme": {}}}
+
+    monkeypatch.setattr("benchmark_service.submission_artifacts.stat", fake_stat)
+    monkeypatch.setattr("benchmark_service.submission_artifacts.download", fake_download)
+    app = _sandbox_app(monkeypatch, InProcessArtifactStub)
+    with patch.object(
+        auth_module,
+        "_exchange_descope_access_key",
+        stub_exchange,
+    ):
+        with TestClient(app) as client:
+            response = _post_eval(
+                client,
+                {"type": "artifact", "schema": "stub.workbook.v1", "data": key},
+            )
+
+    assert response.status_code == 200
+    service = cast(InProcessArtifactStub, app.service)
+    assert service.artifact_call == (
+        "external-run-1",
+        "task-1",
+        "stub.workbook.v1",
+        b"workbook-bytes",
+        "default",
     )
 
 
@@ -1187,9 +1298,10 @@ def test_v1_evaluate_artifact_payload_grades_from_materialized_artifact(
     assert stat_calls == 1
 
 
-def test_v1_evaluate_passes_only_admitted_bytes_to_in_process_benchmark(
+def test_v1_evaluate_passes_tenant_and_admitted_file_to_in_process_benchmark(
     in_process_artifact_client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     key = "submission-artifacts/acme/default/external-run-1/task-1/submission.xlsx"
     reference = SubmissionArtifactReference(key=key, size_bytes=14, etag='"etag-1"')
@@ -1198,13 +1310,20 @@ def test_v1_evaluate_passes_only_admitted_bytes_to_in_process_benchmark(
         assert (k, tenant) == (key, "acme")
         return reference
 
-    async def fake_download(admitted: SubmissionArtifactReference, *, tenant: str) -> bytes:
+    materialized_path = tmp_path / "submission.xlsx"
+
+    @asynccontextmanager
+    async def fake_materialize(admitted: SubmissionArtifactReference, *, tenant: str):
         assert admitted is reference
         assert tenant == "acme"
-        return b"workbook-bytes"
+        materialized_path.write_bytes(b"workbook-bytes")
+        try:
+            yield MaterializedSubmissionArtifact(path=materialized_path, reference=admitted)
+        finally:
+            materialized_path.unlink()
 
     monkeypatch.setattr("benchmark_service.submission_artifacts.stat", fake_stat)
-    monkeypatch.setattr("benchmark_service.submission_artifacts.download", fake_download)
+    monkeypatch.setattr("benchmark_service.submission_artifacts.materialize", fake_materialize)
 
     response = _post_eval(
         in_process_artifact_client,
@@ -1214,14 +1333,18 @@ def test_v1_evaluate_passes_only_admitted_bytes_to_in_process_benchmark(
     assert response.status_code == 200
     assert response.json()["result"] == {"resolved": True}
     app = cast(BenchmarkServiceApp, in_process_artifact_client.app)
-    service = cast(InProcessArtifactStub, app.service)
+    service = cast(MaterializedArtifactStub, app.service)
     assert service.artifact_call == (
+        "acme",
         "external-run-1",
         "task-1",
         "stub.workbook.v1",
         b"workbook-bytes",
         "default",
     )
+    assert service.artifact_path == materialized_path
+    assert service.artifact_reference is reference
+    assert not materialized_path.exists()
     assert _FakeDaytonaConfig.provider.created == []
 
 
@@ -1251,7 +1374,7 @@ def test_v1_evaluate_rejects_artifact_outside_authenticated_request_before_stora
 
     assert response.status_code == 404
     app = cast(BenchmarkServiceApp, in_process_artifact_client.app)
-    assert cast(InProcessArtifactStub, app.service).artifact_call is None
+    assert cast(MaterializedArtifactStub, app.service).artifact_call is None
 
 
 def test_v1_evaluate_rejects_in_process_schema_before_storage(
@@ -1313,16 +1436,18 @@ def test_v1_evaluate_rejects_changed_artifact_before_in_process_hook(
         assert tenant == "acme"
         return reference
 
-    async def changed_download(
+    @asynccontextmanager
+    async def changed_materialize(
         _reference: SubmissionArtifactReference,
         *,
         tenant: str,
-    ) -> bytes:
+    ):
         assert tenant == "acme"
         raise SubmissionArtifactChanged("artifact changed after it was accepted")
+        yield MaterializedSubmissionArtifact(path=Path("unused"), reference=_reference)
 
     monkeypatch.setattr("benchmark_service.submission_artifacts.stat", fake_stat)
-    monkeypatch.setattr("benchmark_service.submission_artifacts.download", changed_download)
+    monkeypatch.setattr("benchmark_service.submission_artifacts.materialize", changed_materialize)
 
     response = _post_eval(
         in_process_artifact_client,
@@ -1331,7 +1456,7 @@ def test_v1_evaluate_rejects_changed_artifact_before_in_process_hook(
 
     assert response.status_code == 409
     app = cast(BenchmarkServiceApp, in_process_artifact_client.app)
-    assert cast(InProcessArtifactStub, app.service).artifact_call is None
+    assert cast(MaterializedArtifactStub, app.service).artifact_call is None
 
 
 async def test_v1_evaluate_orders_reservation_quota_queue_and_artifact_preflight(
@@ -1426,7 +1551,7 @@ async def test_v1_evaluate_orders_reservation_quota_queue_and_artifact_preflight
     assert first_response.result == {"resolved": True, "weighted_pass_percentage": 100.0}
 
 
-@pytest.mark.parametrize("operation", ["stat", "download"])
+@pytest.mark.parametrize("operation", ["stat", "download", "materialize"])
 async def test_canceled_artifact_storage_worker_keeps_grading_admission(
     monkeypatch: pytest.MonkeyPatch,
     operation: str,
@@ -1435,6 +1560,7 @@ async def test_canceled_artifact_storage_worker_keeps_grading_admission(
     reference = SubmissionArtifactReference(key=key, size_bytes=1, etag='"etag-1"')
     worker_started = Event()
     release_worker = Event()
+    materialize_directory: Path | None = None
 
     def wait_for_release() -> None:
         worker_started.set()
@@ -1455,16 +1581,33 @@ async def test_canceled_artifact_storage_worker_keeps_grading_admission(
         wait_for_release()
         raise RuntimeError("late artifact storage failure")
 
+    def blocking_materialize(
+        artifact_reference: SubmissionArtifactReference,
+        tenant: str,
+        directory: Path,
+    ) -> MaterializedSubmissionArtifact:
+        nonlocal materialize_directory
+        assert artifact_reference is reference
+        assert tenant == "acme"
+        materialize_directory = directory
+        wait_for_release()
+        raise RuntimeError("late artifact storage failure")
+
     if operation == "stat":
         monkeypatch.setattr(grading.submission_artifacts, "_stat_sync", blocking_stat)
-    else:
+    elif operation == "download":
         monkeypatch.setattr(grading.submission_artifacts, "_download_sync", blocking_download)
+    else:
+        monkeypatch.setattr(grading.submission_artifacts, "_materialize_sync", blocking_materialize)
 
     async def run_storage_operation() -> None:
         if operation == "stat":
             await grading.submission_artifacts.stat(key, tenant="acme")
-        else:
+        elif operation == "download":
             await grading.submission_artifacts.download(reference, tenant="acme")
+        else:
+            async with grading.submission_artifacts.materialize(reference, tenant="acme"):
+                pytest.fail("failed materialization must not yield")
 
     admission = _GradingAdmission(
         max_concurrency=1,
@@ -1480,6 +1623,9 @@ async def test_canceled_artifact_storage_worker_keeps_grading_admission(
     storage_task = asyncio.create_task(admitted_storage_operation())
     try:
         assert await _thread_event_set(worker_started)
+        if operation == "materialize":
+            assert materialize_directory is not None
+            assert materialize_directory.exists()
         storage_task.cancel()
         await asyncio.sleep(0)
         storage_task.cancel()
@@ -1493,6 +1639,9 @@ async def test_canceled_artifact_storage_worker_keeps_grading_admission(
         release_worker.set()
         with pytest.raises(asyncio.CancelledError):
             await storage_task
+        if operation == "materialize":
+            assert materialize_directory is not None
+            assert not materialize_directory.exists()
         async with admission.acquire(("acme", "run-1", "task-1")):
             pass
     finally:

@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import benchmark_service
-from benchmark_service import Sandbox
+from benchmark_service import MaterializedSubmissionArtifact, Sandbox
 from benchmark_service.app import BenchmarkServiceApp, _get_service_metadata  # pyright: ignore[reportPrivateUsage]
 from benchmark_service.base import BenchmarkService
 from benchmark_service.schemas import (
@@ -165,6 +165,26 @@ class _InProcessArtifactModeService(_FakeService):
         yield
 
 
+class _MaterializedArtifactModeService(_FakeService):
+    eval_mode = EvalMode.IN_PROCESS_MATERIALIZED_ARTIFACT
+    accepted_submission_schemas = {
+        V1PayloadType.ARTIFACT: frozenset({"fake.workbook.v1"}),
+    }
+
+    async def evaluate_materialized_artifact(
+        self,
+        *,
+        tenant: str,
+        run_id: str,
+        task_id: str,
+        schema_id: str,
+        artifact: MaterializedSubmissionArtifact,
+        dataset: str | None = None,
+    ) -> AsyncGenerator[StreamChunk, None]:
+        return
+        yield
+
+
 def test_version_reports_text_eval_mode_by_default() -> None:
     app = BenchmarkServiceApp(_FakeService)
     with TestClient(app) as client:
@@ -192,3 +212,13 @@ def test_version_reports_in_process_artifact_mode(monkeypatch: pytest.MonkeyPatc
         response = client.get("/version")
     assert response.status_code == 200
     assert response.json()["eval_mode"] == "in_process_artifact"
+
+
+def test_version_reports_materialized_artifact_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SUBMISSION_ARTIFACT_BUCKET", "vals-submission-artifacts")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    app = BenchmarkServiceApp(_MaterializedArtifactModeService)
+    with TestClient(app) as client:
+        response = client.get("/version")
+    assert response.status_code == 200
+    assert response.json()["eval_mode"] == "in_process_materialized_artifact"

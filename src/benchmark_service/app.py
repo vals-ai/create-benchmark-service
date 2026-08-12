@@ -711,25 +711,29 @@ class BenchmarkServiceApp(FastAPI):
                             if artifact_reference is None:
                                 raise RuntimeError("in-process artifact evaluation requires an admitted artifact")
                             try:
-                                artifact = await submission_artifacts.download(artifact_reference, tenant=tenant)
+                                async with submission_artifacts.materialize(
+                                    artifact_reference,
+                                    tenant=tenant,
+                                ) as artifact:
+                                    response = await collapse_stream(
+                                        self.service.evaluate_artifact(
+                                            tenant=tenant,
+                                            run_id=body.run_id,
+                                            task_id=body.task_id,
+                                            schema_id=body.payload.schema_id,
+                                            artifact=artifact,
+                                            dataset=body.dataset,
+                                        ),
+                                        run_id=body.run_id,
+                                        task_id=body.task_id,
+                                        evaluator_version=self._service_version,
+                                    )
                             except submission_artifacts.SubmissionArtifactNotFound as exc:
                                 raise HTTPException(status_code=404, detail=str(exc)) from exc
                             except submission_artifacts.SubmissionArtifactChanged as exc:
                                 raise HTTPException(status_code=409, detail=str(exc)) from exc
                             except submission_artifacts.SubmissionArtifactTooLarge as exc:
                                 raise HTTPException(status_code=413, detail=str(exc)) from exc
-                            response = await collapse_stream(
-                                self.service.evaluate_artifact(
-                                    run_id=body.run_id,
-                                    task_id=body.task_id,
-                                    schema_id=body.payload.schema_id,
-                                    artifact=artifact,
-                                    dataset=body.dataset,
-                                ),
-                                run_id=body.run_id,
-                                task_id=body.task_id,
-                                evaluator_version=self._service_version,
-                            )
             except _DuplicateGradingRequest as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             except _GradingCapacityExceeded as exc:

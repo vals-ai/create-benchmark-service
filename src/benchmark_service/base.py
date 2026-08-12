@@ -30,6 +30,7 @@ from benchmark_service.schemas import (
     StreamResultChunk,
     TaskFilter,
 )
+from benchmark_service.submission_artifacts import MaterializedSubmissionArtifact
 from benchmark_service.v1_schemas import V1PayloadType, V1Task
 
 
@@ -322,13 +323,15 @@ class BenchmarkService(ABC):
 
     def evaluate_artifact(
         self,
+        *,
+        tenant: str,
         run_id: str,
         task_id: str,
         schema_id: str,
-        artifact: bytes,
+        artifact: MaterializedSubmissionArtifact,
         dataset: str | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
-        """Grade framework-admitted artifact bytes for one run in the service process."""
+        """Grade a framework-owned local artifact for one authenticated tenant."""
         raise NotImplementedError(
             f"{type(self).__name__}.evaluate_artifact must be implemented for "
             "eval_mode == EvalMode.IN_PROCESS_ARTIFACT"

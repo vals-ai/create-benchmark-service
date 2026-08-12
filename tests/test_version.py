@@ -10,7 +10,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 import benchmark_service
-from benchmark_service import Sandbox
+from benchmark_service import MaterializedSubmissionArtifact, Sandbox
 from benchmark_service.app import BenchmarkServiceApp, _get_service_metadata  # pyright: ignore[reportPrivateUsage]
 from benchmark_service.base import BenchmarkService
 from benchmark_service.schemas import (
@@ -155,10 +155,12 @@ class _InProcessArtifactModeService(_FakeService):
 
     async def evaluate_artifact(
         self,
+        *,
+        tenant: str,
         run_id: str,
         task_id: str,
         schema_id: str,
-        artifact: bytes,
+        artifact: MaterializedSubmissionArtifact,
         dataset: str | None = None,
     ) -> AsyncGenerator[StreamChunk, None]:
         return

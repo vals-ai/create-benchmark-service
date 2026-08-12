@@ -159,20 +159,27 @@ Yield these from your generator methods; the framework serialises and forwards t
 
 ### v1 Eval API (lab-facing)
 
-`/v1/evaluate` and `/v1/score` are the lab-facing surface. Text-mode evaluation reuses `evaluate_response`, in-process artifact evaluation passes admitted bytes to `evaluate_artifact`, and sandbox-mode evaluation runs `evaluate_instance`. Scoring reuses `calculate_final_score` for every mode.
+`/v1/evaluate` and `/v1/score` are the lab-facing surface. Text-mode evaluation reuses `evaluate_response`, in-process artifact evaluation passes a framework-owned local file to `evaluate_artifact`, and sandbox-mode evaluation runs `evaluate_instance`. Scoring reuses `calculate_final_score` for every mode.
 
 ### In-process artifact evaluation (`eval_mode = IN_PROCESS_ARTIFACT`)
 
 Benchmarks that grade an uploaded file inside the service process declare
 `eval_mode = EvalMode.IN_PROCESS_ARTIFACT`, declare only the artifact schema
 IDs they accept, and implement
-`evaluate_artifact(task_id, schema_id, artifact, dataset)`. The framework
+`evaluate_artifact(tenant, run_id, task_id, schema_id, artifact, dataset)`. The framework
 validates the authenticated tenant, dataset, task, schema, and upload key,
-captures the artifact's size and ETag, and downloads that admitted version
-before invoking benchmark code. The hook receives bytes and never receives an
-object key, bucket, or tenant credential.
+captures the artifact's size and ETag, and streams that admitted version to a
+temporary file before invoking benchmark code. The hook receives the
+authenticated tenant and a `MaterializedSubmissionArtifact` containing the
+read-only local `path` and immutable `reference`; it never receives a bucket or
+tenant credential. The path remains valid only while the hook's stream is being
+consumed and must not be retained after the hook finishes.
 
 These deployments require `SUBMISSION_ARTIFACT_BUCKET` and `AWS_REGION`.
+Set `SUBMISSION_ARTIFACT_MAX_DOWNLOAD_BYTES` to the largest artifact the
+deployment accepts and provision temporary disk for both that file and any
+expanded or copied form the benchmark creates. The framework checks the size
+captured at admission, the download response, and the bytes written to disk.
 Artifact admission and evaluation share the normal grading concurrency and
 duplicate-request limits. Text evaluation and the websocket resume endpoints
 remain unchanged.
@@ -257,7 +264,7 @@ Response:
 
 **`POST /v1/score`** — aggregate across a run. Request `{run_id, dataset, evaluation_results: {task_id: {"status": "evaluated", "result": {...}} | {"status": "did_not_complete"} | null}}`. Before calling `calculate_final_score`, the framework converts every non-null item to the same eval-result envelope shape used by the runner and internal `/final-score/` path: `{"task_id": task_id, "status": status, "result": result}` plus `error` when the v1 item carries errors. Multiple v1 errors are collapsed into that single `error` string; callers should leave `errors` empty for successful `evaluated` items. `null` still represents a missing task and is passed through as `null`. Response `{run_id, tasks_evaluated, final_score, metadata}`.
 
-**`POST /v1/submissions/upload-url`** — mint a presigned S3 PUT URL for a submission artifact (e.g. an agent workspace tarball the eval side later rehydrates). Request `{run_id, task_id, dataset?, filename}`; every field must be a plain key segment (`[A-Za-z0-9][A-Za-z0-9._-]{0,127}`) and `task_id` must exist in the dataset. Response `{key, url, expires_in}`: the caller PUTs the artifact bytes to `url`, then reports `key` as the task's generation output. Deployments serving uploads must set `SUBMISSION_ARTIFACT_BUCKET` (the receiving S3 bucket) and `AWS_REGION` (the bucket's region — presigned URLs are signed per region). Without the bucket the endpoint returns 503; a bucket without a region fails at startup. Server-side reads default to a 64 MiB limit; set `SUBMISSION_ARTIFACT_MAX_DOWNLOAD_BYTES` to a smaller positive byte count when the deployment needs a tighter bound. Invalid configured limits fail at startup. Not available to trial tenants.
+**`POST /v1/submissions/upload-url`** — mint a presigned S3 PUT URL for a submission artifact (e.g. an agent workspace tarball the eval side later rehydrates). Request `{run_id, task_id, dataset?, filename}`; every field must be a plain key segment (`[A-Za-z0-9][A-Za-z0-9._-]{0,127}`) and `task_id` must exist in the dataset. Response `{key, url, expires_in}`: the caller PUTs the artifact bytes to `url`, then reports `key` as the task's generation output. Deployments serving uploads must set `SUBMISSION_ARTIFACT_BUCKET` (the receiving S3 bucket) and `AWS_REGION` (the bucket's region — presigned URLs are signed per region). Without the bucket the endpoint returns 503; a bucket without a region fails at startup. Server-side reads default to a 64 MiB limit; set `SUBMISSION_ARTIFACT_MAX_DOWNLOAD_BYTES` to the deployment's positive maximum accepted size. Invalid configured limits fail at startup. Not available to trial tenants.
 
 The service role needs `s3:PutObject` and `s3:GetObject` on `arn:aws:s3:::BUCKET/submission-artifacts/*`, plus `s3:ListBucket` on `arn:aws:s3:::BUCKET` limited to the `submission-artifacts/*` namespace in the deployment policy. The list permission is part of the missing-object contract: [S3 returns 404 for a missing object only when the caller has `s3:ListBucket`](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html#API_HeadObject_Permissions); without it S3 returns 403, which the framework leaves as a permission failure rather than misreporting the object as missing.
 

@@ -41,6 +41,7 @@ from benchmark_service.schemas import (
     SandboxRecoveryPolicy,
     TextGradingSubmission,
 )
+from benchmark_service.submission_artifacts import MaterializedSubmissionArtifact, SubmissionArtifactReference
 
 __all__ = [
     "BenchmarkServiceApp",
@@ -60,6 +61,7 @@ __all__ = [
     "ImageSource",
     "InflightMiddleware",
     "ModalProviderConfig",
+    "MaterializedSubmissionArtifact",
     "Resources",
     "Sandbox",
     "SandboxCommandError",
@@ -73,6 +75,7 @@ __all__ = [
     "SandboxRecoveryPolicy",
     "SandboxSource",
     "SnapshotSource",
+    "SubmissionArtifactReference",
     "TargetedSnapshotSource",
     "TextGradingSubmission",
     "VolumeMount",

@@ -194,6 +194,11 @@ def require_supported_auth_config() -> None:
             "auth was removed. Configure Descope (DESCOPE_PROJECT_ID plus a tenant "
             f"allowlist), or set {AUTH_DISABLED_ENV}=true for local development."
         )
+    if _env_bool(AUTH_DISABLED_ENV):
+        logger.warning(
+            "%s=true: every request is served without a credential. Local development only.",
+            AUTH_DISABLED_ENV,
+        )
 
 
 def clear_auth_cache() -> None:

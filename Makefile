@@ -16,8 +16,8 @@ install: ## Install dependencies
 	uv venv --python $(PYTHON_VERSION)
 	uv sync --dev
 
-dev: venv_check  ## Start the development server
-	uv run fastapi dev main.py --port 0
+dev: venv_check  ## Start the development server (no auth; the Dockerfile runs uvicorn directly, so this cannot reach a deployed image)
+	AUTH_DISABLED=true uv run fastapi dev main.py --port 0
 
 lint: ## CHeck style with ruff
 	uv run ruff check .

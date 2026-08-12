@@ -515,9 +515,33 @@ class ArtifactSandboxStub(SandboxStub):
 
 
 class InProcessArtifactStub(StubBenchmark):
-    """Grades an admitted local artifact without creating a grading sandbox."""
+    """Grades admitted bytes without creating a grading sandbox."""
 
     eval_mode = EvalMode.IN_PROCESS_ARTIFACT
+    accepted_submission_schemas = {
+        V1PayloadType.ARTIFACT: frozenset({"stub.workbook.v1"}),
+    }
+    artifact_call: tuple[str, str, str, bytes, str | None] | None = None
+
+    async def evaluate_artifact(
+        self,
+        run_id: str,
+        task_id: str,
+        schema_id: str,
+        artifact: bytes,
+        dataset: str | None = None,
+    ) -> AsyncGenerator[StreamChunk, None]:
+        self.artifact_call = (run_id, task_id, schema_id, artifact, dataset)
+        yield StreamResultChunk(
+            type="result",
+            data={"resolved": artifact == b"workbook-bytes"},
+        )
+
+
+class MaterializedArtifactStub(StubBenchmark):
+    """Grades an admitted local artifact without creating a grading sandbox."""
+
+    eval_mode = EvalMode.IN_PROCESS_MATERIALIZED_ARTIFACT
     accepted_submission_schemas = {
         V1PayloadType.ARTIFACT: frozenset({"stub.workbook.v1"}),
     }
@@ -525,7 +549,7 @@ class InProcessArtifactStub(StubBenchmark):
     artifact_path: Path | None = None
     artifact_reference: SubmissionArtifactReference | None = None
 
-    async def evaluate_artifact(
+    async def evaluate_materialized_artifact(
         self,
         *,
         tenant: str,
@@ -945,6 +969,36 @@ def test_in_process_artifact_mode_rejects_non_artifact_schemas() -> None:
 
             async def evaluate_artifact(
                 self,
+                run_id: str,
+                task_id: str,
+                schema_id: str,
+                artifact: bytes,
+                dataset: str | None = None,
+            ) -> AsyncGenerator[StreamChunk, None]:
+                yield StreamResultChunk(type="result", data={})
+
+
+def test_materialized_artifact_mode_requires_its_artifact_hook() -> None:
+    with pytest.raises(TypeError, match="evaluate_materialized_artifact"):
+
+        class _MissingMaterializedArtifactHook(StubBenchmark):  # pyright: ignore[reportUnusedClass]
+            eval_mode = EvalMode.IN_PROCESS_MATERIALIZED_ARTIFACT
+            accepted_submission_schemas = {
+                V1PayloadType.ARTIFACT: frozenset({"stub.workbook.v1"}),
+            }
+
+
+def test_materialized_artifact_mode_rejects_non_artifact_schemas() -> None:
+    with pytest.raises(TypeError, match="only non-empty artifact"):
+
+        class _TextSchema(StubBenchmark):  # pyright: ignore[reportUnusedClass]
+            eval_mode = EvalMode.IN_PROCESS_MATERIALIZED_ARTIFACT
+            accepted_submission_schemas = {
+                V1PayloadType.TEXT: frozenset({"stub.text.v1"}),
+            }
+
+            async def evaluate_materialized_artifact(
+                self,
                 *,
                 tenant: str,
                 run_id: str,
@@ -1126,10 +1180,12 @@ def test_sandbox_mode_missing_artifact_storage_fails_at_boot(
             pass
 
 
+@pytest.mark.parametrize("service_cls", [InProcessArtifactStub, MaterializedArtifactStub])
 def test_in_process_artifact_mode_missing_storage_fails_at_boot(
     monkeypatch: pytest.MonkeyPatch,
+    service_cls: type[StubBenchmark],
 ) -> None:
-    app = _sandbox_app(monkeypatch, InProcessArtifactStub)
+    app = _sandbox_app(monkeypatch, service_cls)
     monkeypatch.delenv("SUBMISSION_ARTIFACT_BUCKET", raising=False)
 
     with pytest.raises(RuntimeError, match="SUBMISSION_ARTIFACT_BUCKET"):
@@ -1151,7 +1207,7 @@ def artifact_descope_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestCl
 
 @pytest.fixture
 def in_process_artifact_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
-    app = _sandbox_app(monkeypatch, InProcessArtifactStub)
+    app = _sandbox_app(monkeypatch, MaterializedArtifactStub)
 
     async def _stub_exchange(_project_id: str, _access_key: str) -> dict[str, dict[str, dict[str, str]]]:
         return {"tenants": {"acme": {}}}
@@ -1166,6 +1222,49 @@ def _post_eval(client: TestClient, payload: dict[str, Any]) -> Any:
         "/v1/evaluate",
         json={"run_id": "external-run-1", "task_id": "task-1", "dataset": "default", "payload": payload},
         headers={"x-descope-api-key": "key-acme"},
+    )
+
+
+def test_v1_evaluate_preserves_byte_backed_in_process_artifact_hook(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    key = "submission-artifacts/acme/default/external-run-1/task-1/submission.xlsx"
+    reference = SubmissionArtifactReference(key=key, size_bytes=14, etag='"etag-1"')
+
+    async def fake_stat(k: str, *, tenant: str) -> SubmissionArtifactReference:
+        assert (k, tenant) == (key, "acme")
+        return reference
+
+    async def fake_download(admitted: SubmissionArtifactReference, *, tenant: str) -> bytes:
+        assert admitted is reference
+        assert tenant == "acme"
+        return b"workbook-bytes"
+
+    async def stub_exchange(_project_id: str, _access_key: str) -> dict[str, dict[str, dict[str, str]]]:
+        return {"tenants": {"acme": {}}}
+
+    monkeypatch.setattr("benchmark_service.submission_artifacts.stat", fake_stat)
+    monkeypatch.setattr("benchmark_service.submission_artifacts.download", fake_download)
+    app = _sandbox_app(monkeypatch, InProcessArtifactStub)
+    with patch.object(
+        auth_module,
+        "_exchange_descope_access_key",
+        stub_exchange,
+    ):
+        with TestClient(app) as client:
+            response = _post_eval(
+                client,
+                {"type": "artifact", "schema": "stub.workbook.v1", "data": key},
+            )
+
+    assert response.status_code == 200
+    service = cast(InProcessArtifactStub, app.service)
+    assert service.artifact_call == (
+        "external-run-1",
+        "task-1",
+        "stub.workbook.v1",
+        b"workbook-bytes",
+        "default",
     )
 
 
@@ -1234,7 +1333,7 @@ def test_v1_evaluate_passes_tenant_and_admitted_file_to_in_process_benchmark(
     assert response.status_code == 200
     assert response.json()["result"] == {"resolved": True}
     app = cast(BenchmarkServiceApp, in_process_artifact_client.app)
-    service = cast(InProcessArtifactStub, app.service)
+    service = cast(MaterializedArtifactStub, app.service)
     assert service.artifact_call == (
         "acme",
         "external-run-1",
@@ -1275,7 +1374,7 @@ def test_v1_evaluate_rejects_artifact_outside_authenticated_request_before_stora
 
     assert response.status_code == 404
     app = cast(BenchmarkServiceApp, in_process_artifact_client.app)
-    assert cast(InProcessArtifactStub, app.service).artifact_call is None
+    assert cast(MaterializedArtifactStub, app.service).artifact_call is None
 
 
 def test_v1_evaluate_rejects_in_process_schema_before_storage(
@@ -1357,7 +1456,7 @@ def test_v1_evaluate_rejects_changed_artifact_before_in_process_hook(
 
     assert response.status_code == 409
     app = cast(BenchmarkServiceApp, in_process_artifact_client.app)
-    assert cast(InProcessArtifactStub, app.service).artifact_call is None
+    assert cast(MaterializedArtifactStub, app.service).artifact_call is None
 
 
 async def test_v1_evaluate_orders_reservation_quota_queue_and_artifact_preflight(

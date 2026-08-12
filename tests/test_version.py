@@ -155,6 +155,24 @@ class _InProcessArtifactModeService(_FakeService):
 
     async def evaluate_artifact(
         self,
+        run_id: str,
+        task_id: str,
+        schema_id: str,
+        artifact: bytes,
+        dataset: str | None = None,
+    ) -> AsyncGenerator[StreamChunk, None]:
+        return
+        yield
+
+
+class _MaterializedArtifactModeService(_FakeService):
+    eval_mode = EvalMode.IN_PROCESS_MATERIALIZED_ARTIFACT
+    accepted_submission_schemas = {
+        V1PayloadType.ARTIFACT: frozenset({"fake.workbook.v1"}),
+    }
+
+    async def evaluate_materialized_artifact(
+        self,
         *,
         tenant: str,
         run_id: str,
@@ -194,3 +212,13 @@ def test_version_reports_in_process_artifact_mode(monkeypatch: pytest.MonkeyPatc
         response = client.get("/version")
     assert response.status_code == 200
     assert response.json()["eval_mode"] == "in_process_artifact"
+
+
+def test_version_reports_materialized_artifact_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SUBMISSION_ARTIFACT_BUCKET", "vals-submission-artifacts")
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    app = BenchmarkServiceApp(_MaterializedArtifactModeService)
+    with TestClient(app) as client:
+        response = client.get("/version")
+    assert response.status_code == 200
+    assert response.json()["eval_mode"] == "in_process_materialized_artifact"

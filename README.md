@@ -159,18 +159,28 @@ Yield these from your generator methods; the framework serialises and forwards t
 
 ### v1 Eval API (lab-facing)
 
-`/v1/evaluate` and `/v1/score` are the lab-facing surface. Text-mode evaluation reuses `evaluate_response`, in-process artifact evaluation passes a framework-owned local file to `evaluate_artifact`, and sandbox-mode evaluation runs `evaluate_instance`. Scoring reuses `calculate_final_score` for every mode.
+`/v1/evaluate` and `/v1/score` are the lab-facing surface. Text-mode evaluation reuses `evaluate_response`; byte-backed and materialized artifact modes call their corresponding in-process hooks; and sandbox-mode evaluation runs `evaluate_instance`. Scoring reuses `calculate_final_score` for every mode.
 
-### In-process artifact evaluation (`eval_mode = IN_PROCESS_ARTIFACT`)
+### Byte-backed artifact evaluation (`eval_mode = IN_PROCESS_ARTIFACT`)
 
 Benchmarks that grade an uploaded file inside the service process declare
 `eval_mode = EvalMode.IN_PROCESS_ARTIFACT`, declare only the artifact schema
 IDs they accept, and implement
-`evaluate_artifact(tenant, run_id, task_id, schema_id, artifact, dataset)`. The framework
+`evaluate_artifact(run_id, task_id, schema_id, artifact, dataset)`. The framework
 validates the authenticated tenant, dataset, task, schema, and upload key,
-captures the artifact's size and ETag, and streams that admitted version to a
-temporary file before invoking benchmark code. The hook receives the
-authenticated tenant and a `MaterializedSubmissionArtifact` containing the
+captures the artifact's size and ETag, and downloads that admitted version
+before invoking benchmark code. The hook receives bytes and never receives an
+object key, bucket, or tenant credential. Use this mode only when the configured
+maximum artifact size is safe to hold in service memory.
+
+### Materialized artifact evaluation (`eval_mode = IN_PROCESS_MATERIALIZED_ARTIFACT`)
+
+Benchmarks that need file-backed intake declare
+`eval_mode = EvalMode.IN_PROCESS_MATERIALIZED_ARTIFACT`, declare only the
+artifact schema IDs they accept, and implement
+`evaluate_materialized_artifact(tenant, run_id, task_id, schema_id, artifact, dataset)`.
+The framework streams the admitted object to a temporary file. The hook receives
+the authenticated tenant and a `MaterializedSubmissionArtifact` containing the
 read-only local `path` and immutable `reference`; it never receives a bucket or
 tenant credential. The path remains valid only while the hook's stream is being
 consumed and must not be retained after the hook finishes.

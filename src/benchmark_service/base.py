@@ -72,11 +72,21 @@ class BenchmarkService(ABC):
                     f"{cls.__name__} declares eval_mode = EvalMode.IN_PROCESS_ARTIFACT "
                     "and must implement evaluate_artifact"
                 )
+        if cls.eval_mode == EvalMode.IN_PROCESS_MATERIALIZED_ARTIFACT:
+            if cls.evaluate_materialized_artifact is BenchmarkService.evaluate_materialized_artifact:
+                raise TypeError(
+                    f"{cls.__name__} declares eval_mode = EvalMode.IN_PROCESS_MATERIALIZED_ARTIFACT "
+                    "and must implement evaluate_materialized_artifact"
+                )
+        if cls.eval_mode in {
+            EvalMode.IN_PROCESS_ARTIFACT,
+            EvalMode.IN_PROCESS_MATERIALIZED_ARTIFACT,
+        }:
             artifact_schemas = cls.accepted_submission_schemas.get(V1PayloadType.ARTIFACT)
             if not artifact_schemas or set(cls.accepted_submission_schemas) != {V1PayloadType.ARTIFACT}:
                 raise TypeError(
-                    f"{cls.__name__} declares eval_mode = EvalMode.IN_PROCESS_ARTIFACT and must declare "
-                    "only non-empty artifact accepted_submission_schemas"
+                    f"{cls.__name__} declares eval_mode = EvalMode.{cls.eval_mode.name} and must declare only "
+                    "non-empty artifact accepted_submission_schemas"
                 )
 
     @classmethod
@@ -323,6 +333,20 @@ class BenchmarkService(ABC):
 
     def evaluate_artifact(
         self,
+        run_id: str,
+        task_id: str,
+        schema_id: str,
+        artifact: bytes,
+        dataset: str | None = None,
+    ) -> AsyncGenerator[StreamChunk, None]:
+        """Grade framework-admitted artifact bytes for one run in the service process."""
+        raise NotImplementedError(
+            f"{type(self).__name__}.evaluate_artifact must be implemented for "
+            "eval_mode == EvalMode.IN_PROCESS_ARTIFACT"
+        )
+
+    def evaluate_materialized_artifact(
+        self,
         *,
         tenant: str,
         run_id: str,
@@ -333,8 +357,8 @@ class BenchmarkService(ABC):
     ) -> AsyncGenerator[StreamChunk, None]:
         """Grade a framework-owned local artifact for one authenticated tenant."""
         raise NotImplementedError(
-            f"{type(self).__name__}.evaluate_artifact must be implemented for "
-            "eval_mode == EvalMode.IN_PROCESS_ARTIFACT"
+            f"{type(self).__name__}.evaluate_materialized_artifact must be implemented for "
+            "eval_mode == EvalMode.IN_PROCESS_MATERIALIZED_ARTIFACT"
         )
 
     @abstractmethod

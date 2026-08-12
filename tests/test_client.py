@@ -1112,9 +1112,10 @@ async def test_ws_idle_past_the_budget_fails_the_stream(health_status: str | Non
     assert str(exc) == f"WebSocket idle for {exc.idle_s:.1f}s without an application message ({expected_health})"
 
 
-async def test_ws_idle_watchdog_can_be_disabled() -> None:
-    """``ws_idle_timeout_s=None`` keeps the pre-watchdog behavior of waiting indefinitely."""
-    client = BenchmarkServiceClient(url=BASE_URL, headers=HEADERS, timeout=10, ws_idle_timeout_s=None)
+@pytest.mark.parametrize("ws_idle_timeout_s", [None, 0], ids=["none", "zero"])
+async def test_ws_idle_watchdog_can_be_disabled(ws_idle_timeout_s: float | None) -> None:
+    """Both documented ways to disable it keep the pre-watchdog behavior of waiting indefinitely."""
+    client = BenchmarkServiceClient(url=BASE_URL, headers=HEADERS, timeout=10, ws_idle_timeout_s=ws_idle_timeout_s)
 
     with patch("benchmark_service.client.websockets.connect", return_value=_silent_ws_mock()):
         with pytest.raises(TimeoutError):

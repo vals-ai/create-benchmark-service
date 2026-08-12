@@ -302,9 +302,8 @@ class BenchmarkServiceClient:
         self._url = url
         self._headers = headers
         self._timeout = timeout
-        self._ws_idle_timeout_s = (
-            _default_ws_idle_timeout_s() if ws_idle_timeout_s is _UNSET_WS_IDLE_TIMEOUT else ws_idle_timeout_s
-        )
+        idle_timeout = _default_ws_idle_timeout_s() if ws_idle_timeout_s is _UNSET_WS_IDLE_TIMEOUT else ws_idle_timeout_s
+        self._ws_idle_timeout_s = idle_timeout if idle_timeout is None or idle_timeout > 0 else None
         self._sandbox_providers = {}
         self._http_client = httpx.AsyncClient(
             follow_redirects=True,

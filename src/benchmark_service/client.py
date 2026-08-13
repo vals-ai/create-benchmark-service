@@ -656,9 +656,9 @@ class BenchmarkServiceClient:
         """Fetch a dataset's task list via the lab-facing /v1/ surface.
 
         Auth headers (Descope) are taken from self._headers as set at
-        construction. Server returns 403 for legacy bearer or unauthorized
-        datasets, 404 for unknown datasets, and 501 when the benchmark has
-        not implemented task listing.
+        construction. Server returns 403 for unauthorized datasets, 404 for
+        unknown datasets, and 501 when the benchmark has not implemented task
+        listing.
         """
         response = await self._http_client.get(f"{self._url}/v1/datasets/{dataset}/tasks")
 

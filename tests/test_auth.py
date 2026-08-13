@@ -12,8 +12,10 @@ import pytest
 from benchmark_service import Sandbox
 from benchmark_service import auth as auth_module
 from benchmark_service.auth import (
+    UNAUTHENTICATED_TENANT_SENTINEL,
     clear_allowlist_cache,
     clear_auth_cache,
+    require_supported_auth_config,
     resolve_caller_tenant,
     resolve_descope_tenant,
 )
@@ -38,7 +40,7 @@ def _allowlist_env(payload: dict[str, Any]) -> str:
 
 @pytest.fixture
 def descope_env(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("AUTH_REQUIRED", "true")
+    monkeypatch.delenv("AUTH_DISABLED", raising=False)
     monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
     monkeypatch.setenv(
         "DESCOPE_TENANT_ALLOWLIST_JSON",
@@ -94,52 +96,62 @@ async def test_resolve_descope_tenant_rejects_multi_tenant_jwt() -> None:
 
 
 @pytest.mark.usefixtures("descope_env")
-async def test_resolve_descope_tenant_rejects_reserved_legacy_tenant(
+async def test_resolve_descope_tenant_rejects_reserved_sentinel_tenant(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv(
         "DESCOPE_TENANT_ALLOWLIST_JSON",
-        _allowlist_env({"tenants": {"_legacy": {"datasets": ["secret"]}}}),
+        _allowlist_env({"tenants": {UNAUTHENTICATED_TENANT_SENTINEL: {"datasets": ["secret"]}}}),
     )
     headers = {"x-descope-api-key": "key-reserved"}
     with patch.object(
         auth_module,
         "_exchange_descope_access_key",
-        return_value=_mock_jwt_response(["_legacy"]),
+        return_value=_mock_jwt_response([UNAUTHENTICATED_TENANT_SENTINEL]),
     ):
         tenant = await resolve_descope_tenant(headers)
     assert tenant is None
 
 
-async def test_resolve_caller_tenant_legacy_no_api_key_required(
+async def test_resolve_caller_tenant_rejects_static_bearer_key(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("AUTH_REQUIRED", "false")
-    monkeypatch.delenv("BENCHMARK_API_KEY", raising=False)
-    tenant = await resolve_caller_tenant({})
-    assert tenant == "_legacy"
-
-
-async def test_resolve_caller_tenant_legacy_correct_api_key(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("AUTH_REQUIRED", "false")
+    monkeypatch.delenv("AUTH_DISABLED", raising=False)
     monkeypatch.setenv("BENCHMARK_API_KEY", "secret123")
+    monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
     tenant = await resolve_caller_tenant({"authorization": "Bearer secret123"})
-    assert tenant == "_legacy"
-
-
-async def test_resolve_caller_tenant_legacy_wrong_api_key(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("AUTH_REQUIRED", "false")
-    monkeypatch.setenv("BENCHMARK_API_KEY", "secret123")
-    tenant = await resolve_caller_tenant({"authorization": "Bearer wrong"})
     assert tenant is None
 
 
+async def test_resolve_caller_tenant_returns_sentinel_when_auth_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AUTH_DISABLED", "true")
+    tenant = await resolve_caller_tenant({})
+    assert tenant == UNAUTHENTICATED_TENANT_SENTINEL
+
+
+def test_require_supported_auth_config_rejects_auth_required_false(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AUTH_REQUIRED", "false")
+
+    with pytest.raises(RuntimeError, match="no longer supported"):
+        require_supported_auth_config()
+
+
+def test_require_supported_auth_config_allows_descope_deploys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
+    require_supported_auth_config()
+
+    monkeypatch.delenv("AUTH_REQUIRED", raising=False)
+    require_supported_auth_config()
+
+
 class _BareBenchmark(BenchmarkService):
-    """Service that does NOT override check_auth; uses the new resolve_tenant default."""
+    """Service that uses the framework's default tenant resolution."""
 
     async def load_datasets(self) -> dict[str, dict[str, Any]]:
         return {"default": {}}
@@ -163,29 +175,7 @@ class _BareBenchmark(BenchmarkService):
     ) -> FinalScoreResult: ...  # type: ignore[return]
 
 
-class _LegacyOverrideBenchmark(_BareBenchmark):
-    """Service that overrides check_auth (legacy bool API)."""
-
-    def __init__(self, allow: bool) -> None:
-        self._allow = allow
-
-    async def check_auth(self, headers: dict[str, str]) -> bool:
-        return self._allow
-
-
-async def test_resolve_tenant_legacy_override_returns_sentinel_on_true() -> None:
-    service = _LegacyOverrideBenchmark(allow=True)
-    tenant = await service.resolve_tenant({})
-    assert tenant == "_legacy"
-
-
-async def test_resolve_tenant_legacy_override_returns_none_on_false() -> None:
-    service = _LegacyOverrideBenchmark(allow=False)
-    tenant = await service.resolve_tenant({})
-    assert tenant is None
-
-
-async def test_check_dataset_access_legacy_sentinel_always_allowed() -> None:
+async def test_check_dataset_access_unauthenticated_sentinel_always_allowed() -> None:
     service = _BareBenchmark()
-    assert await service.check_dataset_access("_legacy", "anything") is True
-    assert await service.check_dataset_access("_legacy", None) is True
+    assert await service.check_dataset_access(UNAUTHENTICATED_TENANT_SENTINEL, "anything") is True
+    assert await service.check_dataset_access(UNAUTHENTICATED_TENANT_SENTINEL, None) is True

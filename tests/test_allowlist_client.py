@@ -146,12 +146,6 @@ async def test_transport_and_decode_failures_are_not_cached() -> None:
     [
         {"name": "example-service", "datasets": ["default"]},
         {"name": "example-service", "datasets": [1], "trial_mode": False},
-        {
-            "name": "example-service",
-            "datasets": ["default"],
-            "trial_mode": False,
-            "unexpected": True,
-        },
         {"name": "example-service", "datasets": ["default"], "trial_mode": 1},
         {"name": "other-service", "datasets": ["default"], "trial_mode": False},
     ],
@@ -161,6 +155,17 @@ async def test_invalid_policy_is_rejected(payload: object) -> None:
     client = CatalogAllowlistClient("https://catalog.example.test", "example-service", transport=transport)
 
     assert await client.get_tenant_config("key-acme", "acme") is None
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_unknown_policy_fields_are_ignored() -> None:
+    transport, requests = _transport(
+        [_response({"name": "example-service", "datasets": ["default"], "trial_mode": False, "future": True})]
+    )
+    client = CatalogAllowlistClient("https://catalog.example.test", "example-service", transport=transport)
+
+    assert await client.get_tenant_config("key-acme", "acme") == TenantConfig(datasets=["default"])
     assert len(requests) == 1
 
 

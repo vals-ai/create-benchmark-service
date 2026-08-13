@@ -50,7 +50,7 @@ class TenantConfig(BaseModel):
 class _CatalogAllowlistResponse(BaseModel):
     """Strict response contract for the service-specific catalog endpoint."""
 
-    model_config = ConfigDict(extra="forbid", strict=True)
+    model_config = ConfigDict(extra="ignore", strict=True)
 
     name: str
     datasets: list[str]

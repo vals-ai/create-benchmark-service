@@ -311,7 +311,10 @@ class BenchmarkServiceApp(FastAPI):
         @asynccontextmanager
         async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
             allowlist = load_allowlist()
-            evaluation_quota.require_configured(allowlist, service_name=configured_deployment_name)
+            if not os.getenv("BENCHMARK_CATALOG_API_URL", "").strip():
+                evaluation_quota.require_configured(
+                    allowlist, service_name=configured_deployment_name
+                )
             submission_artifacts.require_configured()
             if not submission_artifacts.is_configured():
                 logger.warning(
@@ -357,7 +360,6 @@ class BenchmarkServiceApp(FastAPI):
                 if tenant is None:
                     return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
                 request.state.tenant = tenant
-                request.state.tenant_config = get_tenant_config(tenant)
                 if _is_trial_tenant(tenant) and not _trial_tenant_may_access_path(request.url.path):
                     return JSONResponse(
                         status_code=403,

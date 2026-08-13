@@ -103,8 +103,7 @@ def _get_catalog_client() -> CatalogAllowlistClient | None:
     service_name = _catalog_service_name()
     if api_url is None or service_name is None:
         logger.warning(
-            "%s requires both %s and %s",
-            _BENCHMARK_CATALOG_API_URL_ENV,
+            "Catalog allowlist mode requires both %s and %s",
             _BENCHMARK_CATALOG_API_URL_ENV,
             _SERVICE_NAME_ENV,
         )

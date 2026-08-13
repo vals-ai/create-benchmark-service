@@ -58,6 +58,20 @@ class _CatalogAllowlistResponse(BaseModel):
     trial_mode: bool
 
 
+class _NonClosingTransport(httpx.AsyncBaseTransport):
+    """Adapt a caller-owned transport without taking ownership of its lifetime."""
+
+    def __init__(self, delegate: httpx.AsyncBaseTransport) -> None:
+        self._delegate = delegate
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        return await self._delegate.handle_async_request(request)
+
+    async def aclose(self) -> None:
+        # The caller owns the delegated transport and closes it separately.
+        return None
+
+
 class CatalogAllowlistClient:
     """Fetch and cache one service's tenant policy from the catalog API."""
 
@@ -77,7 +91,10 @@ class CatalogAllowlistClient:
         if not self.service_name:
             raise ValueError("Catalog service name must not be empty")
 
-        self._client = httpx.AsyncClient(timeout=timeout, transport=transport)
+        client_transport = (
+            _NonClosingTransport(transport) if transport is not None else None
+        )
+        self._client = httpx.AsyncClient(timeout=timeout, transport=client_transport)
         if cache_timer is None:
             self._cache = TTLCache[str, TenantConfig](
                 maxsize=ALLOWLIST_CACHE_MAX_SIZE,

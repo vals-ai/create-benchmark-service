@@ -77,6 +77,20 @@ async def test_reuses_transport_until_client_is_closed() -> None:
     assert transport.closed is False
 
     await client.aclose()
+    assert transport.closed is False
+    await transport.aclose()
+    assert transport.closed is True
+
+
+@pytest.mark.asyncio
+async def test_client_does_not_close_caller_owned_transport() -> None:
+    transport = _ReusableTransport([_response({}, status_code=404)])
+    client = CatalogAllowlistClient("https://catalog.example.test", "example-service", transport=transport)
+
+    await client.aclose()
+
+    assert transport.closed is False
+    await transport.aclose()
     assert transport.closed is True
 
 

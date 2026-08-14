@@ -287,8 +287,8 @@ def _get_config_header(headers: Mapping[str, str], *names: str) -> str | None:
     return None
 
 
-def _admission_pool_id(*, organization_id: str, target: str, api_url: str) -> str:
-    scope = "\0".join((api_url.rstrip("/"), organization_id, target))
+def _admission_pool_id(*, organization_id: str, api_url: str) -> str:
+    scope = "\0".join((api_url.rstrip("/"), organization_id))
     return f"daytona:{uuid.uuid5(uuid.NAMESPACE_URL, scope)}"
 
 
@@ -894,7 +894,6 @@ class DaytonaSandboxProvider(SandboxProvider):
         self._admission_pool = (
             _admission_pool_id(
                 organization_id=self._organization_id,
-                target=self._target,
                 api_url=self._api_url,
             )
             if self._organization_id is not None

@@ -1241,23 +1241,25 @@ def _admission_provider(
     return _configured_daytona_provider(DAYTONA_ORGANIZATION_ID=organization_id), requested
 
 
-def test_daytona_pool_id_is_stable_nonsecret_and_configuration_scoped() -> None:
+def test_daytona_pool_id_is_stable_nonsecret_and_capacity_account_scoped() -> None:
     first = _configured_daytona_provider(DAYTONA_API_KEY="first-secret", DAYTONA_API_URL="https://d.test/")
     rotated = _configured_daytona_provider(DAYTONA_API_KEY="rotated-secret", DAYTONA_API_URL="https://d.test")
     pool_id = first.admission_pool_id
 
     assert pool_id is not None
     assert pool_id == rotated.admission_pool_id
+    assert pool_id == _configured_daytona_provider(
+        DAYTONA_API_URL="https://d.test", DAYTONA_TARGET="canonical-region-id"
+    ).admission_pool_id
     assert (
         len(
             {
                 pool_id,
-                _configured_daytona_provider(DAYTONA_TARGET="eu").admission_pool_id,
                 _configured_daytona_provider(DAYTONA_ORGANIZATION_ID="org-2").admission_pool_id,
                 _configured_daytona_provider(DAYTONA_API_URL="https://other.example/api").admission_pool_id,
             }
         )
-        == 4
+        == 3
     )
     assert _configured_daytona_provider(DAYTONA_ORGANIZATION_ID=None).admission_pool_id is None
     assert all(value not in pool_id for value in ("first-secret", "rotated-secret", "d.test"))

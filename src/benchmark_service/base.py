@@ -13,7 +13,7 @@ from typing import Any, ClassVar, Self
 from fastapi.encoders import jsonable_encoder
 
 from benchmark_service.auth import (
-    LEGACY_TENANT_SENTINEL,
+    UNAUTHENTICATED_TENANT_SENTINEL,
     check_benchmark_service_auth,
     get_tenant_config,
     resolve_caller_tenant,
@@ -128,12 +128,12 @@ class BenchmarkService(ABC):
         """
         if type(self).check_auth is not BenchmarkService.check_auth:
             ok = await self.check_auth(headers)
-            return LEGACY_TENANT_SENTINEL if ok else None
+            return UNAUTHENTICATED_TENANT_SENTINEL if ok else None
         return await resolve_caller_tenant(headers)
 
     async def check_dataset_access(self, tenant: str, dataset: str | None) -> bool:
         """Return True if `tenant` may use `dataset` on this service."""
-        if tenant == LEGACY_TENANT_SENTINEL:
+        if tenant == UNAUTHENTICATED_TENANT_SENTINEL:
             return True
         entry = get_tenant_config(tenant)
         if entry is None:

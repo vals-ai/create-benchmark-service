@@ -20,11 +20,12 @@ from websockets.exceptions import ConnectionClosed
 
 from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import (
-    LEGACY_TENANT_SENTINEL,
+    UNAUTHENTICATED_TENANT_SENTINEL,
     clear_request_tenant_config,
     close_catalog_client,
     get_tenant_config,
     load_allowlist,
+    require_supported_auth_config,
 )
 from benchmark_service.base import BenchmarkService
 from benchmark_service.grading import SUBMISSION_ARTIFACT_SANDBOX_PATH, collapse_stream, evaluate_submission
@@ -104,16 +105,11 @@ _PUBLIC_PATHS = frozenset({"/health", "/version"})
 
 
 def _require_descope_tenant(tenant: str | None) -> None:
-    """Raise 403 when the resolved tenant is the legacy bearer sentinel.
-
-    The /v1/ surface requires Descope auth; legacy bearer callers resolve to
-    LEGACY_TENANT_SENTINEL and must be rejected even though they are technically
-    authenticated against the legacy key.
-    """
-    if tenant == LEGACY_TENANT_SENTINEL:
+    """Raise 403 when the request has no Descope tenant identity."""
+    if tenant == UNAUTHENTICATED_TENANT_SENTINEL:
         raise HTTPException(
             status_code=403,
-            detail="The /v1/ surface requires Descope authentication; legacy bearer auth is not accepted.",
+            detail="The /v1/ surface requires Descope authentication.",
         )
 
 
@@ -310,6 +306,7 @@ class BenchmarkServiceApp(FastAPI):
 
         @asynccontextmanager
         async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
+            require_supported_auth_config()
             allowlist = load_allowlist()
             if not os.getenv("BENCHMARK_CATALOG_API_URL", "").strip():
                 evaluation_quota.require_configured(

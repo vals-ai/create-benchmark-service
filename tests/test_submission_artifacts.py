@@ -1,4 +1,6 @@
 from collections.abc import Generator
+from pathlib import Path
+from stat import S_IMODE
 
 import pytest
 from botocore.exceptions import ClientError
@@ -112,13 +114,20 @@ class _FakeBody:
         self.data = data
         self.read_error = read_error
         self.read_called = False
+        self.read_amounts: list[int | None] = []
+        self.offset = 0
         self.closed = False
 
-    def read(self) -> bytes:
+    def read(self, amt: int | None = None) -> bytes:
         self.read_called = True
+        self.read_amounts.append(amt)
         if self.read_error is not None:
             raise self.read_error
-        return self.data
+        if amt is None:
+            amt = len(self.data) - self.offset
+        chunk = self.data[self.offset : self.offset + amt]
+        self.offset += len(chunk)
+        return chunk
 
     def close(self) -> None:
         self.closed = True
@@ -130,11 +139,13 @@ class _FakeS3:
         *,
         content_length: int = 14,
         etag: str = '"etag-1"',
+        response_etag: str | None = None,
         error_code: str | None = None,
         body: _FakeBody | None = None,
     ) -> None:
         self.content_length = content_length
         self.etag = etag
+        self.response_etag = response_etag if response_etag is not None else etag
         self.error_code = error_code
         self.body = body if body is not None else _FakeBody()
         self.calls: list[dict[str, object]] = []
@@ -148,7 +159,7 @@ class _FakeS3:
         self._raise_error("GetObject")
         if IfMatch != self.etag:
             raise ClientError({"Error": {"Code": "PreconditionFailed", "Message": "ETag changed"}}, "GetObject")
-        return {"Body": self.body, "ContentLength": self.content_length, "ETag": self.etag}
+        return {"Body": self.body, "ContentLength": self.content_length, "ETag": self.response_etag}
 
     def head_object(self, *, Bucket: str, Key: str) -> dict[str, object]:
         self.calls.append({"op": "HeadObject", "Bucket": Bucket, "Key": Key})
@@ -292,3 +303,80 @@ async def test_download_rejects_an_artifact_replaced_after_admission(monkeypatch
     with pytest.raises(submission_artifacts.SubmissionArtifactChanged, match="changed"):
         await submission_artifacts.download(reference, tenant="acme")
     assert fake.calls[-1]["IfMatch"] == '"etag-1"'
+
+
+async def test_materialize_streams_admitted_object_to_owned_read_only_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = _FakeBody(b"artifact-bytes")
+    fake = _FakeS3(body=body)
+    _install_fake_s3(monkeypatch, fake)
+    monkeypatch.setenv(submission_artifacts.MAX_DOWNLOAD_BYTES_ENV, "100")
+    materialized_path: Path | None = None
+    materialized_directory: Path | None = None
+
+    async with submission_artifacts.materialize(_reference(), tenant="acme") as artifact:
+        materialized_path = artifact.path
+        materialized_directory = artifact.path.parent
+        assert artifact.reference == _reference()
+        assert artifact.path.name == "submission.xlsx"
+        assert artifact.path.read_bytes() == b"artifact-bytes"
+        assert S_IMODE(artifact.path.stat().st_mode) == 0o400
+        assert S_IMODE(artifact.path.parent.stat().st_mode) == 0o700
+
+    assert materialized_path is not None
+    assert materialized_directory is not None
+    assert not materialized_path.exists()
+    assert not materialized_directory.exists()
+    assert body.closed
+    assert body.read_amounts == [
+        submission_artifacts.MATERIALIZE_CHUNK_BYTES,
+        submission_artifacts.MATERIALIZE_CHUNK_BYTES,
+    ]
+    assert fake.calls == [
+        {
+            "op": "GetObject",
+            "Bucket": "vals-submission-artifacts",
+            "Key": _TENANT_KEY,
+            "IfMatch": '"etag-1"',
+        }
+    ]
+
+
+@pytest.mark.parametrize(
+    "fake",
+    [
+        _FakeS3(content_length=13),
+        _FakeS3(response_etag='"etag-2"'),
+        _FakeS3(body=_FakeBody(b"short")),
+        _FakeS3(body=_FakeBody(b"artifact-bytes-plus")),
+    ],
+    ids=["response-size", "response-etag", "short-body", "long-body"],
+)
+async def test_materialize_rejects_content_that_does_not_match_admission(
+    monkeypatch: pytest.MonkeyPatch,
+    fake: _FakeS3,
+) -> None:
+    _install_fake_s3(monkeypatch, fake)
+    monkeypatch.setenv(submission_artifacts.MAX_DOWNLOAD_BYTES_ENV, "100")
+
+    with pytest.raises(submission_artifacts.SubmissionArtifactChanged, match="changed"):
+        async with submission_artifacts.materialize(_reference(), tenant="acme"):
+            pytest.fail("changed artifact must not reach benchmark code")
+
+    assert fake.body.closed
+
+
+async def test_materialize_stops_before_writing_beyond_configured_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = _FakeBody(b"artifact-bytes-plus")
+    fake = _FakeS3(content_length=14, body=body)
+    _install_fake_s3(monkeypatch, fake)
+    monkeypatch.setenv(submission_artifacts.MAX_DOWNLOAD_BYTES_ENV, "14")
+
+    with pytest.raises(submission_artifacts.SubmissionArtifactTooLarge, match="14-byte download limit"):
+        async with submission_artifacts.materialize(_reference(), tenant="acme"):
+            pytest.fail("oversized artifact must not reach benchmark code")
+
+    assert body.closed

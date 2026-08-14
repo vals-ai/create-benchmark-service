@@ -10,7 +10,6 @@ from tests.conftest import StubBenchmark
 
 
 def test_lifespan_raises_on_malformed_env_var(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
     monkeypatch.setenv("DESCOPE_TENANT_ALLOWLIST_JSON", "{not valid json")
 

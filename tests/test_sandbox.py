@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import shlex
 from collections.abc import AsyncGenerator, Mapping
 from datetime import UTC, datetime
@@ -6,18 +7,23 @@ from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, cast
 
 import pytest
-from aiohttp import ClientConnectionError, ClientResponseError, RequestInfo
+from aiohttp import ClientConnectionError, ClientPayloadError, ClientResponseError, RequestInfo
 from daytona import DaytonaConfig, GpuType, SandboxState
 from daytona.common.errors import (
+    SOURCE_API,
+    SOURCE_DAEMON,
+    SOURCE_PROXY,
     DaytonaConflictError,
     DaytonaConnectionError,
     DaytonaError,
     DaytonaNotFoundError,
     DaytonaRateLimitError,
+    DaytonaTimeoutError,
 )
-from daytona.common.pty import PtyResult
+from daytona.common.pty import PtyResult, PtySize
 from daytona_api_client import VolumeState
 from daytona_api_client_async.exceptions import ApiException, NotFoundException
+from daytona_toolbox_api_client_async.models.pty_session_info import PtySessionInfo
 from multidict import CIMultiDict, CIMultiDictProxy
 from pydantic import TypeAdapter, ValidationError
 from yarl import URL
@@ -31,6 +37,7 @@ from benchmark_service.sandbox import (
     MissingSandboxConfigError,
     Resources,
     Sandbox,
+    SandboxConnectionError,
     SandboxCreateRequest,
     SandboxError,
     SandboxNotFoundError,
@@ -41,8 +48,12 @@ from benchmark_service.sandbox import (
     VolumeMount,
 )
 from benchmark_service.sandbox.daytona import (
+    _PTY_COLS,  # pyright: ignore[reportPrivateUsage]
+    _PTY_CREATE_MARKER_ENV,  # pyright: ignore[reportPrivateUsage]
+    _PTY_ROWS,  # pyright: ignore[reportPrivateUsage]
     _PTY_STDOUT_TAIL_MAX_BYTES,  # pyright: ignore[reportPrivateUsage]
     DaytonaProviderConfig,
+    _is_not_found_error,  # pyright: ignore[reportPrivateUsage]
     _is_transient_daytona_error,  # pyright: ignore[reportPrivateUsage]
     DaytonaSandbox,
     DaytonaSandboxProvider,
@@ -50,11 +61,61 @@ from benchmark_service.sandbox.daytona import (
 )
 
 
-def _client_response_error(status: int, message: str) -> ClientResponseError:
-    url = URL("https://daytona.example.test")
-    headers: CIMultiDict[str] = CIMultiDict()
-    request_info = RequestInfo(url=url, method="GET", headers=CIMultiDictProxy(headers), real_url=url)
-    return ClientResponseError(request_info, (), status=status, message=message)
+_SENSITIVE_RETRY_SENTINEL = "SENSITIVE_RETRY_SENTINEL"
+_STANDARD_LOG_RECORD_KEYS = frozenset(vars(logging.LogRecord("", logging.WARNING, "", 0, "", (), None)))
+
+
+def _client_response_error(
+    status: int,
+    message: str,
+    *,
+    url: str = "https://daytona.example.test",
+    headers: Mapping[str, str] | None = None,
+) -> ClientResponseError:
+    request_url = URL(url)
+    header_values: CIMultiDict[str] = CIMultiDict(headers or {})
+    header_proxy = CIMultiDictProxy(header_values)
+    request_info = RequestInfo(url=request_url, method="GET", headers=header_proxy, real_url=request_url)
+    return ClientResponseError(request_info, (), status=status, message=message, headers=header_proxy)
+
+
+def _callback_extra(record: logging.LogRecord) -> dict[str, object]:
+    return {
+        key: value
+        for key, value in vars(record).items()
+        if key not in _STANDARD_LOG_RECORD_KEYS and key not in {"asctime", "message"}
+    }
+
+
+def _retry_records(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [
+        record
+        for record in caplog.records
+        if record.name == daytona_module.__name__ and record.getMessage().startswith("daytona.retry ")
+    ]
+
+
+def _assert_safe_retry_record(
+    record: logging.LogRecord,
+    expected_message: str,
+    expected_fields: Mapping[str, object],
+) -> None:
+    assert record.levelno == logging.WARNING
+    assert record.getMessage() == expected_message
+    assert _callback_extra(record) == expected_fields
+    assert record.exc_info is None
+    assert record.exc_text is None
+    assert record.stack_info is None
+    assert _SENSITIVE_RETRY_SENTINEL not in repr((record.getMessage(), vars(record)))
+
+
+def _skip_retry_sleep(monkeypatch: pytest.MonkeyPatch, method: object) -> None:
+    """Run a tenacity-wrapped method's retries without their real backoff delays."""
+
+    async def no_wait(_seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr(cast(Any, method).retry, "sleep", no_wait)
 
 
 def _unwrap_shell_command(command: str) -> str:
@@ -63,10 +124,18 @@ def _unwrap_shell_command(command: str) -> str:
     return command
 
 
+def _assert_pty_create_config(envs: Mapping[str, str], pty_size: PtySize) -> None:
+    assert envs["TERM"] == "dumb"
+    assert envs["LANG"] == "C.UTF-8"
+    assert envs[_PTY_CREATE_MARKER_ENV]
+    assert pty_size == PtySize(rows=_PTY_ROWS, cols=_PTY_COLS)
+
+
 class Process:
     def __init__(self) -> None:
         self.command: str | None = None
         self.pty_envs: dict[str, str] | None = None
+        self.pty_size: PtySize | None = None
         self.pty_handle: PtyHandle | None = None
 
     async def exec(self, command: str) -> SimpleNamespace:
@@ -84,9 +153,12 @@ class Process:
         id: str,
         on_data: Callable[[bytes], None | Awaitable[None]],
         envs: dict[str, str],
+        pty_size: PtySize,
     ) -> "PtyHandle":
         assert id
+        _assert_pty_create_config(envs, pty_size)
         self.pty_envs = envs
+        self.pty_size = pty_size
         self.pty_handle = PtyHandle(on_data)
         return self.pty_handle
 
@@ -94,16 +166,50 @@ class Process:
         assert session_id
 
 
-class RateLimitedProcess(Process):
-    def __init__(self) -> None:
+class RetryingProcess(Process):
+    def __init__(self, errors: list[BaseException]) -> None:
         super().__init__()
+        self._errors = list(errors)
         self.attempts = 0
 
     async def exec(self, command: str) -> SimpleNamespace:
         self.attempts += 1
-        if self.attempts == 1:
-            raise DaytonaRateLimitError("rate limited", headers={"retry-after-sandbox-create": "0"})
+        if self._errors:
+            raise self._errors.pop(0)
         return await super().exec(command)
+
+
+async def _run_retrying_exec(
+    process: RetryingProcess,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> tuple[ExecResult, list[float], list[logging.LogRecord]]:
+    inner = InnerSandbox()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+    observed_waits: list[float] = []
+
+    async def record_wait(seconds: float) -> None:
+        observed_waits.append(seconds)
+
+    retryer = cast(Any, DaytonaSandbox.exec).retry
+    monkeypatch.setattr(retryer, "sleep", record_wait)
+    with caplog.at_level(logging.WARNING, logger=daytona_module.__name__):
+        result = await sandbox.exec(_SENSITIVE_RETRY_SENTINEL)
+
+    return result, observed_waits, _retry_records(caplog)
+
+
+async def _disable_pty_retry_waits(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def no_wait(_seconds: float) -> None:
+        pass
+
+    for method in (
+        DaytonaSandbox._create_pty_session,  # pyright: ignore[reportPrivateUsage]
+        DaytonaSandbox._get_pty_create_session_info,  # pyright: ignore[reportPrivateUsage]
+        DaytonaSandbox._connect_created_pty,  # pyright: ignore[reportPrivateUsage]
+    ):
+        monkeypatch.setattr(cast(Any, method).retry, "sleep", no_wait)
 
 
 class FailedExecuteCommandProcess(Process):
@@ -115,6 +221,18 @@ class FailedExecuteCommandProcess(Process):
         self.attempts += 1
         if self.attempts == 1:
             raise DaytonaError("Failed to execute command:")
+        return await super().exec(command)
+
+
+class ContainerIpProcess(Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        self.attempts += 1
+        if self.attempts == 1:
+            raise DaytonaError("Failed to execute command: failed to resolve container IP after 3 attempts")
         return await super().exec(command)
 
 
@@ -155,6 +273,29 @@ class MisclassifiedTransportProcess(Process):
         return await super().exec(command)
 
 
+class HangingProcess(Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.attempts = 0
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        self.attempts += 1
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+class SlowSuccessProcess(Process):
+    def __init__(self, delay: float) -> None:
+        super().__init__()
+        self.attempts = 0
+        self._delay = delay
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        self.attempts += 1
+        await asyncio.sleep(self._delay)
+        return await super().exec(command)
+
+
 class DetailedFailedExecuteCommandProcess(Process):
     def __init__(self) -> None:
         super().__init__()
@@ -174,6 +315,7 @@ class PtyHandle:
     def __init__(self, on_data: Callable[[bytes], None | Awaitable[None]]) -> None:
         self._on_data = on_data
         self.inputs: list[str] = []
+        self.disconnected = False
 
     async def send_input(self, data: str) -> None:
         self.inputs.append(data)
@@ -187,7 +329,7 @@ class PtyHandle:
         pass
 
     async def disconnect(self) -> None:
-        pass
+        self.disconnected = True
 
 
 class DisconnectedPtyHandle(PtyHandle):
@@ -200,6 +342,7 @@ class ReconnectingProcess(Process):
         super().__init__()
         self.checked_session_id: str | None = None
         self.connected_session_id: str | None = None
+        self.handles: list[PtyHandle] = []
 
     async def exec(self, command: str) -> SimpleNamespace:
         if _unwrap_shell_command(command).startswith("test -e "):
@@ -212,10 +355,13 @@ class ReconnectingProcess(Process):
         id: str,
         on_data: Callable[[bytes], None | Awaitable[None]],
         envs: dict[str, str],
+        pty_size: PtySize,
     ) -> PtyHandle:
         assert id
-        assert envs == {"TERM": "dumb", "LANG": "C.UTF-8"}
-        return DisconnectedPtyHandle(on_data)
+        _assert_pty_create_config(envs, pty_size)
+        handle = DisconnectedPtyHandle(on_data)
+        self.handles.append(handle)
+        return handle
 
     async def get_pty_session_info(self, session_id: str) -> SimpleNamespace:
         assert self.connected_session_id is None
@@ -229,7 +375,9 @@ class ReconnectingProcess(Process):
     ) -> PtyHandle:
         assert self.checked_session_id == session_id
         self.connected_session_id = session_id
-        return PtyHandle(on_data)
+        handle = PtyHandle(on_data)
+        self.handles.append(handle)
+        return handle
 
 
 class FinishedPtyHandle(PtyHandle):
@@ -253,10 +401,13 @@ class LostPtyProcess(ReconnectingProcess):
         id: str,
         on_data: Callable[[bytes], None | Awaitable[None]],
         envs: dict[str, str],
+        pty_size: PtySize,
     ) -> FinishedPtyHandle:
         assert id
-        assert envs == {"TERM": "dumb", "LANG": "C.UTF-8"}
-        return FinishedPtyHandle(on_data, self._result)
+        _assert_pty_create_config(envs, pty_size)
+        handle = FinishedPtyHandle(on_data, self._result)
+        self.handles.append(handle)
+        return handle
 
     async def get_pty_session_info(self, session_id: str) -> SimpleNamespace:
         self.checked_session_id = session_id
@@ -270,8 +421,159 @@ class CreatePtyFailureProcess(Process):
         id: str,
         on_data: Callable[[bytes], None | Awaitable[None]],
         envs: dict[str, str],
+        pty_size: PtySize,
     ) -> PtyHandle:
+        _assert_pty_create_config(envs, pty_size)
         raise DaytonaConnectionError("toolbox unreachable")
+
+
+class CreatePtyConflictProcess(Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.create_attempts = 0
+        self.reconnect_attempts = 0
+        self.killed_session_ids: list[str] = []
+
+    async def create_pty_session(
+        self,
+        *,
+        id: str,
+        on_data: Callable[[bytes], None | Awaitable[None]],
+        envs: dict[str, str],
+        pty_size: PtySize,
+    ) -> PtyHandle:
+        _assert_pty_create_config(envs, pty_size)
+        self.create_attempts += 1
+        raise DaytonaConflictError("PTY session already exists")
+
+    async def get_pty_session_info(self, session_id: str) -> SimpleNamespace:
+        self.reconnect_attempts += 1
+        raise AssertionError(f"must not inspect conflicting PTY session: {session_id}")
+
+    async def connect_pty_session(
+        self, session_id: str, on_data: Callable[[bytes], None | Awaitable[None]]
+    ) -> PtyHandle:
+        self.reconnect_attempts += 1
+        raise AssertionError(f"must not connect conflicting PTY session: {session_id}")
+
+    async def kill_pty_session(self, session_id: str) -> None:
+        self.killed_session_ids.append(session_id)
+
+
+class ReconcilingPtyProcess(Process):
+    def __init__(
+        self,
+        create_outcomes: list[BaseException | None],
+        *,
+        get_errors: list[BaseException] | None = None,
+        connect_errors: list[BaseException] | None = None,
+    ) -> None:
+        super().__init__()
+        self.create_outcomes = list(create_outcomes)
+        self.get_errors = list(get_errors or [])
+        self.connect_errors = list(connect_errors or [])
+        self.create_ids: list[str] = []
+        self.create_envs: list[dict[str, str]] = []
+        self.get_session_ids: list[str] = []
+        self.connect_session_ids: list[str] = []
+        self.handles: list[PtyHandle] = []
+        self.killed_session_ids: list[str] = []
+        self.status_cleanup_calls = 0
+        self.info_id: str | None = None
+        self.info_rows = _PTY_ROWS
+        self.info_cols = _PTY_COLS
+        self.info_env_overrides: dict[str, str] = {}
+        self.info_env_omissions: set[str] = set()
+        self.destroy_sandbox_on_get: Any | None = None
+        self.destroy_sandbox_on_connect: Any | None = None
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        if _unwrap_shell_command(command).startswith("rm -f "):
+            self.status_cleanup_calls += 1
+        return await super().exec(command)
+
+    async def create_pty_session(
+        self,
+        *,
+        id: str,
+        on_data: Callable[[bytes], None | Awaitable[None]],
+        envs: dict[str, str],
+        pty_size: PtySize,
+    ) -> PtyHandle:
+        _assert_pty_create_config(envs, pty_size)
+        self.create_ids.append(id)
+        self.create_envs.append(dict(envs))
+        if not self.create_outcomes:
+            raise AssertionError("unexpected extra PTY create attempt")
+        outcome = self.create_outcomes.pop(0)
+        if outcome is not None:
+            raise outcome
+        handle = PtyHandle(on_data)
+        self.handles.append(handle)
+        return handle
+
+    async def get_pty_session_info(self, session_id: str) -> PtySessionInfo:
+        self.get_session_ids.append(session_id)
+        if self.destroy_sandbox_on_get is not None:
+            self.destroy_sandbox_on_get.state = SandboxState.DESTROYED
+        if self.get_errors:
+            raise self.get_errors.pop(0)
+        envs = dict(self.create_envs[0])
+        envs.update(self.info_env_overrides)
+        for key in self.info_env_omissions:
+            envs.pop(key, None)
+        return PtySessionInfo(
+            active=False,
+            cols=self.info_cols,
+            created_at="2026-08-07T00:00:00Z",
+            cwd="/home/daytona",
+            envs=envs,
+            id=self.info_id or session_id,
+            lazy_start=False,
+            rows=self.info_rows,
+        )
+
+    async def connect_pty_session(
+        self,
+        session_id: str,
+        on_data: Callable[[bytes], None | Awaitable[None]],
+    ) -> PtyHandle:
+        self.connect_session_ids.append(session_id)
+        if self.destroy_sandbox_on_connect is not None:
+            self.destroy_sandbox_on_connect.state = SandboxState.DESTROYED
+        if self.connect_errors:
+            raise self.connect_errors.pop(0)
+        handle = PtyHandle(on_data)
+        self.handles.append(handle)
+        return handle
+
+    async def kill_pty_session(self, session_id: str) -> None:
+        self.killed_session_ids.append(session_id)
+
+
+class BlockingReconciliationProcess(ReconcilingPtyProcess):
+    def __init__(self, blocked_stage: str) -> None:
+        super().__init__([DaytonaConnectionError("create outcome lost"), DaytonaConflictError("already exists")])
+        self.blocked_stage = blocked_stage
+        self.block_started = asyncio.Event()
+
+    async def get_pty_session_info(self, session_id: str) -> PtySessionInfo:
+        if self.blocked_stage == "get":
+            self.get_session_ids.append(session_id)
+            self.block_started.set()
+            await asyncio.Event().wait()
+        return await super().get_pty_session_info(session_id)
+
+    async def connect_pty_session(
+        self,
+        session_id: str,
+        on_data: Callable[[bytes], None | Awaitable[None]],
+    ) -> PtyHandle:
+        if self.blocked_stage == "connect":
+            self.connect_session_ids.append(session_id)
+            self.block_started.set()
+            await asyncio.Event().wait()
+        return await super().connect_pty_session(session_id, on_data)
 
 
 class CrashingReconnectProcess(ReconnectingProcess):
@@ -302,27 +604,26 @@ class FloodingProcess(Process):
         id: str,
         on_data: Callable[[bytes], None | Awaitable[None]],
         envs: dict[str, str],
+        pty_size: PtySize,
     ) -> PtyHandle:
         assert id
+        _assert_pty_create_config(envs, pty_size)
         self.pty_envs = envs
         self.pty_handle = FloodingPtyHandle(on_data)
         return self.pty_handle
 
 
 class BlockingPtyHandle(PtyHandle):
-    disconnected = False
-
     async def wait(self) -> None:
         await asyncio.Event().wait()
 
-    async def disconnect(self) -> None:
-        self.disconnected = True
-
 
 class BlockingProcess(Process):
+    handle_cls: type[PtyHandle] = BlockingPtyHandle
+
     def __init__(self) -> None:
         super().__init__()
-        self.handle: BlockingPtyHandle | None = None
+        self.handle: PtyHandle | None = None
         self.killed_session_id: str | None = None
 
     async def create_pty_session(
@@ -331,14 +632,37 @@ class BlockingProcess(Process):
         id: str,
         on_data: Callable[[bytes], None | Awaitable[None]],
         envs: dict[str, str],
-    ) -> BlockingPtyHandle:
+        pty_size: PtySize,
+    ) -> PtyHandle:
         assert id
-        assert envs == {"TERM": "dumb", "LANG": "C.UTF-8"}
-        self.handle = BlockingPtyHandle(on_data)
+        _assert_pty_create_config(envs, pty_size)
+        self.handle = self.handle_cls(on_data)
         return self.handle
 
     async def kill_pty_session(self, session_id: str) -> None:
         self.killed_session_id = session_id
+
+
+class StalledSendPtyHandle(BlockingPtyHandle):
+    async def send_input(self, data: str) -> None:
+        # Let the stty prologue through so the stall lands on the command send itself.
+        if data.startswith("stty"):
+            return
+        await asyncio.Event().wait()
+
+
+class StalledSendProcess(BlockingProcess):
+    handle_cls = StalledSendPtyHandle
+
+
+class StalledDisconnectPtyHandle(PtyHandle):
+    async def disconnect(self) -> None:
+        await super().disconnect()
+        await asyncio.Event().wait()
+
+
+class StalledDisconnectProcess(BlockingProcess):
+    handle_cls = StalledDisconnectPtyHandle
 
 
 class Files:
@@ -364,6 +688,25 @@ class RemovedSandboxFiles(Files):
         async def chunks() -> Any:
             raise _client_response_error(status=502, message="Bad Gateway")
             yield b""
+
+        return chunks()
+
+
+class FlakyStreamingFiles(Files):
+    def __init__(self, error: Exception) -> None:
+        self._error = error
+        self.attempts = 0
+
+    async def download_file_stream(self, remote_path: str) -> Any:
+        assert remote_path == "/tmp/result.txt"
+        self.attempts += 1
+        fails = self.attempts == 1
+
+        async def chunks() -> Any:
+            yield b"hello"
+            if fails:
+                raise self._error
+            yield b" world"
 
         return chunks()
 
@@ -466,18 +809,6 @@ class RemovedInnerSandbox(InnerSandbox):
         raise DaytonaNotFoundError("sandbox not found")
 
 
-class DeleteConflictSandbox(InnerSandbox):
-    def __init__(self) -> None:
-        super().__init__()
-        self.autostop_attempts = 0
-
-    async def set_autostop_interval(self, interval: int) -> None:
-        self.autostop_attempts += 1
-        if self.autostop_attempts == 1:
-            raise DaytonaConflictError("Failed to set auto-stop interval: Sandbox was modified by another operation")
-        await super().set_autostop_interval(interval)
-
-
 class ErrorStateSandbox(InnerSandbox):
     state = SandboxState.ERROR
 
@@ -489,38 +820,30 @@ class RecreatedInnerSandbox(InnerSandbox):
     id = "recreated-sandbox-id"
 
 
-class InactiveSandbox(InnerSandbox):
+class DeleteWithoutPreparationSandbox(InnerSandbox):
     def __init__(self, state: SandboxState) -> None:
         super().__init__()
         self.state = state
 
     async def wait_for_sandbox_start(self, timeout: int) -> None:
-        raise AssertionError("inactive sandbox deletion must not wait for startup")
+        raise AssertionError("sandbox deletion must not wait for startup")
 
     async def refresh_data(self) -> None:
-        raise AssertionError("inactive sandbox deletion must not refresh before deletion")
+        raise AssertionError("sandbox deletion must not refresh before deletion")
 
     async def set_autostop_interval(self, interval: int) -> None:
-        raise AssertionError("inactive sandbox deletion must not update autostop")
+        raise AssertionError("sandbox deletion must not update autostop")
 
 
-class BuildingSandbox(InnerSandbox):
-    state = SandboxState.BUILDING_SNAPSHOT
-
+class HungStartInnerSandbox(InnerSandbox):
     def __init__(self) -> None:
         super().__init__()
-        self.waited_for_start = False
+        self.start_attempts = 0
 
     async def wait_for_sandbox_start(self, timeout: int) -> None:
         assert timeout == 0
-        self.waited_for_start = True
-        self.state = SandboxState.STARTED
-
-
-class RefreshToErrorSandbox(InnerSandbox):
-    async def refresh_data(self) -> None:
-        await super().refresh_data()
-        self.state = SandboxState.ERROR
+        self.start_attempts += 1
+        await asyncio.Event().wait()
 
 
 class BareHtml502RefreshSandbox(InnerSandbox):
@@ -533,6 +856,71 @@ class BareHtml502RefreshSandbox(InnerSandbox):
         if self.refresh_attempts == 1:
             raise DaytonaError("Failed to refresh sandbox data: <html><h1>502 Bad Gateway</h1></html>")
         await super().refresh_data()
+
+
+class PersistentBareHtml502RefreshSandbox(InnerSandbox):
+    async def refresh_data(self) -> None:
+        raise DaytonaError("Failed to refresh sandbox data: <html><h1>502 Bad Gateway</h1></html>")
+
+
+class StatusDuringFailedRefreshProcess(Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.status_exists = False
+        self.status_probe_command: str | None = None
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        evaluated_command = _unwrap_shell_command(command)
+        if evaluated_command.startswith("test -e "):
+            if self.status_probe_command is None:
+                self.status_probe_command = evaluated_command
+            else:
+                assert evaluated_command == self.status_probe_command
+            return SimpleNamespace(exit_code=0 if self.status_exists else 1, result="")
+        return await super().exec(command)
+
+
+class StatusDuringFailedRefreshSandbox(InnerSandbox):
+    def __init__(self) -> None:
+        super().__init__()
+        self.status_process = StatusDuringFailedRefreshProcess()
+        self.process = self.status_process
+
+    async def refresh_data(self) -> None:
+        self.status_process.status_exists = True
+        raise DaytonaError("Failed to refresh sandbox data: <html><h1>502 Bad Gateway</h1></html>")
+
+
+class StatusDuringFailedProbeProcess(Process):
+    def __init__(self, *, publish_status_on_failure: bool = True, fail_reprobe: bool = False) -> None:
+        super().__init__()
+        self.publish_status_on_failure = publish_status_on_failure
+        self.fail_reprobe = fail_reprobe
+        self.status_exists = False
+        self.status_probe_commands: list[str] = []
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        evaluated_command = _unwrap_shell_command(command)
+        if evaluated_command.startswith("test -e "):
+            self.status_probe_commands.append(evaluated_command)
+            if len(self.status_probe_commands) == 1:
+                self.status_exists = self.publish_status_on_failure
+                raise DaytonaError("Failed to execute command: initial status probe failed")
+            assert evaluated_command == self.status_probe_commands[0]
+            if self.fail_reprobe:
+                raise DaytonaError("Failed to execute command: reconciliation status probe failed")
+            return SimpleNamespace(exit_code=0 if self.status_exists else 1, result="")
+        return await super().exec(command)
+
+
+class HangingRefreshSandbox(InnerSandbox):
+    def __init__(self) -> None:
+        super().__init__()
+        self.refresh_attempts = 0
+
+    async def refresh_data(self) -> None:
+        self.refresh_attempts += 1
+        await asyncio.Event().wait()
 
 
 class UnexpectedRefreshSandbox(InnerSandbox):
@@ -577,6 +965,25 @@ class DaytonaClient:
             yield self.sandbox
 
         return sandboxes()
+
+
+class DeleteConflictDaytonaClient(DaytonaClient):
+    def __init__(self, sandbox: InnerSandbox) -> None:
+        super().__init__(sandbox)
+        self.delete_attempts = 0
+
+    async def delete(self, sandbox: InnerSandbox) -> None:
+        assert sandbox is self.sandbox
+        self.delete_attempts += 1
+        if self.delete_attempts == 1:
+            raise DaytonaConflictError("Sandbox was modified by another operation")
+        await super().delete(sandbox)
+
+
+class DeleteNotFoundDaytonaClient(DaytonaClient):
+    async def delete(self, sandbox: InnerSandbox) -> None:
+        assert sandbox is self.sandbox
+        raise DaytonaNotFoundError("sandbox not found")
 
 
 class DaytonaRegionsClient:
@@ -662,6 +1069,7 @@ class SysboxRunnerFaultDaytonaClient(DaytonaClient):
 
 class ConflictThenFlakyLookupDaytonaClient(DaytonaClient):
     """create always name-conflicts; the recovery lookup fails transiently once."""
+
     def __init__(self, sandbox: InnerSandbox) -> None:
         super().__init__(sandbox)
         self.get_attempts = 0
@@ -947,7 +1355,9 @@ async def test_daytona_command_wraps_shell_pipelines_when_timeout_is_set() -> No
     inner = InnerSandbox()
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    await sandbox.exec("container_id=$(docker compose ps -q main); cat /tmp/file | docker exec -i \"$container_id\" cat", timeout=60)
+    await sandbox.exec(
+        'container_id=$(docker compose ps -q main); cat /tmp/file | docker exec -i "$container_id" cat', timeout=60
+    )
 
     assert inner.process.command == (
         "timeout 60 sh -c "
@@ -968,6 +1378,21 @@ def test_daytona_retry_after_uses_any_retry_after_header() -> None:
     exc = DaytonaRateLimitError("rate limited", headers={"retry-after-custom": "5"})
 
     assert daytona_retry_after_seconds(exc) == 5
+
+
+@pytest.mark.parametrize(
+    "invalid_delay",
+    [
+        pytest.param(-1, id="negative"),
+        pytest.param(float("nan"), id="nan"),
+        pytest.param(float("inf"), id="positive-infinity"),
+        pytest.param(float("-inf"), id="negative-infinity"),
+    ],
+)
+def test_daytona_retry_after_rejects_negative_and_non_finite_values(invalid_delay: float) -> None:
+    exc = DaytonaRateLimitError("rate limited", headers={"retry-after": invalid_delay})
+
+    assert daytona_retry_after_seconds(exc) is None
 
 
 @pytest.mark.parametrize(
@@ -1011,6 +1436,11 @@ def test_daytona_permanent_http_statuses_are_not_transient(status_code: int) -> 
     assert not _is_transient_daytona_error(DaytonaError("provider request failed", status_code=status_code))
 
 
+def test_daytona_not_found_classification_uses_structured_code_and_status_fallback() -> None:
+    assert _is_not_found_error(DaytonaError("sandbox missing", code="NOT_FOUND"))
+    assert _is_not_found_error(DaytonaError("sandbox missing", status_code=404))
+
+
 @pytest.mark.parametrize(
     "message",
     [
@@ -1041,15 +1471,135 @@ async def test_daytona_unexpected_refresh_uses_staged_backoff(monkeypatch: pytes
         assert expected * 0.9 <= observed <= expected
 
 
-async def test_daytona_exec_retries_rate_limits() -> None:
+async def test_daytona_exec_logs_each_rate_limit_retry(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sensitive_message = f"rate limited {_SENSITIVE_RETRY_SENTINEL}"
+    sensitive_code = f"CODE_{_SENSITIVE_RETRY_SENTINEL}"
+    errors: list[BaseException] = [
+        DaytonaRateLimitError(sensitive_message, 429, {"retry-after": "nan"}, sensitive_code, SOURCE_API),
+        DaytonaRateLimitError(
+            sensitive_message, 429, {"retry-after-sandbox-create": "0.25"}, sensitive_code, SOURCE_PROXY
+        ),
+        DaytonaRateLimitError(
+            sensitive_message, 429, {"retry-after-sandbox-create": "0.5"}, sensitive_code, SOURCE_DAEMON
+        ),
+    ]
+    process = RetryingProcess(errors)
+
+    result, observed_waits, records = await _run_retrying_exec(process, monkeypatch, caplog)
+
+    assert result.exit_code == 0
+    assert process.attempts == 4
+    assert observed_waits == [1.0, 0.25, 0.5]
+    assert len(records) == 3
+
+    expected_messages = [
+        "daytona.retry sandbox_provider=daytona daytona_step=exec daytona_retry_attempt=1 "
+        "daytona_retry_delay_s=1.0 daytona_retry_category=rate_limit daytona_status_code=429 daytona_source=api",
+        "daytona.retry sandbox_provider=daytona daytona_step=exec daytona_retry_attempt=2 "
+        "daytona_retry_delay_s=0.25 daytona_retry_category=rate_limit daytona_status_code=429 daytona_source=proxy",
+        "daytona.retry sandbox_provider=daytona daytona_step=exec daytona_retry_attempt=3 "
+        "daytona_retry_delay_s=0.5 daytona_retry_category=rate_limit daytona_status_code=429 daytona_source=daemon",
+    ]
+    for attempt, (record, delay, source, expected_message) in enumerate(
+        zip(records, observed_waits, ("api", "proxy", "daemon"), expected_messages, strict=True),
+        start=1,
+    ):
+        expected_fields = {
+            "sandbox_provider": "daytona",
+            "daytona_step": "exec",
+            "daytona_retry_attempt": attempt,
+            "daytona_retry_delay_s": delay,
+            "daytona_retry_category": "rate_limit",
+            "daytona_status_code": 429,
+            "daytona_source": source,
+        }
+        _assert_safe_retry_record(record, expected_message, expected_fields)
+
+
+@pytest.mark.parametrize(
+    ("provider_error", "status_code"),
+    [
+        pytest.param(
+            DaytonaError(
+                f"provider message {_SENSITIVE_RETRY_SENTINEL}",
+                status_code=502,
+                headers={"x-sensitive": _SENSITIVE_RETRY_SENTINEL},
+                code=f"CODE_{_SENSITIVE_RETRY_SENTINEL}",
+                source=_SENSITIVE_RETRY_SENTINEL,
+            ),
+            502,
+            id="daytona-error",
+        ),
+        pytest.param(
+            _client_response_error(
+                503,
+                f"provider message {_SENSITIVE_RETRY_SENTINEL}",
+                url=f"https://daytona.example.test/{_SENSITIVE_RETRY_SENTINEL}",
+                headers={"x-sensitive": _SENSITIVE_RETRY_SENTINEL},
+            ),
+            503,
+            id="client-response-error",
+        ),
+    ],
+)
+async def test_daytona_exec_logs_typed_status_without_sensitive_details(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    provider_error: DaytonaError | ClientResponseError,
+    status_code: int,
+) -> None:
+    process = RetryingProcess([provider_error])
+
+    result, observed_waits, records = await _run_retrying_exec(process, monkeypatch, caplog)
+
+    assert result.exit_code == 0
+    assert process.attempts == 2
+    assert len(observed_waits) == 1
+    expected_fields = {
+        "sandbox_provider": "daytona",
+        "daytona_step": "exec",
+        "daytona_retry_attempt": 1,
+        "daytona_retry_delay_s": observed_waits[0],
+        "daytona_retry_category": "transient",
+        "daytona_status_code": status_code,
+    }
+    expected_message = (
+        "daytona.retry sandbox_provider=daytona daytona_step=exec daytona_retry_attempt=1 "
+        f"daytona_retry_delay_s={observed_waits[0]} daytona_retry_category=transient "
+        f"daytona_status_code={status_code}"
+    )
+    _assert_safe_retry_record(records[0], expected_message, expected_fields)
+
+
+async def test_daytona_retry_logging_failure_preserves_retry_behavior(monkeypatch: pytest.MonkeyPatch) -> None:
+    process = RetryingProcess([DaytonaError("provider unavailable", status_code=503)])
     inner = InnerSandbox()
-    process = RateLimitedProcess()
     inner.process = process
     sandbox = DaytonaSandbox(cast(Any, inner))
+    observed_waits: list[float] = []
+    warning_calls = 0
 
-    await sandbox.exec("pytest")
+    async def record_wait(seconds: float) -> None:
+        observed_waits.append(seconds)
 
+    def fail_warning(_message: str, **_kwargs: object) -> None:
+        nonlocal warning_calls
+        warning_calls += 1
+        raise RuntimeError("logging unavailable")
+
+    retryer = cast(Any, DaytonaSandbox.exec).retry
+    monkeypatch.setattr(retryer, "sleep", record_wait)
+    monkeypatch.setattr(daytona_module.logger, "warning", fail_warning)
+
+    result = await sandbox.exec("pytest")
+
+    assert result.exit_code == 0
     assert process.attempts == 2
+    assert warning_calls == 1
+    assert len(observed_waits) == 1
 
 
 async def test_daytona_exec_retries_failed_execute_command_errors() -> None:
@@ -1085,6 +1635,85 @@ async def test_daytona_exec_retries_wrapped_connection_errors() -> None:
 async def test_daytona_exec_retries_misclassified_transport_errors() -> None:
     inner = InnerSandbox()
     process = MisclassifiedTransportProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    result = await sandbox.exec("pytest")
+
+    assert result.exit_code == 0
+    assert process.attempts == 2
+
+
+async def test_daytona_exec_with_timeout_bounds_hanging_toolbox_call(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A toolbox call that never returns must surface as a retryable error rather than hang."""
+    inner = InnerSandbox()
+    process = HangingProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", 0.05)
+
+    _skip_retry_sleep(monkeypatch, DaytonaSandbox.exec)
+
+    with pytest.raises(SandboxConnectionError, match="timed out"):
+        await asyncio.wait_for(sandbox.exec("pytest", timeout=0.01), timeout=5)
+
+    assert process.attempts == 6
+
+
+async def test_daytona_exec_does_not_cap_untimed_long_command(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An untimed command must outlive the toolbox bound.
+
+    Capping it would abort long installs and re-run non-idempotent commands on the retry.
+    """
+    inner = InnerSandbox()
+    process = SlowSuccessProcess(delay=0.2)
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", 0.02)
+
+    result = await asyncio.wait_for(sandbox.exec("sleep 999"), timeout=5)
+
+    assert result.exit_code == 0
+    assert process.attempts == 1
+
+
+async def test_daytona_control_exec_bounds_hanging_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Internal probes stay bounded even though an untimed public exec does not."""
+    inner = InnerSandbox()
+    process = HangingProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", 0.05)
+
+    _skip_retry_sleep(monkeypatch, DaytonaSandbox._control_exec)  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(SandboxConnectionError, match="timed out"):
+        await asyncio.wait_for(sandbox._control_exec("test -e /tmp/x"), timeout=5)  # pyright: ignore[reportPrivateUsage]
+
+    assert process.attempts == 6
+
+
+async def test_daytona_check_sandbox_alive_bounds_hanging_refresh(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The liveness check runs inside the PTY poll loop, so a stalled refresh must not hang it."""
+    inner = HangingRefreshSandbox()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", 0.05)
+
+    _skip_retry_sleep(monkeypatch, DaytonaSandbox._check_sandbox_alive)  # pyright: ignore[reportPrivateUsage]
+
+    with pytest.raises(SandboxConnectionError, match="timed out"):
+        await asyncio.wait_for(sandbox._check_sandbox_alive(), timeout=5)  # pyright: ignore[reportPrivateUsage]
+
+    assert inner.refresh_attempts == 6
+
+
+async def test_daytona_exec_retries_container_ip_resolution_failures() -> None:
+    inner = InnerSandbox()
+    process = ContainerIpProcess()
     inner.process = process
     sandbox = DaytonaSandbox(cast(Any, inner))
 
@@ -1181,6 +1810,31 @@ async def test_daytona_stream_download_raises_sandbox_not_found_when_removed() -
         _ = [chunk async for chunk in sandbox.stream_download("/tmp/result.txt")]
 
 
+@pytest.mark.parametrize(
+    "stream_error",
+    [
+        ConnectionResetError("connection reset"),
+        ClientPayloadError("response truncated"),
+    ],
+)
+async def test_daytona_download_retries_stream_errors(
+    monkeypatch: pytest.MonkeyPatch,
+    stream_error: Exception,
+) -> None:
+    """Transport errors raised mid-stream escape the SDK untyped, so they need their own retry."""
+    inner = InnerSandbox()
+    files = FlakyStreamingFiles(stream_error)
+    inner.fs = files
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    _skip_retry_sleep(monkeypatch, DaytonaSandbox.download_file)
+
+    result = await sandbox.download_file("/tmp/result.txt")
+
+    assert result == b"hello world"
+    assert files.attempts == 2
+
+
 async def test_daytona_pty_caps_result_output_without_dropping_streamed_chunks() -> None:
     """The PTY exec result should retain only a bounded output tail.
 
@@ -1213,6 +1867,24 @@ async def test_daytona_command_streams_output() -> None:
     assert output == ["hello"]
 
 
+async def test_daytona_command_publishes_status_atomically_and_cleans_temp() -> None:
+    inner = InnerSandbox()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    assert [chunk async for chunk in sandbox.command("printf hello")] == ["hello"]
+
+    assert inner.process.pty_handle is not None
+    publish_input = inner.process.pty_handle.inputs[1]
+    write_command, move_command = publish_input.split(" && mv ", maxsplit=1)
+    temp_path = shlex.split(write_command.rsplit(">", maxsplit=1)[1])[0]
+    move_args = shlex.split(move_command.removesuffix("; exit\n"))
+    assert move_args == [temp_path, temp_path.removesuffix(".tmp")]
+
+    assert inner.process.command is not None
+    cleanup_args = shlex.split(_unwrap_shell_command(inner.process.command))
+    assert cleanup_args == ["rm", "-f", temp_path.removesuffix(".tmp"), temp_path]
+
+
 async def test_daytona_command_uses_native_process_environment() -> None:
     secret = "value with spaces; $(touch /tmp/leaked)"
     inner = InnerSandbox()
@@ -1221,13 +1893,16 @@ async def test_daytona_command_uses_native_process_environment() -> None:
     output = [chunk async for chunk in sandbox.command("printf hello", env_vars={"AGENT_SECRET": secret})]
 
     assert output == ["hello"]
-    assert inner.process.pty_envs == {
-        "TERM": "dumb",
-        "LANG": "C.UTF-8",
-        "AGENT_SECRET": secret,
-    }
+    assert inner.process.pty_envs is not None
+    assert inner.process.pty_envs["TERM"] == "dumb"
+    assert inner.process.pty_envs["LANG"] == "C.UTF-8"
+    assert inner.process.pty_envs["AGENT_SECRET"] == secret
+    marker = inner.process.pty_envs[_PTY_CREATE_MARKER_ENV]
+    assert marker
+    assert inner.process.pty_size == PtySize(rows=_PTY_ROWS, cols=_PTY_COLS)
     assert inner.process.pty_handle is not None
-    assert all(secret not in data for data in inner.process.pty_handle.inputs)
+    assert inner.process.pty_handle.inputs[0].startswith("stty -echo; unset ")
+    assert all(secret not in data and marker not in data for data in inner.process.pty_handle.inputs)
 
 
 @pytest.mark.parametrize(
@@ -1266,6 +1941,42 @@ async def test_daytona_command_finishes_when_pty_close_never_arrives(monkeypatch
     assert process.killed_session_id is not None
 
 
+async def test_daytona_command_bounds_stalled_pty_send(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A PTY that never accepts input must fail the command and still release the session."""
+    inner = InnerSandbox()
+    process = StalledSendProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", 0.05)
+
+    with pytest.raises(SandboxConnectionError, match="timed out"):
+        async with asyncio.timeout(5):
+            _ = [chunk async for chunk in sandbox.command("printf hello")]
+
+    assert process.handle is not None
+    assert process.handle.disconnected is True
+    assert process.killed_session_id is not None
+
+
+async def test_daytona_command_continues_cleanup_when_disconnect_stalls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stalled disconnect must not strand cleanup after the command already succeeded."""
+    inner = InnerSandbox()
+    process = StalledDisconnectProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", 0.05)
+
+    async with asyncio.timeout(5):
+        output = [chunk async for chunk in sandbox.command("printf hello")]
+
+    assert output == ["hello"]
+    assert process.handle is not None
+    assert process.handle.disconnected is True
+    assert process.killed_session_id is not None
+
+
 async def test_daytona_command_checks_pty_before_reconnecting() -> None:
     inner = InnerSandbox()
     process = ReconnectingProcess()
@@ -1277,6 +1988,10 @@ async def test_daytona_command_checks_pty_before_reconnecting() -> None:
     assert output == ["hello"]
     assert process.checked_session_id is not None
     assert process.connected_session_id == process.checked_session_id
+    command_inputs = [data for handle in process.handles for data in handle.inputs if "mkdir -p " in data]
+    assert len(command_inputs) == 1
+    assert command_inputs[0] in process.handles[0].inputs
+    assert process.handles[1].inputs == []
 
 
 async def test_daytona_command_prefers_status_over_pty_exit() -> None:
@@ -1291,6 +2006,50 @@ async def test_daytona_command_prefers_status_over_pty_exit() -> None:
 
     assert [chunk async for chunk in sandbox.command("printf hello")] == ["hello"]
     assert process.checked_session_id is None
+
+
+async def test_daytona_command_returns_completed_status_before_later_health_502(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inner = PersistentBareHtml502RefreshSandbox()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+    _skip_retry_sleep(monkeypatch, DaytonaSandbox._check_sandbox_alive)  # pyright: ignore[reportPrivateUsage]
+
+    assert [chunk async for chunk in sandbox.command("printf hello")] == ["hello"]
+
+
+async def test_daytona_command_rechecks_status_written_during_failed_health_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inner = StatusDuringFailedRefreshSandbox()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+    _skip_retry_sleep(monkeypatch, DaytonaSandbox._check_sandbox_alive)  # pyright: ignore[reportPrivateUsage]
+
+    assert [chunk async for chunk in sandbox.command("printf hello")] == ["hello"]
+
+
+async def test_daytona_command_rechecks_status_after_initial_probe_failure() -> None:
+    inner = InnerSandbox()
+    process = StatusDuringFailedProbeProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    assert [chunk async for chunk in sandbox.command("printf hello")] == ["hello"]
+    assert len(process.status_probe_commands) == 2
+
+
+@pytest.mark.parametrize("fail_reprobe", [False, True], ids=["status-absent", "reprobe-failed"])
+async def test_daytona_command_preserves_initial_probe_error_without_completed_status(fail_reprobe: bool) -> None:
+    inner = InnerSandbox()
+    process = StatusDuringFailedProbeProcess(publish_status_on_failure=False, fail_reprobe=fail_reprobe)
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxError, match="initial status probe failed"):
+        _ = [chunk async for chunk in sandbox.command("printf hello")]
+
+    assert len(process.status_probe_commands) == 2
+    assert inner.refresh_count == 0
 
 
 async def test_daytona_command_reports_pty_exit_before_status() -> None:
@@ -1356,6 +2115,399 @@ async def test_daytona_command_checks_sandbox_health_after_pty_create_failure() 
         _ = [chunk async for chunk in sandbox.command("printf hello")]
 
     assert inner.refresh_count == 1
+
+
+@pytest.mark.parametrize("inner_type", [InnerSandbox, BareHtml502RefreshSandbox])
+async def test_daytona_command_keeps_pty_create_conflicts_terminal(inner_type: type[InnerSandbox]) -> None:
+    inner = inner_type()
+    process = CreatePtyConflictProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxError, match="PTY session already exists") as exc_info:
+        _ = [chunk async for chunk in sandbox.command("printf hello")]
+
+    assert type(exc_info.value) is SandboxError
+    assert process.create_attempts == 1
+    assert process.reconnect_attempts == 0
+    assert process.pty_handle is None
+    assert process.killed_session_ids == []
+    assert process.command is None
+    assert inner.refresh_count == 0
+    if isinstance(inner, BareHtml502RefreshSandbox):
+        assert inner.refresh_attempts == 0
+
+
+@pytest.mark.parametrize(
+    ("create_outcomes", "expected_create_attempts"),
+    [
+        pytest.param(
+            [DaytonaConnectionError("connection lost"), DaytonaConflictError("already exists")],
+            2,
+            id="connection",
+        ),
+        pytest.param(
+            [DaytonaTimeoutError("timed out"), DaytonaConflictError("already exists")],
+            2,
+            id="timeout",
+        ),
+        pytest.param(
+            [DaytonaError("server disconnected"), DaytonaConflictError("already exists")],
+            2,
+            id="flattened-transport-message",
+        ),
+        pytest.param(
+            [
+                _daytona_error_with_cause("create failed", ClientConnectionError("tcp reset")),
+                DaytonaConflictError("already exists"),
+            ],
+            2,
+            id="wrapped-connection-cause",
+        ),
+        *[
+            pytest.param(
+                [DaytonaError("server failed", status_code=status), DaytonaConflictError("already exists")],
+                2,
+                id=f"server-{status}",
+            )
+            for status in (408, 500, 502, 503, 504)
+        ],
+        pytest.param(
+            [
+                DaytonaError("server failed", status_code=500),
+                DaytonaRateLimitError("rate limited", 429, {"retry-after": "0"}, "RATE_LIMIT", SOURCE_API),
+                DaytonaConflictError("already exists"),
+            ],
+            3,
+            id="ambiguity-survives-rate-limit",
+        ),
+    ],
+)
+async def test_daytona_command_reconciles_ambiguous_pty_create_once(
+    monkeypatch: pytest.MonkeyPatch,
+    create_outcomes: list[BaseException | None],
+    expected_create_attempts: int,
+) -> None:
+    await _disable_pty_retry_waits(monkeypatch)
+    process = ReconcilingPtyProcess(create_outcomes)
+    inner = InnerSandbox()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    assert [chunk async for chunk in sandbox.command("printf unique-command")] == ["hello"]
+
+    assert len(process.create_ids) == expected_create_attempts
+    assert len(set(process.create_ids)) == 1
+    assert len({_env[_PTY_CREATE_MARKER_ENV] for _env in process.create_envs}) == 1
+    assert process.get_session_ids == [process.create_ids[0]]
+    assert process.connect_session_ids == [process.create_ids[0]]
+    command_inputs = [data for handle in process.handles for data in handle.inputs if "unique-command" in data]
+    assert len(command_inputs) == 1
+    assert process.killed_session_ids == [process.create_ids[0]]
+    assert process.status_cleanup_calls == 1
+
+
+@pytest.mark.parametrize(
+    "create_outcomes",
+    [
+        pytest.param(
+            [DaytonaError("rate limited", status_code=429), DaytonaConflictError("already exists")],
+            id="generic-rate-limit-before-typed-conflict",
+        ),
+        pytest.param(
+            [DaytonaConnectionError("connection lost"), DaytonaError("already exists")],
+            id="message-only-conflict-after-ambiguity",
+        ),
+        pytest.param(
+            [DaytonaConnectionError("connection lost"), DaytonaError("plain conflict", status_code=409)],
+            id="untyped-409-after-ambiguity",
+        ),
+    ],
+)
+async def test_daytona_command_does_not_reconcile_nonqualifying_conflicts(
+    monkeypatch: pytest.MonkeyPatch,
+    create_outcomes: list[BaseException | None],
+) -> None:
+    await _disable_pty_retry_waits(monkeypatch)
+    process = ReconcilingPtyProcess(create_outcomes)
+    inner = InnerSandbox()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxError):
+        _ = [chunk async for chunk in sandbox.command("printf hello")]
+
+    assert process.get_session_ids == []
+    assert process.connect_session_ids == []
+    assert process.handles == []
+    assert process.killed_session_ids == []
+    assert process.status_cleanup_calls == 0
+
+
+@pytest.mark.parametrize(
+    "mismatch",
+    ["missing-marker", "wrong-marker", "wrong-environment", "wrong-id", "wrong-rows", "wrong-cols"],
+)
+async def test_daytona_command_rejects_mismatched_pty_create_fingerprint(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    mismatch: str,
+) -> None:
+    await _disable_pty_retry_waits(monkeypatch)
+    process = ReconcilingPtyProcess([DaytonaConnectionError("connection lost"), DaytonaConflictError("already exists")])
+    if mismatch == "missing-marker":
+        process.info_env_omissions.add(_PTY_CREATE_MARKER_ENV)
+    elif mismatch == "wrong-marker":
+        process.info_env_overrides[_PTY_CREATE_MARKER_ENV] = "wrong-marker"
+    elif mismatch == "wrong-environment":
+        process.info_env_overrides["EXPECTED_ENV"] = "wrong-value"
+    elif mismatch == "wrong-id":
+        process.info_id = "unrelated-session"
+    elif mismatch == "wrong-rows":
+        process.info_rows += 1
+    else:
+        process.info_cols += 1
+    inner = InnerSandbox()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+    sensitive_value = "sensitive-environment-value"
+
+    with caplog.at_level(logging.WARNING, logger=daytona_module.__name__), pytest.raises(SandboxError) as exc_info:
+        _ = [chunk async for chunk in sandbox.command("printf hello", env_vars={"EXPECTED_ENV": sensitive_value})]
+
+    marker = process.create_envs[0][_PTY_CREATE_MARKER_ENV]
+    diagnostic_data = repr((str(exc_info.value), [(record.getMessage(), vars(record)) for record in caplog.records]))
+    assert marker not in diagnostic_data
+    assert sensitive_value not in diagnostic_data
+    assert "wrong-marker" not in diagnostic_data
+    assert process.get_session_ids == [process.create_ids[0]]
+    assert process.connect_session_ids == []
+    assert process.handles == []
+    assert process.killed_session_ids == []
+    assert process.status_cleanup_calls == 0
+
+
+async def test_daytona_command_keeps_marker_operation_scoped_and_unsets_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    await _disable_pty_retry_waits(monkeypatch)
+    process = ReconcilingPtyProcess(
+        [DaytonaConnectionError("first lost"), None, DaytonaConnectionError("second lost"), None]
+    )
+    inner = InnerSandbox()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    for command in ("printf first-command", "printf second-command"):
+        assert [
+            chunk
+            async for chunk in sandbox.command(
+                command,
+                env_vars={_PTY_CREATE_MARKER_ENV: "caller-value", "EXPECTED_ENV": "expected"},
+            )
+        ] == ["hello"]
+
+    first_markers = {envs[_PTY_CREATE_MARKER_ENV] for envs in process.create_envs[:2]}
+    second_markers = {envs[_PTY_CREATE_MARKER_ENV] for envs in process.create_envs[2:]}
+    assert len(first_markers) == len(second_markers) == 1
+    assert first_markers != second_markers
+    assert "caller-value" not in first_markers | second_markers
+    assert process.get_session_ids == []
+    assert process.connect_session_ids == []
+    for handle in process.handles:
+        assert handle.inputs[0].startswith(f"stty -echo; unset {_PTY_CREATE_MARKER_ENV}")
+        marker_values = first_markers | second_markers
+        assert all(marker not in data for marker in marker_values for data in handle.inputs)
+    command_inputs = [data for handle in process.handles for data in handle.inputs if "mkdir -p " in data]
+    assert len(command_inputs) == 2
+    assert len(process.killed_session_ids) == 2
+    assert process.status_cleanup_calls == 2
+
+
+@pytest.mark.parametrize("retry_stage", ["get", "connect"])
+async def test_daytona_command_retries_only_the_active_reconciliation_phase(
+    monkeypatch: pytest.MonkeyPatch,
+    retry_stage: str,
+) -> None:
+    await _disable_pty_retry_waits(monkeypatch)
+    process = ReconcilingPtyProcess(
+        [DaytonaConnectionError("create lost"), DaytonaConflictError("already exists")],
+        get_errors=[DaytonaConnectionError("get lost")] if retry_stage == "get" else None,
+        connect_errors=[DaytonaConnectionError("connect lost")] if retry_stage == "connect" else None,
+    )
+    inner = InnerSandbox()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    assert [chunk async for chunk in sandbox.command("printf phase-command")] == ["hello"]
+
+    assert len(process.create_ids) == 2
+    assert len(process.get_session_ids) == (2 if retry_stage == "get" else 1)
+    assert len(process.connect_session_ids) == (2 if retry_stage == "connect" else 1)
+    command_inputs = [data for handle in process.handles for data in handle.inputs if "phase-command" in data]
+    assert len(command_inputs) == 1
+    assert len(process.killed_session_ids) == 1
+
+
+@pytest.mark.parametrize(
+    (
+        "failure_stage",
+        "provider_error",
+        "destroy_sandbox",
+        "expected_type",
+        "expected_message",
+        "expected_kills",
+    ),
+    [
+        pytest.param(
+            "get",
+            DaytonaError("invalid get", status_code=400),
+            False,
+            SandboxError,
+            "invalid get",
+            0,
+            id="get-permanent",
+        ),
+        pytest.param(
+            "get",
+            DaytonaNotFoundError("PTY missing"),
+            False,
+            SandboxError,
+            "PTY session disappeared during create reconciliation",
+            0,
+            id="get-not-found",
+        ),
+        pytest.param(
+            "get",
+            DaytonaNotFoundError("PTY missing"),
+            True,
+            SandboxNotFoundError,
+            "Sandbox not found: name=sandbox-name, id=sandbox-id.",
+            0,
+            id="get-sandbox-destroyed",
+        ),
+        pytest.param(
+            "connect",
+            DaytonaError("invalid connect", status_code=400),
+            False,
+            SandboxError,
+            "invalid connect",
+            1,
+            id="connect-permanent",
+        ),
+        pytest.param(
+            "connect",
+            DaytonaNotFoundError("PTY missing"),
+            False,
+            SandboxError,
+            "PTY session disappeared before create reconciliation connected",
+            1,
+            id="connect-not-found",
+        ),
+        pytest.param(
+            "connect",
+            DaytonaNotFoundError("PTY missing"),
+            True,
+            SandboxNotFoundError,
+            "Sandbox not found: name=sandbox-name, id=sandbox-id.",
+            1,
+            id="connect-sandbox-destroyed",
+        ),
+    ],
+)
+async def test_daytona_command_applies_reconciliation_ownership_to_terminal_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    failure_stage: str,
+    provider_error: BaseException,
+    destroy_sandbox: bool,
+    expected_type: type[SandboxError],
+    expected_message: str,
+    expected_kills: int,
+) -> None:
+    await _disable_pty_retry_waits(monkeypatch)
+    process = ReconcilingPtyProcess(
+        [DaytonaConnectionError("create lost"), DaytonaConflictError("already exists")],
+        get_errors=[provider_error] if failure_stage == "get" else None,
+        connect_errors=[provider_error] if failure_stage == "connect" else None,
+    )
+    inner = InnerSandbox()
+    inner.process = process
+    if destroy_sandbox:
+        if failure_stage == "get":
+            process.destroy_sandbox_on_get = inner
+        else:
+            process.destroy_sandbox_on_connect = inner
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxError) as exc_info:
+        _ = [chunk async for chunk in sandbox.command("printf hello")]
+
+    assert type(exc_info.value) is expected_type
+    assert expected_message in str(exc_info.value)
+    assert all(handle.inputs == [] for handle in process.handles)
+    assert len(process.killed_session_ids) == expected_kills
+    assert process.status_cleanup_calls == expected_kills
+
+
+@pytest.mark.parametrize(
+    ("blocked_stage", "operation", "expected_kills"),
+    [
+        ("get", "process.get_pty_session_info", 0),
+        ("connect", "process.connect_pty_session", 1),
+    ],
+)
+async def test_daytona_command_bounds_stalled_pty_reconciliation(
+    monkeypatch: pytest.MonkeyPatch,
+    blocked_stage: str,
+    operation: str,
+    expected_kills: int,
+) -> None:
+    await _disable_pty_retry_waits(monkeypatch)
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", 0.01)
+    process = BlockingReconciliationProcess(blocked_stage)
+    inner = InnerSandbox()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+    generator = sandbox.command("printf hello")
+
+    with pytest.raises(SandboxConnectionError, match=rf"Daytona {operation} timed out"):
+        await asyncio.wait_for(anext(generator), timeout=2)
+    await generator.aclose()
+
+    assert all(handle.inputs == [] for handle in process.handles)
+    assert len(process.get_session_ids) == (6 if blocked_stage == "get" else 1)
+    assert len(process.connect_session_ids) == (0 if blocked_stage == "get" else 6)
+    assert len(process.killed_session_ids) == expected_kills
+    assert process.status_cleanup_calls == expected_kills
+
+
+@pytest.mark.parametrize(("blocked_stage", "expected_kills"), [("get", 0), ("connect", 1)])
+async def test_daytona_command_cancellation_respects_reconciliation_ownership(
+    monkeypatch: pytest.MonkeyPatch,
+    blocked_stage: str,
+    expected_kills: int,
+) -> None:
+    await _disable_pty_retry_waits(monkeypatch)
+    process = BlockingReconciliationProcess(blocked_stage)
+    inner = InnerSandbox()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+    generator = sandbox.command("printf hello")
+    task = asyncio.create_task(anext(generator))
+
+    await asyncio.wait_for(process.block_started.wait(), timeout=1)
+    assert all(handle.inputs == [] for handle in process.handles)
+    assert process.killed_session_ids == []
+    assert process.status_cleanup_calls == 0
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await generator.aclose()
+
+    assert all(handle.inputs == [] for handle in process.handles)
+    assert len(process.killed_session_ids) == expected_kills
+    assert process.status_cleanup_calls == expected_kills
 
 
 async def test_daytona_command_checks_sandbox_health_after_reconnect_failure() -> None:
@@ -1452,6 +2604,26 @@ async def test_daytona_provider_recovers_existing_sandbox_on_create_conflict() -
 
     assert daytona.created is True
     assert sandbox.id == inner.id
+
+
+async def test_daytona_provider_create_conflict_bounds_hung_sandbox_start(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Recovering a conflicting sandbox must not block forever on a start that never lands."""
+    inner = HungStartInnerSandbox()
+
+    class ConflictingHungStartClient(DaytonaClient):
+        async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
+            raise DaytonaError(f"Sandbox with name {inner.name} already exists")
+
+    daytona = ConflictingHungStartClient(inner)
+
+    monkeypatch.setattr(daytona_module, "_SANDBOX_START_TIMEOUT_SECONDS", 0.05)
+
+    _skip_retry_sleep(monkeypatch, DaytonaSandboxProvider.create_sandbox)
+
+    with pytest.raises(SandboxConnectionError, match="timed out"):
+        await asyncio.wait_for(_provider(daytona).create_sandbox(_request(inner.name)), timeout=5)
+
+    assert inner.start_attempts == 6
 
 
 class CapturingCreateDaytonaClient(DaytonaClient):
@@ -1619,45 +2791,51 @@ def test_targeted_snapshot_rejects_empty_target() -> None:
         TargetedSnapshotSource(snapshot="snap-1", target="")
 
 
-async def test_daytona_provider_delete_sets_autostop_before_delete() -> None:
+@pytest.mark.parametrize(
+    "state",
+    [
+        SandboxState.CREATING,
+        SandboxState.STARTED,
+        SandboxState.BUILDING_SNAPSHOT,
+        SandboxState.ERROR,
+        SandboxState.STOPPED,
+        SandboxState.ARCHIVED,
+    ],
+)
+async def test_daytona_provider_delete_does_not_prepare_sandbox(state: SandboxState) -> None:
+    inner = DeleteWithoutPreparationSandbox(state)
+    daytona = DaytonaClient(inner)
+
+    await _provider(daytona).delete_sandbox(inner.name)
+
+    assert daytona.deleted is True
+
+
+async def test_daytona_provider_delete_retries_state_conflicts(monkeypatch: pytest.MonkeyPatch) -> None:
     inner = InnerSandbox()
-    daytona = DaytonaClient(inner)
+    daytona = DeleteConflictDaytonaClient(inner)
+    _skip_retry_sleep(monkeypatch, DaytonaSandboxProvider.delete_sandbox)
 
     await _provider(daytona).delete_sandbox(inner.name)
 
-    assert inner.autostop_interval == 1
+    assert daytona.delete_attempts == 2
     assert daytona.deleted is True
 
 
-async def test_daytona_provider_delete_retries_state_conflicts() -> None:
-    inner = DeleteConflictSandbox()
-    daytona = DaytonaClient(inner)
+async def test_daytona_provider_delete_treats_final_not_found_as_absent() -> None:
+    inner = InnerSandbox()
+    daytona = DeleteNotFoundDaytonaClient(inner)
 
     await _provider(daytona).delete_sandbox(inner.name)
 
-    assert inner.autostop_attempts == 2
-    assert daytona.deleted is True
-
-
-async def test_daytona_provider_delete_retries_bare_html_502_refresh_errors() -> None:
-    inner = BareHtml502RefreshSandbox()
-    daytona = DaytonaClient(inner)
-
-    await _provider(daytona).delete_sandbox(inner.name)
-
-    assert inner.refresh_attempts == 2
-    assert daytona.deleted is True
+    assert daytona.deleted is False
 
 
 async def test_daytona_provider_get_retries_unexpected_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     inner = InnerSandbox()
     daytona = UnexpectedGetDaytonaClient(inner)
 
-    async def no_wait(_seconds: float) -> None:
-        pass
-
-    retryer = cast(Any, DaytonaSandboxProvider.get_sandbox).retry
-    monkeypatch.setattr(retryer, "sleep", no_wait)
+    _skip_retry_sleep(monkeypatch, DaytonaSandboxProvider.get_sandbox)
 
     sandbox = await _provider(daytona).get_sandbox(inner.name)
 
@@ -1669,11 +2847,7 @@ async def test_daytona_provider_delete_retries_unexpected_remove_errors(monkeypa
     inner = InnerSandbox()
     daytona = UnexpectedRemoveDaytonaClient(inner)
 
-    async def no_wait(_seconds: float) -> None:
-        pass
-
-    retryer = cast(Any, DaytonaSandboxProvider.delete_sandbox).retry
-    monkeypatch.setattr(retryer, "sleep", no_wait)
+    _skip_retry_sleep(monkeypatch, DaytonaSandboxProvider.delete_sandbox)
 
     await _provider(daytona).delete_sandbox(inner.name)
 
@@ -1728,58 +2902,6 @@ async def test_daytona_provider_create_maps_not_found_errors() -> None:
 
     with pytest.raises(SandboxNotFoundError, match="Sandbox not found: sandbox not found"):
         await _provider(daytona).create_sandbox(_request("sandbox-name"))
-
-
-async def test_daytona_provider_delete_removes_error_state_sandbox() -> None:
-    """Failed-state sandboxes should be deletable without waiting for startup.
-
-    Test cases:
-    - A sandbox in SandboxState.ERROR is deleted even though waiting for startup fails.
-    """
-    inner = ErrorStateSandbox()
-    daytona = DaytonaClient(inner)
-
-    await _provider(daytona).delete_sandbox(inner.name)
-
-    assert daytona.deleted is True
-
-
-async def test_daytona_provider_delete_removes_sandbox_that_fails_after_refresh() -> None:
-    """Sandbox state can change after the initial get and still be deletable.
-
-    Test cases:
-    - A sandbox that refreshes into SandboxState.ERROR is deleted without setting autostop.
-    """
-    inner = RefreshToErrorSandbox()
-    daytona = DaytonaClient(inner)
-
-    await _provider(daytona).delete_sandbox(inner.name)
-
-    assert inner.refresh_count == 1
-    assert inner.autostop_interval is None
-    assert daytona.deleted is True
-
-
-@pytest.mark.parametrize("state", [SandboxState.STOPPED, SandboxState.ARCHIVED])
-async def test_daytona_provider_delete_removes_inactive_sandbox_without_starting(state: SandboxState) -> None:
-    inner = InactiveSandbox(state)
-    daytona = DaytonaClient(inner)
-
-    await _provider(daytona).delete_sandbox(inner.name)
-
-    assert daytona.deleted is True
-
-
-async def test_daytona_provider_delete_waits_for_building_sandbox() -> None:
-    inner = BuildingSandbox()
-    daytona = DaytonaClient(inner)
-
-    await _provider(daytona).delete_sandbox(inner.name)
-
-    assert inner.waited_for_start is True
-    assert inner.refresh_count == 1
-    assert inner.autostop_interval == 1
-    assert daytona.deleted is True
 
 
 def test_sandbox_query_rejects_naive_creation_cutoff() -> None:
@@ -1850,6 +2972,64 @@ async def test_daytona_target_resolution_preserves_provider_error(monkeypatch: p
 
     assert daytona_retry_after_seconds(exc_info.value) == 3
     assert regions_client.close_attempts == 1
+
+
+async def test_daytona_list_bounds_each_page_not_the_whole_drain(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A healthy listing must not be killed for having more pages than the bound covers.
+
+    AsyncDaytona.list is cursor-paginated, so bounding the drain caps total pagination time and a
+    retry restarts from page one -- a long-but-progressing listing could then never complete.
+    """
+    provider, daytona, _ = _inventory_provider(
+        monkeypatch,
+        target="configured-target",
+        regions=[SimpleNamespace(id="configured-target", name="configured-target")],
+    )
+    page_delay = 0.1
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", page_delay * 2.5)
+    # Without this, a regression here retries through the real backoff ladder before failing.
+    _skip_retry_sleep(monkeypatch, DaytonaSandboxProvider._list_sandboxes)  # pyright: ignore[reportPrivateUsage]
+
+    def paginated(query: object) -> Any:
+        daytona.listed_query = query
+
+        async def pages() -> Any:
+            for _ in range(5):
+                await asyncio.sleep(page_delay)
+                yield daytona.sandbox
+
+        return pages()
+
+    monkeypatch.setattr(daytona, "list", paginated)
+
+    # Five pages cost 5 * page_delay in total, well past the bound; each page stays inside it.
+    sandboxes = [sandbox async for sandbox in provider.list_sandboxes(SandboxQuery(labels={}))]
+
+    assert len(sandboxes) == 5
+
+
+async def test_daytona_list_still_bounds_a_stalled_page(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider, daytona, _ = _inventory_provider(
+        monkeypatch,
+        target="configured-target",
+        regions=[SimpleNamespace(id="configured-target", name="configured-target")],
+    )
+    monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", 0.05)
+    _skip_retry_sleep(monkeypatch, DaytonaSandboxProvider._list_sandboxes)  # pyright: ignore[reportPrivateUsage]
+
+    def stalled(query: object) -> Any:
+        daytona.listed_query = query
+
+        async def pages() -> Any:
+            await asyncio.Event().wait()
+            yield daytona.sandbox
+
+        return pages()
+
+    monkeypatch.setattr(daytona, "list", stalled)
+
+    with pytest.raises(SandboxConnectionError, match="daytona.list timed out"):
+        _ = [sandbox async for sandbox in provider.list_sandboxes(SandboxQuery(labels={}))]
 
 
 async def test_daytona_provider_rejects_unavailable_target(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1924,6 +3104,56 @@ async def test_daytona_create_forwards_network_block_all() -> None:
 
     assert daytona.create_params is not None
     assert daytona.create_params.network_block_all is True
+
+
+async def test_daytona_create_retries_rate_limited_volume_lookup_safely(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    error = ApiException(
+        status=429,
+        reason=f"rate limited {_SENSITIVE_RETRY_SENTINEL}",
+        body=f"body {_SENSITIVE_RETRY_SENTINEL}",
+        data={"secret": _SENSITIVE_RETRY_SENTINEL},
+    )
+    error.headers = {"x-sensitive": _SENSITIVE_RETRY_SENTINEL}
+    ready = SimpleNamespace(id="volume-id", name="fixtures", state=VolumeState.READY, error_reason=None)
+    daytona = VolumeCapturingDaytonaClient(InnerSandbox(), [error, ready])
+    observed_waits: list[float] = []
+
+    async def record_wait(seconds: float) -> None:
+        observed_waits.append(seconds)
+
+    retryer = cast(Any, DaytonaSandboxProvider.create_sandbox).retry
+    monkeypatch.setattr(retryer, "sleep", record_wait)
+    with caplog.at_level(logging.WARNING, logger=daytona_module.__name__):
+        sandbox = await _provider(daytona).create_sandbox(
+            _request(
+                "grade-sb",
+                volumes=[VolumeMount(name="fixtures", mount_path="/fixtures")],
+            )
+        )
+
+    assert sandbox.id == "sandbox-id"
+    assert daytona.volume.calls == [("fixtures", False), ("fixtures", False)]
+    assert daytona.created is True
+    assert len(observed_waits) == 1
+    assert 4.5 <= observed_waits[0] <= 5
+    records = _retry_records(caplog)
+    assert len(records) == 1
+    expected_fields = {
+        "sandbox_provider": "daytona",
+        "daytona_step": "create_sandbox",
+        "daytona_retry_attempt": 1,
+        "daytona_retry_delay_s": observed_waits[0],
+        "daytona_retry_category": "rate_limit",
+        "daytona_status_code": 429,
+    }
+    expected_message = (
+        "daytona.retry sandbox_provider=daytona daytona_step=create_sandbox daytona_retry_attempt=1 "
+        f"daytona_retry_delay_s={observed_waits[0]} daytona_retry_category=rate_limit daytona_status_code=429"
+    )
+    _assert_safe_retry_record(records[0], expected_message, expected_fields)
 
 
 async def test_daytona_create_awaits_volume_and_waits_until_ready(monkeypatch: pytest.MonkeyPatch) -> None:

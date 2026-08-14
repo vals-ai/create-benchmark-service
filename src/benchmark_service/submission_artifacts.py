@@ -2,8 +2,12 @@
 
 import os
 import re
+import tempfile
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import lru_cache, partial
+from pathlib import Path
 from typing import Protocol, cast
 
 import boto3
@@ -19,6 +23,7 @@ SUBMISSION_ARTIFACT_REGION_ENV = "AWS_REGION"
 SUBMISSION_ARTIFACT_KEY_PREFIX = "submission-artifacts"
 MAX_DOWNLOAD_BYTES_ENV = "SUBMISSION_ARTIFACT_MAX_DOWNLOAD_BYTES"
 DEFAULT_MAX_DOWNLOAD_BYTES = 64 * 1024**2
+MATERIALIZE_CHUNK_BYTES = 8 * 1024**2
 
 _KEY_SEGMENT_RE = re.compile(KEY_SEGMENT_PATTERN)
 
@@ -47,8 +52,16 @@ class SubmissionArtifactReference:
     etag: str
 
 
+@dataclass(frozen=True, slots=True)
+class MaterializedSubmissionArtifact:
+    """Framework-owned local copy of one admitted submission artifact."""
+
+    path: Path
+    reference: SubmissionArtifactReference
+
+
 class _StreamingBody(Protocol):
-    def read(self) -> bytes: ...
+    def read(self, amt: int | None = None) -> bytes: ...
     def close(self) -> None: ...
 
 
@@ -234,6 +247,57 @@ def _download_sync(reference: SubmissionArtifactReference, tenant: str) -> bytes
         body.close()
 
 
+def _materialize_sync(
+    reference: SubmissionArtifactReference,
+    tenant: str,
+    directory: Path,
+) -> MaterializedSubmissionArtifact:
+    _require_tenant_key(reference.key, tenant)
+    limit = _max_download_bytes()
+    _require_size_within_limit(reference.size_bytes, reference.key, limit)
+    _require_etag(reference.etag, reference.key)
+    bucket = _artifact_bucket()
+    try:
+        response = _s3_client().get_object(Bucket=bucket, Key=reference.key, IfMatch=reference.etag)
+    except ClientError as exc:
+        _raise_for_artifact_error(exc, reference.key)
+        raise
+
+    body = cast(_StreamingBody, response["Body"])
+    try:
+        response_size = _require_size_within_limit(response.get("ContentLength"), reference.key, limit)
+        response_etag = _require_etag(response.get("ETag"), reference.key)
+        if response_size != reference.size_bytes or response_etag != reference.etag:
+            raise SubmissionArtifactChanged(
+                f"artifact {reference.key} changed after it was accepted; submit it again before grading"
+            )
+
+        destination = directory / reference.key.rsplit("/", maxsplit=1)[-1]
+        bytes_written = 0
+        with destination.open("xb") as output:
+            while True:
+                chunk = body.read(MATERIALIZE_CHUNK_BYTES)
+                if not chunk:
+                    break
+                next_size = bytes_written + len(chunk)
+                _require_size_within_limit(next_size, reference.key, limit)
+                if next_size > reference.size_bytes:
+                    raise SubmissionArtifactChanged(
+                        f"artifact {reference.key} changed after it was accepted; submit it again before grading"
+                    )
+                output.write(chunk)
+                bytes_written = next_size
+
+        if bytes_written != reference.size_bytes:
+            raise SubmissionArtifactChanged(
+                f"artifact {reference.key} changed after it was accepted; submit it again before grading"
+            )
+        destination.chmod(0o400)
+        return MaterializedSubmissionArtifact(path=destination, reference=reference)
+    finally:
+        body.close()
+
+
 async def stat(key: str, *, tenant: str) -> SubmissionArtifactReference:
     """Capture the artifact's immutable identity without fetching it.
 
@@ -245,3 +309,20 @@ async def stat(key: str, *, tenant: str) -> SubmissionArtifactReference:
 async def download(reference: SubmissionArtifactReference, *, tenant: str) -> bytes:
     """Fetch the admitted artifact version for server-side grading."""
     return await run_blocking(partial(_download_sync, reference, tenant))
+
+
+@asynccontextmanager
+async def materialize(
+    reference: SubmissionArtifactReference,
+    *,
+    tenant: str,
+) -> AsyncIterator[MaterializedSubmissionArtifact]:
+    """Stream an admitted artifact to a temporary file owned by the framework."""
+    temporary_directory = tempfile.TemporaryDirectory(prefix="benchmark-submission-artifact-")
+    try:
+        artifact = await run_blocking(
+            partial(_materialize_sync, reference, tenant, Path(temporary_directory.name))
+        )
+        yield artifact
+    finally:
+        await run_blocking(temporary_directory.cleanup)

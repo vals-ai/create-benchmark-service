@@ -19,7 +19,12 @@ from uvicorn.protocols.utils import ClientDisconnected
 from websockets.exceptions import ConnectionClosed
 
 from benchmark_service._version import __version__ as _framework_version
-from benchmark_service.auth import LEGACY_TENANT_SENTINEL, get_tenant_config, load_allowlist
+from benchmark_service.auth import (
+    UNAUTHENTICATED_TENANT_SENTINEL,
+    get_tenant_config,
+    load_allowlist,
+    require_supported_auth_config,
+)
 from benchmark_service.base import BenchmarkService
 from benchmark_service.grading import SUBMISSION_ARTIFACT_SANDBOX_PATH, collapse_stream, evaluate_submission
 from benchmark_service.inflight import InflightMiddleware
@@ -100,16 +105,16 @@ _PUBLIC_PATHS = frozenset({"/health", "/version"})
 
 
 def _require_descope_tenant(tenant: str | None) -> None:
-    """Raise 403 when the resolved tenant is the legacy bearer sentinel.
+    """Raise 403 when the request was not authenticated against a Descope tenant.
 
-    The /v1/ surface requires Descope auth; legacy bearer callers resolve to
-    LEGACY_TENANT_SENTINEL and must be rejected even though they are technically
-    authenticated against the legacy key.
+    The /v1/ surface is tenant-scoped, so requests served with auth disabled
+    (local development) resolve to UNAUTHENTICATED_TENANT_SENTINEL and carry no
+    tenant identity to authorize against.
     """
-    if tenant == LEGACY_TENANT_SENTINEL:
+    if tenant == UNAUTHENTICATED_TENANT_SENTINEL:
         raise HTTPException(
             status_code=403,
-            detail="The /v1/ surface requires Descope authentication; legacy bearer auth is not accepted.",
+            detail="The /v1/ surface requires Descope authentication.",
         )
 
 
@@ -312,6 +317,7 @@ class BenchmarkServiceApp(FastAPI):
 
         @asynccontextmanager
         async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
+            require_supported_auth_config()
             allowlist = load_allowlist()
             evaluation_quota.require_configured(allowlist, service_name=configured_deployment_name)
             submission_artifacts.require_configured()
@@ -322,7 +328,12 @@ class BenchmarkServiceApp(FastAPI):
                 )
             self.service = await service_cls.create()
             if (
-                self.service.eval_mode in {EvalMode.IN_PROCESS_ARTIFACT, EvalMode.SANDBOX}
+                self.service.eval_mode
+                in {
+                    EvalMode.IN_PROCESS_ARTIFACT,
+                    EvalMode.IN_PROCESS_MATERIALIZED_ARTIFACT,
+                    EvalMode.SANDBOX,
+                }
                 and self.service.accepted_submission_schemas.get(V1PayloadType.ARTIFACT)
                 and not submission_artifacts.is_configured()
             ):
@@ -627,7 +638,11 @@ class BenchmarkServiceApp(FastAPI):
         except ValueError as exc:
             raise HTTPException(status_code=404, detail=f"Task not found: {body.task_id}") from exc
 
-        if self.service.eval_mode in {EvalMode.IN_PROCESS_ARTIFACT, EvalMode.SANDBOX}:
+        if self.service.eval_mode in {
+            EvalMode.IN_PROCESS_ARTIFACT,
+            EvalMode.IN_PROCESS_MATERIALIZED_ARTIFACT,
+            EvalMode.SANDBOX,
+        }:
             accepted_schemas = self.service.accepted_submission_schemas.get(body.payload.type)
             if not accepted_schemas:
                 raise HTTPException(
@@ -707,7 +722,7 @@ class BenchmarkServiceApp(FastAPI):
                                 evaluator_version=self._service_version,
                                 dataset=body.dataset,
                             )
-                        else:
+                        elif self.service.eval_mode == EvalMode.IN_PROCESS_ARTIFACT:
                             if artifact_reference is None:
                                 raise RuntimeError("in-process artifact evaluation requires an admitted artifact")
                             try:
@@ -730,6 +745,33 @@ class BenchmarkServiceApp(FastAPI):
                                 task_id=body.task_id,
                                 evaluator_version=self._service_version,
                             )
+                        else:
+                            if artifact_reference is None:
+                                raise RuntimeError("materialized artifact evaluation requires an admitted artifact")
+                            try:
+                                async with submission_artifacts.materialize(
+                                    artifact_reference,
+                                    tenant=tenant,
+                                ) as artifact:
+                                    response = await collapse_stream(
+                                        self.service.evaluate_materialized_artifact(
+                                            tenant=tenant,
+                                            run_id=body.run_id,
+                                            task_id=body.task_id,
+                                            schema_id=body.payload.schema_id,
+                                            artifact=artifact,
+                                            dataset=body.dataset,
+                                        ),
+                                        run_id=body.run_id,
+                                        task_id=body.task_id,
+                                        evaluator_version=self._service_version,
+                                    )
+                            except submission_artifacts.SubmissionArtifactNotFound as exc:
+                                raise HTTPException(status_code=404, detail=str(exc)) from exc
+                            except submission_artifacts.SubmissionArtifactChanged as exc:
+                                raise HTTPException(status_code=409, detail=str(exc)) from exc
+                            except submission_artifacts.SubmissionArtifactTooLarge as exc:
+                                raise HTTPException(status_code=413, detail=str(exc)) from exc
             except _DuplicateGradingRequest as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             except _GradingCapacityExceeded as exc:

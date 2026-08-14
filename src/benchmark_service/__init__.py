@@ -6,6 +6,7 @@ from benchmark_service.base import BenchmarkService
 from benchmark_service.client import (
     BenchmarkServiceClient,
     BenchmarkServiceError,
+    BenchmarkServiceStreamClosedError,
     BenchmarkServiceUnauthenticatedError,
     SandboxRecoveryAttempt,
 )
@@ -40,6 +41,7 @@ from benchmark_service.schemas import (
     SandboxRecoveryPolicy,
     TextGradingSubmission,
 )
+from benchmark_service.submission_artifacts import MaterializedSubmissionArtifact, SubmissionArtifactReference
 
 __all__ = [
     "BenchmarkServiceApp",
@@ -47,6 +49,7 @@ __all__ = [
     "BenchmarkServiceUnauthenticatedError",
     "BenchmarkServiceClient",
     "BenchmarkServiceError",
+    "BenchmarkServiceStreamClosedError",
     "SandboxRecoveryAttempt",
     "ArtifactGradingSubmission",
     "ComposeSource",
@@ -58,6 +61,7 @@ __all__ = [
     "ImageSource",
     "InflightMiddleware",
     "ModalProviderConfig",
+    "MaterializedSubmissionArtifact",
     "Resources",
     "Sandbox",
     "SandboxCommandError",
@@ -71,6 +75,7 @@ __all__ = [
     "SandboxRecoveryPolicy",
     "SandboxSource",
     "SnapshotSource",
+    "SubmissionArtifactReference",
     "TargetedSnapshotSource",
     "TextGradingSubmission",
     "VolumeMount",

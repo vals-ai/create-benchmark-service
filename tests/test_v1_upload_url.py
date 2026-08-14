@@ -38,7 +38,6 @@ def _descope_client(
 ) -> Generator[TestClient, None, None]:
     clear_allowlist_cache()
     clear_auth_cache()
-    monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
     monkeypatch.setenv(
         "DESCOPE_TENANT_ALLOWLIST_JSON",
@@ -173,4 +172,20 @@ def test_upload_url_requires_auth(descope_client: TestClient) -> None:
         "/v1/submissions/upload-url",
         json={"run_id": "run-1", "task_id": "task-1", "dataset": "default", "filename": "submission.xlsx"},
     )
-    assert resp.status_code in (401, 403)
+    assert resp.status_code == 401
+
+
+def test_upload_url_is_denied_when_auth_is_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Artifact keys are namespaced by tenant, which AUTH_DISABLED=true has none of."""
+    clear_allowlist_cache()
+    clear_auth_cache()
+    monkeypatch.delenv("DESCOPE_PROJECT_ID", raising=False)
+    monkeypatch.setenv("AUTH_DISABLED", "true")
+    _install_signed_url_stub(monkeypatch)
+
+    with TestClient(BenchmarkServiceApp(StubBenchmark)) as client:
+        resp = client.post(
+            "/v1/submissions/upload-url",
+            json={"run_id": "run-1", "task_id": "task-1", "dataset": "default", "filename": "submission.xlsx"},
+        )
+    assert resp.status_code == 403

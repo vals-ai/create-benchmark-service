@@ -180,7 +180,6 @@ class _AllPassTrialBenchmark(StubBenchmark):
 def trial_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
     clear_allowlist_cache()
     clear_auth_cache()
-    monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
     monkeypatch.setenv(
         "DESCOPE_TENANT_ALLOWLIST_JSON",
@@ -201,7 +200,6 @@ def trial_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None,
 def all_pass_trial_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
     clear_allowlist_cache()
     clear_auth_cache()
-    monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
     monkeypatch.setenv(
         "DESCOPE_TENANT_ALLOWLIST_JSON",

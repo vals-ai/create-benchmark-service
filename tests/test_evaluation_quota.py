@@ -251,7 +251,6 @@ def test_quota_configuration_requires_durable_counter_settings_at_startup(
     missing_env: str,
 ) -> None:
     _set_allowlist(monkeypatch)
-    monkeypatch.setenv("AUTH_REQUIRED", "false")
     monkeypatch.setenv(evaluation_quota.EVALUATION_QUOTA_TABLE_ENV, "evaluation-quotas")
     monkeypatch.setenv(evaluation_quota.SERVICE_NAME_ENV, "example-benchmark")
     monkeypatch.delenv(missing_env)
@@ -267,7 +266,6 @@ def quota_client(
 ) -> Generator[tuple[TestClient, _FakeDynamoDB, BenchmarkServiceApp], None, None]:
     clear_allowlist_cache()
     clear_auth_cache()
-    monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
     monkeypatch.setenv(evaluation_quota.SERVICE_NAME_ENV, "example-benchmark")
     monkeypatch.setenv(evaluation_quota.EVALUATION_QUOTA_TABLE_ENV, "evaluation-quotas")

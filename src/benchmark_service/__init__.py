@@ -1,6 +1,7 @@
 """Benchmark service framework for creating evaluation APIs."""
 
 from benchmark_service._version import __version__
+from benchmark_service.allowlist import CatalogAllowlistClient
 from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.base import BenchmarkService
 from benchmark_service.client import (
@@ -45,6 +46,7 @@ from benchmark_service.submission_artifacts import MaterializedSubmissionArtifac
 
 __all__ = [
     "BenchmarkServiceApp",
+    "CatalogAllowlistClient",
     "BenchmarkService",
     "BenchmarkServiceUnauthenticatedError",
     "BenchmarkServiceClient",

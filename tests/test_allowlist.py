@@ -11,8 +11,10 @@ from benchmark_service.auth import clear_allowlist_cache, get_tenant_config, loa
 
 
 @pytest.fixture(autouse=True)
-def reset_allowlist_cache() -> None:
+def reset_allowlist_cache(monkeypatch: pytest.MonkeyPatch) -> None:
     clear_allowlist_cache()
+    monkeypatch.delenv("BENCHMARK_CATALOG_API_URL", raising=False)
+    monkeypatch.delenv("SERVICE_NAME", raising=False)
 
 
 def test_load_allowlist_from_env_json(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -86,12 +88,14 @@ def test_unknown_tenant_policy_field_is_rejected(monkeypatch: pytest.MonkeyPatch
 def test_tenant_config_parses_trial_mode_from_allowlist_json(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(
         "DESCOPE_TENANT_ALLOWLIST_JSON",
-        json.dumps({
-            "tenants": {
-                "acme-corp": {"datasets": ["validation"]},
-                "trial": {"datasets": ["trial"], "trial_mode": True},
+        json.dumps(
+            {
+                "tenants": {
+                    "acme-corp": {"datasets": ["validation"]},
+                    "trial": {"datasets": ["trial"], "trial_mode": True},
+                }
             }
-        }),
+        ),
     )
     allowlist = load_allowlist()
     assert allowlist.tenants["acme-corp"].trial_mode is False

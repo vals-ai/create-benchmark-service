@@ -196,7 +196,9 @@ async def consume_evaluation_request(
 
     table_name = os.environ.get(EVALUATION_QUOTA_TABLE_ENV, "").strip()
     if not table_name:
-        raise RuntimeError(f"{EVALUATION_QUOTA_TABLE_ENV} is required when tenant {tenant!r} has an evaluation quota")
+        raise EvaluationQuotaUnavailable(
+            f"{EVALUATION_QUOTA_TABLE_ENV} is required when tenant {tenant!r} has an evaluation quota"
+        )
 
     current = (now or datetime.now(UTC)).astimezone(UTC)
     period_start, period_end = _utc_period(current, tenant_config.evaluation_quota.period)

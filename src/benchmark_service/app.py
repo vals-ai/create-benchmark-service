@@ -21,6 +21,8 @@ from websockets.exceptions import ConnectionClosed
 from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import (
     UNAUTHENTICATED_TENANT_SENTINEL,
+    clear_request_tenant_config,
+    close_catalog_client,
     get_tenant_config,
     load_allowlist,
     require_supported_auth_config,
@@ -73,9 +75,7 @@ from benchmark_service.v1_schemas import (
 
 logger = logging.getLogger(__name__)
 
-_EVALUATION_QUOTA_UNAVAILABLE_DETAIL = (
-    "Evaluation quota enforcement is temporarily unavailable; try again later."
-)
+_EVALUATION_QUOTA_UNAVAILABLE_DETAIL = "Evaluation quota enforcement is temporarily unavailable; try again later."
 
 
 async def send_json_if_connected(websocket: WebSocket, payload: dict[str, Any]) -> bool:
@@ -105,12 +105,7 @@ _PUBLIC_PATHS = frozenset({"/health", "/version"})
 
 
 def _require_descope_tenant(tenant: str | None) -> None:
-    """Raise 403 when the request was not authenticated against a Descope tenant.
-
-    The /v1/ surface is tenant-scoped, so requests served with auth disabled
-    (local development) resolve to UNAUTHENTICATED_TENANT_SENTINEL and carry no
-    tenant identity to authorize against.
-    """
+    """Raise 403 when the request has no Descope tenant identity."""
     if tenant == UNAUTHENTICATED_TENANT_SENTINEL:
         raise HTTPException(
             status_code=403,
@@ -220,9 +215,7 @@ class _GradingAdmission:
         return cls(
             max_concurrency=max_concurrency,
             max_queued=_grading_nonnegative_int("GRADING_MAX_QUEUED", max_concurrency),
-            max_admitted_per_tenant=_grading_nonnegative_int(
-                "GRADING_MAX_ADMITTED_PER_TENANT", max_concurrency
-            ),
+            max_admitted_per_tenant=_grading_nonnegative_int("GRADING_MAX_ADMITTED_PER_TENANT", max_concurrency),
             queue_timeout_s=_grading_positive_float("GRADING_QUEUE_TIMEOUT_S", 30.0),
         )
 
@@ -230,16 +223,12 @@ class _GradingAdmission:
     async def reserve(self, key: tuple[str, str, str]) -> AsyncGenerator[None, None]:
         tenant, run_id, task_id = key
         if key in self._admitted:
-            raise _DuplicateGradingRequest(
-                f"an evaluation for run {run_id} task {task_id} is already in progress"
-            )
+            raise _DuplicateGradingRequest(f"an evaluation for run {run_id} task {task_id} is already in progress")
         if (
             len(self._admitted) >= self._max_admitted
             or self._admitted_by_tenant[tenant] >= self._max_admitted_per_tenant
         ):
-            raise _GradingCapacityExceeded(
-                "The benchmark service is at grading capacity; retry this evaluation later."
-            )
+            raise _GradingCapacityExceeded("The benchmark service is at grading capacity; retry this evaluation later.")
 
         self._admitted.add(key)
         self._admitted_by_tenant[tenant] += 1
@@ -319,7 +308,10 @@ class BenchmarkServiceApp(FastAPI):
         async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
             require_supported_auth_config()
             allowlist = load_allowlist()
-            evaluation_quota.require_configured(allowlist, service_name=configured_deployment_name)
+            if not os.getenv("BENCHMARK_CATALOG_API_URL", "").strip():
+                evaluation_quota.require_configured(
+                    allowlist, service_name=configured_deployment_name
+                )
             submission_artifacts.require_configured()
             if not submission_artifacts.is_configured():
                 logger.warning(
@@ -342,12 +334,15 @@ class BenchmarkServiceApp(FastAPI):
                     f"{submission_artifacts.SUBMISSION_ARTIFACT_BUCKET_ENV} and "
                     f"{submission_artifacts.SUBMISSION_ARTIFACT_REGION_ENV}"
                 )
-            if self.service.eval_mode == EvalMode.SANDBOX:
-                async with _grading_provider_config().create_provider() as provider:
-                    self._grading_provider = provider
-                    yield
-                    return
-            yield
+            try:
+                if self.service.eval_mode == EvalMode.SANDBOX:
+                    async with _grading_provider_config().create_provider() as provider:
+                        self._grading_provider = provider
+                        yield
+                        return
+                yield
+            finally:
+                await close_catalog_client()
 
         super().__init__(title=service_cls.__name__, lifespan=lifespan)
         self._grading_provider: SandboxProvider | None = None
@@ -359,18 +354,22 @@ class BenchmarkServiceApp(FastAPI):
     def _register_routes(self) -> None:
         @self.middleware("http")
         async def _check_auth(request: Request, call_next):  # type: ignore[no-untyped-def]
-            if request.url.path in _PUBLIC_PATHS:
+            clear_request_tenant_config()
+            try:
+                if request.url.path in _PUBLIC_PATHS:
+                    return await call_next(request)  # type: ignore[reportUnknownVariableType]
+                tenant = await self.service.resolve_tenant(dict(request.headers))
+                if tenant is None:
+                    return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+                request.state.tenant = tenant
+                if _is_trial_tenant(tenant) and not _trial_tenant_may_access_path(request.url.path):
+                    return JSONResponse(
+                        status_code=403,
+                        content={"detail": "Trial tenants may only access approved /v1 endpoints (/v1/*)"},
+                    )
                 return await call_next(request)  # type: ignore[reportUnknownVariableType]
-            tenant = await self.service.resolve_tenant(dict(request.headers))
-            if tenant is None:
-                return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
-            request.state.tenant = tenant
-            if _is_trial_tenant(tenant) and not _trial_tenant_may_access_path(request.url.path):
-                return JSONResponse(
-                    status_code=403,
-                    content={"detail": "Trial tenants may only access approved /v1 endpoints (/v1/*)"},
-                )
-            return await call_next(request)  # type: ignore[reportUnknownVariableType]
+            finally:
+                clear_request_tenant_config()
 
         self.add_exception_handler(ValueError, self._value_error_handler)
         self.add_exception_handler(Exception, self._exception_handler)
@@ -546,6 +545,7 @@ class BenchmarkServiceApp(FastAPI):
             if not await send_json_if_connected(websocket, error_chunk.model_dump()):
                 logger.warning("setup-task websocket disconnected before error chunk could be sent")
         finally:
+            clear_request_tenant_config()
             with suppress(RuntimeError):
                 await websocket.close()
 
@@ -587,6 +587,7 @@ class BenchmarkServiceApp(FastAPI):
             if not await send_json_if_connected(websocket, error_chunk.model_dump()):
                 logger.warning("evaluate-response websocket disconnected before error chunk could be sent")
         finally:
+            clear_request_tenant_config()
             with suppress(RuntimeError):
                 await websocket.close()
 
@@ -625,6 +626,7 @@ class BenchmarkServiceApp(FastAPI):
             if not await send_json_if_connected(websocket, error_chunk.model_dump()):
                 logger.warning("evaluate-instance websocket disconnected before error chunk could be sent")
         finally:
+            clear_request_tenant_config()
             with suppress(RuntimeError):
                 await websocket.close()
 
@@ -801,9 +803,7 @@ class BenchmarkServiceApp(FastAPI):
             return sanitize_v1_eval_response(response, self.service.project_trial_result)
         return response
 
-    async def _v1_submission_upload_url(
-        self, request: Request, body: V1UploadUrlRequest
-    ) -> V1UploadUrlResponse:
+    async def _v1_submission_upload_url(self, request: Request, body: V1UploadUrlRequest) -> V1UploadUrlResponse:
         tenant = cast(str, request.state.tenant)
         _require_descope_tenant(tenant)
         if not submission_artifacts.is_configured():

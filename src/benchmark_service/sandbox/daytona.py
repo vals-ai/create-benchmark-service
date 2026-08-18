@@ -128,9 +128,8 @@ _TRANSPORT_ERROR_MESSAGES = (
     "server disconnected",
     "temporary authentication service error",
 )
-# Daytona's gateway throttler rejects a request before it reaches the sandbox, and reports the
-# throttle inside the message of whatever status it happens to use (e.g. a 401 when the throttled
-# call is Bearer token validation), so the status code alone does not identify it.
+# Daytona's gateway throttler reports the throttle only in the message, under whatever status the
+# throttled call carries (a 401 when it is Bearer token validation), so the status cannot identify it.
 _THROTTLED_ERROR_MESSAGES = ("throttlerexception",)
 _RETRYABLE_DAYTONA_CAUSES = (ClientConnectionError, ClientPayloadError, ConnectionError, TimeoutError)
 _PROVIDER_RETRY_DELAYS_SECONDS = (5, 25, 90, 300, 420)

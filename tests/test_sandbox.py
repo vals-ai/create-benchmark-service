@@ -53,6 +53,7 @@ from benchmark_service.sandbox.daytona import (
     _PTY_ROWS,  # pyright: ignore[reportPrivateUsage]
     _PTY_STDOUT_TAIL_MAX_BYTES,  # pyright: ignore[reportPrivateUsage]
     DaytonaProviderConfig,
+    _is_ambiguous_pty_create_error,  # pyright: ignore[reportPrivateUsage]
     _is_not_found_error,  # pyright: ignore[reportPrivateUsage]
     _is_transient_daytona_error,  # pyright: ignore[reportPrivateUsage]
     DaytonaSandbox,
@@ -1420,6 +1421,17 @@ def test_daytona_unexpected_provider_errors_are_transient(message: str) -> None:
 )
 def test_daytona_temporary_authentication_errors_are_transient(message: str) -> None:
     assert _is_transient_daytona_error(DaytonaError(message))
+
+
+def test_daytona_throttled_unauthorized_errors_are_transient() -> None:
+    exc = DaytonaError(
+        "Failed to execute command: unauthorized: authentication failed: Bearer token validation error: "
+        "ThrottlerException: Too Many Requests",
+        status_code=401,
+    )
+
+    assert _is_transient_daytona_error(exc)
+    assert not _is_ambiguous_pty_create_error(exc)
 
 
 @pytest.mark.parametrize("status_code", [408, 429, 500, 502, 503, 504])

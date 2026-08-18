@@ -17,6 +17,7 @@ from websockets.frames import Close
 
 from benchmark_service import (
     BenchmarkServiceStreamClosedError,
+    BenchmarkServiceStreamError,
     BenchmarkServiceStreamIdleError,
     SandboxNotFoundError,
     SandboxRecoveryPolicy,
@@ -1108,8 +1109,28 @@ async def test_ws_idle_past_the_budget_fails_the_stream(health_status: str | Non
             await client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG)
 
     exc = exc_info.value
+    assert isinstance(exc, BenchmarkServiceStreamError)
     assert exc.idle_s >= 0.05
     assert str(exc) == f"WebSocket idle for {exc.idle_s:.1f}s without an application message ({expected_health})"
+
+
+async def test_ws_idle_health_probe_is_bounded() -> None:
+    """A failed health probe must not turn an idle failure into another unbounded wait."""
+    client = BenchmarkServiceClient(url=BASE_URL, headers=HEADERS, timeout=10, ws_idle_timeout_s=0.01)
+
+    async def _hanging_health_check() -> HealthCheckResponse:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    with (
+        patch("benchmark_service.client.websockets.connect", return_value=_silent_ws_mock()),
+        patch("benchmark_service.client._HEALTH_PROBE_TIMEOUT_S", 0.01),
+        patch.object(client, "health_check", _hanging_health_check),
+    ):
+        with pytest.raises(BenchmarkServiceStreamIdleError) as exc_info:
+            await asyncio.wait_for(client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG), timeout=0.1)
+
+    assert exc_info.value.health_ok is False
 
 
 @pytest.mark.parametrize("ws_idle_timeout_s", [None, 0], ids=["none", "zero"])

@@ -74,6 +74,8 @@ _WS_PING_TIMEOUT_S = None
 # indistinguishable from a dead one from the client side.
 _WS_IDLE_TIMEOUT_ENV = "BENCHMARK_SERVICE_WS_IDLE_TIMEOUT_S"
 _DEFAULT_WS_IDLE_TIMEOUT_S = 3600.0
+# Diagnostics must not delay the idle failure while the retry-decorated health request backs off.
+_HEALTH_PROBE_TIMEOUT_S = 5.0
 # Distinguishes "caller passed None to disable" from "caller said nothing".
 _UNSET_WS_IDLE_TIMEOUT: float = -1.0
 
@@ -127,7 +129,11 @@ class BenchmarkServiceUnauthenticatedError(BenchmarkServiceError):
         return "Authentication failed: " + super().__str__()
 
 
-class BenchmarkServiceStreamIdleError(BenchmarkServiceError):
+class BenchmarkServiceStreamError(BenchmarkServiceError):
+    """Base class for failures after an evaluation WebSocket is established."""
+
+
+class BenchmarkServiceStreamIdleError(BenchmarkServiceStreamError):
     """Raised when an established evaluation WebSocket goes silent past the idle budget.
 
     The socket was never closed, so keepalive and close handling cannot surface the failure.
@@ -145,7 +151,7 @@ class BenchmarkServiceStreamIdleError(BenchmarkServiceError):
         self.health_ok = health_ok
 
 
-class BenchmarkServiceStreamClosedError(BenchmarkServiceError):
+class BenchmarkServiceStreamClosedError(BenchmarkServiceStreamError):
     """Raised when an established evaluation WebSocket closes without a terminal chunk.
 
     ``idle_s`` counts silence since the last application message, or since connect if none arrived.
@@ -416,7 +422,8 @@ class BenchmarkServiceClient:
     async def _health_ok(self) -> bool:
         """Best-effort liveness probe used to describe an idle stream failure."""
         try:
-            return (await self.health_check()).status == "ok"
+            response = await asyncio.wait_for(self.health_check(), timeout=_HEALTH_PROBE_TIMEOUT_S)
+            return response.status == "ok"
         except Exception:
             return False
 

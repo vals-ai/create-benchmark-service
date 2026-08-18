@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
+import os
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -49,6 +51,8 @@ from benchmark_service.v1_schemas import (
     V1Versions,
 )
 
+logger = logging.getLogger(__name__)
+
 _stream_chunk_adapter: TypeAdapter[StreamChunk] = TypeAdapter(StreamChunk)
 _RecoveryResult = TypeVar("_RecoveryResult")
 
@@ -64,6 +68,30 @@ _SERVER_PING_TIMEOUT_S = 10
 # server goes on to complete.
 _WS_PING_INTERVAL_S = _SERVER_PING_INTERVAL_S
 _WS_PING_TIMEOUT_S = None
+# Silence budget for an established stream. Protocol keepalive cannot detect a peer that stops
+# producing while the socket stays open (lost host, blackholed connection), which leaves the stream
+# blocked forever; this bounds that wait. The budget is generous because a slow evaluation is
+# indistinguishable from a dead one from the client side.
+_WS_IDLE_TIMEOUT_ENV = "BENCHMARK_SERVICE_WS_IDLE_TIMEOUT_S"
+_DEFAULT_WS_IDLE_TIMEOUT_S = 3600.0
+# Diagnostics must not delay the idle failure while the retry-decorated health request backs off.
+_HEALTH_PROBE_TIMEOUT_S = 5.0
+# Distinguishes "caller passed None to disable" from "caller said nothing".
+_UNSET_WS_IDLE_TIMEOUT: float = -1.0
+
+
+def _default_ws_idle_timeout_s() -> float | None:
+    """Idle budget from the environment; ``0`` or a negative value disables the watchdog."""
+    raw = os.environ.get(_WS_IDLE_TIMEOUT_ENV)
+    if raw is None:
+        return _DEFAULT_WS_IDLE_TIMEOUT_S
+    try:
+        parsed = float(raw)
+    except ValueError:
+        logger.warning("Ignoring non-numeric %s=%r", _WS_IDLE_TIMEOUT_ENV, raw)
+        return _DEFAULT_WS_IDLE_TIMEOUT_S
+    return parsed if parsed > 0 else None
+
 
 _retry_http = retry(
     retry=retry_if_exception_type(
@@ -101,7 +129,29 @@ class BenchmarkServiceUnauthenticatedError(BenchmarkServiceError):
         return "Authentication failed: " + super().__str__()
 
 
-class BenchmarkServiceStreamClosedError(BenchmarkServiceError):
+class BenchmarkServiceStreamError(BenchmarkServiceError):
+    """Base class for failures after an evaluation WebSocket is established."""
+
+
+class BenchmarkServiceStreamIdleError(BenchmarkServiceStreamError):
+    """Raised when an established evaluation WebSocket goes silent past the idle budget.
+
+    The socket was never closed, so keepalive and close handling cannot surface the failure.
+    ``health_ok`` records whether the service answered ``/health`` while the stream was silent,
+    which separates a wedged or lost task from a service that is down entirely.
+    """
+
+    idle_s: float
+    health_ok: bool
+
+    def __init__(self, *, idle_s: float, health_ok: bool) -> None:
+        health = "service still reports healthy" if health_ok else "service health check also failing"
+        super().__init__(f"WebSocket idle for {idle_s:.1f}s without an application message ({health})")
+        self.idle_s = idle_s
+        self.health_ok = health_ok
+
+
+class BenchmarkServiceStreamClosedError(BenchmarkServiceStreamError):
     """Raised when an established evaluation WebSocket closes without a terminal chunk.
 
     ``idle_s`` counts silence since the last application message, or since connect if none arrived.
@@ -235,19 +285,31 @@ class BenchmarkServiceClient:
     _url: str
     _headers: dict[str, str]
     _timeout: int
+    _ws_idle_timeout_s: float | None
     _sandbox_providers: dict[str, SandboxProvider]
 
-    def __init__(self, url: str, headers: dict[str, str], timeout: int = 60):
+    def __init__(
+        self,
+        url: str,
+        headers: dict[str, str],
+        timeout: int = 60,
+        ws_idle_timeout_s: float | None = _UNSET_WS_IDLE_TIMEOUT,
+    ):
         """Initialize the client.
 
         Args:
             url: Base URL of the benchmark service.
             headers: Headers to include in all requests.
             timeout: Request timeout in seconds.
+            ws_idle_timeout_s: Silence budget for an established evaluation stream, after which
+                the stream fails with ``BenchmarkServiceStreamIdleError``. ``None`` disables the
+                watchdog; omit it to take the value from ``BENCHMARK_SERVICE_WS_IDLE_TIMEOUT_S``.
         """
         self._url = url
         self._headers = headers
         self._timeout = timeout
+        idle_timeout = _default_ws_idle_timeout_s() if ws_idle_timeout_s is _UNSET_WS_IDLE_TIMEOUT else ws_idle_timeout_s
+        self._ws_idle_timeout_s = idle_timeout if idle_timeout is None or idle_timeout > 0 else None
         self._sandbox_providers = {}
         self._http_client = httpx.AsyncClient(
             follow_redirects=True,
@@ -300,6 +362,8 @@ class BenchmarkServiceClient:
             BenchmarkServiceStreamClosedError: If the established socket closes without a
                 terminal chunk. Pre-connection failures (DNS, connect, handshake) stay
                 distinguishable: they propagate unwrapped from websockets.connect.
+            BenchmarkServiceStreamIdleError: If the socket stays open but produces no
+                application message within the idle budget.
         """
         async with websockets.connect(
             f"{self._ws_url}/ws/{path}",
@@ -314,7 +378,18 @@ class BenchmarkServiceClient:
             try:
                 await websocket.send(request.model_dump_json())
 
-                async for message in websocket:
+                stream = aiter(websocket)
+                while True:
+                    try:
+                        message = await asyncio.wait_for(anext(stream), timeout=self._ws_idle_timeout_s)
+                    except StopAsyncIteration:
+                        break
+                    except TimeoutError:
+                        raise BenchmarkServiceStreamIdleError(
+                            idle_s=time.monotonic() - last_message_at,
+                            health_ok=await self._health_ok(),
+                        ) from None
+
                     last_message_at = time.monotonic()
                     chunk: StreamChunk = _stream_chunk_adapter.validate_json(message)
 
@@ -343,6 +418,14 @@ class BenchmarkServiceClient:
                 close_reason=websocket.close_reason,
                 idle_s=time.monotonic() - last_message_at,
             )
+
+    async def _health_ok(self) -> bool:
+        """Best-effort liveness probe used to describe an idle stream failure."""
+        try:
+            response = await asyncio.wait_for(self.health_check(), timeout=_HEALTH_PROBE_TIMEOUT_S)
+            return response.status == "ok"
+        except Exception:
+            return False
 
     @_retry_http
     async def health_check(self) -> HealthCheckResponse:

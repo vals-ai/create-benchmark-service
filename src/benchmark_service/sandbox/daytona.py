@@ -91,7 +91,7 @@ _SOURCE_NAMES: Mapping[str | None, str] = {
     SOURCE_PROXY: "proxy",
 }
 _PTY_STATUS_CHECK_ATTEMPTS = 30
-_PTY_STATUS_POLL_SECONDS = 5
+_PTY_STATUS_POLL_SECONDS = 30
 _PTY_STDOUT_TAIL_MAX_BYTES = 64 * 1024
 _PTY_CREATE_MARKER_ENV = "_CBS_PTY_CREATE_MARKER"
 _PTY_ROWS = 24
@@ -697,17 +697,6 @@ class DaytonaSandbox(Sandbox):
                         raise
                     break
                 if result.exit_code == 0:
-                    break
-
-                try:
-                    await self._check_sandbox_alive()
-                except SandboxError:
-                    status_exists = False
-                    with suppress(SandboxError):
-                        result = await self._control_exec(f"test -e {shlex.quote(status_path)}")
-                        status_exists = result.exit_code == 0
-                    if not status_exists:
-                        raise
                     break
 
                 if not done:

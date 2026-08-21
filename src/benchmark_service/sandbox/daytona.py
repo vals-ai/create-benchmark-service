@@ -972,7 +972,7 @@ class DaytonaSandboxProvider(SandboxProvider):
             raise SandboxError("Daytona rejected the admission capacity request") from exc
         except InvalidURL as exc:
             raise SandboxError("Daytona admission URL is invalid") from exc
-        except (ConnectionError, TimeoutError, ClientError):
+        except (TimeoutError, ClientError):
             return True
 
         total = (usage.total_cpu_quota, usage.total_memory_quota, usage.total_disk_quota)

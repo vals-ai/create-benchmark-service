@@ -1245,9 +1245,12 @@ def test_daytona_pool_id_is_stable_nonsecret_and_capacity_account_scoped() -> No
 
     assert pool_id is not None
     assert pool_id == rotated.admission_pool_id
-    assert pool_id == _configured_daytona_provider(
-        DAYTONA_API_URL="https://d.test", DAYTONA_TARGET="canonical-region-id"
-    ).admission_pool_id
+    assert (
+        pool_id
+        == _configured_daytona_provider(
+            DAYTONA_API_URL="https://d.test", DAYTONA_TARGET="canonical-region-id"
+        ).admission_pool_id
+    )
     assert (
         len(
             {
@@ -1300,8 +1303,6 @@ async def test_daytona_admission_accepts_target_id_without_region_lookup(monkeyp
         (None, _ADMISSION_IMAGE, _ADMISSION_RESOURCES, {}, True, False),
         ("org-1", SnapshotSource(snapshot="snap"), _ADMISSION_RESOURCES, {}, True, False),
         ("org-1", _ADMISSION_IMAGE, Resources(vcpu=2, memory=4, disk=10, gpu=1), {}, True, False),
-        ("org-1", _ADMISSION_IMAGE, Resources(vcpu=0, memory=1, disk=1), {}, SandboxError, False),
-        ("org-1", _ADMISSION_IMAGE, Resources(vcpu=1, memory=1, disk=-1), {}, SandboxError, False),
         ("org-1", _ADMISSION_IMAGE, _ADMISSION_RESOURCES, {}, True, True),
         ("org-1", ComposeSource(outer=_ADMISSION_IMAGE), Resources(vcpu=7, memory=4, disk=10), {}, False, True),
         ("org-1", _ADMISSION_IMAGE, _ADMISSION_RESOURCES, {"current_memory_usage": 29}, False, True),
@@ -1333,6 +1334,22 @@ async def test_daytona_admission_decisions(
     else:
         assert await provider.check_admission(source, resources) is expected
     assert requested == (["org-1"] if observed else [])
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"vcpu": 0},
+        {"memory": 0},
+        {"disk": 0},
+        {"vcpu": -1},
+        {"memory": -1},
+        {"disk": -1},
+    ],
+)
+def test_resources_require_positive_capacity(updates: dict[str, int]) -> None:
+    with pytest.raises(ValidationError):
+        Resources.model_validate({"vcpu": 2, "memory": 4, "disk": 10} | updates)
 
 
 async def test_daytona_admission_uses_organization_limits_only_for_null_region_limits(
@@ -3562,7 +3579,7 @@ async def test_volume_run_subpath_requires_run_label_before_lookup() -> None:
     ("organization_headers", "expected"),
     [
         ({"x-organization-id": "org-primary"}, "org-primary"),
-        ({"daytona_organization_id": "org-legacy"}, "org-legacy"),
+        ({"daytona_organization_id": "org-legacy"}, None),
         ({}, None),
     ],
 )
@@ -3593,7 +3610,7 @@ def test_daytona_config_from_headers_reads_legacy_required_fields() -> None:
             "daytona_api_key": "legacy-key",
             "daytona_api_url": "https://legacy.daytona.example",
             "daytona_target": "legacy-target",
-            "daytona_organization_id": "legacy-org",
+            "x-organization-id": "org-primary",
         }
     )
 
@@ -3602,7 +3619,17 @@ def test_daytona_config_from_headers_reads_legacy_required_fields() -> None:
         config.DAYTONA_API_URL,
         config.DAYTONA_TARGET,
         config.DAYTONA_ORGANIZATION_ID,
-    ) == ("legacy-key", "https://legacy.daytona.example", "legacy-target", "legacy-org")
+    ) == ("legacy-key", "https://legacy.daytona.example", "legacy-target", "org-primary")
+
+
+def test_daytona_config_normalizes_api_url() -> None:
+    config = DaytonaProviderConfig(
+        DAYTONA_API_KEY="key-1",
+        DAYTONA_API_URL="https://daytona.example///",
+        DAYTONA_TARGET="us",
+    )
+
+    assert config.DAYTONA_API_URL == "https://daytona.example"
 
 
 def test_daytona_config_from_env_reads_environment(monkeypatch: pytest.MonkeyPatch) -> None:

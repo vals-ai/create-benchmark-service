@@ -127,7 +127,7 @@ Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` 
 
 When a setup or evaluate-instance request omits `sandbox_provider`, the Daytona header fallback reads
 `x-api-key`, `x-api-url`, and `x-target`, plus optional `x-organization-id`. The legacy
-`daytona_api_key`, `daytona_api_url`, `daytona_target`, and `daytona_organization_id` aliases remain accepted.
+`daytona_api_key`, `daytona_api_url`, and `daytona_target` aliases remain accepted.
 Providing the organization ID enables organization-scoped capacity admission; omitting it preserves direct creation.
 The API key must be able to read organization usage. When the target is a region name instead of its ID,
 the key must also be able to list regions so admission can resolve the canonical ID.

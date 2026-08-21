@@ -54,7 +54,7 @@ from daytona.common.errors import (
 from daytona.common.pty import PtyResult, PtySize
 from daytona.handle.async_pty_handle import AsyncPtyHandle
 from daytona_toolbox_api_client_async.models.pty_session_info import PtySessionInfo
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 from tenacity import (
     RetryCallState,
     retry,
@@ -213,12 +213,17 @@ class DaytonaProviderConfig(BaseModel):
     DAYTONA_TARGET: str
     DAYTONA_ORGANIZATION_ID: str | None = Field(default=None, exclude_if=lambda value: value is None)
 
+    @field_validator("DAYTONA_API_URL")
+    @classmethod
+    def _normalize_api_url(cls, value: str) -> str:
+        return value.rstrip("/")
+
     @classmethod
     def from_headers(cls, headers: Mapping[str, str]) -> "DaytonaProviderConfig":
         api_key = _get_config_header(headers, "x-api-key", "daytona_api_key")
         api_url = _get_config_header(headers, "x-api-url", "daytona_api_url")
         target = _get_config_header(headers, "x-target", "daytona_target")
-        organization_id = _get_config_header(headers, "x-organization-id", "daytona_organization_id")
+        organization_id = _get_config_header(headers, "x-organization-id")
         if not api_key or not api_url or not target:
             raise MissingSandboxConfigError("Missing required headers: x-api-key, x-api-url, x-target")
         return cls(
@@ -291,7 +296,7 @@ def _get_config_header(headers: Mapping[str, str], *names: str) -> str | None:
 
 
 def _admission_pool_id(*, organization_id: str, api_url: str) -> str:
-    scope = "\0".join((api_url.rstrip("/"), organization_id))
+    scope = "\0".join((api_url, organization_id))
     return f"daytona:{uuid.uuid5(uuid.NAMESPACE_URL, scope)}"
 
 
@@ -889,18 +894,10 @@ class DaytonaSandboxProvider(SandboxProvider):
             raise MissingSandboxConfigError("DAYTONA_TARGET must not be blank")
         self._organization_id = config.DAYTONA_ORGANIZATION_ID or None
         self._api_url = config.DAYTONA_API_URL
-        self._admission_pool = (
-            _admission_pool_id(
-                organization_id=self._organization_id,
-                api_url=self._api_url,
-            )
-            if self._organization_id is not None
-            else None
-        )
         self._target_id: str | None = None
         self._target_id_lock = asyncio.Lock()
         self._target_api_configuration = DaytonaApiConfiguration(
-            host=self._api_url.rstrip("/"),
+            host=self._api_url,
             access_token=config.DAYTONA_API_KEY,
         )
         self._daytona = _daytona_client(config, self._target)
@@ -913,7 +910,9 @@ class DaytonaSandboxProvider(SandboxProvider):
 
     @property
     def admission_pool_id(self) -> str | None:
-        return self._admission_pool
+        if self._organization_id is None:
+            return None
+        return _admission_pool_id(organization_id=self._organization_id, api_url=self._api_url)
 
     async def check_admission(
         self,
@@ -925,8 +924,6 @@ class DaytonaSandboxProvider(SandboxProvider):
         if self._organization_id is None or not isinstance(source, ImageSource) or resources.gpu:
             return True
         demand = (resources.vcpu, resources.memory, resources.disk)
-        if any(requested <= 0 for requested in demand):
-            raise SandboxError("Daytona admission demand must be positive")
 
         try:
             async with (

@@ -55,6 +55,7 @@ from benchmark_service.sandbox.daytona import (
     _PTY_ROWS,  # pyright: ignore[reportPrivateUsage]
     _PTY_STDOUT_TAIL_MAX_BYTES,  # pyright: ignore[reportPrivateUsage]
     DaytonaProviderConfig,
+    _is_ambiguous_pty_create_error,  # pyright: ignore[reportPrivateUsage]
     _is_not_found_error,  # pyright: ignore[reportPrivateUsage]
     _is_transient_daytona_error,  # pyright: ignore[reportPrivateUsage]
     DaytonaSandbox,
@@ -645,6 +646,30 @@ class BlockingProcess(Process):
         self.killed_session_id = session_id
 
 
+class RunningProcess(BlockingProcess):
+    def __init__(self) -> None:
+        super().__init__()
+        self.status_probe_started = asyncio.Event()
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        if _unwrap_shell_command(command).startswith("test -e "):
+            self.status_probe_started.set()
+            return SimpleNamespace(exit_code=1, result="")
+        return await super().exec(command)
+
+
+class DyingProcess(Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.status_probe_commands = 0
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        if _unwrap_shell_command(command).startswith("test -e "):
+            self.status_probe_commands += 1
+            raise DaytonaNotFoundError("sandbox not found")
+        return await super().exec(command)
+
+
 class StalledSendPtyHandle(BlockingPtyHandle):
     async def send_input(self, data: str) -> None:
         # Let the stty prologue through so the stall lands on the command send itself.
@@ -862,34 +887,6 @@ class BareHtml502RefreshSandbox(InnerSandbox):
 
 class PersistentBareHtml502RefreshSandbox(InnerSandbox):
     async def refresh_data(self) -> None:
-        raise DaytonaError("Failed to refresh sandbox data: <html><h1>502 Bad Gateway</h1></html>")
-
-
-class StatusDuringFailedRefreshProcess(Process):
-    def __init__(self) -> None:
-        super().__init__()
-        self.status_exists = False
-        self.status_probe_command: str | None = None
-
-    async def exec(self, command: str) -> SimpleNamespace:
-        evaluated_command = _unwrap_shell_command(command)
-        if evaluated_command.startswith("test -e "):
-            if self.status_probe_command is None:
-                self.status_probe_command = evaluated_command
-            else:
-                assert evaluated_command == self.status_probe_command
-            return SimpleNamespace(exit_code=0 if self.status_exists else 1, result="")
-        return await super().exec(command)
-
-
-class StatusDuringFailedRefreshSandbox(InnerSandbox):
-    def __init__(self) -> None:
-        super().__init__()
-        self.status_process = StatusDuringFailedRefreshProcess()
-        self.process = self.status_process
-
-    async def refresh_data(self) -> None:
-        self.status_process.status_exists = True
         raise DaytonaError("Failed to refresh sandbox data: <html><h1>502 Bad Gateway</h1></html>")
 
 
@@ -1677,6 +1674,17 @@ def test_daytona_temporary_authentication_errors_are_transient(message: str) -> 
     assert _is_transient_daytona_error(DaytonaError(message))
 
 
+def test_daytona_throttled_unauthorized_errors_are_transient() -> None:
+    exc = DaytonaError(
+        "Failed to execute command: unauthorized: authentication failed: Bearer token validation error: "
+        "ThrottlerException: Too Many Requests",
+        status_code=401,
+    )
+
+    assert _is_transient_daytona_error(exc)
+    assert not _is_ambiguous_pty_create_error(exc)
+
+
 @pytest.mark.parametrize("status_code", [408, 429, 500, 502, 503, 504])
 def test_daytona_retryable_http_statuses_are_transient(status_code: int) -> None:
     assert _is_transient_daytona_error(DaytonaError("provider request failed", status_code=status_code))
@@ -2263,24 +2271,41 @@ async def test_daytona_command_prefers_status_over_pty_exit() -> None:
     assert process.checked_session_id is None
 
 
-async def test_daytona_command_returns_completed_status_before_later_health_502(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+async def test_daytona_command_returns_completed_status_without_health_refresh() -> None:
     inner = PersistentBareHtml502RefreshSandbox()
     sandbox = DaytonaSandbox(cast(Any, inner))
-    _skip_retry_sleep(monkeypatch, DaytonaSandbox._check_sandbox_alive)  # pyright: ignore[reportPrivateUsage]
 
     assert [chunk async for chunk in sandbox.command("printf hello")] == ["hello"]
+    assert inner.refresh_count == 0
 
 
-async def test_daytona_command_rechecks_status_written_during_failed_health_refresh(
+async def test_daytona_command_does_not_refresh_sandbox_state_while_pty_is_running(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    inner = StatusDuringFailedRefreshSandbox()
+    monkeypatch.setattr(daytona_module, "_PTY_STATUS_POLL_SECONDS", 0)
+    inner = InnerSandbox()
+    process = RunningProcess()
+    inner.process = process
     sandbox = DaytonaSandbox(cast(Any, inner))
-    _skip_retry_sleep(monkeypatch, DaytonaSandbox._check_sandbox_alive)  # pyright: ignore[reportPrivateUsage]
 
-    assert [chunk async for chunk in sandbox.command("printf hello")] == ["hello"]
+    stream = sandbox.command("printf hello")
+    assert await anext(stream) == "hello"
+    await asyncio.wait_for(process.status_probe_started.wait(), timeout=1)
+    assert inner.refresh_count == 0
+    await stream.aclose()
+
+
+async def test_daytona_command_reports_sandbox_death_from_control_exec_failure() -> None:
+    inner = InnerSandbox()
+    process = DyingProcess()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxNotFoundError, match="Sandbox not found: name=sandbox-name, id=sandbox-id\\."):
+        _ = [chunk async for chunk in sandbox.command("printf hello")]
+
+    assert process.status_probe_commands == 2
+    assert inner.refresh_count == 0
 
 
 async def test_daytona_command_rechecks_status_after_initial_probe_failure() -> None:
@@ -2345,19 +2370,18 @@ async def test_daytona_command_reports_missing_pty_context(reconnect_error: Dayt
     assert "PTY session disappeared before command status was written" in message
     assert "wait_result=(exit_code=0, error=None)" in message
     assert "state=SandboxState.STARTED" in message
-    assert inner.refresh_count == 2
+    assert inner.refresh_count == 1
 
 
-async def test_daytona_command_checks_sandbox_health_before_reconnecting() -> None:
+async def test_daytona_command_reconnects_without_per_poll_sandbox_health_check() -> None:
     inner = InnerSandbox()
     inner.process = ReconnectingProcess()
     inner.state = SandboxState.DESTROYED
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    with pytest.raises(SandboxNotFoundError, match="Sandbox not found: name=sandbox-name, id=sandbox-id\\."):
-        _ = [chunk async for chunk in sandbox.command("printf hello")]
+    assert [chunk async for chunk in sandbox.command("printf hello")] == ["hello"]
 
-    assert inner.refresh_count == 1
+    assert inner.refresh_count == 0
 
 
 async def test_daytona_command_checks_sandbox_health_after_pty_create_failure() -> None:
@@ -2773,7 +2797,7 @@ async def test_daytona_command_checks_sandbox_health_after_reconnect_failure() -
     with pytest.raises(SandboxNotFoundError, match="Sandbox not found: name=sandbox-name, id=sandbox-id\\."):
         _ = [chunk async for chunk in sandbox.command("printf hello")]
 
-    assert inner.refresh_count == 2
+    assert inner.refresh_count == 1
 
 
 async def test_daytona_command_keeps_error_state_as_sandbox_error() -> None:

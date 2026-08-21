@@ -7,50 +7,25 @@ import json
 import logging
 import os
 from collections.abc import Mapping
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any
 
 import yaml
 from cachetools import TTLCache
 from descope.descope_client import DescopeClient
-from pydantic import BaseModel, ConfigDict, Field, PositiveInt
+from pydantic import BaseModel, ConfigDict, Field
 
-logger = logging.getLogger(__name__)
-
-DESCOPE_API_KEY_HEADER = "x-descope-api-key"
-DEFAULT_AUTH_CACHE_TTL_SECONDS = 300
-AUTH_CACHE_MAX_SIZE = 1024
-UNAUTHENTICATED_TENANT_SENTINEL = "_unauthenticated"
-AUTH_DISABLED_ENV = "AUTH_DISABLED"
-_REMOVED_AUTH_REQUIRED_ENV = "AUTH_REQUIRED"
-EvaluationQuotaPeriod = Literal["day", "week", "month", "year"]
-
-
-class EvaluationQuotaConfig(BaseModel):
-    """Per-tenant evaluation request quota."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    limit: PositiveInt
-    period: EvaluationQuotaPeriod
-
-
-class TenantConfig(BaseModel):
-    """Per-tenant access rules within a benchmark service."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    datasets: list[str] = Field(default_factory=list)
-    evaluation_quota: EvaluationQuotaConfig | None = None
-    trial_mode: bool = Field(
-        default=False,
-        description=(
-            "If true, responses on /v1/evaluate and /v1/score are sanitized to "
-            "score-only fields. Set this on prospects' tenants in allowlist.yaml."
-        ),
-    )
+from benchmark_service.allowlist import (
+    ALLOWLIST_CACHE_MAX_SIZE,
+    DESCOPE_API_KEY_HEADER,
+    CatalogAllowlistClient,
+    EvaluationQuotaConfig as EvaluationQuotaConfig,
+    EvaluationQuotaPeriod as EvaluationQuotaPeriod,
+    TenantConfig,
+)
 
 
 class AllowlistConfig(BaseModel):
@@ -66,32 +41,109 @@ class AllowlistConfig(BaseModel):
     tenants: dict[str, TenantConfig] = Field(default_factory=dict)
 
 
+logger = logging.getLogger(__name__)
+
+DEFAULT_AUTH_CACHE_TTL_SECONDS = 300
+AUTH_CACHE_MAX_SIZE = ALLOWLIST_CACHE_MAX_SIZE
+UNAUTHENTICATED_TENANT_SENTINEL = "_unauthenticated"
+AUTH_DISABLED_ENV = "AUTH_DISABLED"
+_REMOVED_AUTH_REQUIRED_ENV = "AUTH_REQUIRED"
+
+
 _DESCOPE_ALLOWLIST_JSON_ENV = "DESCOPE_TENANT_ALLOWLIST_JSON"
 _DESCOPE_ALLOWLIST_PATH_ENV = "DESCOPE_ALLOWLIST_PATH"
+_BENCHMARK_CATALOG_API_URL_ENV = "BENCHMARK_CATALOG_API_URL"
+_SERVICE_NAME_ENV = "SERVICE_NAME"
+
 
 _allowlist_cache: AllowlistConfig | None = None
 _allowlist_warned: bool = False
+_catalog_client: CatalogAllowlistClient | None = None
+_request_tenant_config: ContextVar[tuple[str, TenantConfig] | None] = ContextVar(
+    "request_tenant_config",
+    default=None,
+)
+
+
+def _catalog_api_url() -> str | None:
+    value = os.environ.get(_BENCHMARK_CATALOG_API_URL_ENV, "").strip()
+    return value.rstrip("/") or None
+
+
+def _catalog_service_name() -> str | None:
+    value = os.environ.get(_SERVICE_NAME_ENV, "").strip()
+    return value or None
 
 
 def clear_allowlist_cache() -> None:
-    """Reset module-level allowlist state. Intended for tests."""
-    global _allowlist_cache, _allowlist_warned
+    """Reset module-level legacy and catalog allowlist state. Intended for tests."""
+    global _allowlist_cache, _allowlist_warned, _catalog_client
     _allowlist_cache = None
     _allowlist_warned = False
+    _catalog_client = None
+    clear_request_tenant_config()
+
+
+def clear_request_tenant_config() -> None:
+    """Clear the tenant policy snapshot associated with the current request."""
+    _request_tenant_config.set(None)
+
+
+async def close_catalog_client() -> None:
+    """Close the process-level catalog HTTP client."""
+    global _catalog_client
+    if _catalog_client is not None:
+        await _catalog_client.aclose()
+        _catalog_client = None
+
+
+def _get_catalog_client() -> CatalogAllowlistClient | None:
+    global _catalog_client
+
+    api_url = _catalog_api_url()
+    service_name = _catalog_service_name()
+    if api_url is None or service_name is None:
+        logger.warning(
+            "Catalog allowlist mode requires both %s and %s",
+            _BENCHMARK_CATALOG_API_URL_ENV,
+            _SERVICE_NAME_ENV,
+        )
+        return None
+
+    if _catalog_client is None:
+        _catalog_client = CatalogAllowlistClient(api_url, service_name)
+    return _catalog_client
+
+
+async def _fetch_api_tenant_config(access_key: str, tenant: str) -> TenantConfig | None:
+    """Fetch and cache one tenant's service policy from the catalog API."""
+    client = _get_catalog_client()
+    if client is None:
+        return None
+    config = await client.get_tenant_config(access_key, tenant)
+    if config is not None:
+        _request_tenant_config.set((tenant, config))
+    return config
 
 
 def load_allowlist() -> AllowlistConfig:
     """Load the tenant + dataset allowlist for this service.
 
     Resolution order:
-      1. `DESCOPE_TENANT_ALLOWLIST_JSON` env var (production via CDK).
-      2. `DESCOPE_ALLOWLIST_PATH` env var pointing at a YAML file (local dev).
-      3. Empty config (legal: fails closed for Descope callers; logs once).
+      1. The catalog API when `BENCHMARK_CATALOG_API_URL` is configured.
+      2. `DESCOPE_TENANT_ALLOWLIST_JSON` env var (legacy rollout fallback).
+      3. `DESCOPE_ALLOWLIST_PATH` env var pointing at a YAML file (local dev).
+      4. Empty config (legal: fails closed when AUTH_REQUIRED=true; logs once).
 
     Raises:
         ValueError: if the configured source exists but is malformed.
     """
     global _allowlist_cache, _allowlist_warned
+
+    # API mode is caller-scoped. Startup validation must not make a caller-less
+    # request, and legacy policy must never override an explicitly configured API.
+    if _catalog_api_url() is not None:
+        return AllowlistConfig()
 
     if _allowlist_cache is not None:
         return _allowlist_cache
@@ -130,7 +182,7 @@ def load_allowlist() -> AllowlistConfig:
     if not get_auth_settings().auth_disabled and not _allowlist_warned:
         logger.warning(
             "No tenant allowlist configured (set %s or %s). All Descope-authenticated "
-            "requests will be rejected.",
+            "requests will be rejected when AUTH_REQUIRED=true.",
             _DESCOPE_ALLOWLIST_JSON_ENV,
             _DESCOPE_ALLOWLIST_PATH_ENV,
         )
@@ -140,6 +192,12 @@ def load_allowlist() -> AllowlistConfig:
 
 def get_tenant_config(tenant: str) -> TenantConfig | None:
     """Return the TenantConfig for `tenant`, or None if not allowlisted."""
+    request_config = _request_tenant_config.get()
+    if request_config is not None and request_config[0] == tenant:
+        return request_config[1]
+    if _catalog_api_url() is not None:
+        client = _get_catalog_client()
+        return client.cached_tenant_config(tenant) if client is not None else None
     return load_allowlist().tenants.get(tenant)
 
 
@@ -181,12 +239,7 @@ def get_auth_settings() -> AuthSettings:
 
 
 def require_supported_auth_config() -> None:
-    """Fail startup for deploys still configured for the removed bearer auth mode.
-
-    `AUTH_REQUIRED=false` used to select static `BENCHMARK_API_KEY` bearer auth.
-    Honouring it now would serve the deployment with no credential check at all,
-    so such a container refuses to boot until it is migrated to Descope.
-    """
+    """Fail startup for deploys still configured for the removed bearer auth mode."""
     value = os.environ.get(_REMOVED_AUTH_REQUIRED_ENV)
     if value is not None and not _env_bool(_REMOVED_AUTH_REQUIRED_ENV):
         raise RuntimeError(
@@ -229,15 +282,18 @@ async def resolve_descope_tenant(headers: Mapping[str, str]) -> str | None:
     cache_key = (settings.descope_project_id, access_key)
     cached = _auth_cache.get(cache_key)
     if cached is not None:
-        return cached
+        if _catalog_api_url() is None:
+            return cached
+        return cached if await _fetch_api_tenant_config(access_key, cached) is not None else None
 
     try:
         jwt_response = await _exchange_descope_access_key(settings.descope_project_id, access_key)
+        tenants_claim = jwt_response.get("tenants", {})
+        tenants = list(tenants_claim.keys())
     except Exception:
-        logger.warning("Failed to exchange Descope access key", exc_info=True)
+        logger.warning("Failed to resolve tenant from Descope access key", exc_info=True)
         return None
 
-    tenants = list(jwt_response.get("tenants", {}).keys())
     if len(tenants) != 1:
         logger.warning("Descope access key must be scoped to exactly one tenant, got %s", len(tenants))
         return None
@@ -247,23 +303,27 @@ async def resolve_descope_tenant(headers: Mapping[str, str]) -> str | None:
         logger.info("Descope tenant %s is reserved for the local development sentinel", tenant)
         return None
 
-    allowlist = load_allowlist()
-    if tenant not in allowlist.tenants:
-        logger.info("Descope tenant %s is not in the service allowlist", tenant)
-        return None
+    if _catalog_api_url() is not None:
+        if await _fetch_api_tenant_config(access_key, tenant) is None:
+            logger.info("Descope tenant %s is not in the service allowlist", tenant)
+            return None
+    else:
+        allowlist = load_allowlist()
+        if tenant not in allowlist.tenants:
+            logger.info("Descope tenant %s is not in the service allowlist", tenant)
+            return None
 
     _auth_cache[cache_key] = tenant
     return tenant
 
 
 async def resolve_caller_tenant(headers: Mapping[str, str]) -> str | None:
-    """Return the caller tenant id, the local-dev sentinel, or None to reject.
-
-    Descope access keys are the only accepted credential. `AUTH_DISABLED=true`
-    switches authentication off for local development; deployed services must
-    never set it, so a deploy that lacks Descope configuration rejects every
-    request instead of serving unauthenticated traffic.
-    """
+    """Return the caller tenant id, the local-dev sentinel, or None to reject."""
     if get_auth_settings().auth_disabled:
         return UNAUTHENTICATED_TENANT_SENTINEL
     return await resolve_descope_tenant(headers)
+
+
+async def check_benchmark_service_auth(headers: Mapping[str, str]) -> bool:
+    """Validate benchmark-service auth headers using the configured auth mode."""
+    return await resolve_caller_tenant(headers) is not None

@@ -96,7 +96,7 @@ _SOURCE_NAMES: Mapping[str | None, str] = {
     SOURCE_PROXY: "proxy",
 }
 _PTY_STATUS_CHECK_ATTEMPTS = 30
-_PTY_STATUS_POLL_SECONDS = 5
+_PTY_STATUS_POLL_SECONDS = 30
 _PTY_STDOUT_TAIL_MAX_BYTES = 64 * 1024
 _PTY_CREATE_MARKER_ENV = "_CBS_PTY_CREATE_MARKER"
 _PTY_ROWS = 24
@@ -133,6 +133,9 @@ _TRANSPORT_ERROR_MESSAGES = (
     "server disconnected",
     "temporary authentication service error",
 )
+# Daytona's gateway throttler reports the throttle only in the message, under whatever status the
+# throttled call carries (a 401 when it is Bearer token validation), so the status cannot identify it.
+_THROTTLED_ERROR_MESSAGES = ("throttlerexception",)
 _RETRYABLE_DAYTONA_CAUSES = (ClientConnectionError, ClientPayloadError, ConnectionError, TimeoutError)
 _PROVIDER_RETRY_DELAYS_SECONDS = (5, 25, 90, 300, 420)
 _FIXED_PROVIDER_WAIT = wait_chain(*(wait_random(delay * 0.9, delay) for delay in _PROVIDER_RETRY_DELAYS_SECONDS))
@@ -356,10 +359,16 @@ def _provider_status_code(exc: DaytonaError | ClientResponseError) -> int | None
     return exc.status_code
 
 
+def _is_throttled_error(exc: DaytonaError | ClientResponseError) -> bool:
+    return _message_contains(exc, _THROTTLED_ERROR_MESSAGES)
+
+
 def _is_transient_daytona_error(exc: DaytonaError | ClientResponseError) -> bool:
     if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS) or _has_retryable_cause(exc):
         return True
     if _provider_status_code(exc) in _RETRYABLE_PROVIDER_STATUSES:
+        return True
+    if _is_throttled_error(exc):
         return True
     return _message_contains(exc, _TRANSPORT_ERROR_MESSAGES)
 
@@ -371,7 +380,7 @@ def _is_name_conflict_error(exc: DaytonaError) -> bool:
 
 
 def _is_ambiguous_pty_create_error(exc: DaytonaError | ClientResponseError) -> bool:
-    if isinstance(exc, DaytonaRateLimitError) or _provider_status_code(exc) == 429:
+    if isinstance(exc, DaytonaRateLimitError) or _provider_status_code(exc) == 429 or _is_throttled_error(exc):
         return False
     return _is_transient_daytona_error(exc)
 
@@ -712,17 +721,6 @@ class DaytonaSandbox(Sandbox):
                         raise
                     break
                 if result.exit_code == 0:
-                    break
-
-                try:
-                    await self._check_sandbox_alive()
-                except SandboxError:
-                    status_exists = False
-                    with suppress(SandboxError):
-                        result = await self._control_exec(f"test -e {shlex.quote(status_path)}")
-                        status_exists = result.exit_code == 0
-                    if not status_exists:
-                        raise
                     break
 
                 if not done:

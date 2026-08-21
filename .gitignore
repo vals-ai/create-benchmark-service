@@ -10,3 +10,6 @@ __pycache__/
 .env
 
 src/benchmark_service/_version.py
+
+# Agent scratch workspace
+.scratch/

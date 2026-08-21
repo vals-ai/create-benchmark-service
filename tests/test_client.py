@@ -1,6 +1,8 @@
 """Tests for BenchmarkServiceClient."""
 
+import asyncio
 import json
+import os
 import socket
 from pathlib import Path
 from typing import Any
@@ -13,7 +15,13 @@ from pydantic import ValidationError
 from websockets.exceptions import ConnectionClosedError
 from websockets.frames import Close
 
-from benchmark_service import BenchmarkServiceStreamClosedError, SandboxNotFoundError, SandboxRecoveryPolicy
+from benchmark_service import (
+    BenchmarkServiceStreamClosedError,
+    BenchmarkServiceStreamError,
+    BenchmarkServiceStreamIdleError,
+    SandboxNotFoundError,
+    SandboxRecoveryPolicy,
+)
 from benchmark_service.client import (
     _SERVER_PING_INTERVAL_S,  # pyright: ignore[reportPrivateUsage]
     _SERVER_PING_TIMEOUT_S,  # pyright: ignore[reportPrivateUsage]
@@ -23,7 +31,7 @@ from benchmark_service.client import (
 )
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
-from benchmark_service.schemas import RetrieveTaskResponse
+from benchmark_service.schemas import HealthCheckResponse, RetrieveTaskResponse
 from benchmark_service.v1_schemas import (
     V1DatasetTasksResponse,
     V1EvalResponse,
@@ -1053,6 +1061,99 @@ async def test_ws_connect_pings_on_the_server_cadence_without_a_pong_deadline() 
 
     assert connect.call_args.kwargs["ping_interval"] == 30
     assert connect.call_args.kwargs["ping_timeout"] is None
+
+
+class _SilentStream:
+    """Stream that stays open and never produces an application message."""
+
+    def __aiter__(self) -> "_SilentStream":
+        return self
+
+    async def __anext__(self) -> str:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+def _silent_ws_mock() -> AsyncMock:
+    ws = _SilentStream()
+    ws.send = AsyncMock()  # type: ignore[attr-defined]
+
+    mock_connect = AsyncMock()
+    mock_connect.__aenter__ = AsyncMock(return_value=ws)
+    mock_connect.__aexit__ = AsyncMock(return_value=False)
+    return mock_connect
+
+
+@pytest.mark.parametrize(
+    ("health_status", "expected_health"),
+    [("ok", "service still reports healthy"), (None, "service health check also failing")],
+    ids=["service_healthy", "service_unreachable"],
+)
+async def test_ws_idle_past_the_budget_fails_the_stream(health_status: str | None, expected_health: str) -> None:
+    """A silent-but-open stream must fail instead of blocking forever, and record service liveness.
+
+    Keepalive cannot see a peer that stops producing while the socket stays open, so without this
+    budget the task stays In Progress until someone force-stops the run.
+    """
+    client = BenchmarkServiceClient(url=BASE_URL, headers=HEADERS, timeout=10, ws_idle_timeout_s=0.05)
+    if health_status is None:
+        health = AsyncMock(side_effect=httpx.ConnectError("service down"))
+    else:
+        health = AsyncMock(return_value=HealthCheckResponse(status=health_status))
+
+    with (
+        patch("benchmark_service.client.websockets.connect", return_value=_silent_ws_mock()),
+        patch.object(client, "health_check", health),
+    ):
+        with pytest.raises(BenchmarkServiceStreamIdleError) as exc_info:
+            await client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG)
+
+    exc = exc_info.value
+    assert isinstance(exc, BenchmarkServiceStreamError)
+    assert exc.idle_s >= 0.05
+    assert str(exc) == f"WebSocket idle for {exc.idle_s:.1f}s without an application message ({expected_health})"
+
+
+async def test_ws_idle_health_probe_is_bounded() -> None:
+    """A failed health probe must not turn an idle failure into another unbounded wait."""
+    client = BenchmarkServiceClient(url=BASE_URL, headers=HEADERS, timeout=10, ws_idle_timeout_s=0.01)
+
+    async def _hanging_health_check() -> HealthCheckResponse:
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    with (
+        patch("benchmark_service.client.websockets.connect", return_value=_silent_ws_mock()),
+        patch("benchmark_service.client._HEALTH_PROBE_TIMEOUT_S", 0.01),
+        patch.object(client, "health_check", _hanging_health_check),
+    ):
+        with pytest.raises(BenchmarkServiceStreamIdleError) as exc_info:
+            await asyncio.wait_for(client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG), timeout=0.1)
+
+    assert exc_info.value.health_ok is False
+
+
+@pytest.mark.parametrize("ws_idle_timeout_s", [None, 0], ids=["none", "zero"])
+async def test_ws_idle_watchdog_can_be_disabled(ws_idle_timeout_s: float | None) -> None:
+    """Both documented ways to disable it keep the pre-watchdog behavior of waiting indefinitely."""
+    client = BenchmarkServiceClient(url=BASE_URL, headers=HEADERS, timeout=10, ws_idle_timeout_s=ws_idle_timeout_s)
+
+    with patch("benchmark_service.client.websockets.connect", return_value=_silent_ws_mock()):
+        with pytest.raises(TimeoutError):
+            await asyncio.wait_for(client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG), timeout=0.05)
+
+
+@pytest.mark.parametrize(
+    ("env_value", "expected"),
+    [(None, 3600.0), ("120.5", 120.5), ("0", None), ("nonsense", 3600.0)],
+    ids=["unset", "override", "disabled", "unparseable"],
+)
+def test_ws_idle_timeout_from_the_environment(env_value: str | None, expected: float | None) -> None:
+    env = {} if env_value is None else {"BENCHMARK_SERVICE_WS_IDLE_TIMEOUT_S": env_value}
+    with patch.dict(os.environ, env, clear=True):
+        client = BenchmarkServiceClient(url=BASE_URL, headers=HEADERS, timeout=10)
+
+    assert client._ws_idle_timeout_s == expected  # pyright: ignore[reportPrivateUsage]
 
 
 def test_dockerfile_template_matches_the_client_keepalive_constants() -> None:

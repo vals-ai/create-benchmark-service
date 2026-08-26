@@ -6,6 +6,7 @@ import asyncio
 import inspect
 import logging
 import os
+import socket
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
@@ -78,6 +79,25 @@ _DEFAULT_WS_IDLE_TIMEOUT_S = 3600.0
 _HEALTH_PROBE_TIMEOUT_S = 5.0
 # Distinguishes "caller passed None to disable" from "caller said nothing".
 _UNSET_WS_IDLE_TIMEOUT: float = -1.0
+
+_HTTP_MAX_CONNECTIONS = 200
+_TCP_KEEPALIVE_IDLE_S = 60
+_TCP_KEEPALIVE_INTERVAL_S = 30
+_TCP_KEEPALIVE_PROBES = 5
+
+
+def _tcp_keepalive_socket_options() -> list[tuple[int, int, int]]:
+    options = [(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)]
+
+    keepalive_idle = getattr(socket, "TCP_KEEPIDLE", getattr(socket, "TCP_KEEPALIVE", None))
+    if keepalive_idle is not None:
+        options.append((socket.IPPROTO_TCP, keepalive_idle, _TCP_KEEPALIVE_IDLE_S))
+    if hasattr(socket, "TCP_KEEPINTVL"):
+        options.append((socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, _TCP_KEEPALIVE_INTERVAL_S))
+    if hasattr(socket, "TCP_KEEPCNT"):
+        options.append((socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _TCP_KEEPALIVE_PROBES))
+
+    return options
 
 
 def _default_ws_idle_timeout_s() -> float | None:
@@ -311,11 +331,16 @@ class BenchmarkServiceClient:
         idle_timeout = _default_ws_idle_timeout_s() if ws_idle_timeout_s is _UNSET_WS_IDLE_TIMEOUT else ws_idle_timeout_s
         self._ws_idle_timeout_s = idle_timeout if idle_timeout is None or idle_timeout > 0 else None
         self._sandbox_providers = {}
+        transport = httpx.AsyncHTTPTransport(
+            limits=httpx.Limits(max_connections=_HTTP_MAX_CONNECTIONS),
+            socket_options=_tcp_keepalive_socket_options(),
+        )
         self._http_client = httpx.AsyncClient(
             follow_redirects=True,
             timeout=timeout,
             headers=headers,
-            limits=httpx.Limits(max_connections=200),
+            limits=httpx.Limits(max_connections=_HTTP_MAX_CONNECTIONS),
+            mounts={"all://": transport},
         )
 
     def get_sandbox_provider(self, provider: SandboxProviderConfig) -> SandboxProvider:

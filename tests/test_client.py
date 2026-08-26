@@ -23,8 +23,12 @@ from benchmark_service import (
     SandboxRecoveryPolicy,
 )
 from benchmark_service.client import (
+    _HTTP_MAX_CONNECTIONS,  # pyright: ignore[reportPrivateUsage]
     _SERVER_PING_INTERVAL_S,  # pyright: ignore[reportPrivateUsage]
     _SERVER_PING_TIMEOUT_S,  # pyright: ignore[reportPrivateUsage]
+    _TCP_KEEPALIVE_IDLE_S,  # pyright: ignore[reportPrivateUsage]
+    _TCP_KEEPALIVE_INTERVAL_S,  # pyright: ignore[reportPrivateUsage]
+    _TCP_KEEPALIVE_PROBES,  # pyright: ignore[reportPrivateUsage]
     BenchmarkServiceClient,
     BenchmarkServiceError,
     SandboxRecoveryAttempt,
@@ -46,6 +50,25 @@ from benchmark_service.v1_schemas import (
 BASE_URL = "http://localhost:8000"
 HEADERS = {"Authorization": "Bearer token"}
 DAYTONA_CONFIG = DaytonaProviderConfig(DAYTONA_API_KEY="key", DAYTONA_API_URL="url", DAYTONA_TARGET="target")
+
+
+async def test_http_client_enables_tcp_keepalive() -> None:
+    with patch("benchmark_service.client.httpx.AsyncHTTPTransport", wraps=httpx.AsyncHTTPTransport) as transport:
+        client = BenchmarkServiceClient(url=BASE_URL, headers=HEADERS)
+
+    await client.close()
+
+    socket_options = transport.call_args.kwargs["socket_options"]
+    assert (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1) in socket_options
+
+    keepalive_idle = getattr(socket, "TCP_KEEPIDLE", getattr(socket, "TCP_KEEPALIVE", None))
+    if keepalive_idle is not None:
+        assert (socket.IPPROTO_TCP, keepalive_idle, _TCP_KEEPALIVE_IDLE_S) in socket_options
+    if hasattr(socket, "TCP_KEEPINTVL"):
+        assert (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, _TCP_KEEPALIVE_INTERVAL_S) in socket_options
+    if hasattr(socket, "TCP_KEEPCNT"):
+        assert (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _TCP_KEEPALIVE_PROBES) in socket_options
+    assert transport.call_args.kwargs["limits"] == httpx.Limits(max_connections=_HTTP_MAX_CONNECTIONS)
 
 
 class RetryableSetupError(Exception):

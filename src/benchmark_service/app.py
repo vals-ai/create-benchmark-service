@@ -28,6 +28,7 @@ from benchmark_service.auth import (
     require_supported_auth_config,
 )
 from benchmark_service.base import BenchmarkService
+from benchmark_service.context import sandbox_provider_scope
 from benchmark_service.grading import SUBMISSION_ARTIFACT_SANDBOX_PATH, collapse_stream, evaluate_submission
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.schemas import (
@@ -611,11 +612,14 @@ class BenchmarkServiceApp(FastAPI):
             async with sandbox_config.create_provider() as provider:
                 sandbox = await provider.get_sandbox(request.instance_id)
 
-                await _forward_stream(
-                    websocket,
-                    self.service.evaluate_instance(request.task_id, sandbox, dataset=request.dataset),
-                    endpoint="evaluate-instance",
-                )
+                # Benchmarks that grade in a second sandbox read the provider
+                # from the request scope; see benchmark_service.context.
+                with sandbox_provider_scope(provider):
+                    await _forward_stream(
+                        websocket,
+                        self.service.evaluate_instance(request.task_id, sandbox, dataset=request.dataset),
+                        endpoint="evaluate-instance",
+                    )
 
         except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
             logger.warning("evaluate-instance websocket disconnected")

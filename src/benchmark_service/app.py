@@ -64,6 +64,7 @@ from benchmark_service import evaluation_quota, submission_artifacts
 from benchmark_service.v1_schemas import (
     V1DatasetTasksResponse,
     V1EvalRequest,
+    V1EvalStatus,
     V1EvalResponse,
     V1PayloadType,
     V1ScoreItem,
@@ -280,19 +281,23 @@ def _get_service_metadata(service_cls: type[BenchmarkService]) -> tuple[str | No
         return None, None
 
 
-def _v1_score_item_to_eval_result(task_id: str, item: V1ScoreItem | None) -> dict[str, Any] | None:
-    if item is None:
-        return None
+def _v1_score_item_to_eval_result(_task_id: str, item: V1ScoreItem | None) -> Any | None:
+    """One task's evaluation as calculate_final_score receives it on either scoring surface.
 
-    result: dict[str, Any] = {
-        "task_id": task_id,
-        "status": item.status.value,
-        "result": jsonable_encoder(item.result),
-    }
-    if item.errors:
-        # Runner-side EvalResult.error is str | None, so v1's error list collapses here.
-        result["error"] = "; ".join(item.errors)
-    return result
+    /final-score/ forwards the grader payload verbatim, so /v1/score does too: benchmarks
+    implement one hook and must not have to ask which endpoint the caller used. This wrapped
+    the payload as {task_id, status, result} instead, and the cost showed up as three private
+    unwrappers -- emb's _score_payload, code-migration's _grader_result, this suite's own
+    _score_item_resolved -- and one benchmark that did not write a fourth and silently scored
+    every run zero.
+
+    A task that did not reach a verdict becomes None, which is what every implementation
+    already reads as incomplete. Its `errors` go no further: nothing consumes them in
+    scoring, and the alternative is smuggling a framework key into a grader's own payload.
+    """
+    if item is None or item.status != V1EvalStatus.EVALUATED:
+        return None
+    return jsonable_encoder(item.result)
 
 
 class BenchmarkServiceApp(FastAPI):

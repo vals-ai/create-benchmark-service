@@ -1,0 +1,36 @@
+[project]
+name = "create-benchmark-service"
+dynamic = ["version"]
+description = "Client for deployed Vals benchmark services"
+readme = "README.md"
+requires-python = ">=3.12"
+
+dependencies = [
+    "daytona>=0.193.0",
+    "modal>=1.4.2",
+    "fastapi[standard]>=0.135.3",
+    "click>=8.3.2",
+    "jinja2>=3.1.6",
+    "websockets>=15.0.1",
+    "httpx>=0.28.1",
+    "tenacity>=8.3.0",
+    "descope>=1.13.0",
+    "cachetools>=5.5.0",
+    "pyyaml>=6.0.2",
+    "starlette>=1.0.1",
+    "boto3>=1.34",
+]
+
+[build-system]
+requires = ["hatchling", "hatch-vcs"]
+build-backend = "hatchling.build"
+
+[tool.hatch.version]
+source = "vcs"
+raw-options = { root = ".." }
+
+[tool.hatch.build.hooks.vcs]
+version-file = "../src/benchmark_service/_version.py"
+
+[tool.hatch.build.targets.wheel.force-include]
+"../src/benchmark_service" = "benchmark_service"

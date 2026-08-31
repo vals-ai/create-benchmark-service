@@ -416,6 +416,11 @@ class BenchmarkService(ABC):
         - You may want weighted scoring or other metrics
         - Return any metadata you want to include
 
+        Both scoring surfaces deliver the same shape, so implement this once: each value is
+        the payload your evaluation produced, or None for a task that reached no verdict.
+        `/v1/score` unwraps its envelope before calling you, and `/final-score/` forwards the
+        payload verbatim.
+
         Args:
             evaluation_results: Dictionary mapping task_id to your evaluation result objects
             dataset: Name of the dataset. Defaults to 'default'.

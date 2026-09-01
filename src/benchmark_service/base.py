@@ -192,12 +192,13 @@ class BenchmarkService(ABC):
     async def list_tasks(self, dataset: str | None = None) -> list[V1Task]:
         """Return tasks for `dataset` as the lab-facing /v1/ surface sees them.
 
-        Benchmark task objects often contain evaluator-only fields (rubrics,
-        expected answers, grader config, etc.) that must not leak to external
-        labs. The framework therefore does not infer a public representation
-        from arbitrary internal task objects. Benchmarks exposing the endpoint
-        must override this method and explicitly return V1Task(id, question,
-        timeout).
+        The framework does not infer a public representation from arbitrary
+        internal task objects: every field on this surface is one the
+        benchmark put there deliberately. Held-out test-set content must
+        never appear here in any form; rubrics and scoring detail for
+        approved splits may be shared with labs. Benchmarks exposing the
+        endpoint must override this method and explicitly return
+        V1Task(id, question, timeout).
 
         Raises:
             NotImplementedError: if the benchmark has not opted into task listing.
@@ -415,6 +416,9 @@ class BenchmarkService(ABC):
         - Common approach: percentage of resolved tasks
         - You may want weighted scoring or other metrics
         - Return any metadata you want to include
+
+        Each value is the payload your evaluation produced, or None for a task that reached
+        no verdict -- both scoring surfaces deliver that shape.
 
         Args:
             evaluation_results: Dictionary mapping task_id to your evaluation result objects

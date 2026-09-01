@@ -163,14 +163,10 @@ class _AllPassTrialBenchmark(StubBenchmark):
         for item in evaluation_results.values():
             if not isinstance(item, dict):
                 continue
-            item_dict = cast(dict[str, object], item)
-            result = item_dict.get("result")
-            if not isinstance(result, dict):
-                continue
-            result_dict = cast(dict[str, object], result)
-            all_pass = result_dict.get("all_pass")
+            result = cast(dict[str, object], item)
+            all_pass = result.get("all_pass")
             if all_pass is None:
-                all_pass = result_dict.get("resolved")
+                all_pass = result.get("resolved")
             passed += 1 if all_pass else 0
         score = (passed / total * 100.0) if total else 0.0
         return FinalScoreResult(score=score, metadata={"all_pass_tasks": passed})

@@ -31,6 +31,7 @@ from fastapi.encoders import jsonable_encoder
 
 from benchmark_service import submission_artifacts
 from benchmark_service.base import BenchmarkService
+from benchmark_service.context import sandbox_provider_scope
 from benchmark_service.sandbox import (
     ComposeSource,
     Resources,
@@ -492,6 +493,32 @@ async def evaluate_submission(
     labels: dict[str, str] | None = None,
 ) -> V1EvalResponse:
     """Evaluate one typed submission per the benchmark's eval mode."""
+    # Bound here rather than inside the stream: the stream is finalized through
+    # a task, which copies the context, and a token cannot be reset in a copy.
+    with sandbox_provider_scope(provider):
+        return await _evaluate_submission(
+            service=service,
+            run_id=run_id,
+            tenant=tenant,
+            submission=submission,
+            provider=provider,
+            evaluator_version=evaluator_version,
+            dataset=dataset,
+            labels=labels,
+        )
+
+
+async def _evaluate_submission(
+    *,
+    service: BenchmarkService,
+    run_id: str,
+    tenant: str,
+    submission: GradingSubmission,
+    provider: SandboxProvider | None,
+    evaluator_version: str | None,
+    dataset: str | None,
+    labels: dict[str, str] | None = None,
+) -> V1EvalResponse:
     if service.eval_mode == EvalMode.SANDBOX:
         if provider is None:
             raise ValueError("eval_mode == EvalMode.SANDBOX requires a sandbox provider")

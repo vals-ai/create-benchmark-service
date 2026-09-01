@@ -20,18 +20,11 @@ from benchmark_service.schemas import (
 
 
 def _score_item_resolved(score_item: object) -> bool:
+    """Deliberately reads one shape. Both scoring surfaces deliver the grader payload
+    verbatim, so a benchmark never has to ask which endpoint the caller used."""
     if not isinstance(score_item, dict):
         return False
-
-    item = cast(dict[str, object], score_item)
-    if "status" in item and "result" in item:
-        result = item.get("result")
-        if not isinstance(result, dict):
-            return False
-        nested_result = cast(dict[str, object], result)
-        return item.get("status") == "evaluated" and nested_result.get("resolved") is True
-
-    return item.get("resolved") is True
+    return cast(dict[str, object], score_item).get("resolved") is True
 
 
 class StubBenchmark(BenchmarkService):

@@ -282,7 +282,7 @@ def test_v1_evaluate_rejects_unauthorized_dataset_with_403(descope_client: TestC
     assert resp.status_code == 403
 
 
-def test_v1_score_passes_eval_envelopes_to_final_scoring(scoring_client: TestClient) -> None:
+def test_v1_score_hands_final_scoring_the_grader_payload(scoring_client: TestClient) -> None:
     resp = scoring_client.post(
         "/v1/score",
         json={
@@ -303,20 +303,46 @@ def test_v1_score_passes_eval_envelopes_to_final_scoring(scoring_client: TestCli
     assert body["metadata"] == {"total": 3, "resolved": 1}
     assert body["tasks_evaluated"] == ["task-1", "task-2", "task-3"]
     assert CapturingScoreBenchmark.captured_dataset == "default"
+    # The grader payload verbatim, exactly as /final-score/ delivers it. A task that reached
+    # no verdict is None, which every benchmark already reads as incomplete.
     assert CapturingScoreBenchmark.captured_evaluation_results == {
-        "task-1": {
-            "task_id": "task-1",
-            "status": "evaluated",
-            "result": {"resolved": True},
-        },
-        "task-2": {
-            "task_id": "task-2",
-            "status": "did_not_complete",
-            "result": None,
-            "error": "timed out",
-        },
+        "task-1": {"resolved": True},
+        "task-2": None,
         "task-3": None,
     }
+
+
+def test_both_scoring_surfaces_deliver_one_shape(scoring_client: TestClient) -> None:
+    """calculate_final_score is a single hook, so it must not receive two shapes.
+
+    It did: /v1/score wrapped the payload as {task_id, status, result} while /final-score/
+    forwarded it verbatim. Three benchmarks wrote private unwrappers and one did not, scoring
+    every packaged run zero while its evaluations passed.
+    """
+    payload = {"resolved": True, "detail": "compiles"}
+
+    v1 = scoring_client.post(
+        "/v1/score",
+        json={
+            "run_id": "r",
+            "dataset": "default",
+            "evaluation_results": {"task-1": {"status": "evaluated", "result": payload}},
+        },
+        headers={"x-descope-api-key": "key-acme"},
+    )
+    assert v1.status_code == 200
+    from_v1 = CapturingScoreBenchmark.captured_evaluation_results
+
+    legacy = scoring_client.post(
+        "/final-score/",
+        json={"dataset": "default", "evaluation_results": {"task-1": payload}},
+        headers={"x-descope-api-key": "key-acme"},
+    )
+    assert legacy.status_code == 200
+    from_legacy = CapturingScoreBenchmark.captured_evaluation_results
+
+    assert from_v1 == from_legacy == {"task-1": payload}
+    assert v1.json()["final_score"] == legacy.json()["final_score"] == 100.0
 
 
 def test_v1_score_rejects_unauthorized_dataset_with_403(descope_client: TestClient) -> None:

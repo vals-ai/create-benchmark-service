@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import inspect
 import logging
 import os
@@ -11,6 +12,7 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
+from urllib.request import getproxies
 from uuid import uuid4
 
 import httpx
@@ -98,6 +100,53 @@ def _tcp_keepalive_socket_options() -> list[tuple[int, int, int]]:
         options.append((socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _TCP_KEEPALIVE_PROBES))
 
     return options
+
+
+def _http_transport(proxy: str | None = None) -> httpx.AsyncHTTPTransport:
+    return httpx.AsyncHTTPTransport(
+        limits=httpx.Limits(max_connections=_HTTP_MAX_CONNECTIONS),
+        proxy=proxy,
+        socket_options=_tcp_keepalive_socket_options(),
+    )
+
+
+def _http_proxy_mounts() -> dict[str, httpx.AsyncHTTPTransport | None]:
+    proxy_info = getproxies()
+    no_proxy_hosts = [host.strip() for host in proxy_info.get("no", "").split(",")]
+    if "*" in no_proxy_hosts:
+        return {}
+
+    mounts: dict[str, httpx.AsyncHTTPTransport | None] = {}
+    for scheme in ("http", "https", "all"):
+        proxy = proxy_info.get(scheme)
+        if proxy:
+            proxy_url = proxy if "://" in proxy else f"http://{proxy}"
+            mounts[f"{scheme}://"] = _http_transport(proxy_url)
+
+    for hostname in no_proxy_hosts:
+        if not hostname:
+            continue
+        if "://" in hostname:
+            pattern = hostname
+        elif hostname.startswith("[") and "]" in hostname:
+            bracket_end = hostname.index("]")
+            try:
+                ipaddress.IPv6Address(hostname[1:bracket_end])
+            except ValueError:
+                pattern = f"all://*{hostname}"
+            else:
+                pattern = f"all://{hostname}"
+        else:
+            bare_hostname = hostname.split("/", maxsplit=1)[0]
+            try:
+                address = ipaddress.ip_address(bare_hostname)
+            except ValueError:
+                pattern = f"all://{hostname}" if hostname.lower() == "localhost" else f"all://*{hostname}"
+            else:
+                pattern = f"all://[{hostname}]" if address.version == 6 else f"all://{hostname}"
+        mounts[pattern] = None
+
+    return mounts
 
 
 def _default_ws_idle_timeout_s() -> float | None:
@@ -331,16 +380,13 @@ class BenchmarkServiceClient:
         idle_timeout = _default_ws_idle_timeout_s() if ws_idle_timeout_s is _UNSET_WS_IDLE_TIMEOUT else ws_idle_timeout_s
         self._ws_idle_timeout_s = idle_timeout if idle_timeout is None or idle_timeout > 0 else None
         self._sandbox_providers = {}
-        transport = httpx.AsyncHTTPTransport(
-            limits=httpx.Limits(max_connections=_HTTP_MAX_CONNECTIONS),
-            socket_options=_tcp_keepalive_socket_options(),
-        )
         self._http_client = httpx.AsyncClient(
             follow_redirects=True,
             timeout=timeout,
             headers=headers,
-            limits=httpx.Limits(max_connections=_HTTP_MAX_CONNECTIONS),
-            mounts={"all://": transport},
+            transport=_http_transport(),
+            mounts=_http_proxy_mounts(),
+            trust_env=False,
         )
 
     def get_sandbox_provider(self, provider: SandboxProviderConfig) -> SandboxProvider:

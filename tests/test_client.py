@@ -52,13 +52,66 @@ HEADERS = {"Authorization": "Bearer token"}
 DAYTONA_CONFIG = DaytonaProviderConfig(DAYTONA_API_KEY="key", DAYTONA_API_URL="url", DAYTONA_TARGET="target")
 
 
-async def test_http_client_enables_tcp_keepalive() -> None:
-    with patch("benchmark_service.client.httpx.AsyncHTTPTransport", wraps=httpx.AsyncHTTPTransport) as transport:
-        client = BenchmarkServiceClient(url=BASE_URL, headers=HEADERS)
+class RecordingHTTPTransport(httpx.AsyncBaseTransport):
+    def __init__(self, **options: Any) -> None:
+        self.options = options
+        self.requests: list[httpx.Request] = []
 
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        return httpx.Response(200, json={"status": "ok"}, request=request)
+
+
+@pytest.mark.parametrize(
+    ("url", "proxy_info", "expected_proxy"),
+    [
+        ("https://service.example.com", {}, None),
+        ("http://service.example.com", {"http": "proxy.example.com:8080"}, "http://proxy.example.com:8080"),
+        ("https://service.example.com", {"all": "proxy.example.com:8080"}, "http://proxy.example.com:8080"),
+        (
+            "https://service.example.com",
+            {"https": "http://https-proxy.example.com:8080", "all": "http://all-proxy.example.com:8080"},
+            "http://https-proxy.example.com:8080",
+        ),
+        (
+            "https://service.example.com",
+            {"https": "http://proxy.example.com:8080", "no": "service.example.com"},
+            None,
+        ),
+        ("https://service.example.com", {"all": "http://proxy.example.com:8080", "no": "*"}, None),
+        (
+            "https://[::1]:8000",
+            {"https": "http://proxy.example.com:8080", "no": "[::1]:8000"},
+            None,
+        ),
+    ],
+)
+async def test_http_client_keeps_proxy_routing_and_enables_tcp_keepalive(
+    url: str,
+    proxy_info: dict[str, str],
+    expected_proxy: str | None,
+) -> None:
+    transports: list[RecordingHTTPTransport] = []
+
+    def create_transport(**kwargs: Any) -> RecordingHTTPTransport:
+        transport = RecordingHTTPTransport(**kwargs)
+        transports.append(transport)
+        return transport
+
+    with (
+        patch("benchmark_service.client.getproxies", return_value=proxy_info),
+        patch("benchmark_service.client.httpx.AsyncHTTPTransport", side_effect=create_transport),
+    ):
+        client = BenchmarkServiceClient(url=url, headers=HEADERS)
+
+    response = await client.health_check()
     await client.close()
 
-    socket_options = transport.call_args.kwargs["socket_options"]
+    assert response.status == "ok"
+    selected_transport = next(transport for transport in transports if transport.requests)
+    assert selected_transport.requests[0].url == httpx.URL(f"{url}/health")
+    assert selected_transport.options["proxy"] == expected_proxy
+    socket_options = selected_transport.options["socket_options"]
     assert (socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1) in socket_options
 
     keepalive_idle = getattr(socket, "TCP_KEEPIDLE", getattr(socket, "TCP_KEEPALIVE", None))
@@ -68,7 +121,7 @@ async def test_http_client_enables_tcp_keepalive() -> None:
         assert (socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, _TCP_KEEPALIVE_INTERVAL_S) in socket_options
     if hasattr(socket, "TCP_KEEPCNT"):
         assert (socket.IPPROTO_TCP, socket.TCP_KEEPCNT, _TCP_KEEPALIVE_PROBES) in socket_options
-    assert transport.call_args.kwargs["limits"] == httpx.Limits(max_connections=_HTTP_MAX_CONNECTIONS)
+    assert selected_transport.options["limits"] == httpx.Limits(max_connections=_HTTP_MAX_CONNECTIONS)
 
 
 class RetryableSetupError(Exception):

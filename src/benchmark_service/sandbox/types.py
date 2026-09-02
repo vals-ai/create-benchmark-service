@@ -81,9 +81,9 @@ def _volume_subpath_fields(template: str) -> list[str]:
 
 
 class Resources(BaseModel):
-    vcpu: int = Field(description="Logical sandbox CPU count")
-    memory: int = Field(description="Sandbox memory")
-    disk: int = Field(description="Sandbox ephemeral disk")
+    vcpu: int = Field(gt=0, description="Logical sandbox CPU count")
+    memory: int = Field(gt=0, description="Sandbox memory")
+    disk: int = Field(gt=0, description="Sandbox ephemeral disk")
     gpu: int = Field(default=0, ge=0, description="Number of GPUs to allocate")
     gpu_type: str | None = Field(default=None, description="GPU type to allocate, e.g. 'H100' (provider-specific)")
 
@@ -297,6 +297,17 @@ class Sandbox(ABC):
 
 
 class SandboxProvider(ABC):
+    @property
+    def admission_pool_id(self) -> str | None:
+        return None
+
+    async def check_admission(
+        self,
+        source: SandboxSource,
+        resources: Resources,
+    ) -> bool:
+        return True
+
     @abstractmethod
     async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox: ...
 

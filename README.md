@@ -121,9 +121,16 @@ Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` 
 `sandbox_provider` is selected per setup/evaluate-instance request and carries the provider credentials. The tracker resolves it from AWS Secrets Manager (`sandbox_provider_secret_name`); the secret's keys are the config fields:
 
 ```json
-{"type": "daytona", "api_key": "...", "api_url": "...", "target": "..."}
+{"type": "daytona", "DAYTONA_API_KEY": "...", "DAYTONA_API_URL": "...", "DAYTONA_TARGET": "...", "DAYTONA_ORGANIZATION_ID": "..."}
 {"type": "modal", "MODAL_TOKEN_ID": "...", "MODAL_TOKEN_SECRET": "..."}
 ```
+
+When a setup or evaluate-instance request omits `sandbox_provider`, the Daytona header fallback reads
+`x-api-key`, `x-api-url`, and `x-target`, plus optional `x-organization-id`. The legacy
+`daytona_api_key`, `daytona_api_url`, and `daytona_target` aliases remain accepted.
+Providing the organization ID enables organization-scoped capacity admission; omitting it preserves direct creation.
+The API key must be able to read organization usage. When the target is a region name instead of its ID,
+the key must also be able to list regions so admission can resolve the canonical ID.
 
 Provider compatibility notes:
 
@@ -201,7 +208,8 @@ through bounded sandbox cleanup. The hook receives `TextGradingSubmission` or
 `text`/`artifact_reference` field, so it never has to infer the submission type.
 
 Daytona is the default grading provider and reads `DAYTONA_API_KEY`,
-`DAYTONA_API_URL`, and `DAYTONA_TARGET`. Set
+`DAYTONA_API_URL`, and `DAYTONA_TARGET`. Optional `DAYTONA_ORGANIZATION_ID`
+enables organization-scoped capacity admission. Set
 `GRADING_SANDBOX_PROVIDER=modal` to use Modal with `MODAL_TOKEN_ID` and
 `MODAL_TOKEN_SECRET`. Artifact-capable benchmarks also require
 `SUBMISSION_ARTIFACT_BUCKET` and `AWS_REGION`; missing server configuration
@@ -318,7 +326,7 @@ Pydantic models used across requests and responses:
 - **`SandboxSource`** — `ImageSource`, `SnapshotSource`, top-level Daytona-only `TargetedSnapshotSource`, or `ComposeSource` with an outer image/snapshot
 - **`EvalSandboxSpec`** — grading overrides whose optional `source` is an image or snapshot, never `ComposeSource`
 - **`GradingSubmission`** — typed `TextGradingSubmission` or `ArtifactGradingSubmission` passed only to the sandbox-grading hook
-- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; currently `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET)` or `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)`
+- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; currently `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET, DAYTONA_ORGANIZATION_ID=None)` or `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)`
 - **`Resources`** — `vcpu`, `memory`, `disk`, optional `gpu` (count, default 0) and `gpu_type` (requires `gpu >= 1`)
 - **`VolumeMount`** — named persistent volume, absolute `mount_path`, optional `read_only`, `create_if_missing`, and relative `subpath`; `{run_id}` in a subpath resolves from the sandbox's `run-id` or `run_id` label and fails when that label is absent
 - **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, optional `sandbox_provider` with Daytona header fallback, `dataset`

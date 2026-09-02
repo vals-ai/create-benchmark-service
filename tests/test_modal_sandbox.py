@@ -257,12 +257,13 @@ def test_modal_config_reads_secrets_manager_shape() -> None:
     config = sandbox_provider_config_from_mapping(
         {
             "type": "modal",
+            "runtime": "vm",
             "MODAL_TOKEN_ID": "id",
             "MODAL_TOKEN_SECRET": "secret",
             "MODAL_ENVIRONMENT": "legacy-ignored",
         }
     )
-    assert config == ModalProviderConfig(MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret")
+    assert config == ModalProviderConfig(runtime="vm", MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret")
 
 
 def test_command_merges_stderr_and_applies_timeout_inside_cwd() -> None:
@@ -610,10 +611,23 @@ async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> N
     assert captured["block_network"] is False
     assert captured["outbound_cidr_allowlist"] == ["0.0.0.0/0"]
     assert captured["outbound_domain_allowlist"] == ["*"]
-    # Nested-Docker capability is requested unconditionally, matching Daytona
-    # sandboxes which always support it.
     assert captured["experimental_options"] == {"enable_docker": True}
     assert captured["gpu"] is None
+
+
+async def test_create_sandbox_uses_vm_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return FakeInnerSandbox()
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    provider._config.runtime = "vm"  # pyright: ignore[reportPrivateUsage]
+
+    await provider.create_sandbox(_request())
+
+    assert captured["experimental_options"] == {"vm_runtime": True}
 
 
 async def test_create_sandbox_maps_gpu_request(monkeypatch: pytest.MonkeyPatch) -> None:

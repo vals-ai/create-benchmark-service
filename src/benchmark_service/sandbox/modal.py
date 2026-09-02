@@ -60,6 +60,7 @@ _PROVIDER_RETRY = retry(
 
 class ModalProviderConfig(BaseModel):
     type: Literal["modal"] = "modal"
+    runtime: Literal["gvisor", "vm"] = "gvisor"
     MODAL_TOKEN_ID: str
     MODAL_TOKEN_SECRET: str
 
@@ -77,7 +78,13 @@ class ModalProviderConfig(BaseModel):
         ]
         if missing:
             raise MissingSandboxConfigError(f"Missing required environment variables: {', '.join(missing)}")
-        return cls(MODAL_TOKEN_ID=token_id, MODAL_TOKEN_SECRET=token_secret)  # type: ignore[arg-type]
+        return cls.model_validate(
+            {
+                "runtime": os.environ.get("MODAL_RUNTIME", "gvisor"),
+                "MODAL_TOKEN_ID": token_id,
+                "MODAL_TOKEN_SECRET": token_secret,
+            }
+        )
 
     def create_provider(self) -> SandboxProvider:
         return ModalSandboxProvider(self)
@@ -508,8 +515,9 @@ class ModalSandboxProvider(SandboxProvider):
             "outbound_cidr_allowlist": list(_ALLOW_ALL_CIDRS) if allow_all_egress else None,
             "outbound_domain_allowlist": list(_ALLOW_ALL_DOMAINS) if allow_all_egress else None,
             "client": client,
-            # Nested Docker always on, matching Daytona; no disk parameter exists.
-            "experimental_options": {"enable_docker": True},
+            "experimental_options": (
+                {"vm_runtime": True} if self._config.runtime == "vm" else {"enable_docker": True}
+            ),
         }
         if request.volumes:
             create_kwargs["volumes"] = self._resolve_volumes(request.volumes, client, request.labels)

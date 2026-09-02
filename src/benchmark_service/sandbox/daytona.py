@@ -954,17 +954,6 @@ class DaytonaSandboxProvider(SandboxProvider):
                     usage.max_memory_per_sandbox,
                     usage.max_disk_per_sandbox,
                 )
-                if any(limit is None for limit in per_sandbox_limit):
-                    organization = await organizations_api.get_organization(self._organization_id)
-                    organization_limit = (
-                        organization.max_cpu_per_sandbox,
-                        organization.max_memory_per_sandbox,
-                        organization.max_disk_per_sandbox,
-                    )
-                    per_sandbox_limit = tuple(
-                        region_limit if region_limit is not None else fallback
-                        for region_limit, fallback in zip(per_sandbox_limit, organization_limit, strict=True)
-                    )
         except (OpenApiException, ClientResponseError) as exc:
             status = cast(int | None, getattr(exc, "status", None))
             if status in (408, 429) or (status is not None and 500 <= status <= 599):

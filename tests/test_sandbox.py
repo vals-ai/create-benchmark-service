@@ -1195,7 +1195,6 @@ def _admission_provider(
     monkeypatch: pytest.MonkeyPatch,
     result: Exception | SimpleNamespace,
     organization_id: str | None = "org-1",
-    organization_limits: tuple[int, int, int] | Exception = (8, 32, 100),
     regions: Exception | list[SimpleNamespace] | None = None,
     region_requests: list[str] | None = None,
 ) -> tuple[DaytonaSandboxProvider, list[str]]:
@@ -1208,13 +1207,7 @@ def _admission_provider(
         return result
 
     async def get_organization(_organization: str) -> SimpleNamespace:
-        if isinstance(organization_limits, Exception):
-            raise organization_limits
-        return SimpleNamespace(
-            max_cpu_per_sandbox=organization_limits[0],
-            max_memory_per_sandbox=organization_limits[1],
-            max_disk_per_sandbox=organization_limits[2],
-        )
+        raise AssertionError("organization details should not be fetched for admission")
 
     async def list_available_regions() -> list[SimpleNamespace]:
         if region_requests is not None:
@@ -1303,7 +1296,6 @@ async def test_daytona_admission_accepts_target_id_without_region_lookup(monkeyp
         (None, _ADMISSION_IMAGE, _ADMISSION_RESOURCES, {}, True, False),
         ("org-1", SnapshotSource(snapshot="snap"), _ADMISSION_RESOURCES, {}, True, False),
         ("org-1", _ADMISSION_IMAGE, Resources(vcpu=2, memory=4, disk=10, gpu=1), {}, True, False),
-        ("org-1", _ADMISSION_IMAGE, _ADMISSION_RESOURCES, {}, True, True),
         ("org-1", ComposeSource(outer=_ADMISSION_IMAGE), Resources(vcpu=7, memory=4, disk=10), {}, False, True),
         ("org-1", _ADMISSION_IMAGE, _ADMISSION_RESOURCES, {"current_memory_usage": 29}, False, True),
         ("org-1", _ADMISSION_IMAGE, Resources(vcpu=9, memory=4, disk=10), {}, SandboxError, True),
@@ -1352,26 +1344,16 @@ def test_resources_require_positive_capacity(updates: dict[str, int]) -> None:
         Resources.model_validate({"vcpu": 2, "memory": 4, "disk": 10} | updates)
 
 
-async def test_daytona_admission_uses_organization_limits_only_for_null_region_limits(
+async def test_daytona_admission_treats_null_region_limits_as_unknown_without_organization_lookup(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    provider, _ = _admission_provider(
+    provider, requested = _admission_provider(
         monkeypatch,
         SimpleNamespace(region_usage=[_usage_row()]),
-        organization_limits=(1, 32, 100),
     )
 
-    with pytest.raises(SandboxError):
-        await provider.check_admission(_ADMISSION_IMAGE, _ADMISSION_RESOURCES)
-
-    provider, _ = _admission_provider(
-        monkeypatch,
-        SimpleNamespace(
-            region_usage=[_usage_row(max_cpu_per_sandbox=8, max_memory_per_sandbox=32, max_disk_per_sandbox=100)]
-        ),
-        organization_limits=AssertionError("organization limits should not be fetched"),
-    )
     assert await provider.check_admission(_ADMISSION_IMAGE, _ADMISSION_RESOURCES)
+    assert requested == ["org-1"]
 
 
 @pytest.mark.parametrize(

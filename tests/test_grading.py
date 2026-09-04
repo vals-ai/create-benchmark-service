@@ -60,7 +60,7 @@ from benchmark_service.submission_artifacts import (
     SubmissionArtifactNotFound,
     SubmissionArtifactReference,
 )
-from benchmark_service.v1_schemas import V1EvalRequest, V1EvalStatus, V1Payload, V1PayloadType
+from benchmark_service.v1_schemas import V1EvalRequest, V1EvalResponse, V1EvalStatus, V1Payload, V1PayloadType
 from tests.conftest import StubBenchmark
 
 
@@ -1545,8 +1545,17 @@ async def test_v1_evaluate_orders_reservation_quota_queue_and_artifact_preflight
             queued_evaluation.cancel()
             await asyncio.gather(queued_evaluation, return_exceptions=True)
         first_response = await first_evaluation
-    assert first_response.status == V1EvalStatus.EVALUATED
-    assert first_response.result == {"resolved": True, "weighted_pass_percentage": 100.0}
+    messages: list[dict[str, Any]] = []
+
+    async def send(message: dict[str, Any]) -> None:
+        messages.append(message)
+
+    await first_response.stream_response(send)
+    response = V1EvalResponse.model_validate_json(
+        b"".join(message.get("body", b"") for message in messages)
+    )
+    assert response.status == V1EvalStatus.EVALUATED
+    assert response.result == {"resolved": True, "weighted_pass_percentage": 100.0}
 
 
 @pytest.mark.parametrize("operation", ["stat", "download", "materialize"])

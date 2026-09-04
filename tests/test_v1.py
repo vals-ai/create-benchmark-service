@@ -1,5 +1,6 @@
 """Tests for the lab-facing /v1/ eval API surface."""
 
+import asyncio
 import json
 from collections.abc import Generator
 from typing import Any
@@ -8,9 +9,11 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, ValidationError
+from starlette.types import Message
 
 from benchmark_service import auth as auth_module
-from benchmark_service.app import BenchmarkServiceApp
+from benchmark_service import app as app_module
+from benchmark_service.app import BenchmarkServiceApp, _V1EvaluateResponse  # pyright: ignore[reportPrivateUsage]
 from benchmark_service.auth import clear_allowlist_cache, clear_auth_cache
 from benchmark_service.schemas import FinalScoreResult
 from benchmark_service.v1_schemas import (
@@ -150,6 +153,79 @@ def test_eval_response_round_trips_evaluated_status() -> None:
     rehydrated = V1EvalResponse.model_validate(raw)
     assert rehydrated == resp
     assert raw["status"] == V1EvalStatus.EVALUATED
+
+
+async def test_v1_evaluate_response_sends_heartbeats_before_the_final_json(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    release = asyncio.Event()
+    heartbeat_sent = asyncio.Event()
+    cleaned_up = asyncio.Event()
+    messages: list[Message] = []
+
+    async def evaluate() -> V1EvalResponse:
+        await release.wait()
+        return V1EvalResponse(
+            run_id="run-1",
+            task_id="task-1",
+            status=V1EvalStatus.EVALUATED,
+            result={"score": 1.0},
+        )
+
+    async def cleanup() -> None:
+        cleaned_up.set()
+
+    async def send(message: Message) -> None:
+        messages.append(message)
+        if message.get("body") == b"\n":
+            heartbeat_sent.set()
+
+    monkeypatch.setattr(app_module, "_V1_EVALUATE_HEARTBEAT_INTERVAL_S", 0.01)
+    response = _V1EvaluateResponse(evaluate, cleanup)
+    stream = asyncio.create_task(response.stream_response(send))  # pyright: ignore[reportPrivateUsage]
+
+    await asyncio.wait_for(heartbeat_sent.wait(), timeout=1)
+    assert not stream.done()
+    release.set()
+    await asyncio.wait_for(stream, timeout=1)
+
+    body = b"".join(message.get("body", b"") for message in messages)
+    result = V1EvalResponse.model_validate_json(body)
+    assert result.status == V1EvalStatus.EVALUATED
+    assert result.result == {"score": 1.0}
+    assert cleaned_up.is_set()
+
+
+async def test_v1_evaluate_response_cancels_grading_when_streaming_stops() -> None:
+    evaluation_started = asyncio.Event()
+    evaluation_cancelled = asyncio.Event()
+    cleaned_up = asyncio.Event()
+
+    async def evaluate() -> V1EvalResponse:
+        evaluation_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            evaluation_cancelled.set()
+            raise
+        raise AssertionError("unreachable")
+
+    async def cleanup() -> None:
+        cleaned_up.set()
+
+    async def send(_message: Message) -> None:
+        pass
+
+    response = _V1EvaluateResponse(evaluate, cleanup)
+    stream = asyncio.create_task(response.stream_response(send))  # pyright: ignore[reportPrivateUsage]
+    await asyncio.wait_for(evaluation_started.wait(), timeout=1)
+
+    stream.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await stream
+
+    assert evaluation_cancelled.is_set()
+    assert cleaned_up.is_set()
 
 
 def test_score_request_carries_run_id_and_nullable_results() -> None:

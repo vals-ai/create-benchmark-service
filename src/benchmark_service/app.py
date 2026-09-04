@@ -7,13 +7,14 @@ import os
 import re
 import traceback
 from collections import Counter
-from collections.abc import AsyncGenerator
-from contextlib import aclosing, asynccontextmanager, suppress
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine
+from contextlib import AsyncExitStack, aclosing, asynccontextmanager, suppress
 from typing import Any, cast
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.encoders import jsonable_encoder
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.types import Send
 from starlette.websockets import WebSocketDisconnect
 from uvicorn.protocols.utils import ClientDisconnected
 from websockets.exceptions import ConnectionClosed
@@ -78,6 +79,52 @@ from benchmark_service.v1_schemas import (
 logger = logging.getLogger(__name__)
 
 _EVALUATION_QUOTA_UNAVAILABLE_DETAIL = "Evaluation quota enforcement is temporarily unavailable; try again later."
+_V1_EVALUATE_HEARTBEAT_INTERVAL_S = 30.0
+
+
+class _V1EvaluateResponse(StreamingResponse):
+    """Stream JSON whitespace while a grading response is being prepared."""
+
+    def __init__(
+        self,
+        evaluate: Callable[[], Coroutine[Any, Any, V1EvalResponse]],
+        cleanup: Callable[[], Awaitable[None]],
+    ) -> None:
+        self._evaluate = evaluate
+        self._cleanup = cleanup
+        self._evaluation_task: asyncio.Task[V1EvalResponse] | None = None
+        self._cleaned_up = False
+        super().__init__(self._body(), media_type="application/json")
+
+    async def _body(self) -> AsyncGenerator[bytes, None]:
+        self._evaluation_task = asyncio.create_task(self._evaluate())
+        try:
+            while True:
+                done, _ = await asyncio.wait(
+                    {self._evaluation_task},
+                    timeout=_V1_EVALUATE_HEARTBEAT_INTERVAL_S,
+                )
+                if done:
+                    response = await self._evaluation_task
+                    await self._run_cleanup()
+                    yield response.model_dump_json().encode()
+                    return
+                yield b"\n"
+        finally:
+            if not self._evaluation_task.done():
+                self._evaluation_task.cancel()
+                await asyncio.gather(self._evaluation_task, return_exceptions=True)
+
+    async def stream_response(self, send: Send) -> None:
+        try:
+            await super().stream_response(send)
+        finally:
+            await self._run_cleanup()
+
+    async def _run_cleanup(self) -> None:
+        if not self._cleaned_up:
+            await self._cleanup()
+            self._cleaned_up = True
 
 
 async def send_json_if_connected(websocket: WebSocket, payload: dict[str, Any]) -> bool:
@@ -639,9 +686,10 @@ class BenchmarkServiceApp(FastAPI):
             with suppress(RuntimeError):
                 await websocket.close()
 
-    async def _v1_evaluate(self, request: Request, body: V1EvalRequest) -> V1EvalResponse:
+    async def _v1_evaluate(self, request: Request, body: V1EvalRequest) -> Response:
         tenant = cast(str, request.state.tenant)
         _require_descope_tenant(tenant)
+        trial_tenant = _is_trial_tenant(tenant)
         if not await self.service.check_dataset_access(tenant, body.dataset):
             raise HTTPException(status_code=403, detail="Dataset not allowed")
         try:
@@ -691,102 +739,118 @@ class BenchmarkServiceApp(FastAPI):
                         detail="Submission artifact not found for this evaluation.",
                     ) from exc
 
+            resources = AsyncExitStack()
             try:
-                async with self._grading_admission.reserve((tenant, body.run_id, body.task_id)):
-                    await self._consume_evaluation_quota(tenant)
-                    async with self._grading_admission.acquire_active_slot():
-                        artifact_reference: submission_artifacts.SubmissionArtifactReference | None = None
-                        submission: GradingSubmission
-                        if body.payload.type == V1PayloadType.ARTIFACT:
-                            try:
-                                artifact_reference = await submission_artifacts.stat(body.payload.data, tenant=tenant)
-                            except submission_artifacts.SubmissionArtifactNotFound as exc:
-                                raise HTTPException(status_code=404, detail=str(exc)) from exc
-                            except submission_artifacts.SubmissionArtifactTooLarge as exc:
-                                raise HTTPException(status_code=413, detail=str(exc)) from exc
-                            submission = ArtifactGradingSubmission(
-                                task_id=body.task_id,
-                                schema_id=body.payload.schema_id,
-                                artifact_reference=artifact_reference,
-                                sandbox_path=SUBMISSION_ARTIFACT_SANDBOX_PATH,
-                            )
-                        else:
-                            submission = TextGradingSubmission(
-                                task_id=body.task_id,
-                                schema_id=body.payload.schema_id,
-                                text=body.payload.data,
-                            )
+                await resources.enter_async_context(
+                    self._grading_admission.reserve((tenant, body.run_id, body.task_id))
+                )
+                await self._consume_evaluation_quota(tenant)
+                await resources.enter_async_context(self._grading_admission.acquire_active_slot())
 
-                        if self.service.eval_mode == EvalMode.SANDBOX:
-                            provider = self._grading_provider
-                            if provider is None:
-                                raise HTTPException(
-                                    status_code=503,
-                                    detail="Grading sandbox is not configured; contact the benchmark service owner.",
-                                )
-                            response = await evaluate_submission(
-                                service=self.service,
-                                run_id=body.run_id,
-                                tenant=tenant,
-                                submission=submission,
-                                provider=provider,
-                                evaluator_version=self._service_version,
-                                dataset=body.dataset,
-                            )
-                        elif self.service.eval_mode == EvalMode.IN_PROCESS_ARTIFACT:
-                            if artifact_reference is None:
-                                raise RuntimeError("in-process artifact evaluation requires an admitted artifact")
-                            try:
-                                artifact = await submission_artifacts.download(artifact_reference, tenant=tenant)
-                            except submission_artifacts.SubmissionArtifactNotFound as exc:
-                                raise HTTPException(status_code=404, detail=str(exc)) from exc
-                            except submission_artifacts.SubmissionArtifactChanged as exc:
-                                raise HTTPException(status_code=409, detail=str(exc)) from exc
-                            except submission_artifacts.SubmissionArtifactTooLarge as exc:
-                                raise HTTPException(status_code=413, detail=str(exc)) from exc
-                            response = await collapse_stream(
-                                self.service.evaluate_artifact(
-                                    run_id=body.run_id,
-                                    task_id=body.task_id,
-                                    schema_id=body.payload.schema_id,
-                                    artifact=artifact,
-                                    dataset=body.dataset,
-                                ),
+                artifact_reference: submission_artifacts.SubmissionArtifactReference | None = None
+                submission: GradingSubmission
+                if body.payload.type == V1PayloadType.ARTIFACT:
+                    try:
+                        artifact_reference = await submission_artifacts.stat(body.payload.data, tenant=tenant)
+                    except submission_artifacts.SubmissionArtifactNotFound as exc:
+                        raise HTTPException(status_code=404, detail=str(exc)) from exc
+                    except submission_artifacts.SubmissionArtifactTooLarge as exc:
+                        raise HTTPException(status_code=413, detail=str(exc)) from exc
+                    submission = ArtifactGradingSubmission(
+                        task_id=body.task_id,
+                        schema_id=body.payload.schema_id,
+                        artifact_reference=artifact_reference,
+                        sandbox_path=SUBMISSION_ARTIFACT_SANDBOX_PATH,
+                    )
+                else:
+                    submission = TextGradingSubmission(
+                        task_id=body.task_id,
+                        schema_id=body.payload.schema_id,
+                        text=body.payload.data,
+                    )
+
+                if self.service.eval_mode == EvalMode.SANDBOX:
+                    provider = self._grading_provider
+                    if provider is None:
+                        raise HTTPException(
+                            status_code=503,
+                            detail="Grading sandbox is not configured; contact the benchmark service owner.",
+                        )
+
+                    async def evaluate() -> V1EvalResponse:
+                        return await evaluate_submission(
+                            service=self.service,
+                            run_id=body.run_id,
+                            tenant=tenant,
+                            submission=submission,
+                            provider=provider,
+                            evaluator_version=self._service_version,
+                            dataset=body.dataset,
+                        )
+
+                elif self.service.eval_mode == EvalMode.IN_PROCESS_ARTIFACT:
+                    if artifact_reference is None:
+                        raise RuntimeError("in-process artifact evaluation requires an admitted artifact")
+                    try:
+                        artifact = await submission_artifacts.download(artifact_reference, tenant=tenant)
+                    except submission_artifacts.SubmissionArtifactNotFound as exc:
+                        raise HTTPException(status_code=404, detail=str(exc)) from exc
+                    except submission_artifacts.SubmissionArtifactChanged as exc:
+                        raise HTTPException(status_code=409, detail=str(exc)) from exc
+                    except submission_artifacts.SubmissionArtifactTooLarge as exc:
+                        raise HTTPException(status_code=413, detail=str(exc)) from exc
+
+                    async def evaluate() -> V1EvalResponse:
+                        return await collapse_stream(
+                            self.service.evaluate_artifact(
                                 run_id=body.run_id,
                                 task_id=body.task_id,
-                                evaluator_version=self._service_version,
-                            )
-                        else:
-                            if artifact_reference is None:
-                                raise RuntimeError("materialized artifact evaluation requires an admitted artifact")
-                            try:
-                                async with submission_artifacts.materialize(
-                                    artifact_reference,
-                                    tenant=tenant,
-                                ) as artifact:
-                                    response = await collapse_stream(
-                                        self.service.evaluate_materialized_artifact(
-                                            tenant=tenant,
-                                            run_id=body.run_id,
-                                            task_id=body.task_id,
-                                            schema_id=body.payload.schema_id,
-                                            artifact=artifact,
-                                            dataset=body.dataset,
-                                        ),
-                                        run_id=body.run_id,
-                                        task_id=body.task_id,
-                                        evaluator_version=self._service_version,
-                                    )
-                            except submission_artifacts.SubmissionArtifactNotFound as exc:
-                                raise HTTPException(status_code=404, detail=str(exc)) from exc
-                            except submission_artifacts.SubmissionArtifactChanged as exc:
-                                raise HTTPException(status_code=409, detail=str(exc)) from exc
-                            except submission_artifacts.SubmissionArtifactTooLarge as exc:
-                                raise HTTPException(status_code=413, detail=str(exc)) from exc
+                                schema_id=body.payload.schema_id,
+                                artifact=artifact,
+                                dataset=body.dataset,
+                            ),
+                            run_id=body.run_id,
+                            task_id=body.task_id,
+                            evaluator_version=self._service_version,
+                        )
+
+                else:
+                    if artifact_reference is None:
+                        raise RuntimeError("materialized artifact evaluation requires an admitted artifact")
+                    try:
+                        artifact = await resources.enter_async_context(
+                            submission_artifacts.materialize(artifact_reference, tenant=tenant)
+                        )
+                    except submission_artifacts.SubmissionArtifactNotFound as exc:
+                        raise HTTPException(status_code=404, detail=str(exc)) from exc
+                    except submission_artifacts.SubmissionArtifactChanged as exc:
+                        raise HTTPException(status_code=409, detail=str(exc)) from exc
+                    except submission_artifacts.SubmissionArtifactTooLarge as exc:
+                        raise HTTPException(status_code=413, detail=str(exc)) from exc
+
+                    async def evaluate() -> V1EvalResponse:
+                        return await collapse_stream(
+                            self.service.evaluate_materialized_artifact(
+                                tenant=tenant,
+                                run_id=body.run_id,
+                                task_id=body.task_id,
+                                schema_id=body.payload.schema_id,
+                                artifact=artifact,
+                                dataset=body.dataset,
+                            ),
+                            run_id=body.run_id,
+                            task_id=body.task_id,
+                            evaluator_version=self._service_version,
+                        )
             except _DuplicateGradingRequest as exc:
+                await resources.aclose()
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
             except _GradingCapacityExceeded as exc:
+                await resources.aclose()
                 raise HTTPException(status_code=429, detail=str(exc)) from exc
+            except BaseException:
+                await resources.aclose()
+                raise
         else:
             if body.payload.type == V1PayloadType.ARTIFACT:
                 raise HTTPException(
@@ -799,18 +863,36 @@ class BenchmarkServiceApp(FastAPI):
                 text=body.payload.data,
             )
             await self._consume_evaluation_quota(tenant)
-            response = await evaluate_submission(
-                service=self.service,
-                run_id=body.run_id,
-                tenant=tenant,
-                submission=submission,
-                provider=None,
-                evaluator_version=self._service_version,
-                dataset=body.dataset,
-            )
-        if _is_trial_tenant(tenant):
-            return sanitize_v1_eval_response(response, self.service.project_trial_result)
-        return response
+            resources = AsyncExitStack()
+
+            async def evaluate() -> V1EvalResponse:
+                return await evaluate_submission(
+                    service=self.service,
+                    run_id=body.run_id,
+                    tenant=tenant,
+                    submission=submission,
+                    provider=None,
+                    evaluator_version=self._service_version,
+                    dataset=body.dataset,
+                )
+
+        async def evaluate_and_release() -> V1EvalResponse:
+            try:
+                response = await evaluate()
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("evaluation failed after the response started")
+                response = V1EvalResponse(
+                    run_id=body.run_id,
+                    task_id=body.task_id,
+                    status=V1EvalStatus.ERROR,
+                    evaluator_version=self._service_version,
+                    errors=[str(exc)],
+                )
+            if trial_tenant:
+                return sanitize_v1_eval_response(response, self.service.project_trial_result)
+            return response
+
+        return _V1EvaluateResponse(evaluate_and_release, resources.aclose)
 
     async def _v1_submission_upload_url(self, request: Request, body: V1UploadUrlRequest) -> V1UploadUrlResponse:
         tenant = cast(str, request.state.tenant)

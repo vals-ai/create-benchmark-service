@@ -112,6 +112,14 @@ _DELETE_CONFLICT_MESSAGES = ("state change in progress", "modified by another op
 _REMOVED_SANDBOX_CLIENT_STATUSES = (404, 502)
 _RETRYABLE_PROVIDER_STATUSES = (408, 429, 500, 502, 503, 504)
 _FAILED_EXECUTE_COMMAND_PREFIX = "failed to execute command:"
+# Daytona's runner responds with a generic 400 ("bad request") when the container backing the
+# sandbox is already gone -- the toolbox cannot route to a container that no longer has an IP.
+# There is no HTTP 404 or NOT_FOUND error_code on this path, so match by message text and treat
+# it as a not-found: retrying exec against a container with no IP will never succeed.
+_REMOVED_CONTAINER_MESSAGES = (
+    "failed to resolve container ip",
+    "no ip address found",
+)
 _VOLUME_READY_POLL_SECONDS = 0.5
 _VOLUME_READY_TIMEOUT_SECONDS = 30.0
 _VOLUME_PENDING_STATES = frozenset({"creating", "pending_create"})
@@ -307,6 +315,8 @@ def _is_delete_conflict(exc: DaytonaConflictError) -> bool:
 def _is_not_found_error(exc: DaytonaError | ClientResponseError) -> bool:
     if isinstance(exc, ClientResponseError):
         return exc.status in _REMOVED_SANDBOX_CLIENT_STATUSES
+    if _message_contains(exc, _REMOVED_CONTAINER_MESSAGES):
+        return True
     return (
         isinstance(exc, DaytonaNotFoundError)
         or exc.status_code == 404

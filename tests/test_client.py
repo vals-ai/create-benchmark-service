@@ -1267,7 +1267,6 @@ async def test_client_v1_evaluate_posts_payload_and_returns_v1_eval_response(
     }
     assert called_kwargs["json"]["dataset"] == "validation"
     assert called_kwargs["json"]["versions"] == {"runner": "benchmark-orchestrator-1.2.3"}
-    assert called_kwargs["timeout"] == 3600.0
 
 
 async def test_client_v1_upload_url_posts_artifact_identity(

@@ -74,8 +74,6 @@ _WS_PING_TIMEOUT_S = None
 # indistinguishable from a dead one from the client side.
 _WS_IDLE_TIMEOUT_ENV = "BENCHMARK_SERVICE_WS_IDLE_TIMEOUT_S"
 _DEFAULT_WS_IDLE_TIMEOUT_S = 3600.0
-# V1 evaluation can run browser workflows for up to one hour.
-_V1_EVALUATE_TIMEOUT_S = 3600.0
 # Diagnostics must not delay the idle failure while the retry-decorated health request backs off.
 _HEALTH_PROBE_TIMEOUT_S = 5.0
 # Distinguishes "caller passed None to disable" from "caller said nothing".
@@ -814,7 +812,6 @@ class BenchmarkServiceClient:
         response = await self._http_client.post(
             f"{self._url}/v1/evaluate",
             json=request.model_dump(mode="json", by_alias=True, exclude_none=True),
-            timeout=max(self._timeout, _V1_EVALUATE_TIMEOUT_S),
         )
 
         if response.status_code == 401:

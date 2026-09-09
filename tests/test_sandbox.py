@@ -798,6 +798,11 @@ class InnerSandbox:
     id = "sandbox-id"
     name = "sandbox-name"
     state = SandboxState.STARTED
+    runner_id: str | None = "runner-1"
+    daemon_version: str | None = "daemon-1"
+    warm_pool_id: str | None = None
+    snapshot: str | None = "snap-name"
+    target: str | None = "us-west-3"
 
     def __init__(self) -> None:
         self.labels: dict[str, str] = {}
@@ -1515,13 +1520,20 @@ def test_sandbox_metadata_defaults_are_optional_for_existing_subclasses() -> Non
 
 def test_compose_sandbox_delegates_inventory_metadata() -> None:
     created_at = datetime(2026, 7, 24, 12, 30, tzinfo=UTC)
-    outer = RecordingSandbox()
+
+    class MetadataSandbox(RecordingSandbox):
+        @property
+        def provider_metadata(self) -> dict[str, str]:
+            return {"runner_id": "runner-1"}
+
+    outer = MetadataSandbox()
     outer.labels = {"run_id": "r1"}
     outer.created_at = created_at
     sandbox = ComposeSandbox(outer, ComposeSource(outer=ImageSource(image="docker:28.3.3-dind")))
 
     assert sandbox.labels == {"run_id": "r1"}
     assert sandbox.created_at == created_at
+    assert sandbox.provider_metadata == {"runner_id": "runner-1"}
 
 
 async def test_compose_sandbox_routes_operations_through_main_service() -> None:
@@ -2938,6 +2950,17 @@ def test_daytona_sandbox_exposes_inventory_metadata() -> None:
 
     assert sandbox.labels == {"Benchmark": "vcb", "clean-up": "true"}
     assert sandbox.created_at == datetime(2026, 7, 24, 12, 30, tzinfo=UTC)
+
+
+def test_daytona_sandbox_reports_provider_metadata() -> None:
+    inner = InnerSandbox()
+
+    assert DaytonaSandbox(cast(Any, inner)).provider_metadata == {
+        "runner_id": "runner-1",
+        "daemon_version": "daemon-1",
+        "snapshot": "snap-name",
+        "target": "us-west-3",
+    }
 
 
 def test_daytona_sandbox_allows_missing_creation_timestamp() -> None:

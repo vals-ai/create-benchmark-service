@@ -275,6 +275,11 @@ class Sandbox(ABC):
     def created_at(self, value: datetime | None) -> None:
         self._created_at = value
 
+    @property
+    def provider_metadata(self) -> Mapping[str, str]:
+        """Provider-reported attributes (runner id, image revision, ...) useful for debugging allocation."""
+        return {}
+
     @abstractmethod
     async def exec(
         self,

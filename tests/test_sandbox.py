@@ -1585,7 +1585,7 @@ async def test_compose_sandbox_routes_operations_through_main_service() -> None:
     assert outer.exec_commands[1] == (
         "MAIN_IMAGE_NAME=task docker compose -p task -f /harbor/compose.yaml "
         f"exec {_COMPOSE_EXEC_ENV_ARGS} "
-        "-T -w /workspace main sh -lc 'echo ok'"
+        "-T -e AGENT_SECRET -w /workspace main sh -lc 'echo ok'"
     )
     assert outer.command_env_vars == [{"AGENT_SECRET": secret}]
     assert secret not in outer.exec_commands[1]
@@ -1632,6 +1632,21 @@ async def test_compose_command_rejects_invalid_environment_names_before_outer_ca
         _ = [chunk async for chunk in sandbox.command("true", env_vars={"BAD-NAME": "secret"})]
 
     assert outer.exec_commands == []
+
+
+async def test_compose_command_env_overrides_survive_outer_shell_filter() -> None:
+    """An explicit HOME/PATH/DOCKER_* env override is named on `exec -e` so the identity filter cannot drop it."""
+    outer = RecordingSandbox()
+    sandbox = ComposeSandbox(outer, ComposeSource(outer=ImageSource(image="docker:28.3.3-dind")))
+
+    _ = [
+        chunk
+        async for chunk in sandbox.command(
+            "true", env_vars={"HOME": "/home/agent", "PATH": "/opt/bin", "DOCKER_HOST": "unix:///run/x.sock"}
+        )
+    ]
+
+    assert outer.exec_commands[0].endswith("-T -e HOME -e PATH -e DOCKER_HOST main sh -lc true")
 
 
 def test_compose_exec_forwards_secrets_but_not_outer_shell_identity() -> None:

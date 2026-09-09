@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import shlex
 import uuid
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Iterable, Mapping
 
 from benchmark_service.sandbox.types import (
     ComposeSource,
@@ -63,8 +63,10 @@ class ComposeSandbox(Sandbox):
     def _compose_exec_command(self, parts: list[str]) -> str:
         return f"{self._compose_command_prefix} exec {_COMPOSE_EXEC_ENV_ARGS} {shlex.join(parts)}"
 
-    def _exec_command(self, command: str, cwd: str | None) -> str:
+    def _exec_command(self, command: str, cwd: str | None, env_names: Iterable[str] = ()) -> str:
         parts = ["-T"]
+        for name in env_names:
+            parts.extend(["-e", name])
         if cwd:
             parts.extend(["-w", cwd])
         parts.extend([self._service, "sh", "-lc", command])
@@ -95,7 +97,8 @@ class ComposeSandbox(Sandbox):
         env_vars: Mapping[str, str] | None = None,
     ) -> AsyncGenerator[str, None]:
         env = validate_command_env(env_vars) if env_vars is not None else None
-        async for chunk in self._outer.command(self._exec_command(command, cwd), timeout=timeout, env_vars=env):
+        inner = self._exec_command(command, cwd, env or ())
+        async for chunk in self._outer.command(inner, timeout=timeout, env_vars=env):
             yield chunk
 
     async def upload_file(self, remote_path: str, content: bytes) -> None:

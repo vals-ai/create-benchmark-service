@@ -798,6 +798,11 @@ class InnerSandbox:
     id = "sandbox-id"
     name = "sandbox-name"
     state = SandboxState.STARTED
+    runner_id: str | None = "runner-1"
+    daemon_version: str | None = "daemon-1"
+    warm_pool_id: str | None = None
+    snapshot: str | None = "snap-name"
+    target: str | None = "us-west-3"
 
     def __init__(self) -> None:
         self.labels: dict[str, str] = {}
@@ -2938,6 +2943,17 @@ def test_daytona_sandbox_exposes_inventory_metadata() -> None:
 
     assert sandbox.labels == {"Benchmark": "vcb", "clean-up": "true"}
     assert sandbox.created_at == datetime(2026, 7, 24, 12, 30, tzinfo=UTC)
+
+
+def test_daytona_sandbox_reports_provider_metadata() -> None:
+    inner = InnerSandbox()
+
+    assert DaytonaSandbox(cast(Any, inner)).provider_metadata == {
+        "runner_id": "runner-1",
+        "daemon_version": "daemon-1",
+        "snapshot": "snap-name",
+        "target": "us-west-3",
+    }
 
 
 def test_daytona_sandbox_allows_missing_creation_timestamp() -> None:

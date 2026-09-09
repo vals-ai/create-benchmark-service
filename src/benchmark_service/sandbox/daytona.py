@@ -503,6 +503,17 @@ class DaytonaSandbox(Sandbox):
     def state(self) -> str:
         return str(self._sandbox.state)
 
+    @property
+    def provider_metadata(self) -> Mapping[str, str]:
+        metadata = {
+            "runner_id": self._sandbox.runner_id,
+            "daemon_version": self._sandbox.daemon_version,
+            "warm_pool_id": self._sandbox.warm_pool_id,
+            "snapshot": self._sandbox.snapshot,
+            "target": self._sandbox.target,
+        }
+        return {key: str(value) for key, value in metadata.items() if value is not None}
+
     def _parse_created_at(self, value: str | None) -> datetime | None:
         if value is None:
             return None

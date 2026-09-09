@@ -1194,17 +1194,6 @@ class DaytonaSandboxProvider(SandboxProvider):
 
     async def _discard_sandbox(self, name: str, sandbox: AsyncSandbox, daytona: AsyncDaytona) -> None:
         """Delete a failed-verification sandbox and wait for its name to be freed for recreation."""
-        try:
-            await _bounded("daytona.delete", daytona.delete(sandbox), _TOOLBOX_CALL_TIMEOUT_SECONDS)
-        except DaytonaNotFoundError:
-            pass
-        except DaytonaConflictError as exc:
-            if _is_delete_conflict(exc):
-                raise SandboxConnectionError(str(exc)) from exc
-            raise self._sandbox_error(exc) from exc
-        except DaytonaError as exc:
-            raise self._sandbox_error(exc) from exc
-
         deadline = time.monotonic() + _SANDBOX_GONE_TIMEOUT_SECONDS
         while True:
             try:
@@ -1218,6 +1207,16 @@ class DaytonaSandboxProvider(SandboxProvider):
                     f"discarded sandbox {name!r} still exists {_SANDBOX_GONE_TIMEOUT_SECONDS:g}s "
                     "after delete; refusing to recreate under the same name"
                 )
+            try:
+                await _bounded("daytona.delete", daytona.delete(sandbox), _TOOLBOX_CALL_TIMEOUT_SECONDS)
+            except DaytonaNotFoundError:
+                pass
+            except DaytonaConflictError as exc:
+                # A state-change conflict means removal is already in progress; keep polling.
+                if not _is_delete_conflict(exc):
+                    raise self._sandbox_error(exc) from exc
+            except DaytonaError as exc:
+                raise self._sandbox_error(exc) from exc
             await asyncio.sleep(_SANDBOX_GONE_POLL_SECONDS)
 
     async def _delete_failed_sandbox(self, name: str, daytona: AsyncDaytona) -> None:

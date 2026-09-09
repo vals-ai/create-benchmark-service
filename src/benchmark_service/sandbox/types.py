@@ -8,9 +8,10 @@ from pathlib import PurePosixPath
 from string import Formatter
 from typing import Annotated, Literal, Self
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, FiniteFloat, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, FiniteFloat, StringConstraints, model_validator
 
 
+_VerifyCommand = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 _VERIFY_COMMAND_DESCRIPTION = (
     "Shell command run inside each new sandbox; a non-zero exit means the sandbox does not "
     "contain the expected source content and creation is retried on a fresh sandbox"
@@ -19,7 +20,7 @@ _VERIFY_COMMAND_DESCRIPTION = (
 class ImageSource(BaseModel):
     type: Literal["image"] = "image"
     image: str
-    verify_command: str | None = Field(
+    verify_command: _VerifyCommand | None = Field(
         default=None, description=_VERIFY_COMMAND_DESCRIPTION, exclude_if=lambda value: value is None
     )
 
@@ -27,7 +28,7 @@ class ImageSource(BaseModel):
 class SnapshotSource(BaseModel):
     type: Literal["snapshot"] = "snapshot"
     snapshot: str
-    verify_command: str | None = Field(
+    verify_command: _VerifyCommand | None = Field(
         default=None, description=_VERIFY_COMMAND_DESCRIPTION, exclude_if=lambda value: value is None
     )
 
@@ -36,7 +37,7 @@ class TargetedSnapshotSource(BaseModel):
     type: Literal["targeted_snapshot"] = "targeted_snapshot"
     snapshot: str
     target: str = Field(min_length=1)
-    verify_command: str | None = Field(
+    verify_command: _VerifyCommand | None = Field(
         default=None, description=_VERIFY_COMMAND_DESCRIPTION, exclude_if=lambda value: value is None
     )
 

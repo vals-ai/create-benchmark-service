@@ -3056,6 +3056,12 @@ def test_source_omits_unset_verify_command_on_the_wire() -> None:
     assert SnapshotSource(snapshot="snap", verify_command="true").model_dump()["verify_command"] == "true"
 
 
+@pytest.mark.parametrize("command", ["", "   "])
+def test_source_rejects_blank_verify_command(command: str) -> None:
+    with pytest.raises(ValidationError):
+        SnapshotSource(snapshot="snap", verify_command=command)
+
+
 async def test_daytona_provider_recreates_sandbox_on_failed_source_verification() -> None:
     """A sandbox whose rootfs fails the source's verify_command is discarded and recreated."""
     daytona = VerifyProbeDaytonaClient(failures=1)
@@ -3115,6 +3121,29 @@ async def test_daytona_provider_verifies_conflict_recovered_sandbox() -> None:
     assert sandbox._sandbox is daytona.created_sandboxes[0]  # pyright: ignore[reportPrivateUsage]
     assert [_unwrap_shell_command(c) for c in commands] == ["test -x /usr/bin/dockerd"]
     assert [_unwrap_shell_command(c) for c in daytona.commands] == ["test -x /usr/bin/dockerd"]
+
+
+async def test_daytona_provider_discard_retries_in_progress_delete() -> None:
+    """A state-change conflict on delete means removal is already running; discard keeps polling."""
+
+    class ConflictingDeleteClient(VerifyProbeDaytonaClient):
+        def __init__(self) -> None:
+            super().__init__(failures=1)
+            self.delete_conflicts = 1
+
+        async def delete(self, sandbox: InnerSandbox) -> None:
+            if self.delete_conflicts:
+                self.delete_conflicts -= 1
+                raise DaytonaConflictError("Sandbox state change in progress")
+            await super().delete(sandbox)
+
+    daytona = ConflictingDeleteClient()
+
+    sandbox = await _provider(daytona).create_sandbox(_verify_request("sandbox-name"))
+
+    assert daytona.create_attempts == 2
+    assert daytona.deleted_sandboxes == daytona.created_sandboxes[:1]
+    assert sandbox._sandbox is daytona.created_sandboxes[1]  # pyright: ignore[reportPrivateUsage]
 
 
 async def test_daytona_provider_create_conflict_bounds_hung_sandbox_start(monkeypatch: pytest.MonkeyPatch) -> None:

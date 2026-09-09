@@ -11,20 +11,29 @@ from typing import Annotated, Literal, Self
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, FiniteFloat, model_validator
 
 
+_VERIFY_COMMAND_DESCRIPTION = (
+    "Shell command run inside each new sandbox; a non-zero exit means the sandbox does not "
+    "contain the expected source content and creation is retried on a fresh sandbox"
+)
+
+
 class ImageSource(BaseModel):
     type: Literal["image"] = "image"
     image: str
+    verify_command: str | None = Field(default=None, description=_VERIFY_COMMAND_DESCRIPTION)
 
 
 class SnapshotSource(BaseModel):
     type: Literal["snapshot"] = "snapshot"
     snapshot: str
+    verify_command: str | None = Field(default=None, description=_VERIFY_COMMAND_DESCRIPTION)
 
 
 class TargetedSnapshotSource(BaseModel):
     type: Literal["targeted_snapshot"] = "targeted_snapshot"
     snapshot: str
     target: str = Field(min_length=1)
+    verify_command: str | None = Field(default=None, description=_VERIFY_COMMAND_DESCRIPTION)
 
 
 BaseSandboxSource = Annotated[ImageSource | SnapshotSource, Field(discriminator="type")]

@@ -3050,6 +3050,12 @@ def _verify_request(name: str) -> SandboxCreateRequest:
     )
 
 
+def test_source_omits_unset_verify_command_on_the_wire() -> None:
+    """Consumers must not see a verify_command key unless it was set."""
+    assert "verify_command" not in SnapshotSource(snapshot="snap").model_dump()
+    assert SnapshotSource(snapshot="snap", verify_command="true").model_dump()["verify_command"] == "true"
+
+
 async def test_daytona_provider_recreates_sandbox_on_failed_source_verification() -> None:
     """A sandbox whose rootfs fails the source's verify_command is discarded and recreated."""
     daytona = VerifyProbeDaytonaClient(failures=1)

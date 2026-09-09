@@ -37,8 +37,10 @@ from benchmark_service.sandbox import (
     ExecResult,
     ImageSource,
     MissingSandboxConfigError,
+    ResourceCapacity,
     Resources,
     Sandbox,
+    SandboxCapacity,
     SandboxConnectionError,
     SandboxCreateRequest,
     SandboxError,
@@ -1288,6 +1290,94 @@ async def test_daytona_admission_accepts_target_id_without_region_lookup(monkeyp
     assert await provider.check_admission(_ADMISSION_IMAGE, _ADMISSION_RESOURCES)
     assert requested == ["org-1"]
     assert region_requests == []
+
+
+async def test_daytona_capacity_preserves_provider_values_and_clamps_oversubscription(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, requested = _admission_provider(
+        monkeypatch,
+        SimpleNamespace(
+            region_usage=[
+                _usage_row(
+                    total_cpu_quota=8.5,
+                    current_cpu_usage=2.25,
+                    total_memory_quota=0,
+                    current_memory_usage=0,
+                    total_disk_quota=100.5,
+                    current_disk_usage=101,
+                )
+            ]
+        ),
+        regions=AssertionError("canonical target IDs should not require a region lookup"),
+    )
+
+    capacity = await provider.get_capacity()
+
+    assert capacity == SandboxCapacity(
+        cpu=ResourceCapacity(total=8.5, used=2.25),
+        memory=ResourceCapacity(total=0, used=0),
+        disk=ResourceCapacity(total=100.5, used=101),
+    )
+    assert capacity is not None
+    assert (capacity.cpu.available, capacity.memory.available, capacity.disk.available) == (6.25, 0, 0)
+    assert requested == ["org-1"]
+
+
+async def test_daytona_capacity_resolves_named_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    region_requests: list[str] = []
+    provider, requested = _admission_provider(
+        monkeypatch,
+        SimpleNamespace(region_usage=[_usage_row(region_id="region-id")]),
+        regions=[SimpleNamespace(id="region-id", name="us")],
+        region_requests=region_requests,
+    )
+
+    capacity = await provider.get_capacity()
+
+    assert capacity is not None
+    assert capacity.cpu.available == 6
+    assert requested == ["org-1"]
+    assert region_requests == ["list_available_regions"]
+
+
+async def test_daytona_capacity_is_unsupported_without_organization_id(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider, requested = _admission_provider(
+        monkeypatch,
+        AssertionError("capacity should not be observed"),
+        organization_id=None,
+    )
+
+    assert await provider.get_capacity() is None
+    assert requested == []
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        TimeoutError(),
+        ClientConnectionError("connection reset"),
+        InvalidURL("not-a-url"),
+        ApiException(status=429),
+        ApiException(status=503),
+        ApiException(status=401),
+        SimpleNamespace(region_usage=[_usage_row(), _usage_row()]),
+        SimpleNamespace(region_usage=[_usage_row(total_cpu_quota=float("nan"))]),
+        SimpleNamespace(region_usage=[_usage_row(current_memory_usage=-1)]),
+    ],
+)
+async def test_daytona_capacity_observation_failures_are_safe(
+    monkeypatch: pytest.MonkeyPatch,
+    result: Exception | SimpleNamespace,
+) -> None:
+    provider, requested = _admission_provider(monkeypatch, result)
+
+    with pytest.raises(SandboxError) as error:
+        await provider.get_capacity()
+
+    assert "secret" not in str(error.value).lower()
+    assert "test-key" not in str(error.value).lower()
+    assert requested == ["org-1"]
 
 
 @pytest.mark.parametrize(

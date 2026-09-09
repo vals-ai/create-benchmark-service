@@ -2998,14 +2998,17 @@ async def test_daytona_provider_recovers_existing_sandbox_on_create_conflict() -
 
 
 class _VerifyProbeProcess(Process):
-    def __init__(self, commands: list[str], *, fail: bool) -> None:
+    def __init__(self, commands: list[str], *, fail: bool, exc: DaytonaError | None = None) -> None:
         super().__init__()
         self._commands = commands
         self._fail = fail
+        self._exc = exc
 
     async def exec(self, command: str) -> SimpleNamespace:
         self.command = command
         self._commands.append(command)
+        if self._exc is not None:
+            raise self._exc
         if self._fail:
             return SimpleNamespace(exit_code=1, result="probe output")
         return SimpleNamespace(exit_code=0, result="")
@@ -3121,6 +3124,31 @@ async def test_daytona_provider_verifies_conflict_recovered_sandbox() -> None:
     assert sandbox._sandbox is daytona.created_sandboxes[0]  # pyright: ignore[reportPrivateUsage]
     assert [_unwrap_shell_command(c) for c in commands] == ["test -x /usr/bin/dockerd"]
     assert [_unwrap_shell_command(c) for c in daytona.commands] == ["test -x /usr/bin/dockerd"]
+
+
+async def test_daytona_provider_discards_sandbox_when_verify_cannot_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A transport failure running the probe means an unusable sandbox: discard and recreate."""
+    _skip_retry_sleep(monkeypatch, DaytonaSandbox._control_exec)  # pyright: ignore[reportPrivateUsage]
+
+    class UnreachableProbeClient(VerifyProbeDaytonaClient):
+        def __init__(self) -> None:
+            super().__init__(failures=0)
+
+        async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
+            inner = await super().create(*_args, **_kwargs)
+            if self.create_attempts == 1:
+                inner.process = _VerifyProbeProcess(
+                    self.commands, fail=False, exc=DaytonaConnectionError("connection refused")
+                )
+            return inner
+
+    daytona = UnreachableProbeClient()
+
+    sandbox = await _provider(daytona).create_sandbox(_verify_request("sandbox-name"))
+
+    assert daytona.create_attempts == 2
+    assert daytona.deleted_sandboxes == daytona.created_sandboxes[:1]
+    assert sandbox._sandbox is daytona.created_sandboxes[1]  # pyright: ignore[reportPrivateUsage]
 
 
 async def test_daytona_provider_discard_retries_in_progress_delete() -> None:

@@ -576,9 +576,9 @@ class DaytonaSandbox(Sandbox):
         """Run the source's verify_command in the sandbox; return None on pass, else a failure reason."""
         try:
             result = await self._control_exec(command)
-        except SandboxConnectionError:
-            raise
         except SandboxError as exc:
+            # A sandbox we cannot exec into is unusable; report it as failed so it is
+            # discarded within the provider's bounded verify loop rather than retried.
             return f"verify command could not run: {exc}"
         if result.exit_code != 0:
             output = result.output.strip()
@@ -1195,20 +1195,25 @@ class DaytonaSandboxProvider(SandboxProvider):
     async def _discard_sandbox(self, name: str, sandbox: AsyncSandbox, daytona: AsyncDaytona) -> None:
         """Delete a failed-verification sandbox and wait for its name to be freed for recreation."""
         deadline = time.monotonic() + _SANDBOX_GONE_TIMEOUT_SECONDS
-        while True:
-            try:
-                await _bounded("daytona.get", daytona.get(name), _TOOLBOX_CALL_TIMEOUT_SECONDS)
-            except DaytonaNotFoundError:
-                return
-            except DaytonaError as exc:
-                raise self._sandbox_error(exc) from exc
-            if time.monotonic() >= deadline:
+
+        def remaining() -> float:
+            left = deadline - time.monotonic()
+            if left <= 0:
                 raise SandboxError(
                     f"discarded sandbox {name!r} still exists {_SANDBOX_GONE_TIMEOUT_SECONDS:g}s "
                     "after delete; refusing to recreate under the same name"
                 )
+            return left
+
+        while True:
             try:
-                await _bounded("daytona.delete", daytona.delete(sandbox), _TOOLBOX_CALL_TIMEOUT_SECONDS)
+                await _bounded("daytona.get", daytona.get(name), remaining())
+            except DaytonaNotFoundError:
+                return
+            except DaytonaError as exc:
+                raise self._sandbox_error(exc) from exc
+            try:
+                await _bounded("daytona.delete", daytona.delete(sandbox), remaining())
             except DaytonaNotFoundError:
                 pass
             except DaytonaConflictError as exc:
@@ -1217,7 +1222,7 @@ class DaytonaSandboxProvider(SandboxProvider):
                     raise self._sandbox_error(exc) from exc
             except DaytonaError as exc:
                 raise self._sandbox_error(exc) from exc
-            await asyncio.sleep(_SANDBOX_GONE_POLL_SECONDS)
+            await asyncio.sleep(min(_SANDBOX_GONE_POLL_SECONDS, remaining()))
 
     async def _delete_failed_sandbox(self, name: str, daytona: AsyncDaytona) -> None:
         try:

@@ -8,7 +8,7 @@ from pathlib import PurePosixPath
 from string import Formatter
 from typing import Annotated, Literal, Self
 
-from pydantic import AwareDatetime, BaseModel, Field, model_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, FiniteFloat, model_validator
 
 
 class ImageSource(BaseModel):
@@ -92,6 +92,25 @@ class Resources(BaseModel):
         if self.gpu_type is not None and self.gpu < 1:
             raise ValueError("gpu_type requires gpu >= 1")
         return self
+
+
+class ResourceCapacity(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    total: FiniteFloat = Field(ge=0)
+    used: FiniteFloat = Field(ge=0)
+
+    @property
+    def available(self) -> float:
+        return max(0.0, self.total - self.used)
+
+
+class SandboxCapacity(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    cpu: ResourceCapacity
+    memory: ResourceCapacity
+    disk: ResourceCapacity
 
 
 class VolumeMount(BaseModel):
@@ -307,6 +326,9 @@ class SandboxProvider(ABC):
         resources: Resources,
     ) -> bool:
         return True
+
+    async def get_capacity(self) -> SandboxCapacity | None:
+        return None
 
     @abstractmethod
     async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox: ...

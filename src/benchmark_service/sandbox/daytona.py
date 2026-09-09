@@ -31,6 +31,7 @@ from daytona_api_client_async import (
     SandboxClass,
 )
 from daytona_api_client_async.exceptions import NotFoundException, OpenApiException
+from daytona_api_client_async.models.region_usage_overview import RegionUsageOverview
 from daytona import (
     GpuType,
 )
@@ -71,8 +72,10 @@ from benchmark_service.sandbox.types import (
     ExecResult,
     ImageSource,
     MissingSandboxConfigError,
+    ResourceCapacity,
     Resources,
     Sandbox,
+    SandboxCapacity,
     SandboxCommandError,
     SandboxConnectionError,
     SandboxCreateRequest,
@@ -914,6 +917,47 @@ class DaytonaSandboxProvider(SandboxProvider):
             return None
         return _admission_pool_id(organization_id=self._organization_id, api_url=self._api_url)
 
+    async def _capacity_usage(self) -> RegionUsageOverview:
+        assert self._organization_id is not None
+        async with (
+            asyncio.timeout(_ADMISSION_TIMEOUT_SECONDS),
+            DaytonaApiClient(self._target_api_configuration) as api_client,
+        ):
+            organizations_api = OrganizationsApi(api_client)
+            overview = await organizations_api.get_organization_usage_overview(self._organization_id)
+            matches = [
+                usage
+                for usage in overview.region_usage
+                if usage.region_id == self._target and usage.sandbox_class == SandboxClass.CONTAINER
+            ]
+            if not matches:
+                target_id = await self._resolve_target_id_using(organizations_api.list_available_regions)
+                matches = [
+                    usage
+                    for usage in overview.region_usage
+                    if usage.region_id == target_id and usage.sandbox_class == SandboxClass.CONTAINER
+                ]
+            if len(matches) != 1:
+                raise SandboxError(
+                    f"Expected one Daytona capacity row for target {self._target!r}, found {len(matches)}"
+                )
+            return matches[0]
+
+    async def get_capacity(self) -> SandboxCapacity | None:
+        if self._organization_id is None:
+            return None
+        try:
+            usage = await self._capacity_usage()
+            return SandboxCapacity(
+                cpu=ResourceCapacity(total=usage.total_cpu_quota, used=usage.current_cpu_usage),
+                memory=ResourceCapacity(total=usage.total_memory_quota, used=usage.current_memory_usage),
+                disk=ResourceCapacity(total=usage.total_disk_quota, used=usage.current_disk_usage),
+            )
+        except SandboxError:
+            raise
+        except (OpenApiException, ClientError, TimeoutError, ValueError):
+            raise SandboxError("Daytona capacity is unavailable") from None
+
     async def check_admission(
         self,
         source: SandboxSource,
@@ -926,34 +970,12 @@ class DaytonaSandboxProvider(SandboxProvider):
         demand = (resources.vcpu, resources.memory, resources.disk)
 
         try:
-            async with (
-                asyncio.timeout(_ADMISSION_TIMEOUT_SECONDS),
-                DaytonaApiClient(self._target_api_configuration) as api_client,
-            ):
-                organizations_api = OrganizationsApi(api_client)
-                overview = await organizations_api.get_organization_usage_overview(self._organization_id)
-                matches = [
-                    usage
-                    for usage in overview.region_usage
-                    if usage.region_id == self._target and usage.sandbox_class == SandboxClass.CONTAINER
-                ]
-                if not matches:
-                    target_id = await self._resolve_target_id_using(organizations_api.list_available_regions)
-                    matches = [
-                        usage
-                        for usage in overview.region_usage
-                        if usage.region_id == target_id and usage.sandbox_class == SandboxClass.CONTAINER
-                    ]
-                if len(matches) != 1:
-                    raise SandboxError(
-                        f"Expected one Daytona capacity row for target {self._target!r}, found {len(matches)}"
-                    )
-                usage = matches[0]
-                per_sandbox_limit = (
-                    usage.max_cpu_per_sandbox,
-                    usage.max_memory_per_sandbox,
-                    usage.max_disk_per_sandbox,
-                )
+            usage = await self._capacity_usage()
+            per_sandbox_limit = (
+                usage.max_cpu_per_sandbox,
+                usage.max_memory_per_sandbox,
+                usage.max_disk_per_sandbox,
+            )
         except (OpenApiException, ClientResponseError) as exc:
             status = cast(int | None, getattr(exc, "status", None))
             if status in (408, 429) or (status is not None and 500 <= status <= 599):

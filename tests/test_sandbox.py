@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import shlex
+import subprocess
 from collections.abc import AsyncGenerator, Mapping
 from contextlib import nullcontext
 from datetime import UTC, datetime
@@ -31,6 +32,7 @@ from pydantic import TypeAdapter, ValidationError
 from yarl import URL
 
 import benchmark_service.sandbox.daytona as daytona_module
+from benchmark_service.sandbox.compose import _COMPOSE_EXEC_ENV_ARGS  # pyright: ignore[reportPrivateUsage]
 from benchmark_service.sandbox import (
     ComposeSource,
     ComposeSandbox,
@@ -41,6 +43,7 @@ from benchmark_service.sandbox import (
     Resources,
     Sandbox,
     SandboxCapacity,
+    SandboxCommandError,
     SandboxConnectionError,
     SandboxCreateRequest,
     SandboxError,
@@ -1576,14 +1579,12 @@ async def test_compose_sandbox_routes_operations_through_main_service() -> None:
     assert output == ["ok"]
     assert outer.exec_commands[0] == (
         "MAIN_IMAGE_NAME=task docker compose -p task -f /harbor/compose.yaml "
-        "exec "
-        "$(env | sed -n 's/^\\([A-Za-z_][A-Za-z0-9_]*\\)=.*/-e \\1/p') "
+        f"exec {_COMPOSE_EXEC_ENV_ARGS} "
         "-T -w /workspace main sh -lc 'pytest -q'"
     )
     assert outer.exec_commands[1] == (
         "MAIN_IMAGE_NAME=task docker compose -p task -f /harbor/compose.yaml "
-        "exec "
-        "$(env | sed -n 's/^\\([A-Za-z_][A-Za-z0-9_]*\\)=.*/-e \\1/p') "
+        f"exec {_COMPOSE_EXEC_ENV_ARGS} "
         "-T -w /workspace main sh -lc 'echo ok'"
     )
     assert outer.command_env_vars == [{"AGENT_SECRET": secret}]
@@ -1631,6 +1632,38 @@ async def test_compose_command_rejects_invalid_environment_names_before_outer_ca
         _ = [chunk async for chunk in sandbox.command("true", env_vars={"BAD-NAME": "secret"})]
 
     assert outer.exec_commands == []
+
+
+def test_compose_exec_forwards_secrets_but_not_outer_shell_identity() -> None:
+    """The env forwarded into `docker compose exec` must not carry the DinD shell's HOME/PATH/docker vars.
+
+    Non-root task images (USER agent) fail `mkdir -p $HOME/.local/bin` when HOME=/root leaks in.
+    """
+    outer_env = {
+        "HOME": "/root",
+        "PATH": "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+        "HOSTNAME": "sandbox",
+        "PWD": "/",
+        "SHLVL": "1",
+        "TERM": "dumb",
+        "DOCKER_HOST": "tcp://docker:2375",
+        "DOCKER_TLS_CERTDIR": "",
+        "DIND_COMMIT": "abc",
+        "LANG": "C.UTF-8",
+        "AGENT_SECRET": "s3cret with spaces",
+        "MODEL_GATEWAY_URL": "https://gateway",
+    }
+    printed = subprocess.run(
+        ["sh", "-c", f"printf '%s\\n' {_COMPOSE_EXEC_ENV_ARGS}"],
+        env=outer_env,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.split()
+    forwarded = {printed[i + 1] for i in range(0, len(printed), 2)}
+
+    assert set(printed[::2]) == {"-e"}
+    assert forwarded == {"LANG", "AGENT_SECRET", "MODEL_GATEWAY_URL"}
 
 
 async def test_compose_sandbox_cleans_temp_files_when_copy_operations_fail() -> None:
@@ -2229,6 +2262,34 @@ async def test_daytona_command_streams_output() -> None:
     output = [chunk async for chunk in sandbox.command("printf hello")]
 
     assert output == ["hello"]
+
+
+async def test_daytona_command_reads_status_after_toolbox_shell_diagnostics() -> None:
+    """A control probe whose shell prints getcwd diagnostics still yields the written exit code."""
+
+    class NoisyShellProcess(Process):
+        async def exec(self, command: str) -> SimpleNamespace:
+            if _unwrap_shell_command(command).startswith("cat "):
+                return SimpleNamespace(
+                    exit_code=0,
+                    result=(
+                        "shell-init: error retrieving current directory: getcwd: cannot access parent "
+                        "directories: No such file or directory\n"
+                        "job-working-directory: error retrieving current directory: getcwd: cannot access "
+                        "parent directories: No such file or directory\n"
+                        "3\n"
+                    ),
+                )
+            return await super().exec(command)
+
+    inner = InnerSandbox()
+    inner.process = NoisyShellProcess()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    with pytest.raises(SandboxCommandError) as excinfo:
+        _ = [chunk async for chunk in sandbox.command("printf hello")]
+
+    assert excinfo.value.exit_code == 3
 
 
 async def test_daytona_command_publishes_status_atomically_and_cleans_temp() -> None:

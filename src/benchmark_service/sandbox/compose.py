@@ -12,7 +12,25 @@ from benchmark_service.sandbox.types import (
     validate_command_env,
 )
 
-_COMPOSE_EXEC_ENV_ARGS = r"$(env | sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/-e \1/p')"
+# Outer docker-in-docker shell identity; never forwarded into service containers.
+_OUTER_SHELL_ENV = (
+    "HOME",
+    "PATH",
+    "HOSTNAME",
+    "PWD",
+    "OLDPWD",
+    "SHLVL",
+    "SHELL",
+    "TERM",
+    "USER",
+    "LOGNAME",
+    "_",
+    "DOCKER_[A-Za-z0-9_]*",
+    "DIND_[A-Za-z0-9_]*",
+)
+_COMPOSE_EXEC_ENV_ARGS = (
+    "$(env | sed -En '/^(" + "|".join(_OUTER_SHELL_ENV) + ")=/d; s/^([A-Za-z_][A-Za-z0-9_]*)=.*/-e \\1/p')"
+)
 
 
 class ComposeSandbox(Sandbox):

@@ -769,7 +769,9 @@ class DaytonaSandbox(Sandbox):
                 raise SandboxError(
                     f"Failed to read Daytona PTY exit code for {self._sandbox_ref}: status_path={status_path}"
                 )
-            return ExecResult(exit_code=int(result.output.strip()), output="".join(stdout))
+            # The toolbox shell may prepend its own startup diagnostics (e.g. shell-init getcwd
+            # errors) to stdout; the status file itself is the final line.
+            return ExecResult(exit_code=int(result.output.strip().splitlines()[-1]), output="".join(stdout))
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
         finally:

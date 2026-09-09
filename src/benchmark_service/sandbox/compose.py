@@ -35,6 +35,10 @@ class ComposeSandbox(Sandbox):
     def state(self) -> str:
         return self._outer.state
 
+    @property
+    def provider_metadata(self) -> Mapping[str, str]:
+        return self._outer.provider_metadata
+
     def _compose_command(self, parts: list[str]) -> str:
         return f"{self._compose_command_prefix} {shlex.join(parts)}"
 

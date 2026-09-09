@@ -1520,13 +1520,20 @@ def test_sandbox_metadata_defaults_are_optional_for_existing_subclasses() -> Non
 
 def test_compose_sandbox_delegates_inventory_metadata() -> None:
     created_at = datetime(2026, 7, 24, 12, 30, tzinfo=UTC)
-    outer = RecordingSandbox()
+
+    class MetadataSandbox(RecordingSandbox):
+        @property
+        def provider_metadata(self) -> dict[str, str]:
+            return {"runner_id": "runner-1"}
+
+    outer = MetadataSandbox()
     outer.labels = {"run_id": "r1"}
     outer.created_at = created_at
     sandbox = ComposeSandbox(outer, ComposeSource(outer=ImageSource(image="docker:28.3.3-dind")))
 
     assert sandbox.labels == {"run_id": "r1"}
     assert sandbox.created_at == created_at
+    assert sandbox.provider_metadata == {"runner_id": "runner-1"}
 
 
 async def test_compose_sandbox_routes_operations_through_main_service() -> None:

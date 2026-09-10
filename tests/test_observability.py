@@ -27,6 +27,7 @@ from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapProp
 from sentry_sdk.consts import INSTRUMENTER
 from sentry_sdk.envelope import Envelope
 from sentry_sdk.integrations.opentelemetry import SentryPropagator, SentrySpanProcessor
+from sentry_sdk.integrations.stdlib import StdlibIntegration
 from sentry_sdk.transport import Transport
 
 from benchmark_service import observability
@@ -110,6 +111,7 @@ def configured_sentry(monkeypatch: pytest.MonkeyPatch) -> Iterator[_CaptureTrans
 
     def init_with_transport(*args: Any, **kwargs: Any) -> Any:
         kwargs["transport"] = transport
+        kwargs["disabled_integrations"] = [StdlibIntegration]
         return real_init(*args, **kwargs)
 
     monkeypatch.setenv("AUTH_DISABLED", "true")
@@ -121,7 +123,9 @@ def configured_sentry(monkeypatch: pytest.MonkeyPatch) -> Iterator[_CaptureTrans
     yield transport
     sentry_sdk.flush()
     sentry_sdk.get_client().close()
-    real_init(dsn=None)
+    real_init(dsn=None, disabled_integrations=[StdlibIntegration])
+
+
 
 
 def _composite_propagator() -> CompositePropagator:
@@ -138,6 +142,7 @@ def otel_tracer(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[trace.Tracer,
         transport=_CaptureTransport,
         instrumenter=INSTRUMENTER.OTEL,
         traces_sample_rate=1.0,
+        disabled_integrations=[StdlibIntegration],
     )
     provider = TracerProvider()
     exporter = InMemorySpanExporter()
@@ -156,7 +161,8 @@ def otel_tracer(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[trace.Tracer,
             sentry_sdk.flush()
             sentry_sdk.get_client().close()
         finally:
-            real_init(dsn=None)
+            real_init(dsn=None, disabled_integrations=[StdlibIntegration])
+
 
 
 

@@ -59,9 +59,9 @@ def correlation_scope(*, run_id: str | None = None, task_id: str | None = None) 
             _run_id.reset(run_token)
 
 
-def request_headers(headers: Mapping[str, str] | None = None) -> dict[str, str]:
+def request_headers(headers: Mapping[str, str]) -> dict[str, str]:
     """Copy headers, inject the current trace context, and add dynamic identity."""
-    request_headers = dict(headers or {})
+    request_headers = dict(headers)
     inject(request_headers)
     run_id = _run_id.get()
     task_id = _task_id.get()
@@ -73,7 +73,7 @@ def request_headers(headers: Mapping[str, str] | None = None) -> dict[str, str]:
 
 
 @contextmanager
-def websocket_request_span(operation: str, headers: Mapping[str, str] | None = None) -> Iterator[dict[str, str]]:
+def websocket_request_span(operation: str, headers: Mapping[str, str]) -> Iterator[dict[str, str]]:
     """Create the explicit WebSocket client span and inject its request headers."""
     with _tracer.start_as_current_span(operation, kind=SpanKind.CLIENT):
         yield request_headers(headers)

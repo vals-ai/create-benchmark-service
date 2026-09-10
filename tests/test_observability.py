@@ -214,9 +214,9 @@ async def test_concurrent_correlation_scopes_restore_their_caller() -> None:
     async def headers_for(run_id: str, task_id: str) -> dict[str, str]:
         with correlation_scope(run_id=run_id, task_id=task_id):
             await barrier.wait()
-            inner_headers = request_headers()
+            inner_headers = request_headers({})
             assert (inner_headers[RUN_ID_HEADER], inner_headers[TASK_ID_HEADER]) == (run_id, task_id)
-        restored = request_headers()
+        restored = request_headers({})
         assert (restored[RUN_ID_HEADER], restored[TASK_ID_HEADER]) == ("outer-run", "outer-task")
         return inner_headers
 
@@ -225,9 +225,9 @@ async def test_concurrent_correlation_scopes_restore_their_caller() -> None:
             headers_for("run-a", "task-a"),
             headers_for("run-b", "task-b"),
         )
-        restored = request_headers()
+        restored = request_headers({})
 
-    uncorrelated = request_headers()
+    uncorrelated = request_headers({})
     assert (first[RUN_ID_HEADER], first[TASK_ID_HEADER]) == ("run-a", "task-a")
     assert (second[RUN_ID_HEADER], second[TASK_ID_HEADER]) == ("run-b", "task-b")
     assert (restored[RUN_ID_HEADER], restored[TASK_ID_HEADER]) == ("outer-run", "outer-task")

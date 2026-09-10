@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable
 from typing import Literal
@@ -10,6 +11,7 @@ from urllib.parse import quote
 import httpx
 from cachetools import TTLCache
 from pydantic import BaseModel, ConfigDict, Field, PositiveInt
+from tenacity import retry, retry_if_exception_type, retry_if_result, stop_after_attempt, wait_random_exponential
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +19,7 @@ DESCOPE_API_KEY_HEADER = "x-descope-api-key"
 DEFAULT_ALLOWLIST_CACHE_TTL_SECONDS = 300
 ALLOWLIST_CACHE_MAX_SIZE = 1024
 DEFAULT_CATALOG_REQUEST_TIMEOUT_SECONDS = 5.0
+CATALOG_ATTEMPT_TIMEOUT_SECONDS = 2.0
 
 
 EvaluationQuotaPeriod = Literal["day", "week", "month", "year"]
@@ -72,6 +75,10 @@ class _NonClosingTransport(httpx.AsyncBaseTransport):
         return None
 
 
+def _transient_catalog_response(response: httpx.Response) -> bool:
+    return response.status_code in (408, 429) or 500 <= response.status_code < 600
+
+
 class CatalogAllowlistClient:
     """Fetch and cache one service's tenant policy from the catalog API."""
 
@@ -94,7 +101,10 @@ class CatalogAllowlistClient:
         client_transport = (
             _NonClosingTransport(transport) if transport is not None else None
         )
-        self._client = httpx.AsyncClient(timeout=timeout, transport=client_transport)
+        self._request_timeout = timeout
+        self._client = httpx.AsyncClient(
+            timeout=min(timeout, CATALOG_ATTEMPT_TIMEOUT_SECONDS), transport=client_transport
+        )
         if cache_timer is None:
             self._cache = TTLCache[str, TenantConfig](
                 maxsize=ALLOWLIST_CACHE_MAX_SIZE,
@@ -124,6 +134,18 @@ class CatalogAllowlistClient:
         """Return a cached policy without making a network request."""
         return self._cache.get(tenant)
 
+    @retry(
+        retry=(
+            retry_if_exception_type((httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError))
+            | retry_if_result(_transient_catalog_response)
+        ),
+        stop=stop_after_attempt(3),
+        wait=wait_random_exponential(multiplier=0.1, max=0.5),
+        reraise=True,
+    )
+    async def _fetch_policy(self, access_key: str) -> httpx.Response:
+        return await self._client.get(self.endpoint, headers={DESCOPE_API_KEY_HEADER: access_key})
+
     async def get_tenant_config(self, access_key: str, tenant: str) -> TenantConfig | None:
         """Fetch a tenant policy, returning ``None`` for misses or failures."""
         cached = self._cache.get(tenant)
@@ -131,10 +153,8 @@ class CatalogAllowlistClient:
             return cached
 
         try:
-            response = await self._client.get(
-                self.endpoint,
-                headers={DESCOPE_API_KEY_HEADER: access_key},
-            )
+            async with asyncio.timeout(self._request_timeout):
+                response = await self._fetch_policy(access_key)
         except Exception:
             logger.warning("Failed to fetch tenant policy from benchmark catalog API", exc_info=True)
             return None

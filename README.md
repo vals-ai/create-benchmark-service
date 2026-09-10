@@ -364,6 +364,8 @@ SERVICE_NAME=<registered-service-name>
 
 Catalog requests use the authenticated `x-descope-api-key` header. The service never reads the catalog bucket directly. Leave `BENCHMARK_CATALOG_API_URL` unset to retain the JSON/YAML behavior during rollout.
 
+Catalog lookups retry connection failures, timeouts, HTTP 408/429, and server errors up to three attempts with randomized backoff. The default total deadline is five seconds, with at most two seconds per attempt. Authorization denials and malformed policies are not retried. Exhausted retries deny access without reusing expired policy or caching the failure.
+
 Example allowlist:
 
 ```yaml

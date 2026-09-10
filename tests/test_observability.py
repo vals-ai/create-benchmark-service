@@ -7,7 +7,7 @@ import socket
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from typing import Any
-from unittest.mock import Mock, call
+from unittest.mock import Mock
 
 import opentelemetry.propagate as propagate
 import pytest
@@ -30,7 +30,8 @@ from sentry_sdk.integrations.opentelemetry import SentryPropagator, SentrySpanPr
 from sentry_sdk.integrations.stdlib import StdlibIntegration
 from sentry_sdk.transport import Transport
 
-from benchmark_service import observability
+from benchmark_service import __version__ as framework_version
+from benchmark_service import app as app_module, observability
 from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.client import BenchmarkServiceClient, SandboxRecoveryAttempt
 from benchmark_service.observability import (
@@ -49,6 +50,7 @@ class _CaptureTransport(Transport):
         super().__init__(options)
         self.events: list[dict[str, Any]] = []
         self.transactions: list[dict[str, Any]] = []
+        self.init_calls = 0
 
     def capture_envelope(self, envelope: Envelope) -> None:
         for item in envelope.items:
@@ -65,8 +67,21 @@ class _FailedStatusError(Exception):
 
 
 class _FailingWebSocketBenchmark(StubBenchmark):
+    def get_service_version(self) -> str:
+        return "websocket-service-4.5.6"
+
     async def evaluate_response(self, request: EvaluateResponseRequest, dataset: str | None = None) -> Any:
         raise RuntimeError("websocket evaluation failed")
+
+
+class _VersionedBenchmark(StubBenchmark):
+    def get_service_version(self) -> str:
+        return "service-hook-1.2.3"
+
+
+class _OtherVersionedBenchmark(StubBenchmark):
+    def get_service_version(self) -> str:
+        return "other-service-4.5.6"
 
 
 _INCOMING_TRACE_ID = "0123456789abcdef0123456789abcdef"
@@ -108,8 +123,14 @@ async def _serve_loopback(app: FastAPI) -> AsyncIterator[str]:
 def configured_sentry(monkeypatch: pytest.MonkeyPatch) -> Iterator[_CaptureTransport]:
     transport = _CaptureTransport()
     real_init = sentry_sdk.init
+    monkeypatch.setattr(
+        observability.sentry_sdk,
+        "is_initialized",
+        lambda: transport.init_calls > 0,
+    )
 
     def init_with_transport(*args: Any, **kwargs: Any) -> Any:
+        transport.init_calls += 1
         kwargs["transport"] = transport
         kwargs["disabled_integrations"] = [StdlibIntegration]
         return real_init(*args, **kwargs)
@@ -182,30 +203,128 @@ def test_app_without_sentry_dsn_preserves_health(monkeypatch: pytest.MonkeyPatch
     init.assert_not_called()
 
 
-def test_init_sentry_uses_deployment_identity_and_full_sampling(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_init_sentry_uses_process_configuration_once(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("SENTRY_DSN", "https://public@example.com/1")
     monkeypatch.setenv("SENTRY_ENVIRONMENT", "dev")
     monkeypatch.setenv("SENTRY_RELEASE", "abc123")
+    is_initialized = Mock(side_effect=[False, True])
     init = Mock()
-    scope = Mock()
+    monkeypatch.setattr(observability.sentry_sdk, "is_initialized", is_initialized)
     monkeypatch.setattr(observability.sentry_sdk, "init", init)
-    monkeypatch.setattr(observability.sentry_sdk, "get_global_scope", Mock(return_value=scope))
 
-    enabled = init_sentry(service_name="swebench", framework_version="0.38.0", service_version="1.2.3")
+    assert init_sentry() is True
+    assert init_sentry() is True
 
-    assert enabled is True
+    assert init.call_count == 1
     options = init.call_args.kwargs
     assert options["dsn"] == "https://public@example.com/1"
     assert options["environment"] == "dev"
     assert options["release"] == "abc123"
     assert options["traces_sample_rate"] == 1.0
-    scope.set_tag.assert_has_calls(
-        [
-            call("service.name", "swebench"),
-            call("framework.version", "0.38.0"),
-            call("service.version", "1.2.3"),
-        ]
+
+
+def test_lifespan_failure_before_service_creation_uses_package_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_sentry: _CaptureTransport,
+) -> None:
+    monkeypatch.setattr(
+        app_module,
+        "_get_service_metadata",
+        Mock(return_value=("benchmark-package", "package-1.2.3")),
     )
+    monkeypatch.setattr(
+        app_module,
+        "require_supported_auth_config",
+        Mock(side_effect=RuntimeError("startup configuration failed")),
+    )
+    app = BenchmarkServiceApp(_VersionedBenchmark)
+
+    with sentry_sdk.isolation_scope():
+        sentry_sdk.set_tag("service.version", "caller-service-8.8.8")
+        with pytest.raises(RuntimeError, match="startup configuration failed"):
+            with TestClient(app):
+                pass
+        sentry_sdk.flush()
+
+        assert len(configured_sentry.events) == 1
+        tags = configured_sentry.events[0]["tags"]
+        assert tags["service.name"] == "swebench"
+        assert tags["framework.version"] == framework_version
+        assert tags["service.version"] == "package-1.2.3"
+
+        sentry_sdk.capture_message("caller scope after lifespan failure")
+        sentry_sdk.flush()
+        assert configured_sentry.events[1]["tags"]["service.version"] == "caller-service-8.8.8"
+
+
+def test_lifespan_failure_after_service_creation_uses_runtime_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_sentry: _CaptureTransport,
+) -> None:
+    monkeypatch.setattr(
+        app_module,
+        "_get_service_metadata",
+        Mock(return_value=("benchmark-package", "package-1.2.3")),
+    )
+
+    def fail_after_service_creation(_service: _VersionedBenchmark) -> Any:
+        raise RuntimeError("post-create startup failed")
+
+    monkeypatch.setattr(
+        _VersionedBenchmark,
+        "eval_mode",
+        property(fail_after_service_creation),
+    )
+    app = BenchmarkServiceApp(_VersionedBenchmark)
+
+    with pytest.raises(RuntimeError, match="post-create startup failed"):
+        with TestClient(app):
+            pass
+    sentry_sdk.flush()
+
+    assert len(configured_sentry.events) == 1
+    tags = configured_sentry.events[0]["tags"]
+    assert tags["service.name"] == "swebench"
+    assert tags["framework.version"] == framework_version
+    assert tags["service.version"] == "service-hook-1.2.3"
+
+
+def test_versionless_app_does_not_inherit_other_app_service_version(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_sentry: _CaptureTransport,
+) -> None:
+    monkeypatch.setattr(
+        app_module,
+        "_get_service_metadata",
+        Mock(return_value=("benchmark-package", None)),
+    )
+    monkeypatch.setenv("SERVICE_NAME", "versioned-service")
+    versioned_app = BenchmarkServiceApp(_VersionedBenchmark)
+    monkeypatch.setenv("SERVICE_NAME", "versionless-service")
+    versionless_app = BenchmarkServiceApp(StubBenchmark)
+
+    async def fail() -> None:
+        raise RuntimeError("app failed")
+
+    versioned_app.add_api_route("/fail", fail, methods=["GET"])
+    versionless_app.add_api_route("/fail", fail, methods=["GET"])
+    with TestClient(versioned_app, raise_server_exceptions=False) as client:
+        versioned_response = client.get("/fail")
+    with TestClient(versionless_app, raise_server_exceptions=False) as client:
+        versionless_response = client.get("/fail")
+    sentry_sdk.flush()
+
+    assert (versioned_response.status_code, versionless_response.status_code) == (
+        500,
+        500,
+    )
+    assert len(configured_sentry.events) == 2
+    versioned_tags = configured_sentry.events[0]["tags"]
+    versionless_tags = configured_sentry.events[1]["tags"]
+    assert versioned_tags["service.version"] == "service-hook-1.2.3"
+    assert versionless_tags["service.name"] == "versionless-service"
+    assert versionless_tags["framework.version"] == framework_version
+    assert "service.version" not in versionless_tags
 
 
 async def test_concurrent_correlation_scopes_restore_their_caller() -> None:
@@ -275,6 +394,71 @@ def test_http_exceptions_are_captured_once_with_request_identity(
     assert transaction["contexts"]["trace"]["trace_id"] == _INCOMING_TRACE_ID
 
 
+def test_request_identity_uses_runtime_service_version_override(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_sentry: _CaptureTransport,
+) -> None:
+    monkeypatch.setattr(
+        app_module,
+        "_get_service_metadata",
+        Mock(return_value=("benchmark-package", "package-1.2.3")),
+    )
+    app = BenchmarkServiceApp(_VersionedBenchmark)
+
+    async def fail() -> None:
+        raise RuntimeError("versioned request failed")
+
+    app.add_api_route("/fail-versioned", fail, methods=["GET"])
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.get("/fail-versioned")
+    sentry_sdk.flush()
+
+    assert response.status_code == 500
+    assert len(configured_sentry.events) == 1
+    event = configured_sentry.events[0]
+    tags = event["tags"]
+    assert tags["service.name"] == "swebench"
+    assert tags["framework.version"] == framework_version
+    assert tags["service.version"] == "service-hook-1.2.3"
+    assert event["release"] == "abc123"
+
+
+def test_multiple_apps_keep_request_identity_and_single_client_initialization(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_sentry: _CaptureTransport,
+) -> None:
+    monkeypatch.setenv("SERVICE_NAME", "first-service")
+    first_app = BenchmarkServiceApp(_VersionedBenchmark)
+    monkeypatch.setenv("SERVICE_NAME", "second-service")
+    second_app = BenchmarkServiceApp(_OtherVersionedBenchmark)
+
+    async def fail() -> None:
+        raise RuntimeError("app failed")
+
+    first_app.add_api_route("/fail", fail, methods=["GET"])
+    second_app.add_api_route("/fail", fail, methods=["GET"])
+    with TestClient(first_app, raise_server_exceptions=False) as client:
+        first_response = client.get("/fail")
+    with TestClient(second_app, raise_server_exceptions=False) as client:
+        second_response = client.get("/fail")
+    sentry_sdk.flush()
+
+    assert (first_response.status_code, second_response.status_code) == (500, 500)
+    assert len(configured_sentry.events) == 2
+    assert [
+        (
+            event["tags"]["service.name"],
+            event["tags"]["framework.version"],
+            event["tags"]["service.version"],
+        )
+        for event in configured_sentry.events
+    ] == [
+        ("first-service", framework_version, "service-hook-1.2.3"),
+        ("second-service", framework_version, "other-service-4.5.6"),
+    ]
+    assert configured_sentry.init_calls == 1
+
+
 def test_websocket_exception_is_captured_once_with_request_identity(
     configured_sentry: _CaptureTransport,
 ) -> None:
@@ -293,6 +477,9 @@ def test_websocket_exception_is_captured_once_with_request_identity(
     assert "websocket evaluation failed" in response["data"]
     assert len(configured_sentry.events) == 1
     tags = configured_sentry.events[0]["tags"]
+    assert tags["service.name"] == "swebench"
+    assert tags["framework.version"] == framework_version
+    assert tags["service.version"] == "websocket-service-4.5.6"
     assert tags["run_id"] == "run-2"
     assert tags["task_id"] == "task-2"
     assert tags["dataset"] == "default"

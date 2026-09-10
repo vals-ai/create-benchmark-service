@@ -8,9 +8,10 @@ import re
 import traceback
 from collections import Counter
 from collections.abc import AsyncGenerator
-from contextlib import aclosing, asynccontextmanager, suppress
+from contextlib import aclosing, asynccontextmanager, nullcontext, suppress
 from typing import Any, cast
 
+import sentry_sdk
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
@@ -33,6 +34,7 @@ from benchmark_service.grading import SUBMISSION_ARTIFACT_SANDBOX_PATH, collapse
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.observability import (
     bind_request_context,
+    bind_service_context,
     capture_exception,
     capture_http_exception,
     init_sentry,
@@ -316,51 +318,62 @@ class BenchmarkServiceApp(FastAPI):
         self._service_name, self._service_version = _get_service_metadata(service_cls)
         configured_deployment_name = os.getenv(evaluation_quota.SERVICE_NAME_ENV, "").strip()
         deployment_name = configured_deployment_name or service_cls.__name__
-        sentry_enabled = init_sentry(
-            service_name=deployment_name,
-            framework_version=_framework_version,
-            service_version=self._service_version,
-        )
+        sentry_enabled = init_sentry()
 
         @asynccontextmanager
         async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
-            require_supported_auth_config()
-            allowlist = load_allowlist()
-            if not os.getenv("BENCHMARK_CATALOG_API_URL", "").strip():
-                evaluation_quota.require_configured(
-                    allowlist, service_name=configured_deployment_name
-                )
-            submission_artifacts.require_configured()
-            if not submission_artifacts.is_configured():
-                logger.warning(
-                    f"{submission_artifacts.SUBMISSION_ARTIFACT_BUCKET_ENV} is not set; "
-                    "POST /v1/submissions/upload-url will return 503"
-                )
-            self.service = await service_cls.create()
-            if (
-                self.service.eval_mode
-                in {
-                    EvalMode.IN_PROCESS_ARTIFACT,
-                    EvalMode.IN_PROCESS_MATERIALIZED_ARTIFACT,
-                    EvalMode.SANDBOX,
-                }
-                and self.service.accepted_submission_schemas.get(V1PayloadType.ARTIFACT)
-                and not submission_artifacts.is_configured()
-            ):
-                raise RuntimeError(
-                    "artifact grading requires submission storage; set "
-                    f"{submission_artifacts.SUBMISSION_ARTIFACT_BUCKET_ENV} and "
-                    f"{submission_artifacts.SUBMISSION_ARTIFACT_REGION_ENV}"
-                )
-            try:
-                if self.service.eval_mode == EvalMode.SANDBOX:
-                    async with _grading_provider_config().create_provider() as provider:
-                        self._grading_provider = provider
+            sentry_lifespan_scope = (
+                sentry_sdk.isolation_scope() if sentry_enabled else nullcontext()
+            )
+            with sentry_lifespan_scope:
+                self._bind_service_context(self._service_version)
+                try:
+                    require_supported_auth_config()
+                    allowlist = load_allowlist()
+                    if not os.getenv("BENCHMARK_CATALOG_API_URL", "").strip():
+                        evaluation_quota.require_configured(
+                            allowlist, service_name=configured_deployment_name
+                        )
+                    submission_artifacts.require_configured()
+                    if not submission_artifacts.is_configured():
+                        logger.warning(
+                            f"{submission_artifacts.SUBMISSION_ARTIFACT_BUCKET_ENV} is not set; "
+                            "POST /v1/submissions/upload-url will return 503"
+                        )
+                    self.service = await service_cls.create()
+                    self._bind_service_context(self._current_service_version())
+                    if (
+                        self.service.eval_mode
+                        in {
+                            EvalMode.IN_PROCESS_ARTIFACT,
+                            EvalMode.IN_PROCESS_MATERIALIZED_ARTIFACT,
+                            EvalMode.SANDBOX,
+                        }
+                        and self.service.accepted_submission_schemas.get(
+                            V1PayloadType.ARTIFACT
+                        )
+                        and not submission_artifacts.is_configured()
+                    ):
+                        raise RuntimeError(
+                            "artifact grading requires submission storage; set "
+                            f"{submission_artifacts.SUBMISSION_ARTIFACT_BUCKET_ENV} and "
+                            f"{submission_artifacts.SUBMISSION_ARTIFACT_REGION_ENV}"
+                        )
+                    try:
+                        if self.service.eval_mode == EvalMode.SANDBOX:
+                            async with (
+                                _grading_provider_config().create_provider() as provider
+                            ):
+                                self._grading_provider = provider
+                                yield
+                                return
                         yield
-                        return
-                yield
-            finally:
-                await close_catalog_client()
+                    finally:
+                        await close_catalog_client()
+                except Exception as exc:
+                    if sentry_enabled:
+                        capture_exception(exc)
+                    raise
 
         super().__init__(title=service_cls.__name__, lifespan=lifespan)
         self._grading_provider: SandboxProvider | None = None
@@ -370,11 +383,21 @@ class BenchmarkServiceApp(FastAPI):
         self.add_middleware(InflightMiddleware, service_name=self._deployment_name)
         self._register_routes()
 
+    def _bind_service_context(self, service_version: str | None) -> None:
+        if not self._sentry_enabled:
+            return
+        bind_service_context(
+            service_name=self._deployment_name,
+            framework_version=_framework_version,
+            service_version=service_version,
+        )
+
     def _register_routes(self) -> None:
         @self.middleware("http")
         async def _check_auth(request: Request, call_next):  # type: ignore[no-untyped-def]
             clear_request_tenant_config()
             if self._sentry_enabled:
+                self._bind_service_context(self._current_service_version())
                 bind_request_context(request.headers)
             try:
                 if request.url.path in _PUBLIC_PATHS:
@@ -446,6 +469,7 @@ class BenchmarkServiceApp(FastAPI):
 
     async def _authorize_websocket(self, websocket: WebSocket) -> str | None:
         """Authenticate a WebSocket caller. Returns tenant id, or None after closing 1008."""
+        self._bind_service_context(self._current_service_version())
         tenant = await self.service.resolve_tenant(dict(websocket.headers))
         if tenant is None:
             await websocket.close(code=1008, reason="Unauthorized")

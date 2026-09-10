@@ -24,24 +24,20 @@ _task_id: ContextVar[str | None] = ContextVar("benchmark_service_task_id", defau
 _tracer = trace.get_tracer("benchmark_service.client")
 
 
-def init_sentry(*, service_name: str, framework_version: str, service_version: str | None) -> bool:
-    """Initialize native Sentry telemetry when a DSN is configured."""
+def init_sentry() -> bool:
+    """Initialize the process-wide Sentry client once when a DSN is configured."""
     dsn = os.getenv(SENTRY_DSN_ENV)
     if not dsn:
         return False
 
-    sentry_sdk.init(
-        dsn=dsn,
-        environment=os.getenv(SENTRY_ENVIRONMENT_ENV),
-        release=os.getenv(SENTRY_RELEASE_ENV),
-        traces_sample_rate=1.0,
-        integrations=[LoggingIntegration(level=None, event_level=None, sentry_logs_level=None)],
-    )
-    scope = sentry_sdk.get_global_scope()
-    scope.set_tag("service.name", service_name)
-    scope.set_tag("framework.version", framework_version)
-    if service_version is not None:
-        scope.set_tag("service.version", service_version)
+    if not sentry_sdk.is_initialized():
+        sentry_sdk.init(
+            dsn=dsn,
+            environment=os.getenv(SENTRY_ENVIRONMENT_ENV),
+            release=os.getenv(SENTRY_RELEASE_ENV),
+            traces_sample_rate=1.0,
+            integrations=[LoggingIntegration(level=None, event_level=None, sentry_logs_level=None)],
+        )
     return True
 
 
@@ -77,6 +73,14 @@ def websocket_request_span(operation: str, headers: Mapping[str, str]) -> Iterat
     """Create the explicit WebSocket client span and inject its request headers."""
     with _tracer.start_as_current_span(operation, kind=SpanKind.CLIENT):
         yield request_headers(headers)
+
+
+def bind_service_context(*, service_name: str, framework_version: str, service_version: str | None) -> None:
+    """Attach app-owned service identity to the current native Sentry scope."""
+    sentry_sdk.set_tag("service.name", service_name)
+    sentry_sdk.set_tag("framework.version", framework_version)
+    if service_version is not None:
+        sentry_sdk.set_tag("service.version", service_version)
 
 
 def bind_request_context(

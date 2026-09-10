@@ -305,10 +305,10 @@ async def test_http_client_transport_span_injects_trace_and_dynamic_identity(
     app = FastAPI()
     observed_headers: dict[str, str] = {}
 
-    @app.get("/health")
     async def health(request: Request) -> dict[str, str]:
         observed_headers.update(request.headers)
         return {"status": "ok"}
+    app.add_api_route("/health", health, methods=["GET"])
 
     instrumentor = HTTPXClientInstrumentor()
     instrumentor.instrument(tracer_provider=provider)
@@ -353,7 +353,6 @@ async def test_websocket_handshake_uses_its_client_span_and_dynamic_identity(
     app = FastAPI()
     observed_headers: dict[str, str] = {}
 
-    @app.websocket("/ws/evaluate-response")
     async def evaluate_response(websocket: WebSocket) -> None:
         observed_headers.update(websocket.headers)
         await websocket.accept()
@@ -368,6 +367,7 @@ async def test_websocket_handshake_uses_its_client_span_and_dynamic_identity(
             }
         )
         await websocket.close()
+    app.add_api_websocket_route("/ws/evaluate-response", evaluate_response)
 
     async with _serve_loopback(app) as url:
         async with BenchmarkServiceClient(url, {"Authorization": "Bearer test"}) as client:

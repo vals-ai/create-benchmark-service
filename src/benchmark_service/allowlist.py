@@ -136,7 +136,7 @@ class CatalogAllowlistClient:
 
     @retry(
         retry=(
-            retry_if_exception_type((httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError))
+            retry_if_exception_type((TimeoutError, httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError))
             | retry_if_result(_transient_catalog_response)
         ),
         stop=stop_after_attempt(3),
@@ -144,7 +144,8 @@ class CatalogAllowlistClient:
         reraise=True,
     )
     async def _fetch_policy(self, access_key: str) -> httpx.Response:
-        return await self._client.get(self.endpoint, headers={DESCOPE_API_KEY_HEADER: access_key})
+        async with asyncio.timeout(min(self._request_timeout, CATALOG_ATTEMPT_TIMEOUT_SECONDS)):
+            return await self._client.get(self.endpoint, headers={DESCOPE_API_KEY_HEADER: access_key})
 
     async def get_tenant_config(self, access_key: str, tenant: str) -> TenantConfig | None:
         """Fetch a tenant policy, returning ``None`` for misses or failures."""

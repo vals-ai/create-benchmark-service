@@ -206,6 +206,25 @@ async def test_request_deadline_bounds_the_whole_lookup() -> None:
 
 
 @pytest.mark.asyncio
+async def test_attempt_deadline_allows_a_retry_within_the_total_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("benchmark_service.allowlist.CATALOG_ATTEMPT_TIMEOUT_SECONDS", 0.01)
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if len(requests) == 1:
+            await asyncio.sleep(10)
+        return _response({"name": "example-service", "datasets": ["default"], "trial_mode": False})
+
+    client = CatalogAllowlistClient(
+        "https://catalog.example.test", "example-service", transport=httpx.MockTransport(handler), timeout=1
+    )
+    assert await client.get_tenant_config("key-acme", "acme") is not None
+    assert len(requests) == 2
+    await client.aclose()
+
+
+@pytest.mark.asyncio
 async def test_cancellation_is_not_retried_or_swallowed() -> None:
     started = asyncio.Event()
     requests: list[httpx.Request] = []

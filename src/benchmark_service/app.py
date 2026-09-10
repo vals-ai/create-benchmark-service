@@ -31,6 +31,12 @@ from benchmark_service.base import BenchmarkService
 from benchmark_service.context import sandbox_provider_scope
 from benchmark_service.grading import SUBMISSION_ARTIFACT_SANDBOX_PATH, collapse_stream, evaluate_submission
 from benchmark_service.inflight import InflightMiddleware
+from benchmark_service.observability import (
+    bind_request_context,
+    capture_exception,
+    capture_http_exception,
+    init_sentry,
+)
 from benchmark_service.schemas import (
     ArtifactGradingSubmission,
     EvalMode,
@@ -309,6 +315,12 @@ class BenchmarkServiceApp(FastAPI):
     def __init__(self, service_cls: type[BenchmarkService]) -> None:
         self._service_name, self._service_version = _get_service_metadata(service_cls)
         configured_deployment_name = os.getenv(evaluation_quota.SERVICE_NAME_ENV, "").strip()
+        deployment_name = configured_deployment_name or service_cls.__name__
+        sentry_enabled = init_sentry(
+            service_name=deployment_name,
+            framework_version=_framework_version,
+            service_version=self._service_version,
+        )
 
         @asynccontextmanager
         async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
@@ -353,7 +365,8 @@ class BenchmarkServiceApp(FastAPI):
         super().__init__(title=service_cls.__name__, lifespan=lifespan)
         self._grading_provider: SandboxProvider | None = None
         self._grading_admission = _GradingAdmission.from_env()
-        self._deployment_name = configured_deployment_name or service_cls.__name__
+        self._deployment_name = deployment_name
+        self._sentry_enabled = sentry_enabled
         self.add_middleware(InflightMiddleware, service_name=self._deployment_name)
         self._register_routes()
 
@@ -361,6 +374,8 @@ class BenchmarkServiceApp(FastAPI):
         @self.middleware("http")
         async def _check_auth(request: Request, call_next):  # type: ignore[no-untyped-def]
             clear_request_tenant_config()
+            if self._sentry_enabled:
+                bind_request_context(request.headers)
             try:
                 if request.url.path in _PUBLIC_PATHS:
                     return await call_next(request)  # type: ignore[reportUnknownVariableType]
@@ -407,6 +422,8 @@ class BenchmarkServiceApp(FastAPI):
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
     async def _exception_handler(self, _request: Request, exc: Exception) -> Response:
+        if self._sentry_enabled:
+            capture_http_exception(exc)
         logger.error(f"Error: {exc}")
         logger.error(traceback.format_exc())
         return JSONResponse(status_code=500, content={"detail": "Internal server error"})
@@ -492,6 +509,8 @@ class BenchmarkServiceApp(FastAPI):
         slice: str | None = Query(default=None, description="Slice of dataset (e.g., '3:10:1', '1:10:2')"),
         dataset: str | None = Query(default=None, description="Dataset name to use (defaults to 'default')"),
     ) -> VerifyTaskIdsResponse:
+        if self._sentry_enabled:
+            bind_request_context(request.headers, dataset=dataset)
         if not await self.service.check_dataset_access(request.state.tenant, dataset):
             raise HTTPException(status_code=403, detail="Dataset not allowed")
 
@@ -514,6 +533,8 @@ class BenchmarkServiceApp(FastAPI):
         skip_validation: bool = Query(False, description="Skip validation of task existence"),
         dataset: str | None = Query(default=None, description="Dataset name to use (defaults to 'default')"),
     ) -> RetrieveTaskResponse:
+        if self._sentry_enabled:
+            bind_request_context(request.headers, task_id=task_id, dataset=dataset)
         if not await self.service.check_dataset_access(request.state.tenant, dataset):
             raise HTTPException(status_code=403, detail="Dataset not allowed")
         return await self.service.retrieve_task(task_id, skip_validation, dataset=dataset)
@@ -527,6 +548,13 @@ class BenchmarkServiceApp(FastAPI):
                 return
 
             request = SetupTaskRequest(**await websocket.receive_json())
+            if self._sentry_enabled:
+                bind_request_context(
+                    websocket.headers,
+                    task_id=request.task_id,
+                    dataset=request.dataset,
+                    sandbox_id=request.instance_id,
+                )
             sandbox_config = _request_sandbox_provider_config(request, websocket)
 
             if not await self.service.check_dataset_access(tenant, request.dataset):
@@ -545,6 +573,8 @@ class BenchmarkServiceApp(FastAPI):
         except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
             logger.warning("setup-task websocket disconnected")
         except Exception as e:
+            if self._sentry_enabled:
+                capture_exception(e)
             error_msg = f"{str(e)}\n{traceback.format_exc()}"
             logger.error(f"WebSocket error: {error_msg}")
             error_chunk = StreamErrorChunk(type="error", data=error_msg)
@@ -556,6 +586,8 @@ class BenchmarkServiceApp(FastAPI):
                 await websocket.close()
 
     async def _evaluate_response(self, request: Request, body: EvaluateResponseRequest) -> Any:
+        if self._sentry_enabled:
+            bind_request_context(request.headers, task_id=body.task_id, dataset=body.dataset)
         if not await self.service.check_dataset_access(request.state.tenant, body.dataset):
             raise HTTPException(status_code=403, detail="Dataset not allowed")
         await self._consume_evaluation_quota(cast(str, request.state.tenant))
@@ -571,6 +603,8 @@ class BenchmarkServiceApp(FastAPI):
 
             data = await websocket.receive_json()
             request = EvaluateResponseRequest(**data)
+            if self._sentry_enabled:
+                bind_request_context(websocket.headers, task_id=request.task_id, dataset=request.dataset)
 
             if not await self.service.check_dataset_access(tenant, request.dataset):
                 await websocket.close(code=1008, reason="Dataset not allowed")
@@ -587,6 +621,8 @@ class BenchmarkServiceApp(FastAPI):
         except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
             logger.warning("evaluate-response websocket disconnected")
         except Exception as e:
+            if self._sentry_enabled:
+                capture_exception(e)
             error_msg = f"{str(e)}\n{traceback.format_exc()}"
             logger.error(f"WebSocket error: {error_msg}")
             error_chunk = StreamErrorChunk(type="error", data=error_msg)
@@ -606,6 +642,13 @@ class BenchmarkServiceApp(FastAPI):
                 return
 
             request = EvaluateInstanceRequest(**await websocket.receive_json())
+            if self._sentry_enabled:
+                bind_request_context(
+                    websocket.headers,
+                    task_id=request.task_id,
+                    dataset=request.dataset,
+                    sandbox_id=request.instance_id,
+                )
             sandbox_config = _request_sandbox_provider_config(request, websocket)
 
             if not await self.service.check_dataset_access(tenant, request.dataset):
@@ -629,6 +672,8 @@ class BenchmarkServiceApp(FastAPI):
         except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
             logger.warning("evaluate-instance websocket disconnected")
         except Exception as e:
+            if self._sentry_enabled:
+                capture_exception(e)
             error_msg = f"{str(e)}\n{traceback.format_exc()}"
             logger.error(f"WebSocket error: {error_msg}")
             error_chunk = StreamErrorChunk(type="error", data=error_msg)
@@ -640,6 +685,8 @@ class BenchmarkServiceApp(FastAPI):
                 await websocket.close()
 
     async def _v1_evaluate(self, request: Request, body: V1EvalRequest) -> V1EvalResponse:
+        if self._sentry_enabled:
+            bind_request_context(request.headers, run_id=body.run_id, task_id=body.task_id, dataset=body.dataset)
         tenant = cast(str, request.state.tenant)
         _require_descope_tenant(tenant)
         if not await self.service.check_dataset_access(tenant, body.dataset):
@@ -813,6 +860,8 @@ class BenchmarkServiceApp(FastAPI):
         return response
 
     async def _v1_submission_upload_url(self, request: Request, body: V1UploadUrlRequest) -> V1UploadUrlResponse:
+        if self._sentry_enabled:
+            bind_request_context(request.headers, run_id=body.run_id, task_id=body.task_id, dataset=body.dataset)
         tenant = cast(str, request.state.tenant)
         _require_descope_tenant(tenant)
         if not submission_artifacts.is_configured():
@@ -841,6 +890,8 @@ class BenchmarkServiceApp(FastAPI):
         )
 
     async def _v1_score(self, request: Request, body: V1ScoreRequest) -> V1ScoreResponse:
+        if self._sentry_enabled:
+            bind_request_context(request.headers, run_id=body.run_id, dataset=body.dataset)
         _require_descope_tenant(request.state.tenant)
         if not await self.service.check_dataset_access(request.state.tenant, body.dataset):
             raise HTTPException(status_code=403, detail="Dataset not allowed")
@@ -861,6 +912,8 @@ class BenchmarkServiceApp(FastAPI):
         return response
 
     async def _v1_list_dataset_tasks(self, request: Request, dataset: str) -> V1DatasetTasksResponse:
+        if self._sentry_enabled:
+            bind_request_context(request.headers, dataset=dataset)
         _require_descope_tenant(request.state.tenant)
         if not await self.service.check_dataset_access(request.state.tenant, dataset):
             raise HTTPException(status_code=403, detail=f"Dataset={dataset} access not allowed")
@@ -882,6 +935,8 @@ class BenchmarkServiceApp(FastAPI):
         return response
 
     async def _final_score(self, request: Request, body: FinalScoreRequest) -> FinalScoreResponse:
+        if self._sentry_enabled:
+            bind_request_context(request.headers, dataset=body.dataset)
         if not await self.service.check_dataset_access(request.state.tenant, body.dataset):
             raise HTTPException(status_code=403, detail="Dataset not allowed")
 

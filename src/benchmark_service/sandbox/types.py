@@ -113,6 +113,14 @@ class SandboxCapacity(BaseModel):
     disk: ResourceCapacity
 
 
+class SandboxCapacityDomain(BaseModel):
+    model_config = ConfigDict(frozen=True)
+
+    target_id: str = Field(min_length=1)
+    sandbox_class: str = Field(min_length=1)
+    capacity: SandboxCapacity
+
+
 class VolumeMount(BaseModel):
     """A named, persistent volume attached to a sandbox at a fixed path.
 
@@ -333,6 +341,9 @@ class SandboxProvider(ABC):
         return True
 
     async def get_capacity(self) -> SandboxCapacity | None:
+        return None
+
+    async def get_capacity_domains(self) -> list[SandboxCapacityDomain] | None:
         return None
 
     @abstractmethod

@@ -3,7 +3,8 @@
 Run: uv run pytest tests/test_sandbox_contract.py
 """
 
-from benchmark_service.sandbox import ModalProviderConfig, Sandbox, SandboxProvider
+from benchmark_service import SandboxCapacityDomain as RootSandboxCapacityDomain
+from benchmark_service.sandbox import ModalProviderConfig, Sandbox, SandboxCapacityDomain, SandboxProvider
 
 
 _SANDBOX_IMPLEMENTATIONS = tuple(
@@ -30,7 +31,12 @@ def test_sandbox_implementations_are_concrete() -> None:
     assert not incomplete, f"Sandbox implementations are missing abstract methods: {incomplete}"
 
 
+def test_capacity_domain_is_exported_from_public_packages() -> None:
+    assert RootSandboxCapacityDomain is SandboxCapacityDomain
+
+
 async def test_provider_capacity_defaults_to_unsupported() -> None:
     provider = ModalProviderConfig(MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret").create_provider()
 
     assert await provider.get_capacity() is None
+    assert await provider.get_capacity_domains() is None

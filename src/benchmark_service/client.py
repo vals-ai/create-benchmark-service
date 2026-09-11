@@ -7,7 +7,7 @@ import inspect
 import logging
 import os
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass, field
 from typing import Any, TypeVar
 from uuid import uuid4
@@ -23,6 +23,7 @@ from tenacity import (
 )
 from websockets.exceptions import ConnectionClosed
 
+from benchmark_service.observability import correlation_scope, request_headers, websocket_request_span
 from benchmark_service.sandbox import SandboxNotFoundError, SandboxProvider, SandboxProviderConfig
 from benchmark_service.schemas import (
     EvaluateInstanceRequest,
@@ -279,6 +280,11 @@ class _SandboxRecoveryState:
         self.outage_started_epoch = None
 
 
+class _TelemetryAuth(httpx.Auth):
+    def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
+        request.headers.update(request_headers(request.headers))
+        yield request
+
 class BenchmarkServiceClient:
     """HTTP/WebSocket client for communicating with a benchmark service."""
 
@@ -312,6 +318,7 @@ class BenchmarkServiceClient:
         self._ws_idle_timeout_s = idle_timeout if idle_timeout is None or idle_timeout > 0 else None
         self._sandbox_providers = {}
         self._http_client = httpx.AsyncClient(
+            auth=_TelemetryAuth(),
             follow_redirects=True,
             timeout=timeout,
             headers=headers,
@@ -365,59 +372,61 @@ class BenchmarkServiceClient:
             BenchmarkServiceStreamIdleError: If the socket stays open but produces no
                 application message within the idle budget.
         """
-        async with websockets.connect(
-            f"{self._ws_url}/ws/{path}",
-            additional_headers=self._headers,
-            open_timeout=60,
-            ping_interval=_WS_PING_INTERVAL_S,
-            ping_timeout=_WS_PING_TIMEOUT_S,
-            max_size=10 * 1024 * 1024,  # 10MB
-        ) as websocket:
-            last_message_at = time.monotonic()
+        operation = f"WEBSOCKET /ws/{path}"
+        with websocket_request_span(operation, self._headers) as headers:
+            async with websockets.connect(
+                f"{self._ws_url}/ws/{path}",
+                additional_headers=headers,
+                open_timeout=60,
+                ping_interval=_WS_PING_INTERVAL_S,
+                ping_timeout=_WS_PING_TIMEOUT_S,
+                max_size=10 * 1024 * 1024,  # 10MB
+            ) as websocket:
+                last_message_at = time.monotonic()
 
-            try:
-                await websocket.send(request.model_dump_json())
+                try:
+                    await websocket.send(request.model_dump_json())
 
-                stream = aiter(websocket)
-                while True:
-                    try:
-                        message = await asyncio.wait_for(anext(stream), timeout=self._ws_idle_timeout_s)
-                    except StopAsyncIteration:
-                        break
-                    except TimeoutError:
-                        raise BenchmarkServiceStreamIdleError(
-                            idle_s=time.monotonic() - last_message_at,
-                            health_ok=await self._health_ok(),
-                        ) from None
+                    stream = aiter(websocket)
+                    while True:
+                        try:
+                            message = await asyncio.wait_for(anext(stream), timeout=self._ws_idle_timeout_s)
+                        except StopAsyncIteration:
+                            break
+                        except TimeoutError:
+                            raise BenchmarkServiceStreamIdleError(
+                                idle_s=time.monotonic() - last_message_at,
+                                health_ok=await self._health_ok(),
+                            ) from None
 
-                    last_message_at = time.monotonic()
-                    chunk: StreamChunk = _stream_chunk_adapter.validate_json(message)
+                        last_message_at = time.monotonic()
+                        chunk: StreamChunk = _stream_chunk_adapter.validate_json(message)
 
-                    match chunk.type:
-                        case "error":
-                            raise BenchmarkServiceError(chunk.data)
-                        case "result":
-                            return chunk.data
-                        case "message":
-                            if on_message:
-                                on_message(chunk.data)
-                        case "eval_resume_state":
-                            if on_eval_resume_state:
-                                on_eval_resume_state(chunk.data)
-            except ConnectionClosed as exc:
-                close_frame = exc.rcvd or exc.sent
+                        match chunk.type:
+                            case "error":
+                                raise BenchmarkServiceError(chunk.data)
+                            case "result":
+                                return chunk.data
+                            case "message":
+                                if on_message:
+                                    on_message(chunk.data)
+                            case "eval_resume_state":
+                                if on_eval_resume_state:
+                                    on_eval_resume_state(chunk.data)
+                except ConnectionClosed as exc:
+                    close_frame = exc.rcvd or exc.sent
+                    raise BenchmarkServiceStreamClosedError(
+                        close_code=close_frame.code if close_frame else None,
+                        close_reason=close_frame.reason if close_frame else None,
+                        idle_s=time.monotonic() - last_message_at,
+                    ) from exc
+
+                # The socket closed cleanly, but a stream without a terminal chunk is still broken.
                 raise BenchmarkServiceStreamClosedError(
-                    close_code=close_frame.code if close_frame else None,
-                    close_reason=close_frame.reason if close_frame else None,
+                    close_code=websocket.close_code,
+                    close_reason=websocket.close_reason,
                     idle_s=time.monotonic() - last_message_at,
-                ) from exc
-
-            # The socket closed cleanly, but a stream without a terminal chunk is still broken.
-            raise BenchmarkServiceStreamClosedError(
-                close_code=websocket.close_code,
-                close_reason=websocket.close_reason,
-                idle_s=time.monotonic() - last_message_at,
-            )
+                )
 
     async def _health_ok(self) -> bool:
         """Best-effort liveness probe used to describe an idle stream failure."""
@@ -555,44 +564,45 @@ class BenchmarkServiceClient:
         if any(issubclass(error_type, SandboxNotFoundError) for error_type in retryable_attempt_errors):
             raise ValueError("SandboxNotFoundError is controlled only by SandboxRecoveryPolicy")
 
-        state = _SandboxRecoveryState(
-            run_id=run_id,
-            task_id=task_id,
-            load_task=lambda: self.retrieve_task(task_id=task_id, dataset=dataset),
-            default_max_attempts=default_max_attempts,
-        )
+        with correlation_scope(run_id=run_id, task_id=task_id):
+            state = _SandboxRecoveryState(
+                run_id=run_id,
+                task_id=task_id,
+                load_task=lambda: self.retrieve_task(task_id=task_id, dataset=dataset),
+                default_max_attempts=default_max_attempts,
+            )
 
-        attempt_number = 1
-        while attempt_number <= state.max_attempts:
-            attempt = state.attempt(attempt_number)
-            try:
-                return await operation(attempt)
-            except SandboxNotFoundError as exc:
-                if state.task is None:
-                    await state.retrieve_task()
-                if not attempt.sandbox_loss_retry_available:
-                    raise
-                state.record_loss(attempt_number)
-                retry_error: Exception = exc
-            except Exception as exc:
-                if (
-                    not isinstance(exc, retryable_attempt_errors)
-                    or attempt_number >= state.max_attempts
-                    or state.consecutive_attempt_errors >= default_max_attempts - 1
-                ):
-                    raise
-                state.record_attempt_error()
-                retry_error = exc
+            attempt_number = 1
+            while attempt_number <= state.max_attempts:
+                attempt = state.attempt(attempt_number)
+                try:
+                    return await operation(attempt)
+                except SandboxNotFoundError as exc:
+                    if state.task is None:
+                        await state.retrieve_task()
+                    if not attempt.sandbox_loss_retry_available:
+                        raise
+                    state.record_loss(attempt_number)
+                    retry_error: Exception = exc
+                except Exception as exc:
+                    if (
+                        not isinstance(exc, retryable_attempt_errors)
+                        or attempt_number >= state.max_attempts
+                        or state.consecutive_attempt_errors >= default_max_attempts - 1
+                    ):
+                        raise
+                    state.record_attempt_error()
+                    retry_error = exc
 
-            if on_retry is not None:
-                callback_result = on_retry(attempt, retry_error)
-                if inspect.isawaitable(callback_result):
-                    await callback_result
-            if retry_delay_s:
-                await asyncio.sleep(retry_delay_s)
-            attempt_number += 1
+                if on_retry is not None:
+                    callback_result = on_retry(attempt, retry_error)
+                    if inspect.isawaitable(callback_result):
+                        await callback_result
+                if retry_delay_s:
+                    await asyncio.sleep(retry_delay_s)
+                attempt_number += 1
 
-        raise AssertionError("sandbox recovery loop exited without a result")
+            raise AssertionError("sandbox recovery loop exited without a result")
 
     async def setup_task(
         self,
@@ -770,10 +780,11 @@ class BenchmarkServiceClient:
             dataset=dataset,
             filename=filename,
         )
-        response = await self._http_client.post(
-            f"{self._url}/v1/submissions/upload-url",
-            json=request.model_dump(mode="json", exclude_none=True),
-        )
+        with correlation_scope(run_id=run_id, task_id=task_id):
+            response = await self._http_client.post(
+                f"{self._url}/v1/submissions/upload-url",
+                json=request.model_dump(mode="json", exclude_none=True),
+            )
 
         if response.status_code == 401:
             raise _unauthenticated_error(response)
@@ -809,10 +820,11 @@ class BenchmarkServiceClient:
             payload=V1Payload(type=payload_type, schema=payload_schema, data=payload_data),
             versions=versions or V1Versions(),
         )
-        response = await self._http_client.post(
-            f"{self._url}/v1/evaluate",
-            json=request.model_dump(mode="json", by_alias=True, exclude_none=True),
-        )
+        with correlation_scope(run_id=run_id, task_id=task_id):
+            response = await self._http_client.post(
+                f"{self._url}/v1/evaluate",
+                json=request.model_dump(mode="json", by_alias=True, exclude_none=True),
+            )
 
         if response.status_code == 401:
             raise _unauthenticated_error(response)
@@ -833,10 +845,11 @@ class BenchmarkServiceClient:
     ) -> V1ScoreResponse:
         """Score via the lab-facing /v1/score surface without retrying a submitted request."""
         request = V1ScoreRequest(run_id=run_id, dataset=dataset, evaluation_results=evaluation_results)
-        response = await self._http_client.post(
-            f"{self._url}/v1/score",
-            json=request.model_dump(mode="json", exclude_none=True),
-        )
+        with correlation_scope(run_id=run_id):
+            response = await self._http_client.post(
+                f"{self._url}/v1/score",
+                json=request.model_dump(mode="json", exclude_none=True),
+            )
 
         if response.status_code == 401:
             raise _unauthenticated_error(response)

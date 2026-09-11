@@ -30,6 +30,7 @@ from benchmark_service.schemas import (
     StreamChunk,
     StreamResultChunk,
     TaskFilter,
+    TaskOutcome,
 )
 from benchmark_service.v1_schemas import V1PayloadType, V1Task
 
@@ -408,6 +409,15 @@ class BenchmarkService(ABC):
         raise NotImplementedError(
             f"{type(self).__name__}.prepare_grading_sandbox must be implemented for eval_mode == EvalMode.SANDBOX"
         )
+
+    async def calculate_final_score_with_outcomes(
+        self,
+        evaluation_results: dict[str, Any],
+        task_outcomes: dict[str, TaskOutcome],
+        dataset: str | None = None,
+    ) -> FinalScoreResult:
+        """Opt in to task provenance without changing legacy score inputs."""
+        return await self.calculate_final_score(evaluation_results, dataset=dataset)
 
     @abstractmethod
     async def calculate_final_score(

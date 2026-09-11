@@ -240,6 +240,28 @@ class EvaluateInstanceRequest(BaseModel):
     dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
 
 
+class EvaluatedTaskOutcome(BaseModel):
+    kind: Literal["evaluated"] = "evaluated"
+
+
+class ErrorTaskOutcome(BaseModel):
+    kind: Literal["error"] = "error"
+    producer: str | None
+    operation: str | None
+    error_type: str | None
+    cause_code: str | None
+
+
+class UnavailableTaskOutcome(BaseModel):
+    kind: Literal["unavailable"] = "unavailable"
+    reason: Literal["not_finished", "missing_result"]
+
+
+TaskOutcome = Annotated[
+    EvaluatedTaskOutcome | ErrorTaskOutcome | UnavailableTaskOutcome, Field(discriminator="kind")
+]
+
+
 class FinalScoreRequest(BaseModel):
     """
     Request containing all evaluation results to calculate final score.
@@ -255,6 +277,17 @@ class FinalScoreRequest(BaseModel):
 
     evaluation_results: dict[str, Any] = Field(description="Mapping of task_id to benchmark-specific evaluation result")
     dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
+    task_outcomes: dict[str, TaskOutcome] | None = None
+
+    @model_validator(mode="after")
+    def validate_outcome_tasks(self) -> "FinalScoreRequest":
+        if self.task_outcomes is not None and self.task_outcomes.keys() != self.evaluation_results.keys():
+            raise ValueError("Task outcomes must match evaluation result task IDs")
+        if self.task_outcomes is not None:
+            for task_id, outcome in self.task_outcomes.items():
+                if (outcome.kind == "evaluated") != (self.evaluation_results[task_id] is not None):
+                    raise ValueError("Only evaluated task outcomes can contain an evaluation result")
+        return self
 
 
 class FinalScoreResult(BaseModel):

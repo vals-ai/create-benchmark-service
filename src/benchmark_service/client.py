@@ -35,6 +35,7 @@ from benchmark_service.schemas import (
     SetupTaskRequest,
     SetupTaskResponse,
     StreamChunk,
+    TaskOutcome,
     VerifyTaskIdsResponse,
     VersionResponse,
 )
@@ -724,7 +725,13 @@ class BenchmarkServiceClient:
         return await self._websocket_request("evaluate-instance", request, on_message, on_eval_resume_state)
 
     @_retry_http
-    async def final_score(self, evaluation_results: dict[str, Any], dataset: str | None = None) -> FinalScoreResponse:
+    async def final_score(
+        self,
+        evaluation_results: dict[str, Any],
+        dataset: str | None = None,
+        *,
+        task_outcomes: dict[str, TaskOutcome] | None = None,
+    ) -> FinalScoreResponse:
         """Compute the final score from evaluation results.
 
         Args:
@@ -733,6 +740,9 @@ class BenchmarkServiceClient:
         body: dict[str, Any] = {"evaluation_results": evaluation_results}
         if dataset is not None:
             body["dataset"] = dataset
+
+        if task_outcomes is not None:
+            body["task_outcomes"] = {task_id: outcome.model_dump() for task_id, outcome in task_outcomes.items()}
 
         response = await self._http_client.post(
             f"{self._url}/final-score/",

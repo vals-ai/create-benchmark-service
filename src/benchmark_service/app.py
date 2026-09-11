@@ -978,7 +978,12 @@ class BenchmarkServiceApp(FastAPI):
 
         tasks_evaluated = list(body.evaluation_results.keys())
         validated_task_ids = await self.service.validate_task_ids(tasks_evaluated, dataset=body.dataset)
-        result = await self.service.calculate_final_score(body.evaluation_results, dataset=body.dataset)
+        if body.task_outcomes is None:
+            result = await self.service.calculate_final_score(body.evaluation_results, dataset=body.dataset)
+        else:
+            result = await self.service.calculate_final_score_with_outcomes(
+                body.evaluation_results, body.task_outcomes, dataset=body.dataset
+            )
 
         return FinalScoreResponse(
             tasks_evaluated=validated_task_ids,

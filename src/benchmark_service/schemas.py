@@ -328,6 +328,7 @@ class StreamErrorChunk(BaseModel):
 
     type: Literal["error"] = Field(description="Chunk type identifier")
     data: str = Field(description="Error message")
+    error_code: Literal["resumable_evaluation_infrastructure"] | None = None
 
 
 class StreamEvalResumeStateChunk(BaseModel):

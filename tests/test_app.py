@@ -12,6 +12,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from benchmark_service import auth as auth_module
 from benchmark_service.app import BenchmarkServiceApp, send_json_if_connected
+from benchmark_service.base import ResumableEvaluationInfrastructureError
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
 from benchmark_service.sandbox.types import (
@@ -244,6 +245,26 @@ def test_websocket_evaluate_response_with_eval_resume_state(client: TestClient) 
                 "state": {"artifact_prefix": "s3://bucket/run"},
             },
         }
+
+
+@pytest.mark.parametrize("resumable", [False, True])
+def test_websocket_evaluation_error_code(client: TestClient, monkeypatch: pytest.MonkeyPatch, resumable: bool) -> None:
+    async def fail(*args: Any, **kwargs: Any) -> AsyncGenerator[StreamResultChunk, None]:
+        error = ResumableEvaluationInfrastructureError if resumable else RuntimeError
+        raise error("evaluation failed")
+        yield  # pragma: no cover
+
+    app = cast(BenchmarkServiceApp, client.app)
+    monkeypatch.setattr(app.service, "stream_evaluate_response", fail)
+    with client.websocket_connect("/ws/evaluate-response") as ws:
+        ws.send_json({"task_id": "task-1", "eval_resume_state": {"candidate": "saved"}})
+        chunk = ws.receive_json()
+    assert chunk["type"] == "error"
+    assert "evaluation failed" in chunk["data"]
+    if resumable:
+        assert chunk["error_code"] == "resumable_evaluation_infrastructure"
+    else:
+        assert "error_code" not in chunk
 
 
 def test_websocket_setup_task_resolves_sandbox_provider(

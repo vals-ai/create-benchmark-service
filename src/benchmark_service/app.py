@@ -28,7 +28,7 @@ from benchmark_service.auth import (
     load_allowlist,
     require_supported_auth_config,
 )
-from benchmark_service.base import BenchmarkService
+from benchmark_service.base import BenchmarkService, ResumableEvaluationInfrastructureError
 from benchmark_service.context import sandbox_provider_scope
 from benchmark_service.grading import SUBMISSION_ARTIFACT_SANDBOX_PATH, collapse_stream, evaluate_submission
 from benchmark_service.inflight import InflightMiddleware
@@ -649,8 +649,14 @@ class BenchmarkServiceApp(FastAPI):
                 capture_exception(e)
             error_msg = f"{str(e)}\n{traceback.format_exc()}"
             logger.error(f"WebSocket error: {error_msg}")
-            error_chunk = StreamErrorChunk(type="error", data=error_msg)
-            if not await send_json_if_connected(websocket, error_chunk.model_dump()):
+            error_chunk = StreamErrorChunk(
+                type="error",
+                data=error_msg,
+                error_code="resumable_evaluation_infrastructure"
+                if isinstance(e, ResumableEvaluationInfrastructureError)
+                else None,
+            )
+            if not await send_json_if_connected(websocket, error_chunk.model_dump(exclude_none=True)):
                 logger.warning("evaluate-response websocket disconnected before error chunk could be sent")
         finally:
             clear_request_tenant_config()
@@ -700,8 +706,14 @@ class BenchmarkServiceApp(FastAPI):
                 capture_exception(e)
             error_msg = f"{str(e)}\n{traceback.format_exc()}"
             logger.error(f"WebSocket error: {error_msg}")
-            error_chunk = StreamErrorChunk(type="error", data=error_msg)
-            if not await send_json_if_connected(websocket, error_chunk.model_dump()):
+            error_chunk = StreamErrorChunk(
+                type="error",
+                data=error_msg,
+                error_code="resumable_evaluation_infrastructure"
+                if isinstance(e, ResumableEvaluationInfrastructureError)
+                else None,
+            )
+            if not await send_json_if_connected(websocket, error_chunk.model_dump(exclude_none=True)):
                 logger.warning("evaluate-instance websocket disconnected before error chunk could be sent")
         finally:
             clear_request_tenant_config()

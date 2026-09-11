@@ -27,6 +27,7 @@ from benchmark_service.client import (
     _SERVER_PING_TIMEOUT_S,  # pyright: ignore[reportPrivateUsage]
     BenchmarkServiceClient,
     BenchmarkServiceError,
+    BenchmarkServiceResumableEvaluationError,
     SandboxRecoveryAttempt,
 )
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
@@ -939,14 +940,20 @@ async def test_ws_result_chunk(method: str, args: list[str]) -> None:
     ],
     ids=["setup_task", "evaluate_instance"],
 )
-async def test_ws_error_chunk(method: str, args: list[str]) -> None:
-    messages = [json.dumps({"type": "error", "data": "something went wrong"})]
+@pytest.mark.parametrize("resumable", [False, True])
+async def test_ws_error_chunk(method: str, args: list[str], resumable: bool) -> None:
+    chunk = {"type": "error", "data": "something went wrong"}
+    if resumable:
+        chunk["error_code"] = "resumable_evaluation_infrastructure"
+    messages = [json.dumps(chunk)]
     mock_connect = _ws_mock(messages)
 
     client = _make_client()
     with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
-        with pytest.raises(BenchmarkServiceError, match="something went wrong"):
+        error_type = BenchmarkServiceResumableEvaluationError if resumable else BenchmarkServiceError
+        with pytest.raises(error_type, match="something went wrong") as error:
             await getattr(client, method)(*args)
+        assert type(error.value) is error_type
 
 
 @pytest.mark.parametrize(

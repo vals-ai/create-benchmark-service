@@ -123,6 +123,10 @@ class BenchmarkServiceError(Exception):
         self.status_code = status_code
 
 
+class BenchmarkServiceResumableEvaluationError(BenchmarkServiceError):
+    """Evaluation infrastructure failed and the saved evaluation can resume."""
+
+
 class BenchmarkServiceUnauthenticatedError(BenchmarkServiceError):
     """Exception raised when the benchmark service returns 401 — credentials are missing or invalid."""
 
@@ -404,6 +408,8 @@ class BenchmarkServiceClient:
 
                         match chunk.type:
                             case "error":
+                                if chunk.error_code == "resumable_evaluation_infrastructure":
+                                    raise BenchmarkServiceResumableEvaluationError(chunk.data)
                                 raise BenchmarkServiceError(chunk.data)
                             case "result":
                                 return chunk.data

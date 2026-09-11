@@ -34,6 +34,10 @@ from benchmark_service.schemas import (
 from benchmark_service.v1_schemas import V1PayloadType, V1Task
 
 
+class ResumableEvaluationInfrastructureError(RuntimeError):
+    """Evaluation infrastructure failed after durable resume state was saved."""
+
+
 class BenchmarkService(ABC):
     """Abstract base class for benchmark implementations.
 

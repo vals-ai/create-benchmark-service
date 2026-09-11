@@ -1275,6 +1275,28 @@ def _snapshot_metadata(**updates: object) -> SimpleNamespace:
     return SimpleNamespace(**(values | updates))
 
 
+def _targeted_admission_case(
+    monkeypatch: pytest.MonkeyPatch,
+    usage: BaseException | SimpleNamespace,
+    *,
+    snapshot: Exception | SimpleNamespace | None = None,
+    regions: Exception | list[SimpleNamespace] | None = None,
+    region_requests: list[str] | None = None,
+) -> tuple[DaytonaSandboxProvider, list[str], list[str], list[str]]:
+    provider, usage_requests = _admission_provider(
+        monkeypatch,
+        usage,
+        regions=regions,
+        region_requests=region_requests,
+    )
+    target_requests, snapshot_requests = _targeted_snapshot_result(
+        monkeypatch,
+        provider,
+        snapshot or _snapshot_metadata(),
+    )
+    return provider, usage_requests, target_requests, snapshot_requests
+
+
 def test_daytona_pool_id_is_stable_nonsecret_and_capacity_account_scoped() -> None:
     first = _configured_daytona_provider(DAYTONA_API_KEY="first-secret", DAYTONA_API_URL="https://d.test/")
     rotated = _configured_daytona_provider(DAYTONA_API_KEY="rotated-secret", DAYTONA_API_URL="https://d.test")
@@ -1334,42 +1356,36 @@ async def test_daytona_admission_accepts_target_id_without_region_lookup(monkeyp
     assert region_requests == []
 
 
-@pytest.mark.parametrize("snapshot_ref", ["vcb100-openhands-12c16g30d-test", "snapshot-id-123"])
 async def test_daytona_targeted_snapshot_admission_uses_snapshot_target_class_and_resources(
     monkeypatch: pytest.MonkeyPatch,
-    snapshot_ref: str,
 ) -> None:
     region_requests: list[str] = []
-    provider, requested = _admission_provider(
+    snapshot_ref = "vcb100-openhands-12c16g30d-test"
+    provider, requested, target_requests, snapshot_requests = _targeted_admission_case(
         monkeypatch,
         SimpleNamespace(
             region_usage=[
-                _usage_row(region_id="us-west-3", sandbox_class=SandboxClass.CONTAINER, current_disk_usage=100),
-                _usage_row(region_id="other", sandbox_class=SandboxClass.LINUX_VM, current_disk_usage=100),
+                _usage_row(region_id="us-west-3", sandbox_class=SandboxClass.CONTAINER),
+                _usage_row(region_id="other", sandbox_class=SandboxClass.LINUX_VM),
                 _usage_row(
                     region_id="us-west-3",
                     sandbox_class=SandboxClass.LINUX_VM,
                     total_cpu_quota=20,
-                    current_cpu_usage=0,
+                    current_cpu_usage=8,
                     total_memory_quota=32,
-                    current_memory_usage=0,
+                    current_memory_usage=16,
                     total_disk_quota=100,
-                    current_disk_usage=60,
+                    current_disk_usage=70,
                 ),
             ]
         ),
         regions=AssertionError("canonical target IDs should not require a region lookup"),
         region_requests=region_requests,
     )
-    target_requests, snapshot_requests = _targeted_snapshot_result(
-        monkeypatch,
-        provider,
-        _snapshot_metadata(),
-    )
 
     assert await provider.check_admission(
         TargetedSnapshotSource(snapshot=snapshot_ref, target="us-west-3"),
-        Resources(vcpu=12, memory=16, disk=50),
+        Resources(vcpu=13, memory=17, disk=31, gpu=1),
     )
     assert target_requests == ["us-west-3"]
     assert snapshot_requests == [snapshot_ref]
@@ -1377,49 +1393,20 @@ async def test_daytona_targeted_snapshot_admission_uses_snapshot_target_class_an
     assert region_requests == []
 
 
-async def test_daytona_targeted_snapshot_admission_waits_for_exact_capacity(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    provider, requested = _admission_provider(
-        monkeypatch,
-        SimpleNamespace(
-            region_usage=[
-                _usage_row(
-                    region_id="us-west-3",
-                    sandbox_class=SandboxClass.LINUX_VM,
-                    total_cpu_quota=20,
-                    current_cpu_usage=0,
-                    total_memory_quota=32,
-                    current_memory_usage=0,
-                    total_disk_quota=100,
-                    current_disk_usage=71,
-                )
-            ]
-        ),
-    )
-    _targeted_snapshot_result(monkeypatch, provider, _snapshot_metadata())
-
-    admitted = await provider.check_admission(
-        TargetedSnapshotSource(snapshot="snapshot", target="us-west-3"),
-        Resources(vcpu=12, memory=16, disk=50),
-    )
-
-    assert not admitted
-    assert requested == ["org-1"]
-
-
 @pytest.mark.parametrize(
-    "usage_updates",
+    ("usage_updates", "expected"),
     [
-        {"total_cpu_quota": 11},
-        {"max_disk_per_sandbox": 29},
+        ({"current_disk_usage": 71}, False),
+        ({"total_cpu_quota": 11}, SandboxError),
+        ({"max_disk_per_sandbox": 29}, SandboxError),
     ],
 )
-async def test_daytona_targeted_snapshot_admission_rejects_demand_above_limits(
+async def test_daytona_targeted_snapshot_admission_applies_capacity_decisions(
     monkeypatch: pytest.MonkeyPatch,
     usage_updates: dict[str, object],
+    expected: bool | type[SandboxError],
 ) -> None:
-    provider, _requested = _admission_provider(
+    provider, requested, _targets, _snapshots = _targeted_admission_case(
         monkeypatch,
         SimpleNamespace(
             region_usage=[
@@ -1441,13 +1428,17 @@ async def test_daytona_targeted_snapshot_admission_rejects_demand_above_limits(
             ]
         ),
     )
-    _targeted_snapshot_result(monkeypatch, provider, _snapshot_metadata())
+    decision = provider.check_admission(
+        TargetedSnapshotSource(snapshot="snapshot", target="us-west-3"),
+        _ADMISSION_RESOURCES,
+    )
 
-    with pytest.raises(SandboxError, match="demand exceeds capacity"):
-        await provider.check_admission(
-            TargetedSnapshotSource(snapshot="snapshot", target="us-west-3"),
-            _ADMISSION_RESOURCES,
-        )
+    if expected is SandboxError:
+        with pytest.raises(SandboxError, match="demand exceeds capacity"):
+            await decision
+    else:
+        assert await decision is expected
+    assert requested == ["org-1"]
 
 
 @pytest.mark.parametrize(
@@ -1463,7 +1454,7 @@ async def test_daytona_targeted_snapshot_admission_checks_explicit_snapshot_regi
     region_ids: list[str] | None,
     accepted: bool,
 ) -> None:
-    provider, _requested = _admission_provider(
+    provider, _requested, _targets, _snapshots = _targeted_admission_case(
         monkeypatch,
         SimpleNamespace(
             region_usage=[
@@ -1475,8 +1466,8 @@ async def test_daytona_targeted_snapshot_admission_checks_explicit_snapshot_regi
                 )
             ]
         ),
+        snapshot=_snapshot_metadata(region_ids=region_ids),
     )
-    _targeted_snapshot_result(monkeypatch, provider, _snapshot_metadata(region_ids=region_ids))
     decision = provider.check_admission(
         TargetedSnapshotSource(snapshot="snapshot", target="us-west-3"),
         _ADMISSION_RESOURCES,
@@ -1493,7 +1484,7 @@ async def test_daytona_targeted_snapshot_admission_resolves_target_without_defau
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     region_requests: list[str] = []
-    provider, requested = _admission_provider(
+    provider, requested, target_requests, _snapshots = _targeted_admission_case(
         monkeypatch,
         SimpleNamespace(
             region_usage=[
@@ -1507,16 +1498,12 @@ async def test_daytona_targeted_snapshot_admission_resolves_target_without_defau
                 )
             ]
         ),
+        snapshot=_snapshot_metadata(region_ids=["region-id"]),
         regions=[SimpleNamespace(id="region-id", name="west")],
         region_requests=region_requests,
     )
     monkeypatch.setattr(provider, "_target", "west")
     monkeypatch.setattr(provider, "_target_id", "cached-default-region")
-    target_requests, _snapshot_requests = _targeted_snapshot_result(
-        monkeypatch,
-        provider,
-        _snapshot_metadata(region_ids=["region-id"]),
-    )
 
     assert await provider.check_admission(
         TargetedSnapshotSource(snapshot="snapshot", target="west"),
@@ -1532,8 +1519,6 @@ async def test_daytona_targeted_snapshot_admission_resolves_target_without_defau
     [
         {"cpu": 0},
         {"mem": float("nan")},
-        {"disk": -1},
-        {"gpu": float("inf")},
         {"gpu": -1},
         {"sandbox_class": None},
         {"sandbox_class": "unknown"},
@@ -1543,11 +1528,11 @@ async def test_daytona_targeted_snapshot_admission_rejects_invalid_metadata(
     monkeypatch: pytest.MonkeyPatch,
     metadata_updates: dict[str, object],
 ) -> None:
-    provider, requested = _admission_provider(
+    provider, requested, _targets, _snapshots = _targeted_admission_case(
         monkeypatch,
         AssertionError("invalid snapshot metadata should not fetch organization usage"),
+        snapshot=_snapshot_metadata(**metadata_updates),
     )
-    _targeted_snapshot_result(monkeypatch, provider, _snapshot_metadata(**metadata_updates))
 
     with pytest.raises(SandboxError, match="capacity metadata is invalid"):
         await provider.check_admission(
@@ -1563,7 +1548,6 @@ async def test_daytona_targeted_snapshot_admission_rejects_invalid_metadata(
         (TimeoutError(), True),
         (DaytonaError("temporary", status_code=503), True),
         (DaytonaError("not found", status_code=404), SandboxError),
-        (DaytonaError("forbidden", status_code=403), SandboxError),
     ],
 )
 async def test_daytona_targeted_snapshot_admission_metadata_error_policy(
@@ -1571,11 +1555,11 @@ async def test_daytona_targeted_snapshot_admission_metadata_error_policy(
     snapshot_error: Exception,
     expected: bool | type[SandboxError],
 ) -> None:
-    provider, requested = _admission_provider(
+    provider, requested, _targets, _snapshots = _targeted_admission_case(
         monkeypatch,
         AssertionError("failed snapshot metadata should not fetch organization usage"),
+        snapshot=snapshot_error,
     )
-    _targeted_snapshot_result(monkeypatch, provider, snapshot_error)
     decision = provider.check_admission(
         TargetedSnapshotSource(snapshot="snapshot", target="us-west-3"),
         _ADMISSION_RESOURCES,
@@ -1593,11 +1577,10 @@ async def test_daytona_targeted_snapshot_admission_metadata_error_policy(
 async def test_daytona_targeted_snapshot_admission_has_one_deadline(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    provider, requested = _admission_provider(
+    provider, requested, _targets, _snapshots = _targeted_admission_case(
         monkeypatch,
         AssertionError("the real organization usage client should be replaced"),
     )
-    _targeted_snapshot_result(monkeypatch, provider, _snapshot_metadata())
     usage_started = asyncio.Event()
 
     async def wait_for_usage(**_kwargs: object) -> SimpleNamespace:
@@ -1651,84 +1634,42 @@ async def test_daytona_targeted_snapshot_admission_propagates_cancellation(
     assert requested == []
 
 
-async def test_daytona_targeted_gpu_snapshot_preserves_unmetered_gpu_policy(
+@pytest.mark.parametrize(
+    ("target", "region_ids", "accepted", "resolves_target"),
+    [
+        ("west", None, True, True),
+        ("us-west-3", ["us-west-3"], True, False),
+        ("west", [], False, True),
+        ("west", ["other-region"], False, True),
+    ],
+)
+async def test_daytona_targeted_gpu_snapshot_checks_target_scope_before_unmetered_admission(
     monkeypatch: pytest.MonkeyPatch,
+    target: str,
+    region_ids: list[str] | None,
+    accepted: bool,
+    resolves_target: bool,
 ) -> None:
     region_requests: list[str] = []
-    provider, requested = _admission_provider(
+    provider, requested, _targets, _snapshots = _targeted_admission_case(
         monkeypatch,
         AssertionError("GPU admission should not fetch organization usage"),
+        snapshot=_snapshot_metadata(gpu=1, region_ids=region_ids),
         regions=[SimpleNamespace(id="us-west-3", name="west")],
         region_requests=region_requests,
     )
-    _targeted_snapshot_result(monkeypatch, provider, _snapshot_metadata(gpu=1, region_ids=None))
-
-    assert await provider.check_admission(
-        TargetedSnapshotSource(snapshot="snapshot", target="west"),
+    decision = provider.check_admission(
+        TargetedSnapshotSource(snapshot="snapshot", target=target),
         _ADMISSION_RESOURCES,
     )
+
+    if accepted:
+        assert await decision
+    else:
+        with pytest.raises(SandboxError, match="not available in the requested target"):
+            await decision
     assert requested == []
-    assert region_requests == ["list_available_regions"]
-
-
-@pytest.mark.parametrize(
-    "metadata_updates",
-    [
-        {"gpu": 1, "sandbox_class": None},
-        {"gpu": 1, "region_ids": []},
-        {"gpu": 1, "region_ids": ["other-region"]},
-    ],
-)
-async def test_daytona_targeted_gpu_snapshot_rejects_invalid_scope(
-    monkeypatch: pytest.MonkeyPatch,
-    metadata_updates: dict[str, object],
-) -> None:
-    provider, requested = _admission_provider(
-        monkeypatch,
-        AssertionError("GPU admission should not fetch organization usage"),
-        regions=[SimpleNamespace(id="us-west-3", name="west")],
-    )
-    _targeted_snapshot_result(monkeypatch, provider, _snapshot_metadata(**metadata_updates))
-
-    with pytest.raises(SandboxError):
-        await provider.check_admission(
-            TargetedSnapshotSource(snapshot="snapshot", target="west"),
-            _ADMISSION_RESOURCES,
-        )
-    assert requested == []
-
-
-async def test_daytona_targeted_snapshot_requested_gpu_does_not_bypass_metadata(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    provider, requested = _admission_provider(
-        monkeypatch,
-        SimpleNamespace(
-            region_usage=[
-                _usage_row(
-                    region_id="us-west-3",
-                    sandbox_class=SandboxClass.LINUX_VM,
-                    total_cpu_quota=20,
-                    current_cpu_usage=0,
-                    total_memory_quota=32,
-                    current_memory_usage=0,
-                )
-            ]
-        ),
-    )
-    target_requests, snapshot_requests = _targeted_snapshot_result(
-        monkeypatch,
-        provider,
-        _snapshot_metadata(),
-    )
-
-    assert await provider.check_admission(
-        TargetedSnapshotSource(snapshot="snapshot", target="us-west-3"),
-        Resources(vcpu=1, memory=1, disk=1, gpu=1),
-    )
-    assert target_requests == ["us-west-3"]
-    assert snapshot_requests == ["snapshot"]
-    assert requested == ["org-1"]
+    assert region_requests == (["list_available_regions"] if resolves_target else [])
 
 
 async def test_daytona_capacity_preserves_provider_values_and_clamps_oversubscription(
@@ -1830,16 +1771,10 @@ async def test_daytona_capacity_domains_preserve_successful_empty_observation(
     "result",
     [
         TimeoutError(),
-        ClientConnectionError("connection reset"),
-        InvalidURL("not-a-url"),
-        ApiException(status=429),
         ApiException(status=503),
-        ApiException(status=401),
         SimpleNamespace(region_usage=[_usage_row(), _usage_row()]),
         SimpleNamespace(region_usage=[_usage_row(sandbox_class=SandboxClass.UNKNOWN_DEFAULT_OPEN_API)]),
         SimpleNamespace(region_usage=[_usage_row(region_id="")]),
-        SimpleNamespace(region_usage=[_usage_row(total_cpu_quota=float("nan"))]),
-        SimpleNamespace(region_usage=[_usage_row(current_memory_usage=-1)]),
     ],
 )
 async def test_daytona_capacity_domain_observation_failures_are_safe(

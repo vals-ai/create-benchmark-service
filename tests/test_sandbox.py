@@ -1909,11 +1909,14 @@ async def test_daytona_exec_logs_each_rate_limit_retry(
 
     expected_messages = [
         "daytona.retry sandbox_provider=daytona daytona_step=exec daytona_retry_attempt=1 "
-        "daytona_retry_delay_s=1.0 daytona_retry_category=rate_limit daytona_status_code=429 daytona_source=api",
+        "daytona_retry_delay_s=1.0 daytona_retry_category=rate_limit daytona_status_code=429 daytona_source=api "
+        "daytona_cause_class=DaytonaRateLimitError",
         "daytona.retry sandbox_provider=daytona daytona_step=exec daytona_retry_attempt=2 "
-        "daytona_retry_delay_s=0.25 daytona_retry_category=rate_limit daytona_status_code=429 daytona_source=proxy",
+        "daytona_retry_delay_s=0.25 daytona_retry_category=rate_limit daytona_status_code=429 daytona_source=proxy "
+        "daytona_cause_class=DaytonaRateLimitError",
         "daytona.retry sandbox_provider=daytona daytona_step=exec daytona_retry_attempt=3 "
-        "daytona_retry_delay_s=0.5 daytona_retry_category=rate_limit daytona_status_code=429 daytona_source=daemon",
+        "daytona_retry_delay_s=0.5 daytona_retry_category=rate_limit daytona_status_code=429 daytona_source=daemon "
+        "daytona_cause_class=DaytonaRateLimitError",
     ]
     for attempt, (record, delay, source, expected_message) in enumerate(
         zip(records, observed_waits, ("api", "proxy", "daemon"), expected_messages, strict=True),
@@ -1927,6 +1930,7 @@ async def test_daytona_exec_logs_each_rate_limit_retry(
             "daytona_retry_category": "rate_limit",
             "daytona_status_code": 429,
             "daytona_source": source,
+            "daytona_cause_class": "DaytonaRateLimitError",
         }
         _assert_safe_retry_record(record, expected_message, expected_fields)
 
@@ -1977,11 +1981,12 @@ async def test_daytona_exec_logs_typed_status_without_sensitive_details(
         "daytona_retry_delay_s": observed_waits[0],
         "daytona_retry_category": "transient",
         "daytona_status_code": status_code,
+        "daytona_cause_class": type(provider_error).__name__,
     }
     expected_message = (
         "daytona.retry sandbox_provider=daytona daytona_step=exec daytona_retry_attempt=1 "
         f"daytona_retry_delay_s={observed_waits[0]} daytona_retry_category=transient "
-        f"daytona_status_code={status_code}"
+        f"daytona_status_code={status_code} daytona_cause_class={type(provider_error).__name__}"
     )
     _assert_safe_retry_record(records[0], expected_message, expected_fields)
 
@@ -3615,10 +3620,12 @@ async def test_daytona_create_retries_rate_limited_volume_lookup_safely(
         "daytona_retry_delay_s": observed_waits[0],
         "daytona_retry_category": "rate_limit",
         "daytona_status_code": 429,
+        "daytona_cause_class": "ApiException",
     }
     expected_message = (
         "daytona.retry sandbox_provider=daytona daytona_step=create_sandbox daytona_retry_attempt=1 "
-        f"daytona_retry_delay_s={observed_waits[0]} daytona_retry_category=rate_limit daytona_status_code=429"
+        f"daytona_retry_delay_s={observed_waits[0]} daytona_retry_category=rate_limit daytona_status_code=429 "
+        "daytona_cause_class=ApiException"
     )
     _assert_safe_retry_record(records[0], expected_message, expected_fields)
 

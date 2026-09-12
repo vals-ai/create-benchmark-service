@@ -447,15 +447,18 @@ def _provider_retry_before_sleep(retry_state: RetryCallState) -> None:
         status_code: int | None = None
         source: str | None = None
         provider_error = exc.__cause__
-        if isinstance(provider_error, DaytonaError):
-            status_code = provider_error.status_code
-            source = _SOURCE_NAMES.get(provider_error.source)
-        elif isinstance(provider_error, ClientResponseError):
-            status_code = provider_error.status
-        elif isinstance(provider_error, OpenApiException):
-            raw_status = getattr(provider_error, "status", None)
-            if type(raw_status) is int:
-                status_code = raw_status
+        cause_class: str | None = None
+        if provider_error is not None:
+            cause_class = type(provider_error).__name__
+            if isinstance(provider_error, DaytonaError):
+                status_code = provider_error.status_code
+                source = _SOURCE_NAMES.get(provider_error.source)
+            elif isinstance(provider_error, ClientResponseError):
+                status_code = provider_error.status
+            elif isinstance(provider_error, OpenApiException):
+                raw_status = getattr(provider_error, "status", None)
+                if type(raw_status) is int:
+                    status_code = raw_status
 
         category = "rate_limit" if _rate_limit_error(exc) is not None or status_code == 429 else "transient"
         fields: dict[str, object] = {
@@ -469,6 +472,8 @@ def _provider_retry_before_sleep(retry_state: RetryCallState) -> None:
             fields["daytona_status_code"] = status_code
         if source is not None:
             fields["daytona_source"] = source
+        if cause_class is not None:
+            fields["daytona_cause_class"] = cause_class
 
         message = "daytona.retry " + " ".join(f"{key}={value}" for key, value in fields.items())
         logger.warning(message, extra=fields)

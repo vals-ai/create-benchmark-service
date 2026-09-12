@@ -76,6 +76,7 @@ from benchmark_service.sandbox.types import (
     Resources,
     Sandbox,
     SandboxCapacity,
+    SandboxCapacityDomain,
     SandboxCommandError,
     SandboxConnectionError,
     SandboxCreateRequest,
@@ -301,6 +302,14 @@ def _get_config_header(headers: Mapping[str, str], *names: str) -> str | None:
 def _admission_pool_id(*, organization_id: str, api_url: str) -> str:
     scope = "\0".join((api_url, organization_id))
     return f"daytona:{uuid.uuid5(uuid.NAMESPACE_URL, scope)}"
+
+
+def _capacity_from_usage(usage: RegionUsageOverview) -> SandboxCapacity:
+    return SandboxCapacity(
+        cpu=ResourceCapacity(total=usage.total_cpu_quota, used=usage.current_cpu_usage),
+        memory=ResourceCapacity(total=usage.total_memory_quota, used=usage.current_memory_usage),
+        disk=ResourceCapacity(total=usage.total_disk_quota, used=usage.current_disk_usage),
+    )
 
 
 def _provider_retry_wait(retry_state: RetryCallState) -> float:
@@ -930,7 +939,30 @@ class DaytonaSandboxProvider(SandboxProvider):
             return None
         return _admission_pool_id(organization_id=self._organization_id, api_url=self._api_url)
 
-    async def _capacity_usage(self) -> RegionUsageOverview:
+    async def _resolve_capacity_target_id(
+        self,
+        target: str,
+        list_available_regions: Callable[[], Awaitable[list[Any]]],
+        *,
+        cache_configured_target: bool,
+    ) -> str:
+        if cache_configured_target and target == self._target:
+            return await self._resolve_target_id_using(list_available_regions)
+
+        regions = await list_available_regions()
+        region = next((region for region in regions if region.name == target), None)
+        region = region or next((region for region in regions if region.id == target), None)
+        if region is None:
+            raise SandboxError(f"Daytona target is not available: {target!r}.")
+        return cast(str, region.id)
+
+    async def _capacity_usage(
+        self,
+        *,
+        target: str,
+        sandbox_class: SandboxClass,
+        cache_configured_target: bool = True,
+    ) -> RegionUsageOverview:
         assert self._organization_id is not None
         async with (
             asyncio.timeout(_ADMISSION_TIMEOUT_SECONDS),
@@ -941,18 +973,23 @@ class DaytonaSandboxProvider(SandboxProvider):
             matches = [
                 usage
                 for usage in overview.region_usage
-                if usage.region_id == self._target and usage.sandbox_class == SandboxClass.CONTAINER
+                if usage.region_id == target and usage.sandbox_class == sandbox_class
             ]
             if not matches:
-                target_id = await self._resolve_target_id_using(organizations_api.list_available_regions)
+                target_id = await self._resolve_capacity_target_id(
+                    target,
+                    organizations_api.list_available_regions,
+                    cache_configured_target=cache_configured_target,
+                )
                 matches = [
                     usage
                     for usage in overview.region_usage
-                    if usage.region_id == target_id and usage.sandbox_class == SandboxClass.CONTAINER
+                    if usage.region_id == target_id and usage.sandbox_class == sandbox_class
                 ]
             if len(matches) != 1:
                 raise SandboxError(
-                    f"Expected one Daytona capacity row for target {self._target!r}, found {len(matches)}"
+                    f"Expected one Daytona capacity row for target {target!r} and class "
+                    f"{sandbox_class.value!r}, found {len(matches)}"
                 )
             return matches[0]
 
@@ -960,12 +997,42 @@ class DaytonaSandboxProvider(SandboxProvider):
         if self._organization_id is None:
             return None
         try:
-            usage = await self._capacity_usage()
-            return SandboxCapacity(
-                cpu=ResourceCapacity(total=usage.total_cpu_quota, used=usage.current_cpu_usage),
-                memory=ResourceCapacity(total=usage.total_memory_quota, used=usage.current_memory_usage),
-                disk=ResourceCapacity(total=usage.total_disk_quota, used=usage.current_disk_usage),
+            usage = await self._capacity_usage(
+                target=self._target,
+                sandbox_class=SandboxClass.CONTAINER,
             )
+            return _capacity_from_usage(usage)
+        except SandboxError:
+            raise
+        except (OpenApiException, ClientError, TimeoutError, ValueError):
+            raise SandboxError("Daytona capacity is unavailable") from None
+
+    async def get_capacity_domains(self) -> list[SandboxCapacityDomain] | None:
+        if self._organization_id is None:
+            return None
+        try:
+            async with (
+                asyncio.timeout(_ADMISSION_TIMEOUT_SECONDS),
+                DaytonaApiClient(self._target_api_configuration) as api_client,
+            ):
+                overview = await OrganizationsApi(api_client).get_organization_usage_overview(self._organization_id)
+                domains: list[SandboxCapacityDomain] = []
+                keys: set[tuple[str, str]] = set()
+                for usage in overview.region_usage:
+                    if usage.sandbox_class == SandboxClass.UNKNOWN_DEFAULT_OPEN_API:
+                        raise SandboxError("Daytona capacity metadata is invalid")
+                    key = (usage.region_id, usage.sandbox_class.value)
+                    if key in keys:
+                        raise SandboxError("Daytona capacity metadata contains duplicate domains")
+                    keys.add(key)
+                    domains.append(
+                        SandboxCapacityDomain(
+                            target_id=usage.region_id,
+                            sandbox_class=usage.sandbox_class.value,
+                            capacity=_capacity_from_usage(usage),
+                        )
+                    )
+                return sorted(domains, key=lambda domain: (domain.target_id, domain.sandbox_class))
         except SandboxError:
             raise
         except (OpenApiException, ClientError, TimeoutError, ValueError):
@@ -978,17 +1045,66 @@ class DaytonaSandboxProvider(SandboxProvider):
     ) -> bool:
         if isinstance(source, ComposeSource):
             source = source.outer
-        if self._organization_id is None or not isinstance(source, ImageSource) or resources.gpu:
+        if self._organization_id is None:
             return True
-        demand = (resources.vcpu, resources.memory, resources.disk)
+        if isinstance(source, ImageSource) and resources.gpu:
+            return True
+        if not isinstance(source, (ImageSource, TargetedSnapshotSource)):
+            return True
+
+        target = self._target
+        sandbox_class = SandboxClass.CONTAINER
+        demand: tuple[float, float, float] = (resources.vcpu, resources.memory, resources.disk)
 
         try:
-            usage = await self._capacity_usage()
+            if isinstance(source, TargetedSnapshotSource):
+                target = source.target
+                async with asyncio.timeout(_ADMISSION_TIMEOUT_SECONDS):
+                    snapshot = await self._client_for_target(target).snapshot.get(source.snapshot)
+                    snapshot_resources = (snapshot.cpu, snapshot.mem, snapshot.disk)
+                    if any(not math.isfinite(value) or value <= 0 for value in snapshot_resources) or (
+                        not math.isfinite(snapshot.gpu) or snapshot.gpu < 0
+                    ):
+                        raise SandboxError("Daytona targeted snapshot capacity metadata is invalid")
+                    if snapshot.sandbox_class is None:
+                        raise SandboxError("Daytona targeted snapshot capacity metadata is invalid")
+                    try:
+                        sandbox_class = SandboxClass(snapshot.sandbox_class)
+                    except ValueError:
+                        raise SandboxError("Daytona targeted snapshot capacity metadata is invalid") from None
+                    if sandbox_class == SandboxClass.UNKNOWN_DEFAULT_OPEN_API:
+                        raise SandboxError("Daytona targeted snapshot capacity metadata is invalid")
+                    if snapshot.gpu:
+                        target_id = target
+                        if snapshot.region_ids is None or target not in snapshot.region_ids:
+                            async with DaytonaApiClient(self._target_api_configuration) as api_client:
+                                target_id = await self._resolve_capacity_target_id(
+                                    target,
+                                    OrganizationsApi(api_client).list_available_regions,
+                                    cache_configured_target=False,
+                                )
+                        if snapshot.region_ids is not None and target_id not in snapshot.region_ids:
+                            raise SandboxError("Daytona targeted snapshot is not available in the requested target")
+                        return True
+                    demand = snapshot_resources
+                    usage = await self._capacity_usage(
+                        target=target,
+                        sandbox_class=sandbox_class,
+                        cache_configured_target=False,
+                    )
+                    if snapshot.region_ids is not None and usage.region_id not in snapshot.region_ids:
+                        raise SandboxError("Daytona targeted snapshot is not available in the requested target")
+            else:
+                usage = await self._capacity_usage(target=target, sandbox_class=sandbox_class)
             per_sandbox_limit = (
                 usage.max_cpu_per_sandbox,
                 usage.max_memory_per_sandbox,
                 usage.max_disk_per_sandbox,
             )
+        except DaytonaError as exc:
+            if _is_transient_daytona_error(exc):
+                return True
+            raise SandboxError("Daytona rejected the targeted snapshot admission request") from exc
         except (OpenApiException, ClientResponseError) as exc:
             status = cast(int | None, getattr(exc, "status", None))
             if status in (408, 429) or (status is not None and 500 <= status <= 599):
@@ -1001,6 +1117,10 @@ class DaytonaSandboxProvider(SandboxProvider):
 
         total = (usage.total_cpu_quota, usage.total_memory_quota, usage.total_disk_quota)
         used = (usage.current_cpu_usage, usage.current_memory_usage, usage.current_disk_usage)
+        if any(not math.isfinite(value) or value < 0 for value in (*total, *used)) or any(
+            value is not None and (not math.isfinite(value) or value < 0) for value in per_sandbox_limit
+        ):
+            raise SandboxError("Daytona capacity metadata is invalid")
         if any(requested > quota for requested, quota in zip(demand, total, strict=True)) or any(
             limit is not None and requested > limit for requested, limit in zip(demand, per_sandbox_limit, strict=True)
         ):

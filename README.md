@@ -129,14 +129,18 @@ When a setup or evaluate-instance request omits `sandbox_provider`, the Daytona 
 `x-api-key`, `x-api-url`, and `x-target`, plus optional `x-organization-id`. The legacy
 `daytona_api_key`, `daytona_api_url`, and `daytona_target` aliases remain accepted.
 Providing the organization ID enables organization-scoped capacity admission; omitting it preserves direct creation.
-The API key must be able to read organization usage. When the target is a region name instead of its ID,
-the key must also be able to list regions so admission can resolve the canonical ID.
+`SandboxProvider.get_capacity_domains()` reports Daytona CPU, memory, and disk usage separately for every canonical
+target and sandbox class; `get_capacity()` retains its configured-target container view. Capacity is observational and
+is not reserved. The API key must be able to read organization usage. Targeted snapshot admission also requires
+snapshot-read access.
+When the target is a region name instead of its ID, the key must be able to list regions so admission can resolve
+the canonical ID.
 
 Provider compatibility notes:
 
 - `Sandbox.labels` and `Sandbox.created_at` expose provider inventory metadata when available; unsupported metadata is `None`, and creation times are timezone-aware UTC. `SandboxQuery.created_at_lte` is an inclusive creation-time bound. Daytona supports it and always limits listing to the provider's configured target, which may be a Daytona region name or ID. Modal rejects creation-time-bounded listing.
 - Modal supports both `ImageSource` (registry pull) and `SnapshotSource` (a Modal filesystem snapshot created via `Sandbox.snapshot_filesystem()`, restored by image id). `TargetedSnapshotSource` is Daytona-only.
-- Daytona uses `TargetedSnapshotSource(snapshot=..., target=...)` to select a target only when creating that sandbox. Its legacy `docker_image` value is intentionally invalid because that field cannot preserve the target.
+- Daytona uses `TargetedSnapshotSource(snapshot=..., target=...)` to select the target for admission and creation. Admission uses the snapshot's CPU, memory, disk, and sandbox class with the exact target's organization-usage row; GPU snapshots retain unmetered GPU admission. Its legacy `docker_image` value is intentionally invalid because that field cannot preserve the target.
 - Modal sandboxes do not expose a disk-size parameter; `Resources.disk` is accepted for schema compatibility but not enforced.
 - GPUs are requested via `Resources.gpu` (count) and `Resources.gpu_type`. Modal requires `gpu_type` (any Modal GPU name, e.g. `H100`, `A100-80GB`, `T4`) and passes `"<type>:<count>"` to the sandbox. Daytona accepts a count with an optional type restricted to its `GpuType` enum (`H100`, `H200`, `RTX-PRO-6000`, `RTX-4090`, `RTX-5090`); GPU requests are rejected for Daytona snapshot sandboxes because snapshot resources are fixed at snapshot creation.
 - Nested Docker (Docker-in-Docker) capability is granted on every sandbox for both providers — Daytona supports it natively and the Modal adapter requests it unconditionally — so benchmarks never configure it. The benchmark service still owns the Docker-capable image, dockerd startup flags, compose workflow, and cleanup.

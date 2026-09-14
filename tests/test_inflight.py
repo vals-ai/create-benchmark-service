@@ -117,9 +117,9 @@ def test_benchmarkserviceapp_installs_inflight_middleware() -> None:
 
 
 def test_emit_emf_metric_serializes_dimensions_and_unit(capsys: pytest.CaptureFixture[str]) -> None:
-    from benchmark_service.inflight import _emit_emf_metric  # pyright: ignore[reportPrivateUsage]
+    from benchmark_service.inflight import emit_emf_metric
 
-    _emit_emf_metric(
+    emit_emf_metric(
         "proof-bench",
         "GradingAdmissionOutcomes",
         "Count",

@@ -545,7 +545,11 @@ async def test_websocket_handshake_uses_its_client_span_and_dynamic_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tracer, exporter, _provider = otel_tracer
-    monkeypatch.setattr(client_module.trace, "get_tracer", lambda _name: tracer)
+
+    def get_tracer(_name: str) -> trace.Tracer:
+        return tracer
+
+    monkeypatch.setattr(client_module.trace, "get_tracer", get_tracer)
     app = FastAPI()
     observed_headers: dict[str, str] = {}
 

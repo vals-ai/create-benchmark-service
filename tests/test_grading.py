@@ -91,7 +91,7 @@ def emitted_admission_metrics(
             }
         )
 
-    monkeypatch.setattr("benchmark_service.app._emit_emf_metric", emit)
+    monkeypatch.setattr("benchmark_service.app.emit_emf_metric", emit)
     return records
 
 

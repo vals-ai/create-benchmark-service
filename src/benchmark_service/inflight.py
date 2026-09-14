@@ -25,7 +25,7 @@ METRIC_NAMESPACE = "Vals/BenchmarkServices"
 EXCLUDED_PATHS = frozenset({"/health"})
 
 
-def _emit_emf_metric(
+def emit_emf_metric(
     service_name: str,
     metric_name: str,
     unit: str,
@@ -109,7 +109,7 @@ class InflightMiddleware:
                 logger.exception("inflight emitter loop error")
 
     def _emit_once(self) -> None:
-        _emit_emf_metric(self.service_name, "InFlightRequests", "Count", self._inflight)
+        emit_emf_metric(self.service_name, "InFlightRequests", "Count", self._inflight)
 
     async def aclose(self) -> None:
         if self._emitter_task is not None:

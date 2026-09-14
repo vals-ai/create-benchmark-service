@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import socket
+from collections.abc import Mapping
 from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
@@ -115,22 +116,24 @@ class _RecordingTracer:
 @pytest.fixture
 def recovery_span(monkeypatch: pytest.MonkeyPatch) -> _RecordingSpan:
     span = _RecordingSpan()
-    monkeypatch.setattr(
-        client_module.trace,
-        "get_tracer",
-        lambda _name: _RecordingTracer(span),
-    )
+
+    def get_tracer(_name: str) -> _RecordingTracer:
+        return _RecordingTracer(span)
+
+    monkeypatch.setattr(client_module.trace, "get_tracer", get_tracer)
     return span
 
 
 @pytest.fixture
 def websocket_span(monkeypatch: pytest.MonkeyPatch) -> _RecordingSpan:
     span = _RecordingSpan()
-    monkeypatch.setattr(
-        client_module,
-        "websocket_request_span",
-        lambda _operation, headers: nullcontext((span, dict(headers))),
-    )
+
+    def websocket_request_span(
+        _operation: str, headers: Mapping[str, str]
+    ) -> nullcontext[tuple[_RecordingSpan, dict[str, str]]]:
+        return nullcontext((span, dict(headers)))
+
+    monkeypatch.setattr(client_module, "websocket_request_span", websocket_request_span)
     return span
 
 

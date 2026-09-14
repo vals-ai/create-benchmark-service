@@ -32,7 +32,7 @@ from benchmark_service.auth import (
 from benchmark_service.base import BenchmarkService
 from benchmark_service.context import sandbox_provider_scope
 from benchmark_service.grading import SUBMISSION_ARTIFACT_SANDBOX_PATH, collapse_stream, evaluate_submission
-from benchmark_service.inflight import InflightMiddleware, _emit_emf_metric
+from benchmark_service.inflight import InflightMiddleware, emit_emf_metric
 from benchmark_service.observability import (
     bind_request_context,
     bind_service_context,
@@ -233,31 +233,27 @@ class _GradingAdmission:
             service_name=service_name,
         )
 
+    def _emit_outcome(self, outcome: str) -> None:
+        emit_emf_metric(
+            self._service_name,
+            "GradingAdmissionOutcomes",
+            "Count",
+            1,
+            dimensions=("Outcome",),
+            dimension_values=(outcome,),
+        )
+
     @asynccontextmanager
     async def reserve(self, key: tuple[str, str, str]) -> AsyncGenerator[None, None]:
         tenant, run_id, task_id = key
         if key in self._admitted:
-            _emit_emf_metric(
-                self._service_name,
-                "GradingAdmissionOutcomes",
-                "Count",
-                1,
-                dimensions=("Outcome",),
-                dimension_values=("duplicate_rejected",),
-            )
+            self._emit_outcome("duplicate_rejected")
             raise _DuplicateGradingRequest(f"an evaluation for run {run_id} task {task_id} is already in progress")
         if (
             len(self._admitted) >= self._max_admitted
             or self._admitted_by_tenant[tenant] >= self._max_admitted_per_tenant
         ):
-            _emit_emf_metric(
-                self._service_name,
-                "GradingAdmissionOutcomes",
-                "Count",
-                1,
-                dimensions=("Outcome",),
-                dimension_values=("capacity_rejected",),
-            )
+            self._emit_outcome("capacity_rejected")
             raise _GradingCapacityExceeded("The benchmark service is at grading capacity; retry this evaluation later.")
 
         self._admitted.add(key)
@@ -278,38 +274,24 @@ class _GradingAdmission:
             try:
                 await asyncio.wait_for(self._active.acquire(), self._queue_timeout_s)
             except TimeoutError as exc:
-                _emit_emf_metric(
+                emit_emf_metric(
                     self._service_name,
                     "GradingAdmissionWaitSeconds",
                     "Seconds",
                     time.monotonic() - started_at,
                 )
-                _emit_emf_metric(
-                    self._service_name,
-                    "GradingAdmissionOutcomes",
-                    "Count",
-                    1,
-                    dimensions=("Outcome",),
-                    dimension_values=("queue_timeout",),
-                )
+                self._emit_outcome("queue_timeout")
                 raise _GradingCapacityExceeded(
                     "The benchmark service could not start grading in time; retry this evaluation later."
                 ) from exc
             acquired = True
-            _emit_emf_metric(
+            emit_emf_metric(
                 self._service_name,
                 "GradingAdmissionWaitSeconds",
                 "Seconds",
                 time.monotonic() - started_at,
             )
-            _emit_emf_metric(
-                self._service_name,
-                "GradingAdmissionOutcomes",
-                "Count",
-                1,
-                dimensions=("Outcome",),
-                dimension_values=("admitted",),
-            )
+            self._emit_outcome("admitted")
             yield
         finally:
             if acquired:

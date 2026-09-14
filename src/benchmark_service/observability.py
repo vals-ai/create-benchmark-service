@@ -35,7 +35,7 @@ def init_sentry() -> bool:
             dsn=dsn,
             environment=os.getenv(SENTRY_ENVIRONMENT_ENV),
             release=os.getenv(SENTRY_RELEASE_ENV),
-            traces_sample_rate=1.0,
+            traces_sample_rate=0.1,
             integrations=[LoggingIntegration(level=None, event_level=None, sentry_logs_level=None)],
         )
     return True

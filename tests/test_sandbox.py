@@ -3553,6 +3553,183 @@ async def test_daytona_provider_recovers_existing_sandbox_on_create_conflict() -
     assert sandbox.id == inner.id
 
 
+class _VerifyProbeProcess(Process):
+    def __init__(self, commands: list[str], *, fail: bool, exc: DaytonaError | None = None) -> None:
+        super().__init__()
+        self._commands = commands
+        self._fail = fail
+        self._exc = exc
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        self.command = command
+        self._commands.append(command)
+        if self._exc is not None:
+            raise self._exc
+        if self._fail:
+            return SimpleNamespace(exit_code=1, result="probe output")
+        return SimpleNamespace(exit_code=0, result="")
+
+
+class VerifyProbeDaytonaClient(DaytonaClient):
+    """create() returns a fresh sandbox each call; its verify probe fails for the first `failures` creates."""
+
+    def __init__(self, *, failures: int) -> None:
+        super().__init__(InnerSandbox())
+        self.failures = failures
+        self.create_attempts = 0
+        self.created_sandboxes: list[InnerSandbox] = []
+        self.deleted_sandboxes: list[InnerSandbox] = []
+        self.commands: list[str] = []
+        self._live: InnerSandbox | None = None
+
+    async def get(self, instance_id: str) -> InnerSandbox:
+        if self._live is None:
+            raise DaytonaNotFoundError("sandbox not found")
+        return self._live
+
+    async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
+        self.create_attempts += 1
+        self.created = True
+        inner = InnerSandbox()
+        inner.process = _VerifyProbeProcess(self.commands, fail=self.create_attempts <= self.failures)
+        self.created_sandboxes.append(inner)
+        self._live = inner
+        return inner
+
+    async def delete(self, sandbox: InnerSandbox) -> None:
+        self.deleted_sandboxes.append(sandbox)
+        if sandbox is self._live:
+            self._live = None
+
+
+def _verify_request(name: str) -> SandboxCreateRequest:
+    return _request(
+        name,
+        source=SnapshotSource(snapshot="snap", verify_command="test -x /usr/bin/dockerd"),
+    )
+
+
+def test_source_omits_unset_verify_command_on_the_wire() -> None:
+    """Consumers must not see a verify_command key unless it was set."""
+    assert "verify_command" not in SnapshotSource(snapshot="snap").model_dump()
+    assert SnapshotSource(snapshot="snap", verify_command="true").model_dump()["verify_command"] == "true"
+
+
+@pytest.mark.parametrize("command", ["", "   "])
+def test_source_rejects_blank_verify_command(command: str) -> None:
+    with pytest.raises(ValidationError):
+        SnapshotSource(snapshot="snap", verify_command=command)
+
+
+async def test_daytona_provider_recreates_sandbox_on_failed_source_verification() -> None:
+    """A sandbox whose rootfs fails the source's verify_command is discarded and recreated."""
+    daytona = VerifyProbeDaytonaClient(failures=1)
+
+    sandbox = await _provider(daytona).create_sandbox(_verify_request("sandbox-name"))
+
+    assert daytona.create_attempts == 2
+    assert daytona.deleted_sandboxes == daytona.created_sandboxes[:1]
+    assert sandbox._sandbox is daytona.created_sandboxes[1]  # pyright: ignore[reportPrivateUsage]
+    assert [_unwrap_shell_command(c) for c in daytona.commands] == ["test -x /usr/bin/dockerd"] * 2
+
+
+async def test_daytona_provider_fails_after_source_verification_attempts_exhausted() -> None:
+    daytona = VerifyProbeDaytonaClient(failures=99)
+
+    with pytest.raises(SandboxError, match="failed source verification"):
+        await _provider(daytona).create_sandbox(_verify_request("sandbox-name"))
+
+    assert daytona.create_attempts == daytona_module._SOURCE_VERIFY_ATTEMPTS  # pyright: ignore[reportPrivateUsage]
+    assert daytona.deleted_sandboxes == daytona.created_sandboxes
+
+
+async def test_daytona_provider_skips_verification_when_source_has_no_command() -> None:
+    inner = InnerSandbox()
+    daytona = DaytonaClient(inner)
+
+    await _provider(daytona).create_sandbox(_request(inner.name))
+
+    assert inner.process.command is None
+
+
+async def test_daytona_provider_verifies_conflict_recovered_sandbox() -> None:
+    """A sandbox recovered from a name conflict is verified like a freshly created one."""
+    commands: list[str] = []
+    stale = InnerSandbox()
+    stale.process = _VerifyProbeProcess(commands, fail=True)
+
+    class ConflictOnceClient(VerifyProbeDaytonaClient):
+        def __init__(self, stale: InnerSandbox) -> None:
+            super().__init__(failures=0)
+            self.stale = stale
+            self.conflicted = False
+
+        async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
+            if not self.conflicted:
+                self.conflicted = True
+                self._live = self.stale
+                raise DaytonaError(f"Sandbox with name {self.stale.name} already exists")
+            return await super().create(*_args, **_kwargs)
+
+    daytona = ConflictOnceClient(stale)
+
+    sandbox = await _provider(daytona).create_sandbox(_verify_request(stale.name))
+
+    assert daytona.deleted_sandboxes == [stale]
+    assert daytona.create_attempts == 1
+    assert sandbox._sandbox is daytona.created_sandboxes[0]  # pyright: ignore[reportPrivateUsage]
+    assert [_unwrap_shell_command(c) for c in commands] == ["test -x /usr/bin/dockerd"]
+    assert [_unwrap_shell_command(c) for c in daytona.commands] == ["test -x /usr/bin/dockerd"]
+
+
+async def test_daytona_provider_discards_sandbox_when_verify_cannot_run(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A transport failure running the probe means an unusable sandbox: discard and recreate."""
+    _skip_retry_sleep(monkeypatch, DaytonaSandbox._control_exec)  # pyright: ignore[reportPrivateUsage]
+
+    class UnreachableProbeClient(VerifyProbeDaytonaClient):
+        def __init__(self) -> None:
+            super().__init__(failures=0)
+
+        async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
+            inner = await super().create(*_args, **_kwargs)
+            if self.create_attempts == 1:
+                inner.process = _VerifyProbeProcess(
+                    self.commands, fail=False, exc=DaytonaConnectionError("connection refused")
+                )
+            return inner
+
+    daytona = UnreachableProbeClient()
+
+    sandbox = await _provider(daytona).create_sandbox(_verify_request("sandbox-name"))
+
+    assert daytona.create_attempts == 2
+    assert daytona.deleted_sandboxes == daytona.created_sandboxes[:1]
+    assert sandbox._sandbox is daytona.created_sandboxes[1]  # pyright: ignore[reportPrivateUsage]
+
+
+async def test_daytona_provider_discard_retries_in_progress_delete() -> None:
+    """A state-change conflict on delete means removal is already running; discard keeps polling."""
+
+    class ConflictingDeleteClient(VerifyProbeDaytonaClient):
+        def __init__(self) -> None:
+            super().__init__(failures=1)
+            self.delete_conflicts = 1
+
+        async def delete(self, sandbox: InnerSandbox) -> None:
+            if self.delete_conflicts:
+                self.delete_conflicts -= 1
+                raise DaytonaConflictError("Sandbox state change in progress")
+            await super().delete(sandbox)
+
+    daytona = ConflictingDeleteClient()
+
+    sandbox = await _provider(daytona).create_sandbox(_verify_request("sandbox-name"))
+
+    assert daytona.create_attempts == 2
+    assert daytona.deleted_sandboxes == daytona.created_sandboxes[:1]
+    assert sandbox._sandbox is daytona.created_sandboxes[1]  # pyright: ignore[reportPrivateUsage]
+
+
 async def test_daytona_provider_create_conflict_bounds_hung_sandbox_start(monkeypatch: pytest.MonkeyPatch) -> None:
     """Recovering a conflicting sandbox must not block forever on a start that never lands."""
     inner = HungStartInnerSandbox()

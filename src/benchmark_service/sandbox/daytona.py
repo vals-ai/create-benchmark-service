@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import shlex
+import time
 import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
@@ -154,6 +155,13 @@ _TOOLBOX_CALL_TIMEOUT_SECONDS = 120.0
 # create budget in this service (grading's _GRADING_CREATE_TIMEOUT_S), so a start that a concurrent
 # create is still legitimately waiting on is never aborted early.
 _SANDBOX_START_TIMEOUT_SECONDS = 600.0
+
+# A source's verify_command runs in each new sandbox; failure means the delivered rootfs does
+# not match the source (e.g. a runner restored a stale/partial snapshot), so the sandbox is
+# discarded and recreated, landing on different backing nodes.
+_SOURCE_VERIFY_ATTEMPTS = 3
+_SANDBOX_GONE_POLL_SECONDS = 2.0
+_SANDBOX_GONE_TIMEOUT_SECONDS = 120.0
 
 _T = TypeVar("_T")
 
@@ -577,6 +585,19 @@ class DaytonaSandbox(Sandbox):
         stalled probe is exactly the hang the bound exists to break.
         """
         return await self._run_exec(_command(command, None, None), _TOOLBOX_CALL_TIMEOUT_SECONDS)
+
+    async def verify_source(self, command: str) -> str | None:
+        """Run the source's verify_command in the sandbox; return None on pass, else a failure reason."""
+        try:
+            result = await self._control_exec(command)
+        except SandboxError as exc:
+            # A sandbox we cannot exec into is unusable; report it as failed so it is
+            # discarded within the provider's bounded verify loop rather than retried.
+            return f"verify command could not run: {exc}"
+        if result.exit_code != 0:
+            output = result.output.strip()
+            return f"verify command exited {result.exit_code}" + (f": {output}" if output else "")
+        return None
 
     async def _run_exec(self, full_command: str, transport_timeout: float | None) -> ExecResult:
         try:
@@ -1257,22 +1278,78 @@ class DaytonaSandboxProvider(SandboxProvider):
             case ComposeSource():
                 raise SandboxError("ComposeSource must be unwrapped before provider.create_sandbox")
 
-        try:
-            inner = await daytona.create(params, timeout=request.create_timeout)
-        except DaytonaError as exc:
-            # A name conflict means an earlier attempt of this same request
-            # created the sandbox but the response was lost (transport retry).
-            # Recover it by name so the retry doesn't strand an orphan and fail
-            # the request on the conflict.
-            if _is_name_conflict_error(exc):
-                existing = await self._find_existing_sandbox(request.name, daytona)
-                if existing is not None:
-                    return DaytonaSandbox(existing)
-            elif _is_transient_daytona_error(exc):
-                await self._delete_failed_sandbox(request.name, daytona)
-            raise self._sandbox_error(exc) from exc
+        verify_command = getattr(request.source, "verify_command", None)
+        attempts = _SOURCE_VERIFY_ATTEMPTS if verify_command is not None else 1
+        failure: str | None = None
+        for attempt in range(1, attempts + 1):
+            inner: AsyncSandbox | None = None
+            try:
+                inner = await daytona.create(params, timeout=request.create_timeout)
+            except DaytonaError as exc:
+                # A name conflict means an earlier attempt of this same request
+                # created the sandbox but the response was lost (transport retry).
+                # Recover it by name so the retry doesn't strand an orphan and fail
+                # the request on the conflict.
+                if _is_name_conflict_error(exc):
+                    inner = await self._find_existing_sandbox(request.name, daytona)
+                elif _is_transient_daytona_error(exc):
+                    await self._delete_failed_sandbox(request.name, daytona)
+                if inner is None:
+                    raise self._sandbox_error(exc) from exc
 
-        return DaytonaSandbox(inner)
+            if verify_command is None:
+                return DaytonaSandbox(inner)
+            sandbox = DaytonaSandbox(inner)
+            failure = await sandbox.verify_source(verify_command)
+            if failure is None:
+                return sandbox
+            logger.warning(
+                "sandbox %s (id=%s runner=%s daemon=%s) failed source verification (attempt %d/%d): %s",
+                request.name,
+                inner.id,
+                inner.runner_id,
+                inner.daemon_version,
+                attempt,
+                attempts,
+                failure,
+            )
+            await self._discard_sandbox(request.name, inner, daytona)
+
+        raise SandboxError(
+            f"Sandbox {request.name!r} failed source verification on all {attempts} attempts: {failure}"
+        )
+
+    async def _discard_sandbox(self, name: str, sandbox: AsyncSandbox, daytona: AsyncDaytona) -> None:
+        """Delete a failed-verification sandbox and wait for its name to be freed for recreation."""
+        deadline = time.monotonic() + _SANDBOX_GONE_TIMEOUT_SECONDS
+
+        def remaining() -> float:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                raise SandboxError(
+                    f"discarded sandbox {name!r} still exists {_SANDBOX_GONE_TIMEOUT_SECONDS:g}s "
+                    "after delete; refusing to recreate under the same name"
+                )
+            return left
+
+        while True:
+            try:
+                await _bounded("daytona.get", daytona.get(name), remaining())
+            except DaytonaNotFoundError:
+                return
+            except DaytonaError as exc:
+                raise self._sandbox_error(exc) from exc
+            try:
+                await _bounded("daytona.delete", daytona.delete(sandbox), remaining())
+            except DaytonaNotFoundError:
+                pass
+            except DaytonaConflictError as exc:
+                # A state-change conflict means removal is already in progress; keep polling.
+                if not _is_delete_conflict(exc):
+                    raise self._sandbox_error(exc) from exc
+            except DaytonaError as exc:
+                raise self._sandbox_error(exc) from exc
+            await asyncio.sleep(min(_SANDBOX_GONE_POLL_SECONDS, remaining()))
 
     async def _delete_failed_sandbox(self, name: str, daytona: AsyncDaytona) -> None:
         try:

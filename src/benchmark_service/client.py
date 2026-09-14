@@ -14,6 +14,7 @@ from uuid import uuid4
 
 import httpx
 import websockets
+from opentelemetry import trace
 from pydantic import BaseModel, TypeAdapter
 from tenacity import (
     retry,
@@ -373,60 +374,86 @@ class BenchmarkServiceClient:
                 application message within the idle budget.
         """
         operation = f"WEBSOCKET /ws/{path}"
-        with websocket_request_span(operation, self._headers) as headers:
-            async with websockets.connect(
-                f"{self._ws_url}/ws/{path}",
-                additional_headers=headers,
-                open_timeout=60,
-                ping_interval=_WS_PING_INTERVAL_S,
-                ping_timeout=_WS_PING_TIMEOUT_S,
-                max_size=10 * 1024 * 1024,  # 10MB
-            ) as websocket:
-                last_message_at = time.monotonic()
-
-                try:
-                    await websocket.send(request.model_dump_json())
-
-                    stream = aiter(websocket)
-                    while True:
-                        try:
-                            message = await asyncio.wait_for(anext(stream), timeout=self._ws_idle_timeout_s)
-                        except StopAsyncIteration:
-                            break
-                        except TimeoutError:
-                            raise BenchmarkServiceStreamIdleError(
-                                idle_s=time.monotonic() - last_message_at,
-                                health_ok=await self._health_ok(),
-                            ) from None
-
-                        last_message_at = time.monotonic()
-                        chunk: StreamChunk = _stream_chunk_adapter.validate_json(message)
-
-                        match chunk.type:
-                            case "error":
-                                raise BenchmarkServiceError(chunk.data)
-                            case "result":
-                                return chunk.data
-                            case "message":
-                                if on_message:
-                                    on_message(chunk.data)
-                            case "eval_resume_state":
-                                if on_eval_resume_state:
-                                    on_eval_resume_state(chunk.data)
-                except ConnectionClosed as exc:
-                    close_frame = exc.rcvd or exc.sent
+        with websocket_request_span(operation, self._headers) as (span, headers):
+            message_chunk_count = 0
+            resume_state_chunk_count = 0
+            outcome: str | None = None
+            try:
+                async with websockets.connect(
+                    f"{self._ws_url}/ws/{path}",
+                    additional_headers=headers,
+                    open_timeout=60,
+                    ping_interval=_WS_PING_INTERVAL_S,
+                    ping_timeout=_WS_PING_TIMEOUT_S,
+                    max_size=10 * 1024 * 1024,  # 10MB
+                ) as websocket:
+                    last_message_at = time.monotonic()
+                    try:
+                        await websocket.send(request.model_dump_json())
+                        stream = aiter(websocket)
+                        while True:
+                            try:
+                                message = await asyncio.wait_for(
+                                    anext(stream), timeout=self._ws_idle_timeout_s
+                                )
+                            except StopAsyncIteration:
+                                break
+                            except TimeoutError:
+                                idle_s = time.monotonic() - last_message_at
+                                health_ok = await self._health_ok()
+                                span.set_attribute(
+                                    "benchmark_service.websocket.idle_health_ok", health_ok
+                                )
+                                outcome = "idle_timeout"
+                                raise BenchmarkServiceStreamIdleError(
+                                    idle_s=idle_s,
+                                    health_ok=health_ok,
+                                ) from None
+                            last_message_at = time.monotonic()
+                            chunk: StreamChunk = _stream_chunk_adapter.validate_json(message)
+                            match chunk.type:
+                                case "error":
+                                    outcome = "service_error"
+                                    raise BenchmarkServiceError(chunk.data)
+                                case "result":
+                                    outcome = "result"
+                                    return chunk.data
+                                case "message":
+                                    message_chunk_count += 1
+                                    if on_message:
+                                        on_message(chunk.data)
+                                case "eval_resume_state":
+                                    resume_state_chunk_count += 1
+                                    if on_eval_resume_state:
+                                        on_eval_resume_state(chunk.data)
+                    except ConnectionClosed as exc:
+                        close_frame = exc.rcvd or exc.sent
+                        outcome = "closed_without_terminal"
+                        raise BenchmarkServiceStreamClosedError(
+                            close_code=close_frame.code if close_frame else None,
+                            close_reason=close_frame.reason if close_frame else None,
+                            idle_s=time.monotonic() - last_message_at,
+                        ) from exc
+                    # The socket closed cleanly, but a stream without a terminal chunk is still broken.
+                    outcome = "closed_without_terminal"
                     raise BenchmarkServiceStreamClosedError(
-                        close_code=close_frame.code if close_frame else None,
-                        close_reason=close_frame.reason if close_frame else None,
+                        close_code=websocket.close_code,
+                        close_reason=websocket.close_reason,
                         idle_s=time.monotonic() - last_message_at,
-                    ) from exc
-
-                # The socket closed cleanly, but a stream without a terminal chunk is still broken.
-                raise BenchmarkServiceStreamClosedError(
-                    close_code=websocket.close_code,
-                    close_reason=websocket.close_reason,
-                    idle_s=time.monotonic() - last_message_at,
-                )
+                    )
+            except Exception:
+                if outcome is None:
+                    outcome = "other_exception"
+                raise
+            finally:
+                if outcome is not None:
+                    span.set_attribute("benchmark_service.websocket.outcome", outcome)
+                    span.set_attribute(
+                        "benchmark_service.websocket.message_chunk_count", message_chunk_count
+                    )
+                    span.set_attribute(
+                        "benchmark_service.websocket.resume_state_chunk_count", resume_state_chunk_count
+                    )
 
     async def _health_ok(self) -> bool:
         """Best-effort liveness probe used to describe an idle stream failure."""
@@ -572,37 +599,81 @@ class BenchmarkServiceClient:
                 default_max_attempts=default_max_attempts,
             )
 
-            attempt_number = 1
-            while attempt_number <= state.max_attempts:
-                attempt = state.attempt(attempt_number)
+            with trace.get_tracer("benchmark_service.client").start_as_current_span(
+                "benchmark_service.recovery"
+            ) as recovery_span:
+                trigger_kinds: set[str] = set()
+                outcome: str | None = None
+                attempt_count = 0
+                retry_count = 0
+                attempt_number = 1
                 try:
-                    return await operation(attempt)
-                except SandboxNotFoundError as exc:
-                    if state.task is None:
-                        await state.retrieve_task()
-                    if not attempt.sandbox_loss_retry_available:
-                        raise
-                    state.record_loss(attempt_number)
-                    retry_error: Exception = exc
-                except Exception as exc:
-                    if (
-                        not isinstance(exc, retryable_attempt_errors)
-                        or attempt_number >= state.max_attempts
-                        or state.consecutive_attempt_errors >= default_max_attempts - 1
-                    ):
-                        raise
-                    state.record_attempt_error()
-                    retry_error = exc
-
-                if on_retry is not None:
-                    callback_result = on_retry(attempt, retry_error)
-                    if inspect.isawaitable(callback_result):
-                        await callback_result
-                if retry_delay_s:
-                    await asyncio.sleep(retry_delay_s)
-                attempt_number += 1
-
-            raise AssertionError("sandbox recovery loop exited without a result")
+                    while attempt_number <= state.max_attempts:
+                        attempt = state.attempt(attempt_number)
+                        attempt_count += 1
+                        try:
+                            result = await operation(attempt)
+                            outcome = "recovered" if retry_count else "success"
+                            return result
+                        except SandboxNotFoundError as exc:
+                            trigger_kinds.add("sandbox_loss")
+                            if state.task is None:
+                                await state.retrieve_task()
+                            if not attempt.sandbox_loss_retry_available:
+                                outcome = "exhausted"
+                                raise
+                            state.record_loss(attempt_number)
+                            retry_error: Exception = exc
+                        except Exception as exc:
+                            if not isinstance(exc, retryable_attempt_errors):
+                                outcome = "operation_error"
+                                raise
+                            trigger_kinds.add("attempt_error")
+                            if (
+                                attempt_number >= state.max_attempts
+                                or state.consecutive_attempt_errors >= default_max_attempts - 1
+                            ):
+                                outcome = "exhausted"
+                                raise
+                            state.record_attempt_error()
+                            retry_error = exc
+                        if on_retry is not None:
+                            try:
+                                callback_result = on_retry(attempt, retry_error)
+                                if inspect.isawaitable(callback_result):
+                                    await callback_result
+                            except Exception:
+                                outcome = "callback_error"
+                                raise
+                        retry_count += 1
+                        if retry_delay_s:
+                            await asyncio.sleep(retry_delay_s)
+                        attempt_number += 1
+                    outcome = "exhausted"
+                    raise AssertionError("sandbox recovery loop exited without a result")
+                except Exception:
+                    if outcome is None:
+                        outcome = "operation_error"
+                    raise
+                finally:
+                    if outcome is not None:
+                        trigger = (
+                            "mixed"
+                            if len(trigger_kinds) > 1
+                            else next(iter(trigger_kinds), "none")
+                        )
+                        recovery_span.set_attribute(
+                            "benchmark_service.recovery.outcome", outcome
+                        )
+                        recovery_span.set_attribute(
+                            "benchmark_service.recovery.trigger", trigger
+                        )
+                        recovery_span.set_attribute(
+                            "benchmark_service.recovery.attempt_count", attempt_count
+                        )
+                        recovery_span.set_attribute(
+                            "benchmark_service.recovery.retry_count", retry_count
+                        )
 
     async def setup_task(
         self,

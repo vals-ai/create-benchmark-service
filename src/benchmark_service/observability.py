@@ -69,10 +69,13 @@ def request_headers(headers: Mapping[str, str]) -> dict[str, str]:
 
 
 @contextmanager
-def websocket_request_span(operation: str, headers: Mapping[str, str]) -> Iterator[dict[str, str]]:
+def websocket_request_span(
+    operation: str,
+    headers: Mapping[str, str],
+) -> Iterator[tuple[trace.Span, dict[str, str]]]:
     """Create the explicit WebSocket client span and inject its request headers."""
-    with _tracer.start_as_current_span(operation, kind=SpanKind.CLIENT):
-        yield request_headers(headers)
+    with _tracer.start_as_current_span(operation, kind=SpanKind.CLIENT) as span:
+        yield span, request_headers(headers)
 
 
 def bind_service_context(*, service_name: str, framework_version: str, service_version: str | None) -> None:

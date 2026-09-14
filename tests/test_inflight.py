@@ -114,3 +114,24 @@ def test_benchmarkserviceapp_installs_inflight_middleware() -> None:
         for m in app.user_middleware
     )
     assert found, "InflightMiddleware not in app.user_middleware"
+
+
+def test_emit_emf_metric_serializes_dimensions_and_unit(capsys: pytest.CaptureFixture[str]) -> None:
+    from benchmark_service.inflight import emit_emf_metric
+
+    emit_emf_metric(
+        "proof-bench",
+        "GradingAdmissionOutcomes",
+        "Count",
+        1,
+        dimensions=("Outcome",),
+        dimension_values=("admitted",),
+    )
+
+    payload = json.loads(capsys.readouterr().out.strip())
+    metric = payload["_aws"]["CloudWatchMetrics"][0]
+    assert metric["Dimensions"] == [["ServiceName", "Outcome"]]
+    assert metric["Metrics"] == [{"Name": "GradingAdmissionOutcomes", "Unit": "Count"}]
+    assert payload["ServiceName"] == "proof-bench"
+    assert payload["Outcome"] == "admitted"
+    assert payload["GradingAdmissionOutcomes"] == 1

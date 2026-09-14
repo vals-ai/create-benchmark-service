@@ -9,6 +9,7 @@ from collections.abc import AsyncGenerator, Generator, Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
 from threading import Event
+from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import patch
 
@@ -62,6 +63,36 @@ from benchmark_service.submission_artifacts import (
 )
 from benchmark_service.v1_schemas import V1EvalRequest, V1EvalStatus, V1Payload, V1PayloadType
 from tests.conftest import StubBenchmark
+
+
+@pytest.fixture
+def emitted_admission_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+
+    def emit(
+        service_name: str,
+        metric_name: str,
+        unit: str,
+        value: int | float,
+        *,
+        dimensions: tuple[str, ...] = (),
+        dimension_values: tuple[str, ...] = (),
+    ) -> None:
+        records.append(
+            {
+                "service_name": service_name,
+                "metric_name": metric_name,
+                "unit": unit,
+                "value": value,
+                "dimensions": dimensions,
+                "dimension_values": dimension_values,
+            }
+        )
+
+    monkeypatch.setattr("benchmark_service.app.emit_emf_metric", emit)
+    return records
 
 
 class FakeSandbox(Sandbox):
@@ -761,6 +792,7 @@ async def test_request_cancellation_keeps_admission_until_sandbox_deletion() -> 
         max_queued=0,
         max_admitted_per_tenant=1,
         queue_timeout_s=0.01,
+        service_name="proof-bench",
     )
     key = ("acme", "run-1", "task-1")
 
@@ -1494,6 +1526,7 @@ async def test_v1_evaluate_orders_reservation_quota_queue_and_artifact_preflight
         max_queued=1,
         max_admitted_per_tenant=2,
         queue_timeout_s=0.05,
+        service_name="proof-bench",
     )
 
     async def consume_quota(tenant: str) -> None:
@@ -1612,6 +1645,7 @@ async def test_canceled_artifact_storage_worker_keeps_grading_admission(
         max_queued=0,
         max_admitted_per_tenant=1,
         queue_timeout_s=0.01,
+        service_name="proof-bench",
     )
 
     async def admitted_storage_operation() -> None:
@@ -1685,16 +1719,20 @@ def test_v1_evaluate_artifact_payload_on_text_benchmark_returns_400(monkeypatch:
     assert "does not accept artifact" in resp.json()["detail"]
 
 
-async def test_grading_admission_rejects_duplicate_and_excess_work_while_held() -> None:
+async def test_grading_admission_rejects_duplicate_and_excess_work_while_held(
+    emitted_admission_metrics: list[dict[str, Any]],
+) -> None:
     admission = _GradingAdmission(
         max_concurrency=1,
         max_queued=0,
         max_admitted_per_tenant=1,
         queue_timeout_s=0.01,
+        service_name="proof-bench",
     )
     key = ("acme", "run-1", "task-1")
 
     async with admission.acquire(key):
+        emitted_admission_metrics.clear()
         with pytest.raises(_DuplicateGradingRequest):
             async with admission.acquire(key):
                 pass
@@ -1702,17 +1740,35 @@ async def test_grading_admission_rejects_duplicate_and_excess_work_while_held() 
             async with admission.acquire(("other", "run-2", "task-2")):
                 pass
 
+    assert [record["metric_name"] for record in emitted_admission_metrics] == [
+        "GradingAdmissionOutcomes",
+        "GradingAdmissionOutcomes",
+    ]
+    assert [record["dimension_values"] for record in emitted_admission_metrics] == [
+        ("duplicate_rejected",),
+        ("capacity_rejected",),
+    ]
+    assert all(
+        record["dimensions"] == ("Outcome",)
+        and record["service_name"] == "proof-bench"
+        for record in emitted_admission_metrics
+    )
 
-async def test_grading_admission_bounds_each_tenant_and_queue_wait() -> None:
+
+async def test_grading_admission_bounds_each_tenant_and_queue_wait(
+    emitted_admission_metrics: list[dict[str, Any]],
+) -> None:
     admission = _GradingAdmission(
         max_concurrency=1,
         max_queued=1,
         max_admitted_per_tenant=1,
         queue_timeout_s=0.01,
+        service_name="proof-bench",
     )
     queued_key = ("other", "run-2", "task-2")
 
     async with admission.acquire(("acme", "run-1", "task-1")):
+        emitted_admission_metrics.clear()
         with pytest.raises(_GradingCapacityExceeded):
             async with admission.acquire(("acme", "run-2", "task-2")):
                 pass
@@ -1722,6 +1778,139 @@ async def test_grading_admission_bounds_each_tenant_and_queue_wait() -> None:
 
     async with admission.acquire(queued_key):
         pass
+
+    assert [record["metric_name"] for record in emitted_admission_metrics] == [
+        "GradingAdmissionOutcomes",
+        "GradingAdmissionWaitSeconds",
+        "GradingAdmissionOutcomes",
+        "GradingAdmissionWaitSeconds",
+        "GradingAdmissionOutcomes",
+    ]
+    outcomes = [
+        record["dimension_values"]
+        for record in emitted_admission_metrics
+        if record["metric_name"] == "GradingAdmissionOutcomes"
+    ]
+    assert outcomes == [
+        ("capacity_rejected",),
+        ("queue_timeout",),
+        ("admitted",),
+    ]
+    waits = [
+        record
+        for record in emitted_admission_metrics
+        if record["metric_name"] == "GradingAdmissionWaitSeconds"
+    ]
+    assert len(waits) == 2
+    assert all(
+        record["unit"] == "Seconds"
+        and record["dimensions"] == ()
+        and record["dimension_values"] == ()
+        and record["value"] >= 0
+        for record in waits
+    )
+
+
+async def test_grading_admission_measures_active_slot_wait_and_admitted_outcome(
+    monkeypatch: pytest.MonkeyPatch,
+    emitted_admission_metrics: list[dict[str, Any]],
+) -> None:
+    times = iter((10.0, 12.5))
+    monkeypatch.setattr(
+        "benchmark_service.app.time",
+        SimpleNamespace(monotonic=lambda: next(times)),
+    )
+    admission = _GradingAdmission(
+        max_concurrency=1,
+        max_queued=0,
+        max_admitted_per_tenant=1,
+        queue_timeout_s=0.01,
+        service_name="proof-bench",
+    )
+
+    async with admission.acquire_active_slot():
+        pass
+
+    assert emitted_admission_metrics == [
+        {
+            "service_name": "proof-bench",
+            "metric_name": "GradingAdmissionWaitSeconds",
+            "unit": "Seconds",
+            "value": 2.5,
+            "dimensions": (),
+            "dimension_values": (),
+        },
+        {
+            "service_name": "proof-bench",
+            "metric_name": "GradingAdmissionOutcomes",
+            "unit": "Count",
+            "value": 1,
+            "dimensions": ("Outcome",),
+            "dimension_values": ("admitted",),
+        },
+    ]
+
+
+async def test_grading_admission_quota_failure_before_slot_emits_no_decision(
+    emitted_admission_metrics: list[dict[str, Any]],
+) -> None:
+    admission = _GradingAdmission(
+        max_concurrency=1,
+        max_queued=0,
+        max_admitted_per_tenant=1,
+        queue_timeout_s=0.01,
+        service_name="proof-bench",
+    )
+
+    with pytest.raises(RuntimeError, match="quota unavailable"):
+        async with admission.reserve(("acme", "run-1", "task-1")):
+            raise RuntimeError("quota unavailable")
+
+    assert emitted_admission_metrics == []
+
+
+async def test_grading_admission_post_acquisition_failure_has_no_second_decision(
+    emitted_admission_metrics: list[dict[str, Any]],
+) -> None:
+    admission = _GradingAdmission(
+        max_concurrency=1,
+        max_queued=0,
+        max_admitted_per_tenant=1,
+        queue_timeout_s=0.01,
+        service_name="proof-bench",
+    )
+
+    with pytest.raises(RuntimeError, match="grading failed"):
+        async with admission.acquire(("acme", "run-1", "task-1")):
+            raise RuntimeError("grading failed")
+
+    assert [record["metric_name"] for record in emitted_admission_metrics] == [
+        "GradingAdmissionWaitSeconds",
+        "GradingAdmissionOutcomes",
+    ]
+    assert emitted_admission_metrics[-1]["dimension_values"] == ("admitted",)
+
+
+async def test_grading_admission_cancellation_has_no_extra_decision(
+    emitted_admission_metrics: list[dict[str, Any]],
+) -> None:
+    admission = _GradingAdmission(
+        max_concurrency=1,
+        max_queued=0,
+        max_admitted_per_tenant=1,
+        queue_timeout_s=0.01,
+        service_name="proof-bench",
+    )
+
+    with pytest.raises(asyncio.CancelledError):
+        async with admission.acquire(("acme", "run-1", "task-1")):
+            raise asyncio.CancelledError
+
+    assert [record["metric_name"] for record in emitted_admission_metrics] == [
+        "GradingAdmissionWaitSeconds",
+        "GradingAdmissionOutcomes",
+    ]
+    assert emitted_admission_metrics[-1]["dimension_values"] == ("admitted",)
 
 
 def test_ws_evaluate_response_stays_sandboxless_for_sandbox_benchmarks(monkeypatch: pytest.MonkeyPatch) -> None:

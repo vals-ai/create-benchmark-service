@@ -4,6 +4,8 @@ import asyncio
 import json
 import os
 import socket
+from collections.abc import Mapping
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -15,6 +17,7 @@ from pydantic import ValidationError
 from websockets.exceptions import ConnectionClosedError
 from websockets.frames import Close
 
+import benchmark_service.client as client_module
 from benchmark_service import (
     BenchmarkServiceStreamClosedError,
     BenchmarkServiceStreamError,
@@ -52,6 +55,10 @@ class RetryableSetupError(Exception):
     """Test-only error representing a fresh-sandbox setup retry."""
 
 
+class _RecoveryInterrupted(BaseException):
+    pass
+
+
 def _task_response(max_sandbox_attempts: int | None = None) -> RetrieveTaskResponse:
     policy = {"max_sandbox_attempts": max_sandbox_attempts} if max_sandbox_attempts is not None else None
     return RetrieveTaskResponse.model_validate(
@@ -71,6 +78,63 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
     resp.json.return_value = json_data
     resp.text = text
     return resp
+
+
+class _RecordingSpan:
+    def __init__(self) -> None:
+        self.attributes: dict[str, str | int | bool] = {}
+        self.closed = False
+
+    def set_attribute(self, name: str, value: str | int | bool) -> None:
+        self.attributes[name] = value
+
+
+class _RecordingSpanContext:
+    def __init__(self, span: _RecordingSpan) -> None:
+        self._span = span
+
+    def __enter__(self) -> _RecordingSpan:
+        return self._span
+
+    def __exit__(
+        self,
+        _exc_type: type[BaseException] | None,
+        _exc: BaseException | None,
+        _traceback: object,
+    ) -> None:
+        self._span.closed = True
+
+
+class _RecordingTracer:
+    def __init__(self, span: _RecordingSpan) -> None:
+        self._span = span
+
+    def start_as_current_span(self, _name: str) -> _RecordingSpanContext:
+        return _RecordingSpanContext(self._span)
+
+
+@pytest.fixture
+def recovery_span(monkeypatch: pytest.MonkeyPatch) -> _RecordingSpan:
+    span = _RecordingSpan()
+
+    def get_tracer(_name: str) -> _RecordingTracer:
+        return _RecordingTracer(span)
+
+    monkeypatch.setattr(client_module.trace, "get_tracer", get_tracer)
+    return span
+
+
+@pytest.fixture
+def websocket_span(monkeypatch: pytest.MonkeyPatch) -> _RecordingSpan:
+    span = _RecordingSpan()
+
+    def websocket_request_span(
+        _operation: str, headers: Mapping[str, str]
+    ) -> nullcontext[tuple[_RecordingSpan, dict[str, str]]]:
+        return nullcontext((span, dict(headers)))
+
+    monkeypatch.setattr(client_module, "websocket_request_span", websocket_request_span)
+    return span
 
 
 @pytest.mark.parametrize(
@@ -198,6 +262,7 @@ def test_sandbox_recovery_policy_rejects_out_of_range_attempts(max_sandbox_attem
 async def test_client_keeps_task_loading_lazy_when_initial_operation_completes(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
     monkeypatch: pytest.MonkeyPatch,
+    recovery_span: _RecordingSpan,
 ) -> None:
     client, _mock_http = benchmark_client
     retrieve_task = AsyncMock(return_value=_task_response(3))
@@ -215,6 +280,12 @@ async def test_client_keeps_task_loading_lazy_when_initial_operation_completes(
 
     assert result == 1
     retrieve_task.assert_not_awaited()
+    assert recovery_span.attributes == {
+        "benchmark_service.recovery.outcome": "success",
+        "benchmark_service.recovery.trigger": "none",
+        "benchmark_service.recovery.attempt_count": 1,
+        "benchmark_service.recovery.retry_count": 0,
+    }
 
 
 @pytest.mark.parametrize(
@@ -259,6 +330,7 @@ async def test_client_rejects_sandbox_loss_in_caller_retry_types(
 async def test_client_awaits_async_retry_callback(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
     monkeypatch: pytest.MonkeyPatch,
+    recovery_span: _RecordingSpan,
 ) -> None:
     client, _mock_http = benchmark_client
     monkeypatch.setattr(client, "retrieve_task", AsyncMock(return_value=_task_response(2)))
@@ -279,6 +351,12 @@ async def test_client_awaits_async_retry_callback(
 
     assert result == "finished"
     on_retry.assert_awaited_once()
+    assert recovery_span.attributes == {
+        "benchmark_service.recovery.outcome": "recovered",
+        "benchmark_service.recovery.trigger": "sandbox_loss",
+        "benchmark_service.recovery.attempt_count": 2,
+        "benchmark_service.recovery.retry_count": 1,
+    }
 
 
 async def test_client_outage_ids_are_unique_across_invocations(
@@ -354,6 +432,7 @@ async def test_client_recovers_consecutive_losses_with_distinct_outage_identity(
 async def test_client_preserves_outage_identity_when_replacement_setup_retries(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
     monkeypatch: pytest.MonkeyPatch,
+    recovery_span: _RecordingSpan,
 ) -> None:
     client, _mock_http = benchmark_client
     monkeypatch.setattr(client, "retrieve_task", AsyncMock(return_value=_task_response(3)))
@@ -394,11 +473,18 @@ async def test_client_preserves_outage_identity_when_replacement_setup_retries(
             "VALKYRIE_SANDBOX_OUTAGE_STARTED_EPOCH": "1234.5",
         },
     ]
+    assert recovery_span.attributes == {
+        "benchmark_service.recovery.outcome": "recovered",
+        "benchmark_service.recovery.trigger": "mixed",
+        "benchmark_service.recovery.attempt_count": 3,
+        "benchmark_service.recovery.retry_count": 2,
+    }
 
 
 async def test_client_does_not_recover_lost_sandbox_without_policy(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
     monkeypatch: pytest.MonkeyPatch,
+    recovery_span: _RecordingSpan,
 ) -> None:
     client, _mock_http = benchmark_client
     monkeypatch.setattr(client, "retrieve_task", AsyncMock(return_value=_task_response()))
@@ -424,11 +510,18 @@ async def test_client_does_not_recover_lost_sandbox_without_policy(
 
     assert calls == 1
     assert attempts[0].sandbox_loss_retry_available is False
+    assert recovery_span.attributes == {
+        "benchmark_service.recovery.outcome": "exhausted",
+        "benchmark_service.recovery.trigger": "sandbox_loss",
+        "benchmark_service.recovery.attempt_count": 1,
+        "benchmark_service.recovery.retry_count": 0,
+    }
 
 
 async def test_client_applies_default_attempt_cap_to_caller_setup_errors(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
     monkeypatch: pytest.MonkeyPatch,
+    recovery_span: _RecordingSpan,
 ) -> None:
     client, _mock_http = benchmark_client
     monkeypatch.setattr(client, "retrieve_task", AsyncMock(return_value=_task_response()))
@@ -454,11 +547,18 @@ async def test_client_applies_default_attempt_cap_to_caller_setup_errors(
 
     assert result == 2
     assert calls == 2
+    assert recovery_span.attributes == {
+        "benchmark_service.recovery.outcome": "recovered",
+        "benchmark_service.recovery.trigger": "attempt_error",
+        "benchmark_service.recovery.attempt_count": 2,
+        "benchmark_service.recovery.retry_count": 1,
+    }
 
 
 async def test_client_keeps_setup_retry_cap_with_larger_recovery_policy(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
     monkeypatch: pytest.MonkeyPatch,
+    recovery_span: _RecordingSpan,
 ) -> None:
     client, _mock_http = benchmark_client
     monkeypatch.setattr(client, "retrieve_task", AsyncMock(return_value=_task_response(10)))
@@ -482,6 +582,162 @@ async def test_client_keeps_setup_retry_cap_with_larger_recovery_policy(
         )
 
     assert attempts == [1, 2]
+    assert recovery_span.attributes == {
+        "benchmark_service.recovery.outcome": "exhausted",
+        "benchmark_service.recovery.trigger": "attempt_error",
+        "benchmark_service.recovery.attempt_count": 2,
+        "benchmark_service.recovery.retry_count": 1,
+    }
+
+
+async def test_client_recovery_records_nonretryable_operation_error(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    recovery_span: _RecordingSpan,
+) -> None:
+    client, _mock_http = benchmark_client
+
+    async def operation(_attempt: SandboxRecoveryAttempt) -> None:
+        raise ValueError("operation failed")
+
+    with pytest.raises(ValueError, match="operation failed"):
+        await client.run_with_sandbox_recovery(
+            "task-1",
+            "run-1",
+            operation,
+            retry_delay_s=0,
+        )
+
+    assert recovery_span.attributes == {
+        "benchmark_service.recovery.outcome": "operation_error",
+        "benchmark_service.recovery.trigger": "none",
+        "benchmark_service.recovery.attempt_count": 1,
+        "benchmark_service.recovery.retry_count": 0,
+    }
+
+
+async def test_client_recovery_records_task_load_failure_as_operation_error(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+    recovery_span: _RecordingSpan,
+) -> None:
+    client, _mock_http = benchmark_client
+    task_load_error = ValueError("task load failed")
+    monkeypatch.setattr(
+        client,
+        "retrieve_task",
+        AsyncMock(side_effect=task_load_error),
+    )
+
+    async def operation(_attempt: SandboxRecoveryAttempt) -> None:
+        raise SandboxNotFoundError("sandbox disappeared")
+
+    with pytest.raises(ValueError, match="task load failed") as exc_info:
+        await client.run_with_sandbox_recovery(
+            "task-1",
+            "run-1",
+            operation,
+            retry_delay_s=0,
+        )
+
+    assert exc_info.value is task_load_error
+
+    assert recovery_span.attributes == {
+        "benchmark_service.recovery.outcome": "operation_error",
+        "benchmark_service.recovery.trigger": "sandbox_loss",
+        "benchmark_service.recovery.attempt_count": 1,
+        "benchmark_service.recovery.retry_count": 0,
+    }
+
+
+async def test_client_recovery_callback_error_does_not_count_unstarted_attempt(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    recovery_span: _RecordingSpan,
+) -> None:
+    client, _mock_http = benchmark_client
+    attempts: list[int] = []
+
+    async def operation(attempt: SandboxRecoveryAttempt) -> None:
+        attempts.append(attempt.number)
+        raise RetryableSetupError("setup failed")
+
+    def on_retry(_attempt: SandboxRecoveryAttempt, _error: Exception) -> None:
+        raise RuntimeError("callback failed")
+
+    with pytest.raises(RuntimeError, match="callback failed"):
+        await client.run_with_sandbox_recovery(
+            "task-1",
+            "run-1",
+            operation,
+            retryable_attempt_errors=(RetryableSetupError,),
+            default_max_attempts=2,
+            retry_delay_s=0,
+            on_retry=on_retry,
+        )
+
+    assert attempts == [1]
+    assert recovery_span.attributes == {
+        "benchmark_service.recovery.outcome": "callback_error",
+        "benchmark_service.recovery.trigger": "attempt_error",
+        "benchmark_service.recovery.attempt_count": 1,
+        "benchmark_service.recovery.retry_count": 0,
+    }
+
+
+async def test_client_recovery_operation_base_exception_omits_final_fields_and_closes_span(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    recovery_span: _RecordingSpan,
+) -> None:
+    client, _mock_http = benchmark_client
+    interruption = _RecoveryInterrupted("operation interrupted")
+
+    async def operation(_attempt: SandboxRecoveryAttempt) -> None:
+        raise interruption
+
+    with pytest.raises(_RecoveryInterrupted, match="operation interrupted") as exc_info:
+        await client.run_with_sandbox_recovery(
+            "task-1",
+            "run-1",
+            operation,
+            retry_delay_s=0,
+        )
+
+    assert exc_info.value is interruption
+
+    assert recovery_span.attributes == {}
+    assert recovery_span.closed is True
+
+
+async def test_client_recovery_callback_base_exception_omits_final_fields_and_next_attempt(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    recovery_span: _RecordingSpan,
+) -> None:
+    client, _mock_http = benchmark_client
+    attempts: list[int] = []
+    interruption = _RecoveryInterrupted("callback interrupted")
+
+    async def operation(attempt: SandboxRecoveryAttempt) -> None:
+        attempts.append(attempt.number)
+        raise RetryableSetupError("setup failed")
+
+    def on_retry(_attempt: SandboxRecoveryAttempt, _error: Exception) -> None:
+        raise interruption
+
+    with pytest.raises(_RecoveryInterrupted, match="callback interrupted") as exc_info:
+        await client.run_with_sandbox_recovery(
+            "task-1",
+            "run-1",
+            operation,
+            retryable_attempt_errors=(RetryableSetupError,),
+            default_max_attempts=2,
+            retry_delay_s=0,
+            on_retry=on_retry,
+        )
+
+    assert exc_info.value is interruption
+
+    assert attempts == [1]
+    assert recovery_span.attributes == {}
+    assert recovery_span.closed is True
 
 
 async def test_client_reraises_provider_error_when_policy_cap_is_exhausted(
@@ -721,6 +977,7 @@ async def test_final_score_with_dataset(
 
 async def test_resume_evaluation_with_eval_resume_state(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    websocket_span: _RecordingSpan,
 ) -> None:
     client, _mock_http = benchmark_client
     state = {"artifact_prefix": "s3://bucket/run"}
@@ -756,6 +1013,11 @@ async def test_resume_evaluation_with_eval_resume_state(
     }
     assert result == {"score": 1.0}
     on_eval_resume_state.assert_called_once_with(state)
+    assert websocket_span.attributes == {
+        "benchmark_service.websocket.outcome": "result",
+        "benchmark_service.websocket.message_chunk_count": 0,
+        "benchmark_service.websocket.resume_state_chunk_count": 1,
+    }
 
 
 async def test_evaluate_response_includes_optional_provider_config(
@@ -863,10 +1125,14 @@ async def test_verify_task_ids_no_dataset_omitted(
     mock_http.get.assert_called_once_with(f"{BASE_URL}/verify-task-ids", params={"task_ids": ["a"]})
 
 
+class _WebSocketInterrupted(BaseException):
+    pass
+
+
 class _AsyncIterator:
     """Async iterator over a list of strings."""
 
-    def __init__(self, items: list[str], terminal_error: Exception | None = None) -> None:
+    def __init__(self, items: list[str], terminal_error: BaseException | None = None) -> None:
         self._items = iter(items)
         self._terminal_error = terminal_error
         # Post-close attributes the client reads when the stream ends without a terminal chunk.
@@ -887,7 +1153,7 @@ class _AsyncIterator:
             raise StopAsyncIteration
 
 
-def _ws_mock(messages: list[str], terminal_error: Exception | None = None) -> AsyncMock:
+def _ws_mock(messages: list[str], terminal_error: BaseException | None = None) -> AsyncMock:
     """Create a mock websockets.connect context manager yielding messages."""
     ws = _AsyncIterator(messages, terminal_error)
     ws.send = AsyncMock()  # type: ignore[attr-defined]
@@ -913,7 +1179,9 @@ def _make_client(url: str = BASE_URL) -> BenchmarkServiceClient:
     ],
     ids=["setup_task", "evaluate_instance"],
 )
-async def test_ws_result_chunk(method: str, args: list[str]) -> None:
+async def test_ws_result_chunk(
+    method: str, args: list[str], websocket_span: _RecordingSpan
+) -> None:
     result_data = {"status": "ok"} if method == "setup_task" else {"score": 1.0}
     messages = [json.dumps({"type": "result", "data": result_data})]
     mock_connect = _ws_mock(messages)
@@ -926,6 +1194,11 @@ async def test_ws_result_chunk(method: str, args: list[str]) -> None:
         assert result.status == "ok"
     else:
         assert result == {"score": 1.0}
+    assert websocket_span.attributes == {
+        "benchmark_service.websocket.outcome": "result",
+        "benchmark_service.websocket.message_chunk_count": 0,
+        "benchmark_service.websocket.resume_state_chunk_count": 0,
+    }
 
 
 @pytest.mark.parametrize(
@@ -939,7 +1212,9 @@ async def test_ws_result_chunk(method: str, args: list[str]) -> None:
     ],
     ids=["setup_task", "evaluate_instance"],
 )
-async def test_ws_error_chunk(method: str, args: list[str]) -> None:
+async def test_ws_error_chunk(
+    method: str, args: list[str], websocket_span: _RecordingSpan
+) -> None:
     messages = [json.dumps({"type": "error", "data": "something went wrong"})]
     mock_connect = _ws_mock(messages)
 
@@ -947,6 +1222,11 @@ async def test_ws_error_chunk(method: str, args: list[str]) -> None:
     with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
         with pytest.raises(BenchmarkServiceError, match="something went wrong"):
             await getattr(client, method)(*args)
+    assert websocket_span.attributes == {
+        "benchmark_service.websocket.outcome": "service_error",
+        "benchmark_service.websocket.message_chunk_count": 0,
+        "benchmark_service.websocket.resume_state_chunk_count": 0,
+    }
 
 
 @pytest.mark.parametrize(
@@ -960,7 +1240,9 @@ async def test_ws_error_chunk(method: str, args: list[str]) -> None:
     ],
     ids=["setup_task", "evaluate_instance"],
 )
-async def test_ws_message_chunks_with_callback(method: str, args: list[str]) -> None:
+async def test_ws_message_chunks_with_callback(
+    method: str, args: list[str], websocket_span: _RecordingSpan
+) -> None:
     result_data = {"status": "ok"} if method == "setup_task" else {"score": 1.0}
     messages = [
         json.dumps({"type": "message", "data": "step 1"}),
@@ -977,6 +1259,11 @@ async def test_ws_message_chunks_with_callback(method: str, args: list[str]) -> 
     assert on_message.call_count == 2
     on_message.assert_any_call("step 1")
     on_message.assert_any_call("step 2")
+    assert websocket_span.attributes == {
+        "benchmark_service.websocket.outcome": "result",
+        "benchmark_service.websocket.message_chunk_count": 2,
+        "benchmark_service.websocket.resume_state_chunk_count": 0,
+    }
 
 
 @pytest.mark.parametrize(
@@ -1019,7 +1306,9 @@ async def test_ws_message_chunks_without_callback(method: str, args: list[str]) 
     ],
     ids=["setup_task", "evaluate_instance"],
 )
-async def test_ws_connection_closed_without_result(method: str, args: list[str]) -> None:
+async def test_ws_connection_closed_without_result(
+    method: str, args: list[str], websocket_span: _RecordingSpan
+) -> None:
     messages: list[str] = []  # no messages — simulates immediate close
     mock_connect = _ws_mock(messages)
 
@@ -1030,6 +1319,12 @@ async def test_ws_connection_closed_without_result(method: str, args: list[str])
 
     exc = exc_info.value
     assert str(exc) == f"WebSocket closed with code 1000 after {exc.idle_s:.1f}s without an application message"
+
+    assert websocket_span.attributes == {
+        "benchmark_service.websocket.outcome": "closed_without_terminal",
+        "benchmark_service.websocket.message_chunk_count": 0,
+        "benchmark_service.websocket.resume_state_chunk_count": 0,
+    }
 
 
 @pytest.mark.parametrize(
@@ -1094,7 +1389,11 @@ def _silent_ws_mock() -> AsyncMock:
     [("ok", "service still reports healthy"), (None, "service health check also failing")],
     ids=["service_healthy", "service_unreachable"],
 )
-async def test_ws_idle_past_the_budget_fails_the_stream(health_status: str | None, expected_health: str) -> None:
+async def test_ws_idle_past_the_budget_fails_the_stream(
+    health_status: str | None,
+    expected_health: str,
+    websocket_span: _RecordingSpan,
+) -> None:
     """A silent-but-open stream must fail instead of blocking forever, and record service liveness.
 
     Keepalive cannot see a peer that stops producing while the socket stays open, so without this
@@ -1117,6 +1416,13 @@ async def test_ws_idle_past_the_budget_fails_the_stream(health_status: str | Non
     assert isinstance(exc, BenchmarkServiceStreamError)
     assert exc.idle_s >= 0.05
     assert str(exc) == f"WebSocket idle for {exc.idle_s:.1f}s without an application message ({expected_health})"
+
+    assert websocket_span.attributes == {
+        "benchmark_service.websocket.idle_health_ok": health_status == "ok",
+        "benchmark_service.websocket.outcome": "idle_timeout",
+        "benchmark_service.websocket.message_chunk_count": 0,
+        "benchmark_service.websocket.resume_state_chunk_count": 0,
+    }
 
 
 async def test_ws_idle_health_probe_is_bounded() -> None:
@@ -1195,13 +1501,82 @@ async def test_ws_close_silence_is_measured_from_last_application_message() -> N
     assert exc_info.value.idle_s == 1.5
 
 
-async def test_ws_preconnection_failure_propagates_as_transport_error() -> None:
+async def test_ws_preconnection_failure_propagates_as_transport_error(
+    websocket_span: _RecordingSpan,
+) -> None:
     """DNS/connect/handshake failures stay distinguishable: they are never wrapped in a service error."""
     client = _make_client()
 
     with patch("benchmark_service.client.websockets.connect", side_effect=socket.gaierror("Name or service not known")):
         with pytest.raises(socket.gaierror):
             await client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG)
+    assert websocket_span.attributes == {
+        "benchmark_service.websocket.outcome": "other_exception",
+        "benchmark_service.websocket.message_chunk_count": 0,
+        "benchmark_service.websocket.resume_state_chunk_count": 0,
+    }
+
+
+async def test_ws_validation_failure_records_other_exception(
+    websocket_span: _RecordingSpan,
+) -> None:
+    client = _make_client()
+
+    with patch(
+        "benchmark_service.client.websockets.connect",
+        return_value=_ws_mock(["not-json"]),
+    ):
+        with pytest.raises(ValidationError):
+            await client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG)
+
+    assert websocket_span.attributes == {
+        "benchmark_service.websocket.outcome": "other_exception",
+        "benchmark_service.websocket.message_chunk_count": 0,
+        "benchmark_service.websocket.resume_state_chunk_count": 0,
+    }
+
+
+async def test_ws_message_callback_failure_counts_received_message(
+    websocket_span: _RecordingSpan,
+) -> None:
+    messages = [
+        json.dumps({"type": "message", "data": "step"}),
+        json.dumps({"type": "result", "data": {"score": 1.0}}),
+    ]
+    client = _make_client()
+
+    with patch(
+        "benchmark_service.client.websockets.connect",
+        return_value=_ws_mock(messages),
+    ):
+        with pytest.raises(RuntimeError, match="callback failed"):
+            await client.evaluate_instance(
+                "task-1",
+                "inst-1",
+                DAYTONA_CONFIG,
+                on_message=MagicMock(side_effect=RuntimeError("callback failed")),
+            )
+
+    assert websocket_span.attributes == {
+        "benchmark_service.websocket.outcome": "other_exception",
+        "benchmark_service.websocket.message_chunk_count": 1,
+        "benchmark_service.websocket.resume_state_chunk_count": 0,
+    }
+
+
+async def test_ws_base_exception_omits_final_diagnostic_fields(
+    websocket_span: _RecordingSpan,
+) -> None:
+    client = _make_client()
+
+    with patch(
+        "benchmark_service.client.websockets.connect",
+        return_value=_ws_mock([], _WebSocketInterrupted()),
+    ):
+        with pytest.raises(_WebSocketInterrupted):
+            await client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG)
+
+    assert websocket_span.attributes == {}
 
 
 async def test_client_list_tasks_returns_v1_dataset_tasks_response(

@@ -5,6 +5,7 @@ import importlib.metadata
 import logging
 import os
 import re
+import time
 import traceback
 from collections import Counter
 from collections.abc import AsyncGenerator
@@ -31,7 +32,7 @@ from benchmark_service.auth import (
 from benchmark_service.base import BenchmarkService
 from benchmark_service.context import sandbox_provider_scope
 from benchmark_service.grading import SUBMISSION_ARTIFACT_SANDBOX_PATH, collapse_stream, evaluate_submission
-from benchmark_service.inflight import InflightMiddleware
+from benchmark_service.inflight import InflightMiddleware, _emit_emf_metric
 from benchmark_service.observability import (
     bind_request_context,
     bind_service_context,
@@ -209,6 +210,7 @@ class _GradingAdmission:
         max_queued: int,
         max_admitted_per_tenant: int,
         queue_timeout_s: float,
+        service_name: str,
     ) -> None:
         if max_admitted_per_tenant < 1:
             raise ValueError("GRADING_MAX_ADMITTED_PER_TENANT must be >= 1")
@@ -216,28 +218,46 @@ class _GradingAdmission:
         self._max_admitted = max_concurrency + max_queued
         self._max_admitted_per_tenant = max_admitted_per_tenant
         self._queue_timeout_s = queue_timeout_s
+        self._service_name = service_name
         self._admitted: set[tuple[str, str, str]] = set()
         self._admitted_by_tenant: Counter[str] = Counter()
 
     @classmethod
-    def from_env(cls) -> "_GradingAdmission":
+    def from_env(cls, *, service_name: str) -> "_GradingAdmission":
         max_concurrency = _grading_max_concurrency()
         return cls(
             max_concurrency=max_concurrency,
             max_queued=_grading_nonnegative_int("GRADING_MAX_QUEUED", max_concurrency),
             max_admitted_per_tenant=_grading_nonnegative_int("GRADING_MAX_ADMITTED_PER_TENANT", max_concurrency),
             queue_timeout_s=_grading_positive_float("GRADING_QUEUE_TIMEOUT_S", 30.0),
+            service_name=service_name,
         )
 
     @asynccontextmanager
     async def reserve(self, key: tuple[str, str, str]) -> AsyncGenerator[None, None]:
         tenant, run_id, task_id = key
         if key in self._admitted:
+            _emit_emf_metric(
+                self._service_name,
+                "GradingAdmissionOutcomes",
+                "Count",
+                1,
+                dimensions=("Outcome",),
+                dimension_values=("duplicate_rejected",),
+            )
             raise _DuplicateGradingRequest(f"an evaluation for run {run_id} task {task_id} is already in progress")
         if (
             len(self._admitted) >= self._max_admitted
             or self._admitted_by_tenant[tenant] >= self._max_admitted_per_tenant
         ):
+            _emit_emf_metric(
+                self._service_name,
+                "GradingAdmissionOutcomes",
+                "Count",
+                1,
+                dimensions=("Outcome",),
+                dimension_values=("capacity_rejected",),
+            )
             raise _GradingCapacityExceeded("The benchmark service is at grading capacity; retry this evaluation later.")
 
         self._admitted.add(key)
@@ -253,14 +273,43 @@ class _GradingAdmission:
     @asynccontextmanager
     async def acquire_active_slot(self) -> AsyncGenerator[None, None]:
         acquired = False
+        started_at = time.monotonic()
         try:
             try:
                 await asyncio.wait_for(self._active.acquire(), self._queue_timeout_s)
             except TimeoutError as exc:
+                _emit_emf_metric(
+                    self._service_name,
+                    "GradingAdmissionWaitSeconds",
+                    "Seconds",
+                    time.monotonic() - started_at,
+                )
+                _emit_emf_metric(
+                    self._service_name,
+                    "GradingAdmissionOutcomes",
+                    "Count",
+                    1,
+                    dimensions=("Outcome",),
+                    dimension_values=("queue_timeout",),
+                )
                 raise _GradingCapacityExceeded(
                     "The benchmark service could not start grading in time; retry this evaluation later."
                 ) from exc
             acquired = True
+            _emit_emf_metric(
+                self._service_name,
+                "GradingAdmissionWaitSeconds",
+                "Seconds",
+                time.monotonic() - started_at,
+            )
+            _emit_emf_metric(
+                self._service_name,
+                "GradingAdmissionOutcomes",
+                "Count",
+                1,
+                dimensions=("Outcome",),
+                dimension_values=("admitted",),
+            )
             yield
         finally:
             if acquired:
@@ -377,7 +426,7 @@ class BenchmarkServiceApp(FastAPI):
 
         super().__init__(title=service_cls.__name__, lifespan=lifespan)
         self._grading_provider: SandboxProvider | None = None
-        self._grading_admission = _GradingAdmission.from_env()
+        self._grading_admission = _GradingAdmission.from_env(service_name=deployment_name)
         self._deployment_name = deployment_name
         self._sentry_enabled = sentry_enabled
         self.add_middleware(InflightMiddleware, service_name=self._deployment_name)

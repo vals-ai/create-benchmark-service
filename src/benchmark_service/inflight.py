@@ -24,6 +24,34 @@ logger = logging.getLogger(__name__)
 METRIC_NAMESPACE = "Vals/BenchmarkServices"
 EXCLUDED_PATHS = frozenset({"/health"})
 
+
+def _emit_emf_metric(
+    service_name: str,
+    metric_name: str,
+    unit: str,
+    value: int | float,
+    *,
+    dimensions: tuple[str, ...] = (),
+    dimension_values: tuple[str, ...] = (),
+) -> None:
+    dimension_names = ("ServiceName", *dimensions)
+    record: dict[str, Any] = {
+        "_aws": {
+            "Timestamp": int(time.time() * 1000),
+            "CloudWatchMetrics": [
+                {
+                    "Namespace": METRIC_NAMESPACE,
+                    "Dimensions": [list(dimension_names)],
+                    "Metrics": [{"Name": metric_name, "Unit": unit}],
+                }
+            ],
+        },
+        "ServiceName": service_name,
+        metric_name: value,
+    }
+    record.update(dict(zip(dimensions, dimension_values, strict=True)))
+    print(json.dumps(record), flush=True)
+
 ASGIScope = MutableMapping[str, Any]
 ASGIReceive = Callable[[], Awaitable[MutableMapping[str, Any]]]
 ASGISend = Callable[[MutableMapping[str, Any]], Awaitable[None]]
@@ -81,21 +109,7 @@ class InflightMiddleware:
                 logger.exception("inflight emitter loop error")
 
     def _emit_once(self) -> None:
-        record = {
-            "_aws": {
-                "Timestamp": int(time.time() * 1000),
-                "CloudWatchMetrics": [
-                    {
-                        "Namespace": METRIC_NAMESPACE,
-                        "Dimensions": [["ServiceName"]],
-                        "Metrics": [{"Name": "InFlightRequests", "Unit": "Count"}],
-                    }
-                ],
-            },
-            "ServiceName": self.service_name,
-            "InFlightRequests": self._inflight,
-        }
-        print(json.dumps(record), flush=True)
+        _emit_emf_metric(self.service_name, "InFlightRequests", "Count", self._inflight)
 
     async def aclose(self) -> None:
         if self._emitter_task is not None:

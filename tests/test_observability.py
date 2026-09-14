@@ -220,7 +220,31 @@ def test_init_sentry_uses_process_configuration_once(monkeypatch: pytest.MonkeyP
     assert options["dsn"] == "https://public@example.com/1"
     assert options["environment"] == "dev"
     assert options["release"] == "abc123"
-    assert options["traces_sample_rate"] == 1.0
+    assert options["traces_sample_rate"] == 0.1
+
+
+@pytest.mark.parametrize(
+    ("parent_sampled", "sample_rand", "expected_sampled"),
+    [(None, 0.05, True), (None, 0.15, False), (True, 0.95, True), (False, 0.05, False)],
+)
+def test_process_sampling_keeps_parent_decisions_and_error_events(
+    monkeypatch: pytest.MonkeyPatch,
+    configured_sentry: _CaptureTransport,
+    parent_sampled: bool | None,
+    sample_rand: float,
+    expected_sampled: bool,
+) -> None:
+    monkeypatch.setattr("sentry_sdk.tracing._generate_sample_rand", Mock(return_value=sample_rand))
+    assert init_sentry() is True
+
+    with sentry_sdk.start_transaction(name="sampling-test", parent_sampled=parent_sampled) as transaction:
+        assert transaction.sampled is expected_sampled
+        sentry_sdk.capture_exception(RuntimeError("sampling-test failure"))
+    sentry_sdk.flush()
+
+    assert len(configured_sentry.transactions) == int(expected_sampled)
+    assert len(configured_sentry.events) == 1
+    assert configured_sentry.events[0]["contexts"]["trace"]["trace_id"] == transaction.trace_id
 
 
 def test_lifespan_failure_before_service_creation_uses_package_identity(

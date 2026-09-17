@@ -27,6 +27,7 @@ from daytona import (
 from daytona_api_client_async import (
     ApiClient as DaytonaApiClient,
     Configuration as DaytonaApiConfiguration,
+    GpuType as ApiGpuType,
     OrganizationsApi,
     SandboxClass,
 )
@@ -305,10 +306,17 @@ def _admission_pool_id(*, organization_id: str, api_url: str) -> str:
 
 
 def _capacity_from_usage(usage: RegionUsageOverview) -> SandboxCapacity:
+    allowed_gpu_types = usage.allowed_gpu_types
     return SandboxCapacity(
         cpu=ResourceCapacity(total=usage.total_cpu_quota, used=usage.current_cpu_usage),
         memory=ResourceCapacity(total=usage.total_memory_quota, used=usage.current_memory_usage),
         disk=ResourceCapacity(total=usage.total_disk_quota, used=usage.current_disk_usage),
+        gpu=ResourceCapacity(total=usage.total_gpu_quota, used=usage.current_gpu_usage),
+        allowed_gpu_types=(
+            None
+            if allowed_gpu_types is None or ApiGpuType.UNKNOWN_DEFAULT_OPEN_API in allowed_gpu_types
+            else tuple(sorted(gpu_type.value for gpu_type in allowed_gpu_types))
+        ),
     )
 
 

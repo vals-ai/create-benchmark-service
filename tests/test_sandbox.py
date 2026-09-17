@@ -24,6 +24,7 @@ from daytona.common.errors import (
 )
 from daytona.common.pty import PtyResult, PtySize
 from daytona_api_client import VolumeState
+from daytona_api_client_async import GpuType as ApiGpuType
 from daytona_api_client_async import SandboxClass
 from daytona_api_client_async.exceptions import ApiException, NotFoundException
 from daytona_toolbox_api_client_async.models.pty_session_info import PtySessionInfo
@@ -1184,6 +1185,9 @@ def _usage_row(**updates: object) -> SimpleNamespace:
         "current_memory_usage": 4,
         "total_disk_quota": 100,
         "current_disk_usage": 25,
+        "total_gpu_quota": 0,
+        "current_gpu_usage": 0,
+        "allowed_gpu_types": [],
         "max_cpu_per_sandbox": None,
         "max_memory_per_sandbox": None,
         "max_disk_per_sandbox": None,
@@ -1686,6 +1690,9 @@ async def test_daytona_capacity_preserves_provider_values_and_clamps_oversubscri
                     current_memory_usage=0,
                     total_disk_quota=100.5,
                     current_disk_usage=101,
+                    total_gpu_quota=8,
+                    current_gpu_usage=2,
+                    allowed_gpu_types=None,
                 )
             ]
         ),
@@ -1698,9 +1705,45 @@ async def test_daytona_capacity_preserves_provider_values_and_clamps_oversubscri
         cpu=ResourceCapacity(total=8.5, used=2.25),
         memory=ResourceCapacity(total=0, used=0),
         disk=ResourceCapacity(total=100.5, used=101),
+        gpu=ResourceCapacity(total=8, used=2),
+        allowed_gpu_types=None,
     )
     assert capacity is not None
-    assert (capacity.cpu.available, capacity.memory.available, capacity.disk.available) == (6.25, 0, 0)
+    assert capacity.gpu is not None
+    assert (
+        capacity.cpu.available,
+        capacity.memory.available,
+        capacity.disk.available,
+        capacity.gpu.available,
+    ) == (6.25, 0, 0, 6)
+    assert requested == ["org-1"]
+
+
+async def test_daytona_capacity_preserves_values_when_gpu_type_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, requested = _admission_provider(
+        monkeypatch,
+        SimpleNamespace(
+            region_usage=[
+                _usage_row(
+                    total_gpu_quota=4,
+                    current_gpu_usage=1,
+                    allowed_gpu_types=[ApiGpuType.UNKNOWN_DEFAULT_OPEN_API],
+                )
+            ]
+        ),
+    )
+
+    capacity = await provider.get_capacity()
+
+    assert capacity == SandboxCapacity(
+        cpu=ResourceCapacity(total=8, used=2),
+        memory=ResourceCapacity(total=32, used=4),
+        disk=ResourceCapacity(total=100, used=25),
+        gpu=ResourceCapacity(total=4, used=1),
+        allowed_gpu_types=None,
+    )
     assert requested == ["org-1"]
 
 
@@ -1725,6 +1768,9 @@ async def test_daytona_capacity_domains_preserve_target_class_and_provider_value
                     current_memory_usage=0,
                     total_disk_quota=100.5,
                     current_disk_usage=101,
+                    total_gpu_quota=4,
+                    current_gpu_usage=5,
+                    allowed_gpu_types=[ApiGpuType.RTX_5090, ApiGpuType.H100],
                 ),
             ]
         ),
@@ -1742,6 +1788,8 @@ async def test_daytona_capacity_domains_preserve_target_class_and_provider_value
                 "cpu": {"total": 8.5, "used": 2.25},
                 "memory": {"total": 0.0, "used": 0.0},
                 "disk": {"total": 100.5, "used": 101.0},
+                "gpu": {"total": 4.0, "used": 5.0},
+                "allowed_gpu_types": ("H100", "RTX-5090"),
             },
         },
         {
@@ -1751,10 +1799,49 @@ async def test_daytona_capacity_domains_preserve_target_class_and_provider_value
                 "cpu": {"total": 12.0, "used": 3.0},
                 "memory": {"total": 32.0, "used": 4.0},
                 "disk": {"total": 100.0, "used": 25.0},
+                "gpu": {"total": 0.0, "used": 0.0},
+                "allowed_gpu_types": (),
             },
         },
     ]
     assert domains[0].capacity.disk.available == 0
+    assert domains[0].capacity.gpu is not None
+    assert domains[0].capacity.gpu.available == 0
+    assert requested == ["org-1"]
+
+
+async def test_daytona_capacity_domains_preserve_values_when_gpu_type_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, requested = _admission_provider(
+        monkeypatch,
+        SimpleNamespace(
+            region_usage=[
+                _usage_row(region_id="region-a", allowed_gpu_types=[ApiGpuType.H100]),
+                _usage_row(
+                    region_id="region-b",
+                    total_cpu_quota=12,
+                    current_cpu_usage=3,
+                    total_gpu_quota=4,
+                    current_gpu_usage=1,
+                    allowed_gpu_types=[ApiGpuType.UNKNOWN_DEFAULT_OPEN_API],
+                ),
+            ]
+        ),
+    )
+
+    domains = await provider.get_capacity_domains()
+
+    assert domains is not None
+    assert [domain.target_id for domain in domains] == ["region-a", "region-b"]
+    assert domains[0].capacity.allowed_gpu_types == ("H100",)
+    assert domains[1].capacity == SandboxCapacity(
+        cpu=ResourceCapacity(total=12, used=3),
+        memory=ResourceCapacity(total=32, used=4),
+        disk=ResourceCapacity(total=100, used=25),
+        gpu=ResourceCapacity(total=4, used=1),
+        allowed_gpu_types=None,
+    )
     assert requested == ["org-1"]
 
 

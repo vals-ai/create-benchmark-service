@@ -111,6 +111,8 @@ class SandboxCapacity(BaseModel):
     cpu: ResourceCapacity
     memory: ResourceCapacity
     disk: ResourceCapacity
+    gpu: ResourceCapacity | None = None
+    allowed_gpu_types: tuple[str, ...] | None = None
 
 
 class SandboxCapacityDomain(BaseModel):

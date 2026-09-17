@@ -129,9 +129,9 @@ When a setup or evaluate-instance request omits `sandbox_provider`, the Daytona 
 `x-api-key`, `x-api-url`, and `x-target`, plus optional `x-organization-id`. The legacy
 `daytona_api_key`, `daytona_api_url`, and `daytona_target` aliases remain accepted.
 Providing the organization ID enables organization-scoped capacity admission; omitting it preserves direct creation.
-`SandboxProvider.get_capacity_domains()` reports Daytona CPU, memory, and disk usage separately for every canonical
-target and sandbox class; `get_capacity()` retains its configured-target container view. Capacity is observational and
-is not reserved. The API key must be able to read organization usage. Targeted snapshot admission also requires
+`SandboxProvider.get_capacity_domains()` reports Daytona CPU, memory, disk, and aggregate GPU usage plus allowed GPU
+types separately for every canonical target and sandbox class; `get_capacity()` retains its configured-target container
+view. Capacity is observational and is not reserved. The API key must be able to read organization usage. Targeted snapshot admission also requires
 snapshot-read access.
 When the target is a region name instead of its ID, the key must be able to list regions so admission can resolve
 the canonical ID.

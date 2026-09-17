@@ -175,7 +175,7 @@ class DockerSandbox(Sandbox):
             raise SandboxError("Docker command timeout must be a positive finite number")
         environment = validate_command_env(env_vars)
         pid_file = f"/tmp/cbs-command-{uuid4().hex}.pid"
-        script = f"echo $$ > {pid_file}; exec /bin/sh -c {shlex.quote('{ ' + command + '\n} 2>&1')}"
+        script = f"echo $$ > {pid_file}; exec /bin/sh -c {shlex.quote(command)} 2>&1"
         with _docker_errors():
             execution = await self._container.exec(
                 ["setsid", "--wait", "/bin/sh", "-c", script],
@@ -266,7 +266,7 @@ class DockerSandboxProvider(SandboxProvider):
         self._docker = Docker(url=config.docker_endpoint)
 
     async def _get_container(self, instance_id: str) -> tuple[DockerContainer, _ContainerInfo]:
-        container = await self._docker.containers.get(instance_id)  # pyright: ignore[reportUnknownMemberType]
+        container = self._docker.containers.container(instance_id)  # pyright: ignore[reportUnknownMemberType]
         info = _ContainerInfo.model_validate(await container.show())  # pyright: ignore[reportUnknownMemberType]
         if info.config.labels.get(_INSTALLATION_LABEL) != self.config.installation_id:
             raise SandboxNotFoundError("Docker container does not belong to this installation")

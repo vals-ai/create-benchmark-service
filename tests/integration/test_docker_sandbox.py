@@ -63,6 +63,10 @@ async def test_docker_commands_and_binary_files(docker_sandbox: Sandbox) -> None
     result = await docker_sandbox.exec("printf failed; exit 7")
     assert result.exit_code == 7
     assert result.output == "failed"
+    for command in ("", "# comment only", "printf comment # trailing comment"):
+        result = await docker_sandbox.exec(command)
+        assert result.exit_code == 0
+        assert result.output == ("comment" if command.startswith("printf") else "")
     data = bytes(range(256)) * 4096
     await docker_sandbox.upload_file("/tmp/a directory/payload.bin", data)
     assert await docker_sandbox.download_file("/tmp/a directory/payload.bin") == data

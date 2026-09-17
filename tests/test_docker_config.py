@@ -34,7 +34,7 @@ def test_docker_grading_uses_process_configuration(monkeypatch: pytest.MonkeyPat
     assert config.installation_id == "test-local"
 
 
-@pytest.mark.parametrize("feature", ["snapshot", "gpu", "secrets", "auto_stop"])
+@pytest.mark.parametrize("feature", ["snapshot", "gpu", "secrets"])
 async def test_docker_rejects_unsupported_features_before_connecting(feature: str) -> None:
     """Report unsupported requests without attempting to create a container."""
     request = SandboxCreateRequest(
@@ -43,10 +43,10 @@ async def test_docker_rejects_unsupported_features_before_connecting(feature: st
         name="test",
         labels={},
         env_vars={},
-        auto_stop_interval=10 if feature == "auto_stop" else 0,
+        auto_stop_interval=0,
         create_timeout=1,
         sandbox_secrets={"TOKEN": "reference"} if feature == "secrets" else {},
     )
     async with DockerSandboxProvider(DockerProviderConfig(docker_endpoint="unix:///does-not-exist.sock")) as provider:
-        with pytest.raises(SandboxError, match="supports image|does not support|auto_stop_interval"):
+        with pytest.raises(SandboxError, match="supports image|does not support"):
             await provider.create_sandbox(request)

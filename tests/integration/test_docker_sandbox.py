@@ -41,7 +41,7 @@ async def docker_sandbox(docker_provider: SandboxProvider) -> Sandbox:
             name="docker-contract",
             labels={"test": "contract"},
             env_vars={},
-            auto_stop_interval=0,
+            auto_stop_interval=10,
             create_timeout=120,
             network_block_all=True,
         )
@@ -72,11 +72,17 @@ async def test_docker_commands_and_binary_files(docker_sandbox: Sandbox) -> None
     assert await docker_sandbox.download_file("/tmp/a directory/payload.bin") == data
     assert (await docker_sandbox.exec("pwd", cwd="/tmp/a directory")).output.strip() == "/tmp/a directory"
     assert (await docker_sandbox.exec("test ! -S /var/run/docker.sock")).exit_code == 0
+    await docker_sandbox.upload_file("/tmp/nonroot-readable", b"payload")
+    result = await docker_sandbox.exec("su nobody -s /bin/sh -c 'cat /tmp/nonroot-readable'")
+    assert result.exit_code == 0
+    assert result.output == "payload"
 
 
 async def test_docker_timeout_and_cancel_kill_commands(docker_sandbox: Sandbox) -> None:
     """Stop command process groups on timeout and caller cancellation."""
     result = await docker_sandbox.exec("sleep 2; touch /tmp/timed-out", timeout=0.2)
+    assert result.exit_code == 124
+    result = await docker_sandbox.exec("(sleep 2; touch /tmp/background-timeout) & echo ready", timeout=0.2)
     assert result.exit_code == 124
     ready = asyncio.Event()
 
@@ -91,7 +97,18 @@ async def test_docker_timeout_and_cancel_kill_commands(docker_sandbox: Sandbox) 
     with pytest.raises(asyncio.CancelledError):
         await task
     await asyncio.sleep(2.2)
-    assert (await docker_sandbox.exec("test ! -e /tmp/timed-out && test ! -e /tmp/cancelled")).exit_code == 0
+    result = await docker_sandbox.exec(
+        "test ! -e /tmp/timed-out && test ! -e /tmp/cancelled && test ! -e /tmp/background-timeout"
+    )
+    assert result.exit_code == 0
+
+
+async def test_docker_successful_command_preserves_background_process(docker_sandbox: Sandbox) -> None:
+    """Leave intentionally detached processes running after a successful command."""
+    result = await docker_sandbox.exec("(sleep 1; touch /tmp/background-success) >/dev/null 2>&1 &")
+    assert result.exit_code == 0
+    await asyncio.sleep(1.2)
+    assert (await docker_sandbox.exec("test -e /tmp/background-success")).exit_code == 0
 
 
 async def test_docker_inventory_and_installation_isolation(

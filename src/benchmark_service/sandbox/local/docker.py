@@ -20,7 +20,6 @@ from uuid import uuid4
 from aiodocker import Docker
 from aiodocker.containers import DockerContainer
 from aiodocker.exceptions import DockerError
-from aiodocker.execs import Exec
 from aiodocker.types import JSONObject
 from aiohttp import ClientError
 from pydantic import BaseModel, Field, field_validator
@@ -141,12 +140,11 @@ class DockerSandbox(Sandbox):
     def state(self) -> str:
         return self._info.state.status
 
-    async def _cleanup_command(self, execution: Exec, pid_file: str) -> None:
+    async def _cleanup_command(self, pid_file: str, *, terminate: bool) -> None:
         async with asyncio.timeout(15):
             with _docker_errors():
                 try:
-                    info = await execution.inspect()
-                    if info.get("Running"):
+                    if terminate:
                         command = (
                             f"if test -f {pid_file}; then pid=$(cat {pid_file}); "
                             'kill -TERM -"$pid" 2>/dev/null; sleep 0.2; '
@@ -182,6 +180,7 @@ class DockerSandbox(Sandbox):
                 environment=environment,
                 workdir=cwd,
             )
+            finished = False
             try:
                 async with asyncio.timeout(timeout):
                     async with execution.start() as stream:
@@ -191,6 +190,7 @@ class DockerSandbox(Sandbox):
                     while info.get("Running"):
                         await asyncio.sleep(0.01)
                         info = await execution.inspect()
+                finished = True
                 exit_code = info.get("ExitCode")
                 if not isinstance(exit_code, int):
                     raise SandboxError("Docker command finished without an exit code")
@@ -199,7 +199,7 @@ class DockerSandbox(Sandbox):
             except TimeoutError:
                 raise SandboxCommandError(124) from None
             finally:
-                await _finish_cleanup(asyncio.create_task(self._cleanup_command(execution, pid_file)))
+                await _finish_cleanup(asyncio.create_task(self._cleanup_command(pid_file, terminate=not finished)))
 
     async def command(
         self,
@@ -240,7 +240,7 @@ class DockerSandbox(Sandbox):
             with tarfile.open(fileobj=output, mode="w") as tar:
                 info = tarfile.TarInfo(path.name)
                 info.size = len(content)
-                info.mode = 0o600
+                info.mode = 0o644
                 tar.addfile(info, io.BytesIO(content))
             return output.getvalue()
 
@@ -282,8 +282,6 @@ class DockerSandboxProvider(SandboxProvider):
             raise SandboxError("Local Docker supports image sources only; snapshots and Compose are not supported")
         if request.resources.gpu or request.volumes or request.sandbox_secrets:
             raise SandboxError("Local Docker does not support GPUs, persistent volumes, or provider-managed secrets")
-        if request.auto_stop_interval != 0:
-            raise SandboxError("Local Docker requires auto_stop_interval=0; the caller must delete its sandboxes")
         validate_command_env(request.env_vars)
         name = f"cbs-{self.config.installation_id}-{uuid4().hex}"
         labels = {**request.labels, _INSTALLATION_LABEL: self.config.installation_id, _NAME_LABEL: request.name}

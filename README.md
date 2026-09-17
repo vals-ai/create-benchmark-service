@@ -163,9 +163,9 @@ native architecture, or select `linux/arm64` or `linux/amd64` to require a match
 
 Docker supports image sources whose images provide `/bin/sh` and `setsid --wait`.
 CPU and memory limits are enforced. `Resources.disk` is accepted but does not set a
-filesystem quota. Set `auto_stop_interval=0`; callers must delete containers after use
-and reconcile abandoned containers after restarting. Listing and deletion are scoped
-to `installation_id`, so use a distinct value for independent local installations.
+filesystem quota. `auto_stop_interval` is accepted but does not set an idle timer; callers
+must delete containers after use and reconcile abandoned containers after restarting. Listing
+and deletion are scoped to `installation_id`, so use a distinct value for independent local installations.
 
 Commands stream output and preserve exit codes. Timeouts and cancelled streams terminate
 the command's process group. File upload and download support binary data. Network access

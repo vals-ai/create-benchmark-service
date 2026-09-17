@@ -306,8 +306,7 @@ def _admission_pool_id(*, organization_id: str, api_url: str) -> str:
 
 
 def _capacity_from_usage(usage: RegionUsageOverview) -> SandboxCapacity:
-    if usage.allowed_gpu_types is not None and ApiGpuType.UNKNOWN_DEFAULT_OPEN_API in usage.allowed_gpu_types:
-        raise SandboxError("Daytona capacity metadata is invalid")
+    allowed_gpu_types = usage.allowed_gpu_types
     return SandboxCapacity(
         cpu=ResourceCapacity(total=usage.total_cpu_quota, used=usage.current_cpu_usage),
         memory=ResourceCapacity(total=usage.total_memory_quota, used=usage.current_memory_usage),
@@ -315,8 +314,8 @@ def _capacity_from_usage(usage: RegionUsageOverview) -> SandboxCapacity:
         gpu=ResourceCapacity(total=usage.total_gpu_quota, used=usage.current_gpu_usage),
         allowed_gpu_types=(
             None
-            if usage.allowed_gpu_types is None
-            else tuple(sorted(gpu_type.value for gpu_type in usage.allowed_gpu_types))
+            if allowed_gpu_types is None or ApiGpuType.UNKNOWN_DEFAULT_OPEN_API in allowed_gpu_types
+            else tuple(sorted(gpu_type.value for gpu_type in allowed_gpu_types))
         ),
     )
 

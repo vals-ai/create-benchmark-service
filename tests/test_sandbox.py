@@ -1719,6 +1719,34 @@ async def test_daytona_capacity_preserves_provider_values_and_clamps_oversubscri
     assert requested == ["org-1"]
 
 
+async def test_daytona_capacity_preserves_values_when_gpu_type_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, requested = _admission_provider(
+        monkeypatch,
+        SimpleNamespace(
+            region_usage=[
+                _usage_row(
+                    total_gpu_quota=4,
+                    current_gpu_usage=1,
+                    allowed_gpu_types=[ApiGpuType.UNKNOWN_DEFAULT_OPEN_API],
+                )
+            ]
+        ),
+    )
+
+    capacity = await provider.get_capacity()
+
+    assert capacity == SandboxCapacity(
+        cpu=ResourceCapacity(total=8, used=2),
+        memory=ResourceCapacity(total=32, used=4),
+        disk=ResourceCapacity(total=100, used=25),
+        gpu=ResourceCapacity(total=4, used=1),
+        allowed_gpu_types=None,
+    )
+    assert requested == ["org-1"]
+
+
 async def test_daytona_capacity_domains_preserve_target_class_and_provider_values(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1782,6 +1810,41 @@ async def test_daytona_capacity_domains_preserve_target_class_and_provider_value
     assert requested == ["org-1"]
 
 
+async def test_daytona_capacity_domains_preserve_values_when_gpu_type_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, requested = _admission_provider(
+        monkeypatch,
+        SimpleNamespace(
+            region_usage=[
+                _usage_row(region_id="region-a", allowed_gpu_types=[ApiGpuType.H100]),
+                _usage_row(
+                    region_id="region-b",
+                    total_cpu_quota=12,
+                    current_cpu_usage=3,
+                    total_gpu_quota=4,
+                    current_gpu_usage=1,
+                    allowed_gpu_types=[ApiGpuType.UNKNOWN_DEFAULT_OPEN_API],
+                ),
+            ]
+        ),
+    )
+
+    domains = await provider.get_capacity_domains()
+
+    assert domains is not None
+    assert [domain.target_id for domain in domains] == ["region-a", "region-b"]
+    assert domains[0].capacity.allowed_gpu_types == ("H100",)
+    assert domains[1].capacity == SandboxCapacity(
+        cpu=ResourceCapacity(total=12, used=3),
+        memory=ResourceCapacity(total=32, used=4),
+        disk=ResourceCapacity(total=100, used=25),
+        gpu=ResourceCapacity(total=4, used=1),
+        allowed_gpu_types=None,
+    )
+    assert requested == ["org-1"]
+
+
 async def test_daytona_capacity_domains_preserve_successful_empty_observation(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1798,7 +1861,6 @@ async def test_daytona_capacity_domains_preserve_successful_empty_observation(
         ApiException(status=503),
         SimpleNamespace(region_usage=[_usage_row(), _usage_row()]),
         SimpleNamespace(region_usage=[_usage_row(sandbox_class=SandboxClass.UNKNOWN_DEFAULT_OPEN_API)]),
-        SimpleNamespace(region_usage=[_usage_row(allowed_gpu_types=[ApiGpuType.UNKNOWN_DEFAULT_OPEN_API])]),
         SimpleNamespace(region_usage=[_usage_row(region_id="")]),
     ],
 )
@@ -1868,7 +1930,6 @@ async def test_daytona_capacity_is_unsupported_without_organization_id(monkeypat
         SimpleNamespace(region_usage=[_usage_row(), _usage_row()]),
         SimpleNamespace(region_usage=[_usage_row(total_cpu_quota=float("nan"))]),
         SimpleNamespace(region_usage=[_usage_row(current_memory_usage=-1)]),
-        SimpleNamespace(region_usage=[_usage_row(allowed_gpu_types=[ApiGpuType.UNKNOWN_DEFAULT_OPEN_API])]),
     ],
 )
 async def test_daytona_capacity_observation_failures_are_safe(

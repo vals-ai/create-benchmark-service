@@ -11,7 +11,7 @@ import os
 import shlex
 import tarfile
 from collections.abc import AsyncGenerator, Generator, Mapping
-from contextlib import contextmanager
+from contextlib import aclosing, contextmanager
 from datetime import datetime
 from pathlib import PurePosixPath
 from typing import Literal
@@ -187,18 +187,17 @@ class DockerSandbox(Sandbox):
     ) -> AsyncGenerator[str]:
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         iterator = self._command_bytes(command, cwd=cwd, timeout=timeout, env_vars=env_vars)
-        try:
-            async for chunk in iterator:
-                if text := decoder.decode(chunk):
+        async with aclosing(iterator):
+            try:
+                async for chunk in iterator:
+                    if text := decoder.decode(chunk):
+                        yield text
+                if text := decoder.decode(b"", final=True):
                     yield text
-            if text := decoder.decode(b"", final=True):
-                yield text
-        except SandboxCommandError:
-            if text := decoder.decode(b"", final=True):
-                yield text
-            raise
-        finally:
-            await iterator.aclose()
+            except SandboxCommandError:
+                if text := decoder.decode(b"", final=True):
+                    yield text
+                raise
 
     async def exec(self, command: str, *, cwd: str | None = None, timeout: float | None = None) -> ExecResult:
         output: list[str] = []

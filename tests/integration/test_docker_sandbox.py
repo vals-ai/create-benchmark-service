@@ -70,6 +70,9 @@ async def test_docker_commands_and_binary_files(docker_sandbox: Sandbox) -> None
     result = await docker_sandbox.exec("printf failed; exit 7")
     assert result.exit_code == 7
     assert result.output == "failed"
+    result = await docker_sandbox.exec("printf '\\342'; exit 7")
+    assert result.exit_code == 7
+    assert result.output == "\ufffd"
     for command in ("", "# comment only", "printf comment # trailing comment"):
         result = await docker_sandbox.exec(command)
         assert result.exit_code == 0
@@ -108,6 +111,18 @@ async def test_docker_timeout_and_cancel_kill_commands(docker_sandbox: Sandbox) 
         "test ! -e /tmp/timed-out && test ! -e /tmp/cancelled && test ! -e /tmp/background-timeout"
     )
     assert result.exit_code == 0
+
+
+async def test_docker_timeout_bounds_exec_creation(docker_sandbox: Sandbox, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Honor the command timeout while Docker is creating the exec instance."""
+    from aiodocker.containers import DockerContainer
+
+    async def stalled_exec(*_args: object, **_kwargs: object) -> None:
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(DockerContainer, "exec", stalled_exec)
+    result = await asyncio.wait_for(docker_sandbox.exec("true", timeout=0.01), timeout=1)
+    assert result.exit_code == 124
 
 
 async def test_docker_successful_command_preserves_background_process(docker_sandbox: Sandbox) -> None:

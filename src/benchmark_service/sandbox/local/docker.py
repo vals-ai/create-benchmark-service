@@ -140,14 +140,15 @@ class DockerSandbox(Sandbox):
         pid_file = f"/tmp/cbs-command-{uuid4().hex}.pid"
         script = f"echo $$ > {pid_file}; exec /bin/sh -c {shlex.quote(command)} 2>&1"
         with _docker_errors():
-            execution = await self._container.exec(
-                ["setsid", "--wait", "/bin/sh", "-c", script],
-                environment=environment,
-                workdir=cwd,
-            )
+            execution = None
             finished = False
             try:
                 async with asyncio.timeout(timeout):
+                    execution = await self._container.exec(
+                        ["setsid", "--wait", "/bin/sh", "-c", script],
+                        environment=environment,
+                        workdir=cwd,
+                    )
                     async with execution.start() as stream:
                         while (message := await stream.read_out()) is not None:
                             yield message.data
@@ -164,7 +165,8 @@ class DockerSandbox(Sandbox):
             except TimeoutError:
                 raise SandboxCommandError(124) from None
             finally:
-                await _finish_cleanup(asyncio.create_task(self._cleanup_command(pid_file, terminate=not finished)))
+                if execution is not None:
+                    await _finish_cleanup(asyncio.create_task(self._cleanup_command(pid_file, terminate=not finished)))
 
     async def command(
         self,
@@ -182,6 +184,10 @@ class DockerSandbox(Sandbox):
                     yield text
             if text := decoder.decode(b"", final=True):
                 yield text
+        except SandboxCommandError:
+            if text := decoder.decode(b"", final=True):
+                yield text
+            raise
         finally:
             await iterator.aclose()
 

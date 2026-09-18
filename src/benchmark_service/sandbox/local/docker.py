@@ -24,7 +24,6 @@ from aiodocker.types import JSONObject
 from aiohttp import ClientError
 from pydantic import AliasPath, BaseModel, Field
 
-from benchmark_service.blocking import run_blocking
 from benchmark_service.sandbox.types import (
     ExecResult,
     ImageSource,
@@ -107,24 +106,23 @@ class DockerSandbox(Sandbox):
 
     async def _cleanup_command(self, pid_file: str, *, terminate: bool) -> None:
         async with asyncio.timeout(15):
-            with _docker_errors():
-                try:
-                    if terminate:
-                        command = (
-                            f"if test -f {pid_file}; then pid=$(cat {pid_file}); "
-                            'kill -TERM -"$pid" 2>/dev/null; sleep 0.2; '
-                            'kill -KILL -"$pid" 2>/dev/null; fi; '
-                            f"rm -f {pid_file}"
-                        )
-                    else:
-                        command = f"rm -f {pid_file}"
-                    cleanup = await self._container.exec(["/bin/sh", "-c", command])
-                    async with cleanup.start() as stream:
-                        while await stream.read_out() is not None:
-                            pass
-                except DockerError as error:
-                    if error.status != 404:
-                        raise
+            try:
+                if terminate:
+                    command = (
+                        f"if test -f {pid_file}; then pid=$(cat {pid_file}); "
+                        'kill -TERM -"$pid" 2>/dev/null; sleep 0.2; '
+                        'kill -KILL -"$pid" 2>/dev/null; fi; '
+                        f"rm -f {pid_file}"
+                    )
+                else:
+                    command = f"rm -f {pid_file}"
+                cleanup = await self._container.exec(["/bin/sh", "-c", command])
+                async with cleanup.start() as stream:
+                    while await stream.read_out() is not None:
+                        pass
+            except DockerError as error:
+                if error.status != 404:
+                    raise
 
     async def _command_bytes(
         self,
@@ -224,7 +222,7 @@ class DockerSandbox(Sandbox):
             return output.getvalue()
 
         with _docker_errors():
-            await self._container.put_archive(str(path.parent), await run_blocking(archive))  # pyright: ignore[reportUnknownMemberType]
+            await self._container.put_archive(str(path.parent), await asyncio.to_thread(archive))  # pyright: ignore[reportUnknownMemberType]
 
     async def download_file(self, remote_path: str) -> bytes:
         return b"".join([chunk async for chunk in self.stream_download(remote_path)])

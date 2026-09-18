@@ -58,7 +58,6 @@ from benchmark_service.schemas import (
     VersionResponse,
 )
 from benchmark_service.sandbox import (
-    DockerProviderConfig,
     ModalProviderConfig,
     SandboxProvider,
     SandboxProviderConfig,
@@ -164,8 +163,6 @@ def _grading_provider_config() -> SandboxProviderConfig:
     provider_type = os.environ.get(GRADING_SANDBOX_PROVIDER_ENV) or "daytona"
     if provider_type == "daytona":
         return DaytonaProviderConfig.from_env()
-    if provider_type == "docker":
-        return DockerProviderConfig()
     if provider_type == "modal":
         return ModalProviderConfig.from_env()
     return sandbox_provider_config_from_mapping({"type": provider_type})

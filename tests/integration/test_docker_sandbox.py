@@ -13,6 +13,7 @@ from benchmark_service import (
     ImageSource,
     Resources,
     Sandbox,
+    SandboxCommandError,
     SandboxCreateRequest,
     SandboxNotFoundError,
     SandboxProvider,
@@ -89,8 +90,17 @@ async def test_docker_commands_and_binary_files(docker_sandbox: Sandbox) -> None
 
 async def test_docker_timeout_and_cancel_kill_commands(docker_sandbox: Sandbox) -> None:
     """Stop command process groups on timeout and caller cancellation."""
-    result = await docker_sandbox.exec("sleep 2; touch /tmp/timed-out", timeout=0.2)
-    assert result.exit_code == 124
+    stream = docker_sandbox.command("echo ready; sleep 2; touch /tmp/timed-out", timeout=0.2)
+    assert "ready" in await asyncio.create_task(anext(stream))
+    pending = asyncio.create_task(anext(stream))
+    done, _ = await asyncio.wait({pending}, timeout=1)
+    if not done:
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        pytest.fail("Command deadline did not survive switching consumer tasks")
+    with pytest.raises(SandboxCommandError) as error:
+        await pending
+    assert error.value.exit_code == 124
     result = await docker_sandbox.exec("(sleep 2; touch /tmp/background-timeout) & echo ready", timeout=0.2)
     assert result.exit_code == 124
     ready = asyncio.Event()

@@ -136,6 +136,7 @@ class DockerSandbox(Sandbox):
     ) -> AsyncGenerator[bytes]:
         if timeout is not None and (not math.isfinite(timeout) or timeout <= 0):
             raise SandboxError("Docker command timeout must be a positive finite number")
+        deadline = asyncio.get_running_loop().time() + timeout if timeout is not None else None
         environment = validate_command_env(env_vars)
         pid_file = f"/tmp/cbs-command-{uuid4().hex}.pid"
         script = f"echo $$ > {pid_file}; exec /bin/sh -c {shlex.quote(command)} 2>&1"
@@ -143,15 +144,23 @@ class DockerSandbox(Sandbox):
             execution = None
             finished = False
             try:
-                async with asyncio.timeout(timeout):
+                async with asyncio.timeout_at(deadline):
                     execution = await self._container.exec(
                         ["setsid", "--wait", "/bin/sh", "-c", script],
                         environment=environment,
                         workdir=cwd,
                     )
-                    async with execution.start() as stream:
-                        while (message := await stream.read_out()) is not None:
-                            yield message.data
+                stream = execution.start()
+                try:
+                    while True:
+                        async with asyncio.timeout_at(deadline):
+                            message = await stream.read_out()
+                        if message is None:
+                            break
+                        yield message.data
+                finally:
+                    await stream.close()
+                async with asyncio.timeout_at(deadline):
                     info = await execution.inspect()
                     while info.get("Running"):
                         await asyncio.sleep(0.01)

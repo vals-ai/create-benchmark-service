@@ -1,10 +1,12 @@
 """Local Docker contract checks; run with CBS_DOCKER_ENABLED=true and DOCKER_HOST."""
 
 import asyncio
+import os
 from collections.abc import AsyncGenerator
 from uuid import uuid4
 
 import pytest
+from aiodocker import Docker
 
 from benchmark_service import (
     DockerProviderConfig,
@@ -19,27 +21,32 @@ from benchmark_service import (
 
 
 @pytest.fixture
-async def docker_provider() -> AsyncGenerator[SandboxProvider]:
-    """Use an isolated installation on the configured local daemon."""
-    config = DockerProviderConfig.from_env().model_copy(update={"installation_id": f"test-{uuid4().hex}"})
-    provider = config.create_provider()
+def docker_labels() -> dict[str, str]:
+    """Identify only containers belonging to this test."""
+    return {"test": f"docker-contract-{uuid4().hex}"}
+
+
+@pytest.fixture
+async def docker_provider(docker_labels: dict[str, str]) -> AsyncGenerator[SandboxProvider]:
+    """Clean up only this test's containers on the configured daemon."""
+    provider = DockerProviderConfig().create_provider()
     try:
         yield provider
     finally:
-        async for sandbox in provider.list_sandboxes(SandboxQuery(labels={})):
+        async for sandbox in provider.list_sandboxes(SandboxQuery(labels=docker_labels)):
             await provider.delete_sandbox(sandbox.id)
         await provider.close()
 
 
 @pytest.fixture
-async def docker_sandbox(docker_provider: SandboxProvider) -> Sandbox:
+async def docker_sandbox(docker_provider: SandboxProvider, docker_labels: dict[str, str]) -> Sandbox:
     """Create a small image-based sandbox for each check."""
     return await docker_provider.create_sandbox(
         SandboxCreateRequest(
             source=ImageSource(image="python:3.12-slim"),
             resources=Resources(vcpu=1, memory=1, disk=1),
             name="docker-contract",
-            labels={"test": "contract"},
+            labels=docker_labels,
             env_vars={},
             auto_stop_interval=10,
             create_timeout=120,
@@ -111,23 +118,26 @@ async def test_docker_successful_command_preserves_background_process(docker_san
     assert (await docker_sandbox.exec("test -e /tmp/background-success")).exit_code == 0
 
 
-async def test_docker_inventory_and_installation_isolation(
+async def test_docker_inventory_excludes_unmanaged_containers(
     docker_provider: SandboxProvider,
     docker_sandbox: Sandbox,
+    docker_labels: dict[str, str],
 ) -> None:
-    """Filter inventory and prevent another installation from deleting containers."""
-    listed = [s async for s in docker_provider.list_sandboxes(SandboxQuery(labels={"test": "contract"}))]
-    assert [s.id for s in listed] == [docker_sandbox.id]
-    assert listed[0].created_at is not None
-    config = DockerProviderConfig.from_env().model_copy(update={"installation_id": f"other-{uuid4().hex}"})
-    other = config.create_provider()
-    try:
-        assert [s async for s in other.list_sandboxes(SandboxQuery(labels={}))] == []
-        with pytest.raises(SandboxNotFoundError):
-            await other.delete_sandbox(docker_sandbox.id)
-        assert (await docker_sandbox.exec("true")).exit_code == 0
-    finally:
-        await other.close()
+    """Filter inventory and reject deletion of unrelated Docker containers."""
+    async with Docker(url=os.environ.get("DOCKER_HOST")) as docker:
+        unrelated = await docker.containers.create({"Image": "python:3.12-slim"})
+        try:
+            listed = [s async for s in docker_provider.list_sandboxes(SandboxQuery(labels=docker_labels))]
+            assert [s.id for s in listed] == [docker_sandbox.id]
+            assert listed[0].created_at is not None
+            assert unrelated.id not in [s.id async for s in docker_provider.list_sandboxes(SandboxQuery(labels={}))]
+            with pytest.raises(SandboxNotFoundError):
+                await docker_provider.get_sandbox(unrelated.id)
+            with pytest.raises(SandboxNotFoundError):
+                await docker_provider.delete_sandbox(unrelated.id)
+            assert (await unrelated.show())["Id"] == unrelated.id  # pyright: ignore[reportUnknownMemberType]
+        finally:
+            await unrelated.delete(force=True, v=True)
     await docker_provider.delete_sandbox(docker_sandbox.id)
     with pytest.raises(SandboxNotFoundError):
         await docker_provider.get_sandbox(docker_sandbox.id)
@@ -145,6 +155,7 @@ async def test_docker_closing_stream_terminates_command(docker_sandbox: Sandbox)
 async def test_docker_failed_start_removes_container(
     docker_provider: SandboxProvider,
     monkeypatch: pytest.MonkeyPatch,
+    docker_labels: dict[str, str],
 ) -> None:
     """Remove the created container even when starting it fails."""
     from aiodocker.containers import DockerContainer
@@ -161,10 +172,10 @@ async def test_docker_failed_start_removes_container(
                 source=ImageSource(image="python:3.12-slim"),
                 resources=Resources(vcpu=1, memory=1, disk=1),
                 name="failed-start",
-                labels={},
+                labels=docker_labels,
                 env_vars={},
                 auto_stop_interval=0,
                 create_timeout=30,
             )
         )
-    assert [s async for s in docker_provider.list_sandboxes(SandboxQuery(labels={}))] == []
+    assert [s async for s in docker_provider.list_sandboxes(SandboxQuery(labels=docker_labels))] == []

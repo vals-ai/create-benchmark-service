@@ -165,7 +165,7 @@ def _grading_provider_config() -> SandboxProviderConfig:
     if provider_type == "daytona":
         return DaytonaProviderConfig.from_env()
     if provider_type == "docker":
-        return DockerProviderConfig.from_env()
+        return DockerProviderConfig()
     if provider_type == "modal":
         return ModalProviderConfig.from_env()
     return sandbox_provider_config_from_mapping({"type": provider_type})

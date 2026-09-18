@@ -22,7 +22,7 @@ from aiodocker.containers import DockerContainer
 from aiodocker.exceptions import DockerError
 from aiodocker.types import JSONObject
 from aiohttp import ClientError
-from pydantic import BaseModel, Field, field_validator
+from pydantic import AliasPath, BaseModel, Field
 
 from benchmark_service.blocking import run_blocking
 from benchmark_service.sandbox.types import (
@@ -40,52 +40,24 @@ from benchmark_service.sandbox.types import (
 )
 
 logger = logging.getLogger(__name__)
-_INSTALLATION_LABEL = "io.vals.cbs.installation"
+_MANAGED_LABEL = "io.vals.cbs.managed"
 _NAME_LABEL = "io.vals.cbs.name"
 
 
 class DockerProviderConfig(BaseModel):
     type: Literal["docker"] = "docker"
-    docker_endpoint: str = "unix:///var/run/docker.sock"
-    installation_id: str = Field(default="valkyrie-local", pattern=r"^[a-zA-Z0-9_.-]{1,64}$")
-    platform: Literal["linux/arm64", "linux/amd64"] | None = None
-
-    @field_validator("docker_endpoint")
-    @classmethod
-    def validate_endpoint(cls, value: str) -> str:
-        if not value.startswith("unix:///") or "\x00" in value:
-            raise ValueError("Local Docker requires an absolute Unix socket endpoint")
-        return value
-
-    @classmethod
-    def from_env(cls) -> DockerProviderConfig:
-        return cls.model_validate(
-            {
-                "docker_endpoint": os.environ.get("DOCKER_HOST", "unix:///var/run/docker.sock"),
-                "installation_id": os.environ.get("CBS_DOCKER_INSTALLATION", "valkyrie-local"),
-                "platform": os.environ.get("CBS_DOCKER_PLATFORM"),
-            }
-        )
 
     def create_provider(self) -> SandboxProvider:
         if os.environ.get("CBS_DOCKER_ENABLED", "").lower() != "true":
             raise SandboxError("Docker sandbox access requires CBS_DOCKER_ENABLED=true on this process")
-        return DockerSandboxProvider(self)
-
-
-class _ContainerConfig(BaseModel):
-    labels: dict[str, str] = Field(default_factory=dict, alias="Labels")
-
-
-class _ContainerState(BaseModel):
-    status: str = Field(alias="Status")
+        return DockerSandboxProvider()
 
 
 class _ContainerInfo(BaseModel):
     id: str = Field(alias="Id")
     created: datetime = Field(alias="Created")
-    state: _ContainerState = Field(alias="State")
-    config: _ContainerConfig = Field(alias="Config")
+    state: str = Field(validation_alias=AliasPath("State", "Status"))
+    labels: dict[str, str] | None = Field(validation_alias=AliasPath("Config", "Labels"))
 
 
 @contextmanager
@@ -114,18 +86,11 @@ async def _finish_cleanup(task: asyncio.Task[None]) -> None:
         raise asyncio.CancelledError
 
 
-def _remote_path(value: str) -> PurePosixPath:
-    path = PurePosixPath(value)
-    if not path.is_absolute() or ".." in path.parts or "\x00" in value or path == PurePosixPath("/"):
-        raise SandboxError("Docker file paths must be absolute file paths without traversal")
-    return path
-
-
 class DockerSandbox(Sandbox):
     def __init__(self, container: DockerContainer, info: _ContainerInfo) -> None:
         self._container = container
         self._info = info
-        self.labels = info.config.labels
+        self.labels = info.labels
         self.created_at = info.created
 
     @property
@@ -134,11 +99,11 @@ class DockerSandbox(Sandbox):
 
     @property
     def name(self) -> str:
-        return self._info.config.labels.get(_NAME_LABEL, self.id)
+        return (self._info.labels or {}).get(_NAME_LABEL, self.id)
 
     @property
     def state(self) -> str:
-        return self._info.state.status
+        return self._info.state
 
     async def _cleanup_command(self, pid_file: str, *, terminate: bool) -> None:
         async with asyncio.timeout(15):
@@ -230,7 +195,7 @@ class DockerSandbox(Sandbox):
         return ExecResult(exit_code=0, output="".join(output))
 
     async def upload_file(self, remote_path: str, content: bytes) -> None:
-        path = _remote_path(remote_path)
+        path = PurePosixPath(remote_path)
         result = await self.exec(f"mkdir -p {shlex.quote(str(path.parent))}")
         if result.exit_code:
             raise SandboxCommandError(result.exit_code)
@@ -251,7 +216,7 @@ class DockerSandbox(Sandbox):
         return b"".join([chunk async for chunk in self.stream_download(remote_path)])
 
     async def stream_download(self, remote_path: str) -> AsyncGenerator[bytes]:
-        path = _remote_path(remote_path)
+        path = PurePosixPath(remote_path)
         iterator = self._command_bytes(f"cat -- {shlex.quote(str(path))}")
         try:
             async for chunk in iterator:
@@ -261,15 +226,14 @@ class DockerSandbox(Sandbox):
 
 
 class DockerSandboxProvider(SandboxProvider):
-    def __init__(self, config: DockerProviderConfig) -> None:
-        self.config = config
-        self._docker = Docker(url=config.docker_endpoint)
+    def __init__(self) -> None:
+        self._docker = Docker(url=os.environ.get("DOCKER_HOST"))
 
     async def _get_container(self, instance_id: str) -> tuple[DockerContainer, _ContainerInfo]:
         container = self._docker.containers.container(instance_id)  # pyright: ignore[reportUnknownMemberType]
         info = _ContainerInfo.model_validate(await container.show())  # pyright: ignore[reportUnknownMemberType]
-        if info.config.labels.get(_INSTALLATION_LABEL) != self.config.installation_id:
-            raise SandboxNotFoundError("Docker container does not belong to this installation")
+        if not info.labels or info.labels.get(_MANAGED_LABEL) != "true":
+            raise SandboxNotFoundError("Docker container is not managed by this provider")
         return container, info
 
     async def get_sandbox(self, instance_id: str) -> Sandbox:
@@ -283,8 +247,8 @@ class DockerSandboxProvider(SandboxProvider):
         if request.resources.gpu or request.volumes or request.sandbox_secrets:
             raise SandboxError("Local Docker does not support GPUs, persistent volumes, or provider-managed secrets")
         validate_command_env(request.env_vars)
-        name = f"cbs-{self.config.installation_id}-{uuid4().hex}"
-        labels = {**request.labels, _INSTALLATION_LABEL: self.config.installation_id, _NAME_LABEL: request.name}
+        name = f"cbs-{uuid4().hex}"
+        labels = {**request.labels, _MANAGED_LABEL: "true", _NAME_LABEL: request.name}
         config: JSONObject = {
             "Image": request.source.image,
             "Entrypoint": ["/bin/sh", "-c"],
@@ -301,23 +265,8 @@ class DockerSandboxProvider(SandboxProvider):
         with _docker_errors():
             try:
                 async with asyncio.timeout(request.create_timeout):
-                    try:
-                        await self._docker.images.inspect(request.source.image)
-                    except DockerError as error:
-                        if error.status != 404:
-                            raise
-                        await self._docker.images.pull(request.source.image, platform=self.config.platform)
-                    if self.config.platform is not None:
-                        image = await self._docker.images.inspect(request.source.image)
-                        if f"{image.get('Os')}/{image.get('Architecture')}" != self.config.platform:
-                            raise SandboxError(f"Docker image must match platform {self.config.platform}")
-                    container = await self._docker.containers.create(config, name=name)
-                    await container.start()  # pyright: ignore[reportUnknownMemberType]
-                    sandbox = await self.get_sandbox(container.id)
-                    probe = await sandbox.exec("true", timeout=10)
-                    if probe.exit_code:
-                        raise SandboxError("Docker images must provide /bin/sh and setsid")
-                    return sandbox
+                    container = await self._docker.containers.run(config, name=name)  # pyright: ignore[reportUnknownMemberType]
+                    return await self.get_sandbox(container.id)
             except BaseException as error:
 
                 async def cleanup() -> None:
@@ -339,9 +288,7 @@ class DockerSandboxProvider(SandboxProvider):
             await container.delete(force=True, v=True)
 
     async def list_sandboxes(self, query: SandboxQuery) -> AsyncGenerator[Sandbox]:
-        if query.labels.get(_INSTALLATION_LABEL, self.config.installation_id) != self.config.installation_id:
-            return
-        labels = {**query.labels, _INSTALLATION_LABEL: self.config.installation_id}
+        labels = {**query.labels, _MANAGED_LABEL: "true"}
         with _docker_errors():
             containers = await self._docker.containers.list(  # pyright: ignore[reportUnknownMemberType]
                 all=True, filters={"label": [f"{k}={v}" for k, v in labels.items()]}

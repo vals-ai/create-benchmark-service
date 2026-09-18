@@ -23,20 +23,18 @@ def test_docker_requires_process_opt_in(monkeypatch: pytest.MonkeyPatch) -> None
         config.create_provider()
 
 
-def test_docker_grading_uses_process_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Resolve local grading against the same daemon and installation as execution."""
+def test_docker_grading_selects_docker(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Resolve Docker when selected for sandbox grading."""
     monkeypatch.setenv("GRADING_SANDBOX_PROVIDER", "docker")
-    monkeypatch.setenv("DOCKER_HOST", "unix:///tmp/test-docker.sock")
-    monkeypatch.setenv("CBS_DOCKER_INSTALLATION", "test-local")
-    config = _grading_provider_config()
-    assert isinstance(config, DockerProviderConfig)
-    assert config.docker_endpoint == "unix:///tmp/test-docker.sock"
-    assert config.installation_id == "test-local"
+    assert isinstance(_grading_provider_config(), DockerProviderConfig)
 
 
 @pytest.mark.parametrize("feature", ["snapshot", "gpu", "secrets"])
-async def test_docker_rejects_unsupported_features_before_connecting(feature: str) -> None:
+async def test_docker_rejects_unsupported_features_before_connecting(
+    feature: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     """Report unsupported requests without attempting to create a container."""
+    monkeypatch.setenv("DOCKER_HOST", "unix:///does-not-exist.sock")
     request = SandboxCreateRequest(
         source=SnapshotSource(snapshot="snapshot") if feature == "snapshot" else ImageSource(image="image"),
         resources=Resources(vcpu=1, memory=1, disk=1, gpu=1 if feature == "gpu" else 0),
@@ -47,6 +45,6 @@ async def test_docker_rejects_unsupported_features_before_connecting(feature: st
         create_timeout=1,
         sandbox_secrets={"TOKEN": "reference"} if feature == "secrets" else {},
     )
-    async with DockerSandboxProvider(DockerProviderConfig(docker_endpoint="unix:///does-not-exist.sock")) as provider:
+    async with DockerSandboxProvider() as provider:
         with pytest.raises(SandboxError, match="supports image|does not support"):
             await provider.create_sandbox(request)

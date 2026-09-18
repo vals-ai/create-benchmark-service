@@ -152,27 +152,22 @@ Enable Docker only in local Tracker, executor, and benchmark-service processes w
 `CBS_DOCKER_ENABLED=true`. Each process needs access to the same Docker daemon.
 Task containers do not receive the Docker socket or host-directory mounts.
 
-```json
-{"type": "docker", "docker_endpoint": "unix:///var/run/docker.sock", "installation_id": "valkyrie-local", "platform": "linux/arm64"}
-```
-
-`DockerProviderConfig.from_env()` reads `DOCKER_HOST`, `CBS_DOCKER_INSTALLATION`, and
-`CBS_DOCKER_PLATFORM`. For sandbox grading, also set `GRADING_SANDBOX_PROVIDER=docker`.
-Only absolute Unix socket endpoints are accepted. Omit `platform` to use the daemon's
-native architecture, or select `linux/arm64` or `linux/amd64` to require a matching image.
+Select the provider with `{"type": "docker"}`. Set `DOCKER_HOST` to override the
+Docker context or detected local socket. For sandbox grading, also set
+`GRADING_SANDBOX_PROVIDER=docker`.
 
 Docker supports image sources whose images provide `/bin/sh` and `setsid --wait`.
 CPU and memory limits are enforced. `Resources.disk` is accepted but does not set a
 filesystem quota. `auto_stop_interval` is accepted but does not set an idle timer; callers
 must delete containers after use and reconcile abandoned containers after restarting. Listing
-and deletion are scoped to `installation_id`, so use a distinct value for independent local installations.
+and deletion include only containers marked as managed by this provider.
 
 Commands stream output and preserve exit codes. Timeouts and cancelled streams terminate
 the command's process group. File upload and download support binary data. Network access
 can be disabled with `network_block_all`; address allowlists are unsupported. Docker also
 rejects snapshots, Compose, GPUs, persistent volumes, and provider-managed secrets.
 
-Run the local provider checks against a disposable installation:
+Run the local provider checks:
 
 ```bash
 CBS_DOCKER_ENABLED=true DOCKER_HOST=unix:///var/run/docker.sock \

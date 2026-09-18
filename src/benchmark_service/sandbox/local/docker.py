@@ -271,10 +271,11 @@ class DockerSandboxProvider(SandboxProvider):
 
                 async def cleanup() -> None:
                     try:
-                        await self.delete_sandbox(name)
+                        async with asyncio.timeout(15):
+                            await self.delete_sandbox(name)
                     except SandboxNotFoundError:
                         pass
-                    except SandboxError:
+                    except (SandboxError, TimeoutError):
                         logger.exception("Failed to clean up Docker sandbox after creation failed")
 
                 await _finish_cleanup(asyncio.create_task(cleanup()))

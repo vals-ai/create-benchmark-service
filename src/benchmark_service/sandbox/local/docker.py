@@ -230,14 +230,9 @@ class DockerSandbox(Sandbox):
     async def download_file(self, remote_path: str) -> bytes:
         return b"".join([chunk async for chunk in self.stream_download(remote_path)])
 
-    async def stream_download(self, remote_path: str) -> AsyncGenerator[bytes]:
+    def stream_download(self, remote_path: str) -> AsyncGenerator[bytes]:
         path = PurePosixPath(remote_path)
-        iterator = self._command_bytes(f"cat -- {shlex.quote(str(path))}")
-        try:
-            async for chunk in iterator:
-                yield chunk
-        finally:
-            await iterator.aclose()
+        return self._command_bytes(f"cat -- {shlex.quote(str(path))}")
 
 
 class DockerSandboxProvider(SandboxProvider):

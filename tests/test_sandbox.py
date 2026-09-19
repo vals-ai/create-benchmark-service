@@ -193,6 +193,8 @@ class ControlledProcess(Process):
         self.list_error: BaseException | None = None
         self.kill_error: BaseException | None = None
         self.keep_session_after_kill = False
+        self.status_cleanup_started = asyncio.Event()
+        self.release_status_cleanup: asyncio.Event | None = None
 
     async def exec(self, command: str) -> SimpleNamespace:
         evaluated_command = _unwrap_shell_command(command)
@@ -203,6 +205,10 @@ class ControlledProcess(Process):
             if self.status_error is not None:
                 raise self.status_error
         result = await super().exec(command)
+        if evaluated_command.startswith("rm -f "):
+            self.status_cleanup_started.set()
+            if self.release_status_cleanup is not None:
+                await self.release_status_cleanup.wait()
         if evaluated_command.startswith("cat "):
             self.run_finished.set()
         return result
@@ -4604,6 +4610,32 @@ async def test_daytona_controlled_workload_completes_and_confirms_absence() -> N
     assert "cd /work" in submitted
     assert process.pty_envs is not None
     assert process.pty_envs["MODEL"] == "test"
+
+
+async def test_daytona_controlled_wait_publishes_absence_without_status_cleanup_delay() -> None:
+    process = ControlledProcess()
+    process.release_list = asyncio.Event()
+    process.release_status_cleanup = asyncio.Event()
+    inner = InnerSandbox()
+    inner.process = process
+    sandbox = DaytonaSandbox(cast(Any, inner))
+    workload = sandbox.controlled_workload("printf controlled")
+    wait_task = asyncio.create_task(workload.wait())
+
+    await process.list_started.wait()
+    assert wait_task.done() is False
+    process.release_list.set()
+
+    try:
+        completed = await asyncio.wait_for(asyncio.shield(wait_task), timeout=1)
+    finally:
+        process.release_status_cleanup.set()
+        if not wait_task.done():
+            await wait_task
+
+    assert completed.result.exit_code == 0
+    assert completed.absence_confirmed_at <= asyncio.get_running_loop().time()
+    assert process.status_cleanup_started.is_set() is False
 
 
 async def test_daytona_controlled_natural_completion_and_kill_share_closure() -> None:

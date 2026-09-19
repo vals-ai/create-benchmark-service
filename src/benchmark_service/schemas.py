@@ -10,6 +10,7 @@ from benchmark_service.sandbox.types import (
     BaseSandboxSource,
     ComposeSource,
     ImageSource,
+    GenerationContainment,
     Resources,
     SandboxSource,
     SnapshotSource,
@@ -147,6 +148,10 @@ class RetrieveTaskResponse(BaseModel):
     cwd: str = Field(description="Working directory inside the container")
     agent_timeout: float | None = Field(
         default=None, description="Agent execution max time in seconds (None for no timeout)"
+    )
+    generation_containment: GenerationContainment | None = Field(
+        default=None,
+        description="Generation workload containment required by this task runtime",
     )
     resources: Resources = Field(description="Computational resources needed")
     volumes: list[VolumeMount] = Field(

@@ -10,7 +10,11 @@ from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
 from benchmark_service.sandbox.types import (
     ComposeSource,
+    ControlledWorkload,
+    ControlledWorkloadResult,
+    ControlledWorkloadUnsupportedError,
     ExecResult,
+    GenerationContainment,
     ImageSource,
     MissingSandboxConfigError,
     ResourceCapacity,
@@ -24,6 +28,7 @@ from benchmark_service.sandbox.types import (
     SandboxError,
     SandboxNotFoundError,
     SandboxProvider,
+    LINUX_PID_NAMESPACE_V1,
     SandboxQuery,
     SandboxSource,
     SnapshotSource,
@@ -42,10 +47,15 @@ def sandbox_provider_config_from_mapping(data: Mapping[str, Any]) -> SandboxProv
 
 __all__ = [
     "ComposeSource",
+    "ControlledWorkload",
+    "ControlledWorkloadResult",
+    "ControlledWorkloadUnsupportedError",
     "ComposeSandbox",
     "DaytonaProviderConfig",
     "ExecResult",
+    "GenerationContainment",
     "ImageSource",
+    "LINUX_PID_NAMESPACE_V1",
     "MissingSandboxConfigError",
     "ModalProviderConfig",
     "ResourceCapacity",

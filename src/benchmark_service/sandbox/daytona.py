@@ -1065,12 +1065,10 @@ class _DaytonaControlledWorkload(ControlledWorkload):
                 raise error from kill_error
             raise error
 
-        confirmed_at = asyncio.get_running_loop().time()
-        with suppress(SandboxError):
-            await self._control_exec(
-                f"rm -f {shlex.quote(self._status_path)} {shlex.quote(self._status_temp_path)}"
-            )
-        return confirmed_at
+        # Publish the fresh-list confirmation immediately. Controlled status files are
+        # sandbox-scoped and disappear with normal sandbox teardown; cleaning them here
+        # would delay the caller's deadline arbitration after absence was already proven.
+        return asyncio.get_running_loop().time()
 
     @property
     def _status_path(self) -> str:

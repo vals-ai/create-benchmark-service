@@ -19,6 +19,7 @@ from benchmark_service import (
     BenchmarkServiceStreamClosedError,
     BenchmarkServiceStreamError,
     BenchmarkServiceStreamIdleError,
+    GenerationContainment,
     SandboxNotFoundError,
     SandboxRecoveryPolicy,
 )
@@ -63,6 +64,35 @@ def _task_response(max_sandbox_attempts: int | None = None) -> RetrieveTaskRespo
             "sandbox_recovery": policy,
         }
     )
+
+
+def test_retrieve_task_response_defaults_generation_containment_to_none() -> None:
+    response = _task_response()
+
+    assert response.generation_containment is None
+
+
+def test_retrieve_task_response_round_trips_generation_containment() -> None:
+    response = _task_response()
+    payload = response.model_dump()
+    payload["generation_containment"] = {"type": "linux_pid_namespace", "version": 1}
+
+    parsed = RetrieveTaskResponse.model_validate(payload)
+
+    assert parsed.generation_containment == GenerationContainment(
+        type="linux_pid_namespace", version=1
+    )
+    assert parsed.model_dump()["generation_containment"] == {
+        "type": "linux_pid_namespace",
+        "version": 1,
+    }
+
+@pytest.mark.parametrize("version", [0, True, "1"])
+def test_generation_containment_requires_positive_integer_version(version: object) -> None:
+    with pytest.raises(ValidationError):
+        GenerationContainment.model_validate(
+            {"type": "linux_pid_namespace", "version": version}
+        )
 
 
 def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "error") -> MagicMock:

@@ -3,8 +3,16 @@
 Run: uv run pytest tests/test_sandbox_contract.py
 """
 
+import pytest
+
+from benchmark_service import ControlledWorkload as RootControlledWorkload
+from benchmark_service import GenerationContainment as RootGenerationContainment
 from benchmark_service import SandboxCapacityDomain as RootSandboxCapacityDomain
 from benchmark_service.sandbox import (
+    ComposeSandbox,
+    ControlledWorkload,
+    ControlledWorkloadUnsupportedError,
+    GenerationContainment,
     ModalProviderConfig,
     ResourceCapacity,
     Sandbox,
@@ -46,6 +54,20 @@ def test_capacity_contract_is_exported_and_backward_compatible() -> None:
     assert capacity.gpu is None
     assert capacity.allowed_gpu_types is None
 
+
+def test_controlled_workload_contract_is_exported() -> None:
+    assert RootControlledWorkload is ControlledWorkload
+    assert RootGenerationContainment is GenerationContainment
+
+
+async def test_sandbox_controlled_workload_defaults_to_typed_unsupported() -> None:
+    sandbox = object.__new__(ComposeSandbox)
+
+    assert sandbox.generation_containment is None
+    with pytest.raises(ControlledWorkloadUnsupportedError):
+        await sandbox.probe_generation_containment()
+    with pytest.raises(ControlledWorkloadUnsupportedError):
+        sandbox.controlled_workload("true")
 
 async def test_provider_capacity_defaults_to_unsupported() -> None:
     provider = ModalProviderConfig(MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret").create_provider()

@@ -102,6 +102,14 @@ class DockerSandbox(Sandbox):
     def state(self) -> str:
         return self._info.state
 
+    async def _raise_if_finished(self) -> None:
+        # Docker reports a killed command's exit before it marks the container stopped.
+        for _ in range(10):
+            info = _ContainerInfo.model_validate(await self._container.show())  # pyright: ignore[reportUnknownMemberType]
+            if info.state != "running":
+                raise SandboxNotFoundError(f"Docker container is {info.state}")
+            await asyncio.sleep(0.1)
+
     async def _cleanup_command(self, pid_file: str, *, terminate: bool) -> None:
         try:
             async with asyncio.timeout(15):
@@ -119,7 +127,7 @@ class DockerSandbox(Sandbox):
                     while await stream.read_out() is not None:
                         pass
         except (DockerError, ClientError, OSError) as error:
-            if not isinstance(error, DockerError) or error.status != 404:
+            if not isinstance(error, DockerError) or error.status not in (404, 409):
                 logger.warning("Failed to clean up Docker command", exc_info=True)
 
     async def _command_bytes(
@@ -165,6 +173,9 @@ class DockerSandbox(Sandbox):
                 exit_code = info.get("ExitCode")
                 if not isinstance(exit_code, int):
                     raise SandboxError("Docker command finished without an exit code")
+                if exit_code == 137:
+                    # Stopping a container kills its commands with SIGKILL.
+                    await self._raise_if_finished()
                 if exit_code:
                     raise SandboxCommandError(exit_code)
             except TimeoutError:
@@ -286,15 +297,16 @@ class DockerSandboxProvider(SandboxProvider):
         try:
             async with asyncio.timeout(15):
                 await self.delete_sandbox(name)
-        except SandboxNotFoundError:
-            pass
         except (SandboxError, TimeoutError):
             logger.exception("Failed to clean up Docker sandbox after creation failed")
 
     async def delete_sandbox(self, instance_id: str) -> None:
-        with _docker_errors():
-            container, _ = await self._get_container(instance_id)
-            await container.delete(force=True, v=True)
+        try:
+            with _docker_errors():
+                container, _ = await self._get_container(instance_id)
+                await container.delete(force=True, v=True)
+        except SandboxNotFoundError:
+            return
 
     async def list_sandboxes(self, query: SandboxQuery) -> AsyncGenerator[Sandbox]:
         labels = {**query.labels, _MANAGED_LABEL: "true"}

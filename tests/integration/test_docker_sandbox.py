@@ -166,8 +166,7 @@ async def test_docker_inventory_excludes_unmanaged_containers(
             assert unrelated.id not in [s.id async for s in docker_provider.list_sandboxes(SandboxQuery(labels={}))]
             with pytest.raises(SandboxNotFoundError):
                 await docker_provider.get_sandbox(unrelated.id)
-            with pytest.raises(SandboxNotFoundError):
-                await docker_provider.delete_sandbox(unrelated.id)
+            await docker_provider.delete_sandbox(unrelated.id)
             assert (await unrelated.show())["Id"] == unrelated.id  # pyright: ignore[reportUnknownMemberType]
         finally:
             await unrelated.delete(force=True, v=True)
@@ -183,3 +182,24 @@ async def test_docker_closing_stream_terminates_command(docker_sandbox: Sandbox)
     await stream.aclose()
     await asyncio.sleep(1.2)
     assert (await docker_sandbox.exec("test ! -e /tmp/closed-stream")).exit_code == 0
+
+
+async def test_docker_delete_during_stream_raises_not_found(
+    docker_provider: SandboxProvider, docker_sandbox: Sandbox, caplog: pytest.LogCaptureFixture
+) -> None:
+    """Keep a killed command's exit code, report a sandbox deleted mid-stream as lost, and allow a second delete."""
+    assert (await docker_sandbox.exec("sh -c 'kill -KILL $$'")).exit_code == 137
+    ready = asyncio.Event()
+
+    async def consume() -> None:
+        async for chunk in docker_sandbox.command("echo ready; sleep 300"):
+            if "ready" in chunk:
+                ready.set()
+
+    task = asyncio.create_task(consume())
+    await asyncio.wait_for(ready.wait(), timeout=10)
+    await docker_provider.delete_sandbox(docker_sandbox.id)
+    with pytest.raises(SandboxNotFoundError):
+        await asyncio.wait_for(task, timeout=30)
+    assert "Failed to clean up Docker command" not in caplog.text
+    await docker_provider.delete_sandbox(docker_sandbox.id)

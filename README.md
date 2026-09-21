@@ -148,8 +148,7 @@ Provider compatibility notes:
 
 ### Local Docker sandboxes
 
-Enable Docker only in local Tracker, executor, and benchmark-service processes with
-`CBS_DOCKER_ENABLED=true`. Each process needs access to the same Docker daemon.
+Local Tracker, executor, and benchmark-service processes need access to the same Docker daemon.
 Task containers do not receive the Docker socket or host-directory mounts.
 
 Select the provider with `{"type": "docker"}`. Set `DOCKER_HOST` to override the
@@ -170,7 +169,7 @@ rejects snapshots, Compose, GPUs, persistent volumes, and provider-managed secre
 Run the local provider checks:
 
 ```bash
-CBS_DOCKER_ENABLED=true DOCKER_HOST=unix:///var/run/docker.sock \
+DOCKER_HOST=unix:///var/run/docker.sock \
   uv run pytest tests/integration/test_docker_sandbox.py
 ```
 

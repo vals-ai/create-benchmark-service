@@ -1,4 +1,4 @@
-"""Local Docker contract checks; run with CBS_DOCKER_ENABLED=true and DOCKER_HOST."""
+"""Local Docker contract checks; run with DOCKER_HOST."""
 
 import asyncio
 import os

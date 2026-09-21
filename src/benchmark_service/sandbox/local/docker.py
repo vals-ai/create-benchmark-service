@@ -47,8 +47,6 @@ class DockerProviderConfig(BaseModel):
     type: Literal["docker"] = "docker"
 
     def create_provider(self) -> SandboxProvider:
-        if os.environ.get("CBS_DOCKER_ENABLED", "").lower() != "true":
-            raise SandboxError("Docker sandbox access requires CBS_DOCKER_ENABLED=true on this process")
         return DockerSandboxProvider()
 
 

@@ -253,7 +253,6 @@ class DockerSandboxProvider(SandboxProvider):
             raise SandboxError("Local Docker supports image sources only; snapshots and Compose are not supported")
         if request.resources.gpu or request.volumes or request.sandbox_secrets:
             raise SandboxError("Local Docker does not support GPUs, persistent volumes, or provider-managed secrets")
-        validate_command_env(request.env_vars)
         name = f"cbs-{uuid4().hex}"
         labels = {**request.labels, _MANAGED_LABEL: "true", _NAME_LABEL: request.name}
         config: JSONObject = {

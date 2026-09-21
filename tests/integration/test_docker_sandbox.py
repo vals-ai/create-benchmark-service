@@ -48,7 +48,7 @@ async def docker_sandbox(docker_provider: SandboxProvider, docker_labels: dict[s
             resources=Resources(vcpu=1, memory=1, disk=1),
             name="docker-contract",
             labels=docker_labels,
-            env_vars={},
+            env_vars={"LANG": "C.UTF-8", "TERM": "xterm"},
             auto_stop_interval=10,
             create_timeout=120,
             network_block_all=True,
@@ -58,6 +58,9 @@ async def docker_sandbox(docker_provider: SandboxProvider, docker_labels: dict[s
 
 async def test_docker_commands_and_binary_files(docker_sandbox: Sandbox) -> None:
     """Preserve streamed text, exit status, command environment, and binary files."""
+    result = await docker_sandbox.exec('printf "%s:%s" "$LANG" "$TERM"')
+    assert result.exit_code == 0
+    assert result.output == "C.UTF-8:xterm"
     output = "".join(
         [
             part

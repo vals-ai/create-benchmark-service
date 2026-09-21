@@ -103,8 +103,8 @@ class DockerSandbox(Sandbox):
         return self._info.state
 
     async def _cleanup_command(self, pid_file: str, *, terminate: bool) -> None:
-        async with asyncio.timeout(15):
-            try:
+        try:
+            async with asyncio.timeout(15):
                 if terminate:
                     command = (
                         f"if test -f {pid_file}; then pid=$(cat {pid_file}); "
@@ -118,9 +118,9 @@ class DockerSandbox(Sandbox):
                 async with cleanup.start() as stream:
                     while await stream.read_out() is not None:
                         pass
-            except DockerError as error:
-                if error.status != 404:
-                    raise
+        except (DockerError, ClientError, OSError) as error:
+            if not isinstance(error, DockerError) or error.status != 404:
+                logger.warning("Failed to clean up Docker command", exc_info=True)
 
     async def _command_bytes(
         self,
@@ -230,6 +230,28 @@ class DockerSandbox(Sandbox):
         return self._command_bytes(f"cat -- {shlex.quote(str(path))}")
 
 
+def _build_container_config(request: SandboxCreateRequest) -> JSONObject:
+    """Validate Docker support and build the container creation settings."""
+    if not isinstance(request.source, ImageSource):
+        raise SandboxError("Local Docker supports image sources only; snapshots and Compose are not supported")
+    if request.resources.gpu or request.volumes or request.sandbox_secrets:
+        raise SandboxError("Local Docker does not support GPUs, persistent volumes, or provider-managed secrets")
+    labels = {**request.labels, _MANAGED_LABEL: "true", _NAME_LABEL: request.name}
+    return {
+        "Image": request.source.image,
+        "Entrypoint": ["/bin/sh", "-c"],
+        "Cmd": ["trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done"],
+        "Env": [f"{key}={value}" for key, value in request.env_vars.items()],
+        "Labels": labels,
+        "HostConfig": {
+            "NanoCpus": request.resources.vcpu * 1_000_000_000,
+            "Memory": request.resources.memory * 1024**3,
+            "NetworkMode": "none" if request.network_block_all else "bridge",
+            "SecurityOpt": ["no-new-privileges:true"],
+        },
+    }
+
+
 class DockerSandboxProvider(SandboxProvider):
     def __init__(self) -> None:
         self._docker = Docker(url=os.environ.get("DOCKER_HOST"))
@@ -239,7 +261,7 @@ class DockerSandboxProvider(SandboxProvider):
         info = _ContainerInfo.model_validate(await container.show())  # pyright: ignore[reportUnknownMemberType]
         if not info.labels or info.labels.get(_MANAGED_LABEL) != "true":
             raise SandboxNotFoundError("Docker container is not managed by this provider")
-        return container, info
+        return self._docker.containers.container(info.id), info  # pyright: ignore[reportUnknownMemberType]
 
     async def get_sandbox(self, instance_id: str) -> Sandbox:
         with _docker_errors():
@@ -247,45 +269,27 @@ class DockerSandboxProvider(SandboxProvider):
             return DockerSandbox(container, info)
 
     async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
-        if not isinstance(request.source, ImageSource):
-            raise SandboxError("Local Docker supports image sources only; snapshots and Compose are not supported")
-        if request.resources.gpu or request.volumes or request.sandbox_secrets:
-            raise SandboxError("Local Docker does not support GPUs, persistent volumes, or provider-managed secrets")
+        config = _build_container_config(request)
         name = f"cbs-{uuid4().hex}"
-        labels = {**request.labels, _MANAGED_LABEL: "true", _NAME_LABEL: request.name}
-        config: JSONObject = {
-            "Image": request.source.image,
-            "Entrypoint": ["/bin/sh", "-c"],
-            "Cmd": ["trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done"],
-            "Env": [f"{key}={value}" for key, value in request.env_vars.items()],
-            "Labels": labels,
-            "HostConfig": {
-                "NanoCpus": request.resources.vcpu * 1_000_000_000,
-                "Memory": request.resources.memory * 1024**3,
-                "NetworkMode": "none" if request.network_block_all else "bridge",
-                "SecurityOpt": ["no-new-privileges:true"],
-            },
-        }
         with _docker_errors():
             try:
                 async with asyncio.timeout(request.create_timeout):
                     container = await self._docker.containers.run(config, name=name)  # pyright: ignore[reportUnknownMemberType]
                     return await self.get_sandbox(container.id)
             except BaseException as error:
-
-                async def cleanup() -> None:
-                    try:
-                        async with asyncio.timeout(15):
-                            await self.delete_sandbox(name)
-                    except SandboxNotFoundError:
-                        pass
-                    except (SandboxError, TimeoutError):
-                        logger.exception("Failed to clean up Docker sandbox after creation failed")
-
-                await _finish_cleanup(asyncio.create_task(cleanup()))
+                await _finish_cleanup(asyncio.create_task(self._cleanup_failed_creation(name)))
                 if isinstance(error, TimeoutError):
                     raise SandboxError("Docker sandbox creation timed out") from error
                 raise
+
+    async def _cleanup_failed_creation(self, name: str) -> None:
+        try:
+            async with asyncio.timeout(15):
+                await self.delete_sandbox(name)
+        except SandboxNotFoundError:
+            pass
+        except (SandboxError, TimeoutError):
+            logger.exception("Failed to clean up Docker sandbox after creation failed")
 
     async def delete_sandbox(self, instance_id: str) -> None:
         with _docker_errors():

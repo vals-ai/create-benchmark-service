@@ -152,6 +152,13 @@ async def test_docker_inventory_excludes_unmanaged_containers(
 ) -> None:
     """Filter inventory and reject deletion of unrelated Docker containers."""
     async with Docker(url=os.environ.get("DOCKER_HOST")) as docker:
+        managed = await docker.containers.get(docker_sandbox.id)  # pyright: ignore[reportUnknownMemberType]
+        alias = f"cbs-alias-{uuid4().hex}"
+        await managed.rename(alias)  # pyright: ignore[reportUnknownMemberType]
+        reopened = await docker_provider.get_sandbox(alias)
+        await managed.rename(f"{alias}-renamed")  # pyright: ignore[reportUnknownMemberType]
+        assert reopened.id == docker_sandbox.id
+        assert (await reopened.exec("printf renamed")).output == "renamed"
         unrelated = await docker.containers.create({"Image": "python:3.12-slim"})
         try:
             listed = [s async for s in docker_provider.list_sandboxes(SandboxQuery(labels=docker_labels))]

@@ -630,6 +630,20 @@ async def test_create_sandbox_uses_vm_runtime(monkeypatch: pytest.MonkeyPatch) -
     assert captured["experimental_options"] == {"vm_runtime": True}
 
 
+async def test_create_sandbox_uses_vm_when_the_task_requires_it(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return FakeInnerSandbox()
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    await provider.create_sandbox(_request(resources=Resources(vcpu=4, memory=8, disk=30, runtime="vm")))
+
+    assert captured["experimental_options"] == {"vm_runtime": True}
+
+
 async def test_create_sandbox_maps_gpu_request(monkeypatch: pytest.MonkeyPatch) -> None:
     inner = FakeInnerSandbox()
     captured: dict[str, Any] = {}

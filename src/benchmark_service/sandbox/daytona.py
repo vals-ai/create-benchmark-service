@@ -1216,6 +1216,8 @@ class DaytonaSandboxProvider(SandboxProvider):
 
     @_PROVIDER_RETRY
     async def create_sandbox(self, request: SandboxCreateRequest) -> DaytonaSandbox:
+        if request.resources.runtime == "vm":
+            raise SandboxError("Daytona takes VM or container from the snapshot's sandbox class; runtime 'vm' is unsupported")
         daytona = self._daytona
         if isinstance(request.source, TargetedSnapshotSource):
             daytona = self._client_for_target(request.source.target)

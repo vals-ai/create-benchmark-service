@@ -3808,6 +3808,15 @@ async def test_daytona_provider_rejects_gpu_for_snapshot_source() -> None:
         )
 
 
+
+async def test_daytona_provider_rejects_vm_runtime() -> None:
+    daytona = CapturingCreateDaytonaClient(InnerSandbox())
+    resources = Resources(vcpu=2, memory=4, disk=10, runtime="vm")
+
+    with pytest.raises(SandboxError, match="Daytona takes VM or container from the snapshot"):
+        await _provider(daytona).create_sandbox(_request("sandbox-name", resources=resources))
+
+
 def test_resources_gpu_type_requires_gpu_count() -> None:
     with pytest.raises(ValueError, match="gpu_type requires gpu >= 1"):
         Resources(vcpu=2, memory=4, disk=10, gpu_type="H100")

@@ -86,6 +86,10 @@ class Resources(BaseModel):
     disk: int = Field(gt=0, description="Sandbox ephemeral disk")
     gpu: int = Field(default=0, ge=0, description="Number of GPUs to allocate")
     gpu_type: str | None = Field(default=None, description="GPU type to allocate, e.g. 'H100' (provider-specific)")
+    runtime: Literal["vm"] | None = Field(
+        default=None,
+        description="Isolation the sandbox needs: 'vm' gives it its own kernel. None uses the provider's default",
+    )
 
     @model_validator(mode="after")
     def _validate_gpu(self) -> Self:

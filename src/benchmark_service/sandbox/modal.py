@@ -516,7 +516,9 @@ class ModalSandboxProvider(SandboxProvider):
             "outbound_domain_allowlist": list(_ALLOW_ALL_DOMAINS) if allow_all_egress else None,
             "client": client,
             "experimental_options": (
-                {"vm_runtime": True} if self._config.runtime == "vm" else {"enable_docker": True}
+                {"vm_runtime": True}
+                if "vm" in (request.resources.runtime, self._config.runtime)
+                else {"enable_docker": True}
             ),
         }
         if request.volumes:

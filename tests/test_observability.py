@@ -28,6 +28,7 @@ from sentry_sdk.consts import INSTRUMENTER
 from sentry_sdk.envelope import Envelope
 from sentry_sdk.integrations.opentelemetry import SentryPropagator, SentrySpanProcessor
 from sentry_sdk.integrations.stdlib import StdlibIntegration
+from sentry_sdk.tracing import Transaction
 from sentry_sdk.transport import Transport
 
 from benchmark_service import __version__ as framework_version
@@ -237,7 +238,7 @@ def test_process_sampling_keeps_parent_decisions_and_error_events(
     monkeypatch.setattr("sentry_sdk.tracing._generate_sample_rand", Mock(return_value=sample_rand))
     assert init_sentry() is True
 
-    with sentry_sdk.start_transaction(name="sampling-test", parent_sampled=parent_sampled) as transaction:
+    with sentry_sdk.start_transaction(Transaction(name="sampling-test", parent_sampled=parent_sampled)) as transaction:
         assert transaction.sampled is expected_sampled
         sentry_sdk.capture_exception(RuntimeError("sampling-test failure"))
     sentry_sdk.flush()

@@ -1161,6 +1161,101 @@ def test_ws_idle_timeout_from_the_environment(env_value: str | None, expected: f
     assert client._ws_idle_timeout_s == expected  # pyright: ignore[reportPrivateUsage]
 
 
+class _OneMessageThenSilentStream:
+    """Stream that delivers one application message and then stays open forever."""
+
+    def __init__(self) -> None:
+        self._delivered = False
+
+    def __aiter__(self) -> "_OneMessageThenSilentStream":
+        return self
+
+    async def __anext__(self) -> str:
+        if not self._delivered:
+            self._delivered = True
+            return json.dumps({"type": "message", "data": "starting"})
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+def _one_message_ws_mock() -> AsyncMock:
+    ws = _OneMessageThenSilentStream()
+    ws.send = AsyncMock()  # type: ignore[attr-defined]
+
+    mock_connect = AsyncMock()
+    mock_connect.__aenter__ = AsyncMock(return_value=ws)
+    mock_connect.__aexit__ = AsyncMock(return_value=False)
+    return mock_connect
+
+
+async def test_ws_first_message_budget_fails_a_never_started_stream_before_the_idle_budget() -> None:
+    """A stream that never delivers its first message fails on the tighter first-message budget.
+
+    Before the first application message the service has not started benchmark work, so the
+    caller can retry immediately; waiting out the (hour-long) idle budget only delays that.
+    """
+    client = BenchmarkServiceClient(
+        url=BASE_URL, headers=HEADERS, timeout=10, ws_idle_timeout_s=30.0, ws_first_message_timeout_s=0.05
+    )
+
+    with (
+        patch("benchmark_service.client.websockets.connect", return_value=_silent_ws_mock()),
+        patch.object(client, "health_check", AsyncMock(return_value=HealthCheckResponse(status="ok"))),
+    ):
+        with pytest.raises(BenchmarkServiceStreamIdleError) as exc_info:
+            await asyncio.wait_for(client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG), timeout=1.0)
+
+    assert exc_info.value.first_message is True
+    assert exc_info.value.idle_s < 1.0
+
+
+async def test_ws_first_message_budget_stops_applying_once_the_stream_has_started() -> None:
+    """After the first application message only the idle budget governs, so a benchmark whose
+    chunks are further apart than the first-message budget is not cut off."""
+    client = BenchmarkServiceClient(
+        url=BASE_URL, headers=HEADERS, timeout=10, ws_idle_timeout_s=0.3, ws_first_message_timeout_s=0.05
+    )
+
+    with (
+        patch("benchmark_service.client.websockets.connect", return_value=_one_message_ws_mock()),
+        patch.object(client, "health_check", AsyncMock(return_value=HealthCheckResponse(status="ok"))),
+    ):
+        with pytest.raises(BenchmarkServiceStreamIdleError) as exc_info:
+            await asyncio.wait_for(client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG), timeout=2.0)
+
+    assert exc_info.value.first_message is False
+    assert exc_info.value.idle_s >= 0.3
+
+
+async def test_ws_first_message_budget_never_exceeds_the_idle_budget() -> None:
+    """A caller that tightened the idle budget below the first-message default keeps that bound."""
+    client = BenchmarkServiceClient(
+        url=BASE_URL, headers=HEADERS, timeout=10, ws_idle_timeout_s=0.05, ws_first_message_timeout_s=30.0
+    )
+
+    with (
+        patch("benchmark_service.client.websockets.connect", return_value=_silent_ws_mock()),
+        patch.object(client, "health_check", AsyncMock(return_value=HealthCheckResponse(status="ok"))),
+    ):
+        with pytest.raises(BenchmarkServiceStreamIdleError) as exc_info:
+            await asyncio.wait_for(client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG), timeout=1.0)
+
+    assert exc_info.value.first_message is True
+
+
+@pytest.mark.parametrize(
+    ("env_value", "expected"),
+    [(None, 300.0), ("45", 45.0), ("0", None), ("nonsense", 300.0)],
+    ids=["unset", "override", "disabled", "unparseable"],
+)
+def test_ws_first_message_timeout_from_the_environment(env_value: str | None, expected: float | None) -> None:
+    env = {} if env_value is None else {"BENCHMARK_SERVICE_WS_FIRST_MESSAGE_TIMEOUT_S": env_value}
+    with patch.dict(os.environ, env, clear=True):
+        client = BenchmarkServiceClient(url=BASE_URL, headers=HEADERS, timeout=10)
+
+    assert client._ws_first_message_timeout_s == expected  # pyright: ignore[reportPrivateUsage]
+
+
 def test_dockerfile_template_matches_the_client_keepalive_constants() -> None:
     """The uvicorn --ws-ping-* flags and the client's _SERVER_PING_* constants must not drift apart."""
     dockerfile = Path(__file__).resolve().parents[1] / "templates" / "Dockerfile"

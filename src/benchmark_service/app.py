@@ -9,6 +9,7 @@ import traceback
 from collections import Counter
 from collections.abc import AsyncGenerator
 from contextlib import aclosing, asynccontextmanager, nullcontext, suppress
+from types import TracebackType
 from typing import Any, cast
 
 import sentry_sdk
@@ -30,6 +31,7 @@ from benchmark_service.auth import (
 )
 from benchmark_service.base import BenchmarkService
 from benchmark_service.context import sandbox_provider_scope
+from benchmark_service.executor_health import ExecutorLiveness, dump_threads
 from benchmark_service.grading import SUBMISSION_ARTIFACT_SANDBOX_PATH, collapse_stream, evaluate_submission
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.observability import (
@@ -184,11 +186,67 @@ def _grading_nonnegative_int(name: str, default: int) -> int:
     return value
 
 
-def _grading_positive_float(name: str, default: float) -> float:
+def _positive_float_env(name: str, default: float) -> float:
     value = float(os.environ.get(name) or default)
     if value <= 0:
         raise ValueError(f"{name} must be > 0")
     return value
+
+
+# Budget for the steps between accepting a stream socket and the benchmark's first chunk:
+# caller auth, the request frame, dataset access, provider connect, sandbox lookup. None of
+# them emits an application message, so a stall there looks identical to a slow benchmark
+# from the client side until its idle budget expires. Sandbox lookup dominates the legitimate
+# cost and takes seconds; the budget is minutes so a slow provider API still gets through.
+_STREAM_PRELUDE_TIMEOUT_ENV = "BENCHMARK_SERVICE_STREAM_PRELUDE_TIMEOUT_S"
+_DEFAULT_STREAM_PRELUDE_TIMEOUT_S = 120.0
+
+
+class StreamPreludeTimeoutError(RuntimeError):
+    """A stream handler did not reach the benchmark's generator within the prelude budget."""
+
+
+class _StreamPrelude:
+    """Stage-labelled deadline over a stream handler's pre-generator steps.
+
+    ``stage`` names the step in flight so the timeout error and the accompanying thread dump
+    say where the handler was stuck; ``done()`` lifts the deadline once the benchmark's own
+    generator (which heartbeats) takes over.
+    """
+
+    stage: str
+
+    def __init__(self, endpoint: str, timeout_s: float) -> None:
+        self._endpoint = endpoint
+        self._timeout_s = timeout_s
+        self._timeout = asyncio.timeout(timeout_s)
+        self.stage = "authorize"
+
+    async def __aenter__(self) -> "_StreamPrelude":
+        await self._timeout.__aenter__()
+        return self
+
+    async def __aexit__(
+        self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: TracebackType | None
+    ) -> bool:
+        try:
+            await self._timeout.__aexit__(exc_type, exc, tb)
+        except TimeoutError:
+            logger.error(
+                "%s prelude stalled at %r for %.0fs; thread stacks:\n%s",
+                self._endpoint,
+                self.stage,
+                self._timeout_s,
+                dump_threads(),
+            )
+            raise StreamPreludeTimeoutError(
+                f"{self._endpoint} did not reach the benchmark within {self._timeout_s:.0f}s "
+                f"(stalled at {self.stage!r}); the service process may be wedged"
+            ) from None
+        return False
+
+    def done(self) -> None:
+        self._timeout.reschedule(None)
 
 
 class _DuplicateGradingRequest(Exception):
@@ -226,7 +284,7 @@ class _GradingAdmission:
             max_concurrency=max_concurrency,
             max_queued=_grading_nonnegative_int("GRADING_MAX_QUEUED", max_concurrency),
             max_admitted_per_tenant=_grading_nonnegative_int("GRADING_MAX_ADMITTED_PER_TENANT", max_concurrency),
-            queue_timeout_s=_grading_positive_float("GRADING_QUEUE_TIMEOUT_S", 30.0),
+            queue_timeout_s=_positive_float_env("GRADING_QUEUE_TIMEOUT_S", 30.0),
         )
 
     @asynccontextmanager
@@ -359,6 +417,7 @@ class BenchmarkServiceApp(FastAPI):
                             f"{submission_artifacts.SUBMISSION_ARTIFACT_BUCKET_ENV} and "
                             f"{submission_artifacts.SUBMISSION_ARTIFACT_REGION_ENV}"
                         )
+                    self._executor_liveness.start()
                     try:
                         if self.service.eval_mode == EvalMode.SANDBOX:
                             async with (
@@ -369,6 +428,7 @@ class BenchmarkServiceApp(FastAPI):
                                 return
                         yield
                     finally:
+                        self._executor_liveness.stop()
                         await close_catalog_client()
                 except Exception as exc:
                     if sentry_enabled:
@@ -378,6 +438,10 @@ class BenchmarkServiceApp(FastAPI):
         super().__init__(title=service_cls.__name__, lifespan=lifespan)
         self._grading_provider: SandboxProvider | None = None
         self._grading_admission = _GradingAdmission.from_env()
+        self._executor_liveness = ExecutorLiveness.from_env()
+        self._stream_prelude_timeout_s = _positive_float_env(
+            _STREAM_PRELUDE_TIMEOUT_ENV, _DEFAULT_STREAM_PRELUDE_TIMEOUT_S
+        )
         self._deployment_name = deployment_name
         self._sentry_enabled = sentry_enabled
         self.add_middleware(InflightMiddleware, service_name=self._deployment_name)
@@ -563,36 +627,45 @@ class BenchmarkServiceApp(FastAPI):
             raise HTTPException(status_code=403, detail="Dataset not allowed")
         return await self.service.retrieve_task(task_id, skip_validation, dataset=dataset)
 
+    def _stream_prelude(self, endpoint: str) -> _StreamPrelude:
+        return _StreamPrelude(endpoint, self._stream_prelude_timeout_s)
+
     async def _setup_task(self, websocket: WebSocket) -> None:
         await websocket.accept()
 
         try:
-            tenant = await self._authorize_websocket(websocket)
-            if tenant is None:
-                return
+            async with self._stream_prelude("setup-task") as prelude:
+                tenant = await self._authorize_websocket(websocket)
+                if tenant is None:
+                    return
 
-            request = SetupTaskRequest(**await websocket.receive_json())
-            if self._sentry_enabled:
-                bind_request_context(
-                    websocket.headers,
-                    task_id=request.task_id,
-                    dataset=request.dataset,
-                    sandbox_id=request.instance_id,
-                )
-            sandbox_config = _request_sandbox_provider_config(request, websocket)
+                prelude.stage = "receive_request"
+                request = SetupTaskRequest(**await websocket.receive_json())
+                if self._sentry_enabled:
+                    bind_request_context(
+                        websocket.headers,
+                        task_id=request.task_id,
+                        dataset=request.dataset,
+                        sandbox_id=request.instance_id,
+                    )
+                sandbox_config = _request_sandbox_provider_config(request, websocket)
 
-            if not await self.service.check_dataset_access(tenant, request.dataset):
-                await websocket.close(code=1008, reason="Dataset not allowed")
-                return
+                prelude.stage = "check_dataset_access"
+                if not await self.service.check_dataset_access(tenant, request.dataset):
+                    await websocket.close(code=1008, reason="Dataset not allowed")
+                    return
 
-            async with sandbox_config.create_provider() as provider:
-                sandbox = await provider.get_sandbox(request.instance_id)
+                prelude.stage = "create_provider"
+                async with sandbox_config.create_provider() as provider:
+                    prelude.stage = "get_sandbox"
+                    sandbox = await provider.get_sandbox(request.instance_id)
+                    prelude.done()
 
-                await _forward_stream(
-                    websocket,
-                    self.service.setup_task(request.task_id, sandbox, dataset=request.dataset),
-                    endpoint="setup-task",
-                )
+                    await _forward_stream(
+                        websocket,
+                        self.service.setup_task(request.task_id, sandbox, dataset=request.dataset),
+                        endpoint="setup-task",
+                    )
 
         except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
             logger.warning("setup-task websocket disconnected")
@@ -621,26 +694,31 @@ class BenchmarkServiceApp(FastAPI):
         await websocket.accept()
 
         try:
-            tenant = await self._authorize_websocket(websocket)
-            if tenant is None:
-                return
+            async with self._stream_prelude("evaluate-response") as prelude:
+                tenant = await self._authorize_websocket(websocket)
+                if tenant is None:
+                    return
 
-            data = await websocket.receive_json()
-            request = EvaluateResponseRequest(**data)
-            if self._sentry_enabled:
-                bind_request_context(websocket.headers, task_id=request.task_id, dataset=request.dataset)
+                prelude.stage = "receive_request"
+                data = await websocket.receive_json()
+                request = EvaluateResponseRequest(**data)
+                if self._sentry_enabled:
+                    bind_request_context(websocket.headers, task_id=request.task_id, dataset=request.dataset)
 
-            if not await self.service.check_dataset_access(tenant, request.dataset):
-                await websocket.close(code=1008, reason="Dataset not allowed")
-                return
-            if not await self._consume_websocket_evaluation_quota(websocket, tenant):
-                return
+                prelude.stage = "check_dataset_access"
+                if not await self.service.check_dataset_access(tenant, request.dataset):
+                    await websocket.close(code=1008, reason="Dataset not allowed")
+                    return
+                prelude.stage = "consume_evaluation_quota"
+                if not await self._consume_websocket_evaluation_quota(websocket, tenant):
+                    return
+                prelude.done()
 
-            await _forward_stream(
-                websocket,
-                self.service.stream_evaluate_response(request, dataset=request.dataset),
-                endpoint="evaluate-response",
-            )
+                await _forward_stream(
+                    websocket,
+                    self.service.stream_evaluate_response(request, dataset=request.dataset),
+                    endpoint="evaluate-response",
+                )
 
         except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
             logger.warning("evaluate-response websocket disconnected")
@@ -661,37 +739,44 @@ class BenchmarkServiceApp(FastAPI):
         await websocket.accept()
 
         try:
-            tenant = await self._authorize_websocket(websocket)
-            if tenant is None:
-                return
+            async with self._stream_prelude("evaluate-instance") as prelude:
+                tenant = await self._authorize_websocket(websocket)
+                if tenant is None:
+                    return
 
-            request = EvaluateInstanceRequest(**await websocket.receive_json())
-            if self._sentry_enabled:
-                bind_request_context(
-                    websocket.headers,
-                    task_id=request.task_id,
-                    dataset=request.dataset,
-                    sandbox_id=request.instance_id,
-                )
-            sandbox_config = _request_sandbox_provider_config(request, websocket)
-
-            if not await self.service.check_dataset_access(tenant, request.dataset):
-                await websocket.close(code=1008, reason="Dataset not allowed")
-                return
-            if not await self._consume_websocket_evaluation_quota(websocket, tenant):
-                return
-
-            async with sandbox_config.create_provider() as provider:
-                sandbox = await provider.get_sandbox(request.instance_id)
-
-                # Benchmarks that grade in a second sandbox read the provider
-                # from the request scope; see benchmark_service.context.
-                with sandbox_provider_scope(provider):
-                    await _forward_stream(
-                        websocket,
-                        self.service.evaluate_instance(request.task_id, sandbox, dataset=request.dataset),
-                        endpoint="evaluate-instance",
+                prelude.stage = "receive_request"
+                request = EvaluateInstanceRequest(**await websocket.receive_json())
+                if self._sentry_enabled:
+                    bind_request_context(
+                        websocket.headers,
+                        task_id=request.task_id,
+                        dataset=request.dataset,
+                        sandbox_id=request.instance_id,
                     )
+                sandbox_config = _request_sandbox_provider_config(request, websocket)
+
+                prelude.stage = "check_dataset_access"
+                if not await self.service.check_dataset_access(tenant, request.dataset):
+                    await websocket.close(code=1008, reason="Dataset not allowed")
+                    return
+                prelude.stage = "consume_evaluation_quota"
+                if not await self._consume_websocket_evaluation_quota(websocket, tenant):
+                    return
+
+                prelude.stage = "create_provider"
+                async with sandbox_config.create_provider() as provider:
+                    prelude.stage = "get_sandbox"
+                    sandbox = await provider.get_sandbox(request.instance_id)
+                    prelude.done()
+
+                    # Benchmarks that grade in a second sandbox read the provider
+                    # from the request scope; see benchmark_service.context.
+                    with sandbox_provider_scope(provider):
+                        await _forward_stream(
+                            websocket,
+                            self.service.evaluate_instance(request.task_id, sandbox, dataset=request.dataset),
+                            endpoint="evaluate-instance",
+                        )
 
         except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
             logger.warning("evaluate-instance websocket disconnected")

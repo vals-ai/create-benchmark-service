@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import math
 import os
 import time
 from collections.abc import Awaitable, Callable, Generator
@@ -75,23 +76,34 @@ _WS_PING_TIMEOUT_S = None
 # indistinguishable from a dead one from the client side.
 _WS_IDLE_TIMEOUT_ENV = "BENCHMARK_SERVICE_WS_IDLE_TIMEOUT_S"
 _DEFAULT_WS_IDLE_TIMEOUT_S = 3600.0
+# Tighter budget for the first application message. Before it arrives the service has done no
+# benchmark work yet (auth, sandbox lookup), so silence there means the request never reached the
+# benchmark and waiting the full idle budget only delays the caller's retry.
+_WS_FIRST_MESSAGE_TIMEOUT_ENV = "BENCHMARK_SERVICE_WS_FIRST_MESSAGE_TIMEOUT_S"
+_DEFAULT_WS_FIRST_MESSAGE_TIMEOUT_S = 300.0
 # Diagnostics must not delay the idle failure while the retry-decorated health request backs off.
 _HEALTH_PROBE_TIMEOUT_S = 5.0
 # Distinguishes "caller passed None to disable" from "caller said nothing".
 _UNSET_WS_IDLE_TIMEOUT: float = -1.0
 
 
-def _default_ws_idle_timeout_s() -> float | None:
-    """Idle budget from the environment; ``0`` or a negative value disables the watchdog."""
-    raw = os.environ.get(_WS_IDLE_TIMEOUT_ENV)
+def _timeout_from_env(env: str, default: float) -> float | None:
+    """Silence budget from the environment; ``0`` or a negative value disables it."""
+    raw = os.environ.get(env)
     if raw is None:
-        return _DEFAULT_WS_IDLE_TIMEOUT_S
+        return default
     try:
         parsed = float(raw)
     except ValueError:
-        logger.warning("Ignoring non-numeric %s=%r", _WS_IDLE_TIMEOUT_ENV, raw)
-        return _DEFAULT_WS_IDLE_TIMEOUT_S
+        logger.warning("Ignoring non-numeric %s=%r", env, raw)
+        return default
     return parsed if parsed > 0 else None
+
+
+def _resolve_timeout(value: float | None, env: str, default: float) -> float | None:
+    if value is _UNSET_WS_IDLE_TIMEOUT:
+        return _timeout_from_env(env, default)
+    return value if value is None or value > 0 else None
 
 
 _retry_http = retry(
@@ -144,12 +156,14 @@ class BenchmarkServiceStreamIdleError(BenchmarkServiceStreamError):
 
     idle_s: float
     health_ok: bool
+    first_message: bool
 
-    def __init__(self, *, idle_s: float, health_ok: bool) -> None:
+    def __init__(self, *, idle_s: float, health_ok: bool, first_message: bool = False) -> None:
         health = "service still reports healthy" if health_ok else "service health check also failing"
         super().__init__(f"WebSocket idle for {idle_s:.1f}s without an application message ({health})")
         self.idle_s = idle_s
         self.health_ok = health_ok
+        self.first_message = first_message
 
 
 class BenchmarkServiceStreamClosedError(BenchmarkServiceStreamError):
@@ -292,6 +306,7 @@ class BenchmarkServiceClient:
     _headers: dict[str, str]
     _timeout: int
     _ws_idle_timeout_s: float | None
+    _ws_first_message_timeout_s: float | None
     _sandbox_providers: dict[str, SandboxProvider]
 
     def __init__(
@@ -300,6 +315,7 @@ class BenchmarkServiceClient:
         headers: dict[str, str],
         timeout: int = 60,
         ws_idle_timeout_s: float | None = _UNSET_WS_IDLE_TIMEOUT,
+        ws_first_message_timeout_s: float | None = _UNSET_WS_IDLE_TIMEOUT,
     ):
         """Initialize the client.
 
@@ -310,12 +326,18 @@ class BenchmarkServiceClient:
             ws_idle_timeout_s: Silence budget for an established evaluation stream, after which
                 the stream fails with ``BenchmarkServiceStreamIdleError``. ``None`` disables the
                 watchdog; omit it to take the value from ``BENCHMARK_SERVICE_WS_IDLE_TIMEOUT_S``.
+            ws_first_message_timeout_s: Silence budget before the first application message,
+                after which the stream fails with ``BenchmarkServiceStreamIdleError`` flagged
+                ``first_message``. ``None`` falls back to ``ws_idle_timeout_s``; omit it to take
+                the value from ``BENCHMARK_SERVICE_WS_FIRST_MESSAGE_TIMEOUT_S``.
         """
         self._url = url
         self._headers = headers
         self._timeout = timeout
-        idle_timeout = _default_ws_idle_timeout_s() if ws_idle_timeout_s is _UNSET_WS_IDLE_TIMEOUT else ws_idle_timeout_s
-        self._ws_idle_timeout_s = idle_timeout if idle_timeout is None or idle_timeout > 0 else None
+        self._ws_idle_timeout_s = _resolve_timeout(ws_idle_timeout_s, _WS_IDLE_TIMEOUT_ENV, _DEFAULT_WS_IDLE_TIMEOUT_S)
+        self._ws_first_message_timeout_s = _resolve_timeout(
+            ws_first_message_timeout_s, _WS_FIRST_MESSAGE_TIMEOUT_ENV, _DEFAULT_WS_FIRST_MESSAGE_TIMEOUT_S
+        )
         self._sandbox_providers = {}
         self._http_client = httpx.AsyncClient(
             auth=_TelemetryAuth(),
@@ -370,7 +392,8 @@ class BenchmarkServiceClient:
                 terminal chunk. Pre-connection failures (DNS, connect, handshake) stay
                 distinguishable: they propagate unwrapped from websockets.connect.
             BenchmarkServiceStreamIdleError: If the socket stays open but produces no
-                application message within the idle budget.
+                application message within the idle budget, or no first application
+                message within the (tighter) first-message budget.
         """
         operation = f"WEBSOCKET /ws/{path}"
         with websocket_request_span(operation, self._headers) as headers:
@@ -383,23 +406,32 @@ class BenchmarkServiceClient:
                 max_size=10 * 1024 * 1024,  # 10MB
             ) as websocket:
                 last_message_at = time.monotonic()
+                awaiting_first_message = True
 
                 try:
                     await websocket.send(request.model_dump_json())
 
                     stream = aiter(websocket)
                     while True:
+                        silence_budget_s = self._ws_idle_timeout_s
+                        if awaiting_first_message and self._ws_first_message_timeout_s is not None:
+                            silence_budget_s = min(
+                                self._ws_first_message_timeout_s,
+                                silence_budget_s if silence_budget_s is not None else math.inf,
+                            )
                         try:
-                            message = await asyncio.wait_for(anext(stream), timeout=self._ws_idle_timeout_s)
+                            message = await asyncio.wait_for(anext(stream), timeout=silence_budget_s)
                         except StopAsyncIteration:
                             break
                         except TimeoutError:
                             raise BenchmarkServiceStreamIdleError(
                                 idle_s=time.monotonic() - last_message_at,
                                 health_ok=await self._health_ok(),
+                                first_message=awaiting_first_message,
                             ) from None
 
                         last_message_at = time.monotonic()
+                        awaiting_first_message = False
                         chunk: StreamChunk = _stream_chunk_adapter.validate_json(message)
 
                         match chunk.type:

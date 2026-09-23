@@ -109,7 +109,7 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
                 "docker_image": "python:3.12",
                 "problem_path": "/tmp/problem_statement.txt",
                 "cwd": "/work",
-                "resources": {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None},
+                "resources": {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None, "runtime": None},
                 "agent_timeout": None,
                 "eval_sandbox": None,
                 "sandbox_recovery": None,
@@ -163,7 +163,7 @@ async def test_retrieve_task_accepts_legacy_shape(
 
     assert result.source.model_dump() == {"type": "image", "image": "python:3.12"}
     assert result.model_dump()["docker_image"] == "python:3.12"
-    assert result.resources.model_dump() == {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None}
+    assert result.resources.model_dump() == {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None, "runtime": None}
 
 
 async def test_retrieve_task_accepts_sandbox_recovery_policy(
@@ -531,7 +531,7 @@ async def test_retrieve_task_tolerates_legacy_enable_docker_field(
 
     result = await client.retrieve_task("task-1")
 
-    assert result.resources.model_dump() == {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None}
+    assert result.resources.model_dump() == {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None, "runtime": None}
 
 
 async def test_retrieve_task_serializes_snapshot_source_for_legacy_clients(

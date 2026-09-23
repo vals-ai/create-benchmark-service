@@ -3808,6 +3808,69 @@ async def test_daytona_provider_rejects_gpu_for_snapshot_source() -> None:
         )
 
 
+
+async def test_daytona_provider_rejects_vm_runtime() -> None:
+    daytona = CapturingCreateDaytonaClient(InnerSandbox())
+    resources = Resources(vcpu=2, memory=4, disk=10, runtime="vm")
+
+    with pytest.raises(SandboxError, match="targeted LINUX_VM snapshot"):
+        await _provider(daytona).create_sandbox(_request("sandbox-name", resources=resources))
+
+
+async def test_daytona_provider_accepts_vm_runtime_for_targeted_vm_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    daytona = CapturingCreateDaytonaClient(InnerSandbox())
+
+    async def get_snapshot(_snapshot: str) -> SimpleNamespace:
+        return SimpleNamespace(sandbox_class=SandboxClass.LINUX_VM.value)
+
+    target_client = SimpleNamespace(snapshot=SimpleNamespace(get=get_snapshot), create=daytona.create)
+    provider = _provider(daytona)
+
+    def client_for_target(_target: str) -> SimpleNamespace:
+        return target_client
+
+    monkeypatch.setattr(provider, "_client_for_target", client_for_target)
+
+    await provider.create_sandbox(
+        _request(
+            "vm-snapshot",
+            resources=Resources(vcpu=2, memory=4, disk=10, runtime="vm"),
+            source=TargetedSnapshotSource(snapshot="snapshot", target="us-west-3"),
+        )
+    )
+
+    assert daytona.create_params is not None
+    assert daytona.create_params.snapshot == "snapshot"
+
+
+async def test_daytona_provider_rejects_vm_runtime_for_targeted_container_snapshot(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    daytona = CapturingCreateDaytonaClient(InnerSandbox())
+
+    async def get_snapshot(_snapshot: str) -> SimpleNamespace:
+        return SimpleNamespace(sandbox_class=SandboxClass.CONTAINER.value)
+
+    target_client = SimpleNamespace(snapshot=SimpleNamespace(get=get_snapshot), create=daytona.create)
+    provider = _provider(daytona)
+
+    def client_for_target(_target: str) -> SimpleNamespace:
+        return target_client
+
+    monkeypatch.setattr(provider, "_client_for_target", client_for_target)
+
+    with pytest.raises(SandboxError, match="targeted LINUX_VM snapshot"):
+        await provider.create_sandbox(
+            _request(
+                "container-snapshot",
+                resources=Resources(vcpu=2, memory=4, disk=10, runtime="vm"),
+                source=TargetedSnapshotSource(snapshot="snapshot", target="us-west-3"),
+            )
+        )
+
+
 def test_resources_gpu_type_requires_gpu_count() -> None:
     with pytest.raises(ValueError, match="gpu_type requires gpu >= 1"):
         Resources(vcpu=2, memory=4, disk=10, gpu_type="H100")

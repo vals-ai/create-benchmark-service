@@ -1,5 +1,7 @@
 """Tests for BenchmarkService base class non-abstract methods."""
 
+from typing import Any
+
 import pytest
 
 from benchmark_service.schemas import TaskFilter
@@ -93,3 +95,28 @@ async def test_list_tasks_default_requires_explicit_public_projection() -> None:
     service = await StubBenchmark.create()
     with pytest.raises(NotImplementedError, match="list_tasks"):
         await service.list_tasks(dataset="default")
+
+
+class PrioritizedBenchmark(StubBenchmark):
+    priority_dataset = "index"
+
+    async def load_datasets(self) -> dict[str, dict[str, Any]]:
+        datasets = await super().load_datasets()
+        datasets["index"] = {"task-3": datasets["default"]["task-3"], "task-1": datasets["default"]["task-1"]}
+        return datasets
+
+
+async def test_priority_dataset_tasks_dispatch_first_in_every_dataset() -> None:
+    service = await PrioritizedBenchmark.create()
+    assert list(service.get_dataset("default")) == ["task-1", "task-3", "task-2"]
+    assert list(service.get_dataset("index")) == ["task-3", "task-1"]
+    assert list(service.get_dataset("alt")) == ["alt-task-1", "alt-task-2"]
+    assert await service.filter_tasks(TaskFilter(slice_str="0:2")) == ["task-1", "task-3"]
+
+
+async def test_priority_dataset_must_be_loaded() -> None:
+    class MissingPriority(StubBenchmark):
+        priority_dataset = "missing"
+
+    with pytest.raises(ValueError, match="priority_dataset 'missing' not found"):
+        await MissingPriority.create()

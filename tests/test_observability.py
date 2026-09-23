@@ -32,6 +32,7 @@ from sentry_sdk.transport import Transport
 
 from benchmark_service import __version__ as framework_version
 from benchmark_service import app as app_module, observability
+from benchmark_service import client as client_module
 from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.client import BenchmarkServiceClient, SandboxRecoveryAttempt
 from benchmark_service.observability import (
@@ -565,8 +566,14 @@ async def test_http_client_transport_span_injects_trace_and_dynamic_identity(
 
 async def test_websocket_handshake_uses_its_client_span_and_dynamic_identity(
     otel_tracer: tuple[trace.Tracer, InMemorySpanExporter, TracerProvider],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     tracer, exporter, _provider = otel_tracer
+
+    def get_tracer(_name: str) -> trace.Tracer:
+        return tracer
+
+    monkeypatch.setattr(client_module.trace, "get_tracer", get_tracer)
     app = FastAPI()
     observed_headers: dict[str, str] = {}
 
@@ -603,6 +610,29 @@ async def test_websocket_handshake_uses_its_client_span_and_dynamic_identity(
     assert len(client_spans) == 1
     client_span = client_spans[0]
     assert client_span.name == "WEBSOCKET /ws/evaluate-response"
+    recovery_spans = [
+        span
+        for span in exporter.get_finished_spans()
+        if span.name == "benchmark_service.recovery"
+    ]
+    assert len(recovery_spans) == 1
+    recovery_span = recovery_spans[0]
+    assert recovery_span.context is not None
+    assert recovery_span.parent is not None
+    assert recovery_span.parent.span_id == caller_context.span_id
+    assert client_span.parent is not None
+    assert client_span.parent.span_id == recovery_span.context.span_id
+    assert recovery_span.attributes == {
+        "benchmark_service.recovery.outcome": "success",
+        "benchmark_service.recovery.trigger": "none",
+        "benchmark_service.recovery.attempt_count": 1,
+        "benchmark_service.recovery.retry_count": 0,
+    }
+    assert client_span.attributes == {
+        "benchmark_service.websocket.outcome": "result",
+        "benchmark_service.websocket.message_chunk_count": 0,
+        "benchmark_service.websocket.resume_state_chunk_count": 0,
+    }
     assert result == {"task_id": "task-1", "state": {"artifact_prefix": "s3://bucket/run"}}
     assert client_span.context is not None
     assert client_span.context.trace_id == caller_context.trace_id

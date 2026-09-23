@@ -3,6 +3,7 @@ from __future__ import annotations
 # pyright: reportPrivateUsage=false
 
 import asyncio
+import time
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -207,6 +208,12 @@ def _request(
         create_timeout=120,
         volumes=volumes or [],
     )
+
+
+@pytest.fixture(autouse=True)
+def reset_create_limiter(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(modal_module, "_create_limiter", None)
+    monkeypatch.setenv(modal_module._CREATES_PER_SECOND_ENV, "100000")
 
 
 def _provider(monkeypatch: pytest.MonkeyPatch, sdk_sandbox: Any) -> ModalSandboxProvider:
@@ -623,7 +630,7 @@ async def test_create_sandbox_uses_vm_runtime(monkeypatch: pytest.MonkeyPatch) -
         return FakeInnerSandbox()
 
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
-    provider._config.runtime = "vm"  # pyright: ignore[reportPrivateUsage]
+    provider._config.runtime = "vm"
 
     await provider.create_sandbox(_request())
 
@@ -907,6 +914,83 @@ async def test_create_sandbox_reuses_running_sandbox_with_same_name(monkeypatch:
     assert sandbox.name == "task-1"
     assert sandbox.labels == _request().labels
     assert created == []
+
+
+async def test_create_rate_limiter_spaces_bursts_evenly() -> None:
+    limiter = modal_module._CreateRateLimiter(per_second=50)
+
+    started = time.monotonic()
+    await asyncio.gather(*(limiter.acquire() for _ in range(6)))
+    elapsed = time.monotonic() - started
+
+    # Six creates at 50/s: the last slot is 5 intervals (100ms) after the first.
+    assert 0.09 <= elapsed < 1.0
+
+
+async def test_create_rate_limiter_does_not_bank_idle_time() -> None:
+    limiter = modal_module._CreateRateLimiter(per_second=20)
+
+    await limiter.acquire()
+    await asyncio.sleep(0.2)  # idle for four intervals
+    started = time.monotonic()
+    await asyncio.gather(limiter.acquire(), limiter.acquire())
+    elapsed = time.monotonic() - started
+
+    # First call is immediate; the second still waits one interval (no burst credit).
+    assert 0.04 <= elapsed < 0.5
+
+
+def test_create_rate_limiter_reads_env_once(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(modal_module._CREATES_PER_SECOND_ENV, "4")
+    first = modal_module._create_rate_limiter()
+    monkeypatch.setenv(modal_module._CREATES_PER_SECOND_ENV, "1")
+
+    assert modal_module._create_rate_limiter() is first
+    assert first._interval == 0.25
+
+
+def test_create_rate_limiter_defaults_when_env_unset(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv(modal_module._CREATES_PER_SECOND_ENV)
+
+    limiter = modal_module._create_rate_limiter()
+
+    assert limiter._interval == 1 / modal_module._DEFAULT_CREATES_PER_SECOND
+
+
+@pytest.mark.parametrize("value", ["0", "-1"])
+def test_create_rate_limiter_rejects_non_positive_rate(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
+    monkeypatch.setenv(modal_module._CREATES_PER_SECOND_ENV, value)
+
+    with pytest.raises(ValueError, match=modal_module._CREATES_PER_SECOND_ENV):
+        modal_module._create_rate_limiter()
+
+
+async def test_create_sandbox_takes_a_rate_limit_slot_only_for_real_creates(monkeypatch: pytest.MonkeyPatch) -> None:
+    acquired = 0
+
+    async def acquire(self: Any) -> None:
+        nonlocal acquired
+        acquired += 1
+
+    monkeypatch.setattr(modal_module._CreateRateLimiter, "acquire", acquire)
+    running = FakeInnerSandbox(object_id="sb-existing")
+    names = iter(["task-1"])
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        return FakeInnerSandbox(object_id="sb-new")
+
+    async def from_name(app_name: str, name: str, **kwargs: Any) -> FakeInnerSandbox:
+        if next(names, None) is None:
+            raise ModalNotFoundError("no sandbox with that name")
+        return running
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create), from_name=_aio(from_name)))
+
+    reused = await provider.create_sandbox(_request())
+    created = await provider.create_sandbox(_request())
+
+    assert (reused.id, created.id) == ("sb-existing", "sb-new")
+    assert acquired == 1
 
 
 async def test_create_sandbox_ignores_finished_sandbox_with_same_name(monkeypatch: pytest.MonkeyPatch) -> None:

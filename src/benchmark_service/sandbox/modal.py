@@ -5,6 +5,7 @@ import hashlib
 import os
 import re
 import shlex
+import time
 from collections.abc import AsyncGenerator, Awaitable, Mapping
 from typing import Any, Literal, cast
 
@@ -48,6 +49,10 @@ _COMMAND_STATUS_POLL_SECONDS = 10
 _MAX_NAME_LENGTH = 64
 _INVALID_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_.-]")
 _APP_ID_PATTERN = re.compile(r"^ap-[a-zA-Z0-9]{22}$")
+# Modal admits about five sandbox creates per second per workspace, shared by
+# every process that creates them (tracker executors, service verifiers).
+_CREATES_PER_SECOND_ENV = "MODAL_SANDBOX_CREATES_PER_SECOND"
+_DEFAULT_CREATES_PER_SECOND = 2.0
 
 
 _PROVIDER_RETRY = retry(
@@ -88,6 +93,38 @@ class ModalProviderConfig(BaseModel):
 
     def create_provider(self) -> SandboxProvider:
         return ModalSandboxProvider(self)
+
+
+class _CreateRateLimiter:
+    """Space sandbox creates evenly at a fixed rate.
+
+    Callers take the next free slot in arrival order and sleep until it comes
+    up, so a burst of N creates spreads over N / per_second seconds instead of
+    landing at once. Process-wide: one instance covers every provider.
+    """
+
+    def __init__(self, per_second: float) -> None:
+        if per_second <= 0:
+            raise ValueError(f"{_CREATES_PER_SECOND_ENV} must be > 0")
+        self._interval = 1 / per_second
+        self._next_slot = 0.0
+
+    async def acquire(self) -> None:
+        now = time.monotonic()
+        slot = max(now, self._next_slot)
+        self._next_slot = slot + self._interval
+        await asyncio.sleep(slot - now)
+
+
+_create_limiter: _CreateRateLimiter | None = None
+
+
+def _create_rate_limiter() -> _CreateRateLimiter:
+    global _create_limiter
+    if _create_limiter is None:
+        per_second = float(os.environ.get(_CREATES_PER_SECOND_ENV) or _DEFAULT_CREATES_PER_SECOND)
+        _create_limiter = _CreateRateLimiter(per_second)
+    return _create_limiter
 
 
 def _sandbox_error(exc: ModalError) -> SandboxError:
@@ -522,6 +559,7 @@ class ModalSandboxProvider(SandboxProvider):
         if request.volumes:
             create_kwargs["volumes"] = self._resolve_volumes(request.volumes, client, request.labels)
 
+        await _create_rate_limiter().acquire()
         try:
             # No entrypoint args: an argless Modal sandbox idles until timeout.
             inner = await asyncio.wait_for(

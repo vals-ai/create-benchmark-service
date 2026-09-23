@@ -1216,11 +1216,20 @@ class DaytonaSandboxProvider(SandboxProvider):
 
     @_PROVIDER_RETRY
     async def create_sandbox(self, request: SandboxCreateRequest) -> DaytonaSandbox:
-        if request.resources.runtime == "vm":
-            raise SandboxError("Daytona cannot honor runtime 'vm': the snapshot sets VM or container")
         daytona = self._daytona
         if isinstance(request.source, TargetedSnapshotSource):
             daytona = self._client_for_target(request.source.target)
+        if request.resources.runtime == "vm":
+            if not isinstance(request.source, TargetedSnapshotSource):
+                raise SandboxError("Daytona requires a targeted LINUX_VM snapshot for runtime 'vm'")
+            try:
+                snapshot = await daytona.snapshot.get(request.source.snapshot)
+            except DaytonaError as exc:
+                raise self._sandbox_error(exc) from exc
+            except OpenApiException as exc:
+                raise SandboxError("Daytona rejected the targeted snapshot runtime request") from exc
+            if snapshot.sandbox_class != SandboxClass.LINUX_VM.value:
+                raise SandboxError("Daytona requires a targeted LINUX_VM snapshot for runtime 'vm'")
         resources = DaytonaResources(
             cpu=request.resources.vcpu,
             memory=request.resources.memory,

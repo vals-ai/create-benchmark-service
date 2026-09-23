@@ -489,7 +489,8 @@ class ModalSandboxProvider(SandboxProvider):
             raise SandboxError("Modal sandbox provider does not support sandbox_secrets")
 
         client, app = await self._connect()
-        modal_name = _modal_sandbox_name(request.name)
+        use_vm = request.resources.runtime == "vm" or self._config.runtime == "vm"
+        modal_name = _modal_sandbox_name(f"{request.name}-vm" if use_vm else request.name)
         existing = await self._find_reusable_sandbox(modal_name, client)
         if existing is not None:
             return ModalSandbox(existing, name=request.name, labels=request.labels)
@@ -515,11 +516,7 @@ class ModalSandboxProvider(SandboxProvider):
             "outbound_cidr_allowlist": list(_ALLOW_ALL_CIDRS) if allow_all_egress else None,
             "outbound_domain_allowlist": list(_ALLOW_ALL_DOMAINS) if allow_all_egress else None,
             "client": client,
-            "experimental_options": (
-                {"vm_runtime": True}
-                if request.resources.runtime == "vm" or self._config.runtime == "vm"
-                else {"enable_docker": True}
-            ),
+            "experimental_options": {"vm_runtime": True} if use_vm else {"enable_docker": True},
         }
         if request.volumes:
             create_kwargs["volumes"] = self._resolve_volumes(request.volumes, client, request.labels)

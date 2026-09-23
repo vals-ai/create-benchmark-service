@@ -940,6 +940,24 @@ async def test_create_rate_limiter_does_not_bank_idle_time() -> None:
     assert 0.04 <= elapsed < 0.5
 
 
+async def test_create_rate_limiter_cancelled_waiters_leave_no_hole() -> None:
+    limiter = modal_module._CreateRateLimiter(per_second=2)
+
+    await limiter.acquire()  # sets the next slot 0.5s out
+    waiters = [asyncio.create_task(limiter.acquire()) for _ in range(5)]
+    await asyncio.sleep(0)  # let them queue up behind the lock
+    for waiter in waiters:
+        waiter.cancel()
+    await asyncio.gather(*waiters, return_exceptions=True)
+
+    started = time.monotonic()
+    await limiter.acquire()
+    elapsed = time.monotonic() - started
+
+    # Only the first release counts: one interval to wait, not six.
+    assert elapsed < 0.6
+
+
 def test_create_rate_limiter_reads_env_once(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(modal_module._CREATES_PER_SECOND_ENV, "4")
     first = modal_module._create_rate_limiter()

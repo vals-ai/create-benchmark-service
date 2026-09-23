@@ -98,9 +98,11 @@ class ModalProviderConfig(BaseModel):
 class _CreateRateLimiter:
     """Space sandbox creates evenly at a fixed rate.
 
-    Callers take the next free slot in arrival order and sleep until it comes
-    up, so a burst of N creates spreads over N / per_second seconds instead of
-    landing at once. Process-wide: one instance covers every provider.
+    Callers are released one at a time in arrival order, each at least one
+    interval after the previous release, so a burst of N creates spreads over
+    N / per_second seconds instead of landing at once. Only a release claims
+    the schedule: a caller cancelled while waiting leaves no hole behind.
+    Process-wide: one instance covers every provider.
     """
 
     def __init__(self, per_second: float) -> None:
@@ -108,12 +110,14 @@ class _CreateRateLimiter:
             raise ValueError(f"{_CREATES_PER_SECOND_ENV} must be > 0")
         self._interval = 1 / per_second
         self._next_slot = 0.0
+        self._lock = asyncio.Lock()
 
     async def acquire(self) -> None:
-        now = time.monotonic()
-        slot = max(now, self._next_slot)
-        self._next_slot = slot + self._interval
-        await asyncio.sleep(slot - now)
+        async with self._lock:
+            delay = self._next_slot - time.monotonic()
+            if delay > 0:
+                await asyncio.sleep(delay)
+            self._next_slot = time.monotonic() + self._interval
 
 
 _create_limiter: _CreateRateLimiter | None = None

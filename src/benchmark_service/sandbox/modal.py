@@ -517,7 +517,7 @@ class ModalSandboxProvider(SandboxProvider):
             "client": client,
             "experimental_options": (
                 {"vm_runtime": True}
-                if "vm" in (request.resources.runtime, self._config.runtime)
+                if request.resources.runtime == "vm" or self._config.runtime == "vm"
                 else {"enable_docker": True}
             ),
         }

@@ -3813,7 +3813,7 @@ async def test_daytona_provider_rejects_vm_runtime() -> None:
     daytona = CapturingCreateDaytonaClient(InnerSandbox())
     resources = Resources(vcpu=2, memory=4, disk=10, runtime="vm")
 
-    with pytest.raises(SandboxError, match="Daytona takes VM or container from the snapshot"):
+    with pytest.raises(SandboxError, match="Daytona cannot honor runtime 'vm'"):
         await _provider(daytona).create_sandbox(_request("sandbox-name", resources=resources))
 
 

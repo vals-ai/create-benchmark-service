@@ -16,6 +16,7 @@ from modal.exception import ConnectionError as ModalConnectionError
 from modal.exception import Error as ModalError
 from modal.exception import InvalidError as ModalInvalidError
 from modal.exception import NotFoundError as ModalNotFoundError
+from modal.exception import ResourceExhaustedError as ModalResourceExhaustedError
 from pydantic import BaseModel
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
@@ -49,10 +50,16 @@ _COMMAND_STATUS_POLL_SECONDS = 10
 _MAX_NAME_LENGTH = 64
 _INVALID_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_.-]")
 _APP_ID_PATTERN = re.compile(r"^ap-[a-zA-Z0-9]{22}$")
-# Modal admits about five sandbox creates per second per workspace, shared by
-# every process that creates them (tracker executors, service verifiers).
+# Modal admits five sandbox creates per second per workspace (plus a burst
+# allowance), shared by every process that creates them (tracker executors,
+# service verifiers). The pacer keeps one process from spiking past the refill
+# rate; when several processes exhaust the burst together, Modal rejects some
+# creates outright with no retry hint, so those are retried here with backoff
+# for as long as the request's create_timeout allows.
 _CREATES_PER_SECOND_ENV = "MODAL_SANDBOX_CREATES_PER_SECOND"
-_DEFAULT_CREATES_PER_SECOND = 2.0
+_DEFAULT_CREATES_PER_SECOND = 5.0
+_RATE_LIMIT_RETRY_BASE_SECONDS = 1.0
+_RATE_LIMIT_RETRY_MAX_SECONDS = 10.0
 
 
 _PROVIDER_RETRY = retry(
@@ -563,22 +570,33 @@ class ModalSandboxProvider(SandboxProvider):
         if request.volumes:
             create_kwargs["volumes"] = self._resolve_volumes(request.volumes, client, request.labels)
 
-        await _create_rate_limiter().acquire()
-        try:
-            # No entrypoint args: an argless Modal sandbox idles until timeout.
-            inner = await asyncio.wait_for(
-                ModalSdkSandbox.create.aio(**create_kwargs),  # pyright: ignore[reportUnknownMemberType]
-                timeout=request.create_timeout,
-            )
-        except TimeoutError as exc:
-            raise SandboxError(f"Failed to create Modal sandbox within {request.create_timeout}s") from exc
-        except ModalNotFoundError as exc:
-            if request.volumes and _is_missing_volume_error(exc):
-                raise SandboxError(f"Modal volume mount failed: {exc}") from exc
-            raise _sandbox_error(exc) from exc
-        except ModalError as exc:
-            raise _sandbox_error(exc) from exc
-        return ModalSandbox(inner, name=request.name, labels=request.labels)
+        deadline = time.monotonic() + request.create_timeout
+        retry_delay = _RATE_LIMIT_RETRY_BASE_SECONDS
+        while True:
+            await _create_rate_limiter().acquire()
+            try:
+                # No entrypoint args: an argless Modal sandbox idles until timeout.
+                inner = await asyncio.wait_for(
+                    ModalSdkSandbox.create.aio(**create_kwargs),  # pyright: ignore[reportUnknownMemberType]
+                    timeout=deadline - time.monotonic(),
+                )
+            except TimeoutError as exc:
+                raise SandboxError(f"Failed to create Modal sandbox within {request.create_timeout}s") from exc
+            except ModalResourceExhaustedError as exc:
+                if time.monotonic() + retry_delay >= deadline:
+                    raise SandboxError(
+                        f"Modal sandbox creation rate limit still exceeded after {request.create_timeout}s: {exc}"
+                    ) from exc
+                await asyncio.sleep(retry_delay)
+                retry_delay = min(retry_delay * 2, _RATE_LIMIT_RETRY_MAX_SECONDS)
+            except ModalNotFoundError as exc:
+                if request.volumes and _is_missing_volume_error(exc):
+                    raise SandboxError(f"Modal volume mount failed: {exc}") from exc
+                raise _sandbox_error(exc) from exc
+            except ModalError as exc:
+                raise _sandbox_error(exc) from exc
+            else:
+                return ModalSandbox(inner, name=request.name, labels=request.labels)
 
     @_PROVIDER_RETRY
     async def get_sandbox(self, instance_id: str) -> Sandbox:

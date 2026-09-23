@@ -16,6 +16,7 @@ from modal.exception import ConnectionError as ModalConnectionError
 from modal.exception import Error as ModalError
 from modal.exception import InvalidError as ModalInvalidError
 from modal.exception import NotFoundError as ModalNotFoundError
+from modal.exception import ResourceExhaustedError as ModalResourceExhaustedError
 
 import benchmark_service.sandbox.modal as modal_module
 from benchmark_service.sandbox import sandbox_provider_config_from_mapping
@@ -1009,6 +1010,59 @@ async def test_create_sandbox_takes_a_rate_limit_slot_only_for_real_creates(monk
 
     assert (reused.id, created.id) == ("sb-existing", "sb-new")
     assert acquired == 1
+
+
+async def test_create_sandbox_retries_rate_limited_creates_with_backoff(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(modal_module, "_RATE_LIMIT_RETRY_BASE_SECONDS", 0.01)
+    monkeypatch.setattr(modal_module, "_RATE_LIMIT_RETRY_MAX_SECONDS", 0.02)
+    acquired = 0
+
+    async def acquire(self: Any) -> None:
+        nonlocal acquired
+        acquired += 1
+
+    monkeypatch.setattr(modal_module._CreateRateLimiter, "acquire", acquire)
+    attempts = 0
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise ModalResourceExhaustedError("Sandbox creation rate limit (5/s) exceeded.")
+        return FakeInnerSandbox(object_id="sb-new")
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    sandbox = await provider.create_sandbox(_request())
+
+    assert sandbox.id == "sb-new"
+    # Every attempt is a real create RPC, so each one takes a pacer slot.
+    assert (attempts, acquired) == (3, 3)
+
+
+async def test_create_sandbox_gives_up_on_rate_limit_at_create_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(modal_module, "_RATE_LIMIT_RETRY_BASE_SECONDS", 0.6)
+    attempts = 0
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        nonlocal attempts
+        attempts += 1
+        raise ModalResourceExhaustedError("Sandbox creation rate limit (5/s) exceeded.")
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    request = _request().model_copy(update={"create_timeout": 1})
+
+    started = time.monotonic()
+    with pytest.raises(SandboxError, match="rate limit still exceeded after 1s"):
+        await provider.create_sandbox(request)
+
+    # Attempt at t=0, sleep 0.6, attempt at t=0.6, then 0.6 + 1.2 >= 1 so no third attempt.
+    assert attempts == 2
+    assert time.monotonic() - started < 1.5
 
 
 async def test_create_sandbox_ignores_finished_sandbox_with_same_name(monkeypatch: pytest.MonkeyPatch) -> None:

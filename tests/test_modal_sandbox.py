@@ -1065,6 +1065,29 @@ async def test_create_sandbox_gives_up_on_rate_limit_at_create_timeout(
     assert time.monotonic() - started < 1.5
 
 
+async def test_create_sandbox_timeout_covers_pacer_wait(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def acquire(self: Any) -> None:
+        await asyncio.sleep(5)
+
+    monkeypatch.setattr(modal_module._CreateRateLimiter, "acquire", acquire)
+    attempts = 0
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        nonlocal attempts
+        attempts += 1
+        return FakeInnerSandbox()
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    request = _request().model_copy(update={"create_timeout": 1})
+
+    started = time.monotonic()
+    with pytest.raises(SandboxError, match="Failed to create Modal sandbox within 1s"):
+        await provider.create_sandbox(request)
+
+    assert attempts == 0
+    assert time.monotonic() - started < 2
+
+
 async def test_create_sandbox_ignores_finished_sandbox_with_same_name(monkeypatch: pytest.MonkeyPatch) -> None:
     finished = FakeInnerSandbox(object_id="sb-finished", poll_result=0)  # exited
 

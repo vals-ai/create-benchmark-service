@@ -570,33 +570,34 @@ class ModalSandboxProvider(SandboxProvider):
         if request.volumes:
             create_kwargs["volumes"] = self._resolve_volumes(request.volumes, client, request.labels)
 
-        deadline = time.monotonic() + request.create_timeout
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + request.create_timeout
         retry_delay = _RATE_LIMIT_RETRY_BASE_SECONDS
-        while True:
-            await _create_rate_limiter().acquire()
-            try:
-                # No entrypoint args: an argless Modal sandbox idles until timeout.
-                inner = await asyncio.wait_for(
-                    ModalSdkSandbox.create.aio(**create_kwargs),  # pyright: ignore[reportUnknownMemberType]
-                    timeout=deadline - time.monotonic(),
-                )
-            except TimeoutError as exc:
-                raise SandboxError(f"Failed to create Modal sandbox within {request.create_timeout}s") from exc
-            except ModalResourceExhaustedError as exc:
-                if time.monotonic() + retry_delay >= deadline:
-                    raise SandboxError(
-                        f"Modal sandbox creation rate limit still exceeded after {request.create_timeout}s: {exc}"
-                    ) from exc
-                await asyncio.sleep(retry_delay)
-                retry_delay = min(retry_delay * 2, _RATE_LIMIT_RETRY_MAX_SECONDS)
-            except ModalNotFoundError as exc:
-                if request.volumes and _is_missing_volume_error(exc):
-                    raise SandboxError(f"Modal volume mount failed: {exc}") from exc
-                raise _sandbox_error(exc) from exc
-            except ModalError as exc:
-                raise _sandbox_error(exc) from exc
-            else:
-                return ModalSandbox(inner, name=request.name, labels=request.labels)
+        try:
+            # create_timeout covers pacer waits and rate-limit retries too, not just the create RPC.
+            async with asyncio.timeout_at(deadline):
+                while True:
+                    await _create_rate_limiter().acquire()
+                    try:
+                        # No entrypoint args: an argless Modal sandbox idles until timeout.
+                        inner = await ModalSdkSandbox.create.aio(**create_kwargs)  # pyright: ignore[reportUnknownMemberType]
+                    except ModalResourceExhaustedError as exc:
+                        if loop.time() + retry_delay >= deadline:
+                            raise SandboxError(
+                                f"Modal sandbox creation rate limit still exceeded after {request.create_timeout}s: {exc}"
+                            ) from exc
+                        await asyncio.sleep(retry_delay)
+                        retry_delay = min(retry_delay * 2, _RATE_LIMIT_RETRY_MAX_SECONDS)
+                    except ModalNotFoundError as exc:
+                        if request.volumes and _is_missing_volume_error(exc):
+                            raise SandboxError(f"Modal volume mount failed: {exc}") from exc
+                        raise _sandbox_error(exc) from exc
+                    except ModalError as exc:
+                        raise _sandbox_error(exc) from exc
+                    else:
+                        return ModalSandbox(inner, name=request.name, labels=request.labels)
+        except TimeoutError as exc:
+            raise SandboxError(f"Failed to create Modal sandbox within {request.create_timeout}s") from exc
 
     @_PROVIDER_RETRY
     async def get_sandbox(self, instance_id: str) -> Sandbox:

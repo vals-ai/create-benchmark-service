@@ -19,7 +19,13 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from websockets.asyncio.server import serve
 
 from benchmark_service import BenchmarkServiceApp, BenchmarkServiceClient, BenchmarkServiceError, DatasetVersion
-from benchmark_service.schemas import DATASET_VERSION_HEADER, EvaluateResponseRequest, StreamChunk, StreamResultChunk
+from benchmark_service.schemas import (
+    DATASET_VERSION_HEADER,
+    EvaluateResponseRequest,
+    StreamChunk,
+    StreamErrorChunk,
+    StreamResultChunk,
+)
 from benchmark_service.v1_schemas import V1Task
 from conftest import StubBenchmark
 
@@ -96,9 +102,12 @@ class VersionedBenchmark(StubBenchmark):
                 self.concurrent_ready.set()
             await asyncio.wait_for(self.concurrent_ready.wait(), timeout=5)
         try:
-            yield StreamResultChunk(
-                type="result", data={"version": self.get_dataset(dataset)[request.task_id]["answer"]}
-            )
+            if request.eval_resume_state and request.eval_resume_state.get("terminal_type") == "error":
+                yield StreamErrorChunk(type="error", data="Evaluation failed")
+            else:
+                yield StreamResultChunk(
+                    type="result", data={"version": self.get_dataset(dataset)[request.task_id]["answer"]}
+                )
         finally:
             if request.eval_resume_state and request.eval_resume_state.get("block_cleanup"):
                 self.stream_cleanup_started.set()
@@ -245,17 +254,24 @@ async def test_disconnect_waits_for_blocking_preparation(running_service: tuple[
     assert service.closed == ["blocked"]
 
 
+@pytest.mark.parametrize("terminal_type", ["result", "error"])
 async def test_normal_client_close_does_not_cancel_stream_cleanup(
     running_service: tuple[str, VersionedBenchmark],
+    terminal_type: str,
 ) -> None:
     url, service = running_service
     async with BenchmarkServiceClient(url, {"X-Test-Tenant": "reader"}, dataset_version="v1.0") as client:
-        assert await client.resume_evaluation("task-1", {"block_cleanup": True}) == {"version": "v1.0"}
+        state = {"block_cleanup": True, "terminal_type": terminal_type}
+        if terminal_type == "error":
+            with pytest.raises(BenchmarkServiceError, match="Evaluation failed"):
+                await client.resume_evaluation("task-1", state)
+        else:
+            assert await client.resume_evaluation("task-1", state) == {"version": "v1.0"}
         await asyncio.wait_for(service.stream_cleanup_started.wait(), timeout=5)
         await asyncio.wait_for(service.disconnected.wait(), timeout=5)
         service.stream_cleanup_release.set()
-        assert not service.stream_cleanup_cancelled
         await asyncio.wait_for(service.stream_cleanup_finished.wait(), timeout=5)
+        assert not service.stream_cleanup_cancelled
 
 
 def test_legacy_service_requires_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:

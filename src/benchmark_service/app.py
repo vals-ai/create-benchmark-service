@@ -115,7 +115,7 @@ async def _forward_stream(
     disconnects mid-way."""
     async with aclosing(stream) as chunks:
         async for chunk in chunks:
-            terminal = chunk.type == "result"
+            terminal = chunk.type in {"result", "error"}
             if terminal:
                 websocket.state.benchmark_stream_finished = True
             if not await send_json_if_connected(websocket, chunk.model_dump()):

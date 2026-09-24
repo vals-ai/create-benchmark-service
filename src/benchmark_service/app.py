@@ -15,6 +15,8 @@ import sentry_sdk
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
+from pydantic import TypeAdapter, ValidationError
+from starlette.middleware.base import RequestResponseEndpoint
 from starlette.websockets import WebSocketDisconnect
 from uvicorn.protocols.utils import ClientDisconnected
 from websockets.exceptions import ConnectionClosed
@@ -40,7 +42,10 @@ from benchmark_service.observability import (
     init_sentry,
 )
 from benchmark_service.schemas import (
+    DATASET_VERSION_HEADER,
     ArtifactGradingSubmission,
+    DatasetVersion,
+    DatasetVersionId,
     EvalMode,
     EvaluateInstanceRequest,
     EvaluateResponseRequest,
@@ -49,8 +54,11 @@ from benchmark_service.schemas import (
     GradingSubmission,
     HealthCheckResponse,
     RetrieveTaskResponse,
+    ResolveDatasetRequest,
+    ResolveDatasetResponse,
     SetupTaskRequest,
     StreamChunk,
+    StreamDatasetVersionChunk,
     StreamErrorChunk,
     TaskFilter,
     TextGradingSubmission,
@@ -84,6 +92,7 @@ from benchmark_service.v1_schemas import (
 )
 
 logger = logging.getLogger(__name__)
+_dataset_version_id: TypeAdapter[str] = TypeAdapter(DatasetVersionId)
 
 _EVALUATION_QUOTA_UNAVAILABLE_DETAIL = "Evaluation quota enforcement is temporarily unavailable; try again later."
 
@@ -139,7 +148,32 @@ _TRIAL_ALLOWED_PATH = re.compile(r"/v1/(?:evaluate|score|datasets/[^/]+/tasks)")
 
 
 def _trial_tenant_may_access_path(path: str) -> bool:
-    return _TRIAL_ALLOWED_PATH.fullmatch(path) is not None
+    return path == "/resolve-dataset" or _TRIAL_ALLOWED_PATH.fullmatch(path) is not None
+
+
+@asynccontextmanager
+async def _cancel_on_disconnect(connection: Request | WebSocket) -> AsyncGenerator[None, None]:
+    if not isinstance(connection, WebSocket):
+        yield
+        return
+
+    owner = asyncio.current_task()
+    assert owner is not None
+
+    async def watch() -> None:
+        while True:
+            message = await connection.receive()
+            if message["type"] == "websocket.disconnect":
+                owner.cancel()
+                return
+
+    watcher = asyncio.create_task(watch())
+    try:
+        yield
+    finally:
+        watcher.cancel()
+        with suppress(asyncio.CancelledError):
+            await watcher
 
 
 def _request_sandbox_provider_config(
@@ -394,14 +428,14 @@ class BenchmarkServiceApp(FastAPI):
 
     def _register_routes(self) -> None:
         @self.middleware("http")
-        async def _check_auth(request: Request, call_next):  # type: ignore[no-untyped-def]
+        async def _check_auth(request: Request, call_next: RequestResponseEndpoint) -> Response:  # pyright: ignore[reportUnusedFunction]
             clear_request_tenant_config()
             if self._sentry_enabled:
                 self._bind_service_context(self._current_service_version())
                 bind_request_context(request.headers)
             try:
                 if request.url.path in _PUBLIC_PATHS:
-                    return await call_next(request)  # type: ignore[reportUnknownVariableType]
+                    return await call_next(request)
                 tenant = await self.service.resolve_tenant(dict(request.headers))
                 if tenant is None:
                     return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
@@ -411,7 +445,11 @@ class BenchmarkServiceApp(FastAPI):
                         status_code=403,
                         content={"detail": "Trial tenants may only access approved /v1 endpoints (/v1/*)"},
                     )
-                return await call_next(request)  # type: ignore[reportUnknownVariableType]
+                response = await call_next(request)
+                version = getattr(request.state, "dataset_version", None)
+                if version is not None and 200 <= response.status_code < 300:
+                    response.headers[DATASET_VERSION_HEADER] = version.id
+                return response
             finally:
                 clear_request_tenant_config()
 
@@ -419,6 +457,7 @@ class BenchmarkServiceApp(FastAPI):
         self.add_exception_handler(Exception, self._exception_handler)
         self.add_api_route("/health", self._health_check, methods=["GET"])
         self.add_api_route("/version", self._version, methods=["GET"])
+        self.add_api_route("/resolve-dataset", self._resolve_dataset, methods=["POST"])
         self.add_api_route("/verify-task-ids", self._verify_task_ids, methods=["GET"])
         self.add_api_route("/retrieve-task/", self._retrieve_task, methods=["GET"])
         self.add_api_websocket_route("/ws/setup-task", self._setup_task)
@@ -464,8 +503,61 @@ class BenchmarkServiceApp(FastAPI):
             service_name=self._service_name,
             service_version=self._current_service_version(),
             dataset_version=self.service.get_dataset_version(dataset),
+            dataset_version_pinning=self.service.supports_dataset_version_pinning(dataset or "default"),
             eval_mode=self.service.eval_mode,
         )
+
+    @asynccontextmanager
+    async def _open_dataset(
+        self, tenant: str, dataset: str | None, version: str | None
+    ) -> AsyncGenerator[DatasetVersion | None, None]:
+        if not await self.service.check_dataset_access(tenant, dataset):
+            raise HTTPException(status_code=403, detail="Dataset not allowed")
+        name = dataset or "default"
+        if not self.service.supports_dataset_version_pinning(name):
+            if version is not None:
+                raise HTTPException(status_code=400, detail="Dataset version selection is not supported")
+            yield None
+            return
+        async with self.service.open_dataset_version(name, version) as resolved:
+            yield resolved
+
+    @asynccontextmanager
+    async def _dataset_scope(
+        self, connection: Request | WebSocket, tenant: str, dataset: str | None
+    ) -> AsyncGenerator[None, None]:
+        values = connection.headers.getlist(DATASET_VERSION_HEADER)
+        if len(values) > 1:
+            raise HTTPException(status_code=400, detail=f"Supply {DATASET_VERSION_HEADER} only once")
+        try:
+            version = _dataset_version_id.validate_python(values[0]) if values else None
+        except ValidationError as exc:
+            raise HTTPException(status_code=400, detail=f"Invalid {DATASET_VERSION_HEADER}") from exc
+
+        async with _cancel_on_disconnect(connection):
+            try:
+                async with self._open_dataset(tenant, dataset, version) as resolved:
+                    if version is not None:
+                        if resolved is None or resolved.id != version:
+                            raise HTTPException(status_code=409, detail="The service could not honor the dataset version")
+                        if isinstance(connection, WebSocket):
+                            await connection.send_json(StreamDatasetVersionChunk(data=resolved).model_dump())
+                        else:
+                            connection.state.dataset_version = resolved
+                    yield
+            except HTTPException as exc:
+                if isinstance(connection, WebSocket) and exc.status_code == 403:
+                    await connection.close(code=1008, reason="Dataset not allowed")
+                    raise WebSocketDisconnect(code=1008) from exc
+                raise
+
+    async def _resolve_dataset(self, request: Request, body: ResolveDatasetRequest) -> ResolveDatasetResponse:
+        if request.headers.getlist(DATASET_VERSION_HEADER):
+            raise HTTPException(status_code=400, detail="Use the request body to select the dataset version")
+        async with self._open_dataset(request.state.tenant, body.dataset, body.version) as resolved:
+            if resolved is None:
+                raise HTTPException(status_code=400, detail="Dataset version selection is not supported")
+            return ResolveDatasetResponse(dataset=body.dataset, version=resolved)
 
     async def _authorize_websocket(self, websocket: WebSocket) -> str | None:
         """Authenticate a WebSocket caller. Returns tenant id, or None after closing 1008."""
@@ -535,20 +627,18 @@ class BenchmarkServiceApp(FastAPI):
     ) -> VerifyTaskIdsResponse:
         if self._sentry_enabled:
             bind_request_context(request.headers, dataset=dataset)
-        if not await self.service.check_dataset_access(request.state.tenant, dataset):
-            raise HTTPException(status_code=403, detail="Dataset not allowed")
+        async with self._dataset_scope(request, request.state.tenant, dataset):
+            task_filter = TaskFilter()
 
-        task_filter = TaskFilter()
+            if task_ids:
+                task_filter.task_ids = list(dict.fromkeys(task_ids))
 
-        if task_ids:
-            task_filter.task_ids = list(dict.fromkeys(task_ids))
+            if slice:
+                task_filter.slice_str = slice
 
-        if slice:
-            task_filter.slice_str = slice
+            filtered_task_ids = await self.service.filter_tasks(task_filter, dataset=dataset)
 
-        filtered_task_ids = await self.service.filter_tasks(task_filter, dataset=dataset)
-
-        return VerifyTaskIdsResponse(task_ids=filtered_task_ids)
+            return VerifyTaskIdsResponse(task_ids=filtered_task_ids)
 
     async def _retrieve_task(
         self,
@@ -559,9 +649,8 @@ class BenchmarkServiceApp(FastAPI):
     ) -> RetrieveTaskResponse:
         if self._sentry_enabled:
             bind_request_context(request.headers, task_id=task_id, dataset=dataset)
-        if not await self.service.check_dataset_access(request.state.tenant, dataset):
-            raise HTTPException(status_code=403, detail="Dataset not allowed")
-        return await self.service.retrieve_task(task_id, skip_validation, dataset=dataset)
+        async with self._dataset_scope(request, request.state.tenant, dataset):
+            return await self.service.retrieve_task(task_id, skip_validation, dataset=dataset)
 
     async def _setup_task(self, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -581,18 +670,15 @@ class BenchmarkServiceApp(FastAPI):
                 )
             sandbox_config = _request_sandbox_provider_config(request, websocket)
 
-            if not await self.service.check_dataset_access(tenant, request.dataset):
-                await websocket.close(code=1008, reason="Dataset not allowed")
-                return
+            async with self._dataset_scope(websocket, tenant, request.dataset):
+                async with sandbox_config.create_provider() as provider:
+                    sandbox = await provider.get_sandbox(request.instance_id)
 
-            async with sandbox_config.create_provider() as provider:
-                sandbox = await provider.get_sandbox(request.instance_id)
-
-                await _forward_stream(
-                    websocket,
-                    self.service.setup_task(request.task_id, sandbox, dataset=request.dataset),
-                    endpoint="setup-task",
-                )
+                    await _forward_stream(
+                        websocket,
+                        self.service.setup_task(request.task_id, sandbox, dataset=request.dataset),
+                        endpoint="setup-task",
+                    )
 
         except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
             logger.warning("setup-task websocket disconnected")
@@ -612,10 +698,9 @@ class BenchmarkServiceApp(FastAPI):
     async def _evaluate_response(self, request: Request, body: EvaluateResponseRequest) -> Any:
         if self._sentry_enabled:
             bind_request_context(request.headers, task_id=body.task_id, dataset=body.dataset)
-        if not await self.service.check_dataset_access(request.state.tenant, body.dataset):
-            raise HTTPException(status_code=403, detail="Dataset not allowed")
-        await self._consume_evaluation_quota(cast(str, request.state.tenant))
-        return await self.service.evaluate_response(body, dataset=body.dataset)
+        async with self._dataset_scope(request, request.state.tenant, body.dataset):
+            await self._consume_evaluation_quota(cast(str, request.state.tenant))
+            return await self.service.evaluate_response(body, dataset=body.dataset)
 
     async def _evaluate_response_stream(self, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -630,17 +715,15 @@ class BenchmarkServiceApp(FastAPI):
             if self._sentry_enabled:
                 bind_request_context(websocket.headers, task_id=request.task_id, dataset=request.dataset)
 
-            if not await self.service.check_dataset_access(tenant, request.dataset):
-                await websocket.close(code=1008, reason="Dataset not allowed")
-                return
-            if not await self._consume_websocket_evaluation_quota(websocket, tenant):
-                return
+            async with self._dataset_scope(websocket, tenant, request.dataset):
+                if not await self._consume_websocket_evaluation_quota(websocket, tenant):
+                    return
 
-            await _forward_stream(
-                websocket,
-                self.service.stream_evaluate_response(request, dataset=request.dataset),
-                endpoint="evaluate-response",
-            )
+                await _forward_stream(
+                    websocket,
+                    self.service.stream_evaluate_response(request, dataset=request.dataset),
+                    endpoint="evaluate-response",
+                )
 
         except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
             logger.warning("evaluate-response websocket disconnected")
@@ -675,23 +758,21 @@ class BenchmarkServiceApp(FastAPI):
                 )
             sandbox_config = _request_sandbox_provider_config(request, websocket)
 
-            if not await self.service.check_dataset_access(tenant, request.dataset):
-                await websocket.close(code=1008, reason="Dataset not allowed")
-                return
-            if not await self._consume_websocket_evaluation_quota(websocket, tenant):
-                return
+            async with self._dataset_scope(websocket, tenant, request.dataset):
+                if not await self._consume_websocket_evaluation_quota(websocket, tenant):
+                    return
 
-            async with sandbox_config.create_provider() as provider:
-                sandbox = await provider.get_sandbox(request.instance_id)
+                async with sandbox_config.create_provider() as provider:
+                    sandbox = await provider.get_sandbox(request.instance_id)
 
-                # Benchmarks that grade in a second sandbox read the provider
-                # from the request scope; see benchmark_service.context.
-                with sandbox_provider_scope(provider):
-                    await _forward_stream(
-                        websocket,
-                        self.service.evaluate_instance(request.task_id, sandbox, dataset=request.dataset),
-                        endpoint="evaluate-instance",
-                    )
+                    # Benchmarks that grade in a second sandbox read the provider
+                    # from the request scope; see benchmark_service.context.
+                    with sandbox_provider_scope(provider):
+                        await _forward_stream(
+                            websocket,
+                            self.service.evaluate_instance(request.task_id, sandbox, dataset=request.dataset),
+                            endpoint="evaluate-instance",
+                        )
 
         except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
             logger.warning("evaluate-instance websocket disconnected")
@@ -713,175 +794,174 @@ class BenchmarkServiceApp(FastAPI):
             bind_request_context(request.headers, run_id=body.run_id, task_id=body.task_id, dataset=body.dataset)
         tenant = cast(str, request.state.tenant)
         _require_descope_tenant(tenant)
-        if not await self.service.check_dataset_access(tenant, body.dataset):
-            raise HTTPException(status_code=403, detail="Dataset not allowed")
-        try:
-            await self.service.validate_task_ids([body.task_id], dataset=body.dataset)
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=f"Task not found: {body.task_id}") from exc
-
-        if self.service.eval_mode in {
-            EvalMode.IN_PROCESS_ARTIFACT,
-            EvalMode.IN_PROCESS_MATERIALIZED_ARTIFACT,
-            EvalMode.SANDBOX,
-        }:
-            accepted_schemas = self.service.accepted_submission_schemas.get(body.payload.type)
-            if not accepted_schemas:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"This benchmark does not accept {body.payload.type.value} submissions.",
-                )
-            if body.payload.schema_id not in accepted_schemas:
-                choices = ", ".join(sorted(accepted_schemas))
-                raise HTTPException(
-                    status_code=400,
-                    detail=(
-                        f"This benchmark does not accept {body.payload.type.value} schema "
-                        f"{body.payload.schema_id}. Use one of: {choices}."
-                    ),
-                )
-
-            if body.payload.type == V1PayloadType.ARTIFACT and not body.payload.data:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Artifact submissions must include the uploaded object's key in payload.data.",
-                )
-
-            if body.payload.type == V1PayloadType.ARTIFACT:
-                try:
-                    submission_artifacts.validate_submission_key(
-                        body.payload.data,
-                        tenant=tenant,
-                        dataset=body.dataset or "default",
-                        run_id=body.run_id,
-                        task_id=body.task_id,
-                    )
-                except ValueError as exc:
-                    raise HTTPException(
-                        status_code=404,
-                        detail="Submission artifact not found for this evaluation.",
-                    ) from exc
-
+        async with self._dataset_scope(request, request.state.tenant, body.dataset):
             try:
-                async with self._grading_admission.reserve((tenant, body.run_id, body.task_id)):
-                    await self._consume_evaluation_quota(tenant)
-                    async with self._grading_admission.acquire_active_slot():
-                        artifact_reference: submission_artifacts.SubmissionArtifactReference | None = None
-                        submission: GradingSubmission
-                        if body.payload.type == V1PayloadType.ARTIFACT:
-                            try:
-                                artifact_reference = await submission_artifacts.stat(body.payload.data, tenant=tenant)
-                            except submission_artifacts.SubmissionArtifactNotFound as exc:
-                                raise HTTPException(status_code=404, detail=str(exc)) from exc
-                            except submission_artifacts.SubmissionArtifactTooLarge as exc:
-                                raise HTTPException(status_code=413, detail=str(exc)) from exc
-                            submission = ArtifactGradingSubmission(
-                                task_id=body.task_id,
-                                schema_id=body.payload.schema_id,
-                                artifact_reference=artifact_reference,
-                                sandbox_path=SUBMISSION_ARTIFACT_SANDBOX_PATH,
-                            )
-                        else:
-                            submission = TextGradingSubmission(
-                                task_id=body.task_id,
-                                schema_id=body.payload.schema_id,
-                                text=body.payload.data,
-                            )
+                await self.service.validate_task_ids([body.task_id], dataset=body.dataset)
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail=f"Task not found: {body.task_id}") from exc
 
-                        if self.service.eval_mode == EvalMode.SANDBOX:
-                            provider = self._grading_provider
-                            if provider is None:
-                                raise HTTPException(
-                                    status_code=503,
-                                    detail="Grading sandbox is not configured; contact the benchmark service owner.",
-                                )
-                            response = await evaluate_submission(
-                                service=self.service,
-                                run_id=body.run_id,
-                                tenant=tenant,
-                                submission=submission,
-                                provider=provider,
-                                evaluator_version=self._service_version,
-                                dataset=body.dataset,
-                            )
-                        elif self.service.eval_mode == EvalMode.IN_PROCESS_ARTIFACT:
-                            if artifact_reference is None:
-                                raise RuntimeError("in-process artifact evaluation requires an admitted artifact")
-                            try:
-                                artifact = await submission_artifacts.download(artifact_reference, tenant=tenant)
-                            except submission_artifacts.SubmissionArtifactNotFound as exc:
-                                raise HTTPException(status_code=404, detail=str(exc)) from exc
-                            except submission_artifacts.SubmissionArtifactChanged as exc:
-                                raise HTTPException(status_code=409, detail=str(exc)) from exc
-                            except submission_artifacts.SubmissionArtifactTooLarge as exc:
-                                raise HTTPException(status_code=413, detail=str(exc)) from exc
-                            response = await collapse_stream(
-                                self.service.evaluate_artifact(
-                                    run_id=body.run_id,
+            if self.service.eval_mode in {
+                EvalMode.IN_PROCESS_ARTIFACT,
+                EvalMode.IN_PROCESS_MATERIALIZED_ARTIFACT,
+                EvalMode.SANDBOX,
+            }:
+                accepted_schemas = self.service.accepted_submission_schemas.get(body.payload.type)
+                if not accepted_schemas:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"This benchmark does not accept {body.payload.type.value} submissions.",
+                    )
+                if body.payload.schema_id not in accepted_schemas:
+                    choices = ", ".join(sorted(accepted_schemas))
+                    raise HTTPException(
+                        status_code=400,
+                        detail=(
+                            f"This benchmark does not accept {body.payload.type.value} schema "
+                            f"{body.payload.schema_id}. Use one of: {choices}."
+                        ),
+                    )
+
+                if body.payload.type == V1PayloadType.ARTIFACT and not body.payload.data:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="Artifact submissions must include the uploaded object's key in payload.data.",
+                    )
+
+                if body.payload.type == V1PayloadType.ARTIFACT:
+                    try:
+                        submission_artifacts.validate_submission_key(
+                            body.payload.data,
+                            tenant=tenant,
+                            dataset=body.dataset or "default",
+                            run_id=body.run_id,
+                            task_id=body.task_id,
+                        )
+                    except ValueError as exc:
+                        raise HTTPException(
+                            status_code=404,
+                            detail="Submission artifact not found for this evaluation.",
+                        ) from exc
+
+                try:
+                    async with self._grading_admission.reserve((tenant, body.run_id, body.task_id)):
+                        await self._consume_evaluation_quota(tenant)
+                        async with self._grading_admission.acquire_active_slot():
+                            artifact_reference: submission_artifacts.SubmissionArtifactReference | None = None
+                            submission: GradingSubmission
+                            if body.payload.type == V1PayloadType.ARTIFACT:
+                                try:
+                                    artifact_reference = await submission_artifacts.stat(body.payload.data, tenant=tenant)
+                                except submission_artifacts.SubmissionArtifactNotFound as exc:
+                                    raise HTTPException(status_code=404, detail=str(exc)) from exc
+                                except submission_artifacts.SubmissionArtifactTooLarge as exc:
+                                    raise HTTPException(status_code=413, detail=str(exc)) from exc
+                                submission = ArtifactGradingSubmission(
                                     task_id=body.task_id,
                                     schema_id=body.payload.schema_id,
-                                    artifact=artifact,
-                                    dataset=body.dataset,
-                                ),
-                                run_id=body.run_id,
-                                task_id=body.task_id,
-                                evaluator_version=self._service_version,
-                            )
-                        else:
-                            if artifact_reference is None:
-                                raise RuntimeError("materialized artifact evaluation requires an admitted artifact")
-                            try:
-                                async with submission_artifacts.materialize(
-                                    artifact_reference,
+                                    artifact_reference=artifact_reference,
+                                    sandbox_path=SUBMISSION_ARTIFACT_SANDBOX_PATH,
+                                )
+                            else:
+                                submission = TextGradingSubmission(
+                                    task_id=body.task_id,
+                                    schema_id=body.payload.schema_id,
+                                    text=body.payload.data,
+                                )
+
+                            if self.service.eval_mode == EvalMode.SANDBOX:
+                                provider = self._grading_provider
+                                if provider is None:
+                                    raise HTTPException(
+                                        status_code=503,
+                                        detail="Grading sandbox is not configured; contact the benchmark service owner.",
+                                    )
+                                response = await evaluate_submission(
+                                    service=self.service,
+                                    run_id=body.run_id,
                                     tenant=tenant,
-                                ) as artifact:
-                                    response = await collapse_stream(
-                                        self.service.evaluate_materialized_artifact(
-                                            tenant=tenant,
-                                            run_id=body.run_id,
-                                            task_id=body.task_id,
-                                            schema_id=body.payload.schema_id,
-                                            artifact=artifact,
-                                            dataset=body.dataset,
-                                        ),
+                                    submission=submission,
+                                    provider=provider,
+                                    evaluator_version=self._service_version,
+                                    dataset=body.dataset,
+                                )
+                            elif self.service.eval_mode == EvalMode.IN_PROCESS_ARTIFACT:
+                                if artifact_reference is None:
+                                    raise RuntimeError("in-process artifact evaluation requires an admitted artifact")
+                                try:
+                                    artifact = await submission_artifacts.download(artifact_reference, tenant=tenant)
+                                except submission_artifacts.SubmissionArtifactNotFound as exc:
+                                    raise HTTPException(status_code=404, detail=str(exc)) from exc
+                                except submission_artifacts.SubmissionArtifactChanged as exc:
+                                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                                except submission_artifacts.SubmissionArtifactTooLarge as exc:
+                                    raise HTTPException(status_code=413, detail=str(exc)) from exc
+                                response = await collapse_stream(
+                                    self.service.evaluate_artifact(
                                         run_id=body.run_id,
                                         task_id=body.task_id,
-                                        evaluator_version=self._service_version,
-                                    )
-                            except submission_artifacts.SubmissionArtifactNotFound as exc:
-                                raise HTTPException(status_code=404, detail=str(exc)) from exc
-                            except submission_artifacts.SubmissionArtifactChanged as exc:
-                                raise HTTPException(status_code=409, detail=str(exc)) from exc
-                            except submission_artifacts.SubmissionArtifactTooLarge as exc:
-                                raise HTTPException(status_code=413, detail=str(exc)) from exc
-            except _DuplicateGradingRequest as exc:
-                raise HTTPException(status_code=409, detail=str(exc)) from exc
-            except _GradingCapacityExceeded as exc:
-                raise HTTPException(status_code=429, detail=str(exc)) from exc
-        else:
-            if body.payload.type == V1PayloadType.ARTIFACT:
-                raise HTTPException(
-                    status_code=400,
-                    detail="This benchmark does not accept artifact submissions.",
+                                        schema_id=body.payload.schema_id,
+                                        artifact=artifact,
+                                        dataset=body.dataset,
+                                    ),
+                                    run_id=body.run_id,
+                                    task_id=body.task_id,
+                                    evaluator_version=self._service_version,
+                                )
+                            else:
+                                if artifact_reference is None:
+                                    raise RuntimeError("materialized artifact evaluation requires an admitted artifact")
+                                try:
+                                    async with submission_artifacts.materialize(
+                                        artifact_reference,
+                                        tenant=tenant,
+                                    ) as artifact:
+                                        response = await collapse_stream(
+                                            self.service.evaluate_materialized_artifact(
+                                                tenant=tenant,
+                                                run_id=body.run_id,
+                                                task_id=body.task_id,
+                                                schema_id=body.payload.schema_id,
+                                                artifact=artifact,
+                                                dataset=body.dataset,
+                                            ),
+                                            run_id=body.run_id,
+                                            task_id=body.task_id,
+                                            evaluator_version=self._service_version,
+                                        )
+                                except submission_artifacts.SubmissionArtifactNotFound as exc:
+                                    raise HTTPException(status_code=404, detail=str(exc)) from exc
+                                except submission_artifacts.SubmissionArtifactChanged as exc:
+                                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                                except submission_artifacts.SubmissionArtifactTooLarge as exc:
+                                    raise HTTPException(status_code=413, detail=str(exc)) from exc
+                except _DuplicateGradingRequest as exc:
+                    raise HTTPException(status_code=409, detail=str(exc)) from exc
+                except _GradingCapacityExceeded as exc:
+                    raise HTTPException(status_code=429, detail=str(exc)) from exc
+            else:
+                if body.payload.type == V1PayloadType.ARTIFACT:
+                    raise HTTPException(
+                        status_code=400,
+                        detail="This benchmark does not accept artifact submissions.",
+                    )
+                submission = TextGradingSubmission(
+                    task_id=body.task_id,
+                    schema_id=body.payload.schema_id,
+                    text=body.payload.data,
                 )
-            submission = TextGradingSubmission(
-                task_id=body.task_id,
-                schema_id=body.payload.schema_id,
-                text=body.payload.data,
-            )
-            await self._consume_evaluation_quota(tenant)
-            response = await evaluate_submission(
-                service=self.service,
-                run_id=body.run_id,
-                tenant=tenant,
-                submission=submission,
-                provider=None,
-                evaluator_version=self._service_version,
-                dataset=body.dataset,
-            )
-        if _is_trial_tenant(tenant):
-            return sanitize_v1_eval_response(response, self.service.project_trial_result)
-        return response
+                await self._consume_evaluation_quota(tenant)
+                response = await evaluate_submission(
+                    service=self.service,
+                    run_id=body.run_id,
+                    tenant=tenant,
+                    submission=submission,
+                    provider=None,
+                    evaluator_version=self._service_version,
+                    dataset=body.dataset,
+                )
+            if _is_trial_tenant(tenant):
+                return sanitize_v1_eval_response(response, self.service.project_trial_result)
+            return response
 
     async def _v1_submission_upload_url(self, request: Request, body: V1UploadUrlRequest) -> V1UploadUrlResponse:
         if self._sentry_enabled:
@@ -897,79 +977,73 @@ class BenchmarkServiceApp(FastAPI):
                     f"{submission_artifacts.SUBMISSION_ARTIFACT_REGION_ENV}"
                 ),
             )
-        if not await self.service.check_dataset_access(tenant, body.dataset):
-            raise HTTPException(status_code=403, detail="Dataset not allowed")
-        await self.service.validate_task_ids([body.task_id], dataset=body.dataset)
-        key = submission_artifacts.submission_key(
-            tenant=tenant,
-            dataset=body.dataset or "default",
-            run_id=body.run_id,
-            task_id=body.task_id,
-            filename=body.filename,
-        )
-        return V1UploadUrlResponse(
-            key=key,
-            url=submission_artifacts.presigned_put_url(key),
-            expires_in=submission_artifacts.DEFAULT_UPLOAD_EXPIRY_S,
-        )
+        async with self._dataset_scope(request, request.state.tenant, body.dataset):
+            await self.service.validate_task_ids([body.task_id], dataset=body.dataset)
+            key = submission_artifacts.submission_key(
+                tenant=tenant,
+                dataset=body.dataset or "default",
+                run_id=body.run_id,
+                task_id=body.task_id,
+                filename=body.filename,
+            )
+            return V1UploadUrlResponse(
+                key=key,
+                url=submission_artifacts.presigned_put_url(key),
+                expires_in=submission_artifacts.DEFAULT_UPLOAD_EXPIRY_S,
+            )
 
     async def _v1_score(self, request: Request, body: V1ScoreRequest) -> V1ScoreResponse:
         if self._sentry_enabled:
             bind_request_context(request.headers, run_id=body.run_id, dataset=body.dataset)
         _require_descope_tenant(request.state.tenant)
-        if not await self.service.check_dataset_access(request.state.tenant, body.dataset):
-            raise HTTPException(status_code=403, detail="Dataset not allowed")
-
-        normalized_results = {
-            task_id: _v1_score_item_to_eval_result(task_id, item) for task_id, item in body.evaluation_results.items()
-        }
-        tasks_evaluated = await self.service.validate_task_ids(list(normalized_results.keys()), dataset=body.dataset)
-        result = await self.service.calculate_final_score(normalized_results, dataset=body.dataset)
-        response = V1ScoreResponse(
-            run_id=body.run_id,
-            tasks_evaluated=tasks_evaluated,
-            final_score=result.score,
-            metadata=result.metadata,
-        )
-        if _is_trial_tenant(request.state.tenant):
-            return sanitize_v1_score_response(response)
-        return response
+        async with self._dataset_scope(request, request.state.tenant, body.dataset):
+            normalized_results = {
+                task_id: _v1_score_item_to_eval_result(task_id, item) for task_id, item in body.evaluation_results.items()
+            }
+            tasks_evaluated = await self.service.validate_task_ids(list(normalized_results.keys()), dataset=body.dataset)
+            result = await self.service.calculate_final_score(normalized_results, dataset=body.dataset)
+            response = V1ScoreResponse(
+                run_id=body.run_id,
+                tasks_evaluated=tasks_evaluated,
+                final_score=result.score,
+                metadata=result.metadata,
+            )
+            if _is_trial_tenant(request.state.tenant):
+                return sanitize_v1_score_response(response)
+            return response
 
     async def _v1_list_dataset_tasks(self, request: Request, dataset: str) -> V1DatasetTasksResponse:
         if self._sentry_enabled:
             bind_request_context(request.headers, dataset=dataset)
         _require_descope_tenant(request.state.tenant)
-        if not await self.service.check_dataset_access(request.state.tenant, dataset):
-            raise HTTPException(status_code=403, detail=f"Dataset={dataset} access not allowed")
-        try:
-            self.service.get_dataset(dataset)
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=f"Dataset not found: {dataset}") from exc
-        try:
-            tasks = await self.service.list_tasks(dataset=dataset)
-        except NotImplementedError as exc:
-            raise HTTPException(status_code=501, detail=str(exc)) from exc
-        response = V1DatasetTasksResponse(
-            dataset=dataset,
-            dataset_version=self.service.get_dataset_version(dataset),
-            tasks=tasks,
-        )
-        if _is_trial_tenant(request.state.tenant):
-            return sanitize_v1_dataset_tasks_response(response)
-        return response
+        async with self._dataset_scope(request, request.state.tenant, dataset):
+            try:
+                self.service.get_dataset(dataset)
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail=f"Dataset not found: {dataset}") from exc
+            try:
+                tasks = await self.service.list_tasks(dataset=dataset)
+            except NotImplementedError as exc:
+                raise HTTPException(status_code=501, detail=str(exc)) from exc
+            response = V1DatasetTasksResponse(
+                dataset=dataset,
+                dataset_version=self.service.get_dataset_version(dataset),
+                tasks=tasks,
+            )
+            if _is_trial_tenant(request.state.tenant):
+                return sanitize_v1_dataset_tasks_response(response)
+            return response
 
     async def _final_score(self, request: Request, body: FinalScoreRequest) -> FinalScoreResponse:
         if self._sentry_enabled:
             bind_request_context(request.headers, dataset=body.dataset)
-        if not await self.service.check_dataset_access(request.state.tenant, body.dataset):
-            raise HTTPException(status_code=403, detail="Dataset not allowed")
+        async with self._dataset_scope(request, request.state.tenant, body.dataset):
+            tasks_evaluated = list(body.evaluation_results.keys())
+            validated_task_ids = await self.service.validate_task_ids(tasks_evaluated, dataset=body.dataset)
+            result = await self.service.calculate_final_score(body.evaluation_results, dataset=body.dataset)
 
-        tasks_evaluated = list(body.evaluation_results.keys())
-        validated_task_ids = await self.service.validate_task_ids(tasks_evaluated, dataset=body.dataset)
-        result = await self.service.calculate_final_score(body.evaluation_results, dataset=body.dataset)
-
-        return FinalScoreResponse(
-            tasks_evaluated=validated_task_ids,
-            final_score=result.score,
-            metadata=result.metadata,
-        )
+            return FinalScoreResponse(
+                tasks_evaluated=validated_task_ids,
+                final_score=result.score,
+                metadata=result.metadata,
+            )

@@ -42,7 +42,11 @@ from benchmark_service.sandbox import (
     sandbox_provider_config_from_mapping,
 )
 from benchmark_service.schemas import (
+    DATASET_VERSION_HEADER,
     ArtifactGradingSubmission,
+    DatasetVersion,
+    ResolveDatasetRequest,
+    ResolveDatasetResponse,
     EvalMode,
     GradingSubmission,
     SandboxRecoveryPolicy,
@@ -51,6 +55,10 @@ from benchmark_service.schemas import (
 from benchmark_service.submission_artifacts import MaterializedSubmissionArtifact, SubmissionArtifactReference
 
 __all__ = [
+    "DATASET_VERSION_HEADER",
+    "DatasetVersion",
+    "ResolveDatasetRequest",
+    "ResolveDatasetResponse",
     "BenchmarkServiceApp",
     "CatalogAllowlistClient",
     "BenchmarkService",

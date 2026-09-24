@@ -26,15 +26,20 @@ from websockets.exceptions import ConnectionClosed
 from benchmark_service.observability import correlation_scope, request_headers, websocket_request_span
 from benchmark_service.sandbox import SandboxNotFoundError, SandboxProvider, SandboxProviderConfig
 from benchmark_service.schemas import (
+    DATASET_VERSION_HEADER,
+    DatasetVersionId,
     EvaluateInstanceRequest,
     EvaluateResponseRequest,
     FinalScoreResponse,
     HealthCheckResponse,
     JsonValue,
     RetrieveTaskResponse,
+    ResolveDatasetRequest,
+    ResolveDatasetResponse,
     SetupTaskRequest,
     SetupTaskResponse,
     StreamChunk,
+    StreamDatasetVersionChunk,
     VerifyTaskIdsResponse,
     VersionResponse,
 )
@@ -54,7 +59,10 @@ from benchmark_service.v1_schemas import (
 
 logger = logging.getLogger(__name__)
 
-_stream_chunk_adapter: TypeAdapter[StreamChunk] = TypeAdapter(StreamChunk)
+_stream_chunk_adapter: TypeAdapter[StreamChunk | StreamDatasetVersionChunk] = TypeAdapter(
+    StreamChunk | StreamDatasetVersionChunk
+)
+_dataset_version_id: TypeAdapter[str] = TypeAdapter(DatasetVersionId)
 _RecoveryResult = TypeVar("_RecoveryResult")
 
 _OUTAGE_ID_ENV = "VALKYRIE_SANDBOX_OUTAGE_ID"
@@ -285,6 +293,7 @@ class _TelemetryAuth(httpx.Auth):
         request.headers.update(request_headers(request.headers))
         yield request
 
+
 class BenchmarkServiceClient:
     """HTTP/WebSocket client for communicating with a benchmark service."""
 
@@ -300,6 +309,8 @@ class BenchmarkServiceClient:
         headers: dict[str, str],
         timeout: int = 60,
         ws_idle_timeout_s: float | None = _UNSET_WS_IDLE_TIMEOUT,
+        *,
+        dataset_version: str | None = None,
     ):
         """Initialize the client.
 
@@ -310,20 +321,39 @@ class BenchmarkServiceClient:
             ws_idle_timeout_s: Silence budget for an established evaluation stream, after which
                 the stream fails with ``BenchmarkServiceStreamIdleError``. ``None`` disables the
                 watchdog; omit it to take the value from ``BENCHMARK_SERVICE_WS_IDLE_TIMEOUT_S``.
+            dataset_version: Exact dataset version ID to require for this client's lifetime.
         """
         self._url = url
-        self._headers = headers
+        self._headers = headers.copy()
+        version_headers = [value for key, value in headers.items() if key.lower() == DATASET_VERSION_HEADER.lower()]
+        if len(version_headers) > 1 or (version_headers and dataset_version is not None):
+            raise ValueError("Supply the dataset version once, using dataset_version or its header")
+        selected = version_headers[0] if version_headers else dataset_version
+        self._dataset_version = _dataset_version_id.validate_python(selected) if selected is not None else None
+        if dataset_version is not None:
+            self._headers[DATASET_VERSION_HEADER] = dataset_version
         self._timeout = timeout
-        idle_timeout = _default_ws_idle_timeout_s() if ws_idle_timeout_s is _UNSET_WS_IDLE_TIMEOUT else ws_idle_timeout_s
+        idle_timeout = (
+            _default_ws_idle_timeout_s() if ws_idle_timeout_s is _UNSET_WS_IDLE_TIMEOUT else ws_idle_timeout_s
+        )
         self._ws_idle_timeout_s = idle_timeout if idle_timeout is None or idle_timeout > 0 else None
         self._sandbox_providers = {}
         self._http_client = httpx.AsyncClient(
             auth=_TelemetryAuth(),
             follow_redirects=True,
             timeout=timeout,
-            headers=headers,
+            headers=self._headers,
             limits=httpx.Limits(max_connections=200),
+            event_hooks={"response": [self._check_dataset_version]},
         )
+
+    async def _check_dataset_version(self, response: httpx.Response) -> None:
+        if self._dataset_version is None or not response.is_success:
+            return
+        if response.request.url.path in {httpx.URL(f"{self._url}/{path}").path for path in ("health", "version")}:
+            return
+        if response.headers.get_list(DATASET_VERSION_HEADER) != [self._dataset_version]:
+            raise BenchmarkServiceError("The service did not acknowledge the requested dataset version")
 
     def get_sandbox_provider(self, provider: SandboxProviderConfig) -> SandboxProvider:
         provider_key = provider.model_dump_json()
@@ -383,6 +413,7 @@ class BenchmarkServiceClient:
                 max_size=10 * 1024 * 1024,  # 10MB
             ) as websocket:
                 last_message_at = time.monotonic()
+                acknowledged = self._dataset_version is None
 
                 try:
                     await websocket.send(request.model_dump_json())
@@ -400,7 +431,17 @@ class BenchmarkServiceClient:
                             ) from None
 
                         last_message_at = time.monotonic()
-                        chunk: StreamChunk = _stream_chunk_adapter.validate_json(message)
+                        chunk = _stream_chunk_adapter.validate_json(message)
+
+                        if isinstance(chunk, StreamDatasetVersionChunk):
+                            if acknowledged or chunk.data.id != self._dataset_version:
+                                raise BenchmarkServiceError(
+                                    "The service sent an unexpected dataset version acknowledgement"
+                                )
+                            acknowledged = True
+                            continue
+                        if not acknowledged and chunk.type != "error":
+                            raise BenchmarkServiceError("The service did not acknowledge the requested dataset version")
 
                         match chunk.type:
                             case "error":
@@ -453,9 +494,13 @@ class BenchmarkServiceClient:
         return HealthCheckResponse.model_validate(response.json())
 
     @_retry_http
-    async def version(self) -> VersionResponse:
+    async def version(self, dataset: str | None = None) -> VersionResponse:
         """Fetch framework and benchmark service version metadata."""
-        response = await self._http_client.get(f"{self._url}/version")
+        response = (
+            await self._http_client.get(f"{self._url}/version", params={"dataset": dataset})
+            if dataset is not None
+            else await self._http_client.get(f"{self._url}/version")
+        )
 
         if response.status_code == 401:
             raise _unauthenticated_error(response)
@@ -467,6 +512,25 @@ class BenchmarkServiceClient:
             )
 
         return VersionResponse.model_validate(response.json())
+
+    @_retry_http
+    async def resolve_dataset(self, dataset: str, version: str | None = None) -> ResolveDatasetResponse:
+        """Resolve a selector once, before constructing a client pinned to the returned ID."""
+        if self._dataset_version is not None:
+            raise ValueError("Resolve a dataset with an unpinned client")
+        body = ResolveDatasetRequest(dataset=dataset, version=version)
+        response = await self._http_client.post(f"{self._url}/resolve-dataset", json=body.model_dump())
+        if response.status_code == 401:
+            raise _unauthenticated_error(response)
+        if response.status_code != 200:
+            raise BenchmarkServiceError(
+                f"Dataset resolution failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
+            )
+        resolved = ResolveDatasetResponse.model_validate(response.json())
+        if resolved.dataset != dataset:
+            raise BenchmarkServiceError("The service resolved a different dataset")
+        return resolved
 
     @_retry_http
     async def verify_task_ids(

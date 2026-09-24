@@ -132,6 +132,15 @@ GradingSubmission = Annotated[
     Field(discriminator="type"),
 ]
 
+EgressPolicy = Literal["*"] | list[str]
+
+
+class BenchmarkEgressPlan(BaseModel):
+    """Benchmark-declared network policy for each task lifecycle stage."""
+
+    setup_task: EgressPolicy = "*"
+    evaluation: EgressPolicy = "*"
+
 
 class RetrieveTaskResponse(BaseModel):
     """
@@ -149,6 +158,10 @@ class RetrieveTaskResponse(BaseModel):
         default=None, description="Agent execution max time in seconds (None for no timeout)"
     )
     resources: Resources = Field(description="Computational resources needed")
+    egress: BenchmarkEgressPlan = Field(
+        default_factory=BenchmarkEgressPlan,
+        description="Network egress policy for task setup and evaluation",
+    )
     volumes: list[VolumeMount] = Field(
         default_factory=list,
         description="Persistent volumes to attach to generation and default grading sandboxes",

@@ -31,7 +31,7 @@ from benchmark_service.client import (
 )
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
-from benchmark_service.schemas import HealthCheckResponse, RetrieveTaskResponse
+from benchmark_service.schemas import BenchmarkEgressPlan, EgressPolicy, HealthCheckResponse, RetrieveTaskResponse
 from benchmark_service.v1_schemas import (
     V1DatasetTasksResponse,
     V1EvalResponse,
@@ -110,6 +110,7 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
                 "problem_path": "/tmp/problem_statement.txt",
                 "cwd": "/work",
                 "resources": {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None},
+                "egress": {"setup_task": "*", "evaluation": "*"},
                 "agent_timeout": None,
                 "eval_sandbox": None,
                 "sandbox_recovery": None,
@@ -164,6 +165,37 @@ async def test_retrieve_task_accepts_legacy_shape(
     assert result.source.model_dump() == {"type": "image", "image": "python:3.12"}
     assert result.model_dump()["docker_image"] == "python:3.12"
     assert result.resources.model_dump() == {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None}
+    assert result.egress.model_dump() == {"setup_task": "*", "evaluation": "*"}
+
+
+@pytest.mark.parametrize(
+    ("setup_task", "evaluation"),
+    [
+        ("*", "*"),
+        ([], ["api.openai.com", "203.0.113.10/32"]),
+    ],
+)
+def test_benchmark_egress_plan_serializes_explicit_stage_policies(
+    setup_task: EgressPolicy,
+    evaluation: EgressPolicy,
+) -> None:
+    plan = BenchmarkEgressPlan(setup_task=setup_task, evaluation=evaluation)
+
+    assert plan.model_dump() == {"setup_task": setup_task, "evaluation": evaluation}
+
+
+@pytest.mark.parametrize("policy", ["api.openai.com", None, ["api.openai.com", 1]])
+def test_benchmark_egress_plan_rejects_invalid_policies(policy: object) -> None:
+    with pytest.raises(ValidationError):
+        BenchmarkEgressPlan.model_validate({"setup_task": policy})
+
+
+def test_retrieve_task_rejects_null_egress_plan() -> None:
+    payload = _task_response().model_dump(exclude={"docker_image", "egress"})
+    payload["egress"] = None
+
+    with pytest.raises(ValidationError):
+        RetrieveTaskResponse.model_validate(payload)
 
 
 async def test_retrieve_task_accepts_sandbox_recovery_policy(

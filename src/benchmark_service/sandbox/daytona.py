@@ -993,6 +993,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         self._create_state = _PtyCreateState(marker=uuid.uuid4().hex)
         self._creation_done = asyncio.Event()
         self._close_requested = False
+        self._output_closed = False
         self._close_lock = asyncio.Lock()
         self._close_task: asyncio.Task[float] | None = None
         self._run_task = asyncio.create_task(self._run())
@@ -1004,7 +1005,12 @@ class _DaytonaControlledWorkload(ControlledWorkload):
             task.exception()
 
     async def output(self) -> AsyncGenerator[str, None]:
-        while not self._run_task.done():
+        """Yield queued stdout through natural completion or confirmed PTY absence.
+
+        After successful kill, drain only chunks accepted before closure, without waiting
+        for a potentially stalled status probe in the producer task.
+        """
+        while not self._run_task.done() and not self._output_closed:
             try:
                 yield await asyncio.wait_for(self._output.get(), timeout=0.1)
             except TimeoutError:
@@ -1068,6 +1074,9 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         # Publish the fresh-list confirmation immediately. Controlled status files are
         # sandbox-scoped and disappear with normal sandbox teardown; cleaning them here
         # would delay the caller's deadline arbitration after absence was already proven.
+        # The producer may still be stalled on a status probe after the PTY is gone.
+        # Close only after fresh absence confirmation, preserving every queued chunk.
+        self._output_closed = True
         return asyncio.get_running_loop().time()
 
     @property
@@ -1092,6 +1101,8 @@ class _DaytonaControlledWorkload(ControlledWorkload):
 
         async def on_data(data: bytes) -> None:
             nonlocal stdout_bytes
+            if self._output_closed:
+                return
             text = data.decode("utf-8", errors="replace")
             stdout.append(text)
             stdout_bytes += len(text)

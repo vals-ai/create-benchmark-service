@@ -140,6 +140,7 @@ class BenchmarkEgressPlan(BaseModel):
     """Benchmark-declared network policy for each task lifecycle stage."""
 
     setup_task: EgressPolicy = "*"
+    run: EgressPolicy | None = None
     evaluation: EgressPolicy = "*"
 
 

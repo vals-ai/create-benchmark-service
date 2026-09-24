@@ -111,7 +111,7 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
                 "cwd": "/work",
                 "resources": {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None},
                 "agent_install_order": "before_setup",
-                "egress": {"setup_task": "*", "evaluation": "*"},
+                "egress": {"setup_task": "*", "run": None, "evaluation": "*"},
                 "agent_timeout": None,
                 "eval_sandbox": None,
                 "sandbox_recovery": None,
@@ -167,7 +167,7 @@ async def test_retrieve_task_accepts_legacy_shape(
     assert result.model_dump()["docker_image"] == "python:3.12"
     assert result.resources.model_dump() == {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None}
     assert result.agent_install_order == "before_setup"
-    assert result.egress.model_dump() == {"setup_task": "*", "evaluation": "*"}
+    assert result.egress.model_dump() == {"setup_task": "*", "run": None, "evaluation": "*"}
 
 
 async def test_retrieve_task_accepts_explicit_agent_install_order(
@@ -192,25 +192,38 @@ def test_retrieve_task_rejects_invalid_agent_install_order() -> None:
 
 
 @pytest.mark.parametrize(
-    ("setup_task", "evaluation"),
+    ("setup_task", "run", "evaluation"),
     [
-        ("*", "*"),
-        ([], ["api.openai.com", "203.0.113.10/32"]),
+        ("*", None, "*"),
+        ("*", "*", "*"),
+        ([], [], ["api.openai.com", "203.0.113.10/32"]),
+        (["setup.example.com"], ["run.example.com"], []),
     ],
 )
 def test_benchmark_egress_plan_serializes_explicit_stage_policies(
     setup_task: EgressPolicy,
+    run: EgressPolicy | None,
     evaluation: EgressPolicy,
 ) -> None:
-    plan = BenchmarkEgressPlan(setup_task=setup_task, evaluation=evaluation)
+    plan = BenchmarkEgressPlan(setup_task=setup_task, run=run, evaluation=evaluation)
 
-    assert plan.model_dump() == {"setup_task": setup_task, "evaluation": evaluation}
+    assert plan.model_dump() == {
+        "setup_task": setup_task,
+        "run": run,
+        "evaluation": evaluation,
+    }
 
 
 @pytest.mark.parametrize("policy", ["api.openai.com", None, ["api.openai.com", 1]])
 def test_benchmark_egress_plan_rejects_invalid_policies(policy: object) -> None:
     with pytest.raises(ValidationError):
         BenchmarkEgressPlan.model_validate({"setup_task": policy})
+
+
+@pytest.mark.parametrize("policy", ["api.openai.com", ["api.openai.com", 1]])
+def test_benchmark_egress_plan_rejects_invalid_run_policies(policy: object) -> None:
+    with pytest.raises(ValidationError):
+        BenchmarkEgressPlan.model_validate({"run": policy})
 
 
 def test_retrieve_task_rejects_null_egress_plan() -> None:

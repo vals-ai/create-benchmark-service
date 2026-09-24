@@ -420,7 +420,10 @@ class PtyHandle:
         self.inputs.append(data)
         if data.startswith("stty"):
             return
-        result = self._on_data(b"hello")
+        await self.emit(b"hello")
+
+    async def emit(self, data: bytes) -> None:
+        result = self._on_data(data)
         if result is not None:
             await result
 
@@ -4830,7 +4833,7 @@ async def test_daytona_controlled_output_drains_buffer_after_confirmed_kill_with
 
     await process.status_check_started.wait()
     assert process.pty_handle is not None
-    await process.pty_handle._on_data(b"buffered before kill")
+    await process.pty_handle.emit(b"buffered before kill")
     try:
         await workload.kill()
         stream = workload.output()
@@ -4858,7 +4861,7 @@ async def test_daytona_controlled_output_waiting_consumer_ends_at_kill_boundary(
     try:
         await workload.kill()
         assert process.pty_handle is not None
-        await process.pty_handle._on_data(b"after confirmed kill")
+        await process.pty_handle.emit(b"after confirmed kill")
         with pytest.raises(StopAsyncIteration):
             await asyncio.wait_for(next_chunk, 0.5)
     finally:
@@ -4903,7 +4906,7 @@ async def test_daytona_controlled_natural_output_drains_queued_tail() -> None:
 
     await process.status_check_started.wait()
     assert process.pty_handle is not None
-    await process.pty_handle._on_data(b"tail before completion")
+    await process.pty_handle.emit(b"tail before completion")
     process.release_status_check.set()
     await workload.wait()
 

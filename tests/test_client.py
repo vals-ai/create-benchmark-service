@@ -110,6 +110,7 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
                 "problem_path": "/tmp/problem_statement.txt",
                 "cwd": "/work",
                 "resources": {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None},
+                "agent_install_order": "before_setup",
                 "egress": {"setup_task": "*", "evaluation": "*"},
                 "agent_timeout": None,
                 "eval_sandbox": None,
@@ -165,7 +166,29 @@ async def test_retrieve_task_accepts_legacy_shape(
     assert result.source.model_dump() == {"type": "image", "image": "python:3.12"}
     assert result.model_dump()["docker_image"] == "python:3.12"
     assert result.resources.model_dump() == {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None}
+    assert result.agent_install_order == "before_setup"
     assert result.egress.model_dump() == {"setup_task": "*", "evaluation": "*"}
+
+
+async def test_retrieve_task_accepts_explicit_agent_install_order(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    payload = _task_response().model_dump(mode="json")
+    payload["agent_install_order"] = "after_setup"
+    mock_http.get = AsyncMock(return_value=_mock_response(json_data=payload))
+
+    result = await client.retrieve_task("task-1")
+
+    assert result.agent_install_order == "after_setup"
+
+
+def test_retrieve_task_rejects_invalid_agent_install_order() -> None:
+    payload = _task_response().model_dump(exclude={"docker_image"})
+    payload["agent_install_order"] = "during_setup"
+
+    with pytest.raises(ValidationError):
+        RetrieveTaskResponse.model_validate(payload)
 
 
 @pytest.mark.parametrize(

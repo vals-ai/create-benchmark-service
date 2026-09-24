@@ -328,7 +328,8 @@ result = await client.run_with_sandbox_recovery(
 
 Pydantic models used across requests and responses:
 
-- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `resources`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
+- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
+- **`agent_install_order`** — `"before_setup"` installs agent dependencies before benchmark setup; `"after_setup"` lets setup prepare the environment first. It defaults to `"before_setup"`, so older task responses remain valid; lifecycle execution is the caller's responsibility.
 - **`BenchmarkEgressPlan`** — declarative `setup_task` and `evaluation` policies. `"*"` is unrestricted, `[]` is deny-all, and a non-empty list is an allowlist. Both stages default to `"*"`, so legacy task responses that omit `egress` remain unrestricted; applying the plan is the caller's responsibility.
 - **`SandboxRecoveryPolicy`** — explicit opt-in to recreate a lost generation sandbox with the same run identity and volumes; `max_sandbox_attempts` (2–20, inclusive) includes the initial sandbox
 - **`SandboxSource`** — `ImageSource`, `SnapshotSource`, top-level Daytona-only `TargetedSnapshotSource`, or `ComposeSource` with an outer image/snapshot

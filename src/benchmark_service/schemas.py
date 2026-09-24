@@ -133,6 +133,7 @@ GradingSubmission = Annotated[
 ]
 
 EgressPolicy = Literal["*"] | list[str]
+AgentInstallOrder = Literal["before_setup", "after_setup"]
 
 
 class BenchmarkEgressPlan(BaseModel):
@@ -158,6 +159,10 @@ class RetrieveTaskResponse(BaseModel):
         default=None, description="Agent execution max time in seconds (None for no timeout)"
     )
     resources: Resources = Field(description="Computational resources needed")
+    agent_install_order: AgentInstallOrder = Field(
+        default="before_setup",
+        description="Whether agent dependency installation runs before or after benchmark task setup",
+    )
     egress: BenchmarkEgressPlan = Field(
         default_factory=BenchmarkEgressPlan,
         description="Network egress policy for task setup and evaluation",

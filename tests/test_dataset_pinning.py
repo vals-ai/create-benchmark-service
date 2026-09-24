@@ -15,6 +15,7 @@ import uvicorn
 import websockets
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from websockets.asyncio.server import serve
 
 from benchmark_service import BenchmarkServiceApp, BenchmarkServiceClient, BenchmarkServiceError, DatasetVersion
@@ -33,6 +34,13 @@ class VersionedBenchmark(StubBenchmark):
         self.worker_release = threading.Event()
         self.worker_finished = threading.Event()
         self.cancelled = asyncio.Event()
+        self.disconnected = asyncio.Event()
+        self.stream_cleanup_started = asyncio.Event()
+        self.stream_cleanup_release = asyncio.Event()
+        self.stream_cleanup_finished = asyncio.Event()
+        self.stream_cleanup_cancelled = False
+        self.concurrent_arrivals = 0
+        self.concurrent_ready = asyncio.Event()
         return {
             version: {"task-1": {"answer": version}, f"only-{version}": {"answer": version}}
             for version in ("v1.0", "v1.1")
@@ -54,7 +62,7 @@ class VersionedBenchmark(StubBenchmark):
 
     @asynccontextmanager
     async def open_dataset_version(self, dataset: str, version: str | None) -> AsyncGenerator[DatasetVersion, None]:
-        selected = version or self.default_version
+        selected = "v1.0" if version == "Release α" else version or self.default_version
         if selected not in self.datasets and selected != "blocked":
             raise HTTPException(status_code=404, detail="Dataset version unavailable")
         self.opened.append(selected)
@@ -82,14 +90,46 @@ class VersionedBenchmark(StubBenchmark):
     async def stream_evaluate_response(
         self, request: EvaluateResponseRequest, dataset: str | None = None
     ) -> AsyncGenerator[StreamChunk, None]:
-        await asyncio.sleep(0)
-        yield StreamResultChunk(type="result", data={"version": self.get_dataset(dataset)[request.task_id]["answer"]})
+        if request.eval_resume_state and request.eval_resume_state.get("overlap"):
+            self.concurrent_arrivals += 1
+            if self.concurrent_arrivals == 2:
+                self.concurrent_ready.set()
+            await asyncio.wait_for(self.concurrent_ready.wait(), timeout=5)
+        try:
+            yield StreamResultChunk(
+                type="result", data={"version": self.get_dataset(dataset)[request.task_id]["answer"]}
+            )
+        finally:
+            if request.eval_resume_state and request.eval_resume_state.get("block_cleanup"):
+                self.stream_cleanup_started.set()
+                try:
+                    await self.stream_cleanup_release.wait()
+                    self.stream_cleanup_finished.set()
+                except asyncio.CancelledError:
+                    self.stream_cleanup_cancelled = True
+                    raise
+
+
+class ObserveDisconnect:
+    def __init__(self, app: ASGIApp, benchmark_app: BenchmarkServiceApp) -> None:
+        self.app = app
+        self.benchmark_app = benchmark_app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        async def observed_receive() -> Message:
+            message = await receive()
+            if message["type"] == "websocket.disconnect":
+                cast(VersionedBenchmark, self.benchmark_app.service).disconnected.set()
+            return message
+
+        await self.app(scope, observed_receive, send)
 
 
 @pytest.fixture
 async def running_service(monkeypatch: pytest.MonkeyPatch) -> AsyncGenerator[tuple[str, VersionedBenchmark], None]:
     monkeypatch.setenv("AUTH_DISABLED", "true")
     app = BenchmarkServiceApp(VersionedBenchmark)
+    app.add_middleware(ObserveDisconnect, benchmark_app=app)
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         url = f"http://127.0.0.1:{listener.getsockname()[1]}"
@@ -105,6 +145,7 @@ async def running_service(monkeypatch: pytest.MonkeyPatch) -> AsyncGenerator[tup
         finally:
             app_service = cast(VersionedBenchmark, app.service)
             app_service.worker_release.set()
+            app_service.stream_cleanup_release.set()
             server.should_exit = True
             await asyncio.wait_for(serving, timeout=10)
 
@@ -119,6 +160,7 @@ async def test_pin_survives_default_switch_on_http_and_websocket(
         first = await unpinned.resolve_dataset("default")
         service.default_version = "v1.1"
         second = await unpinned.resolve_dataset("default")
+        assert (await unpinned.resolve_dataset("default", version="Release α")).version.id == first.version.id
         assert first.version.id == "v1.0"
         assert second.version.id == "v1.1"
 
@@ -126,7 +168,7 @@ async def test_pin_survives_default_switch_on_http_and_websocket(
             async with BenchmarkServiceClient(url, headers, dataset_version=version) as client:
                 assert (await client.verify_task_ids(None, None)).task_ids == ["task-1", f"only-{version}"]
                 assert (await client.evaluate_response("task-1", version))["resolved"] is True
-                assert await client.resume_evaluation("task-1", {}) == {"version": version}
+                assert await client.resume_evaluation("task-1", {"overlap": True}) == {"version": version}
                 assert (await client.final_score({f"only-{version}": {"resolved": True}})).final_score == 100
                 tasks = await client.list_tasks("default")
                 assert [task.question for task in tasks.tasks] == [version, version]
@@ -201,6 +243,19 @@ async def test_disconnect_waits_for_blocking_preparation(running_service: tuple[
             await asyncio.sleep(0.01)
     assert service.worker_finished.is_set()
     assert service.closed == ["blocked"]
+
+
+async def test_normal_client_close_does_not_cancel_stream_cleanup(
+    running_service: tuple[str, VersionedBenchmark],
+) -> None:
+    url, service = running_service
+    async with BenchmarkServiceClient(url, {"X-Test-Tenant": "reader"}, dataset_version="v1.0") as client:
+        assert await client.resume_evaluation("task-1", {"block_cleanup": True}) == {"version": "v1.0"}
+        await asyncio.wait_for(service.stream_cleanup_started.wait(), timeout=5)
+        await asyncio.wait_for(service.disconnected.wait(), timeout=5)
+        service.stream_cleanup_release.set()
+        assert not service.stream_cleanup_cancelled
+        await asyncio.wait_for(service.stream_cleanup_finished.wait(), timeout=5)
 
 
 def test_legacy_service_requires_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:

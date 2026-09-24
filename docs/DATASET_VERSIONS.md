@@ -4,6 +4,18 @@ A service can change its default dataset while a run is in progress. Resolve the
 
 This feature is optional. It works with local files, a database, or a separate dataset store. A version ID is an opaque string: the client stores and sends it without interpreting its format.
 
+```mermaid
+sequenceDiagram
+    participant O as Orchestrator
+    participant S as Benchmark service
+    O->>S: Resolve dataset default or release label
+    S-->>O: Exact version ID
+    Note over O: Save ID with the run
+    O->>S: Task or scoring request with saved ID
+    Note over S: Authorize and prepare that version
+    S-->>O: Acknowledge ID and return result
+```
+
 ## Client workflow
 
 ```python
@@ -61,7 +73,7 @@ Use `HTTPException` to report an unavailable version (404), an incompatible vers
 
 The header covers task verification, retrieval, setup, all evaluation paths, scoring, and `/v1` task listing and upload preparation. `/health` and `/version` remain metadata operations. Resolution rejects a version header; its selector belongs in the body.
 
-IDs contain 1–1,024 visible ASCII characters with no whitespace. Labels contain up to 256 Unicode characters. Duplicate headers are rejected. Browser deployments must allow and expose `X-Benchmark-Dataset-Version` in their CORS policy.
+IDs contain 1–1,024 visible ASCII characters with no whitespace. Display labels contain up to 256 Unicode characters. Resolution selectors can contain Unicode and spaces, so a service can map a release name to its exact ID. Duplicate headers are rejected. Browser deployments must allow and expose `X-Benchmark-Dataset-Version` in their CORS policy.
 
 Requests without a pin keep their existing response and stream shapes. Supporting services select their default independently for each such request. An explicit pin on a service without support fails instead of being ignored.
 

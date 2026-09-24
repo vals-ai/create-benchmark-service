@@ -237,7 +237,12 @@ def test_process_sampling_keeps_parent_decisions_and_error_events(
     monkeypatch.setattr("sentry_sdk.tracing._generate_sample_rand", Mock(return_value=sample_rand))
     assert init_sentry() is True
 
-    with sentry_sdk.start_transaction(name="sampling-test", parent_sampled=parent_sampled) as transaction:
+    transaction = (
+        sentry_sdk.start_transaction(name="sampling-test")
+        if parent_sampled is None
+        else sentry_sdk.start_transaction(name="sampling-test", parent_sampled=parent_sampled)
+    )
+    with transaction:
         assert transaction.sampled is expected_sampled
         sentry_sdk.capture_exception(RuntimeError("sampling-test failure"))
     sentry_sdk.flush()

@@ -38,7 +38,7 @@ class ResolveDatasetRequest(BaseModel):
     """Select a fixed version, or the configured default when version is null."""
 
     dataset: str = Field(min_length=1)
-    version: DatasetVersionId | None
+    version: str | None = Field(min_length=1, max_length=1024)
 
 
 class ResolveDatasetResponse(BaseModel):

@@ -1,7 +1,7 @@
 """Request and response models for the benchmark service API."""
 
 from enum import StrEnum
-from typing import Annotated, Any, Literal, assert_never, cast
+from typing import Annotated, Any, Literal, Self, assert_never, cast
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
 
@@ -15,6 +15,7 @@ from benchmark_service.sandbox.types import (
     SnapshotSource,
     TargetedSnapshotSource,
     VolumeMount,
+    validate_command_env,
 )
 from benchmark_service.submission_artifacts import SubmissionArtifactReference
 
@@ -179,6 +180,14 @@ class RetrieveTaskResponse(BaseModel):
             "values are secret identifiers, never secret material"
         ),
     )
+    sandbox_env: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Plain environment variables for the generation sandbox, keyed by name. A value may be a `${VAR}` or "
+            "`${VAR:-default}` template, which the runner fills from the run's own values, such as its secrets; a "
+            "template with no such value and no default fails the task"
+        ),
+    )
     sandbox_recovery: SandboxRecoveryPolicy | None = Field(
         default=None,
         description=(
@@ -188,6 +197,16 @@ class RetrieveTaskResponse(BaseModel):
     eval_sandbox: EvalSandboxSpec | None = Field(
         default=None, description="Grading-sandbox overrides for eval_mode == SANDBOX; None uses generation values"
     )
+
+    @model_validator(mode="after")
+    def _validate_sandbox_env(self) -> Self:
+        validate_command_env(self.sandbox_env)
+        overlapping = sorted(self.sandbox_env.keys() & self.sandbox_secrets.keys())
+        if overlapping:
+            raise ValueError(
+                f"environment variables cannot be both sandbox_env and sandbox_secrets: {', '.join(overlapping)}"
+            )
+        return self
 
     @computed_field(description="Legacy sandbox image field for older Valkyrie clients")
     @property

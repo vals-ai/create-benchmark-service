@@ -48,6 +48,7 @@ from benchmark_service.schemas import (
     SandboxRecoveryPolicy,
     TextGradingSubmission,
 )
+from benchmark_service.sandbox_env import SandboxEnvError, is_sandbox_env_template, resolve_sandbox_env
 from benchmark_service.submission_artifacts import MaterializedSubmissionArtifact, SubmissionArtifactReference
 
 __all__ = [
@@ -81,6 +82,7 @@ __all__ = [
     "SandboxCommandError",
     "SandboxConnectionError",
     "SandboxCreateRequest",
+    "SandboxEnvError",
     "SandboxError",
     "SandboxNotFoundError",
     "SandboxProvider",
@@ -96,4 +98,6 @@ __all__ = [
     "VolumeMount",
     "sandbox_provider_config_from_mapping",
     "__version__",
+    "is_sandbox_env_template",
+    "resolve_sandbox_env",
 ]

@@ -55,6 +55,16 @@ class StreamDatasetVersionChunk(BaseModel):
     data: DatasetVersion
 
 
+class DatasetVersionErrorData(BaseModel):
+    status_code: int
+    detail: str
+
+
+class StreamDatasetVersionErrorChunk(BaseModel):
+    type: Literal["dataset_version_error"] = "dataset_version_error"
+    data: DatasetVersionErrorData
+
+
 type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 
 

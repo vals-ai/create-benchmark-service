@@ -40,6 +40,7 @@ from benchmark_service.schemas import (
     SetupTaskResponse,
     StreamChunk,
     StreamDatasetVersionChunk,
+    StreamDatasetVersionErrorChunk,
     VerifyTaskIdsResponse,
     VersionResponse,
 )
@@ -59,8 +60,8 @@ from benchmark_service.v1_schemas import (
 
 logger = logging.getLogger(__name__)
 
-_stream_chunk_adapter: TypeAdapter[StreamChunk | StreamDatasetVersionChunk] = TypeAdapter(
-    StreamChunk | StreamDatasetVersionChunk
+_stream_chunk_adapter: TypeAdapter[StreamChunk | StreamDatasetVersionChunk | StreamDatasetVersionErrorChunk] = TypeAdapter(
+    StreamChunk | StreamDatasetVersionChunk | StreamDatasetVersionErrorChunk
 )
 _dataset_version_id: TypeAdapter[str] = TypeAdapter(DatasetVersionId)
 _RecoveryResult = TypeVar("_RecoveryResult")
@@ -440,6 +441,10 @@ class BenchmarkServiceClient:
                                 )
                             acknowledged = True
                             continue
+                        if isinstance(chunk, StreamDatasetVersionErrorChunk):
+                            if acknowledged or self._dataset_version is None:
+                                raise BenchmarkServiceError("The service sent an unexpected dataset version error")
+                            raise BenchmarkServiceError(chunk.data.detail, status_code=chunk.data.status_code)
                         if not acknowledged and chunk.type != "error":
                             raise BenchmarkServiceError("The service did not acknowledge the requested dataset version")
 

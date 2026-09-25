@@ -45,6 +45,7 @@ from benchmark_service.schemas import (
     DATASET_VERSION_HEADER,
     ArtifactGradingSubmission,
     DatasetVersion,
+    DatasetVersionErrorData,
     DatasetVersionId,
     EvalMode,
     EvaluateInstanceRequest,
@@ -59,6 +60,7 @@ from benchmark_service.schemas import (
     SetupTaskRequest,
     StreamChunk,
     StreamDatasetVersionChunk,
+    StreamDatasetVersionErrorChunk,
     StreamErrorChunk,
     TaskFilter,
     TextGradingSubmission,
@@ -97,6 +99,13 @@ _dataset_version_id: TypeAdapter[str] = TypeAdapter(DatasetVersionId)
 _EVALUATION_QUOTA_UNAVAILABLE_DETAIL = "Evaluation quota enforcement is temporarily unavailable; try again later."
 
 
+class _DatasetVersionSelectionError(Exception):
+    def __init__(self, status_code: int, detail: str) -> None:
+        super().__init__(detail)
+        self.status_code = status_code
+        self.detail = detail
+
+
 async def send_json_if_connected(websocket: WebSocket, payload: dict[str, Any]) -> bool:
     try:
         await websocket.send_json(payload)
@@ -115,7 +124,7 @@ async def _forward_stream(
     disconnects mid-way."""
     async with aclosing(stream) as chunks:
         async for chunk in chunks:
-            terminal = chunk.type in {"result", "error"}
+            terminal = chunk.type == "result"
             if terminal:
                 websocket.state.benchmark_stream_finished = True
             if not await send_json_if_connected(websocket, chunk.model_dump()):
@@ -123,6 +132,13 @@ async def _forward_stream(
                 return
             if terminal:
                 return
+
+
+async def _send_dataset_version_error(websocket: WebSocket, exc: _DatasetVersionSelectionError) -> None:
+    chunk = StreamDatasetVersionErrorChunk(
+        data=DatasetVersionErrorData(status_code=exc.status_code, detail=exc.detail)
+    )
+    await send_json_if_connected(websocket, chunk.model_dump())
 
 
 _PUBLIC_PATHS = frozenset({"/health", "/version"})
@@ -534,13 +550,18 @@ class BenchmarkServiceApp(FastAPI):
     ) -> AsyncGenerator[None, None]:
         values = connection.headers.getlist(DATASET_VERSION_HEADER)
         if len(values) > 1:
+            if isinstance(connection, WebSocket):
+                raise _DatasetVersionSelectionError(400, f"Supply {DATASET_VERSION_HEADER} only once")
             raise HTTPException(status_code=400, detail=f"Supply {DATASET_VERSION_HEADER} only once")
         try:
             version = _dataset_version_id.validate_python(values[0]) if values else None
         except ValidationError as exc:
+            if isinstance(connection, WebSocket):
+                raise _DatasetVersionSelectionError(400, f"Invalid {DATASET_VERSION_HEADER}") from exc
             raise HTTPException(status_code=400, detail=f"Invalid {DATASET_VERSION_HEADER}") from exc
 
         async with _cancel_on_disconnect(connection, self.service.supports_dataset_version_pinning(dataset or "default")):
+            entered = False
             try:
                 async with self._open_dataset(tenant, dataset, version) as resolved:
                     try:
@@ -551,6 +572,7 @@ class BenchmarkServiceApp(FastAPI):
                                 await connection.send_json(StreamDatasetVersionChunk(data=resolved).model_dump())
                             else:
                                 connection.state.dataset_version = resolved
+                        entered = True
                         yield
                     finally:
                         if isinstance(connection, WebSocket):
@@ -559,6 +581,13 @@ class BenchmarkServiceApp(FastAPI):
                 if isinstance(connection, WebSocket) and exc.status_code == 403:
                     await connection.close(code=1008, reason="Dataset not allowed")
                     raise WebSocketDisconnect(code=1008) from exc
+                if (
+                    isinstance(connection, WebSocket)
+                    and version is not None
+                    and not entered
+                    and exc.status_code in {400, 404, 409, 503}
+                ):
+                    raise _DatasetVersionSelectionError(exc.status_code, str(exc.detail)) from exc
                 raise
 
     async def _resolve_dataset(self, request: Request, body: ResolveDatasetRequest) -> ResolveDatasetResponse:
@@ -692,6 +721,8 @@ class BenchmarkServiceApp(FastAPI):
 
         except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
             logger.warning("setup-task websocket disconnected")
+        except _DatasetVersionSelectionError as exc:
+            await _send_dataset_version_error(websocket, exc)
         except Exception as e:
             if self._sentry_enabled:
                 capture_exception(e)
@@ -737,6 +768,8 @@ class BenchmarkServiceApp(FastAPI):
 
         except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
             logger.warning("evaluate-response websocket disconnected")
+        except _DatasetVersionSelectionError as exc:
+            await _send_dataset_version_error(websocket, exc)
         except Exception as e:
             if self._sentry_enabled:
                 capture_exception(e)
@@ -786,6 +819,8 @@ class BenchmarkServiceApp(FastAPI):
 
         except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
             logger.warning("evaluate-instance websocket disconnected")
+        except _DatasetVersionSelectionError as exc:
+            await _send_dataset_version_error(websocket, exc)
         except Exception as e:
             if self._sentry_enabled:
                 capture_exception(e)
@@ -1037,7 +1072,11 @@ class BenchmarkServiceApp(FastAPI):
                 raise HTTPException(status_code=501, detail=str(exc)) from exc
             response = V1DatasetTasksResponse(
                 dataset=dataset,
-                dataset_version=self.service.get_dataset_version(dataset),
+                dataset_version=(
+                    request.state.dataset_version.label
+                    if hasattr(request.state, "dataset_version")
+                    else self.service.get_dataset_version(dataset)
+                ),
                 tasks=tasks,
             )
             if _is_trial_tenant(request.state.tenant):

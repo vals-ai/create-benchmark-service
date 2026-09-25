@@ -71,6 +71,12 @@ Use `HTTPException` to report an unavailable version (404), an incompatible vers
 | Dataset HTTP requests | Send `X-Benchmark-Dataset-Version: v1.0`. Successful responses echo it. The client rejects a missing or different echo. |
 | Dataset WebSocket requests | Send the same header. Before any handler work, the server emits `{"type":"dataset_version","data":{"id":"v1.0","label":"v1.0"}}`. The client consumes it before exposing progress, checkpoints, or results. |
 
+If version selection fails on a pinned WebSocket request, the framework sends `{"type":"dataset_version_error","data":{"status_code":404,"detail":"Dataset version unavailable"}}` before any version acknowledgement. The status identifies invalid or unsupported selection (400), an unavailable version (404), an incompatible version (409), or a temporary storage failure (503). The framework client raises `BenchmarkServiceError` with that `status_code`. It never retries without the pin. Access denial keeps the existing WebSocket policy close.
+
+The task-list response uses the selected version's display label for a pinned request. The acknowledgement and HTTP response header carry the exact ID. `/version?dataset=...` continues to report the service's configured label, which can differ from a saved pin.
+
+Benchmark-owned `error` chunks retain their existing string payload and can be followed by more chunks, including a `result`. The framework client treats an `error` as a failed operation and closes its socket. A service stream that has more work after an error must handle cancellation and finish its cleanup when that client disconnects.
+
 The header covers task verification, retrieval, setup, all evaluation paths, scoring, and `/v1` task listing and upload preparation. `/health` and `/version` remain metadata operations. Resolution rejects a version header; its selector belongs in the body.
 
 IDs contain 1–1,024 visible ASCII characters with no whitespace. Display labels contain up to 256 Unicode characters. Resolution selectors can contain Unicode and spaces, so a service can map a release name to its exact ID. Duplicate headers are rejected. Browser deployments must allow and expose `X-Benchmark-Dataset-Version` in their CORS policy.

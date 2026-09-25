@@ -494,7 +494,7 @@ class BenchmarkServiceApp(FastAPI):
             service_name=self._service_name,
             service_version=self._current_service_version(),
             dataset_version=self.service.get_dataset_version(dataset),
-            dataset_version_pinning=self.service.supports_dataset_version_pinning(dataset or "default"),
+            dataset_version_selection=self.service.supports_dataset_version_selection(dataset or "default"),
             eval_mode=self.service.eval_mode,
         )
 
@@ -505,7 +505,7 @@ class BenchmarkServiceApp(FastAPI):
         if not await self.service.check_dataset_access(tenant, dataset):
             raise HTTPException(status_code=403, detail="Dataset not allowed")
         name = dataset or "default"
-        if not self.service.supports_dataset_version_pinning(name):
+        if not self.service.supports_dataset_version_selection(name):
             if version is not None:
                 raise HTTPException(status_code=400, detail="Dataset version selection is not supported")
             yield None

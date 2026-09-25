@@ -47,7 +47,7 @@ class VersionedBenchmark(StubBenchmark):
     async def check_dataset_access(self, tenant: str, dataset: str | None) -> bool:
         return tenant == "reader" and dataset in (None, "default")
 
-    def supports_dataset_version_pinning(self, dataset: str) -> bool:
+    def supports_dataset_version_selection(self, dataset: str) -> bool:
         return dataset == "default"
 
     def get_dataset_version(self, dataset: str | None = None) -> str | None:
@@ -127,7 +127,7 @@ async def test_pin_survives_default_switch_on_http_and_websocket(
     url, service = running_service
     headers = {"X-Test-Tenant": "reader"}
     async with BenchmarkServiceClient(url, headers) as unpinned:
-        assert (await unpinned.version("default")).dataset_version_pinning
+        assert (await unpinned.version("default")).dataset_version_selection
         first = await unpinned.resolve_dataset("default")
         service.default_version = "v1.1"
         second = await unpinned.resolve_dataset("default")

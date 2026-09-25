@@ -23,8 +23,8 @@ from benchmark_service import BenchmarkServiceClient
 
 async with BenchmarkServiceClient(service_url, headers) as client:
     metadata = await client.version(dataset="validation")
-    if not metadata.dataset_version_pinning:
-        raise RuntimeError("This service cannot pin dataset versions")
+    if not metadata.dataset_version_selection:
+        raise RuntimeError("This service does not support dataset version selection")
     selected = await client.resolve_dataset("validation")
 
 # Save selected.dataset and selected.version with the run before dispatching tasks.
@@ -34,13 +34,13 @@ async with BenchmarkServiceClient(
     tasks = await client.verify_task_ids(None, None, dataset=selected.dataset)
 ```
 
-Pass `version="v1.0"` to `resolve_dataset` to select a fixed release. Omitting it selects the service's configured default. The protocol defines no `latest` alias. A label alone from `/version` does not establish support for pinning.
+Pass `version="v1.0"` to `resolve_dataset` to select a fixed release. Omitting it selects the service's configured default. The protocol defines no `latest` alias. A label alone from `/version` does not establish support for version selection.
 
 Keep the dataset name and service URL with the version ID. IDs belong to that service and dataset; another service may use the same string for different data. A client pin cannot change during its lifetime. Create another client for another version.
 
 ## Implement the service hooks
 
-Override `supports_dataset_version_pinning(dataset)` and `open_dataset_version(dataset, version)`. The latter is an async context manager that yields a `DatasetVersion(id=..., label=...)`. Both model fields are required; `label` can be `None`.
+Override `supports_dataset_version_selection(dataset)` and `open_dataset_version(dataset, version)`. The latter is an async context manager that yields a `DatasetVersion(id=..., label=...)`. Both model fields are required; `label` can be `None`.
 
 The framework checks dataset access before entering this context. The context must select and prepare the data, then keep it available until the operation finishes. Existing task, grading, and scoring methods keep their signatures. They read the selected data through request-local state, such as a `ContextVar` used by `get_dataset()`.
 
@@ -68,7 +68,7 @@ Use `HTTPException` to report an unavailable version (404), an incompatible vers
 
 | Operation | Contract |
 | --- | --- |
-| `GET /version?dataset=validation` | `dataset_version_pinning: true` declares support for that dataset. Existing services report false. |
+| `GET /version?dataset=validation` | `dataset_version_selection: true` declares support for that dataset. Existing services report false. |
 | `POST /resolve-dataset` | Authenticated body: `{"dataset":"validation","version":null}`. Returns `{"dataset":"validation","version":{"id":"v1.0","label":"v1.0"}}`. Trial tenants can resolve datasets they may access. No evaluation quota is consumed. |
 | Dataset HTTP requests | Send `X-Benchmark-Dataset-Version: v1.0`. Successful responses echo it. The client rejects a missing or different echo. |
 | Dataset WebSocket requests | Send the same header. Before benchmark task or grading work, the server emits `{"type":"dataset_version","data":{"id":"v1.0","label":"v1.0"}}`. The client consumes it before exposing progress, checkpoints, or results. |

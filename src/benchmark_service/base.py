@@ -167,7 +167,7 @@ class BenchmarkService(ABC):
             return False
         return (dataset or "default") in entry.datasets
 
-    def supports_dataset_version_pinning(self, dataset: str) -> bool:
+    def supports_dataset_version_selection(self, dataset: str) -> bool:
         """Whether this dataset can honor immutable version IDs on every operation."""
         return False
 

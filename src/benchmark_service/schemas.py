@@ -350,7 +350,7 @@ class VersionResponse(BaseModel):
     service_name: str | None = None
     service_version: str | None = None
     dataset_version: str | None = None
-    dataset_version_pinning: bool = Field(default=False, strict=True)
+    dataset_version_selection: bool = Field(default=False, strict=True)
     eval_mode: EvalMode = EvalMode.TEXT
 
 

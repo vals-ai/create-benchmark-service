@@ -87,7 +87,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 - `check_dataset_access(tenant, dataset)` — return whether a resolved tenant may access a dataset.
 - `get_service_version()` — optional benchmark-owned service version override. If it returns `None`, `/version` falls back to the installed benchmark package version.
 - `get_dataset_version(dataset)` — optional dataset release/version hook. The value is returned on the dataset task-list response after auth and dataset access checks.
-- `supports_dataset_version_pinning(dataset)` and `open_dataset_version(dataset, version)` — optional hooks for keeping requests on one immutable dataset version. See [dataset version pinning](docs/DATASET_VERSIONS.md) for the service contract and client workflow.
+- `supports_dataset_version_selection(dataset)` and `open_dataset_version(dataset, version)` — optional hooks for selecting an immutable dataset version for each request. See [dataset version selection](docs/DATASET_VERSIONS.md) for the service contract and client workflow.
 
 **Dispatch order.** Task order within a dataset is the order the tracker dispatches tasks in (task rows are created in `filter_tasks` order, and `?slice=` slices that same order). Set the `priority_dataset` class attribute (e.g. `priority_dataset = "vals_index"`) to stably move the tasks a dataset shares with that subset to its front, so a run of a full split finishes the index subset before the long tail. `create()` fails if the named dataset is not loaded.
 

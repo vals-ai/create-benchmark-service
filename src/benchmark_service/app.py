@@ -124,13 +124,8 @@ async def _forward_stream(
     disconnects mid-way."""
     async with aclosing(stream) as chunks:
         async for chunk in chunks:
-            terminal = chunk.type == "result"
-            if terminal:
-                websocket.state.benchmark_stream_finished = True
             if not await send_json_if_connected(websocket, chunk.model_dump()):
                 logger.warning("%s websocket disconnected before benchmark service completed", endpoint)
-                return
-            if terminal:
                 return
 
 
@@ -170,32 +165,6 @@ _TRIAL_ALLOWED_PATH = re.compile(r"/v1/(?:evaluate|score|datasets/[^/]+/tasks)")
 
 def _trial_tenant_may_access_path(path: str) -> bool:
     return path == "/resolve-dataset" or _TRIAL_ALLOWED_PATH.fullmatch(path) is not None
-
-
-@asynccontextmanager
-async def _cancel_on_disconnect(connection: Request | WebSocket, enabled: bool) -> AsyncGenerator[None, None]:
-    if not enabled or not isinstance(connection, WebSocket):
-        yield
-        return
-
-    owner = asyncio.current_task()
-    assert owner is not None
-
-    async def watch() -> None:
-        while True:
-            message = await connection.receive()
-            if message["type"] == "websocket.disconnect":
-                if not getattr(connection.state, "benchmark_stream_finished", False):
-                    owner.cancel()
-                return
-
-    watcher = asyncio.create_task(watch())
-    try:
-        yield
-    finally:
-        watcher.cancel()
-        with suppress(asyncio.CancelledError):
-            await watcher
 
 
 def _request_sandbox_provider_config(
@@ -560,35 +529,30 @@ class BenchmarkServiceApp(FastAPI):
                 raise _DatasetVersionSelectionError(400, f"Invalid {DATASET_VERSION_HEADER}") from exc
             raise HTTPException(status_code=400, detail=f"Invalid {DATASET_VERSION_HEADER}") from exc
 
-        async with _cancel_on_disconnect(connection, self.service.supports_dataset_version_pinning(dataset or "default")):
-            entered = False
-            try:
-                async with self._open_dataset(tenant, dataset, version) as resolved:
-                    try:
-                        if version is not None:
-                            if resolved is None or resolved.id != version:
-                                raise HTTPException(status_code=409, detail="The service could not honor the dataset version")
-                            if isinstance(connection, WebSocket):
-                                await connection.send_json(StreamDatasetVersionChunk(data=resolved).model_dump())
-                            else:
-                                connection.state.dataset_version = resolved
-                        entered = True
-                        yield
-                    finally:
-                        if isinstance(connection, WebSocket):
-                            connection.state.benchmark_stream_finished = True
-            except HTTPException as exc:
-                if isinstance(connection, WebSocket) and exc.status_code == 403:
-                    await connection.close(code=1008, reason="Dataset not allowed")
-                    raise WebSocketDisconnect(code=1008) from exc
-                if (
-                    isinstance(connection, WebSocket)
-                    and version is not None
-                    and not entered
-                    and exc.status_code in {400, 404, 409, 503}
-                ):
-                    raise _DatasetVersionSelectionError(exc.status_code, str(exc.detail)) from exc
-                raise
+        entered = False
+        try:
+            async with self._open_dataset(tenant, dataset, version) as resolved:
+                if version is not None:
+                    if resolved is None or resolved.id != version:
+                        raise HTTPException(status_code=409, detail="The service could not honor the dataset version")
+                    if isinstance(connection, WebSocket):
+                        await connection.send_json(StreamDatasetVersionChunk(data=resolved).model_dump())
+                    else:
+                        connection.state.dataset_version = resolved
+                entered = True
+                yield
+        except HTTPException as exc:
+            if isinstance(connection, WebSocket) and exc.status_code == 403:
+                await connection.close(code=1008, reason="Dataset not allowed")
+                raise WebSocketDisconnect(code=1008) from exc
+            if (
+                isinstance(connection, WebSocket)
+                and version is not None
+                and not entered
+                and exc.status_code in {400, 404, 409, 503}
+            ):
+                raise _DatasetVersionSelectionError(exc.status_code, str(exc.detail)) from exc
+            raise
 
     async def _resolve_dataset(self, request: Request, body: ResolveDatasetRequest) -> ResolveDatasetResponse:
         if request.headers.getlist(DATASET_VERSION_HEADER):

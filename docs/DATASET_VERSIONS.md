@@ -1,6 +1,6 @@
-# Keep a run on one dataset version
+# Select a dataset version for a request
 
-A service can change its default dataset while a run is in progress. Resolve the default once, save the returned version ID with the run, and send that ID on every later request. Retries and final scoring must use the saved ID too.
+A service can change its default dataset while a run is in progress. A run owner such as Valkyrie resolves the default once, saves the returned version ID with the run, and sends that ID on every later request. Retries and final scoring use the saved ID too. This framework selects a version for each request; it does not store run state.
 
 This feature is optional. It works with local files, a database, or a separate dataset store. A version ID is an opaque string: the client stores and sends it without interpreting its format.
 
@@ -58,7 +58,9 @@ async def open_dataset_version(self, dataset, version):
 
 This sketch assumes the service has initialized immutable releases and a request-local variable. A service can retain just one release and reject older IDs. It must never substitute its current default for an unavailable requested version.
 
-Do not replace shared `self.datasets` during a request: concurrent requests can select different versions. Keep task order, task contents, grading data, and versioned assets fixed for an ID. If preparation uses a worker thread, cancellation must wait for that worker before releasing its resources. WebSocket disconnection cancels the operation, including preparation.
+Do not replace shared `self.datasets` during a request: concurrent requests can select different versions. Keep task order, task contents, grading data, and versioned assets fixed for an ID. The service or loader owns the version's resources and releases them when its context exits. If preparation uses a worker thread, the service must wait for that worker before releasing resources when cancellation occurs.
+
+The framework exits the version context when a request or stream completes or raises. A WebSocket send failure ends forwarding, but a disconnected client is not detected while preparation or stream work is waiting without sending. Services must bound such work and handle their own cancellation and cleanup.
 
 Use `HTTPException` to report an unavailable version (404), an incompatible version (409), or temporary storage failure (503). Authorization still applies to a pinned request. A pin is not permission to read the data.
 
@@ -69,13 +71,13 @@ Use `HTTPException` to report an unavailable version (404), an incompatible vers
 | `GET /version?dataset=validation` | `dataset_version_pinning: true` declares support for that dataset. Existing services report false. |
 | `POST /resolve-dataset` | Authenticated body: `{"dataset":"validation","version":null}`. Returns `{"dataset":"validation","version":{"id":"v1.0","label":"v1.0"}}`. Trial tenants can resolve datasets they may access. No evaluation quota is consumed. |
 | Dataset HTTP requests | Send `X-Benchmark-Dataset-Version: v1.0`. Successful responses echo it. The client rejects a missing or different echo. |
-| Dataset WebSocket requests | Send the same header. Before any handler work, the server emits `{"type":"dataset_version","data":{"id":"v1.0","label":"v1.0"}}`. The client consumes it before exposing progress, checkpoints, or results. |
+| Dataset WebSocket requests | Send the same header. Before benchmark task or grading work, the server emits `{"type":"dataset_version","data":{"id":"v1.0","label":"v1.0"}}`. The client consumes it before exposing progress, checkpoints, or results. |
 
 If version selection fails on a pinned WebSocket request, the framework sends `{"type":"dataset_version_error","data":{"status_code":404,"detail":"Dataset version unavailable"}}` before any version acknowledgement. The status identifies invalid or unsupported selection (400), an unavailable version (404), an incompatible version (409), or a temporary storage failure (503). The framework client raises `BenchmarkServiceError` with that `status_code`. It never retries without the pin. Access denial keeps the existing WebSocket policy close.
 
 The task-list response uses the selected version's display label for a pinned request. The acknowledgement and HTTP response header carry the exact ID. `/version?dataset=...` continues to report the service's configured label, which can differ from a saved pin.
 
-Benchmark-owned `error` chunks retain their existing string payload and can be followed by more chunks, including a `result`. The framework client treats an `error` as a failed operation and closes its socket. A service stream that has more work after an error must handle cancellation and finish its cleanup when that client disconnects.
+Benchmark-owned `error` chunks retain their existing string payload and can be followed by more chunks, including a `result`. The framework client treats an `error` as a failed operation and closes its socket. The server continues the stream until it completes or a send fails; the service owns any work and cleanup between those events.
 
 The header covers task verification, retrieval, setup, all evaluation paths, scoring, and `/v1` task listing and upload preparation. `/health` and `/version` remain metadata operations. Resolution rejects a version header; its selector belongs in the body.
 

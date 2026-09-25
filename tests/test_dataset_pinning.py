@@ -3,7 +3,6 @@
 import asyncio
 import json
 import socket
-import threading
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -15,7 +14,6 @@ import uvicorn
 import websockets
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from websockets.asyncio.server import serve
 
 from benchmark_service import BenchmarkServiceApp, BenchmarkServiceClient, BenchmarkServiceError, DatasetVersion
@@ -36,18 +34,6 @@ class VersionedBenchmark(StubBenchmark):
         self.selected: ContextVar[str] = ContextVar("selected")
         self.opened: list[str] = []
         self.closed: list[str] = []
-        self.worker_started = threading.Event()
-        self.worker_release = threading.Event()
-        self.worker_finished = threading.Event()
-        self.cancelled = asyncio.Event()
-        self.disconnected = asyncio.Event()
-        self.stream_cleanup_started = asyncio.Event()
-        self.stream_cleanup_release = asyncio.Event()
-        self.stream_cleanup_finished = asyncio.Event()
-        self.stream_cleanup_cancelled = False
-        self.nonfatal_work_started = asyncio.Event()
-        self.nonfatal_work_cancelled = asyncio.Event()
-        self.nonfatal_work_release = asyncio.Event()
         self.concurrent_arrivals = 0
         self.concurrent_ready = asyncio.Event()
         return {
@@ -67,11 +53,6 @@ class VersionedBenchmark(StubBenchmark):
     def get_dataset_version(self, dataset: str | None = None) -> str | None:
         return "Configured current release"
 
-    def _prepare(self) -> None:
-        self.worker_started.set()
-        assert self.worker_release.wait(timeout=10)
-        self.worker_finished.set()
-
     @asynccontextmanager
     async def open_dataset_version(self, dataset: str, version: str | None) -> AsyncGenerator[DatasetVersion, None]:
         selected = "v1.0" if version == "Release α" else version or self.default_version
@@ -79,19 +60,11 @@ class VersionedBenchmark(StubBenchmark):
             raise HTTPException(status_code=409, detail="Dataset version is incompatible")
         if selected == "storage-down":
             raise HTTPException(status_code=503, detail="Dataset storage is temporarily unavailable")
-        if selected not in self.datasets and selected != "blocked":
+        if selected not in self.datasets:
             raise HTTPException(status_code=404, detail="Dataset version unavailable")
         self.opened.append(selected)
         token = self.selected.set(selected)
         try:
-            if selected == "blocked":
-                worker = asyncio.create_task(asyncio.to_thread(self._prepare))
-                try:
-                    await asyncio.shield(worker)
-                except asyncio.CancelledError:
-                    self.cancelled.set()
-                    await worker
-                    raise
             yield DatasetVersion(id=selected, label=f"Display release {selected}")
         finally:
             self.selected.reset(token)
@@ -111,32 +84,12 @@ class VersionedBenchmark(StubBenchmark):
             if self.concurrent_arrivals == 2:
                 self.concurrent_ready.set()
             await asyncio.wait_for(self.concurrent_ready.wait(), timeout=5)
-        try:
-            if request.eval_resume_state and request.eval_resume_state.get("block_after_error"):
-                yield StreamErrorChunk(type="error", data="Recoverable warning")
-                self.nonfatal_work_started.set()
-                try:
-                    await self.nonfatal_work_release.wait()
-                except asyncio.CancelledError:
-                    self.nonfatal_work_cancelled.set()
-                    raise
-            elif request.eval_resume_state and request.eval_resume_state.get("terminal_type") in {"error", "error_then_result"}:
-                yield StreamErrorChunk(type="error", data="Evaluation failed")
-            if not request.eval_resume_state or request.eval_resume_state.get("terminal_type") != "error":
-                yield StreamResultChunk(
-                    type="result", data={"version": self.get_dataset(dataset)[request.task_id]["answer"]}
-                )
-        finally:
-            if request.eval_resume_state and request.eval_resume_state.get("block_cleanup"):
-                self.stream_cleanup_started.set()
-                try:
-                    await self.stream_cleanup_release.wait()
-                    self.stream_cleanup_finished.set()
-                except asyncio.CancelledError:
-                    self.stream_cleanup_cancelled = True
-                    await self.stream_cleanup_release.wait()
-                    self.stream_cleanup_finished.set()
-                    raise
+        if request.eval_resume_state and request.eval_resume_state.get("terminal_type") in {"error", "error_then_result"}:
+            yield StreamErrorChunk(type="error", data="Evaluation failed")
+        if not request.eval_resume_state or request.eval_resume_state.get("terminal_type") != "error":
+            yield StreamResultChunk(
+                type="result", data={"version": self.get_dataset(dataset)[request.task_id]["answer"]}
+            )
 
 
 class LegacyContinuingBenchmark(StubBenchmark):
@@ -147,26 +100,10 @@ class LegacyContinuingBenchmark(StubBenchmark):
         yield StreamResultChunk(type="result", data={"resolved": True})
 
 
-class ObserveDisconnect:
-    def __init__(self, app: ASGIApp, benchmark_app: BenchmarkServiceApp) -> None:
-        self.app = app
-        self.benchmark_app = benchmark_app
-
-    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        async def observed_receive() -> Message:
-            message = await receive()
-            if message["type"] == "websocket.disconnect":
-                cast(VersionedBenchmark, self.benchmark_app.service).disconnected.set()
-            return message
-
-        await self.app(scope, observed_receive, send)
-
-
 @pytest.fixture
 async def running_service(monkeypatch: pytest.MonkeyPatch) -> AsyncGenerator[tuple[str, VersionedBenchmark], None]:
     monkeypatch.setenv("AUTH_DISABLED", "true")
     app = BenchmarkServiceApp(VersionedBenchmark)
-    app.add_middleware(ObserveDisconnect, benchmark_app=app)
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         url = f"http://127.0.0.1:{listener.getsockname()[1]}"
@@ -180,10 +117,6 @@ async def running_service(monkeypatch: pytest.MonkeyPatch) -> AsyncGenerator[tup
                     await asyncio.sleep(0.01)
             yield url, cast(VersionedBenchmark, app.service)
         finally:
-            app_service = cast(VersionedBenchmark, app.service)
-            app_service.worker_release.set()
-            app_service.stream_cleanup_release.set()
-            app_service.nonfatal_work_release.set()
             server.should_exit = True
             await asyncio.wait_for(serving, timeout=10)
 
@@ -267,84 +200,25 @@ def test_trial_resolution_checks_dataset_access_without_grading(monkeypatch: pyt
         assert cast(VersionedBenchmark, app.service).opened == ["v1.0"]
 
 
-async def test_disconnect_waits_for_blocking_preparation(running_service: tuple[str, VersionedBenchmark]) -> None:
-    url, service = running_service
-    async with websockets.connect(
-        url.replace("http", "ws") + "/ws/evaluate-response",
-        additional_headers={"X-Test-Tenant": "reader", DATASET_VERSION_HEADER: "blocked"},
-    ) as ws:
-        await ws.send(json.dumps({"task_id": "task-1", "response": "answer"}))
-        assert await asyncio.to_thread(service.worker_started.wait, 5)
-    await asyncio.wait_for(service.cancelled.wait(), timeout=5)
-    assert not service.closed
-    service.worker_release.set()
-    async with asyncio.timeout(5):
-        while not service.closed:
-            await asyncio.sleep(0.01)
-    assert service.worker_finished.is_set()
-    assert service.closed == ["blocked"]
-
-
-async def test_normal_client_close_does_not_cancel_stream_cleanup(
-    running_service: tuple[str, VersionedBenchmark],
+@pytest.mark.parametrize("terminal_type", ["error_then_result", "error"])
+async def test_raw_websocket_error_keeps_scope_until_stream_finishes(
+    running_service: tuple[str, VersionedBenchmark], terminal_type: str
 ) -> None:
     url, service = running_service
-    async with BenchmarkServiceClient(url, {"X-Test-Tenant": "reader"}, dataset_version="v1.0") as client:
-        state = {"block_cleanup": True}
-        assert await client.resume_evaluation("task-1", state) == {"version": "v1.0"}
-        await asyncio.wait_for(service.stream_cleanup_started.wait(), timeout=5)
-        await asyncio.wait_for(service.disconnected.wait(), timeout=5)
-        service.stream_cleanup_release.set()
-        await asyncio.wait_for(service.stream_cleanup_finished.wait(), timeout=5)
-        assert not service.stream_cleanup_cancelled
-
-
-async def test_client_error_disconnect_cancels_stream_and_service_finishes_cleanup(
-    running_service: tuple[str, VersionedBenchmark],
-) -> None:
-    url, service = running_service
-    async with BenchmarkServiceClient(url, {"X-Test-Tenant": "reader"}, dataset_version="v1.0") as client:
-        with pytest.raises(BenchmarkServiceError, match="Evaluation failed"):
-            await client.resume_evaluation("task-1", {"terminal_type": "error", "block_cleanup": True})
-        await asyncio.wait_for(service.stream_cleanup_started.wait(), timeout=5)
-        await asyncio.wait_for(service.disconnected.wait(), timeout=5)
-        service.stream_cleanup_release.set()
-        await asyncio.wait_for(service.stream_cleanup_finished.wait(), timeout=5)
-        assert service.stream_cleanup_cancelled
-
-
-async def test_raw_websocket_continues_after_error_to_result(running_service: tuple[str, VersionedBenchmark]) -> None:
-    url, _ = running_service
     async with websockets.connect(
         url.replace("http", "ws") + "/ws/evaluate-response",
         additional_headers={"X-Test-Tenant": "reader", DATASET_VERSION_HEADER: "v1.0"},
     ) as ws:
-        await ws.send(json.dumps({"task_id": "task-1", "eval_resume_state": {"terminal_type": "error_then_result"}}))
+        await ws.send(json.dumps({"task_id": "task-1", "eval_resume_state": {"terminal_type": terminal_type}}))
         assert json.loads(await ws.recv()) == {
             "type": "dataset_version",
             "data": {"id": "v1.0", "label": "Display release v1.0"},
         }
         assert json.loads(await ws.recv()) == {"type": "error", "data": "Evaluation failed"}
-        assert json.loads(await ws.recv()) == {"type": "result", "data": {"version": "v1.0"}}
-
-
-async def test_disconnect_after_nonfatal_error_cancels_pending_work(
-    running_service: tuple[str, VersionedBenchmark],
-) -> None:
-    url, service = running_service
-    async with websockets.connect(
-        url.replace("http", "ws") + "/ws/evaluate-response",
-        additional_headers={"X-Test-Tenant": "reader", DATASET_VERSION_HEADER: "v1.0"},
-    ) as ws:
-        await ws.send(json.dumps({"task_id": "task-1", "eval_resume_state": {"block_after_error": True}}))
-        assert json.loads(await ws.recv())["type"] == "dataset_version"
-        assert json.loads(await ws.recv()) == {"type": "error", "data": "Recoverable warning"}
-        await asyncio.wait_for(service.nonfatal_work_started.wait(), timeout=5)
-    await asyncio.wait_for(service.nonfatal_work_cancelled.wait(), timeout=5)
-    async with asyncio.timeout(5):
-        while not service.closed:
-            await asyncio.sleep(0.01)
-    assert service.closed == ["v1.0"]
+        if terminal_type == "error_then_result":
+            assert json.loads(await ws.recv()) == {"type": "result", "data": {"version": "v1.0"}}
+        await asyncio.wait_for(ws.wait_closed(), timeout=5)
+    assert service.opened == service.closed == ["v1.0"]
 
 
 @pytest.mark.parametrize(

@@ -140,6 +140,7 @@ the canonical ID.
 
 Provider compatibility notes:
 
+- `Sandbox.modify_egress_rules(addresses)` applies a non-empty allowlist, `Sandbox.block_all_egress()` denies all outbound access, and `Sandbox.clear_egress_rules()` restores unrestricted access. Deny-all is a separate provider-native operation; do not represent it as `modify_egress_rules([])`. `ComposeSandbox` forwards all three operations to its outer sandbox.
 - `Sandbox.labels` and `Sandbox.created_at` expose provider inventory metadata when available; unsupported metadata is `None`, and creation times are timezone-aware UTC. `SandboxQuery.created_at_lte` is an inclusive creation-time bound. Daytona supports it and always limits listing to the provider's configured target, which may be a Daytona region name or ID. Modal rejects creation-time-bounded listing.
 - Modal supports both `ImageSource` (registry pull) and `SnapshotSource` (a Modal filesystem snapshot created via `Sandbox.snapshot_filesystem()`, restored by image id). `TargetedSnapshotSource` is Daytona-only.
 - Daytona uses `TargetedSnapshotSource(snapshot=..., target=...)` to select the target for admission and creation. Admission uses the snapshot's CPU, memory, disk, and sandbox class with the exact target's organization-usage row; GPU snapshots retain unmetered GPU admission. Its legacy `docker_image` value is intentionally invalid because that field cannot preserve the target.
@@ -327,7 +328,9 @@ result = await client.run_with_sandbox_recovery(
 
 Pydantic models used across requests and responses:
 
-- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `resources`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
+- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
+- **`agent_install_order`** — `"before_setup"` installs agent dependencies before benchmark setup; `"after_setup"` lets setup prepare the environment first. It defaults to `"before_setup"`, so older task responses remain valid; lifecycle execution is the caller's responsibility.
+- **`BenchmarkEgressPlan`** — declarative `setup_task`, agent `run`, and `evaluation` policies. `"*"` is unrestricted, `[]` is deny-all, and a non-empty list is an allowlist. Setup and evaluation default to `"*"`; `run=None` means the benchmark has no run-policy opinion, preserving legacy task behavior. Applying and composing the plan is the caller's responsibility.
 - **`SandboxRecoveryPolicy`** — explicit opt-in to recreate a lost generation sandbox with the same run identity and volumes; `max_sandbox_attempts` (2–20, inclusive) includes the initial sandbox
 - **`SandboxSource`** — `ImageSource`, `SnapshotSource`, top-level Daytona-only `TargetedSnapshotSource`, or `ComposeSource` with an outer image/snapshot
 - **`EvalSandboxSpec`** — grading overrides whose optional `source` is an image or snapshot, never `ComposeSource`

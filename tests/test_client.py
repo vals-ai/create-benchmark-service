@@ -183,6 +183,23 @@ async def test_retrieve_task_accepts_explicit_agent_install_order(
     assert result.agent_install_order == "after_setup"
 
 
+async def test_retrieve_task_accepts_explicit_egress_policies(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    payload = _task_response().model_dump(mode="json")
+    payload["egress"] = {
+        "setup_task": [],
+        "run": ["api.openai.com"],
+        "evaluation": [],
+    }
+    mock_http.get = AsyncMock(return_value=_mock_response(json_data=payload))
+
+    result = await client.retrieve_task("task-1")
+
+    assert result.egress.model_dump() == payload["egress"]
+
+
 def test_retrieve_task_rejects_invalid_agent_install_order() -> None:
     payload = _task_response().model_dump(exclude={"docker_image"})
     payload["agent_install_order"] = "during_setup"

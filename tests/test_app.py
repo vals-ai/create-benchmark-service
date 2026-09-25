@@ -21,7 +21,7 @@ from benchmark_service.sandbox.types import (
     SandboxProvider,
     SandboxQuery,
 )
-from benchmark_service.schemas import RetrieveTaskResponse, StreamResultChunk
+from benchmark_service.schemas import BenchmarkEgressPlan, RetrieveTaskResponse, StreamResultChunk
 from tests.conftest import StubBenchmark
 
 
@@ -143,6 +143,37 @@ def test_retrieve_task_explicit_agent_install_order(monkeypatch: pytest.MonkeyPa
 
     assert response.status_code == 200
     assert response.json()["agent_install_order"] == "after_setup"
+
+
+def test_retrieve_task_explicit_egress_policies(monkeypatch: pytest.MonkeyPatch) -> None:
+    class RestrictedBenchmark(StubBenchmark):
+        async def retrieve_task(
+            self,
+            task_id: str,
+            skip_validation: bool = False,
+            dataset: str | None = None,
+        ) -> RetrieveTaskResponse:
+            response = await super().retrieve_task(task_id, skip_validation, dataset)
+            return response.model_copy(
+                update={
+                    "egress": BenchmarkEgressPlan(
+                        setup_task=[],
+                        run=["api.openai.com"],
+                        evaluation=[],
+                    )
+                }
+            )
+
+    monkeypatch.setenv("AUTH_DISABLED", "true")
+    with TestClient(BenchmarkServiceApp(RestrictedBenchmark)) as client:
+        response = client.get("/retrieve-task/", params={"task_id": "task-1"})
+
+    assert response.status_code == 200
+    assert response.json()["egress"] == {
+        "setup_task": [],
+        "run": ["api.openai.com"],
+        "evaluation": [],
+    }
 
 
 def test_retrieve_task_invalid(client: TestClient) -> None:

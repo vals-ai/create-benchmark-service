@@ -428,7 +428,7 @@ def test_v1_rejects_boolean_auth_override_when_auth_is_required(monkeypatch: pyt
         response = client.post("/v1/score", json={"run_id": "r", "evaluation_results": {}})
 
     assert response.status_code == 403
-    assert "authenticated tenant" in response.json()["detail"].lower()
+    assert "descope authentication" in response.json()["detail"].lower()
 
 
 def test_v1_task_allows_benchmark_specific_extras() -> None:

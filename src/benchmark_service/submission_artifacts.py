@@ -1,7 +1,5 @@
 """Submission artifact object-storage helpers."""
 
-from __future__ import annotations
-
 import os
 import re
 import tempfile
@@ -206,10 +204,8 @@ def _raise_for_artifact_error(exc: ClientError, key: str) -> None:
 def _stat_sync(key: str, tenant: str) -> SubmissionArtifactReference:
     _require_tenant_key(key, tenant)
     bucket = _artifact_bucket()
-    client = _s3_client()
-
     try:
-        response = client.head_object(Bucket=bucket, Key=key)
+        response = _s3_client().head_object(Bucket=bucket, Key=key)
     except ClientError as exc:
         _raise_for_artifact_error(exc, key)
         raise
@@ -224,10 +220,8 @@ def _download_sync(reference: SubmissionArtifactReference, tenant: str) -> bytes
     _require_size_within_limit(reference.size_bytes, reference.key, limit)
     _require_etag(reference.etag, reference.key)
     bucket = _artifact_bucket()
-    client = _s3_client()
-
     try:
-        response = client.get_object(Bucket=bucket, Key=reference.key, IfMatch=reference.etag)
+        response = _s3_client().get_object(Bucket=bucket, Key=reference.key, IfMatch=reference.etag)
     except ClientError as exc:
         _raise_for_artifact_error(exc, reference.key)
         raise
@@ -249,10 +243,8 @@ def _materialize_sync(
     _require_size_within_limit(reference.size_bytes, reference.key, limit)
     _require_etag(reference.etag, reference.key)
     bucket = _artifact_bucket()
-    client = _s3_client()
-
     try:
-        response = client.get_object(Bucket=bucket, Key=reference.key, IfMatch=reference.etag)
+        response = _s3_client().get_object(Bucket=bucket, Key=reference.key, IfMatch=reference.etag)
     except ClientError as exc:
         _raise_for_artifact_error(exc, reference.key)
         raise

@@ -3,10 +3,7 @@
 from collections.abc import AsyncGenerator
 from typing import Any
 
-from benchmark_service import ImageSource, Resources, Sandbox
-{% if template == "vals-ai" %}from .vals_ai import ValsBenchmarkService
-{% else %}from benchmark_service import BenchmarkService
-{% endif %}
+from benchmark_service import {% if template == "default" %}BenchmarkService, {% endif %}ImageSource, Resources, Sandbox
 from benchmark_service.schemas import (
     EvaluateResponseRequest,
     FinalScoreResult,
@@ -16,7 +13,9 @@ from benchmark_service.schemas import (
     StreamMessageChunk,
     StreamResultChunk,
 )
-from benchmark_service.v1_schemas import V1Task
+from benchmark_service.v1_schemas import V1Task{% if template == "vals-ai" %}
+
+from .vals_ai import ValsBenchmarkService{% endif %}
 
 
 class ExampleBenchmark({% if template == "vals-ai" %}ValsBenchmarkService{% else %}BenchmarkService{% endif %}):

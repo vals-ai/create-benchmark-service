@@ -15,7 +15,6 @@ from templates.vals_ai.auth import (
     UNAUTHENTICATED_TENANT_SENTINEL,
     clear_allowlist_cache,
     clear_auth_cache,
-    require_supported_auth_config,
     resolve_caller_tenant,
     resolve_descope_tenant,
 )
@@ -41,6 +40,7 @@ def _allowlist_env(payload: dict[str, Any]) -> str:
 @pytest.fixture
 def descope_env(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("AUTH_DISABLED", raising=False)
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
     monkeypatch.setenv(
         "DESCOPE_TENANT_ALLOWLIST_JSON",
@@ -118,36 +118,53 @@ async def test_resolve_caller_tenant_rejects_static_bearer_key(
 ) -> None:
     monkeypatch.delenv("AUTH_DISABLED", raising=False)
     monkeypatch.setenv("BENCHMARK_API_KEY", "secret123")
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
     tenant = await resolve_caller_tenant({"authorization": "Bearer secret123"})
     assert tenant is None
 
 
-async def test_resolve_caller_tenant_returns_sentinel_when_auth_disabled(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("auth_required", [None, "false"])
+async def test_resolve_caller_tenant_returns_sentinel_when_auth_not_required(
+    monkeypatch: pytest.MonkeyPatch, auth_required: str | None,
 ) -> None:
-    monkeypatch.setenv("AUTH_DISABLED", "true")
+    if auth_required is None:
+        monkeypatch.delenv("AUTH_REQUIRED", raising=False)
+    else:
+        monkeypatch.setenv("AUTH_REQUIRED", auth_required)
     tenant = await resolve_caller_tenant({})
     assert tenant == UNAUTHENTICATED_TENANT_SENTINEL
 
 
-def test_require_supported_auth_config_rejects_auth_required_false(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("AUTH_REQUIRED", "false")
-
-    with pytest.raises(RuntimeError, match="no longer supported"):
-        require_supported_auth_config()
-
-
-def test_require_supported_auth_config_allows_descope_deploys(
+async def test_auth_disabled_does_not_override_auth_required(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setenv("AUTH_REQUIRED", "true")
-    require_supported_auth_config()
+    monkeypatch.setenv("AUTH_DISABLED", "true")
+    monkeypatch.delenv("DESCOPE_PROJECT_ID", raising=False)
+    assert await resolve_caller_tenant({}) is None
 
+
+@pytest.mark.parametrize("policy_source", ["allowlist", "catalog"])
+def test_local_tenant_never_loads_hosted_policy(monkeypatch: pytest.MonkeyPatch, policy_source: str) -> None:
+    """Local requests bypass policy lookup even when hosted settings are present.
+
+    Test cases:
+    - Malformed allowlist JSON is not loaded for the reserved local tenant.
+    - A configured catalog is not contacted for the reserved local tenant.
+    """
     monkeypatch.delenv("AUTH_REQUIRED", raising=False)
-    require_supported_auth_config()
+    monkeypatch.setenv("DESCOPE_TENANT_ALLOWLIST_JSON", "invalid JSON")
+    monkeypatch.delenv("BENCHMARK_CATALOG_API_URL", raising=False)
+    if policy_source == "catalog":
+        monkeypatch.setenv("BENCHMARK_CATALOG_API_URL", "https://catalog.invalid")
+        monkeypatch.setenv("SERVICE_NAME", "local-benchmark")
+
+    def unexpected_catalog_lookup() -> None:
+        raise AssertionError("local request consulted the catalog")
+
+    monkeypatch.setattr(auth_module, "_get_catalog_client", unexpected_catalog_lookup)
+    assert auth_module.get_tenant_config(UNAUTHENTICATED_TENANT_SENTINEL) is None
 
 
 class _BareBenchmark(ValsBenchmarkService):

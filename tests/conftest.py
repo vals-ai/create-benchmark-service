@@ -106,7 +106,7 @@ async def service() -> StubBenchmark:
 @pytest.fixture
 def client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
     """A TestClient for tests about endpoint behavior rather than authentication."""
-    monkeypatch.setenv("AUTH_DISABLED", "true")
+    monkeypatch.delenv("AUTH_REQUIRED", raising=False)
     with TestClient(BenchmarkServiceApp(StubBenchmark)) as c:
         yield c
 

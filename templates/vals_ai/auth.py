@@ -18,7 +18,7 @@ from cachetools import TTLCache
 from descope.descope_client import DescopeClient
 from pydantic import BaseModel, ConfigDict, Field
 
-from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL
+from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_required
 
 from .allowlist import (
     ALLOWLIST_CACHE_MAX_SIZE,
@@ -46,8 +46,6 @@ logger = logging.getLogger(__name__)
 
 DEFAULT_AUTH_CACHE_TTL_SECONDS = 3600
 AUTH_CACHE_MAX_SIZE = ALLOWLIST_CACHE_MAX_SIZE
-AUTH_DISABLED_ENV = "AUTH_DISABLED"
-_REMOVED_AUTH_REQUIRED_ENV = "AUTH_REQUIRED"
 
 
 _DESCOPE_ALLOWLIST_JSON_ENV = "DESCOPE_TENANT_ALLOWLIST_JSON"
@@ -192,6 +190,8 @@ def load_allowlist() -> AllowlistConfig:
 
 def get_tenant_config(tenant: str) -> TenantConfig | None:
     """Return the TenantConfig for `tenant`, or None if not allowlisted."""
+    if tenant == UNAUTHENTICATED_TENANT_SENTINEL:
+        return None
     request_config = _request_tenant_config.get()
     if request_config is not None and request_config[0] == tenant:
         return request_config[1]
@@ -223,35 +223,12 @@ class AuthSettings:
     descope_project_id: str
 
 
-def _env_bool(name: str, default: bool = False) -> bool:
-    value = os.environ.get(name)
-    if value is None:
-        return default
-    return value.lower() in {"1", "true", "yes", "on"}
-
-
 def get_auth_settings() -> AuthSettings:
     """Load auth settings from the current process environment."""
     return AuthSettings(
-        auth_disabled=_env_bool(AUTH_DISABLED_ENV),
+        auth_disabled=not is_auth_required(),
         descope_project_id=os.environ.get("DESCOPE_PROJECT_ID", ""),
     )
-
-
-def require_supported_auth_config() -> None:
-    """Fail startup for deploys still configured for the removed bearer auth mode."""
-    value = os.environ.get(_REMOVED_AUTH_REQUIRED_ENV)
-    if value is not None and not _env_bool(_REMOVED_AUTH_REQUIRED_ENV):
-        raise RuntimeError(
-            f"{_REMOVED_AUTH_REQUIRED_ENV}={value!r} is no longer supported: static bearer "
-            "auth was removed. Configure Descope (DESCOPE_PROJECT_ID plus a tenant "
-            f"allowlist), or set {AUTH_DISABLED_ENV}=true for local development."
-        )
-    if _env_bool(AUTH_DISABLED_ENV):
-        logger.warning(
-            "%s=true: every request is served without a credential. Local development only.",
-            AUTH_DISABLED_ENV,
-        )
 
 
 def clear_auth_cache() -> None:

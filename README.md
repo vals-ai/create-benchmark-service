@@ -104,7 +104,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 - `validate_task_ids(task_ids, dataset)` — raise `ValueError` if any ID is not in the dataset
 - `list_tasks(dataset)` — return `list[V1Task]` (id, question, timeout) for the Vals app's `GET /v1/datasets/{dataset}/tasks` endpoint. Must be overridden before exposing task listing; the base implementation fails closed to avoid leaking evaluator-only data.
 - `check_auth(headers)` — boolean auth hook. Override for custom auth that does not need tenant or dataset awareness.
-- `resolve_tenant(headers)` — validate request authorization and return a tenant ID, `"_unauthenticated"` for boolean auth or local development, or `None` to reject.
+- `resolve_tenant(headers)` — validate request authorization and return a tenant ID, `"unauthenticated"` for boolean auth or local development, or `None` to reject.
 - `check_dataset_access(tenant, dataset)` — return whether a resolved tenant may access a dataset.
 - `get_service_version()` — optional benchmark-owned service version override. If it returns `None`, `/version` falls back to the installed benchmark package version.
 - `get_dataset_version(dataset)` — optional dataset release/version hook. The value is returned on the dataset task-list response after auth and dataset access checks.
@@ -199,7 +199,7 @@ Benchmarks that grade an uploaded file inside the service process declare
 `eval_mode = EvalMode.IN_PROCESS_ARTIFACT`, declare only the artifact schema
 IDs they accept, and implement
 `evaluate_artifact(task_id, schema_id, artifact, dataset)`. The framework
-validates the authenticated tenant, dataset, task, schema, and upload key,
+validates the tenant, dataset, task, schema, and upload key,
 captures the artifact's size and ETag, and downloads that admitted version
 before invoking benchmark code. The hook receives bytes and never receives an
 object key, bucket, or tenant credential.
@@ -294,7 +294,7 @@ Response:
 
 The service role needs `s3:PutObject` and `s3:GetObject` on `arn:aws:s3:::BUCKET/submission-artifacts/*`, plus `s3:ListBucket` on `arn:aws:s3:::BUCKET` limited to the `submission-artifacts/*` namespace in the deployment policy. The list permission is part of the missing-object contract: [S3 returns 404 for a missing object only when the caller has `s3:ListBucket`](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html#API_HeadObject_Permissions); without it S3 returns 403, which the framework leaves as a permission failure rather than misreporting the object as missing.
 
-**Auth.** The Vals `/v1/*` routes require Descope authentication and tenant/dataset allowlists. Requests using `AUTH_DISABLED=true` or a boolean `check_auth()` override resolve to the `_unauthenticated` sentinel and get 403.
+**Auth.** The Vals `/v1/*` routes work without credentials by default. Set `AUTH_REQUIRED=true` to require Descope authentication and tenant/dataset allowlists. In that mode, a boolean `check_auth()` override cannot grant `/v1/*` access without a tenant identity.
 
 **`GET /v1/datasets/{dataset}/tasks`** — return the dataset's task list. Uses the same tenant authentication and `check_dataset_access()` gate as the rest of `/v1/*`. Response:
 
@@ -309,7 +309,7 @@ The service role needs `s3:PutObject` and `s3:GetObject` on `arn:aws:s3:::BUCKET
 }
 ```
 
-Status codes: 403 if the tenant isn't allowed the dataset or the caller has no tenant identity; 404 if access is allowed but the service's `load_datasets()` doesn't load the dataset; 501 if the benchmark has not implemented `list_tasks`. The base `BenchmarkService.list_tasks` does not infer a public task shape from internal task objects because those objects often include evaluator-only data (`answer`, `checks`, rubrics, grader config). Benchmarks must explicitly map their loaded tasks to `V1Task(id, question, timeout, ...)`. `V1Task` allows benchmark-specific extras, so benchmarks that need to surface additional per-task fields (e.g. SWE-bench's `repo`/`base_commit`) can include them when constructing the `V1Task` — document them in your benchmark's README and validate on the runner side with a typed `Task` subclass.
+Status codes: 403 when authentication is required but the caller lacks an allowed tenant identity for the dataset; 404 if access is allowed but the service's `load_datasets()` doesn't load the dataset; 501 if the benchmark has not implemented `list_tasks`. The base `BenchmarkService.list_tasks` does not infer a public task shape from internal task objects because those objects often include evaluator-only data (`answer`, `checks`, rubrics, grader config). Benchmarks must explicitly map their loaded tasks to `V1Task(id, question, timeout, ...)`. `V1Task` allows benchmark-specific extras, so benchmarks that need to surface additional per-task fields (e.g. SWE-bench's `repo`/`base_commit`) can include them when constructing the `V1Task` — document them in your benchmark's README and validate on the runner side with a typed `Task` subclass.
 
 **Trial mode (Vals template only).** A tenant with `trial_mode: true` in its allowlist entry receives score-only responses on `/v1/evaluate` and `/v1/score`. Benchmarks enabling trial mode must implement `project_trial_result(result)` to return the audited per-task fields trial callers may see and resubmit to `/v1/score`; include any field `calculate_final_score` needs for aggregation. The Vals layer removes `evaluator_version` and error text from `/v1/evaluate` (the error *count* survives as generic `"error"` entries), and `/v1/score` `metadata` is emptied while `final_score` and `tasks_evaluated` remain. The sanitizer builds fresh response objects from allowlisted fields, so fields added later do not leak to trial callers by default. Unhandled server errors return a generic `{"detail": "Internal server error"}` 500 (no traceback) for every caller, not just trial tenants. Trial tenants may access only `/v1/evaluate`, `/v1/score`, and `GET /v1/datasets/{dataset}/tasks`; other `/v1/*`, internal `/evaluate-response/`, `/final-score/`, and `/ws/*` endpoints are denied (403). For trial tenants, the dataset task list is projected to `id`, `question`, and `timeout` even if the benchmark's normal `V1Task` includes extras.
 
@@ -371,11 +371,11 @@ For process-scoped credentials, call `sandbox.command(..., env_vars={...})`. Pro
 
 ### Authentication
 
-The framework authenticates every HTTP request except `/health`, and every WebSocket route before sandbox provider config is used.
+Both templates disable authentication unless `AUTH_REQUIRED=true`. Local routes, including the Vals `/v1/*` routes, work without credentials. Hosted registry deployments set `AUTH_REQUIRED=true`; the framework then authenticates every HTTP request except `/health` and `/version`, and every WebSocket route. `AUTH_DISABLED` is no longer supported and cannot override `AUTH_REQUIRED=true`.
 
-Services generated with `--template vals-ai` use `ValsBenchmarkService` and `ValsBenchmarkServiceApp`, which inherit the shared framework classes. Set `DESCOPE_PROJECT_ID` and a tenant + dataset allowlist. Requests must include a valid Descope access key in `X-Descope-Api-Key`. The key must be scoped to exactly one Descope tenant, and that tenant must appear in the service allowlist. Leave `AUTH_DISABLED` unset for hosted services.
+Services generated with `--template vals-ai` use `ValsBenchmarkService` and `ValsBenchmarkServiceApp`, which inherit the shared framework classes. With `AUTH_REQUIRED=true`, set `DESCOPE_PROJECT_ID` and a tenant + dataset allowlist. Requests must include a valid Descope access key in `X-Descope-Api-Key`. The key must be scoped to exactly one Descope tenant, and that tenant must appear in the service allowlist. Catalog access, quotas, and trial restrictions apply only when authentication is required.
 
-The allowlist is loaded in this order:
+When authentication is required, the allowlist is loaded in this order:
 
 1. `BENCHMARK_CATALOG_API_URL` plus `SERVICE_NAME` — the service-specific catalog API fetches the authenticated tenant policy. The Vals layer caches positive policies for 300 seconds, refreshes an unknown tenant immediately, and fails closed when the API is unavailable or returns invalid data.
 2. `DESCOPE_TENANT_ALLOWLIST_JSON` — JSON payload retained during the staged production rollout.
@@ -410,7 +410,7 @@ tenants:
       - test
 ```
 
-Malformed configured allowlists raise at app startup. Unknown tenants receive `401 Unauthorized`. Known tenants requesting a dataset outside their allowlist receive `403 Dataset not allowed`; WebSocket routes close with code `1008`. The tenant ID `"_unauthenticated"` is reserved for boolean auth and local development and is rejected as a Descope tenant.
+When authentication is required, malformed configured allowlists raise at app startup. Unknown tenants receive `401 Unauthorized`. Known tenants requesting a dataset outside their allowlist receive `403 Dataset not allowed`; WebSocket routes close with code `1008`. The tenant ID `"unauthenticated"` is reserved for boolean auth and local development and is rejected as a Descope tenant.
 
 **Evaluation quotas.** Add `evaluation_quota` to a tenant entry to cap that tenant's evaluation requests. Set `period` to `day`, `week`, `month`, or `year`. Periods use UTC calendar boundaries: days start at 00:00, weeks start Monday at 00:00, months start on the first day at 00:00, and years start January 1 at 00:00. Changing a tenant's period selects a separate counter namespace. `POST /v1/evaluate`, `POST /evaluate-response/`, `/ws/evaluate-response`, and `/ws/evaluate-instance` consume the same quota; task setup, task retrieval, and score aggregation do not. Authentication, request parsing, dataset authorization, and payload compatibility checks happen before the request is counted. Duplicate and immediate-capacity checks for admitted grading requests also happen first. Accepted requests then consume quota before waiting for an active grading slot or accessing submission storage. Once counted, a request still consumes quota if evaluation or another later step fails.
 
@@ -420,7 +420,7 @@ Counter updates are atomic across service processes and are not retried because 
 
 After the configured limit is reached, HTTP routes return 429 with `Retry-After` and WebSocket routes close with code `1008`. Missing counter configuration fails service startup instead of silently disabling enforcement.
 
-The default template rejects requests until you implement authentication. Set `AUTH_DISABLED=true` only for local development. The default app has no `/v1/*` routes.
+With `AUTH_REQUIRED=true`, the default template rejects requests until you implement authentication. The default app has no `/v1/*` routes.
 
 Override `check_auth()` in your `BenchmarkService` subclass for boolean authentication on the internal HTTP and WebSocket routes:
 

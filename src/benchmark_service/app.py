@@ -15,6 +15,7 @@ from uvicorn.protocols.utils import ClientDisconnected
 from websockets.exceptions import ConnectionClosed
 
 from benchmark_service._version import __version__ as _framework_version
+from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_required
 from benchmark_service.base import BenchmarkService
 from benchmark_service.context import sandbox_provider_scope
 from benchmark_service.observability import (
@@ -144,7 +145,9 @@ class BenchmarkServiceApp(FastAPI):
             try:
                 if request.url.path in _PUBLIC_PATHS:
                     return await call_next(request)  # type: ignore[reportUnknownVariableType]
-                tenant = await self.service.resolve_tenant(dict(request.headers))
+                tenant = UNAUTHENTICATED_TENANT_SENTINEL
+                if is_auth_required():
+                    tenant = await self.service.resolve_tenant(dict(request.headers))
                 if tenant is None:
                     return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
                 request.state.tenant = tenant
@@ -198,7 +201,9 @@ class BenchmarkServiceApp(FastAPI):
         """Authenticate a WebSocket caller. Returns tenant id, or None after closing 1008."""
         self.clear_request_context()
         self._bind_service_context(self._current_service_version())
-        tenant = await self.service.resolve_tenant(dict(websocket.headers))
+        tenant = UNAUTHENTICATED_TENANT_SENTINEL
+        if is_auth_required():
+            tenant = await self.service.resolve_tenant(dict(websocket.headers))
         if tenant is None:
             await websocket.close(code=1008, reason="Unauthorized")
             return None

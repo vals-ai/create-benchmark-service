@@ -10,6 +10,7 @@ from fastapi.testclient import TestClient
 
 from templates.vals_ai import auth as auth_module
 from benchmark_service import submission_artifacts
+from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL
 from templates.vals_ai.app import ValsBenchmarkServiceApp
 from templates.vals_ai.auth import clear_allowlist_cache, clear_auth_cache
 from tests.conftest import ValsStubBenchmark as StubBenchmark
@@ -38,6 +39,7 @@ def _descope_client(
 ) -> Generator[TestClient, None, None]:
     clear_allowlist_cache()
     clear_auth_cache()
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
     monkeypatch.setenv(
         "DESCOPE_TENANT_ALLOWLIST_JSON",
@@ -175,12 +177,12 @@ def test_upload_url_requires_auth(descope_client: TestClient) -> None:
     assert resp.status_code == 401
 
 
-def test_upload_url_is_denied_when_auth_is_disabled(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Artifact keys are namespaced by tenant, which AUTH_DISABLED=true has none of."""
+def test_upload_url_uses_reserved_local_namespace_without_auth(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Local uploads use a key-safe namespace that cannot be a hosted Descope tenant."""
     clear_allowlist_cache()
     clear_auth_cache()
     monkeypatch.delenv("DESCOPE_PROJECT_ID", raising=False)
-    monkeypatch.setenv("AUTH_DISABLED", "true")
+    monkeypatch.delenv("AUTH_REQUIRED", raising=False)
     _install_signed_url_stub(monkeypatch)
 
     with TestClient(ValsBenchmarkServiceApp(StubBenchmark)) as client:
@@ -188,4 +190,13 @@ def test_upload_url_is_denied_when_auth_is_disabled(monkeypatch: pytest.MonkeyPa
             "/v1/submissions/upload-url",
             json={"run_id": "run-1", "task_id": "task-1", "dataset": "default", "filename": "submission.xlsx"},
         )
-    assert resp.status_code == 403
+    assert resp.status_code == 200
+    key = resp.json()["key"]
+    assert key == "submission-artifacts/unauthenticated/default/run-1/task-1/submission.xlsx"
+    submission_artifacts.validate_submission_key(
+        key,
+        tenant=UNAUTHENTICATED_TENANT_SENTINEL,
+        dataset="default",
+        run_id="run-1",
+        task_id="task-1",
+    )

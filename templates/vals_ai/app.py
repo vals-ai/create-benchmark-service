@@ -14,7 +14,7 @@ from fastapi.encoders import jsonable_encoder
 
 from benchmark_service import submission_artifacts
 from benchmark_service.app import BenchmarkServiceApp
-from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL
+from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_required
 from benchmark_service.grading import SUBMISSION_ARTIFACT_SANDBOX_PATH, collapse_stream, evaluate_submission
 from benchmark_service.observability import bind_request_context
 from benchmark_service.inflight import InflightMiddleware
@@ -45,7 +45,6 @@ from .auth import (
     close_catalog_client,
     get_tenant_config,
     load_allowlist,
-    require_supported_auth_config,
 )
 from .base import ValsBenchmarkService
 from .trial import sanitize_v1_dataset_tasks_response, sanitize_v1_eval_response, sanitize_v1_score_response
@@ -62,8 +61,8 @@ def _is_trial_tenant(tenant: str) -> bool:
 
 
 def _require_authenticated_tenant(tenant: str | None) -> None:
-    """Raise 403 when the request has no authenticated tenant identity."""
-    if tenant == UNAUTHENTICATED_TENANT_SENTINEL:
+    """Require a tenant identity when hosted authentication is enabled."""
+    if is_auth_required() and tenant == UNAUTHENTICATED_TENANT_SENTINEL:
         raise HTTPException(
             status_code=403,
             detail="The /v1/ surface requires an authenticated tenant.",
@@ -246,13 +245,13 @@ class ValsBenchmarkServiceApp(BenchmarkServiceApp):
     @asynccontextmanager
     async def service_lifespan(self) -> AsyncGenerator[None, None]:
         try:
-            require_supported_auth_config()
-            allowlist = load_allowlist()
-            if not os.getenv("BENCHMARK_CATALOG_API_URL", "").strip():
-                evaluation_quota.require_configured(
-                    allowlist,
-                    service_name=os.getenv(evaluation_quota.SERVICE_NAME_ENV, "").strip(),
-                )
+            if is_auth_required():
+                allowlist = load_allowlist()
+                if not os.getenv("BENCHMARK_CATALOG_API_URL", "").strip():
+                    evaluation_quota.require_configured(
+                        allowlist,
+                        service_name=os.getenv(evaluation_quota.SERVICE_NAME_ENV, "").strip(),
+                    )
             submission_artifacts.require_configured()
             if not submission_artifacts.is_configured():
                 logger.warning(

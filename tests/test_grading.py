@@ -1073,6 +1073,7 @@ def test_grading_provider_config_does_not_render_present_modal_secret(
 def _sandbox_app(monkeypatch: pytest.MonkeyPatch, service_cls: type[StubBenchmark] = SandboxStub) -> ValsBenchmarkServiceApp:
     clear_allowlist_cache()
     clear_auth_cache()
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
     monkeypatch.setenv(
         "DESCOPE_TENANT_ALLOWLIST_JSON",
@@ -1148,6 +1149,7 @@ def test_sandbox_mode_missing_server_sandbox_env_fails_at_boot(
     not 503 (or burn a sandbox) on the first lab call."""
     clear_allowlist_cache()
     clear_auth_cache()
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
     monkeypatch.setenv(
         "DESCOPE_TENANT_ALLOWLIST_JSON",
@@ -1730,7 +1732,7 @@ def test_ws_evaluate_response_stays_sandboxless_for_sandbox_benchmarks(monkeypat
     service-owned in-process evaluation and never provision sandboxes."""
     clear_allowlist_cache()
     clear_auth_cache()
-    monkeypatch.setenv("AUTH_DISABLED", "true")
+    monkeypatch.delenv("AUTH_REQUIRED", raising=False)
     monkeypatch.setenv("SUBMISSION_ARTIFACT_BUCKET", "vals-submission-artifacts")
     monkeypatch.setenv("AWS_REGION", "us-east-1")
     _FakeDaytonaConfig.provider = FakeProvider(FakeSandbox())

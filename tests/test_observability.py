@@ -136,7 +136,7 @@ def configured_sentry(monkeypatch: pytest.MonkeyPatch) -> Iterator[_CaptureTrans
         kwargs["disabled_integrations"] = [StdlibIntegration]
         return real_init(*args, **kwargs)
 
-    monkeypatch.setenv("AUTH_DISABLED", "true")
+    monkeypatch.delenv("AUTH_REQUIRED", raising=False)
     monkeypatch.setenv("SERVICE_NAME", "swebench")
     monkeypatch.setenv("SENTRY_DSN", "https://public@example.com/1")
     monkeypatch.setenv("SENTRY_ENVIRONMENT", "dev")
@@ -192,7 +192,7 @@ def otel_tracer(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[trace.Tracer,
 
 def test_app_without_sentry_dsn_preserves_health(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("SENTRY_DSN", raising=False)
-    monkeypatch.setenv("AUTH_DISABLED", "true")
+    monkeypatch.delenv("AUTH_REQUIRED", raising=False)
     init = Mock()
     monkeypatch.setattr(observability.sentry_sdk, "init", init)
 

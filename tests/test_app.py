@@ -138,7 +138,7 @@ def test_retrieve_task_explicit_agent_install_order(monkeypatch: pytest.MonkeyPa
             response = await super().retrieve_task(task_id, skip_validation, dataset)
             return response.model_copy(update={"agent_install_order": "after_setup"})
 
-    monkeypatch.setenv("AUTH_DISABLED", "true")
+    monkeypatch.delenv("AUTH_REQUIRED", raising=False)
     with TestClient(BenchmarkServiceApp(AfterSetupBenchmark)) as client:
         response = client.get("/retrieve-task/", params={"task_id": "task-1"})
 
@@ -165,7 +165,7 @@ def test_retrieve_task_explicit_egress_policies(monkeypatch: pytest.MonkeyPatch)
                 }
             )
 
-    monkeypatch.setenv("AUTH_DISABLED", "true")
+    monkeypatch.delenv("AUTH_REQUIRED", raising=False)
     with TestClient(BenchmarkServiceApp(RestrictedBenchmark)) as client:
         response = client.get("/retrieve-task/", params={"task_id": "task-1"})
 
@@ -210,7 +210,7 @@ def test_evaluate_response(
 def test_evaluate_response_invalid_task(monkeypatch: pytest.MonkeyPatch) -> None:
     # raise_server_exceptions=False so we observe the handler's 500 response rather than
     # ServerErrorMiddleware re-raising the underlying error into the test.
-    monkeypatch.setenv("AUTH_DISABLED", "true")
+    monkeypatch.delenv("AUTH_REQUIRED", raising=False)
     with TestClient(BenchmarkServiceApp(StubBenchmark), raise_server_exceptions=False) as c:
         response = c.post("/evaluate-response/", json={"task_id": "nonexistent", "response": "2"})
     assert response.status_code == 500
@@ -317,7 +317,7 @@ def test_websocket_setup_task_resolves_sandbox_provider(
 
     monkeypatch.setattr(DaytonaProviderConfig, "create_provider", create_provider)
     monkeypatch.setattr(ModalProviderConfig, "create_provider", create_provider)
-    monkeypatch.setenv("AUTH_DISABLED", "true")
+    monkeypatch.delenv("AUTH_REQUIRED", raising=False)
 
     with TestClient(BenchmarkServiceApp(RuntimeProviderBenchmark)) as c:
         with c.websocket_connect("/ws/setup-task") as ws:
@@ -355,7 +355,7 @@ def test_websocket_setup_task_falls_back_to_header_provider_config(
             yield StreamResultChunk(type="result", data={"task_id": task_id, "sandbox_name": sandbox.name})
 
     monkeypatch.setattr(DaytonaProviderConfig, "create_provider", create_provider)
-    monkeypatch.setenv("AUTH_DISABLED", "true")
+    monkeypatch.delenv("AUTH_REQUIRED", raising=False)
 
     with TestClient(BenchmarkServiceApp(RuntimeProviderBenchmark)) as c:
         with c.websocket_connect(
@@ -389,7 +389,8 @@ class TestAuthMiddleware:
     AUTH_TOKEN = "my-secret-token"
 
     @pytest.fixture
-    def auth_client(self) -> Generator[TestClient, None, None]:
+    def auth_client(self, monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
+        monkeypatch.setenv("AUTH_REQUIRED", "true")
         class AuthBenchmark(StubBenchmark):
             async def resolve_tenant(self, headers: dict[str, str]) -> str | None:
                 if headers.get("authorization") != TestAuthMiddleware.AUTH_TOKEN:
@@ -446,14 +447,19 @@ class TestUnconfiguredAuth:
 
     @pytest.fixture(autouse=True)
     def unconfigured_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.delenv("AUTH_REQUIRED", raising=False)
+        monkeypatch.setenv("AUTH_REQUIRED", "true")
         monkeypatch.delenv("AUTH_DISABLED", raising=False)
         monkeypatch.delenv("DESCOPE_PROJECT_ID", raising=False)
         monkeypatch.setenv("BENCHMARK_API_KEY", self.API_KEY)
 
-    @pytest.fixture
-    def client(self) -> Generator[TestClient, None, None]:
-        with TestClient(BenchmarkServiceApp(StubBenchmark)) as c:
+    @pytest.fixture(params=["core", "vals"])
+    def client(self, request: pytest.FixtureRequest) -> Generator[TestClient, None, None]:
+        app = (
+            BenchmarkServiceApp(StubBenchmark)
+            if request.param == "core"
+            else ValsBenchmarkServiceApp(ValsStubBenchmark)
+        )
+        with TestClient(app) as c:
             yield c
 
     def test_missing_credential_returns_401(self, client: TestClient) -> None:
@@ -469,28 +475,68 @@ class TestUnconfiguredAuth:
     def test_health_skips_auth(self, client: TestClient) -> None:
         assert client.get("/health").status_code == 200
 
-    def test_auth_required_false_refuses_to_start(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        monkeypatch.setenv("AUTH_REQUIRED", "false")
+    def test_auth_disabled_cannot_bypass_required_auth(
+        self, monkeypatch: pytest.MonkeyPatch, client: TestClient,
+    ) -> None:
+        monkeypatch.setenv("AUTH_DISABLED", "true")
+        assert client.get("/verify-task-ids").status_code == 401
+        with client.websocket_connect("/ws/evaluate-response") as ws:
+            with pytest.raises(WebSocketDisconnect) as exc_info:
+                ws.receive_json()
+        assert exc_info.value.code == 1008
 
-        with pytest.raises(RuntimeError, match="AUTH_REQUIRED"):
-            with TestClient(ValsBenchmarkServiceApp(ValsStubBenchmark)):
-                pass
 
-
-class TestAuthDisabled:
-    """AUTH_DISABLED=true is the local-development escape hatch."""
+class TestAuthNotRequired:
+    """Both templates allow local requests unless AUTH_REQUIRED is enabled."""
 
     @pytest.fixture
     def client(self, monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
         monkeypatch.delenv("AUTH_REQUIRED", raising=False)
         monkeypatch.delenv("DESCOPE_PROJECT_ID", raising=False)
-        monkeypatch.setenv("AUTH_DISABLED", "true")
 
         with TestClient(BenchmarkServiceApp(StubBenchmark)) as c:
             yield c
 
     def test_allows_unauthenticated_requests(self, client: TestClient) -> None:
         assert client.get("/verify-task-ids").status_code == 200
+
+
+@pytest.mark.parametrize("app_cls", [BenchmarkServiceApp, ValsBenchmarkServiceApp])
+@pytest.mark.parametrize("auth_required", [None, "false"])
+@pytest.mark.parametrize("auth_hook", ["resolve_tenant", "check_auth"])
+def test_local_http_and_websocket_bypass_custom_auth(
+    monkeypatch: pytest.MonkeyPatch,
+    app_cls: type[BenchmarkServiceApp],
+    auth_required: str | None,
+    auth_hook: str,
+) -> None:
+    """The auth opt-in flag governs custom authentication on both transports.
+
+    Test cases:
+    - Absent or false AUTH_REQUIRED bypasses custom tenant and boolean auth hooks.
+    - Both application templates serve HTTP and WebSocket evaluation locally.
+    """
+    if auth_required is None:
+        monkeypatch.delenv("AUTH_REQUIRED", raising=False)
+    else:
+        monkeypatch.setenv("AUTH_REQUIRED", auth_required)
+
+    class TenantAuthBenchmark(ValsStubBenchmark):
+        async def resolve_tenant(self, headers: dict[str, str]) -> str | None:
+            raise AssertionError("custom tenant authentication was called")
+
+    class BooleanAuthBenchmark(ValsStubBenchmark):
+        async def check_auth(self, headers: dict[str, str]) -> bool:
+            raise AssertionError("custom boolean authentication was called")
+
+    service_cls = TenantAuthBenchmark if auth_hook == "resolve_tenant" else BooleanAuthBenchmark
+    with TestClient(app_cls(service_cls)) as client:
+        response = client.post("/evaluate-response/", json={"task_id": "task-1", "response": "2"})
+        assert response.status_code == 200
+        assert response.json() == {"resolved": True}
+        with client.websocket_connect("/ws/evaluate-response") as ws:
+            ws.send_json({"task_id": "task-1", "response": "2"})
+            assert ws.receive_json() == {"type": "result", "data": {"resolved": True}}
 
 
 class TestDescopeAuth:
@@ -501,6 +547,7 @@ class TestDescopeAuth:
     @pytest.fixture
     def exchange_calls(self, monkeypatch: pytest.MonkeyPatch) -> Generator[list[tuple[str, str]], None, None]:
         auth_module.clear_auth_cache()
+        monkeypatch.setenv("AUTH_REQUIRED", "true")
         monkeypatch.setenv("DESCOPE_PROJECT_ID", self.PROJECT_ID)
         monkeypatch.setenv(
             "DESCOPE_TENANT_ALLOWLIST_JSON",
@@ -560,6 +607,7 @@ class TestDescopeAuth:
 
 @pytest.fixture
 def auth_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
     monkeypatch.setenv(
         "DESCOPE_TENANT_ALLOWLIST_JSON",
@@ -625,7 +673,6 @@ def test_setup_task_ws_close_for_disallowed_dataset(auth_client: TestClient) -> 
 
 
 def test_core_app_ignores_hosted_policy_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("AUTH_DISABLED", "true")
     monkeypatch.setenv("DESCOPE_TENANT_ALLOWLIST_JSON", "malformed hosted policy")
     monkeypatch.setenv("BENCHMARK_CATALOG_API_URL", "https://catalog.invalid")
     monkeypatch.setenv("AUTH_REQUIRED", "false")

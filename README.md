@@ -16,7 +16,7 @@ create-benchmark-service <benchmark-name>
 
 Creates a new service in `./<benchmark-name>-benchmark-service/` in your current directory.
 
-The default template contains the benchmark implementation and generic framework. Select `--template vals-ai` to also copy the Vals authentication and access-policy code into the generated project. The Vals template is bundled with this repository, but default services do not include or import it.
+Use `--template vals-ai` to include Vals authentication and access policy.
 
 ```bash
 create-benchmark-service <benchmark-name> --template vals-ai
@@ -33,7 +33,7 @@ Add the extras your service uses to its `create-benchmark-service` dependency in
 | `s3` | S3 submission artifacts and AWS clients |
 | `telemetry` | Sentry and OpenTelemetry |
 
-For example, use `create-benchmark-service[daytona]` instead of `create-benchmark-service` in the dependency name, keeping the generated Git URL and version pin. The Vals template selects `s3` and `telemetry` and adds Descope dependencies. Add a sandbox provider extra when your benchmark uses one.
+For example, use `create-benchmark-service[daytona]`, keeping the generated Git URL and version pin. Sandbox providers are available to both templates. The Vals template also selects `s3` and `telemetry` and adds Descope dependencies.
 
 ## What Gets Generated
 
@@ -376,45 +376,7 @@ For process-scoped credentials, call `sandbox.command(..., env_vars={...})`. Pro
 
 The framework authenticates every HTTP request except `/health`, and every WebSocket route before sandbox provider config is used.
 
-The default service rejects requests until you implement authentication. Set `AUTH_DISABLED=true` only for local development; `/v1/*` still returns 403 in this mode. `BENCHMARK_API_KEY` no longer enables static bearer authentication.
-
-Override `check_auth()` in your `BenchmarkService` subclass for boolean authentication on the internal HTTP and WebSocket routes:
-
-```python
-from benchmark_service import BenchmarkService
-
-class MyBenchmarkService(BenchmarkService):
-    async def check_auth(self, headers: dict[str, str]) -> bool:
-        return headers.get("authorization") == "my-secret-credential"
-
-    # ... other abstract methods
-```
-
-For tenant-aware authentication, including `/v1/*`, override `resolve_tenant()` and return a tenant ID. Override `check_dataset_access()` to restrict which datasets a tenant can use:
-
-```python
-from benchmark_service import BenchmarkService
-
-class MyBenchmarkService(BenchmarkService):
-    async def resolve_tenant(self, headers: dict[str, str]) -> str | None:
-        token = headers.get("authorization")
-        if token == "Bearer internal-token":
-            return "internal"
-        return None
-
-    async def check_dataset_access(self, tenant: str, dataset: str | None) -> bool:
-        return tenant == "internal" and (dataset or "default") in {"default", "validation"}
-
-    # ... other abstract methods
-```
-
-Header names are lowercase per HTTP convention. Requests that fail auth receive a `401 Unauthorized` response automatically.
-
-### Vals template: authentication and access policy
-
-`--template vals-ai` copies the Vals layer into `src/<benchmark_package>/vals_ai/` and wires it into the generated service. This layer supplies Descope authentication, catalog and allowlist access, trial response filtering, and evaluation quotas.
-
-Set `DESCOPE_PROJECT_ID` and a tenant + dataset allowlist. Requests must include a valid Descope access key in `X-Descope-Api-Key`. The key must be scoped to exactly one Descope tenant, and that tenant must appear in the service allowlist. Leave `AUTH_DISABLED` unset for hosted services.
+For services generated with `--template vals-ai`, set `DESCOPE_PROJECT_ID` and a tenant + dataset allowlist. Requests must include a valid Descope access key in `X-Descope-Api-Key`. The key must be scoped to exactly one Descope tenant, and that tenant must appear in the service allowlist. Leave `AUTH_DISABLED` unset for hosted services.
 
 The allowlist is loaded in this order:
 
@@ -460,6 +422,40 @@ Quota-enabled deployments must set a stable, non-empty `SERVICE_NAME` and set `E
 Counter updates are atomic across service processes and are not retried because increments are not idempotent. A write that reaches DynamoDB counts even if its response is lost, so an ambiguous storage failure can return HTTP 503 or WebSocket close code `1011` after consuming one request. This fail-closed behavior prevents one incoming request from consuming multiple units and prevents an unavailable counter from bypassing the limit. Internal AWS errors are logged but not returned to the caller.
 
 After the configured limit is reached, HTTP routes return 429 with `Retry-After` and WebSocket routes close with code `1008`. Missing counter configuration fails service startup instead of silently disabling enforcement.
+
+The default template rejects requests until you implement authentication. Set `AUTH_DISABLED=true` only for local development; `/v1/*` still returns 403 in this mode.
+
+Override `check_auth()` in your `BenchmarkService` subclass for boolean authentication on the internal HTTP and WebSocket routes:
+
+```python
+from benchmark_service import BenchmarkService
+
+class MyBenchmarkService(BenchmarkService):
+    async def check_auth(self, headers: dict[str, str]) -> bool:
+        return headers.get("authorization") == "my-secret-credential"
+
+    # ... other abstract methods
+```
+
+For tenant-aware authentication, including `/v1/*`, override `resolve_tenant()` and return a tenant ID. Override `check_dataset_access()` to restrict which datasets a tenant can use:
+
+```python
+from benchmark_service import BenchmarkService
+
+class MyBenchmarkService(BenchmarkService):
+    async def resolve_tenant(self, headers: dict[str, str]) -> str | None:
+        token = headers.get("authorization")
+        if token == "Bearer internal-token":
+            return "internal"
+        return None
+
+    async def check_dataset_access(self, tenant: str, dataset: str | None) -> bool:
+        return tenant == "internal" and (dataset or "default") in {"default", "validation"}
+
+    # ... other abstract methods
+```
+
+Header names are lowercase per HTTP convention. Requests that fail auth receive a `401 Unauthorized` response automatically.
 
 Valkyrie users normally configure their Descope credential once via the CLI. Legacy/custom service credentials can still be configured separately:
 

@@ -478,16 +478,13 @@ vals-ai = [
 [package.dev-dependencies]
 dev = [
     { name = "basedpyright" },
-    { name = "boto3" },
-    { name = "cachetools" },
-    { name = "descope" },
+    { name = "create-benchmark-service", extra = ["vals-ai"] },
     { name = "httpx" },
     { name = "opentelemetry-instrumentation-httpx" },
     { name = "opentelemetry-sdk" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
     { name = "ruff" },
-    { name = "sentry-sdk", extra = ["fastapi"] },
     { name = "types-pyyaml" },
 ]
 
@@ -516,16 +513,13 @@ provides-extras = ["vals-ai"]
 [package.metadata.requires-dev]
 dev = [
     { name = "basedpyright", specifier = ">=1.39.0" },
-    { name = "boto3", specifier = ">=1.34" },
-    { name = "cachetools", specifier = ">=5.5.0" },
-    { name = "descope", specifier = ">=1.13.0" },
+    { name = "create-benchmark-service", extras = ["vals-ai"], editable = "." },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "opentelemetry-instrumentation-httpx", specifier = ">=0.61b0,<0.62" },
     { name = "opentelemetry-sdk", specifier = ">=1.20.0" },
     { name = "pytest", specifier = ">=9.0.2" },
     { name = "pytest-asyncio", specifier = ">=1.3.0" },
     { name = "ruff", specifier = ">=0.15.9" },
-    { name = "sentry-sdk", extras = ["fastapi"], specifier = ">=2.58.0,<3.0" },
     { name = "types-pyyaml", specifier = ">=6.0.12" },
 ]
 

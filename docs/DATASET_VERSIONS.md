@@ -4,6 +4,16 @@ A service can change its default dataset while a run is in progress. A run owner
 
 This feature is optional. It works with local files, a database, or a separate dataset store. A version ID is an opaque string: the client stores and sends it without interpreting its format.
 
+## Responsibilities
+
+| Owner | Responsibility |
+| --- | --- |
+| Run owner | Resolve once before task discovery, save the service URL, dataset name, and exact version ID, and reuse them throughout the run and its retries. |
+| Framework | Authorize each request, enter the service's version context, and confirm that an explicitly requested ID was selected. It keeps no run-to-version registry. |
+| Service or loader | Keep the data for an ID immutable, select it for the request, and reject unavailable IDs. Choose how many versions to retain. |
+
+The version covers task identity, order, contents, grading data, and versioned assets. It does not freeze evaluator code, model behavior, or the agent environment. The framework does not derive a version from arbitrary dataset objects or promote an informational release label into version-selection support.
+
 ```mermaid
 sequenceDiagram
     participant O as Orchestrator
@@ -17,6 +27,8 @@ sequenceDiagram
 ```
 
 ## Client workflow
+
+A client that requires a fixed version can use the following flow. The caller's selector, such as a release label, is input to resolution. The returned exact ID is the value to save and send on later requests; do not keep resolving the label or default during the run.
 
 ```python
 from benchmark_service import BenchmarkServiceClient
@@ -84,6 +96,14 @@ The header covers task verification, retrieval, setup, all evaluation paths, sco
 IDs contain 1–1,024 visible ASCII characters with no whitespace. Display labels contain up to 256 Unicode characters. Resolution selectors can contain Unicode and spaces, so a service can map a release name to its exact ID. Duplicate headers are rejected. Browser deployments must allow and expose `X-Benchmark-Dataset-Version` in their CORS policy.
 
 Requests without a pin keep their existing response and stream shapes. Supporting services select their default independently for each such request. An explicit pin on a service without support fails instead of being ignored.
+
+## Services without version selection
+
+`dataset_version_selection: false` means that the service cannot guarantee an exact version across requests. It may still report an informational `dataset_version` label. Normal requests without a version header continue to work; resolution and explicit version requests are rejected.
+
+A run owner that permits unversioned runs should record no enforced version and show that dataset consistency is not guaranteed. It must reject an explicit version choice rather than ignore it. Do not invent an ID by hashing task IDs or public task content: the service may use additional grading data and assets that the caller cannot see.
+
+A service retaining only one immutable version can report support. It returns that version during resolution, accepts its exact ID, and rejects other IDs. If a later deployment removes that version, requests from older runs fail. Historical retention is a service policy, not a condition for implementing this protocol.
 
 ## Rollout and limits
 

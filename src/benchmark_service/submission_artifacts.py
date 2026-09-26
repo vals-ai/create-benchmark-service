@@ -1,5 +1,7 @@
 """Submission artifact object-storage helpers."""
 
+from __future__ import annotations
+
 import os
 import re
 import tempfile
@@ -8,11 +10,10 @@ from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from functools import lru_cache, partial
 from pathlib import Path
-from typing import Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
-import boto3
-from botocore.config import Config
-from botocore.exceptions import ClientError
+if TYPE_CHECKING:
+    from botocore.exceptions import ClientError
 
 from benchmark_service.blocking import run_blocking
 from benchmark_service.v1_schemas import KEY_SEGMENT_PATTERN
@@ -98,6 +99,16 @@ def _artifact_bucket() -> str:
 
 @lru_cache(maxsize=1)
 def _s3_client() -> _S3Client:
+    try:
+        import boto3
+        from botocore.config import Config
+    except ModuleNotFoundError as exc:
+        if exc.name not in {"boto3", "botocore"}:
+            raise
+        raise ModuleNotFoundError(
+            "Submission artifact storage requires the s3 extra: uv add 'create-benchmark-service[s3]'"
+        ) from exc
+
     region = os.environ.get(SUBMISSION_ARTIFACT_REGION_ENV)
     if not region:
         raise RuntimeError(
@@ -218,8 +229,11 @@ def _raise_for_artifact_error(exc: ClientError, key: str) -> None:
 def _stat_sync(key: str, tenant: str) -> SubmissionArtifactReference:
     _require_tenant_key(key, tenant)
     bucket = _artifact_bucket()
+    client = _s3_client()
+    from botocore.exceptions import ClientError
+
     try:
-        response = _s3_client().head_object(Bucket=bucket, Key=key)
+        response = client.head_object(Bucket=bucket, Key=key)
     except ClientError as exc:
         _raise_for_artifact_error(exc, key)
         raise
@@ -234,8 +248,11 @@ def _download_sync(reference: SubmissionArtifactReference, tenant: str) -> bytes
     _require_size_within_limit(reference.size_bytes, reference.key, limit)
     _require_etag(reference.etag, reference.key)
     bucket = _artifact_bucket()
+    client = _s3_client()
+    from botocore.exceptions import ClientError
+
     try:
-        response = _s3_client().get_object(Bucket=bucket, Key=reference.key, IfMatch=reference.etag)
+        response = client.get_object(Bucket=bucket, Key=reference.key, IfMatch=reference.etag)
     except ClientError as exc:
         _raise_for_artifact_error(exc, reference.key)
         raise
@@ -257,8 +274,11 @@ def _materialize_sync(
     _require_size_within_limit(reference.size_bytes, reference.key, limit)
     _require_etag(reference.etag, reference.key)
     bucket = _artifact_bucket()
+    client = _s3_client()
+    from botocore.exceptions import ClientError
+
     try:
-        response = _s3_client().get_object(Bucket=bucket, Key=reference.key, IfMatch=reference.etag)
+        response = client.get_object(Bucket=bucket, Key=reference.key, IfMatch=reference.etag)
     except ClientError as exc:
         _raise_for_artifact_error(exc, reference.key)
         raise

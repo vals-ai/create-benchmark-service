@@ -10,7 +10,8 @@ from fastapi import WebSocket
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from benchmark_service import auth as auth_module
+from templates.vals_ai import auth as auth_module
+from templates.vals_ai.app import BenchmarkServiceApp as ValsBenchmarkServiceApp
 from benchmark_service.app import BenchmarkServiceApp, send_json_if_connected
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
@@ -22,7 +23,7 @@ from benchmark_service.sandbox.types import (
     SandboxQuery,
 )
 from benchmark_service.schemas import BenchmarkEgressPlan, RetrieveTaskResponse, StreamResultChunk
-from tests.conftest import StubBenchmark
+from tests.conftest import StubBenchmark, ValsStubBenchmark
 
 
 class ProviderSelectionSandbox(Sandbox):
@@ -413,6 +414,19 @@ class TestAuthMiddleware:
         response = auth_client.get("/verify-task-ids", headers={"Authorization": self.AUTH_TOKEN})
         assert response.status_code == 200
 
+    def test_custom_tenant_can_evaluate_on_v1(self, auth_client: TestClient) -> None:
+        response = auth_client.post(
+            "/v1/evaluate",
+            headers={"Authorization": self.AUTH_TOKEN},
+            json={
+                "run_id": "custom-run",
+                "task_id": "task-1",
+                "payload": {"type": "text", "schema": "text.v1", "data": "2"},
+            },
+        )
+        assert response.status_code == 200
+        assert response.json()["result"] == {"resolved": True}
+
     def test_health_skips_auth(self, auth_client: TestClient) -> None:
         response = auth_client.get("/health")
         assert response.status_code == 200
@@ -427,7 +441,7 @@ class TestAuthMiddleware:
 
 
 class TestUnconfiguredAuth:
-    """A deploy without Descope configuration serves nothing, and never opens up."""
+    """A deploy without configured authentication rejects protected requests."""
 
     API_KEY = "test-api-key-123"
 
@@ -460,7 +474,7 @@ class TestUnconfiguredAuth:
         monkeypatch.setenv("AUTH_REQUIRED", "false")
 
         with pytest.raises(RuntimeError, match="AUTH_REQUIRED"):
-            with TestClient(BenchmarkServiceApp(StubBenchmark)):
+            with TestClient(ValsBenchmarkServiceApp(ValsStubBenchmark)):
                 pass
 
 
@@ -513,7 +527,7 @@ class TestDescopeAuth:
 
     @pytest.fixture
     def auth_client(self, exchange_calls: list[tuple[str, str]]) -> Generator[TestClient, None, None]:
-        with TestClient(BenchmarkServiceApp(StubBenchmark)) as c:
+        with TestClient(ValsBenchmarkServiceApp(ValsStubBenchmark)) as c:
             yield c
 
     def test_missing_descope_header_returns_401(self, auth_client: TestClient) -> None:
@@ -572,7 +586,7 @@ def _patch_descope(tenants: list[str]) -> Any:
 @pytest.fixture
 def auth_client(auth_env: None) -> Generator[TestClient, None, None]:
     """A TestClient configured for Descope authentication."""
-    with TestClient(BenchmarkServiceApp(StubBenchmark)) as c:
+    with TestClient(ValsBenchmarkServiceApp(ValsStubBenchmark)) as c:
         yield c
 
 
@@ -609,3 +623,22 @@ def test_setup_task_ws_close_for_disallowed_dataset(auth_client: TestClient) -> 
                 ws.receive_json()
     assert exc_info.value.code == 1008
     assert exc_info.value.reason == "Dataset not allowed"
+
+
+def test_core_app_ignores_hosted_policy_configuration(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AUTH_DISABLED", "true")
+    monkeypatch.setenv("DESCOPE_TENANT_ALLOWLIST_JSON", "malformed hosted policy")
+    monkeypatch.setenv("BENCHMARK_CATALOG_API_URL", "https://catalog.invalid")
+    monkeypatch.setenv("AUTH_REQUIRED", "false")
+
+    with TestClient(BenchmarkServiceApp(StubBenchmark)) as client:
+        assert client.get("/verify-task-ids").status_code == 200
+        response = client.post(
+            "/v1/score", json={"run_id": "local-run", "evaluation_results": {}}
+        )
+        assert response.status_code == 403
+
+
+async def test_core_dataset_access_does_not_depend_on_hosted_allowlist() -> None:
+    service = await StubBenchmark.create()
+    assert await service.check_dataset_access("custom-tenant", "default") is True

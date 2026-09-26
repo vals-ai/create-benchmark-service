@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import math
-import os
 import shlex
 import uuid
 from collections import deque
@@ -11,7 +10,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, 
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal, TypeVar, cast
+from typing import Any, TypeVar, cast
 
 from aiohttp import ClientConnectionError, ClientError, ClientPayloadError, ClientResponseError, InvalidURL
 from daytona import (
@@ -56,7 +55,6 @@ from daytona.common.errors import (
 from daytona.common.pty import PtyResult, PtySize
 from daytona.handle.async_pty_handle import AsyncPtyHandle
 from daytona_toolbox_api_client_async.models.pty_session_info import PtySessionInfo
-from pydantic import BaseModel, Field, field_validator
 from tenacity import (
     RetryCallState,
     retry,
@@ -67,6 +65,7 @@ from tenacity import (
     wait_random,
 )
 
+from benchmark_service.sandbox.config import DaytonaProviderConfig as DaytonaProviderConfig
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
     ComposeSource,
@@ -211,62 +210,6 @@ def _resolve_daytona_allowed_addresses(allowed_addresses: list[str]) -> tuple[li
     return cidrs, domains
 
 
-class DaytonaProviderConfig(BaseModel):
-    type: Literal["daytona"] = "daytona"
-    DAYTONA_API_KEY: str
-    DAYTONA_API_URL: str
-    DAYTONA_TARGET: str
-    DAYTONA_ORGANIZATION_ID: str | None = Field(default=None, exclude_if=lambda value: value is None)
-
-    @field_validator("DAYTONA_API_URL")
-    @classmethod
-    def _normalize_api_url(cls, value: str) -> str:
-        return value.rstrip("/")
-
-    @classmethod
-    def from_headers(cls, headers: Mapping[str, str]) -> "DaytonaProviderConfig":
-        api_key = _get_config_header(headers, "x-api-key", "daytona_api_key")
-        api_url = _get_config_header(headers, "x-api-url", "daytona_api_url")
-        target = _get_config_header(headers, "x-target", "daytona_target")
-        organization_id = _get_config_header(headers, "x-organization-id")
-        if not api_key or not api_url or not target:
-            raise MissingSandboxConfigError("Missing required headers: x-api-key, x-api-url, x-target")
-        return cls(
-            DAYTONA_API_KEY=api_key,
-            DAYTONA_API_URL=api_url,
-            DAYTONA_TARGET=target,
-            DAYTONA_ORGANIZATION_ID=organization_id,
-        )
-
-    @classmethod
-    def from_env(cls) -> "DaytonaProviderConfig":
-        """Build config from the DAYTONA_* environment variables; callers never supply creds."""
-        api_key = os.environ.get("DAYTONA_API_KEY")
-        api_url = os.environ.get("DAYTONA_API_URL")
-        target = os.environ.get("DAYTONA_TARGET")
-        organization_id = os.environ.get("DAYTONA_ORGANIZATION_ID")
-        missing = [
-            name
-            for name, value in (
-                ("DAYTONA_API_KEY", api_key),
-                ("DAYTONA_API_URL", api_url),
-                ("DAYTONA_TARGET", target),
-            )
-            if not value
-        ]
-        if missing:
-            raise MissingSandboxConfigError(f"Missing required environment variables: {', '.join(missing)}")
-        return cls(
-            DAYTONA_API_KEY=cast(str, api_key),
-            DAYTONA_API_URL=cast(str, api_url),
-            DAYTONA_TARGET=cast(str, target),
-            DAYTONA_ORGANIZATION_ID=organization_id,
-        )
-
-    def create_provider(self) -> SandboxProvider:
-        return DaytonaSandboxProvider(self)
-
-
 def _daytona_client(config: DaytonaProviderConfig, target: str) -> AsyncDaytona:
     return AsyncDaytona(
         config=DaytonaConfig(
@@ -289,15 +232,6 @@ def _daytona_gpu_type(gpu_type: str | None) -> GpuType | None:
         supported = ", ".join(t.value for t in GpuType if t is not GpuType.UNKNOWN_DEFAULT_OPEN_API)
         raise SandboxError(f"Unsupported Daytona GPU type: {gpu_type}. Supported types: {supported}")
     return member
-
-
-def _get_config_header(headers: Mapping[str, str], *names: str) -> str | None:
-    normalized_headers = {key.lower(): value for key, value in headers.items()}
-    for name in names:
-        value = normalized_headers.get(name.lower())
-        if value:
-            return value
-    return None
 
 
 def _admission_pool_id(*, organization_id: str, api_url: str) -> str:

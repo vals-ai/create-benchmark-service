@@ -7,7 +7,7 @@ import re
 import shlex
 import time
 from collections.abc import AsyncGenerator, Awaitable, Mapping
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 from modal import App, Client, Image, Volume
 from modal import Sandbox as ModalSdkSandbox
@@ -17,14 +17,13 @@ from modal.exception import Error as ModalError
 from modal.exception import InvalidError as ModalInvalidError
 from modal.exception import NotFoundError as ModalNotFoundError
 from modal.exception import ResourceExhaustedError as ModalResourceExhaustedError
-from pydantic import BaseModel
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
+from benchmark_service.sandbox.config import ModalProviderConfig as ModalProviderConfig
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
     ExecResult,
     ImageSource,
-    MissingSandboxConfigError,
     Sandbox,
     SandboxCommandError,
     SandboxConnectionError,
@@ -68,38 +67,6 @@ _PROVIDER_RETRY = retry(
     wait=wait_fixed(2),
     reraise=True,
 )
-
-
-class ModalProviderConfig(BaseModel):
-    type: Literal["modal"] = "modal"
-    runtime: Literal["gvisor", "vm"] = "gvisor"
-    MODAL_TOKEN_ID: str
-    MODAL_TOKEN_SECRET: str
-
-    @classmethod
-    def from_env(cls) -> "ModalProviderConfig":
-        token_id = os.environ.get("MODAL_TOKEN_ID")
-        token_secret = os.environ.get("MODAL_TOKEN_SECRET")
-        missing = [
-            name
-            for name, value in (
-                ("MODAL_TOKEN_ID", token_id),
-                ("MODAL_TOKEN_SECRET", token_secret),
-            )
-            if not value
-        ]
-        if missing:
-            raise MissingSandboxConfigError(f"Missing required environment variables: {', '.join(missing)}")
-        return cls.model_validate(
-            {
-                "runtime": os.environ.get("MODAL_RUNTIME", "gvisor"),
-                "MODAL_TOKEN_ID": token_id,
-                "MODAL_TOKEN_SECRET": token_secret,
-            }
-        )
-
-    def create_provider(self) -> SandboxProvider:
-        return ModalSandboxProvider(self)
 
 
 class _CreateRateLimiter:

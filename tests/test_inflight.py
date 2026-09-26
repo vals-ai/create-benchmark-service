@@ -99,18 +99,18 @@ def test_emit_once_writes_emf_json(capsys: pytest.CaptureFixture[str]) -> None:
     payload = json.loads(captured.out.strip().splitlines()[-1])
     assert payload["ServiceName"] == "proof-bench"
     assert payload["InFlightRequests"] == 7
-    assert payload["_aws"]["CloudWatchMetrics"][0]["Namespace"] == "Vals/BenchmarkServices"
+    assert payload["_aws"]["CloudWatchMetrics"][0]["Namespace"] == "BenchmarkServices"
     metric = payload["_aws"]["CloudWatchMetrics"][0]["Metrics"][0]
     assert metric == {"Name": "InFlightRequests", "Unit": "Count"}
 
 
-def test_benchmarkserviceapp_installs_inflight_middleware() -> None:
+def test_only_vals_template_installs_inflight_middleware() -> None:
     from benchmark_service.app import BenchmarkServiceApp
-    from tests.conftest import StubBenchmark
+    from templates.vals_ai.app import BenchmarkServiceApp as ValsBenchmarkServiceApp
+    from tests.conftest import StubBenchmark, ValsStubBenchmark
 
     app = BenchmarkServiceApp(StubBenchmark)
-    found = any(
-        getattr(m, "cls", None) is InflightMiddleware
-        for m in app.user_middleware
-    )
-    assert found, "InflightMiddleware not in app.user_middleware"
+    assert all(m.cls is not InflightMiddleware for m in app.user_middleware)
+    vals_app = ValsBenchmarkServiceApp(ValsStubBenchmark)
+    middleware = next(m for m in vals_app.user_middleware if m.cls is InflightMiddleware)
+    assert middleware.kwargs["metric_namespace"] == "Vals/BenchmarkServices"

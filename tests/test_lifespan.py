@@ -5,8 +5,8 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from benchmark_service.app import BenchmarkServiceApp
-from tests.conftest import StubBenchmark
+from templates.vals_ai.app import BenchmarkServiceApp
+from tests.conftest import ValsStubBenchmark as StubBenchmark
 
 
 def test_lifespan_raises_on_malformed_env_var(monkeypatch: pytest.MonkeyPatch) -> None:

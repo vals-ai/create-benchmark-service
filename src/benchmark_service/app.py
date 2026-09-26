@@ -4,14 +4,12 @@ import asyncio
 import importlib.metadata
 import logging
 import os
-import re
 import traceback
 from collections import Counter
 from collections.abc import AsyncGenerator
-from contextlib import aclosing, asynccontextmanager, nullcontext, suppress
+from contextlib import aclosing, asynccontextmanager, suppress
 from typing import Any, cast
 
-import sentry_sdk
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
@@ -20,24 +18,17 @@ from uvicorn.protocols.utils import ClientDisconnected
 from websockets.exceptions import ConnectionClosed
 
 from benchmark_service._version import __version__ as _framework_version
-from benchmark_service.auth import (
-    UNAUTHENTICATED_TENANT_SENTINEL,
-    clear_request_tenant_config,
-    close_catalog_client,
-    get_tenant_config,
-    load_allowlist,
-    require_supported_auth_config,
-)
+from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL
 from benchmark_service.base import BenchmarkService
 from benchmark_service.context import sandbox_provider_scope
 from benchmark_service.grading import SUBMISSION_ARTIFACT_SANDBOX_PATH, collapse_stream, evaluate_submission
-from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.observability import (
     bind_request_context,
     bind_service_context,
     capture_exception,
     capture_http_exception,
     init_sentry,
+    isolation_scope,
 )
 from benchmark_service.schemas import (
     ArtifactGradingSubmission,
@@ -58,18 +49,13 @@ from benchmark_service.schemas import (
     VersionResponse,
 )
 from benchmark_service.sandbox import (
+    DaytonaProviderConfig,
     ModalProviderConfig,
     SandboxProvider,
     SandboxProviderConfig,
     sandbox_provider_config_from_mapping,
 )
-from benchmark_service.sandbox.daytona import DaytonaProviderConfig
-from benchmark_service.trial import (
-    sanitize_v1_dataset_tasks_response,
-    sanitize_v1_eval_response,
-    sanitize_v1_score_response,
-)
-from benchmark_service import evaluation_quota, submission_artifacts
+from benchmark_service import submission_artifacts
 from benchmark_service.v1_schemas import (
     V1DatasetTasksResponse,
     V1EvalRequest,
@@ -84,9 +70,6 @@ from benchmark_service.v1_schemas import (
 )
 
 logger = logging.getLogger(__name__)
-
-_EVALUATION_QUOTA_UNAVAILABLE_DETAIL = "Evaluation quota enforcement is temporarily unavailable; try again later."
-
 
 async def send_json_if_connected(websocket: WebSocket, payload: dict[str, Any]) -> bool:
     try:
@@ -114,32 +97,13 @@ async def _forward_stream(
 _PUBLIC_PATHS = frozenset({"/health", "/version"})
 
 
-def _require_descope_tenant(tenant: str | None) -> None:
-    """Raise 403 when the request has no Descope tenant identity."""
+def _require_authenticated_tenant(tenant: str | None) -> None:
+    """Raise 403 when the request has no authenticated tenant identity."""
     if tenant == UNAUTHENTICATED_TENANT_SENTINEL:
         raise HTTPException(
             status_code=403,
-            detail="The /v1/ surface requires Descope authentication.",
+            detail="The /v1/ surface requires an authenticated tenant.",
         )
-
-
-def _is_trial_tenant(tenant: str | None) -> bool:
-    if tenant is None:
-        return False
-    cfg = get_tenant_config(tenant)
-    return cfg is not None and cfg.trial_mode
-
-
-# Lab-facing /v1 endpoints a trial tenant may reach. Deny-by-default: add new
-# trial-accessible endpoints here so they don't silently auto-expose.
-# submissions/upload-url is deliberately absent: minting is unmetered and a
-# presigned PUT can't cap object size or upload count, so trial tenants don't
-# get it until quota/one-shot semantics exist.
-_TRIAL_ALLOWED_PATH = re.compile(r"/v1/(?:evaluate|score|datasets/[^/]+/tasks)")
-
-
-def _trial_tenant_may_access_path(path: str) -> bool:
-    return _TRIAL_ALLOWED_PATH.fullmatch(path) is not None
 
 
 def _request_sandbox_provider_config(
@@ -316,60 +280,47 @@ class BenchmarkServiceApp(FastAPI):
 
     def __init__(self, service_cls: type[BenchmarkService]) -> None:
         self._service_name, self._service_version = _get_service_metadata(service_cls)
-        configured_deployment_name = os.getenv(evaluation_quota.SERVICE_NAME_ENV, "").strip()
+        configured_deployment_name = os.getenv("SERVICE_NAME", "").strip()
         deployment_name = configured_deployment_name or service_cls.__name__
         sentry_enabled = init_sentry()
 
         @asynccontextmanager
         async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
-            sentry_lifespan_scope = (
-                sentry_sdk.isolation_scope() if sentry_enabled else nullcontext()
-            )
-            with sentry_lifespan_scope:
+            with isolation_scope():
                 self._bind_service_context(self._service_version)
                 try:
-                    require_supported_auth_config()
-                    allowlist = load_allowlist()
-                    if not os.getenv("BENCHMARK_CATALOG_API_URL", "").strip():
-                        evaluation_quota.require_configured(
-                            allowlist, service_name=configured_deployment_name
-                        )
-                    submission_artifacts.require_configured()
-                    if not submission_artifacts.is_configured():
-                        logger.warning(
-                            f"{submission_artifacts.SUBMISSION_ARTIFACT_BUCKET_ENV} is not set; "
-                            "POST /v1/submissions/upload-url will return 503"
-                        )
-                    self.service = await service_cls.create()
-                    self._bind_service_context(self._current_service_version())
-                    if (
-                        self.service.eval_mode
-                        in {
-                            EvalMode.IN_PROCESS_ARTIFACT,
-                            EvalMode.IN_PROCESS_MATERIALIZED_ARTIFACT,
-                            EvalMode.SANDBOX,
-                        }
-                        and self.service.accepted_submission_schemas.get(
-                            V1PayloadType.ARTIFACT
-                        )
-                        and not submission_artifacts.is_configured()
-                    ):
-                        raise RuntimeError(
-                            "artifact grading requires submission storage; set "
-                            f"{submission_artifacts.SUBMISSION_ARTIFACT_BUCKET_ENV} and "
-                            f"{submission_artifacts.SUBMISSION_ARTIFACT_REGION_ENV}"
-                        )
-                    try:
+                    async with self.service_lifespan():
+                        submission_artifacts.require_configured()
+                        if not submission_artifacts.is_configured():
+                            logger.warning(
+                                f"{submission_artifacts.SUBMISSION_ARTIFACT_BUCKET_ENV} is not set; "
+                                "POST /v1/submissions/upload-url will return 503"
+                            )
+                        self.service = await service_cls.create()
+                        self._bind_service_context(self._current_service_version())
+                        if (
+                            self.service.eval_mode
+                            in {
+                                EvalMode.IN_PROCESS_ARTIFACT,
+                                EvalMode.IN_PROCESS_MATERIALIZED_ARTIFACT,
+                                EvalMode.SANDBOX,
+                            }
+                            and self.service.accepted_submission_schemas.get(
+                                V1PayloadType.ARTIFACT
+                            )
+                            and not submission_artifacts.is_configured()
+                        ):
+                            raise RuntimeError(
+                                "artifact grading requires submission storage; set "
+                                f"{submission_artifacts.SUBMISSION_ARTIFACT_BUCKET_ENV} and "
+                                f"{submission_artifacts.SUBMISSION_ARTIFACT_REGION_ENV}"
+                            )
                         if self.service.eval_mode == EvalMode.SANDBOX:
-                            async with (
-                                _grading_provider_config().create_provider() as provider
-                            ):
+                            async with _grading_provider_config().create_provider() as provider:
                                 self._grading_provider = provider
                                 yield
                                 return
                         yield
-                    finally:
-                        await close_catalog_client()
                 except Exception as exc:
                     if sentry_enabled:
                         capture_exception(exc)
@@ -380,7 +331,6 @@ class BenchmarkServiceApp(FastAPI):
         self._grading_admission = _GradingAdmission.from_env()
         self._deployment_name = deployment_name
         self._sentry_enabled = sentry_enabled
-        self.add_middleware(InflightMiddleware, service_name=self._deployment_name)
         self._register_routes()
 
     def _bind_service_context(self, service_version: str | None) -> None:
@@ -395,7 +345,7 @@ class BenchmarkServiceApp(FastAPI):
     def _register_routes(self) -> None:
         @self.middleware("http")
         async def _check_auth(request: Request, call_next):  # type: ignore[no-untyped-def]
-            clear_request_tenant_config()
+            self.clear_request_context()
             if self._sentry_enabled:
                 self._bind_service_context(self._current_service_version())
                 bind_request_context(request.headers)
@@ -406,14 +356,13 @@ class BenchmarkServiceApp(FastAPI):
                 if tenant is None:
                     return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
                 request.state.tenant = tenant
-                if _is_trial_tenant(tenant) and not _trial_tenant_may_access_path(request.url.path):
-                    return JSONResponse(
-                        status_code=403,
-                        content={"detail": "Trial tenants may only access approved /v1 endpoints (/v1/*)"},
-                    )
+                try:
+                    self.authorize_request(tenant, request.url.path)
+                except HTTPException as exc:
+                    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
                 return await call_next(request)  # type: ignore[reportUnknownVariableType]
             finally:
-                clear_request_tenant_config()
+                self.clear_request_context()
 
         self.add_exception_handler(ValueError, self._value_error_handler)
         self.add_exception_handler(Exception, self._exception_handler)
@@ -469,60 +418,53 @@ class BenchmarkServiceApp(FastAPI):
 
     async def _authorize_websocket(self, websocket: WebSocket) -> str | None:
         """Authenticate a WebSocket caller. Returns tenant id, or None after closing 1008."""
+        self.clear_request_context()
         self._bind_service_context(self._current_service_version())
         tenant = await self.service.resolve_tenant(dict(websocket.headers))
         if tenant is None:
             await websocket.close(code=1008, reason="Unauthorized")
             return None
-        if _is_trial_tenant(tenant):
-            await websocket.close(code=1008, reason="Trial tenants may only access /v1/*")
+        try:
+            self.authorize_request(tenant, websocket.url.path)
+        except HTTPException as exc:
+            await websocket.close(code=1008, reason=str(exc.detail))
             return None
         websocket.state.tenant = tenant
         return tenant
 
-    async def _consume_evaluation_quota(self, tenant: str) -> None:
-        try:
-            await evaluation_quota.consume_evaluation_request(
-                service_name=self._deployment_name,
-                tenant=tenant,
-            )
-        except evaluation_quota.EvaluationQuotaExceeded as exc:
-            raise HTTPException(
-                status_code=429,
-                detail=str(exc),
-                headers={"Retry-After": str(exc.retry_after_seconds)},
-            ) from exc
-        except evaluation_quota.EvaluationQuotaUnavailable as exc:
-            logger.warning(
-                "Evaluation quota storage unavailable for service %s tenant %s",
-                self._deployment_name,
-                tenant,
-                exc_info=True,
-            )
-            raise HTTPException(status_code=503, detail=_EVALUATION_QUOTA_UNAVAILABLE_DETAIL) from exc
+    @asynccontextmanager
+    async def service_lifespan(self) -> AsyncGenerator[None, None]:
+        """Initialize and close deployment integrations around the service lifetime."""
+        yield
 
-    async def _consume_websocket_evaluation_quota(
-        self,
-        websocket: WebSocket,
-        tenant: str,
-    ) -> bool:
+    def clear_request_context(self) -> None:
+        """Reset deployment-specific request state before and after requests."""
+
+    def authorize_request(self, tenant: str, path: str) -> None:
+        """Raise HTTPException when deployment policy denies an authenticated route."""
+
+    async def consume_evaluation_request(self, tenant: str) -> None:
+        """Apply deployment admission policy before evaluation begins."""
+
+    def project_eval_response(self, tenant: str, response: V1EvalResponse) -> V1EvalResponse:
+        """Return the evaluation fields this caller may receive."""
+        return response
+
+    def project_score_response(self, tenant: str, response: V1ScoreResponse) -> V1ScoreResponse:
+        """Return the aggregate score fields this caller may receive."""
+        return response
+
+    def project_dataset_tasks_response(
+        self, tenant: str, response: V1DatasetTasksResponse
+    ) -> V1DatasetTasksResponse:
+        """Return the task fields this caller may receive."""
+        return response
+
+    async def _admit_websocket_evaluation(self, websocket: WebSocket, tenant: str) -> bool:
         try:
-            await evaluation_quota.consume_evaluation_request(
-                service_name=self._deployment_name,
-                tenant=tenant,
-            )
-        except evaluation_quota.EvaluationQuotaExceeded as exc:
-            reset_timestamp = exc.reset_at.isoformat(timespec="seconds").replace("+00:00", "Z")
-            await websocket.close(code=1008, reason=f"Evaluation quota reached; retry after {reset_timestamp}.")
-            return False
-        except evaluation_quota.EvaluationQuotaUnavailable:
-            logger.warning(
-                "Evaluation quota storage unavailable for service %s tenant %s",
-                self._deployment_name,
-                tenant,
-                exc_info=True,
-            )
-            await websocket.close(code=1011, reason=_EVALUATION_QUOTA_UNAVAILABLE_DETAIL)
+            await self.consume_evaluation_request(tenant)
+        except HTTPException as exc:
+            await websocket.close(code=1008 if exc.status_code < 500 else 1011, reason=str(exc.detail))
             return False
         return True
 
@@ -605,7 +547,7 @@ class BenchmarkServiceApp(FastAPI):
             if not await send_json_if_connected(websocket, error_chunk.model_dump()):
                 logger.warning("setup-task websocket disconnected before error chunk could be sent")
         finally:
-            clear_request_tenant_config()
+            self.clear_request_context()
             with suppress(RuntimeError):
                 await websocket.close()
 
@@ -614,7 +556,7 @@ class BenchmarkServiceApp(FastAPI):
             bind_request_context(request.headers, task_id=body.task_id, dataset=body.dataset)
         if not await self.service.check_dataset_access(request.state.tenant, body.dataset):
             raise HTTPException(status_code=403, detail="Dataset not allowed")
-        await self._consume_evaluation_quota(cast(str, request.state.tenant))
+        await self.consume_evaluation_request(cast(str, request.state.tenant))
         return await self.service.evaluate_response(body, dataset=body.dataset)
 
     async def _evaluate_response_stream(self, websocket: WebSocket) -> None:
@@ -633,7 +575,7 @@ class BenchmarkServiceApp(FastAPI):
             if not await self.service.check_dataset_access(tenant, request.dataset):
                 await websocket.close(code=1008, reason="Dataset not allowed")
                 return
-            if not await self._consume_websocket_evaluation_quota(websocket, tenant):
+            if not await self._admit_websocket_evaluation(websocket, tenant):
                 return
 
             await _forward_stream(
@@ -653,7 +595,7 @@ class BenchmarkServiceApp(FastAPI):
             if not await send_json_if_connected(websocket, error_chunk.model_dump()):
                 logger.warning("evaluate-response websocket disconnected before error chunk could be sent")
         finally:
-            clear_request_tenant_config()
+            self.clear_request_context()
             with suppress(RuntimeError):
                 await websocket.close()
 
@@ -678,7 +620,7 @@ class BenchmarkServiceApp(FastAPI):
             if not await self.service.check_dataset_access(tenant, request.dataset):
                 await websocket.close(code=1008, reason="Dataset not allowed")
                 return
-            if not await self._consume_websocket_evaluation_quota(websocket, tenant):
+            if not await self._admit_websocket_evaluation(websocket, tenant):
                 return
 
             async with sandbox_config.create_provider() as provider:
@@ -704,7 +646,7 @@ class BenchmarkServiceApp(FastAPI):
             if not await send_json_if_connected(websocket, error_chunk.model_dump()):
                 logger.warning("evaluate-instance websocket disconnected before error chunk could be sent")
         finally:
-            clear_request_tenant_config()
+            self.clear_request_context()
             with suppress(RuntimeError):
                 await websocket.close()
 
@@ -712,7 +654,7 @@ class BenchmarkServiceApp(FastAPI):
         if self._sentry_enabled:
             bind_request_context(request.headers, run_id=body.run_id, task_id=body.task_id, dataset=body.dataset)
         tenant = cast(str, request.state.tenant)
-        _require_descope_tenant(tenant)
+        _require_authenticated_tenant(tenant)
         if not await self.service.check_dataset_access(tenant, body.dataset):
             raise HTTPException(status_code=403, detail="Dataset not allowed")
         try:
@@ -764,7 +706,7 @@ class BenchmarkServiceApp(FastAPI):
 
             try:
                 async with self._grading_admission.reserve((tenant, body.run_id, body.task_id)):
-                    await self._consume_evaluation_quota(tenant)
+                    await self.consume_evaluation_request(tenant)
                     async with self._grading_admission.acquire_active_slot():
                         artifact_reference: submission_artifacts.SubmissionArtifactReference | None = None
                         submission: GradingSubmission
@@ -869,7 +811,7 @@ class BenchmarkServiceApp(FastAPI):
                 schema_id=body.payload.schema_id,
                 text=body.payload.data,
             )
-            await self._consume_evaluation_quota(tenant)
+            await self.consume_evaluation_request(tenant)
             response = await evaluate_submission(
                 service=self.service,
                 run_id=body.run_id,
@@ -879,15 +821,13 @@ class BenchmarkServiceApp(FastAPI):
                 evaluator_version=self._service_version,
                 dataset=body.dataset,
             )
-        if _is_trial_tenant(tenant):
-            return sanitize_v1_eval_response(response, self.service.project_trial_result)
-        return response
+        return self.project_eval_response(tenant, response)
 
     async def _v1_submission_upload_url(self, request: Request, body: V1UploadUrlRequest) -> V1UploadUrlResponse:
         if self._sentry_enabled:
             bind_request_context(request.headers, run_id=body.run_id, task_id=body.task_id, dataset=body.dataset)
         tenant = cast(str, request.state.tenant)
-        _require_descope_tenant(tenant)
+        _require_authenticated_tenant(tenant)
         if not submission_artifacts.is_configured():
             raise HTTPException(
                 status_code=503,
@@ -916,7 +856,7 @@ class BenchmarkServiceApp(FastAPI):
     async def _v1_score(self, request: Request, body: V1ScoreRequest) -> V1ScoreResponse:
         if self._sentry_enabled:
             bind_request_context(request.headers, run_id=body.run_id, dataset=body.dataset)
-        _require_descope_tenant(request.state.tenant)
+        _require_authenticated_tenant(request.state.tenant)
         if not await self.service.check_dataset_access(request.state.tenant, body.dataset):
             raise HTTPException(status_code=403, detail="Dataset not allowed")
 
@@ -931,14 +871,12 @@ class BenchmarkServiceApp(FastAPI):
             final_score=result.score,
             metadata=result.metadata,
         )
-        if _is_trial_tenant(request.state.tenant):
-            return sanitize_v1_score_response(response)
-        return response
+        return self.project_score_response(request.state.tenant, response)
 
     async def _v1_list_dataset_tasks(self, request: Request, dataset: str) -> V1DatasetTasksResponse:
         if self._sentry_enabled:
             bind_request_context(request.headers, dataset=dataset)
-        _require_descope_tenant(request.state.tenant)
+        _require_authenticated_tenant(request.state.tenant)
         if not await self.service.check_dataset_access(request.state.tenant, dataset):
             raise HTTPException(status_code=403, detail=f"Dataset={dataset} access not allowed")
         try:
@@ -954,9 +892,7 @@ class BenchmarkServiceApp(FastAPI):
             dataset_version=self.service.get_dataset_version(dataset),
             tasks=tasks,
         )
-        if _is_trial_tenant(request.state.tenant):
-            return sanitize_v1_dataset_tasks_response(response)
-        return response
+        return self.project_dataset_tasks_response(request.state.tenant, response)
 
     async def _final_score(self, request: Request, body: FinalScoreRequest) -> FinalScoreResponse:
         if self._sentry_enabled:

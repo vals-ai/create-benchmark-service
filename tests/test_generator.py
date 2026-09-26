@@ -1,11 +1,15 @@
 """Tests for project generator."""
 
+import ast
 import tempfile
+import tomllib
 from pathlib import Path
 
 import pytest
+from click.testing import CliRunner
 
 import benchmark_service
+from cli.cli import main
 from cli.generator import (
     BenchmarkNames,
     _resolve_framework_ref,  # pyright: ignore[reportPrivateUsage]
@@ -150,6 +154,45 @@ def test_generated_project_includes_release_workflows_but_not_cli_integration(tm
     assert (workflows_dir / "auto-tag-release.yaml").exists()
     assert (workflows_dir / "check-pr-title.yaml").exists()
     assert not (workflows_dir / "cli-integration.yaml").exists()
+    assert not (workflows_dir / "provider-integration.yaml").exists()
+
+
+@pytest.mark.parametrize("template", ["default", "vals-ai"])
+def test_cli_template_selects_runtime_and_dependencies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, template: str
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    result = CliRunner().invoke(main, ["demo", "--template", template])
+    assert result.exit_code == 0, result.output
+
+    project = tmp_path / "demo-benchmark-service"
+    package = project / "src" / "demo_benchmark_service"
+    dependencies = tomllib.loads((project / "pyproject.toml").read_text())["project"]["dependencies"]
+    main_source = (project / "main.py").read_text()
+    service_source = (package / "benchmark_service.py").read_text()
+    if template == "vals-ai":
+        assert "from demo_benchmark_service.vals_ai import BenchmarkServiceApp" in main_source
+        assert "from .vals_ai import BenchmarkService" in service_source
+        assert (package / "vals_ai" / "auth.py").is_file()
+        assert (package / "vals_ai" / "trial.py").is_file()
+        assert any(dependency.startswith("create-benchmark-service[s3,telemetry]") for dependency in dependencies)
+        assert "descope>=1.13.0" in dependencies
+    else:
+        assert "from benchmark_service import BenchmarkServiceApp" in main_source
+        assert "from benchmark_service import BenchmarkService" in service_source
+        assert not (package / "vals_ai").exists()
+        assert len(dependencies) == 1
+        assert dependencies[0].startswith("create-benchmark-service @ ")
+
+    for source_file in project.rglob("*.py"):
+        ast.parse(source_file.read_text(), filename=str(source_file))
+
+
+def test_unknown_template_does_not_create_project(tmp_path: Path) -> None:
+    output_dir = tmp_path / "demo-benchmark-service"
+    with pytest.raises(ValueError, match="Unknown template"):
+        generate_project("demo", output_dir, template="missing")
+    assert not output_dir.exists()
 
 
 def test_generated_benchmark_service_implements_task_listing(tmp_path: Path) -> None:

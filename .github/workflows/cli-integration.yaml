@@ -4,6 +4,13 @@ on: [pull_request, push]
 jobs:
   cli-integration:
     runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - template: default
+            extras: ""
+          - template: vals-ai
+            extras: "[s3,telemetry]"
 
     steps:
       - uses: actions/checkout@v4
@@ -28,12 +35,12 @@ jobs:
         run: |
           mkdir /tmp/cli-test
           cd /tmp/cli-test
-          create-benchmark-service test
+          create-benchmark-service test --template ${{ matrix.template }}
 
       - name: Point generated project at this PR's framework source
         working-directory: /tmp/cli-test/test-benchmark-service
         run: |
-          sed -i "s|create-benchmark-service @ git+https://github.com/vals-ai/create-benchmark-service.git@main|create-benchmark-service @ file://${GITHUB_WORKSPACE}|" pyproject.toml
+          uv add "create-benchmark-service${{ matrix.extras }} @ file://${GITHUB_WORKSPACE}"
 
       - name: Verify generated project installs and passes lint
         working-directory: /tmp/cli-test/test-benchmark-service

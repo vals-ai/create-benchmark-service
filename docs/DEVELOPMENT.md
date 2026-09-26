@@ -42,6 +42,12 @@ If the CLI was installed from a non-tagged commit, scaffolds fall back to `@main
 uv tool install git+https://github.com/vals-ai/create-benchmark-service.git@vX.Y.Z
 ```
 
+### Template and dependency migration
+
+Before upgrading an existing Vals service, generate a service with `--template vals-ai` and copy its `vals_ai/` package and dependencies. Import the benchmark base with `from .vals_ai import BenchmarkService` and the app with `from <benchmark_package>.vals_ai import BenchmarkServiceApp`.
+
+Add the [optional integrations](../README.md#optional-integrations) the service uses. Framework upgrades do not update the copied Vals files.
+
 ### Dataset versioning
 
 Separate from the framework version above, a service can declare a **version per dataset** — a human semver labelling the dataset's content. It is served by `get_dataset_version(name)` (on `GET /version?dataset=` and the dataset task-list response) and stamped into generated lab manifests. It is a **label only**: it records the declared version and does not read or verify dataset content (a content-integrity guard is a planned follow-up).

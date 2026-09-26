@@ -15,7 +15,6 @@ from fastapi.encoders import jsonable_encoder
 from benchmark_service.auth import (
     UNAUTHENTICATED_TENANT_SENTINEL,
     check_benchmark_service_auth,
-    get_tenant_config,
     resolve_caller_tenant,
 )
 from benchmark_service.dataset_versioning import DatasetVersionEntry, load_dataset_versions
@@ -147,9 +146,8 @@ class BenchmarkService(ABC):
     async def resolve_tenant(self, headers: dict[str, str]) -> str | None:
         """Authenticate the caller and return their tenant id, or None to reject.
 
-        Subclasses with a legacy `check_auth` override keep their existing boolean
-        behavior. A successful legacy check returns the "_legacy" sentinel, which
-        skips dataset-level allowlist enforcement.
+        A boolean ``check_auth`` override preserves access to the original
+        endpoints. Override this method to return an identity for ``/v1``.
         """
         if type(self).check_auth is not BenchmarkService.check_auth:
             ok = await self.check_auth(headers)
@@ -158,12 +156,7 @@ class BenchmarkService(ABC):
 
     async def check_dataset_access(self, tenant: str, dataset: str | None) -> bool:
         """Return True if `tenant` may use `dataset` on this service."""
-        if tenant == UNAUTHENTICATED_TENANT_SENTINEL:
-            return True
-        entry = get_tenant_config(tenant)
-        if entry is None:
-            return False
-        return (dataset or "default") in entry.datasets
+        return True
 
     def get_service_version(self) -> str | None:
         """Return a benchmark-owned service version override, if available.
@@ -221,25 +214,6 @@ class BenchmarkService(ABC):
             NotImplementedError: if the benchmark has not opted into task listing.
         """
         raise NotImplementedError(f"{type(self).__name__}.list_tasks must explicitly map internal tasks to V1Task")
-
-    def project_trial_result(self, result: Any) -> Any:
-        """Trial-safe projection of a per-task eval result.
-
-        For `trial_mode` tenants, /v1/evaluate responses are reduced to what this
-        returns, and that projection is all a trial caller can resubmit to
-        /v1/score. So it must include both the score fields a prospect may see
-        AND any field `calculate_final_score` needs to aggregate -- anything
-        dropped here is gone from the final score too.
-
-        Like `list_tasks`, the default raises so trial mode requires an explicit,
-        audited projection rather than leaking rubric / judge data by omission.
-
-        Raises:
-            NotImplementedError: if the benchmark has not opted into trial mode.
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__}.project_trial_result must be implemented for trial_mode tenants"
-        )
 
     async def validate_task_ids(self, task_ids: list[str], dataset: str | None = None) -> list[str]:
         """Validate that task IDs exist in your benchmark dataset.

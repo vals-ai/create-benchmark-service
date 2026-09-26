@@ -8,9 +8,9 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from benchmark_service import auth as auth_module
-from benchmark_service.allowlist import CatalogAllowlistClient
-from benchmark_service.auth import (
+from templates.vals_ai import auth as auth_module
+from templates.vals_ai.allowlist import CatalogAllowlistClient
+from templates.vals_ai.auth import (
     clear_allowlist_cache,
     clear_auth_cache,
     clear_request_tenant_config,
@@ -18,7 +18,7 @@ from benchmark_service.auth import (
     load_allowlist,
     resolve_descope_tenant,
 )
-from tests.conftest import StubBenchmark
+from tests.conftest import ValsStubBenchmark as StubBenchmark
 
 
 @pytest.fixture(autouse=True)

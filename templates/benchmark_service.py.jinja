@@ -3,7 +3,10 @@
 from collections.abc import AsyncGenerator
 from typing import Any
 
-from benchmark_service import BenchmarkService, ImageSource, Resources, Sandbox
+from benchmark_service import ImageSource, Resources, Sandbox
+{% if template == "vals-ai" %}from .vals_ai import BenchmarkService
+{% else %}from benchmark_service import BenchmarkService
+{% endif %}
 from benchmark_service.schemas import (
     EvaluateResponseRequest,
     FinalScoreResult,

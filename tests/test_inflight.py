@@ -106,7 +106,7 @@ def test_emit_once_writes_emf_json(capsys: pytest.CaptureFixture[str]) -> None:
 
 def test_only_vals_template_installs_inflight_middleware() -> None:
     from benchmark_service.app import BenchmarkServiceApp
-    from templates.vals_ai.app import BenchmarkServiceApp as ValsBenchmarkServiceApp
+    from templates.vals_ai.app import ValsBenchmarkServiceApp
     from tests.conftest import StubBenchmark, ValsStubBenchmark
 
     app = BenchmarkServiceApp(StubBenchmark)

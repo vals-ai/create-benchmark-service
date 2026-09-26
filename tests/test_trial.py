@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from templates.vals_ai import auth as auth_module
 from templates.vals_ai.auth import clear_allowlist_cache, clear_auth_cache
-from templates.vals_ai.app import BenchmarkServiceApp
+from templates.vals_ai.app import ValsBenchmarkServiceApp
 from benchmark_service.schemas import EvaluateResponseRequest, FinalScoreResult
 from templates.vals_ai.trial import (
     sanitize_v1_eval_response,
@@ -181,7 +181,7 @@ def trial_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None,
         "DESCOPE_TENANT_ALLOWLIST_JSON",
         json.dumps({"tenants": {"trial": {"datasets": ["default"], "trial_mode": True}}}),
     )
-    app = BenchmarkServiceApp(_TrialResultBenchmark)
+    app = ValsBenchmarkServiceApp(_TrialResultBenchmark)
 
     async def _stub_exchange(_project_id: str, _access_key: str) -> dict[str, dict[str, dict[str, str]]]:
         return {"tenants": {"trial": {}}}
@@ -201,7 +201,7 @@ def all_pass_trial_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClie
         "DESCOPE_TENANT_ALLOWLIST_JSON",
         json.dumps({"tenants": {"trial": {"datasets": ["default"], "trial_mode": True}}}),
     )
-    app = BenchmarkServiceApp(_AllPassTrialBenchmark)
+    app = ValsBenchmarkServiceApp(_AllPassTrialBenchmark)
 
     async def _stub_exchange(_project_id: str, _access_key: str) -> dict[str, dict[str, dict[str, str]]]:
         return {"tenants": {"trial": {}}}

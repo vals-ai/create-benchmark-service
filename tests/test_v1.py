@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from pydantic import BaseModel, ValidationError
 
 from templates.vals_ai import auth as auth_module
-from templates.vals_ai.app import BenchmarkServiceApp
+from templates.vals_ai.app import ValsBenchmarkServiceApp
 from templates.vals_ai.auth import clear_allowlist_cache, clear_auth_cache
 from benchmark_service.schemas import FinalScoreResult
 from benchmark_service.v1_schemas import (
@@ -61,7 +61,7 @@ def descope_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, Non
         "DESCOPE_TENANT_ALLOWLIST_JSON",
         json.dumps({"tenants": {"acme": {"datasets": ["default"]}}}),
     )
-    app = BenchmarkServiceApp(StubBenchmark)
+    app = ValsBenchmarkServiceApp(StubBenchmark)
     app._service_version = "stub-service-1.0"  # pyright: ignore[reportPrivateUsage]
 
     async def _stub_exchange(_project_id: str, _access_key: str) -> dict[str, dict[str, dict[str, str]]]:
@@ -81,7 +81,7 @@ def task_listing_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient
         "DESCOPE_TENANT_ALLOWLIST_JSON",
         json.dumps({"tenants": {"acme": {"datasets": ["default"]}}}),
     )
-    app = BenchmarkServiceApp(TaskListingBenchmark)
+    app = ValsBenchmarkServiceApp(TaskListingBenchmark)
 
     async def _stub_exchange(_project_id: str, _access_key: str) -> dict[str, dict[str, dict[str, str]]]:
         return {"tenants": {"acme": {}}}
@@ -102,7 +102,7 @@ def scoring_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, Non
     )
     CapturingScoreBenchmark.captured_evaluation_results = None
     CapturingScoreBenchmark.captured_dataset = None
-    app = BenchmarkServiceApp(CapturingScoreBenchmark)
+    app = ValsBenchmarkServiceApp(CapturingScoreBenchmark)
 
     async def _stub_exchange(_project_id: str, _access_key: str) -> dict[str, dict[str, dict[str, str]]]:
         return {"tenants": {"acme": {}}}
@@ -110,6 +110,28 @@ def scoring_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, Non
     with patch.object(auth_module, "_exchange_descope_access_key", _stub_exchange):
         with TestClient(app) as client:
             yield client
+
+
+def test_vals_app_exposes_provider_routes_alongside_standard_routes(descope_client: TestClient) -> None:
+    """The Vals application adds its provider API while retaining the shared API.
+
+    Test cases:
+    - OpenAPI includes all four provider endpoints.
+    - The inherited task-verification endpoint remains callable.
+    """
+    headers = {"x-descope-api-key": "key-acme"}
+    schema_response = descope_client.get("/openapi.json", headers=headers)
+    assert schema_response.status_code == 200
+    paths = schema_response.json()["paths"]
+    assert {
+        "/v1/evaluate",
+        "/v1/score",
+        "/v1/submissions/upload-url",
+        "/v1/datasets/{dataset}/tasks",
+    } <= paths.keys()
+    response = descope_client.get("/verify-task-ids", headers=headers)
+    assert response.status_code == 200
+    assert response.json()["task_ids"] == ["task-1", "task-2", "task-3"]
 
 
 def test_eval_request_accepts_text_payload() -> None:
@@ -362,7 +384,7 @@ def test_v1_evaluate_rejects_unauthenticated_mode_with_403(monkeypatch: pytest.M
     clear_allowlist_cache()
     clear_auth_cache()
     monkeypatch.setenv("AUTH_DISABLED", "true")
-    app = BenchmarkServiceApp(StubBenchmark)
+    app = ValsBenchmarkServiceApp(StubBenchmark)
     with TestClient(app) as client:
         resp = client.post(
             "/v1/evaluate",
@@ -381,7 +403,7 @@ def test_v1_score_rejects_unauthenticated_mode_with_403(monkeypatch: pytest.Monk
     clear_allowlist_cache()
     clear_auth_cache()
     monkeypatch.setenv("AUTH_DISABLED", "true")
-    app = BenchmarkServiceApp(StubBenchmark)
+    app = ValsBenchmarkServiceApp(StubBenchmark)
     with TestClient(app) as client:
         resp = client.post(
             "/v1/score",
@@ -470,7 +492,7 @@ def test_v1_list_dataset_tasks_rejects_unauthenticated_mode_with_403(monkeypatch
     clear_allowlist_cache()
     clear_auth_cache()
     monkeypatch.setenv("AUTH_DISABLED", "true")
-    app = BenchmarkServiceApp(StubBenchmark)
+    app = ValsBenchmarkServiceApp(StubBenchmark)
     with TestClient(app) as client:
         resp = client.get("/v1/datasets/default/tasks")
     assert resp.status_code == 403
@@ -486,7 +508,7 @@ def test_v1_list_dataset_tasks_404_for_unknown_dataset_in_allowlist(monkeypatch:
         "DESCOPE_TENANT_ALLOWLIST_JSON",
         json.dumps({"tenants": {"acme": {"datasets": ["default", "ghost-dataset"]}}}),
     )
-    app = BenchmarkServiceApp(StubBenchmark)
+    app = ValsBenchmarkServiceApp(StubBenchmark)
 
     async def _stub_exchange(_project_id: str, _access_key: str) -> dict[str, dict[str, dict[str, str]]]:
         return {"tenants": {"acme": {}}}

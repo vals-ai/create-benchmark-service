@@ -292,15 +292,14 @@ def test_lifespan_failure_after_service_creation_uses_runtime_identity(
         Mock(return_value=("benchmark-package", "package-1.2.3")),
     )
 
-    def fail_after_service_creation(_service: _VersionedBenchmark) -> Any:
-        raise RuntimeError("post-create startup failed")
+    class FailingStartupApp(BenchmarkServiceApp):
+        @asynccontextmanager
+        async def service_lifespan(self) -> AsyncIterator[None]:
+            async with super().service_lifespan():
+                raise RuntimeError("post-create startup failed")
+                yield
 
-    monkeypatch.setattr(
-        _VersionedBenchmark,
-        "eval_mode",
-        property(fail_after_service_creation),
-    )
-    app = BenchmarkServiceApp(_VersionedBenchmark)
+    app = FailingStartupApp(_VersionedBenchmark)
 
     with pytest.raises(RuntimeError, match="post-create startup failed"):
         with TestClient(app):

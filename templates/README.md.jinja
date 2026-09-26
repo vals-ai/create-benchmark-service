@@ -18,16 +18,16 @@ Edit `src/{{ benchmark_package }}/benchmark_service.py` and implement the six ab
 ## Authentication
 
 {% if template == "vals-ai" %}
-The Vals layer lives in `src/{{ benchmark_package }}/vals_ai/`.
+The Vals layer lives in `src/{{ benchmark_package }}/vals_ai/`. `ExampleBenchmark` subclasses `ValsBenchmarkService`; `main.py` uses `ValsBenchmarkServiceApp`. Both inherit the shared classes. The Vals app adds the Descope-protected `/v1/*` routes.
 
 Set `DESCOPE_PROJECT_ID` and configure access through `BENCHMARK_CATALOG_API_URL` plus `SERVICE_NAME`, `DESCOPE_TENANT_ALLOWLIST_JSON`, or `DESCOPE_ALLOWLIST_PATH`. Hosted requests require a Descope access key in `X-Descope-Api-Key`. Quota-enabled services also require `SERVICE_NAME` and `EVALUATION_QUOTA_TABLE_NAME`.
 
-Framework upgrades do not update these copied files.
+Framework upgrades do not update these copied files. `/v1/*` requires Descope authentication and still rejects requests with `AUTH_DISABLED=true`.
 {% else %}
-Implement `check_auth()` for boolean authentication, or `resolve_tenant()` and `check_dataset_access()` for tenant-aware access. The default rejects unauthenticated requests.
+Implement `check_auth()` for boolean authentication, or `resolve_tenant()` and `check_dataset_access()` for tenant-aware access. The default rejects unauthenticated requests. This app includes the shared HTTP and WebSocket routes; it has no `/v1/*` routes.
 {% endif %}
 
-Set `AUTH_DISABLED=true` only for local development. `/v1/*` requires authenticated tenant identity and still rejects requests in this mode.
+Set `AUTH_DISABLED=true` only for local development.
 
 ## Optional integrations
 

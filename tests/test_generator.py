@@ -171,8 +171,8 @@ def test_cli_template_selects_runtime_and_dependencies(
     main_source = (project / "main.py").read_text()
     service_source = (package / "benchmark_service.py").read_text()
     if template == "vals-ai":
-        assert "from demo_benchmark_service.vals_ai import BenchmarkServiceApp" in main_source
-        assert "from .vals_ai import BenchmarkService" in service_source
+        assert "from demo_benchmark_service.vals_ai import ValsBenchmarkServiceApp" in main_source
+        assert "from .vals_ai import ValsBenchmarkService" in service_source
         assert (package / "vals_ai" / "auth.py").is_file()
         assert (package / "vals_ai" / "trial.py").is_file()
         assert any(dependency.startswith("create-benchmark-service[s3,telemetry]") for dependency in dependencies)

@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 from benchmark_service import ImageSource, Resources, Sandbox
 from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.base import BenchmarkService
-from templates.vals_ai.base import BenchmarkService as ValsBenchmarkService
+from templates.vals_ai.base import ValsBenchmarkService
 from benchmark_service.client import BenchmarkServiceClient
 from benchmark_service.schemas import (
     EvaluateResponseRequest,

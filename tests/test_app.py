@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
 from templates.vals_ai import auth as auth_module
-from templates.vals_ai.app import BenchmarkServiceApp as ValsBenchmarkServiceApp
+from templates.vals_ai.app import ValsBenchmarkServiceApp
 from benchmark_service.app import BenchmarkServiceApp, send_json_if_connected
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
@@ -414,7 +414,7 @@ class TestAuthMiddleware:
         response = auth_client.get("/verify-task-ids", headers={"Authorization": self.AUTH_TOKEN})
         assert response.status_code == 200
 
-    def test_custom_tenant_can_evaluate_on_v1(self, auth_client: TestClient) -> None:
+    def test_custom_tenant_does_not_enable_provider_routes(self, auth_client: TestClient) -> None:
         response = auth_client.post(
             "/v1/evaluate",
             headers={"Authorization": self.AUTH_TOKEN},
@@ -424,8 +424,7 @@ class TestAuthMiddleware:
                 "payload": {"type": "text", "schema": "text.v1", "data": "2"},
             },
         )
-        assert response.status_code == 200
-        assert response.json()["result"] == {"resolved": True}
+        assert response.status_code == 404
 
     def test_health_skips_auth(self, auth_client: TestClient) -> None:
         response = auth_client.get("/health")
@@ -630,13 +629,38 @@ def test_core_app_ignores_hosted_policy_configuration(monkeypatch: pytest.Monkey
     monkeypatch.setenv("DESCOPE_TENANT_ALLOWLIST_JSON", "malformed hosted policy")
     monkeypatch.setenv("BENCHMARK_CATALOG_API_URL", "https://catalog.invalid")
     monkeypatch.setenv("AUTH_REQUIRED", "false")
+    monkeypatch.setenv("GRADING_MAX_CONCURRENCY", "0")
+    monkeypatch.setenv("GRADING_SANDBOX_PROVIDER", "unknown-provider")
+    monkeypatch.setenv("SUBMISSION_ARTIFACT_BUCKET", "unused-hosted-bucket")
+    monkeypatch.setenv("SUBMISSION_ARTIFACT_MAX_DOWNLOAD_BYTES", "invalid")
+    monkeypatch.delenv("AWS_REGION", raising=False)
 
     with TestClient(BenchmarkServiceApp(StubBenchmark)) as client:
         assert client.get("/verify-task-ids").status_code == 200
         response = client.post(
             "/v1/score", json={"run_id": "local-run", "evaluation_results": {}}
         )
-        assert response.status_code == 403
+        assert response.status_code == 404
+
+
+@pytest.mark.parametrize(
+    ("method", "path"),
+    [
+        ("POST", "/v1/evaluate"),
+        ("POST", "/v1/score"),
+        ("POST", "/v1/submissions/upload-url"),
+        ("GET", "/v1/datasets/default/tasks"),
+    ],
+)
+def test_core_app_does_not_expose_provider_routes(client: TestClient, method: str, path: str) -> None:
+    """Keep every provider-facing endpoint out of the standard application.
+
+    Test cases:
+    - Local-development authentication does not make a provider route available.
+    - OpenAPI omits all provider routes.
+    """
+    assert client.request(method, path).status_code == 404
+    assert not any(route.startswith("/v1/") for route in client.get("/openapi.json").json()["paths"])
 
 
 async def test_core_dataset_access_does_not_depend_on_hosted_allowlist() -> None:

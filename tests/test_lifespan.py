@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from templates.vals_ai.app import BenchmarkServiceApp
+from templates.vals_ai.app import ValsBenchmarkServiceApp
 from tests.conftest import ValsStubBenchmark as StubBenchmark
 
 
@@ -14,5 +14,5 @@ def test_lifespan_raises_on_malformed_env_var(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setenv("DESCOPE_TENANT_ALLOWLIST_JSON", "{not valid json")
 
     with pytest.raises(ValueError):
-        with TestClient(BenchmarkServiceApp(StubBenchmark)):
+        with TestClient(ValsBenchmarkServiceApp(StubBenchmark)):
             pass

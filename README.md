@@ -16,7 +16,7 @@ create-benchmark-service <benchmark-name>
 
 Creates a new service in `./<benchmark-name>-benchmark-service/` in your current directory.
 
-Use `--template vals-ai` to include Vals authentication and access policy.
+Use `--template vals-ai` to include Vals authentication, access policy, and the provider-facing `/v1/*` routes.
 
 ```bash
 create-benchmark-service <benchmark-name> --template vals-ai
@@ -102,7 +102,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 - `get_dataset(dataset)` — return the task dictionary for a given dataset name (defaults to `"default"`)
 - `filter_tasks(task_filter, dataset)` — return task IDs matching a list or Python slice notation (e.g. `"0:10:2"`)
 - `validate_task_ids(task_ids, dataset)` — raise `ValueError` if any ID is not in the dataset
-- `list_tasks(dataset)` — return `list[V1Task]` (id, question, timeout) for the lab-facing `GET /v1/datasets/{dataset}/tasks` endpoint. Must be overridden before exposing task listing; the base implementation fails closed to avoid leaking evaluator-only data.
+- `list_tasks(dataset)` — return `list[V1Task]` (id, question, timeout) for the Vals app's `GET /v1/datasets/{dataset}/tasks` endpoint. Must be overridden before exposing task listing; the base implementation fails closed to avoid leaking evaluator-only data.
 - `check_auth(headers)` — boolean auth hook. Override for custom auth that does not need tenant or dataset awareness.
 - `resolve_tenant(headers)` — validate request authorization and return a tenant ID, `"_unauthenticated"` for boolean auth or local development, or `None` to reject.
 - `check_dataset_access(tenant, dataset)` — return whether a resolved tenant may access a dataset.
@@ -125,9 +125,6 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | `GET` | `/retrieve-task/?task_id=…` | Return task metadata for a given task ID (optional `?dataset=…`) |
 | `POST` | `/evaluate-response/` | Evaluate without a sandbox and return one final response |
 | `POST` | `/final-score/` | Aggregate results: `{"evaluation_results": {task_id: result, …}, "dataset": "…"}` |
-| `POST` | `/v1/evaluate` | Lab-facing per-task evaluation (see [v1 Eval API](#v1-eval-api-lab-facing) below) |
-| `POST` | `/v1/score` | Lab-facing run aggregation (see [v1 Eval API](#v1-eval-api-lab-facing) below) |
-| `GET` | `/v1/datasets/{dataset}/tasks` | Lab-facing dataset task list (see [v1 Eval API](#v1-eval-api-lab-facing) below) |
 
 **WebSocket endpoints** (stream `StreamChunk` JSON objects):
 
@@ -194,7 +191,7 @@ Yield these from your generator methods; the framework serialises and forwards t
 
 ### v1 Eval API (lab-facing)
 
-`/v1/evaluate` and `/v1/score` are the lab-facing surface. Text-mode evaluation reuses `evaluate_response`, in-process artifact evaluation passes admitted bytes to `evaluate_artifact`, and sandbox-mode evaluation runs `evaluate_instance`. Scoring reuses `calculate_final_score` for every mode.
+`ValsBenchmarkServiceApp` adds the provider-facing `/v1/evaluate`, `/v1/score`, `/v1/datasets/{dataset}/tasks`, and `/v1/submissions/upload-url` routes. The default `BenchmarkServiceApp` does not register them. Text-mode evaluation reuses `evaluate_response`, in-process artifact evaluation passes admitted bytes to `evaluate_artifact`, and sandbox-mode evaluation runs `evaluate_instance`. Scoring reuses `calculate_final_score` for every mode.
 
 ### In-process artifact evaluation (`eval_mode = IN_PROCESS_ARTIFACT`)
 
@@ -297,7 +294,7 @@ Response:
 
 The service role needs `s3:PutObject` and `s3:GetObject` on `arn:aws:s3:::BUCKET/submission-artifacts/*`, plus `s3:ListBucket` on `arn:aws:s3:::BUCKET` limited to the `submission-artifacts/*` namespace in the deployment policy. The list permission is part of the missing-object contract: [S3 returns 404 for a missing object only when the caller has `s3:ListBucket`](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html#API_HeadObject_Permissions); without it S3 returns 403, which the framework leaves as a permission failure rather than misreporting the object as missing.
 
-**Auth.** `/v1/*` requires authenticated tenant identity from `resolve_tenant()`. Requests using `AUTH_DISABLED=true` or a boolean `check_auth()` override resolve to the `_unauthenticated` sentinel and get 403. The Vals template supplies Descope authentication and tenant/dataset allowlists.
+**Auth.** The Vals `/v1/*` routes require Descope authentication and tenant/dataset allowlists. Requests using `AUTH_DISABLED=true` or a boolean `check_auth()` override resolve to the `_unauthenticated` sentinel and get 403.
 
 **`GET /v1/datasets/{dataset}/tasks`** — return the dataset's task list. Uses the same tenant authentication and `check_dataset_access()` gate as the rest of `/v1/*`. Response:
 
@@ -376,7 +373,7 @@ For process-scoped credentials, call `sandbox.command(..., env_vars={...})`. Pro
 
 The framework authenticates every HTTP request except `/health`, and every WebSocket route before sandbox provider config is used.
 
-For services generated with `--template vals-ai`, set `DESCOPE_PROJECT_ID` and a tenant + dataset allowlist. Requests must include a valid Descope access key in `X-Descope-Api-Key`. The key must be scoped to exactly one Descope tenant, and that tenant must appear in the service allowlist. Leave `AUTH_DISABLED` unset for hosted services.
+Services generated with `--template vals-ai` use `ValsBenchmarkService` and `ValsBenchmarkServiceApp`, which inherit the shared framework classes. Set `DESCOPE_PROJECT_ID` and a tenant + dataset allowlist. Requests must include a valid Descope access key in `X-Descope-Api-Key`. The key must be scoped to exactly one Descope tenant, and that tenant must appear in the service allowlist. Leave `AUTH_DISABLED` unset for hosted services.
 
 The allowlist is loaded in this order:
 
@@ -423,7 +420,7 @@ Counter updates are atomic across service processes and are not retried because 
 
 After the configured limit is reached, HTTP routes return 429 with `Retry-After` and WebSocket routes close with code `1008`. Missing counter configuration fails service startup instead of silently disabling enforcement.
 
-The default template rejects requests until you implement authentication. Set `AUTH_DISABLED=true` only for local development; `/v1/*` still returns 403 in this mode.
+The default template rejects requests until you implement authentication. Set `AUTH_DISABLED=true` only for local development. The default app has no `/v1/*` routes.
 
 Override `check_auth()` in your `BenchmarkService` subclass for boolean authentication on the internal HTTP and WebSocket routes:
 
@@ -437,7 +434,7 @@ class MyBenchmarkService(BenchmarkService):
     # ... other abstract methods
 ```
 
-For tenant-aware authentication, including `/v1/*`, override `resolve_tenant()` and return a tenant ID. Override `check_dataset_access()` to restrict which datasets a tenant can use:
+For tenant-aware authentication on the shared routes, override `resolve_tenant()` and return a tenant ID. Override `check_dataset_access()` to restrict which datasets a tenant can use:
 
 ```python
 from benchmark_service import BenchmarkService

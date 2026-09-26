@@ -1,6 +1,6 @@
 """Vals hosted policy copied into a generated benchmark service."""
 
-from .app import BenchmarkServiceApp
-from .base import BenchmarkService
+from .app import ValsBenchmarkServiceApp
+from .base import ValsBenchmarkService
 
-__all__ = ["BenchmarkService", "BenchmarkServiceApp"]
+__all__ = ["ValsBenchmarkService", "ValsBenchmarkServiceApp"]

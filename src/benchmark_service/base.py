@@ -57,7 +57,7 @@ class BenchmarkService(ABC):
     dataset_versions_file: ClassVar[Path | None] = None
     dataset_versions: dict[str, DatasetVersionEntry]
 
-    # How /v1/evaluate grades this benchmark. The framework reads this at boot
+    # How /v1/evaluate grades this benchmark. The Vals app reads this at boot
     # and per dispatch, so it is class state, not a per-instance value.
     eval_mode: ClassVar[EvalMode] = EvalMode.TEXT
     accepted_submission_schemas: ClassVar[dict[V1PayloadType, frozenset[str]]] = {}
@@ -146,8 +146,8 @@ class BenchmarkService(ABC):
     async def resolve_tenant(self, headers: dict[str, str]) -> str | None:
         """Authenticate the caller and return their tenant id, or None to reject.
 
-        A boolean ``check_auth`` override preserves access to the original
-        endpoints. Override this method to return an identity for ``/v1``.
+        A boolean ``check_auth`` override authenticates without a tenant identity.
+        Override this method to support tenant-aware dataset access.
         """
         if type(self).check_auth is not BenchmarkService.check_auth:
             ok = await self.check_auth(headers)

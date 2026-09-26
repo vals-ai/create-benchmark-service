@@ -19,7 +19,7 @@ from templates.vals_ai.auth import (
     resolve_caller_tenant,
     resolve_descope_tenant,
 )
-from templates.vals_ai.base import BenchmarkService
+from templates.vals_ai.base import ValsBenchmarkService
 from benchmark_service.schemas import (
     EvaluateResponseRequest,
     FinalScoreResult,
@@ -150,7 +150,7 @@ def test_require_supported_auth_config_allows_descope_deploys(
     require_supported_auth_config()
 
 
-class _BareBenchmark(BenchmarkService):
+class _BareBenchmark(ValsBenchmarkService):
     """Service that uses the framework's default tenant resolution."""
 
     async def load_datasets(self) -> dict[str, dict[str, Any]]:

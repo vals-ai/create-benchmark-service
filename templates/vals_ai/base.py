@@ -3,19 +3,19 @@
 from typing import Any
 
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL
-from benchmark_service.base import BenchmarkService as CoreBenchmarkService
+from benchmark_service.base import BenchmarkService
 
 from .auth import check_benchmark_service_auth, get_tenant_config, resolve_caller_tenant
 
 
-class BenchmarkService(CoreBenchmarkService):
+class ValsBenchmarkService(BenchmarkService):
     """Apply Vals tenant authentication and dataset access rules."""
 
     async def check_auth(self, headers: dict[str, str]) -> bool:
         return await check_benchmark_service_auth(headers)
 
     async def resolve_tenant(self, headers: dict[str, str]) -> str | None:
-        if type(self).check_auth is not BenchmarkService.check_auth:
+        if type(self).check_auth is not ValsBenchmarkService.check_auth:
             ok = await self.check_auth(headers)
             return UNAUTHENTICATED_TENANT_SENTINEL if ok else None
         return await resolve_caller_tenant(headers)

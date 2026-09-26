@@ -10,7 +10,7 @@ from fastapi.testclient import TestClient
 
 from templates.vals_ai import auth as auth_module
 from benchmark_service import submission_artifacts
-from templates.vals_ai.app import BenchmarkServiceApp
+from templates.vals_ai.app import ValsBenchmarkServiceApp
 from templates.vals_ai.auth import clear_allowlist_cache, clear_auth_cache
 from tests.conftest import ValsStubBenchmark as StubBenchmark
 
@@ -44,7 +44,7 @@ def _descope_client(
         json.dumps({"tenants": {tenant: tenant_config}}),
     )
     _install_signed_url_stub(monkeypatch)
-    app = BenchmarkServiceApp(service_cls)
+    app = ValsBenchmarkServiceApp(service_cls)
 
     async def _stub_exchange(_project_id: str, _access_key: str) -> dict[str, dict[str, dict[str, str]]]:
         return {"tenants": {tenant: {}}}
@@ -183,7 +183,7 @@ def test_upload_url_is_denied_when_auth_is_disabled(monkeypatch: pytest.MonkeyPa
     monkeypatch.setenv("AUTH_DISABLED", "true")
     _install_signed_url_stub(monkeypatch)
 
-    with TestClient(BenchmarkServiceApp(StubBenchmark)) as client:
+    with TestClient(ValsBenchmarkServiceApp(StubBenchmark)) as client:
         resp = client.post(
             "/v1/submissions/upload-url",
             json={"run_id": "run-1", "task_id": "task-1", "dataset": "default", "filename": "submission.xlsx"},

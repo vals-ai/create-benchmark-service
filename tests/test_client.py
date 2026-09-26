@@ -31,7 +31,7 @@ from benchmark_service.client import (
 )
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
-from benchmark_service.schemas import HealthCheckResponse, RetrieveTaskResponse
+from benchmark_service.schemas import BenchmarkEgressPlan, EgressPolicy, HealthCheckResponse, RetrieveTaskResponse
 from benchmark_service.v1_schemas import (
     V1DatasetTasksResponse,
     V1EvalResponse,
@@ -111,6 +111,8 @@ def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "e
                 "problem_path": "/tmp/problem_statement.txt",
                 "cwd": "/work",
                 "resources": {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None},
+                "agent_install_order": "before_setup",
+                "egress": {"setup_task": "*", "run": None, "evaluation": "*"},
                 "agent_timeout": None,
                 "eval_sandbox": None,
                 "sandbox_recovery": None,
@@ -165,6 +167,89 @@ async def test_retrieve_task_accepts_legacy_shape(
     assert result.source.model_dump() == {"type": "image", "image": "python:3.12"}
     assert result.model_dump()["docker_image"] == "python:3.12"
     assert result.resources.model_dump() == {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None}
+    assert result.agent_install_order == "before_setup"
+    assert result.egress.model_dump() == {"setup_task": "*", "run": None, "evaluation": "*"}
+
+
+async def test_retrieve_task_accepts_explicit_agent_install_order(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    payload = _task_response().model_dump(mode="json")
+    payload["agent_install_order"] = "after_setup"
+    mock_http.get = AsyncMock(return_value=_mock_response(json_data=payload))
+
+    result = await client.retrieve_task("task-1")
+
+    assert result.agent_install_order == "after_setup"
+
+
+async def test_retrieve_task_accepts_explicit_egress_policies(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    payload = _task_response().model_dump(mode="json")
+    payload["egress"] = {
+        "setup_task": [],
+        "run": ["api.openai.com"],
+        "evaluation": [],
+    }
+    mock_http.get = AsyncMock(return_value=_mock_response(json_data=payload))
+
+    result = await client.retrieve_task("task-1")
+
+    assert result.egress.model_dump() == payload["egress"]
+
+
+def test_retrieve_task_rejects_invalid_agent_install_order() -> None:
+    payload = _task_response().model_dump(exclude={"docker_image"})
+    payload["agent_install_order"] = "during_setup"
+
+    with pytest.raises(ValidationError):
+        RetrieveTaskResponse.model_validate(payload)
+
+
+@pytest.mark.parametrize(
+    ("setup_task", "run", "evaluation"),
+    [
+        ("*", None, "*"),
+        ("*", "*", "*"),
+        ([], [], ["api.openai.com", "203.0.113.10/32"]),
+        (["setup.example.com"], ["run.example.com"], []),
+    ],
+)
+def test_benchmark_egress_plan_serializes_explicit_stage_policies(
+    setup_task: EgressPolicy,
+    run: EgressPolicy | None,
+    evaluation: EgressPolicy,
+) -> None:
+    plan = BenchmarkEgressPlan(setup_task=setup_task, run=run, evaluation=evaluation)
+
+    assert plan.model_dump() == {
+        "setup_task": setup_task,
+        "run": run,
+        "evaluation": evaluation,
+    }
+
+
+@pytest.mark.parametrize("policy", ["api.openai.com", None, ["api.openai.com", 1]])
+def test_benchmark_egress_plan_rejects_invalid_policies(policy: object) -> None:
+    with pytest.raises(ValidationError):
+        BenchmarkEgressPlan.model_validate({"setup_task": policy})
+
+
+@pytest.mark.parametrize("policy", ["api.openai.com", ["api.openai.com", 1]])
+def test_benchmark_egress_plan_rejects_invalid_run_policies(policy: object) -> None:
+    with pytest.raises(ValidationError):
+        BenchmarkEgressPlan.model_validate({"run": policy})
+
+
+def test_retrieve_task_rejects_null_egress_plan() -> None:
+    payload = _task_response().model_dump(exclude={"docker_image", "egress"})
+    payload["egress"] = None
+
+    with pytest.raises(ValidationError):
+        RetrieveTaskResponse.model_validate(payload)
 
 
 async def test_retrieve_task_accepts_sandbox_recovery_policy(

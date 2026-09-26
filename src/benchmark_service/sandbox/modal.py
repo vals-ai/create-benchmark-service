@@ -393,7 +393,11 @@ class ModalSandbox(Sandbox):
         except ModalError as exc:
             raise _sandbox_error(exc) from exc
 
-    async def _set_outbound_network_policy(self, cidrs: list[str], domains: list[str]) -> None:
+    async def _set_outbound_network_policy(
+        self,
+        cidrs: list[str] | None,
+        domains: list[str] | None,
+    ) -> None:
         try:
             set_policy = cast(Any, self._sandbox)._experimental_set_outbound_network_policy
             await cast(
@@ -434,8 +438,11 @@ for domain in {domains_to_resolve!r}:
         cidrs = list(dict.fromkeys([*cidrs, *await self._resolve_domain_cidrs(domains)]))
         await self._set_outbound_network_policy(cidrs, domains)
 
+    async def block_all_egress(self) -> None:
+        await self._set_outbound_network_policy([], [])
+
     async def clear_egress_rules(self) -> None:
-        await self._set_outbound_network_policy(list(_ALLOW_ALL_CIDRS), list(_ALLOW_ALL_DOMAINS))
+        await self._set_outbound_network_policy(None, None)
 
 
 class ModalSandboxProvider(SandboxProvider):

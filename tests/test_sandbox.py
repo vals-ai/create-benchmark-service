@@ -751,6 +751,7 @@ class RecordingSandbox(Sandbox):
         self.uploads: list[tuple[str, bytes]] = []
         self.downloads: list[str] = []
         self.allowed_addresses: list[str] | None = None
+        self.egress_blocked = False
         self.egress_cleared = False
         self.exec_results = exec_results or []
 
@@ -794,8 +795,16 @@ class RecordingSandbox(Sandbox):
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
         self.allowed_addresses = allowed_addresses
 
+    async def block_all_egress(self) -> None:
+        self.egress_blocked = True
+
     async def clear_egress_rules(self) -> None:
         self.egress_cleared = True
+
+
+async def test_sandbox_block_all_egress_defaults_to_unsupported() -> None:
+    with pytest.raises(SandboxError, match="does not support blocking all egress"):
+        await Sandbox.block_all_egress(RecordingSandbox())
 
 
 class InnerSandbox:
@@ -2107,6 +2116,7 @@ async def test_compose_sandbox_routes_operations_through_main_service() -> None:
     Test cases:
     - ComposeSource stores the DinD outer source and service name.
     - exec, command, upload, and download route through docker compose service `main`.
+    - Egress operations forward to the outer sandbox.
     """
     source = ComposeSource(
         outer=ImageSource(image="docker:28.3.3-dind"),
@@ -2129,6 +2139,7 @@ async def test_compose_sandbox_routes_operations_through_main_service() -> None:
     await sandbox.upload_file("/workspace/instruction.md", b"solve it")
     downloaded = await sandbox.download_file("/workspace/reward.json")
     await sandbox.modify_egress_rules(["api.openai.com"])
+    await sandbox.block_all_egress()
     await sandbox.clear_egress_rules()
 
     assert source.service == "main"
@@ -2152,6 +2163,7 @@ async def test_compose_sandbox_routes_operations_through_main_service() -> None:
     assert outer.command_env_vars == [{"AGENT_SECRET": secret}]
     assert secret not in outer.exec_commands[1]
     assert outer.allowed_addresses == ["api.openai.com"]
+    assert outer.egress_blocked
     assert outer.egress_cleared
     upload_temp = outer.uploads[0][0]
     download_temp = outer.downloads[0]
@@ -4093,8 +4105,8 @@ async def test_daytona_updates_egress_rules() -> None:
     Test cases:
     - Domain entries use Daytona's domain allowlist.
     - CIDR and IPv4 entries use Daytona's network allowlist.
-    - Mixed domain and CIDR entries fail before the provider request.
-    - Clearing egress rules clears both allowlist fields.
+    - Empty, mixed-domain/CIDR allowlists fail before the provider request.
+    - Block-all and unrestricted policies use Daytona's native network flag.
     """
     inner = InnerSandbox()
     sandbox = DaytonaSandbox(cast(Any, inner))
@@ -4102,7 +4114,7 @@ async def test_daytona_updates_egress_rules() -> None:
     await sandbox.modify_egress_rules(["https://api.openai.com/v1", "github.com"])
 
     assert inner.network_settings[-1] == {
-        "network_block_all": None,
+        "network_block_all": False,
         "network_allow_list": "",
         "domain_allow_list": "api.openai.com,github.com",
     }
@@ -4110,16 +4122,34 @@ async def test_daytona_updates_egress_rules() -> None:
     await sandbox.modify_egress_rules(["198.51.100.20/32", "203.0.113.10"])
 
     assert inner.network_settings[-1] == {
-        "network_block_all": None,
+        "network_block_all": False,
         "network_allow_list": "198.51.100.20/32,203.0.113.10/32",
         "domain_allow_list": "",
     }
 
     request_count = len(inner.network_settings)
+    with pytest.raises(ValueError, match="allowed addresses cannot be empty"):
+        await sandbox.modify_egress_rules([])
     with pytest.raises(ValueError, match="allowed addresses cannot mix domains and CIDRs"):
         await sandbox.modify_egress_rules(["https://api.openai.com/v1", "198.51.100.20/32"])
 
     assert len(inner.network_settings) == request_count
+
+    await sandbox.block_all_egress()
+
+    assert inner.network_settings[-1] == {
+        "network_block_all": True,
+        "network_allow_list": None,
+        "domain_allow_list": None,
+    }
+
+    await sandbox.modify_egress_rules(["api.openai.com"])
+
+    assert inner.network_settings[-1] == {
+        "network_block_all": False,
+        "network_allow_list": "",
+        "domain_allow_list": "api.openai.com",
+    }
 
     await sandbox.clear_egress_rules()
 

@@ -16,7 +16,6 @@ from benchmark_service import submission_artifacts
 from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_required
 from benchmark_service.grading import SUBMISSION_ARTIFACT_SANDBOX_PATH, collapse_stream, evaluate_submission
-from benchmark_service.observability import bind_request_context
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.sandbox import (
     DaytonaProviderConfig,
@@ -342,8 +341,8 @@ class ValsBenchmarkServiceApp(BenchmarkServiceApp):
         return response
 
     async def _v1_evaluate(self, request: Request, body: V1EvalRequest) -> V1EvalResponse:
-        if self._sentry_enabled:
-            bind_request_context(request.headers, run_id=body.run_id, task_id=body.task_id, dataset=body.dataset)
+        if self._sentry is not None:
+            self._sentry.bind_request_context(request.headers, run_id=body.run_id, task_id=body.task_id, dataset=body.dataset)
         tenant = cast(str, request.state.tenant)
         _require_authenticated_tenant(tenant)
         if not await self.service.check_dataset_access(tenant, body.dataset):
@@ -515,8 +514,8 @@ class ValsBenchmarkServiceApp(BenchmarkServiceApp):
         return self.project_eval_response(tenant, response)
 
     async def _v1_submission_upload_url(self, request: Request, body: V1UploadUrlRequest) -> V1UploadUrlResponse:
-        if self._sentry_enabled:
-            bind_request_context(request.headers, run_id=body.run_id, task_id=body.task_id, dataset=body.dataset)
+        if self._sentry is not None:
+            self._sentry.bind_request_context(request.headers, run_id=body.run_id, task_id=body.task_id, dataset=body.dataset)
         tenant = cast(str, request.state.tenant)
         _require_authenticated_tenant(tenant)
         if not submission_artifacts.is_configured():
@@ -545,8 +544,8 @@ class ValsBenchmarkServiceApp(BenchmarkServiceApp):
         )
 
     async def _v1_score(self, request: Request, body: V1ScoreRequest) -> V1ScoreResponse:
-        if self._sentry_enabled:
-            bind_request_context(request.headers, run_id=body.run_id, dataset=body.dataset)
+        if self._sentry is not None:
+            self._sentry.bind_request_context(request.headers, run_id=body.run_id, dataset=body.dataset)
         _require_authenticated_tenant(request.state.tenant)
         if not await self.service.check_dataset_access(request.state.tenant, body.dataset):
             raise HTTPException(status_code=403, detail="Dataset not allowed")
@@ -565,8 +564,8 @@ class ValsBenchmarkServiceApp(BenchmarkServiceApp):
         return self.project_score_response(request.state.tenant, response)
 
     async def _v1_list_dataset_tasks(self, request: Request, dataset: str) -> V1DatasetTasksResponse:
-        if self._sentry_enabled:
-            bind_request_context(request.headers, dataset=dataset)
+        if self._sentry is not None:
+            self._sentry.bind_request_context(request.headers, dataset=dataset)
         _require_authenticated_tenant(request.state.tenant)
         if not await self.service.check_dataset_access(request.state.tenant, dataset):
             raise HTTPException(status_code=403, detail=f"Dataset={dataset} access not allowed")

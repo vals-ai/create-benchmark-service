@@ -19,12 +19,12 @@ from benchmark_service.auth import (
 )
 from benchmark_service.dataset_versioning import DatasetVersionEntry, load_dataset_versions
 from benchmark_service.sandbox import Sandbox
-from benchmark_service.submission_artifacts import MaterializedSubmissionArtifact
 from benchmark_service.schemas import (
     EvalMode,
     EvaluateResponseRequest,
     FinalScoreResult,
     GradingSubmission,
+    MaterializedSubmissionArtifact,
     RetrieveTaskResponse,
     StreamChunk,
     StreamResultChunk,

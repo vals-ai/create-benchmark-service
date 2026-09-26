@@ -7,15 +7,19 @@ import re
 import tempfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from functools import lru_cache, partial
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, cast
+from typing import Protocol, cast
 
-if TYPE_CHECKING:
-    from botocore.exceptions import ClientError
+import boto3
+from botocore.config import Config
+from botocore.exceptions import ClientError
 
 from benchmark_service.blocking import run_blocking
+from benchmark_service.schemas import (
+    MaterializedSubmissionArtifact as MaterializedSubmissionArtifact,
+    SubmissionArtifactReference as SubmissionArtifactReference,
+)
 from benchmark_service.v1_schemas import KEY_SEGMENT_PATTERN
 
 DEFAULT_UPLOAD_EXPIRY_S = 3600
@@ -42,23 +46,6 @@ class SubmissionArtifactChanged(Exception):
 
 class SubmissionArtifactTooLarge(Exception):
     """The uploaded object exceeds the configured download size limit."""
-
-
-@dataclass(frozen=True, slots=True)
-class SubmissionArtifactReference:
-    """Immutable identity captured when a submission artifact is admitted."""
-
-    key: str
-    size_bytes: int
-    etag: str
-
-
-@dataclass(frozen=True, slots=True)
-class MaterializedSubmissionArtifact:
-    """Framework-owned local copy of one admitted submission artifact."""
-
-    path: Path
-    reference: SubmissionArtifactReference
 
 
 class _StreamingBody(Protocol):
@@ -99,16 +86,6 @@ def _artifact_bucket() -> str:
 
 @lru_cache(maxsize=1)
 def _s3_client() -> _S3Client:
-    try:
-        import boto3
-        from botocore.config import Config
-    except ModuleNotFoundError as exc:
-        if exc.name not in {"boto3", "botocore"}:
-            raise
-        raise ModuleNotFoundError(
-            "Submission artifact storage requires the vals-ai extra: uv add 'create-benchmark-service[vals-ai]'"
-        ) from exc
-
     region = os.environ.get(SUBMISSION_ARTIFACT_REGION_ENV)
     if not region:
         raise RuntimeError(
@@ -230,7 +207,6 @@ def _stat_sync(key: str, tenant: str) -> SubmissionArtifactReference:
     _require_tenant_key(key, tenant)
     bucket = _artifact_bucket()
     client = _s3_client()
-    from botocore.exceptions import ClientError
 
     try:
         response = client.head_object(Bucket=bucket, Key=key)
@@ -249,7 +225,6 @@ def _download_sync(reference: SubmissionArtifactReference, tenant: str) -> bytes
     _require_etag(reference.etag, reference.key)
     bucket = _artifact_bucket()
     client = _s3_client()
-    from botocore.exceptions import ClientError
 
     try:
         response = client.get_object(Bucket=bucket, Key=reference.key, IfMatch=reference.etag)
@@ -275,7 +250,6 @@ def _materialize_sync(
     _require_etag(reference.etag, reference.key)
     bucket = _artifact_bucket()
     client = _s3_client()
-    from botocore.exceptions import ClientError
 
     try:
         response = client.get_object(Bucket=bucket, Key=reference.key, IfMatch=reference.etag)

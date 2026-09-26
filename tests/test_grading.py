@@ -29,7 +29,7 @@ from benchmark_service import (
     VolumeMount,
 )
 from templates.vals_ai import auth as auth_module
-from benchmark_service import grading
+from benchmark_service import grading, submission_artifacts
 from templates.vals_ai.app import (
     ValsBenchmarkServiceApp,
     _DuplicateGradingRequest,
@@ -579,7 +579,7 @@ async def test_grade_instance_maps_missing_artifact_to_error(monkeypatch: pytest
     async def missing_download(reference: SubmissionArtifactReference, *, tenant: str) -> bytes:
         raise SubmissionArtifactNotFound(f"no artifact was uploaded for key {reference.key}")
 
-    monkeypatch.setattr(grading.submission_artifacts, "download", missing_download)
+    monkeypatch.setattr(submission_artifacts, "download", missing_download)
     service = await ArtifactSandboxStub.create()
     provider = FakeProvider(FakeSandbox())
     resp = await _grade(
@@ -1594,19 +1594,19 @@ async def test_canceled_artifact_storage_worker_keeps_grading_admission(
         raise RuntimeError("late artifact storage failure")
 
     if operation == "stat":
-        monkeypatch.setattr(grading.submission_artifacts, "_stat_sync", blocking_stat)
+        monkeypatch.setattr(submission_artifacts, "_stat_sync", blocking_stat)
     elif operation == "download":
-        monkeypatch.setattr(grading.submission_artifacts, "_download_sync", blocking_download)
+        monkeypatch.setattr(submission_artifacts, "_download_sync", blocking_download)
     else:
-        monkeypatch.setattr(grading.submission_artifacts, "_materialize_sync", blocking_materialize)
+        monkeypatch.setattr(submission_artifacts, "_materialize_sync", blocking_materialize)
 
     async def run_storage_operation() -> None:
         if operation == "stat":
-            await grading.submission_artifacts.stat(key, tenant="acme")
+            await submission_artifacts.stat(key, tenant="acme")
         elif operation == "download":
-            await grading.submission_artifacts.download(reference, tenant="acme")
+            await submission_artifacts.download(reference, tenant="acme")
         else:
-            async with grading.submission_artifacts.materialize(reference, tenant="acme"):
+            async with submission_artifacts.materialize(reference, tenant="acme"):
                 pytest.fail("failed materialization must not yield")
 
     admission = _GradingAdmission(

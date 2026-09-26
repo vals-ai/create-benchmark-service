@@ -40,10 +40,10 @@ from benchmark_service.observability import (
     RUN_ID_HEADER,
     TASK_ID_HEADER,
     correlation_scope,
-    init_sentry,
     request_headers,
 )
 from benchmark_service.schemas import EvaluateResponseRequest
+from benchmark_service.sentry import init_sentry
 from tests.conftest import StubBenchmark
 
 

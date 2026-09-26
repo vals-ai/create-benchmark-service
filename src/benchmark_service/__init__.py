@@ -44,10 +44,11 @@ from benchmark_service.schemas import (
     ArtifactGradingSubmission,
     EvalMode,
     GradingSubmission,
+    MaterializedSubmissionArtifact,
     SandboxRecoveryPolicy,
+    SubmissionArtifactReference,
     TextGradingSubmission,
 )
-from benchmark_service.submission_artifacts import MaterializedSubmissionArtifact, SubmissionArtifactReference
 
 __all__ = [
     "BenchmarkServiceApp",

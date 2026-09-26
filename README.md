@@ -146,8 +146,35 @@ Provider compatibility notes:
 - Daytona uses `TargetedSnapshotSource(snapshot=..., target=...)` to select the target for admission and creation. Admission uses the snapshot's CPU, memory, disk, and sandbox class with the exact target's organization-usage row; GPU snapshots retain unmetered GPU admission. Its legacy `docker_image` value is intentionally invalid because that field cannot preserve the target.
 - Modal sandboxes do not expose a disk-size parameter; `Resources.disk` is accepted for schema compatibility but not enforced.
 - GPUs are requested via `Resources.gpu` (count) and `Resources.gpu_type`. Modal requires `gpu_type` (any Modal GPU name, e.g. `H100`, `A100-80GB`, `T4`) and passes `"<type>:<count>"` to the sandbox. Daytona accepts a count with an optional type restricted to its `GpuType` enum (`H100`, `H200`, `RTX-PRO-6000`, `RTX-4090`, `RTX-5090`); GPU requests are rejected for Daytona snapshot sandboxes because snapshot resources are fixed at snapshot creation.
-- Nested Docker (Docker-in-Docker) capability is granted on every sandbox for both providers — Daytona supports it natively and the Modal adapter requests it unconditionally — so benchmarks never configure it. The benchmark service still owns the Docker-capable image, dockerd startup flags, compose workflow, and cleanup.
+- Nested Docker (Docker-in-Docker) capability is granted on every sandbox for Daytona and Modal — Daytona supports it natively and the Modal adapter requests it unconditionally — so benchmarks never configure it. The benchmark service still owns the Docker-capable image, dockerd startup flags, compose workflow, and cleanup.
 - Transient Modal connection errors are retried up to three attempts, matching the Daytona adapter's provider-level retry shape. Non-transient command failures still surface as `SandboxCommandError` with the command exit code.
+
+### Local Docker sandboxes
+
+Local Tracker, executor, and benchmark-service processes need access to the same Docker daemon.
+Task containers do not receive the Docker socket or host-directory mounts.
+
+Select the provider with `{"type": "docker"}`. Set `DOCKER_HOST` to override the
+Docker context or detected local socket. For sandbox grading, also set
+`GRADING_SANDBOX_PROVIDER=docker`.
+
+Docker supports image sources whose images provide `/bin/sh` and `setsid --wait`.
+CPU and memory limits are enforced. `Resources.disk` is accepted but does not set a
+filesystem quota. `auto_stop_interval` is accepted but does not set an idle timer; callers
+must delete containers after use and reconcile abandoned containers after restarting. Listing
+and deletion include only containers marked as managed by this provider.
+
+Commands stream output and preserve exit codes. Timeouts and cancelled streams terminate
+the command's process group. File upload and download support binary data. Network access
+can be disabled with `network_block_all`; address allowlists are unsupported. Docker also
+rejects snapshots, Compose, GPUs, persistent volumes, and provider-managed secrets.
+
+Run the local provider checks:
+
+```bash
+DOCKER_HOST=unix:///var/run/docker.sock \
+  uv run pytest tests/integration/test_docker_sandbox.py
+```
 
 Benchmark services can send `eval_resume_state` updates to the tracker while evaluation is running. The tracker stores the latest value and sends it back on eval-only retry, so the benchmark service can continue evaluation without recreating the original agent sandbox.
 

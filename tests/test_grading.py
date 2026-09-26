@@ -28,16 +28,16 @@ from benchmark_service import (
     TargetedSnapshotSource,
     VolumeMount,
 )
-from benchmark_service import auth as auth_module
+from templates.vals_ai import auth as auth_module
 from benchmark_service import grading
+from templates.vals_ai.app import BenchmarkServiceApp
 from benchmark_service.app import (
-    BenchmarkServiceApp,
     _DuplicateGradingRequest,
     _GradingAdmission,
     _GradingCapacityExceeded,
     _grading_provider_config,
 )
-from benchmark_service.auth import clear_allowlist_cache, clear_auth_cache
+from templates.vals_ai.auth import clear_allowlist_cache, clear_auth_cache
 from benchmark_service.grading import (
     SUBMISSION_ARTIFACT_SANDBOX_PATH,
     collapse_stream,
@@ -61,7 +61,7 @@ from benchmark_service.submission_artifacts import (
     SubmissionArtifactReference,
 )
 from benchmark_service.v1_schemas import V1EvalRequest, V1EvalStatus, V1Payload, V1PayloadType
-from tests.conftest import StubBenchmark
+from tests.conftest import ValsStubBenchmark as StubBenchmark
 
 
 class FakeSandbox(Sandbox):
@@ -1503,7 +1503,7 @@ async def test_v1_evaluate_orders_reservation_quota_queue_and_artifact_preflight
         if quota_calls == 2:
             queued_quota_consumed.set()
 
-    app._consume_evaluation_quota = consume_quota  # pyright: ignore[reportPrivateUsage]
+    app.consume_evaluation_request = consume_quota
 
     async def evaluate(run_id: str) -> Any:
         request = Request({"type": "http"})

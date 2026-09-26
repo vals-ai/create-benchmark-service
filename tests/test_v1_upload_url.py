@@ -8,11 +8,11 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
-from benchmark_service import auth as auth_module
+from templates.vals_ai import auth as auth_module
 from benchmark_service import submission_artifacts
-from benchmark_service.app import BenchmarkServiceApp
-from benchmark_service.auth import clear_allowlist_cache, clear_auth_cache
-from tests.conftest import StubBenchmark
+from templates.vals_ai.app import BenchmarkServiceApp
+from templates.vals_ai.auth import clear_allowlist_cache, clear_auth_cache
+from tests.conftest import ValsStubBenchmark as StubBenchmark
 
 
 def _install_signed_url_stub(monkeypatch: pytest.MonkeyPatch) -> None:

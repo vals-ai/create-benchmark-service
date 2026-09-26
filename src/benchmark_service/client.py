@@ -748,7 +748,7 @@ class BenchmarkServiceClient:
     async def list_tasks(self, dataset: str) -> V1DatasetTasksResponse:
         """Fetch a dataset's task list via the lab-facing /v1/ surface.
 
-        Auth headers (Descope) are taken from self._headers as set at
+        Auth headers are taken from self._headers as set at
         construction. Server returns 403 for unauthorized datasets, 404 for
         unknown datasets, and 501 when the benchmark has not implemented task
         listing.
@@ -807,7 +807,7 @@ class BenchmarkServiceClient:
         dataset: str | None = None,
         versions: V1Versions | None = None,
     ) -> V1EvalResponse:
-        """Evaluate via the lab-facing /v1/evaluate surface (Descope-authenticated).
+        """Evaluate via the /v1/evaluate surface with caller-supplied authentication.
 
         payload_data is either inline text or an uploaded artifact key, as
         selected by payload_type. Transport failures are not retried because

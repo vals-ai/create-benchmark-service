@@ -15,6 +15,28 @@ Edit `src/{{ benchmark_package }}/benchmark_service.py` and implement the six ab
 
 `setup_task` and `evaluate_instance` are async generators — yield `StreamMessageChunk`, `StreamErrorChunk`, and finally `StreamResultChunk`.
 
+## Authentication
+
+{% if template == "vals-ai" %}
+This service includes the Vals layer in `src/{{ benchmark_package }}/vals_ai/`. The generated service uses it for Descope authentication, tenant/dataset access, trial response filtering, and evaluation quotas.
+
+Set `DESCOPE_PROJECT_ID` and configure access through `BENCHMARK_CATALOG_API_URL` plus `SERVICE_NAME`, `DESCOPE_TENANT_ALLOWLIST_JSON`, or `DESCOPE_ALLOWLIST_PATH`. Hosted requests require a Descope access key in `X-Descope-Api-Key`. Quota-enabled services also require `SERVICE_NAME` and `EVALUATION_QUOTA_TABLE_NAME`.
+
+The Vals files belong to this service. Updating the framework dependency does not update these copied files.
+{% else %}
+This service contains no Vals authentication or access-policy code. Implement `check_auth()` for boolean authentication, or `resolve_tenant()` and `check_dataset_access()` for tenant-aware access. The default rejects unauthenticated requests.
+{% endif %}
+
+Set `AUTH_DISABLED=true` only for local development. `/v1/*` requires authenticated tenant identity and still rejects requests in this mode.
+
+## Optional integrations
+
+Add `daytona`, `modal`, `s3`, or `telemetry` extras to the `create-benchmark-service` dependency in `pyproject.toml` when needed. Keep its generated Git URL and version pin. For example, `create-benchmark-service[daytona]` enables Daytona sandboxes. `s3` enables submission storage; `telemetry` enables Sentry and OpenTelemetry.
+{% if template == "vals-ai" %}
+
+This template already selects `s3` and `telemetry`. Add a sandbox provider extra for benchmarks that use sandboxes.
+{% endif %}
+
 ## Development
 
 ```bash

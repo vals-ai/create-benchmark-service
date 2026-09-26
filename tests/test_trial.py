@@ -8,11 +8,11 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
-from benchmark_service import auth as auth_module
-from benchmark_service.auth import clear_allowlist_cache, clear_auth_cache
-from benchmark_service.app import BenchmarkServiceApp
+from templates.vals_ai import auth as auth_module
+from templates.vals_ai.auth import clear_allowlist_cache, clear_auth_cache
+from templates.vals_ai.app import BenchmarkServiceApp
 from benchmark_service.schemas import EvaluateResponseRequest, FinalScoreResult
-from benchmark_service.trial import (
+from templates.vals_ai.trial import (
     sanitize_v1_eval_response,
     sanitize_v1_score_response,
 )
@@ -22,7 +22,7 @@ from benchmark_service.v1_schemas import (
     V1ScoreResponse,
     V1Task,
 )
-from tests.conftest import StubBenchmark
+from tests.conftest import ValsStubBenchmark as StubBenchmark
 
 
 def _project(result: Any) -> dict[str, Any]:

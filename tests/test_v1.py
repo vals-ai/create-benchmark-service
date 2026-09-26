@@ -9,9 +9,9 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, ValidationError
 
-from benchmark_service import auth as auth_module
-from benchmark_service.app import BenchmarkServiceApp
-from benchmark_service.auth import clear_allowlist_cache, clear_auth_cache
+from templates.vals_ai import auth as auth_module
+from templates.vals_ai.app import BenchmarkServiceApp
+from templates.vals_ai.auth import clear_allowlist_cache, clear_auth_cache
 from benchmark_service.schemas import FinalScoreResult
 from benchmark_service.v1_schemas import (
     V1DatasetTasksResponse,
@@ -23,7 +23,7 @@ from benchmark_service.v1_schemas import (
     V1ScoreResponse,
     V1Task,
 )
-from tests.conftest import StubBenchmark
+from tests.conftest import ValsStubBenchmark as StubBenchmark
 
 
 class DatasetVersionBenchmark(StubBenchmark):
@@ -374,7 +374,7 @@ def test_v1_evaluate_rejects_unauthenticated_mode_with_403(monkeypatch: pytest.M
             },
         )
     assert resp.status_code == 403
-    assert "descope" in resp.json()["detail"].lower()
+    assert "authenticated tenant" in resp.json()["detail"].lower()
 
 
 def test_v1_score_rejects_unauthenticated_mode_with_403(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -388,7 +388,7 @@ def test_v1_score_rejects_unauthenticated_mode_with_403(monkeypatch: pytest.Monk
             json={"run_id": "r", "dataset": "default", "evaluation_results": {}},
         )
     assert resp.status_code == 403
-    assert "descope" in resp.json()["detail"].lower()
+    assert "authenticated tenant" in resp.json()["detail"].lower()
 
 
 def test_v1_task_allows_benchmark_specific_extras() -> None:

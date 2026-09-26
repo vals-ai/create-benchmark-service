@@ -42,6 +42,16 @@ If the CLI was installed from a non-tagged commit, scaffolds fall back to `@main
 uv tool install git+https://github.com/vals-ai/create-benchmark-service.git@vX.Y.Z
 ```
 
+### Template and dependency migration
+
+The default scaffold uses the generic framework. `--template vals-ai` copies the bundled Vals layer into the generated service, including Descope authentication, catalog and allowlist access, trial filtering, and quotas. The copied files are service code; upgrading the framework pin does not update them.
+
+Existing services using the built-in Vals behavior must adopt the Vals template layer before upgrading. Generate a separate service with `--template vals-ai` and copy its `vals_ai/` package into the existing service package. Import the benchmark base with `from .vals_ai import BenchmarkService`. Import the app with `from <benchmark_package>.vals_ai import BenchmarkServiceApp`. Preserve benchmark methods and deployment configuration. A framework upgrade alone does not retain the old Vals behavior.
+
+Add the optional integrations each consumer uses to its framework dependency: `daytona`, `modal`, `s3`, or `telemetry`. The Vals template selects `s3` and `telemetry` and declares its Descope dependencies separately. A plain framework install no longer installs sandbox SDKs or Vals dependencies.
+
+Authentication defaults to rejecting requests. Use `AUTH_DISABLED=true` only for local development; it does not grant access to `/v1/*`. Custom services must implement authentication hooks. Hosted Vals services must use the copied Vals layer and keep `AUTH_DISABLED` unset.
+
 ### Dataset versioning
 
 Separate from the framework version above, a service can declare a **version per dataset** — a human semver labelling the dataset's content. It is served by `get_dataset_version(name)` (on `GET /version?dataset=` and the dataset task-list response) and stamped into generated lab manifests. It is a **label only**: it records the declared version and does not read or verify dataset content (a content-integrity guard is a planned follow-up).

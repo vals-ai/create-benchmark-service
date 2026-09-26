@@ -17,15 +17,15 @@ from fastapi.testclient import TestClient
 from httpx import Response
 from starlette.websockets import WebSocketDisconnect
 
-from benchmark_service import auth as auth_module
-from benchmark_service import evaluation_quota
-from benchmark_service.app import BenchmarkServiceApp
-from benchmark_service.auth import EvaluationQuotaPeriod, clear_allowlist_cache, clear_auth_cache
+from templates.vals_ai import auth as auth_module
+from templates.vals_ai import evaluation_quota
+from templates.vals_ai.app import BenchmarkServiceApp
+from templates.vals_ai.auth import EvaluationQuotaPeriod, clear_allowlist_cache, clear_auth_cache
 from benchmark_service.sandbox import SandboxProvider
 from benchmark_service.schemas import EvalMode
 from benchmark_service.submission_artifacts import SubmissionArtifactNotFound
 from benchmark_service.v1_schemas import V1PayloadType
-from tests.conftest import StubBenchmark
+from tests.conftest import ValsStubBenchmark as StubBenchmark
 
 
 class _RetryConfig(Protocol):

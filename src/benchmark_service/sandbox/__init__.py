@@ -6,8 +6,7 @@ from typing import Annotated, Any
 from pydantic import Field, TypeAdapter
 
 from benchmark_service.sandbox.compose import ComposeSandbox
-from benchmark_service.sandbox.daytona import DaytonaProviderConfig
-from benchmark_service.sandbox.modal import ModalProviderConfig
+from benchmark_service.sandbox.config import DaytonaProviderConfig, ModalProviderConfig
 from benchmark_service.sandbox.types import (
     ComposeSource,
     ExecResult,

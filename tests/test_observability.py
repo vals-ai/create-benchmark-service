@@ -258,8 +258,8 @@ def test_lifespan_failure_before_service_creation_uses_package_identity(
         Mock(return_value=("benchmark-package", "package-1.2.3")),
     )
     monkeypatch.setattr(
-        app_module,
-        "require_supported_auth_config",
+        BenchmarkServiceApp,
+        "service_lifespan",
         Mock(side_effect=RuntimeError("startup configuration failed")),
     )
     app = BenchmarkServiceApp(_VersionedBenchmark)

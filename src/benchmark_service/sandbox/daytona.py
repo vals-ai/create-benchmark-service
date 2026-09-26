@@ -104,6 +104,10 @@ _PTY_STATUS_CHECK_ATTEMPTS = 30
 _PTY_STATUS_POLL_SECONDS = 30
 _PTY_STDOUT_TAIL_MAX_BYTES = 64 * 1024
 _PTY_CREATE_MARKER_ENV = "_CBS_PTY_CREATE_MARKER"
+# Daytona runs PTY sessions in a login shell. Debian's /etc/profile resets PATH there, dropping
+# entries the image set with ENV (e.g. /opt/venv/bin), so the image PATH travels under this name
+# and is restored after the profile has run.
+_PTY_IMAGE_PATH_ENV = "_CBS_PTY_IMAGE_PATH"
 _PTY_ROWS = 24
 _PTY_COLS = 80
 _STATUS_DIR = "/tmp/.sandbox-provider"
@@ -512,6 +516,7 @@ class DaytonaSandbox(Sandbox):
         self._sandbox = sandbox
         self.labels = dict(sandbox.labels)
         self.created_at = self._parse_created_at(sandbox.created_at)
+        self._image_path: str | None = None
 
     @property
     def id(self) -> str:
@@ -706,12 +711,17 @@ class DaytonaSandbox(Sandbox):
         handle: AsyncPtyHandle | None = None
         wait_task: asyncio.Task[PtyResult] | None = None
         create_state = _PtyCreateState(marker=uuid.uuid4().hex)
+        image_path = await self._resolve_image_path()
         pty_envs = {
             "TERM": "dumb",
             "LANG": "C.UTF-8",
             **env_vars,
             _PTY_CREATE_MARKER_ENV: create_state.marker,
+            **({_PTY_IMAGE_PATH_ENV: image_path} if image_path else {}),
         }
+        shell_setup = f"stty -echo; unset {_PTY_CREATE_MARKER_ENV}"
+        if image_path:
+            shell_setup += f'; export PATH="${_PTY_IMAGE_PATH_ENV}"; unset {_PTY_IMAGE_PATH_ENV}'
 
         async def on_data(data: bytes) -> None:
             nonlocal stdout_bytes
@@ -746,7 +756,7 @@ class DaytonaSandbox(Sandbox):
 
             await _bounded(
                 "handle.send_input",
-                handle.send_input(f"stty -echo; unset {_PTY_CREATE_MARKER_ENV}\n"),
+                handle.send_input(f"{shell_setup}\n"),
                 _TOOLBOX_CALL_TIMEOUT_SECONDS,
             )
             await _bounded(
@@ -825,6 +835,18 @@ class DaytonaSandbox(Sandbox):
                     )
                 with suppress(Exception):
                     await self._control_exec(f"rm -f {shlex.quote(status_path)} {shlex.quote(status_temp_path)}")
+
+    async def _resolve_image_path(self) -> str | None:
+        """PATH as the image defines it, read once through the non-login exec transport."""
+        if self._image_path is None:
+            try:
+                result = await self._control_exec('printf %s "$PATH"')
+            except SandboxError:
+                return None
+            if result.exit_code != 0:
+                return None
+            self._image_path = result.output.strip().splitlines()[-1].strip() if result.output.strip() else ""
+        return self._image_path or None
 
     @_PROVIDER_RETRY
     async def _create_pty_session(

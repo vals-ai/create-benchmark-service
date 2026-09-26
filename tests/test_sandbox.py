@@ -58,6 +58,7 @@ from benchmark_service.sandbox import (
 from benchmark_service.sandbox.daytona import (
     _PTY_COLS,  # pyright: ignore[reportPrivateUsage]
     _PTY_CREATE_MARKER_ENV,  # pyright: ignore[reportPrivateUsage]
+    _PTY_IMAGE_PATH_ENV,  # pyright: ignore[reportPrivateUsage]
     _PTY_ROWS,  # pyright: ignore[reportPrivateUsage]
     _PTY_STDOUT_TAIL_MAX_BYTES,  # pyright: ignore[reportPrivateUsage]
     DaytonaProviderConfig,
@@ -140,20 +141,27 @@ def _assert_pty_create_config(envs: Mapping[str, str], pty_size: PtySize) -> Non
     assert pty_size == PtySize(rows=_PTY_ROWS, cols=_PTY_COLS)
 
 
+IMAGE_PATH = "/opt/venv/bin:/usr/local/bin:/usr/bin:/bin"
+
+
 class Process:
     def __init__(self) -> None:
         self.command: str | None = None
+        self.commands: list[str] = []
         self.pty_envs: dict[str, str] | None = None
         self.pty_size: PtySize | None = None
         self.pty_handle: PtyHandle | None = None
 
     async def exec(self, command: str) -> SimpleNamespace:
         self.command = command
+        self.commands.append(command)
         evaluated_command = _unwrap_shell_command(command)
         if evaluated_command.startswith("test -e "):
             return SimpleNamespace(exit_code=0, result="")
         if evaluated_command.startswith("cat "):
             return SimpleNamespace(exit_code=0, result="0")
+        if evaluated_command == 'printf %s "$PATH"':
+            return SimpleNamespace(exit_code=0, result=IMAGE_PATH)
         return SimpleNamespace(exit_code=0, result="")
 
     async def create_pty_session(
@@ -2924,6 +2932,44 @@ async def test_daytona_command_uses_native_process_environment() -> None:
     assert all(secret not in data and marker not in data for data in inner.process.pty_handle.inputs)
 
 
+async def test_daytona_command_restores_image_path_after_login_shell_profile() -> None:
+    """Daytona PTYs are login shells; Debian's /etc/profile resets PATH, dropping ENV PATH entries
+    such as /opt/venv/bin. The image PATH is read once over exec and re-exported in the PTY."""
+    inner = InnerSandbox()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    assert [chunk async for chunk in sandbox.command("python -m pytest")] == ["hello"]
+    assert [chunk async for chunk in sandbox.command("python -m pytest")] == ["hello"]
+
+    path_lookups = [c for c in inner.process.commands if _unwrap_shell_command(c) == 'printf %s "$PATH"']
+    assert len(path_lookups) == 1
+    assert inner.process.pty_envs is not None
+    assert inner.process.pty_envs[_PTY_IMAGE_PATH_ENV] == IMAGE_PATH
+    assert inner.process.pty_handle is not None
+    setup, command = inner.process.pty_handle.inputs[:2]
+    assert setup.startswith(f"stty -echo; unset {_PTY_CREATE_MARKER_ENV}; ")
+    assert f'export PATH="${_PTY_IMAGE_PATH_ENV}"; unset {_PTY_IMAGE_PATH_ENV}\n' in setup
+    assert "python -m pytest" in command
+
+
+async def test_daytona_command_skips_path_restore_when_image_path_unreadable() -> None:
+    class NoPathProcess(Process):
+        async def exec(self, command: str) -> SimpleNamespace:
+            if _unwrap_shell_command(command) == 'printf %s "$PATH"':
+                return SimpleNamespace(exit_code=1, result="")
+            return await super().exec(command)
+
+    inner = InnerSandbox()
+    inner.process = NoPathProcess()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+
+    assert [chunk async for chunk in sandbox.command("printf hello")] == ["hello"]
+    assert inner.process.pty_envs is not None
+    assert _PTY_IMAGE_PATH_ENV not in inner.process.pty_envs
+    assert inner.process.pty_handle is not None
+    assert inner.process.pty_handle.inputs[0] == f"stty -echo; unset {_PTY_CREATE_MARKER_ENV}\n"
+
+
 @pytest.mark.parametrize(
     ("env_vars", "message"),
     [
@@ -3167,7 +3213,7 @@ async def test_daytona_command_keeps_pty_create_conflicts_terminal(inner_type: t
     assert process.reconnect_attempts == 0
     assert process.pty_handle is None
     assert process.killed_session_ids == []
-    assert process.command is None
+    assert [_unwrap_shell_command(c) for c in process.commands] == ['printf %s "$PATH"']
     assert inner.refresh_count == 0
     if isinstance(inner, BareHtml502RefreshSandbox):
         assert inner.refresh_attempts == 0

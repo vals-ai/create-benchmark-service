@@ -4,10 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import socket
+import sys
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager
 from typing import Any
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import opentelemetry.propagate as propagate
 import pytest
@@ -125,7 +126,7 @@ def configured_sentry(monkeypatch: pytest.MonkeyPatch) -> Iterator[_CaptureTrans
     transport = _CaptureTransport()
     real_init = sentry_sdk.init
     monkeypatch.setattr(
-        observability.sentry_sdk,
+        sentry_sdk,
         "is_initialized",
         lambda: transport.init_calls > 0,
     )
@@ -141,7 +142,7 @@ def configured_sentry(monkeypatch: pytest.MonkeyPatch) -> Iterator[_CaptureTrans
     monkeypatch.setenv("SENTRY_DSN", "https://public@example.com/1")
     monkeypatch.setenv("SENTRY_ENVIRONMENT", "dev")
     monkeypatch.setenv("SENTRY_RELEASE", "abc123")
-    monkeypatch.setattr(observability.sentry_sdk, "init", init_with_transport)
+    monkeypatch.setattr(sentry_sdk, "init", init_with_transport)
     yield transport
     sentry_sdk.flush()
     sentry_sdk.get_client().close()
@@ -191,13 +192,20 @@ def otel_tracer(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[trace.Tracer,
 
 
 def test_app_without_sentry_dsn_preserves_health(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start and serve health without importing the optional Sentry SDK.
+
+    Test cases:
+    - No DSN leaves Sentry disabled when its import is unavailable.
+    - Application startup, health requests, and shutdown still succeed.
+    """
     monkeypatch.delenv("SENTRY_DSN", raising=False)
     monkeypatch.delenv("AUTH_REQUIRED", raising=False)
     init = Mock()
-    monkeypatch.setattr(observability.sentry_sdk, "init", init)
+    monkeypatch.setattr(sentry_sdk, "init", init)
 
-    with TestClient(BenchmarkServiceApp(StubBenchmark)) as client:
-        response = client.get("/health")
+    with patch.dict(sys.modules, {"sentry_sdk": None}):
+        with TestClient(BenchmarkServiceApp(StubBenchmark)) as client:
+            response = client.get("/health")
 
     assert response.status_code == 200
     assert response.json() == {"status": "ok"}
@@ -210,8 +218,8 @@ def test_init_sentry_uses_process_configuration_once(monkeypatch: pytest.MonkeyP
     monkeypatch.setenv("SENTRY_RELEASE", "abc123")
     is_initialized = Mock(side_effect=[False, True])
     init = Mock()
-    monkeypatch.setattr(observability.sentry_sdk, "is_initialized", is_initialized)
-    monkeypatch.setattr(observability.sentry_sdk, "init", init)
+    monkeypatch.setattr(sentry_sdk, "is_initialized", is_initialized)
+    monkeypatch.setattr(sentry_sdk, "init", init)
 
     assert init_sentry() is True
     assert init_sentry() is True

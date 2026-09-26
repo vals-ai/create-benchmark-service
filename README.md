@@ -24,9 +24,9 @@ create-benchmark-service <benchmark-name> --template vals-ai
 
 ### Dependencies
 
-The base install includes Daytona and Modal for both templates.
+The base install includes Daytona, Modal, and the OpenTelemetry API for both templates.
 
-`create-benchmark-service[vals-ai]` bundles the Vals dependencies: S3/AWS clients, Sentry, OpenTelemetry, Descope, and caching. The Vals template selects this extra automatically.
+`create-benchmark-service[vals-ai]` bundles the Vals dependencies: S3/AWS clients, Sentry, Descope, and caching. The Vals template selects this extra automatically.
 
 ## What Gets Generated
 

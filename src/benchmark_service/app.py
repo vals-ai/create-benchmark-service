@@ -5,7 +5,7 @@ import logging
 import os
 import traceback
 from collections.abc import AsyncGenerator
-from contextlib import aclosing, asynccontextmanager, suppress
+from contextlib import aclosing, asynccontextmanager, nullcontext, suppress
 from typing import Any, cast
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
@@ -111,7 +111,7 @@ class BenchmarkServiceApp(FastAPI):
 
         @asynccontextmanager
         async def lifespan(_app: FastAPI) -> AsyncGenerator[None, None]:
-            with isolation_scope():
+            with isolation_scope() if sentry_enabled else nullcontext():
                 self._bind_service_context(self._service_version)
                 try:
                     async with self.service_lifespan():

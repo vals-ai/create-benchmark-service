@@ -15,23 +15,19 @@ dependencies = [
     "pyyaml>=6.0.2",
     "starlette>=1.0.1",
     "fastapi[standard-no-fastapi-cloud-cli]>=0.135.3",
+    "daytona>=0.203.0,<2",
+    "daytona-api-client-async>=0.203.0,<2",
+    "modal>=1.5.2",
 ]
 
 [project.scripts]
 create-benchmark-service = "cli.cli:main"
 
 [project.optional-dependencies]
-daytona = [
-    "daytona>=0.203.0,<2",
-    "daytona-api-client-async>=0.203.0,<2",
-]
-modal = [
-    "modal>=1.5.2",
-]
-s3 = [
+vals-ai = [
     "boto3>=1.34",
-]
-telemetry = [
+    "cachetools>=5.5.0",
+    "descope>=1.13.0",
     "opentelemetry-api>=1.20.0",
     "sentry-sdk[fastapi]>=2.58.0,<3.0",
 ]
@@ -48,9 +44,6 @@ dev = [
     "types-pyyaml>=6.0.12",
     "descope>=1.13.0",
     "cachetools>=5.5.0",
-    "daytona>=0.203.0,<2",
-    "daytona-api-client-async>=0.203.0,<2",
-    "modal>=1.5.2",
     "boto3>=1.34",
     "opentelemetry-api>=1.20.0",
     "sentry-sdk[fastapi]>=2.58.0,<3.0",

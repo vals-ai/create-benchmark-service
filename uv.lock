@@ -453,9 +453,12 @@ name = "create-benchmark-service"
 source = { editable = "." }
 dependencies = [
     { name = "click" },
+    { name = "daytona" },
+    { name = "daytona-api-client-async" },
     { name = "fastapi", extra = ["standard-no-fastapi-cloud-cli"] },
     { name = "httpx" },
     { name = "jinja2" },
+    { name = "modal" },
     { name = "pydantic" },
     { name = "pyyaml" },
     { name = "starlette" },
@@ -464,17 +467,10 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
-daytona = [
-    { name = "daytona" },
-    { name = "daytona-api-client-async" },
-]
-modal = [
-    { name = "modal" },
-]
-s3 = [
+vals-ai = [
     { name = "boto3" },
-]
-telemetry = [
+    { name = "cachetools" },
+    { name = "descope" },
     { name = "opentelemetry-api" },
     { name = "sentry-sdk", extra = ["fastapi"] },
 ]
@@ -484,11 +480,8 @@ dev = [
     { name = "basedpyright" },
     { name = "boto3" },
     { name = "cachetools" },
-    { name = "daytona" },
-    { name = "daytona-api-client-async" },
     { name = "descope" },
     { name = "httpx" },
-    { name = "modal" },
     { name = "opentelemetry-api" },
     { name = "opentelemetry-instrumentation-httpx" },
     { name = "opentelemetry-sdk" },
@@ -501,34 +494,33 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "boto3", marker = "extra == 's3'", specifier = ">=1.34" },
+    { name = "boto3", marker = "extra == 'vals-ai'", specifier = ">=1.34" },
+    { name = "cachetools", marker = "extra == 'vals-ai'", specifier = ">=5.5.0" },
     { name = "click", specifier = ">=8.1.3" },
-    { name = "daytona", marker = "extra == 'daytona'", specifier = ">=0.203.0,<2" },
-    { name = "daytona-api-client-async", marker = "extra == 'daytona'", specifier = ">=0.203.0,<2" },
+    { name = "daytona", specifier = ">=0.203.0,<2" },
+    { name = "daytona-api-client-async", specifier = ">=0.203.0,<2" },
+    { name = "descope", marker = "extra == 'vals-ai'", specifier = ">=1.13.0" },
     { name = "fastapi", extras = ["standard-no-fastapi-cloud-cli"], specifier = ">=0.135.3" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "jinja2", specifier = ">=3.1.6" },
-    { name = "modal", marker = "extra == 'modal'", specifier = ">=1.5.2" },
-    { name = "opentelemetry-api", marker = "extra == 'telemetry'", specifier = ">=1.20.0" },
+    { name = "modal", specifier = ">=1.5.2" },
+    { name = "opentelemetry-api", marker = "extra == 'vals-ai'", specifier = ">=1.20.0" },
     { name = "pydantic", specifier = ">=2.12" },
     { name = "pyyaml", specifier = ">=6.0.2" },
-    { name = "sentry-sdk", extras = ["fastapi"], marker = "extra == 'telemetry'", specifier = ">=2.58.0,<3.0" },
+    { name = "sentry-sdk", extras = ["fastapi"], marker = "extra == 'vals-ai'", specifier = ">=2.58.0,<3.0" },
     { name = "starlette", specifier = ">=1.0.1" },
     { name = "tenacity", specifier = ">=8.3.0" },
     { name = "websockets", specifier = ">=15.0.1" },
 ]
-provides-extras = ["daytona", "modal", "s3", "telemetry"]
+provides-extras = ["vals-ai"]
 
 [package.metadata.requires-dev]
 dev = [
     { name = "basedpyright", specifier = ">=1.39.0" },
     { name = "boto3", specifier = ">=1.34" },
     { name = "cachetools", specifier = ">=5.5.0" },
-    { name = "daytona", specifier = ">=0.203.0,<2" },
-    { name = "daytona-api-client-async", specifier = ">=0.203.0,<2" },
     { name = "descope", specifier = ">=1.13.0" },
     { name = "httpx", specifier = ">=0.28.1" },
-    { name = "modal", specifier = ">=1.5.2" },
     { name = "opentelemetry-api", specifier = ">=1.20.0" },
     { name = "opentelemetry-instrumentation-httpx", specifier = ">=0.61b0,<0.62" },
     { name = "opentelemetry-sdk", specifier = ">=1.20.0" },

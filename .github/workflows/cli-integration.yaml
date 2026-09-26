@@ -10,7 +10,7 @@ jobs:
           - template: default
             extras: ""
           - template: vals-ai
-            extras: "[s3,telemetry]"
+            extras: "[vals-ai]"
 
     steps:
       - uses: actions/checkout@v4

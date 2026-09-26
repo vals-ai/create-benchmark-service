@@ -5,10 +5,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 
 dependencies = [
-    "create-benchmark-service{% if template == 'vals-ai' %}[s3,telemetry]{% endif %} @ git+{{ framework_repo_url }}@{{ framework_ref }}",
-{% if template == "vals-ai" %}    "descope>=1.13.0",
-    "cachetools>=5.5.0",
-{% endif %}
+    "create-benchmark-service{% if template == 'vals-ai' %}[vals-ai]{% endif %} @ git+{{ framework_repo_url }}@{{ framework_ref }}",
 ]
 
 [dependency-groups]

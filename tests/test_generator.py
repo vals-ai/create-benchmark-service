@@ -170,18 +170,17 @@ def test_cli_template_selects_runtime_and_dependencies(
     dependencies = tomllib.loads((project / "pyproject.toml").read_text())["project"]["dependencies"]
     main_source = (project / "main.py").read_text()
     service_source = (package / "benchmark_service.py").read_text()
+    assert len(dependencies) == 1
     if template == "vals-ai":
         assert "from demo_benchmark_service.vals_ai import ValsBenchmarkServiceApp" in main_source
         assert "from .vals_ai import ValsBenchmarkService" in service_source
         assert (package / "vals_ai" / "auth.py").is_file()
         assert (package / "vals_ai" / "trial.py").is_file()
-        assert any(dependency.startswith("create-benchmark-service[s3,telemetry]") for dependency in dependencies)
-        assert "descope>=1.13.0" in dependencies
+        assert dependencies[0].startswith("create-benchmark-service[vals-ai] @ ")
     else:
         assert "from benchmark_service import BenchmarkServiceApp" in main_source
         assert "from benchmark_service import BenchmarkService" in service_source
         assert not (package / "vals_ai").exists()
-        assert len(dependencies) == 1
         assert dependencies[0].startswith("create-benchmark-service @ ")
 
     for source_file in project.rglob("*.py"):

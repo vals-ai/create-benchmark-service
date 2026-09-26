@@ -22,18 +22,11 @@ Use `--template vals-ai` to include Vals authentication, access policy, and the 
 create-benchmark-service <benchmark-name> --template vals-ai
 ```
 
-### Optional integrations
+### Dependencies
 
-Add the extras your service uses to its `create-benchmark-service` dependency in `pyproject.toml`:
+The base install includes Daytona and Modal for both templates.
 
-| Extra | Integration |
-| --- | --- |
-| `daytona` | Daytona sandboxes |
-| `modal` | Modal sandboxes |
-| `s3` | S3 submission artifacts and AWS clients |
-| `telemetry` | Sentry and OpenTelemetry |
-
-For example, use `create-benchmark-service[daytona]`, keeping the generated Git URL and version pin. Sandbox providers are available to both templates. The Vals template also selects `s3` and `telemetry` and adds Descope dependencies.
+`create-benchmark-service[vals-ai]` bundles the Vals dependencies: S3/AWS clients, Sentry, OpenTelemetry, Descope, and caching. The Vals template selects this extra automatically.
 
 ## What Gets Generated
 
@@ -290,7 +283,7 @@ Response:
 
 **`POST /v1/score`** — aggregate across a run. Request `{run_id, dataset, evaluation_results: {task_id: {"status": "evaluated", "result": {...}} | {"status": "did_not_complete"} | null}}`. Before calling `calculate_final_score`, the framework unwraps every item to the grader payload itself — the same thing the internal `/final-score/` path passes — so a benchmark implements one hook against one shape and never has to ask which endpoint the caller used. An item whose `status` is anything but `evaluated` becomes `null`, as does an item sent as `null`, and both mean the same thing to scoring: the task reached no verdict. `errors` are not forwarded; they describe the evaluation attempt rather than its result, and scoring consumes no error text. Response `{run_id, tasks_evaluated, final_score, metadata}`.
 
-**`POST /v1/submissions/upload-url`** — mint a presigned S3 PUT URL for a submission artifact (e.g. an agent workspace tarball the eval side later rehydrates). Request `{run_id, task_id, dataset?, filename}`; every field must be a plain key segment (`[A-Za-z0-9][A-Za-z0-9._-]{0,127}`) and `task_id` must exist in the dataset. Response `{key, url, expires_in}`: the caller PUTs the artifact bytes to `url`, then reports `key` as the task's generation output. Deployments serving uploads must install the `s3` extra and set `SUBMISSION_ARTIFACT_BUCKET` (the receiving S3 bucket) and `AWS_REGION` (the bucket's region — presigned URLs are signed per region). Without the bucket the endpoint returns 503; a bucket without a region fails at startup. Server-side reads default to a 64 MiB limit; set `SUBMISSION_ARTIFACT_MAX_DOWNLOAD_BYTES` to a smaller positive byte count when the deployment needs a tighter bound. Invalid configured limits fail at startup. The Vals template denies this endpoint to trial tenants.
+**`POST /v1/submissions/upload-url`** — mint a presigned S3 PUT URL for a submission artifact (e.g. an agent workspace tarball the eval side later rehydrates). Request `{run_id, task_id, dataset?, filename}`; every field must be a plain key segment (`[A-Za-z0-9][A-Za-z0-9._-]{0,127}`) and `task_id` must exist in the dataset. Response `{key, url, expires_in}`: the caller PUTs the artifact bytes to `url`, then reports `key` as the task's generation output. Deployments serving uploads must install the `vals-ai` extra and set `SUBMISSION_ARTIFACT_BUCKET` (the receiving S3 bucket) and `AWS_REGION` (the bucket's region — presigned URLs are signed per region). Without the bucket the endpoint returns 503; a bucket without a region fails at startup. Server-side reads default to a 64 MiB limit; set `SUBMISSION_ARTIFACT_MAX_DOWNLOAD_BYTES` to a smaller positive byte count when the deployment needs a tighter bound. Invalid configured limits fail at startup. The Vals template denies this endpoint to trial tenants.
 
 The service role needs `s3:PutObject` and `s3:GetObject` on `arn:aws:s3:::BUCKET/submission-artifacts/*`, plus `s3:ListBucket` on `arn:aws:s3:::BUCKET` limited to the `submission-artifacts/*` namespace in the deployment policy. The list permission is part of the missing-object contract: [S3 returns 404 for a missing object only when the caller has `s3:ListBucket`](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html#API_HeadObject_Permissions); without it S3 returns 403, which the framework leaves as a permission failure rather than misreporting the object as missing.
 

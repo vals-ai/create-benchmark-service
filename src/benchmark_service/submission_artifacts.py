@@ -106,7 +106,7 @@ def _s3_client() -> _S3Client:
         if exc.name not in {"boto3", "botocore"}:
             raise
         raise ModuleNotFoundError(
-            "Submission artifact storage requires the s3 extra: uv add 'create-benchmark-service[s3]'"
+            "Submission artifact storage requires the vals-ai extra: uv add 'create-benchmark-service[vals-ai]'"
         ) from exc
 
     region = os.environ.get(SUBMISSION_ARTIFACT_REGION_ENV)

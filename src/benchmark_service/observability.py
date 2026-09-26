@@ -42,7 +42,7 @@ def init_sentry() -> bool:
     if not dsn:
         return False
     if sentry_sdk is None:
-        raise ModuleNotFoundError("Sentry requires the telemetry extra: uv add 'create-benchmark-service[telemetry]'")
+        raise ModuleNotFoundError("Sentry requires the vals-ai extra: uv add 'create-benchmark-service[vals-ai]'")
 
     from sentry_sdk.integrations.logging import LoggingIntegration
 

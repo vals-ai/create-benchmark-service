@@ -29,12 +29,12 @@ Set `AUTH_REQUIRED=true` to require authentication. Implement `check_auth()` for
 
 Authentication is disabled by default. Hosted registry deployments set `AUTH_REQUIRED=true`. `AUTH_DISABLED` is no longer supported and cannot override that setting.
 
-## Optional integrations
+## Dependencies
 
-Select extras on the framework dependency in `pyproject.toml`: `daytona` or `modal` for sandboxes, `s3` for submission storage, and `telemetry` for Sentry/OpenTelemetry. Keep the generated Git URL and version pin.
+The base framework includes Daytona and Modal.
 {% if template == "vals-ai" %}
 
-This template already selects `s3` and `telemetry`. Add a sandbox provider extra for benchmarks that use sandboxes.
+This template selects `create-benchmark-service[vals-ai]` for S3/AWS clients, Sentry, OpenTelemetry, Descope, and caching dependencies.
 {% endif %}
 
 ## Development

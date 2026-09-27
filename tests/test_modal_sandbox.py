@@ -712,7 +712,14 @@ async def test_create_sandbox_blocks_network_without_conflicting_allowlists(
     }
 
 
-async def test_create_sandbox_deletes_if_blocked_policy_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    "error",
+    [SandboxError("policy update failed"), TimeoutError("policy update timed out"), asyncio.CancelledError()],
+)
+async def test_create_sandbox_deletes_if_blocked_policy_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    error: BaseException,
+) -> None:
     inner = FakeInnerSandbox()
     deleted: list[str] = []
 
@@ -720,7 +727,7 @@ async def test_create_sandbox_deletes_if_blocked_policy_fails(monkeypatch: pytes
         return inner
 
     async def fail_block_all_egress(self: ModalSandbox) -> None:
-        raise SandboxError("policy update failed")
+        raise error
 
     async def delete(instance_id: str) -> None:
         deleted.append(instance_id)
@@ -729,7 +736,7 @@ async def test_create_sandbox_deletes_if_blocked_policy_fails(monkeypatch: pytes
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
     monkeypatch.setattr(provider, "delete_sandbox", delete)
 
-    with pytest.raises(SandboxError, match="policy update failed"):
+    with pytest.raises(type(error)):
         await provider.create_sandbox(_request().model_copy(update={"network_block_all": True}))
 
     assert deleted == ["sb-123"]

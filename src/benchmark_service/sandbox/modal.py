@@ -612,8 +612,8 @@ class ModalSandboxProvider(SandboxProvider):
             try:
                 async with asyncio.timeout_at(deadline):
                     await sandbox.block_all_egress()
-            except (SandboxError, TimeoutError):
-                await self.delete_sandbox(sandbox.id)
+            except (SandboxError, TimeoutError, asyncio.CancelledError):
+                await asyncio.shield(self.delete_sandbox(sandbox.id))
                 raise
         return sandbox
 

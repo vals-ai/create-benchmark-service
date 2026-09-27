@@ -442,7 +442,7 @@ for domain in {domains_to_resolve!r}:
         await self._set_outbound_network_policy([], [])
 
     async def clear_egress_rules(self) -> None:
-        await self._set_outbound_network_policy(None, None)
+        await self._set_outbound_network_policy(list(_ALLOW_ALL_CIDRS), list(_ALLOW_ALL_DOMAINS))
 
 
 class ModalSandboxProvider(SandboxProvider):

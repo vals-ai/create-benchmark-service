@@ -700,6 +700,13 @@ async def test_create_sandbox_blocks_network_without_conflicting_allowlists(
         "outbound_domain_allowlist": ["api.openai.com"],
     }
 
+    await sandbox.clear_egress_rules()
+
+    assert inner.outbound_policies[-1] == {
+        "outbound_cidr_allowlist": ["0.0.0.0/0"],
+        "outbound_domain_allowlist": ["*"],
+    }
+
 
 async def test_create_sandbox_uses_modal_safe_name(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify Modal receives a safe name while callers keep the requested sandbox name.

@@ -573,7 +573,7 @@ async def test_egress_rule_updates_replace_outbound_policy() -> None:
     Test cases:
     - URLs, domains, and IPv4 addresses are split into Modal domain and CIDR allowlists.
     - Deny-all uses empty provider allowlists without overloading modify_egress_rules([]).
-    - Clearing egress rules restores Modal's open outbound policy.
+    - Clearing egress rules uses an allow-all policy that Modal accepts on a running sandbox.
     """
     inner = FakeInnerSandbox(process=FakeProcess(["198.51.100.8\n198.51.100.9\n"], 0))
     sandbox = _sandbox(inner)
@@ -598,8 +598,8 @@ async def test_egress_rule_updates_replace_outbound_policy() -> None:
     await sandbox.clear_egress_rules()
 
     assert inner.outbound_policies[-1] == {
-        "outbound_cidr_allowlist": None,
-        "outbound_domain_allowlist": None,
+        "outbound_cidr_allowlist": ["0.0.0.0/0"],
+        "outbound_domain_allowlist": ["*"],
     }
 
 

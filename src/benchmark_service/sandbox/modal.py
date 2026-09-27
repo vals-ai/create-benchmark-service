@@ -549,8 +549,8 @@ class ModalSandboxProvider(SandboxProvider):
         if existing is not None:
             return ModalSandbox(existing, name=request.name, labels=request.labels)
         image = self._resolve_image(request.source, client)
-        outbound_cidr_allowlist = [] if request.network_block_all else list(_ALLOW_ALL_CIDRS)
-        outbound_domain_allowlist = [] if request.network_block_all else list(_ALLOW_ALL_DOMAINS)
+        outbound_cidr_allowlist = list(_ALLOW_ALL_CIDRS)
+        outbound_domain_allowlist = list(_ALLOW_ALL_DOMAINS)
         gpu: str | None = None
         if request.resources.gpu:
             if not request.resources.gpu_type:
@@ -603,7 +603,14 @@ class ModalSandboxProvider(SandboxProvider):
                     except ModalError as exc:
                         raise _sandbox_error(exc) from exc
                     else:
-                        return ModalSandbox(inner, name=request.name, labels=request.labels)
+                        sandbox = ModalSandbox(inner, name=request.name, labels=request.labels)
+        if request.network_block_all:
+            try:
+                await sandbox.block_all_egress()
+            except SandboxError:
+                await self.delete_sandbox(sandbox.id)
+                raise
+        return sandbox
         except TimeoutError as exc:
             raise SandboxError(f"Failed to create Modal sandbox within {request.create_timeout}s") from exc
 

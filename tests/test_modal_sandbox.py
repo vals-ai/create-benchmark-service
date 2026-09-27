@@ -690,8 +690,12 @@ async def test_create_sandbox_blocks_network_without_conflicting_allowlists(
     sandbox = await provider.create_sandbox(request)
 
     assert captured["block_network"] is False
-    assert captured["outbound_cidr_allowlist"] == []
-    assert captured["outbound_domain_allowlist"] == []
+    assert captured["outbound_cidr_allowlist"] == ["0.0.0.0/0"]
+    assert captured["outbound_domain_allowlist"] == ["*"]
+    assert inner.outbound_policies[-1] == {
+        "outbound_cidr_allowlist": [],
+        "outbound_domain_allowlist": [],
+    }
 
     await sandbox.modify_egress_rules(["api.openai.com"])
 
@@ -707,6 +711,28 @@ async def test_create_sandbox_blocks_network_without_conflicting_allowlists(
         "outbound_domain_allowlist": ["*"],
     }
 
+
+async def test_create_sandbox_deletes_if_blocked_policy_fails(monkeypatch: pytest.MonkeyPatch) -> None:
+    inner = FakeInnerSandbox()
+    deleted: list[str] = []
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        return inner
+
+    async def fail_block_all_egress(self: ModalSandbox) -> None:
+        raise SandboxError("policy update failed")
+
+    async def delete(instance_id: str) -> None:
+        deleted.append(instance_id)
+
+    monkeypatch.setattr(ModalSandbox, "block_all_egress", fail_block_all_egress)
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    monkeypatch.setattr(provider, "delete_sandbox", delete)
+
+    with pytest.raises(SandboxError, match="policy update failed"):
+        await provider.create_sandbox(_request().model_copy(update={"network_block_all": True}))
+
+    assert deleted == ["sb-123"]
 
 async def test_create_sandbox_uses_modal_safe_name(monkeypatch: pytest.MonkeyPatch) -> None:
     """Verify Modal receives a safe name while callers keep the requested sandbox name.

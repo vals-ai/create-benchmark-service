@@ -603,16 +603,19 @@ class ModalSandboxProvider(SandboxProvider):
                     except ModalError as exc:
                         raise _sandbox_error(exc) from exc
                     else:
-                        sandbox = ModalSandbox(inner, name=request.name, labels=request.labels)
+                        break
+        except TimeoutError as exc:
+            raise SandboxError(f"Failed to create Modal sandbox within {request.create_timeout}s") from exc
+
+        sandbox = ModalSandbox(inner, name=request.name, labels=request.labels)
         if request.network_block_all:
             try:
-                await sandbox.block_all_egress()
-            except SandboxError:
+                async with asyncio.timeout_at(deadline):
+                    await sandbox.block_all_egress()
+            except (SandboxError, TimeoutError):
                 await self.delete_sandbox(sandbox.id)
                 raise
         return sandbox
-        except TimeoutError as exc:
-            raise SandboxError(f"Failed to create Modal sandbox within {request.create_timeout}s") from exc
 
     @_PROVIDER_RETRY
     async def get_sandbox(self, instance_id: str) -> Sandbox:

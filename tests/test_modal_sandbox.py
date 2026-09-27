@@ -677,20 +677,28 @@ async def test_create_sandbox_requires_gpu_type_for_gpu(monkeypatch: pytest.Monk
 async def test_create_sandbox_blocks_network_without_conflicting_allowlists(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    inner = FakeInnerSandbox()
     captured: dict[str, Any] = {}
 
     async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
         captured.update(kwargs)
-        return FakeInnerSandbox()
+        return inner
 
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
     request = _request().model_copy(update={"network_block_all": True})
 
-    await provider.create_sandbox(request)
+    sandbox = await provider.create_sandbox(request)
 
-    assert captured["block_network"] is True
-    assert captured["outbound_cidr_allowlist"] is None
-    assert captured["outbound_domain_allowlist"] is None
+    assert captured["block_network"] is False
+    assert captured["outbound_cidr_allowlist"] == []
+    assert captured["outbound_domain_allowlist"] == []
+
+    await sandbox.modify_egress_rules(["api.openai.com"])
+
+    assert inner.outbound_policies[-1] == {
+        "outbound_cidr_allowlist": [],
+        "outbound_domain_allowlist": ["api.openai.com"],
+    }
 
 
 async def test_create_sandbox_uses_modal_safe_name(monkeypatch: pytest.MonkeyPatch) -> None:

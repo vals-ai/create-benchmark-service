@@ -549,7 +549,8 @@ class ModalSandboxProvider(SandboxProvider):
         if existing is not None:
             return ModalSandbox(existing, name=request.name, labels=request.labels)
         image = self._resolve_image(request.source, client)
-        allow_all_egress = not request.network_block_all
+        outbound_cidr_allowlist = [] if request.network_block_all else list(_ALLOW_ALL_CIDRS)
+        outbound_domain_allowlist = [] if request.network_block_all else list(_ALLOW_ALL_DOMAINS)
         gpu: str | None = None
         if request.resources.gpu:
             if not request.resources.gpu_type:
@@ -566,9 +567,9 @@ class ModalSandboxProvider(SandboxProvider):
             "gpu": gpu,
             "idle_timeout": request.auto_stop_interval * 60 if request.auto_stop_interval else None,
             "timeout": _MAX_LIFETIME_SECONDS,
-            "block_network": request.network_block_all,
-            "outbound_cidr_allowlist": list(_ALLOW_ALL_CIDRS) if allow_all_egress else None,
-            "outbound_domain_allowlist": list(_ALLOW_ALL_DOMAINS) if allow_all_egress else None,
+            "block_network": False,
+            "outbound_cidr_allowlist": outbound_cidr_allowlist,
+            "outbound_domain_allowlist": outbound_domain_allowlist,
             "client": client,
             "experimental_options": (
                 {"vm_runtime": True} if self._config.runtime == "vm" else {"enable_docker": True}

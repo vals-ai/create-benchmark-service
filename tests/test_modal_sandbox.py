@@ -598,8 +598,8 @@ async def test_egress_rule_updates_replace_outbound_policy() -> None:
     await sandbox.clear_egress_rules()
 
     assert inner.outbound_policies[-1] == {
-        "outbound_cidr_allowlist": None,
-        "outbound_domain_allowlist": None,
+        "outbound_cidr_allowlist": ["0.0.0.0/0"],
+        "outbound_domain_allowlist": ["*"],
     }
 
 

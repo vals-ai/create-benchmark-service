@@ -154,7 +154,8 @@ Provider compatibility notes:
 Local Tracker, executor, and benchmark-service processes need access to the same Docker daemon.
 Task containers do not receive the Docker socket or host-directory mounts.
 
-Select the provider with `{"type": "docker"}`. Set `DOCKER_HOST` to override the
+Select the provider with `{"type": "docker"}`. The benchmark service accepts that
+request only with `CBS_DOCKER_ENABLED=true`; leave it unset on a hosted service. Set `DOCKER_HOST` to override the
 Docker context or detected local socket. For sandbox grading, also set
 `GRADING_SANDBOX_PROVIDER=docker`.
 

@@ -58,6 +58,7 @@ from benchmark_service.schemas import (
     VersionResponse,
 )
 from benchmark_service.sandbox import (
+    DockerProviderConfig,
     ModalProviderConfig,
     SandboxProvider,
     SandboxProviderConfig,
@@ -147,6 +148,14 @@ def _request_sandbox_provider_config(
     websocket: WebSocket,
 ) -> SandboxProviderConfig:
     return request.sandbox_provider or DaytonaProviderConfig.from_headers(websocket.headers)
+
+
+DOCKER_ENABLED_ENV = "CBS_DOCKER_ENABLED"
+
+
+def _request_may_use_provider(config: SandboxProviderConfig) -> bool:
+    """Docker needs no caller credentials and drives this host's daemon, so only an opted-in service accepts it."""
+    return not isinstance(config, DockerProviderConfig) or os.environ.get(DOCKER_ENABLED_ENV, "").lower() == "true"
 
 
 GRADING_SANDBOX_PROVIDER_ENV = "GRADING_SANDBOX_PROVIDER"
@@ -580,6 +589,9 @@ class BenchmarkServiceApp(FastAPI):
                     sandbox_id=request.instance_id,
                 )
             sandbox_config = _request_sandbox_provider_config(request, websocket)
+            if not _request_may_use_provider(sandbox_config):
+                await websocket.close(code=1008, reason="Docker sandboxes are disabled on this service")
+                return
 
             if not await self.service.check_dataset_access(tenant, request.dataset):
                 await websocket.close(code=1008, reason="Dataset not allowed")
@@ -674,6 +686,9 @@ class BenchmarkServiceApp(FastAPI):
                     sandbox_id=request.instance_id,
                 )
             sandbox_config = _request_sandbox_provider_config(request, websocket)
+            if not _request_may_use_provider(sandbox_config):
+                await websocket.close(code=1008, reason="Docker sandboxes are disabled on this service")
+                return
 
             if not await self.service.check_dataset_access(tenant, request.dataset):
                 await websocket.close(code=1008, reason="Dataset not allowed")

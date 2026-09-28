@@ -326,6 +326,9 @@ class Sandbox(ABC):
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
         raise SandboxError("Sandbox provider does not support modifying egress rules")
 
+    async def block_all_egress(self) -> None:
+        raise SandboxError("Sandbox provider does not support blocking all egress")
+
     async def clear_egress_rules(self) -> None:
         raise SandboxError("Sandbox provider does not support modifying egress rules")
 

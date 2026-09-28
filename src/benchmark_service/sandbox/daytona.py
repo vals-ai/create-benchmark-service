@@ -659,9 +659,21 @@ class DaytonaSandbox(Sandbox):
             await _bounded(
                 "update_network_settings",
                 self._sandbox.update_network_settings(
+                    network_block_all=False,
                     network_allow_list=",".join(network_allow_list),
                     domain_allow_list=",".join(domain_allow_list),
                 ),
+                _TOOLBOX_CALL_TIMEOUT_SECONDS,
+            )
+        except _SANDBOX_OPERATION_ERRORS as exc:
+            raise self._sandbox_error(exc) from exc
+
+    @_PROVIDER_RETRY
+    async def block_all_egress(self) -> None:
+        try:
+            await _bounded(
+                "update_network_settings",
+                self._sandbox.update_network_settings(network_block_all=True),
                 _TOOLBOX_CALL_TIMEOUT_SECONDS,
             )
         except _SANDBOX_OPERATION_ERRORS as exc:

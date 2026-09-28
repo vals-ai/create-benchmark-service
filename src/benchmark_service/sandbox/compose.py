@@ -159,5 +159,8 @@ class ComposeSandbox(Sandbox):
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
         await self._outer.modify_egress_rules(allowed_addresses)
 
+    async def block_all_egress(self) -> None:
+        await self._outer.block_all_egress()
+
     async def clear_egress_rules(self) -> None:
         await self._outer.clear_egress_rules()

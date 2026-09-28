@@ -34,6 +34,16 @@ from benchmark_service.schemas import (
 from benchmark_service.v1_schemas import V1PayloadType, V1Task
 
 
+def _prioritize_dataset(datasets: dict[str, dict[str, Any]], priority_dataset: str) -> dict[str, dict[str, Any]]:
+    if priority_dataset not in datasets:
+        raise ValueError(f"priority_dataset '{priority_dataset}' not found. Available datasets: {', '.join(datasets)}")
+    priority_ids = datasets[priority_dataset].keys()
+    return {
+        name: dict(sorted(tasks.items(), key=lambda item: item[0] not in priority_ids))
+        for name, tasks in datasets.items()
+    }
+
+
 class BenchmarkService(ABC):
     """Abstract base class for benchmark implementations.
 
@@ -52,6 +62,13 @@ class BenchmarkService(ABC):
     # and per dispatch, so it is class state, not a per-instance value.
     eval_mode: ClassVar[EvalMode] = EvalMode.TEXT
     accepted_submission_schemas: ClassVar[dict[V1PayloadType, frozenset[str]]] = {}
+
+    # Task order within a dataset is dispatch order (the tracker creates task
+    # rows in the order `filter_tasks` returns them). When set, every other
+    # dataset is stably reordered so the tasks it shares with this dataset
+    # come first, e.g. so a run of the full split finishes the index subset
+    # before the long tail.
+    priority_dataset: ClassVar[str | None] = None
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -91,11 +108,11 @@ class BenchmarkService(ABC):
         """Factory method to create and initialize a benchmark service."""
         instance = cls.__new__(cls)
         instance.dataset_versions = (
-            load_dataset_versions(cls.dataset_versions_file)
-            if cls.dataset_versions_file is not None
-            else {}
+            load_dataset_versions(cls.dataset_versions_file) if cls.dataset_versions_file is not None else {}
         )
         instance.datasets = await instance.load_datasets()
+        if cls.priority_dataset is not None:
+            instance.datasets = _prioritize_dataset(instance.datasets, cls.priority_dataset)
         return instance
 
     @abstractmethod
@@ -203,9 +220,7 @@ class BenchmarkService(ABC):
         Raises:
             NotImplementedError: if the benchmark has not opted into task listing.
         """
-        raise NotImplementedError(
-            f"{type(self).__name__}.list_tasks must explicitly map internal tasks to V1Task"
-        )
+        raise NotImplementedError(f"{type(self).__name__}.list_tasks must explicitly map internal tasks to V1Task")
 
     def project_trial_result(self, result: Any) -> Any:
         """Trial-safe projection of a per-task eval result.
@@ -338,8 +353,7 @@ class BenchmarkService(ABC):
     ) -> AsyncGenerator[StreamChunk, None]:
         """Grade framework-admitted artifact bytes for one run in the service process."""
         raise NotImplementedError(
-            f"{type(self).__name__}.evaluate_artifact must be implemented for "
-            "eval_mode == EvalMode.IN_PROCESS_ARTIFACT"
+            f"{type(self).__name__}.evaluate_artifact must be implemented for eval_mode == EvalMode.IN_PROCESS_ARTIFACT"
         )
 
     def evaluate_materialized_artifact(

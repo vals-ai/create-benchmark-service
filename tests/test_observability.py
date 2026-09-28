@@ -32,6 +32,7 @@ from sentry_sdk.integrations.stdlib import StdlibIntegration
 from sentry_sdk.tracing import Transaction
 from sentry_sdk.transport import Transport
 
+import benchmark_service
 from benchmark_service import __version__ as framework_version
 from benchmark_service import app as app_module, observability
 from benchmark_service.app import BenchmarkServiceApp
@@ -44,7 +45,8 @@ from benchmark_service.observability import (
 )
 from benchmark_service.schemas import EvaluateResponseRequest
 from benchmark_service.sentry import init_sentry
-from tests.conftest import StubBenchmark
+from templates.vals_ai.app import ValsBenchmarkServiceApp
+from tests.conftest import StubBenchmark, ValsStubBenchmark
 
 
 class _CaptureTransport(Transport):
@@ -68,7 +70,7 @@ class _FailedStatusError(Exception):
     status_code = 500
 
 
-class _FailingWebSocketBenchmark(StubBenchmark):
+class _FailingWebSocketBenchmark(ValsStubBenchmark):
     def get_service_version(self) -> str:
         return "websocket-service-4.5.6"
 
@@ -76,12 +78,12 @@ class _FailingWebSocketBenchmark(StubBenchmark):
         raise RuntimeError("websocket evaluation failed")
 
 
-class _VersionedBenchmark(StubBenchmark):
+class _VersionedBenchmark(ValsStubBenchmark):
     def get_service_version(self) -> str:
         return "service-hook-1.2.3"
 
 
-class _OtherVersionedBenchmark(StubBenchmark):
+class _OtherVersionedBenchmark(ValsStubBenchmark):
     def get_service_version(self) -> str:
         return "other-service-4.5.6"
 
@@ -191,20 +193,38 @@ def otel_tracer(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[trace.Tracer,
 
 
 
-def test_app_without_sentry_dsn_preserves_health(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize(
+    ("template", "dsn"),
+    [("default", None), ("default", "https://public@example.com/1"), ("vals-ai", None)],
+)
+def test_app_without_sentry_preserves_health(
+    monkeypatch: pytest.MonkeyPatch,
+    template: str,
+    dsn: str | None,
+) -> None:
     """Start and serve health without importing the optional Sentry SDK.
 
     Test cases:
-    - No DSN leaves Sentry disabled when its import is unavailable.
+    - The default app ignores an inherited DSN when Sentry is unavailable.
+    - Both apps leave Sentry disabled when no DSN is configured.
     - Application startup, health requests, and shutdown still succeed.
     """
-    monkeypatch.delenv("SENTRY_DSN", raising=False)
+    if dsn is None:
+        monkeypatch.delenv("SENTRY_DSN", raising=False)
+    else:
+        monkeypatch.setenv("SENTRY_DSN", dsn)
     monkeypatch.delenv("AUTH_REQUIRED", raising=False)
     init = Mock()
     monkeypatch.setattr(sentry_sdk, "init", init)
 
-    with patch.dict(sys.modules, {"sentry_sdk": None}):
-        with TestClient(BenchmarkServiceApp(StubBenchmark)) as client:
+    # Block both cached import paths because other tests import the integration.
+    monkeypatch.delattr(benchmark_service, "sentry", raising=False)
+    with patch.dict(sys.modules, {"benchmark_service.sentry": None, "sentry_sdk": None}):
+        if template == "vals-ai":
+            app = ValsBenchmarkServiceApp(ValsStubBenchmark)
+        else:
+            app = BenchmarkServiceApp(StubBenchmark)
+        with TestClient(app) as client:
             response = client.get("/health")
 
     assert response.status_code == 200
@@ -266,11 +286,11 @@ def test_lifespan_failure_before_service_creation_uses_package_identity(
         Mock(return_value=("benchmark-package", "package-1.2.3")),
     )
     monkeypatch.setattr(
-        BenchmarkServiceApp,
+        ValsBenchmarkServiceApp,
         "service_lifespan",
         Mock(side_effect=RuntimeError("startup configuration failed")),
     )
-    app = BenchmarkServiceApp(_VersionedBenchmark)
+    app = ValsBenchmarkServiceApp(_VersionedBenchmark)
 
     with sentry_sdk.isolation_scope():
         sentry_sdk.set_tag("service.version", "caller-service-8.8.8")
@@ -300,7 +320,7 @@ def test_lifespan_failure_after_service_creation_uses_runtime_identity(
         Mock(return_value=("benchmark-package", "package-1.2.3")),
     )
 
-    class FailingStartupApp(BenchmarkServiceApp):
+    class FailingStartupApp(ValsBenchmarkServiceApp):
         @asynccontextmanager
         async def service_lifespan(self) -> AsyncIterator[None]:
             async with super().service_lifespan():
@@ -331,9 +351,9 @@ def test_versionless_app_does_not_inherit_other_app_service_version(
         Mock(return_value=("benchmark-package", None)),
     )
     monkeypatch.setenv("SERVICE_NAME", "versioned-service")
-    versioned_app = BenchmarkServiceApp(_VersionedBenchmark)
+    versioned_app = ValsBenchmarkServiceApp(_VersionedBenchmark)
     monkeypatch.setenv("SERVICE_NAME", "versionless-service")
-    versionless_app = BenchmarkServiceApp(StubBenchmark)
+    versionless_app = ValsBenchmarkServiceApp(ValsStubBenchmark)
 
     async def fail() -> None:
         raise RuntimeError("app failed")
@@ -391,7 +411,7 @@ def test_http_exceptions_are_captured_once_with_request_identity(
     configured_sentry: _CaptureTransport,
     error_type: type[Exception],
 ) -> None:
-    app = BenchmarkServiceApp(StubBenchmark)
+    app = ValsBenchmarkServiceApp(ValsStubBenchmark)
 
     async def fail() -> None:
         raise error_type("request failed")
@@ -435,7 +455,7 @@ def test_request_identity_uses_runtime_service_version_override(
         "_get_service_metadata",
         Mock(return_value=("benchmark-package", "package-1.2.3")),
     )
-    app = BenchmarkServiceApp(_VersionedBenchmark)
+    app = ValsBenchmarkServiceApp(_VersionedBenchmark)
 
     async def fail() -> None:
         raise RuntimeError("versioned request failed")
@@ -460,9 +480,9 @@ def test_multiple_apps_keep_request_identity_and_single_client_initialization(
     configured_sentry: _CaptureTransport,
 ) -> None:
     monkeypatch.setenv("SERVICE_NAME", "first-service")
-    first_app = BenchmarkServiceApp(_VersionedBenchmark)
+    first_app = ValsBenchmarkServiceApp(_VersionedBenchmark)
     monkeypatch.setenv("SERVICE_NAME", "second-service")
-    second_app = BenchmarkServiceApp(_OtherVersionedBenchmark)
+    second_app = ValsBenchmarkServiceApp(_OtherVersionedBenchmark)
 
     async def fail() -> None:
         raise RuntimeError("app failed")
@@ -494,7 +514,7 @@ def test_multiple_apps_keep_request_identity_and_single_client_initialization(
 def test_websocket_exception_is_captured_once_with_request_identity(
     configured_sentry: _CaptureTransport,
 ) -> None:
-    app = BenchmarkServiceApp(_FailingWebSocketBenchmark)
+    app = ValsBenchmarkServiceApp(_FailingWebSocketBenchmark)
 
     with TestClient(app) as client:
         with client.websocket_connect(

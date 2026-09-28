@@ -232,6 +232,9 @@ class ValsBenchmarkServiceApp(BenchmarkServiceApp):
         self._grading_admission = _GradingAdmission.from_env()
         super().__init__(service_cls)
 
+    def _sentry_enabled(self) -> bool:
+        return bool(os.getenv("SENTRY_DSN"))
+
     def _register_routes(self) -> None:
         self.add_middleware(
             InflightMiddleware,

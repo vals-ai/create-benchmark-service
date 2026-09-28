@@ -100,7 +100,7 @@ class BenchmarkServiceApp(FastAPI):
         configured_deployment_name = os.getenv("SERVICE_NAME", "").strip()
         deployment_name = configured_deployment_name or service_cls.__name__
         sentry = None
-        if os.getenv("SENTRY_DSN"):
+        if self._sentry_enabled():
             from benchmark_service import sentry
 
             sentry.init_sentry()
@@ -121,6 +121,10 @@ class BenchmarkServiceApp(FastAPI):
         self._deployment_name = deployment_name
         self._sentry = sentry
         self._register_routes()
+
+    def _sentry_enabled(self) -> bool:
+        """Let app subclasses opt into the optional Sentry integration."""
+        return False
 
     def _bind_service_context(self, service_version: str | None) -> None:
         if self._sentry is None:

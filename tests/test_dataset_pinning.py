@@ -150,10 +150,10 @@ async def test_pin_survives_default_switch_on_http_and_websocket(
                 evaluation = await client.v1_evaluate(
                     "run-1", "task-1", version, "text.v1", V1PayloadType.TEXT, dataset="default"
                 )
-                assert evaluation.result == {"resolved": True}
+                assert evaluation.result == {"version": version}
                 score = await client.v1_score(
                     "run-1",
-                    {"task-1": V1ScoreItem(status=V1EvalStatus.EVALUATED, result=evaluation.result)},
+                    {f"only-{version}": V1ScoreItem(status=V1EvalStatus.EVALUATED, result={"resolved": True})},
                     dataset="default",
                 )
                 assert score.final_score == 100

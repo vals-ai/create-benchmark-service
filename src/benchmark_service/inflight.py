@@ -21,7 +21,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-METRIC_NAMESPACE = "Vals/BenchmarkServices"
+METRIC_NAMESPACE = "BenchmarkServices"
 EXCLUDED_PATHS = frozenset({"/health"})
 
 ASGIScope = MutableMapping[str, Any]
@@ -37,10 +37,12 @@ class InflightMiddleware:
         app: Callable[[ASGIScope, ASGIReceive, ASGISend], Awaitable[None]],
         service_name: str,
         emit_interval_s: float = 30.0,
+        metric_namespace: str = METRIC_NAMESPACE,
     ) -> None:
         self.app = app
         self.service_name = service_name
         self.emit_interval_s = emit_interval_s
+        self.metric_namespace = metric_namespace
         self._inflight = 0
         self._emitter_task: asyncio.Task[None] | None = None
 
@@ -86,7 +88,7 @@ class InflightMiddleware:
                 "Timestamp": int(time.time() * 1000),
                 "CloudWatchMetrics": [
                     {
-                        "Namespace": METRIC_NAMESPACE,
+                        "Namespace": self.metric_namespace,
                         "Dimensions": [["ServiceName"]],
                         "Metrics": [{"Name": "InFlightRequests", "Unit": "Count"}],
                     }

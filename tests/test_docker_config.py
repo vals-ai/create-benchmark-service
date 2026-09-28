@@ -9,7 +9,6 @@ from aiodocker.execs import Exec
 from aiodocker.stream import Stream
 
 from benchmark_service import DockerProviderConfig
-from benchmark_service.app import _grading_provider_config  # pyright: ignore[reportPrivateUsage]
 from aiodocker.exceptions import DockerError
 
 from benchmark_service import ImageSource, Resources, SandboxError
@@ -20,6 +19,7 @@ from benchmark_service.sandbox.local.docker import (  # pyright: ignore[reportPr
     _ContainerInfo,  # pyright: ignore[reportPrivateUsage]
 )
 from benchmark_service.sandbox.types import ExecResult, SandboxCreateRequest
+from templates.vals_ai.app import _grading_provider_config  # pyright: ignore[reportPrivateUsage]
 
 
 def test_docker_grading_selects_docker(monkeypatch: pytest.MonkeyPatch) -> None:

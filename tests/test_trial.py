@@ -8,11 +8,11 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
-from benchmark_service import auth as auth_module
-from benchmark_service.auth import clear_allowlist_cache, clear_auth_cache
-from benchmark_service.app import BenchmarkServiceApp
+from templates.vals_ai import auth as auth_module
+from templates.vals_ai.auth import clear_allowlist_cache, clear_auth_cache
+from templates.vals_ai.app import ValsBenchmarkServiceApp
 from benchmark_service.schemas import EvaluateResponseRequest, FinalScoreResult
-from benchmark_service.trial import (
+from templates.vals_ai.trial import (
     sanitize_v1_eval_response,
     sanitize_v1_score_response,
 )
@@ -22,7 +22,7 @@ from benchmark_service.v1_schemas import (
     V1ScoreResponse,
     V1Task,
 )
-from tests.conftest import StubBenchmark
+from tests.conftest import ValsStubBenchmark as StubBenchmark
 
 
 def _project(result: Any) -> dict[str, Any]:
@@ -176,12 +176,13 @@ class _AllPassTrialBenchmark(StubBenchmark):
 def trial_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
     clear_allowlist_cache()
     clear_auth_cache()
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
     monkeypatch.setenv(
         "DESCOPE_TENANT_ALLOWLIST_JSON",
         json.dumps({"tenants": {"trial": {"datasets": ["default"], "trial_mode": True}}}),
     )
-    app = BenchmarkServiceApp(_TrialResultBenchmark)
+    app = ValsBenchmarkServiceApp(_TrialResultBenchmark)
 
     async def _stub_exchange(_project_id: str, _access_key: str) -> dict[str, dict[str, dict[str, str]]]:
         return {"tenants": {"trial": {}}}
@@ -196,12 +197,13 @@ def trial_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None,
 def all_pass_trial_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
     clear_allowlist_cache()
     clear_auth_cache()
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
     monkeypatch.setenv(
         "DESCOPE_TENANT_ALLOWLIST_JSON",
         json.dumps({"tenants": {"trial": {"datasets": ["default"], "trial_mode": True}}}),
     )
-    app = BenchmarkServiceApp(_AllPassTrialBenchmark)
+    app = ValsBenchmarkServiceApp(_AllPassTrialBenchmark)
 
     async def _stub_exchange(_project_id: str, _access_key: str) -> dict[str, dict[str, dict[str, str]]]:
         return {"tenants": {"trial": {}}}

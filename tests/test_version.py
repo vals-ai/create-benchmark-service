@@ -194,9 +194,10 @@ def test_version_reports_text_eval_mode_by_default() -> None:
 
 
 def test_version_reports_sandbox_eval_mode_when_overridden(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("DAYTONA_API_KEY", "k")
-    monkeypatch.setenv("DAYTONA_API_URL", "https://daytona.example")
-    monkeypatch.setenv("DAYTONA_TARGET", "us")
+    monkeypatch.delenv("DAYTONA_API_KEY", raising=False)
+    monkeypatch.delenv("DAYTONA_API_URL", raising=False)
+    monkeypatch.delenv("DAYTONA_TARGET", raising=False)
+    monkeypatch.setenv("GRADING_MAX_CONCURRENCY", "0")
     app = BenchmarkServiceApp(_SandboxModeService)
     with TestClient(app) as client:
         response = client.get("/version")
@@ -205,8 +206,8 @@ def test_version_reports_sandbox_eval_mode_when_overridden(monkeypatch: pytest.M
 
 
 def test_version_reports_in_process_artifact_mode(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SUBMISSION_ARTIFACT_BUCKET", "vals-submission-artifacts")
-    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.delenv("SUBMISSION_ARTIFACT_BUCKET", raising=False)
+    monkeypatch.delenv("AWS_REGION", raising=False)
     app = BenchmarkServiceApp(_InProcessArtifactModeService)
     with TestClient(app) as client:
         response = client.get("/version")
@@ -215,8 +216,8 @@ def test_version_reports_in_process_artifact_mode(monkeypatch: pytest.MonkeyPatc
 
 
 def test_version_reports_materialized_artifact_mode(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("SUBMISSION_ARTIFACT_BUCKET", "vals-submission-artifacts")
-    monkeypatch.setenv("AWS_REGION", "us-east-1")
+    monkeypatch.delenv("SUBMISSION_ARTIFACT_BUCKET", raising=False)
+    monkeypatch.delenv("AWS_REGION", raising=False)
     app = BenchmarkServiceApp(_MaterializedArtifactModeService)
     with TestClient(app) as client:
         response = client.get("/version")

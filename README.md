@@ -16,6 +16,18 @@ create-benchmark-service <benchmark-name>
 
 Creates a new service in `./<benchmark-name>-benchmark-service/` in your current directory.
 
+Use `--template vals-ai` to include Vals authentication, access policy, and the provider-facing `/v1/*` routes.
+
+```bash
+create-benchmark-service <benchmark-name> --template vals-ai
+```
+
+### Dependencies
+
+The base install includes Daytona, Modal, and the OpenTelemetry API for both templates.
+
+`create-benchmark-service[vals-ai]` bundles the Vals dependencies: S3/AWS clients, Sentry, Descope, and caching. The Vals template selects this extra automatically.
+
 ## What Gets Generated
 
 ```
@@ -44,14 +56,16 @@ Creates a new service in `./<benchmark-name>-benchmark-service/` in your current
 ├── src/benchmark_service/     # Framework code
 │   ├── __init__.py
 │   ├── app.py                 # FastAPI application
-│   ├── auth.py                # Auth, Descope tenant resolution, allowlist loading
+│   ├── auth.py                # Generic authentication defaults
 │   ├── base.py                # BenchmarkService base class
 │   ├── client.py              # HTTP/WebSocket client
 │   ├── schemas.py             # Pydantic models
 │   └── utils.py               # Utilities
 ├── templates/                 # Templates for generated projects
-│   ├── pyproject.toml
-│   └── README.md.jinja
+│   ├── benchmark_service.py.jinja
+│   ├── pyproject.toml.jinja
+│   ├── README.md.jinja
+│   └── vals_ai/               # Copied only by --template vals-ai
 ├── main.py                    # Example implementation
 ├── pyproject.toml             # CLI + framework config
 └── README.md                  # This file
@@ -81,9 +95,9 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 - `get_dataset(dataset)` — return the task dictionary for a given dataset name (defaults to `"default"`)
 - `filter_tasks(task_filter, dataset)` — return task IDs matching a list or Python slice notation (e.g. `"0:10:2"`)
 - `validate_task_ids(task_ids, dataset)` — raise `ValueError` if any ID is not in the dataset
-- `list_tasks(dataset)` — return `list[V1Task]` (id, question, timeout) for the lab-facing `GET /v1/datasets/{dataset}/tasks` endpoint. Must be overridden before exposing task listing; the base implementation fails closed to avoid leaking evaluator-only data.
-- `check_auth(headers)` — legacy boolean auth hook. Override for custom auth that does not need tenant or dataset awareness.
-- `resolve_tenant(headers)` — validate request authorization and return a tenant ID, `"_legacy"` for legacy auth, or `None` to reject.
+- `list_tasks(dataset)` — return `list[V1Task]` (id, question, timeout) for the Vals app's `GET /v1/datasets/{dataset}/tasks` endpoint. Must be overridden before exposing task listing; the base implementation fails closed to avoid leaking evaluator-only data.
+- `check_auth(headers)` — boolean auth hook. Override for custom auth that does not need tenant or dataset awareness.
+- `resolve_tenant(headers)` — validate request authorization and return a tenant ID, `"unauthenticated"` for boolean auth or local development, or `None` to reject.
 - `check_dataset_access(tenant, dataset)` — return whether a resolved tenant may access a dataset.
 - `get_service_version()` — optional benchmark-owned service version override. If it returns `None`, `/version` falls back to the installed benchmark package version.
 - `get_dataset_version(dataset)` — optional dataset release/version hook. The value is returned on the dataset task-list response after auth and dataset access checks.
@@ -104,9 +118,6 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | `GET` | `/retrieve-task/?task_id=…` | Return task metadata for a given task ID (optional `?dataset=…`) |
 | `POST` | `/evaluate-response/` | Evaluate without a sandbox and return one final response |
 | `POST` | `/final-score/` | Aggregate results: `{"evaluation_results": {task_id: result, …}, "dataset": "…"}` |
-| `POST` | `/v1/evaluate` | Lab-facing per-task evaluation (see [v1 Eval API](#v1-eval-api-lab-facing) below) |
-| `POST` | `/v1/score` | Lab-facing run aggregation (see [v1 Eval API](#v1-eval-api-lab-facing) below) |
-| `GET` | `/v1/datasets/{dataset}/tasks` | Lab-facing dataset task list (see [v1 Eval API](#v1-eval-api-lab-facing) below) |
 
 **WebSocket endpoints** (stream `StreamChunk` JSON objects):
 
@@ -203,7 +214,7 @@ Yield these from your generator methods; the framework serialises and forwards t
 
 ### v1 Eval API (lab-facing)
 
-`/v1/evaluate` and `/v1/score` are the lab-facing surface. Text-mode evaluation reuses `evaluate_response`, in-process artifact evaluation passes admitted bytes to `evaluate_artifact`, and sandbox-mode evaluation runs `evaluate_instance`. Scoring reuses `calculate_final_score` for every mode.
+`ValsBenchmarkServiceApp` adds the provider-facing `/v1/evaluate`, `/v1/score`, `/v1/datasets/{dataset}/tasks`, and `/v1/submissions/upload-url` routes. The default `BenchmarkServiceApp` does not register them. Text-mode evaluation reuses `evaluate_response`, in-process artifact evaluation passes admitted bytes to `evaluate_artifact`, and sandbox-mode evaluation runs `evaluate_instance`. Scoring reuses `calculate_final_score` for every mode.
 
 ### In-process artifact evaluation (`eval_mode = IN_PROCESS_ARTIFACT`)
 
@@ -211,7 +222,7 @@ Benchmarks that grade an uploaded file inside the service process declare
 `eval_mode = EvalMode.IN_PROCESS_ARTIFACT`, declare only the artifact schema
 IDs they accept, and implement
 `evaluate_artifact(task_id, schema_id, artifact, dataset)`. The framework
-validates the authenticated tenant, dataset, task, schema, and upload key,
+validates the tenant, dataset, task, schema, and upload key,
 captures the artifact's size and ETag, and downloads that admitted version
 before invoking benchmark code. The hook receives bytes and never receives an
 object key, bucket, or tenant credential.
@@ -302,13 +313,13 @@ Response:
 
 **`POST /v1/score`** — aggregate across a run. Request `{run_id, dataset, evaluation_results: {task_id: {"status": "evaluated", "result": {...}} | {"status": "did_not_complete"} | null}}`. Before calling `calculate_final_score`, the framework unwraps every item to the grader payload itself — the same thing the internal `/final-score/` path passes — so a benchmark implements one hook against one shape and never has to ask which endpoint the caller used. An item whose `status` is anything but `evaluated` becomes `null`, as does an item sent as `null`, and both mean the same thing to scoring: the task reached no verdict. `errors` are not forwarded; they describe the evaluation attempt rather than its result, and scoring consumes no error text. Response `{run_id, tasks_evaluated, final_score, metadata}`.
 
-**`POST /v1/submissions/upload-url`** — mint a presigned S3 PUT URL for a submission artifact (e.g. an agent workspace tarball the eval side later rehydrates). Request `{run_id, task_id, dataset?, filename}`; every field must be a plain key segment (`[A-Za-z0-9][A-Za-z0-9._-]{0,127}`) and `task_id` must exist in the dataset. Response `{key, url, expires_in}`: the caller PUTs the artifact bytes to `url`, then reports `key` as the task's generation output. Deployments serving uploads must set `SUBMISSION_ARTIFACT_BUCKET` (the receiving S3 bucket) and `AWS_REGION` (the bucket's region — presigned URLs are signed per region). Without the bucket the endpoint returns 503; a bucket without a region fails at startup. Server-side reads default to a 64 MiB limit; set `SUBMISSION_ARTIFACT_MAX_DOWNLOAD_BYTES` to a smaller positive byte count when the deployment needs a tighter bound. Invalid configured limits fail at startup. Not available to trial tenants.
+**`POST /v1/submissions/upload-url`** — mint a presigned S3 PUT URL for a submission artifact (e.g. an agent workspace tarball the eval side later rehydrates). Request `{run_id, task_id, dataset?, filename}`; every field must be a plain key segment (`[A-Za-z0-9][A-Za-z0-9._-]{0,127}`) and `task_id` must exist in the dataset. Response `{key, url, expires_in}`: the caller PUTs the artifact bytes to `url`, then reports `key` as the task's generation output. Deployments serving uploads must install the `vals-ai` extra and set `SUBMISSION_ARTIFACT_BUCKET` (the receiving S3 bucket) and `AWS_REGION` (the bucket's region — presigned URLs are signed per region). Without the bucket the endpoint returns 503; a bucket without a region fails at startup. Server-side reads default to a 64 MiB limit; set `SUBMISSION_ARTIFACT_MAX_DOWNLOAD_BYTES` to a smaller positive byte count when the deployment needs a tighter bound. Invalid configured limits fail at startup. The Vals template denies this endpoint to trial tenants.
 
 The service role needs `s3:PutObject` and `s3:GetObject` on `arn:aws:s3:::BUCKET/submission-artifacts/*`, plus `s3:ListBucket` on `arn:aws:s3:::BUCKET` limited to the `submission-artifacts/*` namespace in the deployment policy. The list permission is part of the missing-object contract: [S3 returns 404 for a missing object only when the caller has `s3:ListBucket`](https://docs.aws.amazon.com/AmazonS3/latest/API/API_HeadObject.html#API_HeadObject_Permissions); without it S3 returns 403, which the framework leaves as a permission failure rather than misreporting the object as missing.
 
-**Auth.** `/v1/*` is Descope-only. Callers using the legacy `BENCHMARK_API_KEY` bearer (i.e. those that resolve to the `_legacy` tenant sentinel) get 403. Migrate the deploy to Descope (`AUTH_REQUIRED=true` + `DESCOPE_PROJECT_ID` + allowlist) before opening `/v1/` to external traffic.
+**Auth.** The Vals `/v1/*` routes work without credentials by default. Set `AUTH_REQUIRED=true` to require Descope authentication and tenant/dataset allowlists. In that mode, a boolean `check_auth()` override cannot grant `/v1/*` access without a tenant identity.
 
-**`GET /v1/datasets/{dataset}/tasks`** — return the dataset's task list. Same Descope-only auth + tenant/dataset allowlist gate as the rest of `/v1/*`. Response:
+**`GET /v1/datasets/{dataset}/tasks`** — return the dataset's task list. Uses the same tenant authentication and `check_dataset_access()` gate as the rest of `/v1/*`. Response:
 
 ```json
 {
@@ -321,9 +332,9 @@ The service role needs `s3:PutObject` and `s3:GetObject` on `arn:aws:s3:::BUCKET
 }
 ```
 
-Status codes: 403 if the tenant isn't allowed the dataset *or* if the caller uses legacy bearer; 404 if the dataset is in the tenant's allowlist but the service's `load_datasets()` doesn't load it; 501 if the benchmark has not implemented `list_tasks`. The base `BenchmarkService.list_tasks` does not infer a public task shape from internal task objects because those objects often include evaluator-only data (`answer`, `checks`, rubrics, grader config). Benchmarks must explicitly map their loaded tasks to `V1Task(id, question, timeout, ...)`. `V1Task` allows benchmark-specific extras, so benchmarks that need to surface additional per-task fields (e.g. SWE-bench's `repo`/`base_commit`) can include them when constructing the `V1Task` — document them in your benchmark's README and validate on the runner side with a typed `Task` subclass.
+Status codes: 403 when authentication is required but the caller lacks an allowed tenant identity for the dataset; 404 if access is allowed but the service's `load_datasets()` doesn't load the dataset; 501 if the benchmark has not implemented `list_tasks`. The base `BenchmarkService.list_tasks` does not infer a public task shape from internal task objects because those objects often include evaluator-only data (`answer`, `checks`, rubrics, grader config). Benchmarks must explicitly map their loaded tasks to `V1Task(id, question, timeout, ...)`. `V1Task` allows benchmark-specific extras, so benchmarks that need to surface additional per-task fields (e.g. SWE-bench's `repo`/`base_commit`) can include them when constructing the `V1Task` — document them in your benchmark's README and validate on the runner side with a typed `Task` subclass.
 
-**Trial mode.** A tenant with `trial_mode: true` in its allowlist entry receives score-only responses on `/v1/evaluate` and `/v1/score`. Benchmarks enabling trial mode must implement `project_trial_result(result)` to return the audited per-task fields trial callers may see and resubmit to `/v1/score`; include any field `calculate_final_score` needs for aggregation. The framework still removes `evaluator_version` and error text from `/v1/evaluate` (the error *count* survives as generic `"error"` entries), and `/v1/score` `metadata` is emptied while `final_score` and `tasks_evaluated` remain. The sanitizer builds fresh response objects from allowlisted fields, so fields added later do not leak to trial callers by default. Unhandled server errors return a generic `{"detail": "Internal server error"}` 500 (no traceback) for every caller, not just trial tenants. Trial tenants may access only `/v1/evaluate`, `/v1/score`, and `GET /v1/datasets/{dataset}/tasks`; other `/v1/*`, internal `/evaluate-response/`, `/final-score/`, and `/ws/*` endpoints are denied (403). For trial tenants, the dataset task list is projected to `id`, `question`, and `timeout` even if the benchmark's normal `V1Task` includes extras.
+**Trial mode (Vals template only).** A tenant with `trial_mode: true` in its allowlist entry receives score-only responses on `/v1/evaluate` and `/v1/score`. Benchmarks enabling trial mode must implement `project_trial_result(result)` to return the audited per-task fields trial callers may see and resubmit to `/v1/score`; include any field `calculate_final_score` needs for aggregation. The Vals layer removes `evaluator_version` and error text from `/v1/evaluate` (the error *count* survives as generic `"error"` entries), and `/v1/score` `metadata` is emptied while `final_score` and `tasks_evaluated` remain. The sanitizer builds fresh response objects from allowlisted fields, so fields added later do not leak to trial callers by default. Unhandled server errors return a generic `{"detail": "Internal server error"}` 500 (no traceback) for every caller, not just trial tenants. Trial tenants may access only `/v1/evaluate`, `/v1/score`, and `GET /v1/datasets/{dataset}/tasks`; other `/v1/*`, internal `/evaluate-response/`, `/final-score/`, and `/ws/*` endpoints are denied (403). For trial tenants, the dataset task list is projected to `id`, `question`, and `timeout` even if the benchmark's normal `V1Task` includes extras.
 
 **Deferred to follow-on plans.** `GET /v1/schema`, `GET /v1/tasks/{task_id}` (single-task lookup), `/ws/v1/evaluate` (streamed judges), async/`poll_url` response shape, idempotency on `(run_id, task_id)`.
 
@@ -383,16 +394,16 @@ For process-scoped credentials, call `sandbox.command(..., env_vars={...})`. Pro
 
 ### Authentication
 
-The framework authenticates every HTTP request except `/health`, and every WebSocket route before sandbox provider config is used.
+Both templates disable authentication unless `AUTH_REQUIRED=true`. Local routes, including the Vals `/v1/*` routes, work without credentials. Hosted registry deployments set `AUTH_REQUIRED=true`; the framework then authenticates every HTTP request except `/health` and `/version`, and every WebSocket route. `AUTH_DISABLED` is no longer supported and cannot override `AUTH_REQUIRED=true`.
 
-For hosted Valkyrie benchmark services, set `AUTH_REQUIRED=true`, `DESCOPE_PROJECT_ID`, and a tenant + dataset allowlist. Requests must include a valid Descope access key in `X-Descope-Api-Key`. The key must be scoped to exactly one Descope tenant, and that tenant must appear in the service allowlist.
+Services generated with `--template vals-ai` use `ValsBenchmarkService` and `ValsBenchmarkServiceApp`, which inherit the shared framework classes. With `AUTH_REQUIRED=true`, set `DESCOPE_PROJECT_ID` and a tenant + dataset allowlist. Requests must include a valid Descope access key in `X-Descope-Api-Key`. The key must be scoped to exactly one Descope tenant, and that tenant must appear in the service allowlist. Catalog access, quotas, and trial restrictions apply only when authentication is required.
 
-The allowlist is loaded in this order:
+When authentication is required, the allowlist is loaded in this order:
 
-1. `BENCHMARK_CATALOG_API_URL` plus `SERVICE_NAME` — the service-specific catalog API fetches the authenticated tenant policy. The framework caches positive policies for 300 seconds, refreshes an unknown tenant immediately, and fails closed when the API is unavailable or returns invalid data.
+1. `BENCHMARK_CATALOG_API_URL` plus `SERVICE_NAME` — the service-specific catalog API fetches the authenticated tenant policy. The Vals layer caches positive policies for 300 seconds, refreshes an unknown tenant immediately, and fails closed when the API is unavailable or returns invalid data.
 2. `DESCOPE_TENANT_ALLOWLIST_JSON` — JSON payload retained during the staged production rollout.
 3. `DESCOPE_ALLOWLIST_PATH` — path to a local YAML file, useful for development.
-4. Empty config — allowed at startup, but Descope-authenticated requests fail closed when `AUTH_REQUIRED=true`.
+4. Empty config — allowed at startup, but Descope-authenticated requests fail closed.
 
 Enable catalog mode by setting both variables in the service container:
 
@@ -422,7 +433,7 @@ tenants:
       - test
 ```
 
-Malformed configured allowlists raise at app startup. Unknown tenants receive `401 Unauthorized`. Known tenants requesting a dataset outside their allowlist receive `403 Dataset not allowed`; WebSocket routes close with code `1008`. The tenant ID `"_legacy"` is reserved for compatibility mode and is rejected as a Descope tenant.
+When authentication is required, malformed configured allowlists raise at app startup. Unknown tenants receive `401 Unauthorized`. Known tenants requesting a dataset outside their allowlist receive `403 Dataset not allowed`; WebSocket routes close with code `1008`. The tenant ID `"unauthenticated"` is reserved for boolean auth and local development and is rejected as a Descope tenant.
 
 **Evaluation quotas.** Add `evaluation_quota` to a tenant entry to cap that tenant's evaluation requests. Set `period` to `day`, `week`, `month`, or `year`. Periods use UTC calendar boundaries: days start at 00:00, weeks start Monday at 00:00, months start on the first day at 00:00, and years start January 1 at 00:00. Changing a tenant's period selects a separate counter namespace. `POST /v1/evaluate`, `POST /evaluate-response/`, `/ws/evaluate-response`, and `/ws/evaluate-instance` consume the same quota; task setup, task retrieval, and score aggregation do not. Authentication, request parsing, dataset authorization, and payload compatibility checks happen before the request is counted. Duplicate and immediate-capacity checks for admitted grading requests also happen first. Accepted requests then consume quota before waiting for an active grading slot or accessing submission storage. Once counted, a request still consumes quota if evaluation or another later step fails.
 
@@ -432,9 +443,9 @@ Counter updates are atomic across service processes and are not retried because 
 
 After the configured limit is reached, HTTP routes return 429 with `Retry-After` and WebSocket routes close with code `1008`. Missing counter configuration fails service startup instead of silently disabling enforcement.
 
-For local development or legacy custom services, leave `AUTH_REQUIRED` unset or `false`. In that mode, `BENCHMARK_API_KEY` preserves the previous static-key behavior by requiring `Authorization: Bearer <key>`. If `BENCHMARK_API_KEY` is not set, requests are allowed. Legacy auth uses the `"_legacy"` sentinel and bypasses dataset-level allowlist enforcement because no tenant identity is available.
+With `AUTH_REQUIRED=true`, the default template rejects requests until you implement authentication. The default app has no `/v1/*` routes.
 
-Override `check_auth()` in your `BenchmarkService` subclass to keep using custom boolean authentication:
+Override `check_auth()` in your `BenchmarkService` subclass for boolean authentication on the internal HTTP and WebSocket routes:
 
 ```python
 from benchmark_service import BenchmarkService
@@ -446,7 +457,7 @@ class MyBenchmarkService(BenchmarkService):
     # ... other abstract methods
 ```
 
-For tenant-aware custom authentication, override `resolve_tenant()` directly and return a tenant ID. Override `check_dataset_access()` if your service needs dataset rules that differ from the configured allowlist:
+For tenant-aware authentication on the shared routes, override `resolve_tenant()` and return a tenant ID. Override `check_dataset_access()` to restrict which datasets a tenant can use:
 
 ```python
 from benchmark_service import BenchmarkService

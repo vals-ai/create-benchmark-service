@@ -17,15 +17,15 @@ from fastapi.testclient import TestClient
 from httpx import Response
 from starlette.websockets import WebSocketDisconnect
 
-from benchmark_service import auth as auth_module
-from benchmark_service import evaluation_quota
-from benchmark_service.app import BenchmarkServiceApp
-from benchmark_service.auth import EvaluationQuotaPeriod, clear_allowlist_cache, clear_auth_cache
+from templates.vals_ai import auth as auth_module
+from templates.vals_ai import evaluation_quota
+from templates.vals_ai.app import ValsBenchmarkServiceApp
+from templates.vals_ai.auth import EvaluationQuotaPeriod, clear_allowlist_cache, clear_auth_cache
 from benchmark_service.sandbox import SandboxProvider
 from benchmark_service.schemas import EvalMode
 from benchmark_service.submission_artifacts import SubmissionArtifactNotFound
 from benchmark_service.v1_schemas import V1PayloadType
-from tests.conftest import StubBenchmark
+from tests.conftest import ValsStubBenchmark as StubBenchmark
 
 
 class _RetryConfig(Protocol):
@@ -250,29 +250,31 @@ def test_quota_configuration_requires_durable_counter_settings_at_startup(
     monkeypatch: pytest.MonkeyPatch,
     missing_env: str,
 ) -> None:
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
     _set_allowlist(monkeypatch)
     monkeypatch.setenv(evaluation_quota.EVALUATION_QUOTA_TABLE_ENV, "evaluation-quotas")
     monkeypatch.setenv(evaluation_quota.SERVICE_NAME_ENV, "example-benchmark")
     monkeypatch.delenv(missing_env)
 
     with pytest.raises(RuntimeError, match=missing_env):
-        with TestClient(BenchmarkServiceApp(StubBenchmark)):
+        with TestClient(ValsBenchmarkServiceApp(StubBenchmark)):
             pass
 
 
 @pytest.fixture
 def quota_client(
     monkeypatch: pytest.MonkeyPatch,
-) -> Generator[tuple[TestClient, _FakeDynamoDB, BenchmarkServiceApp], None, None]:
+) -> Generator[tuple[TestClient, _FakeDynamoDB, ValsBenchmarkServiceApp], None, None]:
     clear_allowlist_cache()
     clear_auth_cache()
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
     monkeypatch.setenv(evaluation_quota.SERVICE_NAME_ENV, "example-benchmark")
     monkeypatch.setenv(evaluation_quota.EVALUATION_QUOTA_TABLE_ENV, "evaluation-quotas")
     _set_allowlist(monkeypatch)
     fake = _FakeDynamoDB()
     monkeypatch.setattr(evaluation_quota, "_dynamodb_client", lambda: fake)
-    app = BenchmarkServiceApp(StubBenchmark)
+    app = ValsBenchmarkServiceApp(StubBenchmark)
 
     async def exchange(
         _project_id: str,
@@ -312,7 +314,7 @@ def _v1_eval(
 
 
 def test_failed_legacy_evaluation_consumes_shared_tenant_quota(
-    quota_client: tuple[TestClient, _FakeDynamoDB, BenchmarkServiceApp],
+    quota_client: tuple[TestClient, _FakeDynamoDB, ValsBenchmarkServiceApp],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client, fake, _app = quota_client
@@ -336,7 +338,7 @@ def test_failed_legacy_evaluation_consumes_shared_tenant_quota(
 
 
 def test_dataset_rejection_does_not_consume_quota(
-    quota_client: tuple[TestClient, _FakeDynamoDB, BenchmarkServiceApp],
+    quota_client: tuple[TestClient, _FakeDynamoDB, ValsBenchmarkServiceApp],
 ) -> None:
     client, fake, _app = quota_client
 
@@ -349,7 +351,7 @@ def test_dataset_rejection_does_not_consume_quota(
 
 
 def test_quota_storage_failure_returns_retriable_http_error(
-    quota_client: tuple[TestClient, _FakeDynamoDB, BenchmarkServiceApp],
+    quota_client: tuple[TestClient, _FakeDynamoDB, ValsBenchmarkServiceApp],
 ) -> None:
     client, fake, _app = quota_client
     fake.error_code = "InternalServerError"
@@ -362,7 +364,7 @@ def test_quota_storage_failure_returns_retriable_http_error(
 
 
 def test_quota_storage_failure_closes_websocket_without_internal_details(
-    quota_client: tuple[TestClient, _FakeDynamoDB, BenchmarkServiceApp],
+    quota_client: tuple[TestClient, _FakeDynamoDB, ValsBenchmarkServiceApp],
 ) -> None:
     client, fake, _app = quota_client
     fake.error_code = "InternalServerError"
@@ -380,7 +382,7 @@ def test_quota_storage_failure_closes_websocket_without_internal_details(
 
 
 def test_unlimited_tenant_does_not_consume_limited_tenant_quota(
-    quota_client: tuple[TestClient, _FakeDynamoDB, BenchmarkServiceApp],
+    quota_client: tuple[TestClient, _FakeDynamoDB, ValsBenchmarkServiceApp],
 ) -> None:
     client, fake, _app = quota_client
 
@@ -412,7 +414,7 @@ def test_unlimited_tenant_does_not_consume_limited_tenant_quota(
     ],
 )
 def test_websocket_evaluation_routes_cannot_bypass_quota(
-    quota_client: tuple[TestClient, _FakeDynamoDB, BenchmarkServiceApp],
+    quota_client: tuple[TestClient, _FakeDynamoDB, ValsBenchmarkServiceApp],
     path: str,
     payload: dict[str, object],
 ) -> None:
@@ -433,7 +435,7 @@ def test_websocket_evaluation_routes_cannot_bypass_quota(
 
 
 def test_sandbox_artifact_storage_failure_consumes_quota_before_storage_access(
-    quota_client: tuple[TestClient, _FakeDynamoDB, BenchmarkServiceApp],
+    quota_client: tuple[TestClient, _FakeDynamoDB, ValsBenchmarkServiceApp],
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     client, fake, app = quota_client

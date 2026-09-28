@@ -217,6 +217,9 @@ class DockerSandbox(Sandbox):
 
     async def upload_file(self, remote_path: str, content: bytes) -> None:
         path = PurePosixPath(remote_path)
+        if not path.is_absolute():
+            # Docker extracts archives relative to /, but commands and downloads resolve from the working directory.
+            path = PurePosixPath((await self.exec("pwd")).output.strip()) / path
         result = await self.exec(f"mkdir -p {shlex.quote(str(path.parent))}")
         if result.exit_code:
             raise SandboxCommandError(result.exit_code)
@@ -282,18 +285,25 @@ class DockerSandboxProvider(SandboxProvider):
     async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
         config = _build_container_config(request)
         name = f"cbs-{uuid4().hex}"
+        run = asyncio.create_task(self._docker.containers.run(config, name=name))  # pyright: ignore[reportUnknownMemberType]
         with _docker_errors():
             try:
                 async with asyncio.timeout(request.create_timeout):
-                    container = await self._docker.containers.run(config, name=name)  # pyright: ignore[reportUnknownMemberType]
+                    container = await asyncio.shield(run)
                     return await self.get_sandbox(container.id)
             except BaseException as error:
-                await _finish_cleanup(asyncio.create_task(self._cleanup_failed_creation(name)))
+                await _finish_cleanup(asyncio.create_task(self._cleanup_failed_creation(name, run)))
                 if isinstance(error, TimeoutError):
                     raise SandboxError("Docker sandbox creation timed out") from error
                 raise
 
-    async def _cleanup_failed_creation(self, name: str) -> None:
+    async def _cleanup_failed_creation(self, name: str, run: asyncio.Task[DockerContainer]) -> None:
+        # Docker keeps creating after the client gives up, so let an in-flight create finish before deleting by name.
+        try:
+            async with asyncio.timeout(15):
+                await asyncio.wait({run})
+        except TimeoutError:
+            run.cancel()
         try:
             async with asyncio.timeout(15):
                 await self.delete_sandbox(name)

@@ -167,7 +167,9 @@ and deletion include only containers marked as managed by this provider.
 
 Commands stream output and preserve exit codes. Timeouts and cancelled streams terminate
 the command's process group. File upload and download support binary data. Network access
-can be disabled with `network_block_all`; address allowlists are unsupported. Docker also
+can be disabled only at creation with `network_block_all`. `modify_egress_rules`, `block_all_egress`
+and `clear_egress_rules` raise `SandboxError`, so egress allowlists and staged egress policies fail
+on Docker sandboxes (#182). Docker also
 rejects snapshots, Compose, GPUs, persistent volumes, and provider-managed secrets.
 
 Run the local provider checks:

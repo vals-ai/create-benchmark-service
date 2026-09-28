@@ -29,7 +29,6 @@ from typing import Any
 
 from fastapi.encoders import jsonable_encoder
 
-from benchmark_service import submission_artifacts
 from benchmark_service.base import BenchmarkService
 from benchmark_service.context import sandbox_provider_scope
 from benchmark_service.sandbox import (
@@ -226,6 +225,8 @@ async def _materialize_artifact(
 ) -> None:
     """Download + upload in one frame so the artifact bytes (up to the download
     cap) are released as soon as they land in the sandbox."""
+    from benchmark_service import submission_artifacts
+
     tarball = await submission_artifacts.download(submission.artifact_reference, tenant=tenant)
     await sandbox.upload_file(submission.sandbox_path, tarball)
 

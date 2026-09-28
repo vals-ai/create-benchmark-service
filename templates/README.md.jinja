@@ -15,6 +15,28 @@ Edit `src/{{ benchmark_package }}/benchmark_service.py` and implement the six ab
 
 `setup_task` and `evaluate_instance` are async generators — yield `StreamMessageChunk`, `StreamErrorChunk`, and finally `StreamResultChunk`.
 
+## Authentication
+
+{% if template == "vals-ai" %}
+The Vals layer lives in `src/{{ benchmark_package }}/vals_ai/`. `ExampleBenchmark` subclasses `ValsBenchmarkService`; `main.py` uses `ValsBenchmarkServiceApp`. Both inherit the shared classes. The Vals app adds the `/v1/*` routes.
+
+Set `AUTH_REQUIRED=true` to enable Descope authentication, catalog/allowlist access, quotas, and trial restrictions. Configure `DESCOPE_PROJECT_ID` and access through `BENCHMARK_CATALOG_API_URL` plus `SERVICE_NAME`, `DESCOPE_TENANT_ALLOWLIST_JSON`, or `DESCOPE_ALLOWLIST_PATH`. Requests then require a Descope access key in `X-Descope-Api-Key`. Quota-enabled services also require `SERVICE_NAME` and `EVALUATION_QUOTA_TABLE_NAME`.
+
+Framework upgrades do not update these copied files. Local `/v1/*` requests work without credentials when `AUTH_REQUIRED` is unset or false.
+{% else %}
+Set `AUTH_REQUIRED=true` to require authentication. Implement `check_auth()` for boolean authentication, or `resolve_tenant()` and `check_dataset_access()` for tenant-aware access. With authentication required, the default rejects requests until you implement these hooks. This app includes the shared HTTP and WebSocket routes; it has no `/v1/*` routes.
+{% endif %}
+
+Authentication is disabled by default. Hosted registry deployments set `AUTH_REQUIRED=true`. `AUTH_DISABLED` is no longer supported and cannot override that setting.
+
+## Dependencies
+
+The base framework includes Daytona, Modal, and the OpenTelemetry API.
+{% if template == "vals-ai" %}
+
+This template selects `create-benchmark-service[vals-ai]` for S3/AWS clients, Sentry, Descope, and caching dependencies.
+{% endif %}
+
 ## Development
 
 ```bash

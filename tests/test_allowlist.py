@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from benchmark_service.auth import clear_allowlist_cache, get_tenant_config, load_allowlist
+from templates.vals_ai.auth import clear_allowlist_cache, get_tenant_config, load_allowlist
 
 
 @pytest.fixture(autouse=True)
@@ -56,6 +56,7 @@ def test_load_allowlist_empty_when_neither_set(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.delenv("DESCOPE_TENANT_ALLOWLIST_JSON", raising=False)
     monkeypatch.delenv("DESCOPE_ALLOWLIST_PATH", raising=False)
 

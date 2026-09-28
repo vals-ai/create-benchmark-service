@@ -28,16 +28,16 @@ from benchmark_service import (
     TargetedSnapshotSource,
     VolumeMount,
 )
-from benchmark_service import auth as auth_module
-from benchmark_service import grading
-from benchmark_service.app import (
-    BenchmarkServiceApp,
+from templates.vals_ai import auth as auth_module
+from benchmark_service import grading, submission_artifacts
+from templates.vals_ai.app import (
+    ValsBenchmarkServiceApp,
     _DuplicateGradingRequest,
     _GradingAdmission,
     _GradingCapacityExceeded,
     _grading_provider_config,
 )
-from benchmark_service.auth import clear_allowlist_cache, clear_auth_cache
+from templates.vals_ai.auth import clear_allowlist_cache, clear_auth_cache
 from benchmark_service.grading import (
     SUBMISSION_ARTIFACT_SANDBOX_PATH,
     collapse_stream,
@@ -61,7 +61,7 @@ from benchmark_service.submission_artifacts import (
     SubmissionArtifactReference,
 )
 from benchmark_service.v1_schemas import V1EvalRequest, V1EvalStatus, V1Payload, V1PayloadType
-from tests.conftest import StubBenchmark
+from tests.conftest import ValsStubBenchmark as StubBenchmark
 
 
 class FakeSandbox(Sandbox):
@@ -579,7 +579,7 @@ async def test_grade_instance_maps_missing_artifact_to_error(monkeypatch: pytest
     async def missing_download(reference: SubmissionArtifactReference, *, tenant: str) -> bytes:
         raise SubmissionArtifactNotFound(f"no artifact was uploaded for key {reference.key}")
 
-    monkeypatch.setattr(grading.submission_artifacts, "download", missing_download)
+    monkeypatch.setattr(submission_artifacts, "download", missing_download)
     service = await ArtifactSandboxStub.create()
     provider = FakeProvider(FakeSandbox())
     resp = await _grade(
@@ -1070,9 +1070,10 @@ def test_grading_provider_config_does_not_render_present_modal_secret(
     assert "must-not-appear" not in str(exc_info.value)
 
 
-def _sandbox_app(monkeypatch: pytest.MonkeyPatch, service_cls: type[StubBenchmark] = SandboxStub) -> BenchmarkServiceApp:
+def _sandbox_app(monkeypatch: pytest.MonkeyPatch, service_cls: type[StubBenchmark] = SandboxStub) -> ValsBenchmarkServiceApp:
     clear_allowlist_cache()
     clear_auth_cache()
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
     monkeypatch.setenv(
         "DESCOPE_TENANT_ALLOWLIST_JSON",
@@ -1081,8 +1082,8 @@ def _sandbox_app(monkeypatch: pytest.MonkeyPatch, service_cls: type[StubBenchmar
     monkeypatch.setenv("SUBMISSION_ARTIFACT_BUCKET", "vals-submission-artifacts")
     monkeypatch.setenv("AWS_REGION", "us-east-1")
     _FakeDaytonaConfig.provider = FakeProvider(FakeSandbox())
-    monkeypatch.setattr("benchmark_service.app.DaytonaProviderConfig", _FakeDaytonaConfig)
-    app = BenchmarkServiceApp(service_cls)
+    monkeypatch.setattr("templates.vals_ai.app.DaytonaProviderConfig", _FakeDaytonaConfig)
+    app = ValsBenchmarkServiceApp(service_cls)
     app._service_version = "stub-service-1.0"  # pyright: ignore[reportPrivateUsage]
     return app
 
@@ -1148,6 +1149,7 @@ def test_sandbox_mode_missing_server_sandbox_env_fails_at_boot(
     not 503 (or burn a sandbox) on the first lab call."""
     clear_allowlist_cache()
     clear_auth_cache()
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.setenv("DESCOPE_PROJECT_ID", "P_test")
     monkeypatch.setenv(
         "DESCOPE_TENANT_ALLOWLIST_JSON",
@@ -1158,7 +1160,7 @@ def test_sandbox_mode_missing_server_sandbox_env_fails_at_boot(
     monkeypatch.delenv("DAYTONA_API_KEY", raising=False)
     monkeypatch.delenv("DAYTONA_API_URL", raising=False)
     monkeypatch.delenv("DAYTONA_TARGET", raising=False)
-    app = BenchmarkServiceApp(SandboxStub)
+    app = ValsBenchmarkServiceApp(SandboxStub)
 
     with pytest.raises(MissingSandboxConfigError):
         with TestClient(app):
@@ -1330,7 +1332,7 @@ def test_v1_evaluate_passes_tenant_and_admitted_file_to_in_process_benchmark(
 
     assert response.status_code == 200
     assert response.json()["result"] == {"resolved": True}
-    app = cast(BenchmarkServiceApp, in_process_artifact_client.app)
+    app = cast(ValsBenchmarkServiceApp, in_process_artifact_client.app)
     service = cast(MaterializedArtifactStub, app.service)
     assert service.artifact_call == (
         "acme",
@@ -1371,7 +1373,7 @@ def test_v1_evaluate_rejects_artifact_outside_authenticated_request_before_stora
     )
 
     assert response.status_code == 404
-    app = cast(BenchmarkServiceApp, in_process_artifact_client.app)
+    app = cast(ValsBenchmarkServiceApp, in_process_artifact_client.app)
     assert cast(MaterializedArtifactStub, app.service).artifact_call is None
 
 
@@ -1453,7 +1455,7 @@ def test_v1_evaluate_rejects_changed_artifact_before_in_process_hook(
     )
 
     assert response.status_code == 409
-    app = cast(BenchmarkServiceApp, in_process_artifact_client.app)
+    app = cast(ValsBenchmarkServiceApp, in_process_artifact_client.app)
     assert cast(MaterializedArtifactStub, app.service).artifact_call is None
 
 
@@ -1503,7 +1505,7 @@ async def test_v1_evaluate_orders_reservation_quota_queue_and_artifact_preflight
         if quota_calls == 2:
             queued_quota_consumed.set()
 
-    app._consume_evaluation_quota = consume_quota  # pyright: ignore[reportPrivateUsage]
+    app.consume_evaluation_request = consume_quota
 
     async def evaluate(run_id: str) -> Any:
         request = Request({"type": "http", "headers": []})
@@ -1592,19 +1594,19 @@ async def test_canceled_artifact_storage_worker_keeps_grading_admission(
         raise RuntimeError("late artifact storage failure")
 
     if operation == "stat":
-        monkeypatch.setattr(grading.submission_artifacts, "_stat_sync", blocking_stat)
+        monkeypatch.setattr(submission_artifacts, "_stat_sync", blocking_stat)
     elif operation == "download":
-        monkeypatch.setattr(grading.submission_artifacts, "_download_sync", blocking_download)
+        monkeypatch.setattr(submission_artifacts, "_download_sync", blocking_download)
     else:
-        monkeypatch.setattr(grading.submission_artifacts, "_materialize_sync", blocking_materialize)
+        monkeypatch.setattr(submission_artifacts, "_materialize_sync", blocking_materialize)
 
     async def run_storage_operation() -> None:
         if operation == "stat":
-            await grading.submission_artifacts.stat(key, tenant="acme")
+            await submission_artifacts.stat(key, tenant="acme")
         elif operation == "download":
-            await grading.submission_artifacts.download(reference, tenant="acme")
+            await submission_artifacts.download(reference, tenant="acme")
         else:
-            async with grading.submission_artifacts.materialize(reference, tenant="acme"):
+            async with submission_artifacts.materialize(reference, tenant="acme"):
                 pytest.fail("failed materialization must not yield")
 
     admission = _GradingAdmission(
@@ -1730,13 +1732,13 @@ def test_ws_evaluate_response_stays_sandboxless_for_sandbox_benchmarks(monkeypat
     service-owned in-process evaluation and never provision sandboxes."""
     clear_allowlist_cache()
     clear_auth_cache()
-    monkeypatch.setenv("AUTH_DISABLED", "true")
+    monkeypatch.delenv("AUTH_REQUIRED", raising=False)
     monkeypatch.setenv("SUBMISSION_ARTIFACT_BUCKET", "vals-submission-artifacts")
     monkeypatch.setenv("AWS_REGION", "us-east-1")
     _FakeDaytonaConfig.provider = FakeProvider(FakeSandbox())
-    monkeypatch.setattr("benchmark_service.app.DaytonaProviderConfig", _FakeDaytonaConfig)
+    monkeypatch.setattr("templates.vals_ai.app.DaytonaProviderConfig", _FakeDaytonaConfig)
 
-    with TestClient(BenchmarkServiceApp(SandboxStub)) as client:
+    with TestClient(ValsBenchmarkServiceApp(SandboxStub)) as client:
         with client.websocket_connect("/ws/evaluate-response") as ws:
             ws.send_json({"task_id": "task-1", "response": "2", "dataset": "default"})
             msg = ws.receive_json()
@@ -1750,4 +1752,4 @@ def test_grading_max_concurrency_of_zero_fails_at_boot(monkeypatch: pytest.Monke
     evaluation would hang forever with no error or log."""
     monkeypatch.setenv("GRADING_MAX_CONCURRENCY", "0")
     with pytest.raises(ValueError, match="GRADING_MAX_CONCURRENCY"):
-        BenchmarkServiceApp(StubBenchmark)
+        ValsBenchmarkServiceApp(StubBenchmark)

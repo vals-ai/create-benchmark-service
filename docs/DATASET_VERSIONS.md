@@ -81,7 +81,7 @@ Use `HTTPException` to report an unavailable version (404), an incompatible vers
 | Operation | Contract |
 | --- | --- |
 | `GET /version?dataset=validation` | `dataset_version_selection: true` declares support for that dataset. Existing services report false. |
-| `POST /resolve-dataset` | Authenticated body: `{"dataset":"validation","version":null}`. Returns `{"dataset":"validation","version":{"id":"v1.0","label":"v1.0"}}`. Trial tenants can resolve datasets they may access. No evaluation quota is consumed. |
+| `POST /resolve-dataset` | Body: `{"dataset":"validation","version":null}`. Returns `{"dataset":"validation","version":{"id":"v1.0","label":"v1.0"}}`. When authentication is enabled, the caller must be authorized for the dataset. Vals trial tenants can resolve datasets they may access. No evaluation quota is consumed. |
 | Dataset HTTP requests | Send `X-Benchmark-Dataset-Version: v1.0`. Successful responses echo it. The client rejects a missing or different echo. |
 | Dataset WebSocket requests | Send the same header. Before benchmark task or grading work, the server emits `{"type":"dataset_version","data":{"id":"v1.0","label":"v1.0"}}`. The client consumes it before exposing progress, checkpoints, or results. |
 
@@ -91,7 +91,7 @@ The task-list response uses the selected version's display label for a pinned re
 
 Benchmark-owned `error` chunks retain their existing string payload and can be followed by more chunks, including a `result`. The framework client treats an `error` as a failed operation and closes its socket. The server continues the stream until it completes or a send fails; the service owns any work and cleanup between those events.
 
-The header covers task verification, retrieval, setup, all evaluation paths, scoring, and `/v1` task listing and upload preparation. `/health` and `/version` remain metadata operations. Resolution rejects a version header; its selector belongs in the body.
+The header covers task verification, retrieval, setup, evaluation, and scoring. Services generated with the Vals template also use it for `/v1` evaluation, scoring, task listing, and upload preparation. `/health` and `/version` remain metadata operations. Resolution rejects a version header; its selector belongs in the body.
 
 IDs contain 1–1,024 visible ASCII characters with no whitespace. Display labels contain up to 256 Unicode characters. Resolution selectors can contain Unicode and spaces, so a service can map a release name to its exact ID. Duplicate headers are rejected. Browser deployments must allow and expose `X-Benchmark-Dataset-Version` in their CORS policy.
 

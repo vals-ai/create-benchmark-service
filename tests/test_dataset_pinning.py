@@ -24,11 +24,13 @@ from benchmark_service.schemas import (
     StreamErrorChunk,
     StreamResultChunk,
 )
-from benchmark_service.v1_schemas import V1Task
+from benchmark_service.v1_schemas import V1EvalStatus, V1PayloadType, V1ScoreItem, V1Task
+from templates.vals_ai.app import ValsBenchmarkServiceApp
+from templates.vals_ai.base import ValsBenchmarkService
 from conftest import StubBenchmark
 
 
-class VersionedBenchmark(StubBenchmark):
+class VersionedBenchmark(StubBenchmark, ValsBenchmarkService):
     async def load_datasets(self) -> dict[str, dict[str, Any]]:
         self.default_version = "v1.0"
         self.selected: ContextVar[str] = ContextVar("selected")
@@ -102,8 +104,9 @@ class LegacyContinuingBenchmark(StubBenchmark):
 
 @pytest.fixture
 async def running_service(monkeypatch: pytest.MonkeyPatch) -> AsyncGenerator[tuple[str, VersionedBenchmark], None]:
-    monkeypatch.setenv("AUTH_DISABLED", "true")
-    app = BenchmarkServiceApp(VersionedBenchmark)
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
+    monkeypatch.setenv("DESCOPE_TENANT_ALLOWLIST_JSON", json.dumps({"tenants": {"reader": {"datasets": ["default"]}}}))
+    app = ValsBenchmarkServiceApp(VersionedBenchmark)
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         url = f"http://127.0.0.1:{listener.getsockname()[1]}"
@@ -144,6 +147,16 @@ async def test_pin_survives_default_switch_on_http_and_websocket(
                 tasks = await client.list_tasks("default")
                 assert [task.question for task in tasks.tasks] == [version, version]
                 assert tasks.dataset_version == f"Display release {version}"
+                evaluation = await client.v1_evaluate(
+                    "run-1", "task-1", version, "text.v1", V1PayloadType.TEXT, dataset="default"
+                )
+                assert evaluation.result == {"resolved": True}
+                score = await client.v1_score(
+                    "run-1",
+                    {"task-1": V1ScoreItem(status=V1EvalStatus.EVALUATED, result=evaluation.result)},
+                    dataset="default",
+                )
+                assert score.final_score == 100
 
         await asyncio.gather(use_version(first.version.id), use_version(second.version.id))
         assert (await unpinned.verify_task_ids(None, None)).task_ids == ["task-1", "only-v1.1"]
@@ -180,12 +193,12 @@ async def test_authorization_and_bad_pins_never_enter_version_scope(
 
 
 def test_trial_resolution_checks_dataset_access_without_grading(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("AUTH_DISABLED", "true")
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
     monkeypatch.setenv(
         "DESCOPE_TENANT_ALLOWLIST_JSON",
         json.dumps({"tenants": {"reader": {"datasets": ["default"], "trial_mode": True}}}),
     )
-    app = BenchmarkServiceApp(VersionedBenchmark)
+    app = ValsBenchmarkServiceApp(VersionedBenchmark)
     with TestClient(app) as client:
         headers = {"X-Test-Tenant": "reader"}
         assert (
@@ -265,7 +278,7 @@ async def test_client_preserves_websocket_version_selection_status(
 
 
 def test_legacy_service_requires_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("AUTH_DISABLED", "true")
+    monkeypatch.delenv("AUTH_REQUIRED", raising=False)
     with TestClient(BenchmarkServiceApp(StubBenchmark)) as client:
         assert client.get("/verify-task-ids").json()["task_ids"] == ["task-1", "task-2", "task-3"]
         assert client.get("/verify-task-ids", headers={DATASET_VERSION_HEADER: "v1.0"}).status_code == 400
@@ -284,7 +297,7 @@ def test_legacy_service_requires_opt_in(monkeypatch: pytest.MonkeyPatch) -> None
 
 
 def test_legacy_unpinned_stream_continues_after_error(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("AUTH_DISABLED", "true")
+    monkeypatch.delenv("AUTH_REQUIRED", raising=False)
     with TestClient(BenchmarkServiceApp(LegacyContinuingBenchmark)) as client:
         with client.websocket_connect("/ws/evaluate-response") as ws:
             ws.send_json({"task_id": "task-1", "response": "2"})

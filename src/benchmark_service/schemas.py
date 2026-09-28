@@ -1,6 +1,8 @@
 """Request and response models for the benchmark service API."""
 
+from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import Path
 from typing import Annotated, Any, Literal, assert_never, cast
 
 from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
@@ -16,7 +18,6 @@ from benchmark_service.sandbox.types import (
     TargetedSnapshotSource,
     VolumeMount,
 )
-from benchmark_service.submission_artifacts import SubmissionArtifactReference
 
 _COMPOSE_LEGACY_DOCKER_IMAGE = "compose+source-required"
 _TARGETED_SNAPSHOT_LEGACY_DOCKER_IMAGE = "targeted-snapshot+source-required"
@@ -159,6 +160,23 @@ class TextGradingSubmission(BaseModel):
     task_id: str
     schema_id: str
     text: str
+
+
+@dataclass(frozen=True, slots=True)
+class SubmissionArtifactReference:
+    """Immutable identity captured when a submission artifact is admitted."""
+
+    key: str
+    size_bytes: int
+    etag: str
+
+
+@dataclass(frozen=True, slots=True)
+class MaterializedSubmissionArtifact:
+    """Framework-owned local copy of one admitted submission artifact."""
+
+    path: Path
+    reference: SubmissionArtifactReference
 
 
 class ArtifactGradingSubmission(BaseModel):

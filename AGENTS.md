@@ -30,4 +30,4 @@ The "public surface" is defined in `docs/DEVELOPMENT.md`. In short: `BenchmarkSe
 - New endpoints touch the public surface → `#minor` at minimum.
 - Schema field changes: adding a field with a default = `#minor`; removing or renaming is breaking — `#minor` while pre-1.0, `#major` after.
 - Don't modify the auto-generated `_version.py` — `hatch-vcs` derives it from git tags.
-- The `/v1/*` surface is Descope-only by design; requests served with `AUTH_DISABLED=true` should 403, not pass through.
+- Authentication is disabled by default. Hosted deployments set `AUTH_REQUIRED=true`; the Vals `/v1/*` routes require Descope in that mode.

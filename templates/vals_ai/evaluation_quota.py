@@ -13,7 +13,7 @@ import boto3
 from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
-from benchmark_service.auth import (
+from .auth import (
     AllowlistConfig,
     EvaluationQuotaConfig,
     EvaluationQuotaPeriod,

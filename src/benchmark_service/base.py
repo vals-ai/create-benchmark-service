@@ -16,18 +16,17 @@ from fastapi.encoders import jsonable_encoder
 from benchmark_service.auth import (
     UNAUTHENTICATED_TENANT_SENTINEL,
     check_benchmark_service_auth,
-    get_tenant_config,
     resolve_caller_tenant,
 )
 from benchmark_service.dataset_versioning import DatasetVersionEntry, load_dataset_versions
 from benchmark_service.sandbox import Sandbox
-from benchmark_service.submission_artifacts import MaterializedSubmissionArtifact
 from benchmark_service.schemas import (
     DatasetVersion,
     EvalMode,
     EvaluateResponseRequest,
     FinalScoreResult,
     GradingSubmission,
+    MaterializedSubmissionArtifact,
     RetrieveTaskResponse,
     StreamChunk,
     StreamResultChunk,
@@ -60,7 +59,7 @@ class BenchmarkService(ABC):
     dataset_versions_file: ClassVar[Path | None] = None
     dataset_versions: dict[str, DatasetVersionEntry]
 
-    # How /v1/evaluate grades this benchmark. The framework reads this at boot
+    # How /v1/evaluate grades this benchmark. The Vals app reads this at boot
     # and per dispatch, so it is class state, not a per-instance value.
     eval_mode: ClassVar[EvalMode] = EvalMode.TEXT
     accepted_submission_schemas: ClassVar[dict[V1PayloadType, frozenset[str]]] = {}
@@ -149,9 +148,8 @@ class BenchmarkService(ABC):
     async def resolve_tenant(self, headers: dict[str, str]) -> str | None:
         """Authenticate the caller and return their tenant id, or None to reject.
 
-        Subclasses with a legacy `check_auth` override keep their existing boolean
-        behavior. A successful legacy check returns the "_legacy" sentinel, which
-        skips dataset-level allowlist enforcement.
+        A boolean ``check_auth`` override authenticates without a tenant identity.
+        Override this method to support tenant-aware dataset access.
         """
         if type(self).check_auth is not BenchmarkService.check_auth:
             ok = await self.check_auth(headers)
@@ -160,12 +158,7 @@ class BenchmarkService(ABC):
 
     async def check_dataset_access(self, tenant: str, dataset: str | None) -> bool:
         """Return True if `tenant` may use `dataset` on this service."""
-        if tenant == UNAUTHENTICATED_TENANT_SENTINEL:
-            return True
-        entry = get_tenant_config(tenant)
-        if entry is None:
-            return False
-        return (dataset or "default") in entry.datasets
+        return True
 
     def supports_dataset_version_selection(self, dataset: str) -> bool:
         """Whether this dataset can honor immutable version IDs on every operation."""
@@ -235,25 +228,6 @@ class BenchmarkService(ABC):
             NotImplementedError: if the benchmark has not opted into task listing.
         """
         raise NotImplementedError(f"{type(self).__name__}.list_tasks must explicitly map internal tasks to V1Task")
-
-    def project_trial_result(self, result: Any) -> Any:
-        """Trial-safe projection of a per-task eval result.
-
-        For `trial_mode` tenants, /v1/evaluate responses are reduced to what this
-        returns, and that projection is all a trial caller can resubmit to
-        /v1/score. So it must include both the score fields a prospect may see
-        AND any field `calculate_final_score` needs to aggregate -- anything
-        dropped here is gone from the final score too.
-
-        Like `list_tasks`, the default raises so trial mode requires an explicit,
-        audited projection rather than leaking rubric / judge data by omission.
-
-        Raises:
-            NotImplementedError: if the benchmark has not opted into trial mode.
-        """
-        raise NotImplementedError(
-            f"{type(self).__name__}.project_trial_result must be implemented for trial_mode tenants"
-        )
 
     async def validate_task_ids(self, task_ids: list[str], dataset: str | None = None) -> list[str]:
         """Validate that task IDs exist in your benchmark dataset.

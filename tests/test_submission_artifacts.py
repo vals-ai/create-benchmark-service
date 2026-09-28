@@ -2,6 +2,7 @@ from collections.abc import Generator
 from pathlib import Path
 from stat import S_IMODE
 
+import boto3
 import pytest
 from botocore.exceptions import ClientError
 
@@ -64,7 +65,7 @@ def test_presigned_put_url_uses_configured_bucket_and_key(monkeypatch: pytest.Mo
         captured.update(client_kwargs=kwargs)
         return _FakeS3()
 
-    monkeypatch.setattr(submission_artifacts.boto3, "client", fake_client)
+    monkeypatch.setattr(boto3, "client", fake_client)
     url = submission_artifacts.presigned_put_url("submission-artifacts/run-1/task-9/submission.xlsx")
     assert url == "https://signed.example/put"
     assert captured["op"] == "put_object"

@@ -5,7 +5,6 @@ import re
 import tempfile
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
 from functools import lru_cache, partial
 from pathlib import Path
 from typing import Protocol, cast
@@ -15,6 +14,10 @@ from botocore.config import Config
 from botocore.exceptions import ClientError
 
 from benchmark_service.blocking import run_blocking
+from benchmark_service.schemas import (
+    MaterializedSubmissionArtifact as MaterializedSubmissionArtifact,
+    SubmissionArtifactReference as SubmissionArtifactReference,
+)
 from benchmark_service.v1_schemas import KEY_SEGMENT_PATTERN
 
 DEFAULT_UPLOAD_EXPIRY_S = 3600
@@ -41,23 +44,6 @@ class SubmissionArtifactChanged(Exception):
 
 class SubmissionArtifactTooLarge(Exception):
     """The uploaded object exceeds the configured download size limit."""
-
-
-@dataclass(frozen=True, slots=True)
-class SubmissionArtifactReference:
-    """Immutable identity captured when a submission artifact is admitted."""
-
-    key: str
-    size_bytes: int
-    etag: str
-
-
-@dataclass(frozen=True, slots=True)
-class MaterializedSubmissionArtifact:
-    """Framework-owned local copy of one admitted submission artifact."""
-
-    path: Path
-    reference: SubmissionArtifactReference
 
 
 class _StreamingBody(Protocol):

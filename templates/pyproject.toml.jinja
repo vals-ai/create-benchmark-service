@@ -5,7 +5,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 
 dependencies = [
-    "create-benchmark-service @ git+{{ framework_repo_url }}@{{ framework_ref }}",
+    "create-benchmark-service{% if template == 'vals-ai' %}[vals-ai]{% endif %} @ git+{{ framework_repo_url }}@{{ framework_ref }}",
 ]
 
 [dependency-groups]
@@ -35,6 +35,9 @@ allow-direct-references = true
 [tool.ruff]
 line-length = 120
 target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F"]
 
 [tool.ruff.format]
 quote-style = "double"

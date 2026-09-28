@@ -103,12 +103,14 @@ def copy_file(source: Path, dest: Path) -> None:
 def generate_project(
     benchmark_name: str,
     output_dir: Path,
+    template: str = "default",
 ) -> None:
     """Generate a new benchmark service project.
 
     Args:
         benchmark_name: Name of the benchmark (e.g., "swebench")
         output_dir: Output directory path
+        template: Scaffold to generate: default or vals-ai.
 
     Raises:
         ValueError: If benchmark name is invalid
@@ -116,6 +118,8 @@ def generate_project(
     """
     # Validate name
     validate_name(benchmark_name)
+    if template not in {"default", "vals-ai"}:
+        raise ValueError(f"Unknown template {template!r}; choose 'default' or 'vals-ai'")
 
     # Check if output directory exists
     if output_dir.exists():
@@ -158,18 +162,19 @@ def generate_project(
         **names,
         "framework_ref": framework_ref,
         "framework_repo_url": _FRAMEWORK_REPO_URL,
+        "template": template,
     }
 
     for template_name, output_name in template_files.items():
-        template = env.get_template(template_name)
-        content = template.render(template_context)
+        project_template = env.get_template(template_name)
+        content = project_template.render(template_context)
         (output_dir / output_name).write_text(content)
 
     # Copy .github directory, excluding framework maintenance workflows
     shutil.copytree(
         root / ".github",
         output_dir / ".github",
-        ignore=shutil.ignore_patterns("cli-integration.yaml"),
+        ignore=shutil.ignore_patterns("cli-integration.yaml", "provider-integration.yaml"),
     )
 
     # Create empty tests directory
@@ -184,6 +189,13 @@ def generate_project(
     (benchmark_package_dir / "__init__.py").write_text(f'"""Utilities for {names["benchmark_name"]} benchmark."""\n')
 
     # Copy templates
-    copy_file(templates_dir / "benchmark_service.py", benchmark_package_dir / "benchmark_service.py")
+    service_template = env.get_template("benchmark_service.py.jinja")
+    (benchmark_package_dir / "benchmark_service.py").write_text(service_template.render(template_context))
+    if template == "vals-ai":
+        shutil.copytree(
+            templates_dir / "vals_ai",
+            benchmark_package_dir / "vals_ai",
+            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+        )
     copy_file(templates_dir / "Dockerfile", output_dir / "Dockerfile")
     copy_file(templates_dir / ".dockerignore", output_dir / ".dockerignore")

@@ -1,7 +1,8 @@
 """Benchmark service entry point."""
 
-from benchmark_service import BenchmarkServiceApp
+{% if template == "default" %}from benchmark_service import BenchmarkServiceApp
 
-from {{ benchmark_package }}.benchmark_service import ExampleBenchmark
+{% endif %}from {{ benchmark_package }}.benchmark_service import ExampleBenchmark{% if template == "vals-ai" %}
+from {{ benchmark_package }}.vals_ai import ValsBenchmarkServiceApp{% endif %}
 
-app = BenchmarkServiceApp(ExampleBenchmark)
+app = {% if template == "vals-ai" %}ValsBenchmarkServiceApp{% else %}BenchmarkServiceApp{% endif %}(ExampleBenchmark)

@@ -442,8 +442,8 @@ for domain in {domains_to_resolve!r}:
         await self._set_outbound_network_policy([], [])
 
     async def clear_egress_rules(self) -> None:
-        # Modal cannot switch a running sandbox to OPEN; restore the allow-all
-        # policy used at creation instead.
+        # Modal rejects switching a running sandbox to OPEN. An allow-all
+        # allowlist provides the same access without that unsupported transition.
         await self._set_outbound_network_policy(list(_ALLOW_ALL_CIDRS), list(_ALLOW_ALL_DOMAINS))
 
 

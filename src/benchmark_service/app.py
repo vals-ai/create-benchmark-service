@@ -151,9 +151,10 @@ def _request_sandbox_provider_config(
 
 
 DOCKER_ENABLED_ENV = "CBS_DOCKER_ENABLED"
+_DOCKER_DISABLED_REASON = "Docker sandboxes are disabled on this service"
 
 
-def _request_may_use_provider(config: SandboxProviderConfig) -> bool:
+def _request_may_use_provider(config: SandboxProviderConfig | None) -> bool:
     """Docker needs no caller credentials and drives this host's daemon, so only an opted-in service accepts it."""
     return not isinstance(config, DockerProviderConfig) or os.environ.get(DOCKER_ENABLED_ENV, "").lower() == "true"
 
@@ -590,7 +591,7 @@ class BenchmarkServiceApp(FastAPI):
                 )
             sandbox_config = _request_sandbox_provider_config(request, websocket)
             if not _request_may_use_provider(sandbox_config):
-                await websocket.close(code=1008, reason="Docker sandboxes are disabled on this service")
+                await websocket.close(code=1008, reason=_DOCKER_DISABLED_REASON)
                 return
 
             if not await self.service.check_dataset_access(tenant, request.dataset):
@@ -624,6 +625,8 @@ class BenchmarkServiceApp(FastAPI):
     async def _evaluate_response(self, request: Request, body: EvaluateResponseRequest) -> Any:
         if self._sentry_enabled:
             bind_request_context(request.headers, task_id=body.task_id, dataset=body.dataset)
+        if not _request_may_use_provider(body.sandbox_provider):
+            raise HTTPException(status_code=403, detail=_DOCKER_DISABLED_REASON)
         if not await self.service.check_dataset_access(request.state.tenant, body.dataset):
             raise HTTPException(status_code=403, detail="Dataset not allowed")
         await self._consume_evaluation_quota(cast(str, request.state.tenant))
@@ -641,6 +644,9 @@ class BenchmarkServiceApp(FastAPI):
             request = EvaluateResponseRequest(**data)
             if self._sentry_enabled:
                 bind_request_context(websocket.headers, task_id=request.task_id, dataset=request.dataset)
+            if not _request_may_use_provider(request.sandbox_provider):
+                await websocket.close(code=1008, reason=_DOCKER_DISABLED_REASON)
+                return
 
             if not await self.service.check_dataset_access(tenant, request.dataset):
                 await websocket.close(code=1008, reason="Dataset not allowed")
@@ -687,7 +693,7 @@ class BenchmarkServiceApp(FastAPI):
                 )
             sandbox_config = _request_sandbox_provider_config(request, websocket)
             if not _request_may_use_provider(sandbox_config):
-                await websocket.close(code=1008, reason="Docker sandboxes are disabled on this service")
+                await websocket.close(code=1008, reason=_DOCKER_DISABLED_REASON)
                 return
 
             if not await self.service.check_dataset_access(tenant, request.dataset):

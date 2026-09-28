@@ -166,3 +166,39 @@ async def test_timed_out_creation_deletes_a_container_docker_finishes_later() ->
         await creation
 
     assert deleted == [True]
+
+
+async def test_timed_out_creation_logs_a_late_creation_failure(caplog: pytest.LogCaptureFixture) -> None:
+    """Log a create that fails after the caller's deadline instead of leaving an unretrieved task error."""
+
+    async def run(_config: object, *, name: str) -> MagicMock:
+        await asyncio.sleep(1.2)
+        raise DockerError(500, "image pull failed")
+
+    container = MagicMock(spec=DockerContainer)
+    container.show = AsyncMock(side_effect=DockerError(404, "No such container"))
+    provider = DockerSandboxProvider.__new__(DockerSandboxProvider)
+    docker = MagicMock()
+    docker.containers.run = run
+    docker.containers.container = MagicMock(return_value=container)
+    provider._docker = docker  # pyright: ignore[reportPrivateUsage]
+    request = SandboxCreateRequest(
+        name="failing-create",
+        source=ImageSource(image="python:3.12-slim"),
+        resources=Resources(vcpu=1, memory=1, disk=5),
+        labels={},
+        env_vars={},
+        auto_stop_interval=5,
+        create_timeout=1,
+    )
+
+    with pytest.raises(SandboxError, match="timed out"):
+        await provider.create_sandbox(request)
+
+    assert any(
+        record.message == "Docker sandbox creation failed after its deadline"
+        and record.exc_info
+        and isinstance(record.exc_info[1], DockerError)
+        for record in caplog.records
+    )
+    assert not any("never retrieved" in record.getMessage() for record in caplog.records)

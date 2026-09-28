@@ -299,11 +299,14 @@ class DockerSandboxProvider(SandboxProvider):
 
     async def _cleanup_failed_creation(self, name: str, run: asyncio.Task[DockerContainer]) -> None:
         # Docker keeps creating after the client gives up, so let an in-flight create finish before deleting by name.
+        was_running = not run.done()
         try:
             async with asyncio.timeout(15):
                 await asyncio.wait({run})
         except TimeoutError:
             run.cancel()
+        if was_running and run.done() and not run.cancelled() and (error := run.exception()) is not None:
+            logger.warning("Docker sandbox creation failed after its deadline", exc_info=error)
         try:
             async with asyncio.timeout(15):
                 await self.delete_sandbox(name)

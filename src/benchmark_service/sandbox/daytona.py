@@ -1004,6 +1004,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         self._output: asyncio.Queue[str] = asyncio.Queue()
         self._create_state = _PtyCreateState(marker=uuid.uuid4().hex)
         self._creation_done = asyncio.Event()
+        self._closed = asyncio.Event()
         self._close_requested = False
         self._output_closed = False
         self._close_lock = asyncio.Lock()
@@ -1089,6 +1090,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         # The producer may still be stalled on a status probe after the PTY is gone.
         # Close only after fresh absence confirmation, preserving every queued chunk.
         self._output_closed = True
+        self._closed.set()
         return asyncio.get_running_loop().time()
 
     @property
@@ -1203,6 +1205,25 @@ class _DaytonaControlledWorkload(ControlledWorkload):
                     "Failed to read Daytona controlled PTY exit code for "
                     f"{self._sandbox_ref}: status_path={self._status_path}"
                 )
+            # The atomic status file can become visible before the PTY delivers its
+            # final frames. Natural completion requires the transport's end-of-stream;
+            # confirmed kill instead closes output without waiting for the producer.
+            if not self._output_closed:
+                closed_task = asyncio.create_task(self._closed.wait())
+                try:
+                    done, _ = await _bounded(
+                        "handle.wait",
+                        asyncio.wait(
+                            {wait_task, closed_task}, return_when=asyncio.FIRST_COMPLETED
+                        ),
+                        _TOOLBOX_CALL_TIMEOUT_SECONDS,
+                    )
+                    if wait_task in done:
+                        await wait_task
+                finally:
+                    closed_task.cancel()
+                    with suppress(asyncio.CancelledError):
+                        await closed_task
             return ExecResult(
                 exit_code=int(result.output.strip().splitlines()[-1]),
                 output="".join(stdout),

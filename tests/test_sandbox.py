@@ -4941,3 +4941,111 @@ async def test_daytona_controlled_natural_output_drains_queued_tail() -> None:
     await workload.wait()
 
     assert [chunk async for chunk in workload.output()] == ["hello", "tail before completion"]
+
+
+async def test_daytona_controlled_natural_completion_waits_for_final_pty_frame(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(daytona_module, "_PTY_STATUS_POLL_SECONDS", 0)
+
+    class StatusFirstHandle(PtyHandle):
+        def __init__(self, on_data: Callable[[bytes], None | Awaitable[None]]) -> None:
+            super().__init__(on_data)
+            self.release_close = asyncio.Event()
+
+        async def wait(self) -> PtyResult | None:
+            await self.release_close.wait()
+            await self.emit(b" final frame")
+            return None
+
+    class StatusFirstProcess(ControlledProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.status_read = asyncio.Event()
+            self.handle: StatusFirstHandle | None = None
+
+        async def exec(self, command: str) -> SimpleNamespace:
+            result = await super().exec(command)
+            if _unwrap_shell_command(command).startswith("cat "):
+                self.status_read.set()
+            return result
+
+        async def create_pty_session(
+            self,
+            *,
+            id: str,
+            on_data: Callable[[bytes], None | Awaitable[None]],
+            envs: dict[str, str],
+            pty_size: PtySize,
+        ) -> StatusFirstHandle:
+            _assert_pty_create_config(envs, pty_size)
+            self.handle = StatusFirstHandle(on_data)
+            self.pty_handle = self.handle
+            self.sessions.add(id)
+            self.create_started.set()
+            return self.handle
+
+    process = StatusFirstProcess()
+    inner = InnerSandbox()
+    inner.process = process
+    workload = DaytonaSandbox(cast(Any, inner)).controlled_workload("printf controlled")
+    wait_task = asyncio.create_task(workload.wait())
+
+    try:
+        await asyncio.wait_for(process.status_read.wait(), 1)
+        assert not wait_task.done(), "status file alone must not complete the output stream"
+    finally:
+        assert process.handle is not None
+        process.handle.release_close.set()
+
+    completed = await asyncio.wait_for(wait_task, 1)
+    assert completed.result == ExecResult(exit_code=0, output="hello final frame")
+    assert [chunk async for chunk in workload.output()] == ["hello", " final frame"]
+
+
+async def test_daytona_controlled_kill_interrupts_natural_pty_drain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(daytona_module, "_PTY_STATUS_POLL_SECONDS", 0)
+
+    class StatusFirstProcess(ControlledProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.status_read = asyncio.Event()
+
+        async def exec(self, command: str) -> SimpleNamespace:
+            result = await super().exec(command)
+            if _unwrap_shell_command(command).startswith("cat "):
+                self.status_read.set()
+            return result
+
+        async def create_pty_session(
+            self,
+            *,
+            id: str,
+            on_data: Callable[[bytes], None | Awaitable[None]],
+            envs: dict[str, str],
+            pty_size: PtySize,
+        ) -> PtyHandle:
+            handle = await super().create_pty_session(
+                id=id, on_data=on_data, envs=envs, pty_size=pty_size
+            )
+
+            async def stalled_wait() -> PtyResult | None:
+                await asyncio.Event().wait()
+                return None
+
+            monkeypatch.setattr(handle, "wait", stalled_wait)
+            return handle
+
+    process = StatusFirstProcess()
+    inner = InnerSandbox()
+    inner.process = process
+    workload = DaytonaSandbox(cast(Any, inner)).controlled_workload("printf controlled")
+
+    await asyncio.wait_for(process.status_read.wait(), 1)
+    await asyncio.wait_for(workload.kill(), 1)
+    completed = await asyncio.wait_for(workload.wait(), 1)
+
+    assert completed.result == ExecResult(exit_code=0, output="hello")
+    assert [chunk async for chunk in workload.output()] == ["hello"]

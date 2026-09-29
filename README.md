@@ -199,6 +199,33 @@ Run the local provider checks:
 DOCKER_HOST=unix:///var/run/docker.sock \
   uv run pytest tests/integration/test_docker_sandbox.py
 ```
+#### Controlled generation workloads
+
+`RetrieveTaskResponse.generation_containment` is an explicit benchmark opt-in, independent of
+`agent_timeout`. It defaults to `None` (the ordinary generation path). To require the controlled
+path, declare `GenerationContainment(type="linux_pid_namespace", version=1)` (exported as
+`LINUX_PID_NAMESPACE_V1`). The caller must match this against the sandbox's
+`generation_containment` and run `await sandbox.probe_generation_containment()` before admitting
+the workload: an advertised capability does not prove the particular sandbox can create the
+namespace. Unsupported sandboxes report `None`; probing or starting a controlled workload raises
+`ControlledWorkloadUnsupportedError` rather than silently falling back to an ordinary command.
+
+A direct Daytona sandbox supports `linux_pid_namespace` v1. Call
+`sandbox.controlled_workload(command, cwd=..., env_vars=...)` to start a separate PTY command under
+`unshare --fork --pid --mount-proc --kill-child=KILL`, and consume `workload.output()` for streamed
+text. On natural completion, `await workload.wait()` returns
+`ControlledWorkloadResult(result=ExecResult(exit_code, output), absence_confirmed_at=...)` only
+after the PTY session is absent from a fresh provider listing. On a deadline or other abort,
+`await workload.kill()` requests PTY termination and likewise confirms absence before returning.
+If confirmation fails, it raises rather than claiming the workload stopped. The absence timestamp
+is event-loop monotonic time, not a wall-clock datetime. The caller owns deadline arbitration and
+must not proceed to independent collection on unconfirmed absence. Ordinary `Sandbox.command()` and
+`Sandbox.exec()` do not provide this contract. Modal and `ComposeSandbox` do not implement it.
+
+Process containment is separate from `BenchmarkEgressPlan`: setup, run, and evaluation egress
+policies control network access at their respective stages, not whether generation descendants
+have stopped. Run-stage deny-all or an allowlist cannot substitute for confirmed workload absence;
+opting into containment does not automatically apply an egress policy.
 
 Benchmark services can send `eval_resume_state` updates to the tracker while evaluation is running. The tracker stores the latest value and sends it back on eval-only retry, so the benchmark service can continue evaluation without recreating the original agent sandbox.
 
@@ -379,7 +406,8 @@ result = await client.run_with_sandbox_recovery(
 
 Pydantic models used across requests and responses:
 
-- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
+- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, optional `generation_containment`, `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
+- **`GenerationContainment`** — task-declared `type="linux_pid_namespace", version=1` for controlled Daytona generation; omission (`None`) preserves the ordinary generation path. The caller selects and probes a matching sandbox and uses its `ControlledWorkload` API; this field alone does not launch or enforce containment.
 - **`agent_install_order`** — `"before_setup"` installs agent dependencies before benchmark setup; `"after_setup"` lets setup prepare the environment first. It defaults to `"before_setup"`, so older task responses remain valid; lifecycle execution is the caller's responsibility.
 - **`BenchmarkEgressPlan`** — declarative `setup_task`, agent `run`, and `evaluation` policies. `"*"` is unrestricted, `[]` is deny-all, and a non-empty list is an allowlist. Setup and evaluation default to `"*"`; `run=None` means the benchmark has no run-policy opinion, preserving legacy task behavior. Applying and composing the plan is the caller's responsibility.
 - **`SandboxRecoveryPolicy`** — explicit opt-in to recreate a lost generation sandbox with the same run identity and volumes; `max_sandbox_attempts` (2–20, inclusive) includes the initial sandbox

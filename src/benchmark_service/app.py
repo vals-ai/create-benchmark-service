@@ -23,7 +23,6 @@ from benchmark_service.context import sandbox_provider_scope
 from benchmark_service.schemas import (
     DATASET_VERSION_HEADER,
     DatasetVersion,
-    DatasetVersionErrorData,
     DatasetVersionId,
     EvaluateInstanceRequest,
     EvaluateResponseRequest,
@@ -36,7 +35,6 @@ from benchmark_service.schemas import (
     SetupTaskRequest,
     StreamChunk,
     StreamDatasetVersionChunk,
-    StreamDatasetVersionErrorChunk,
     StreamErrorChunk,
     TaskFilter,
     VerifyTaskIdsResponse,
@@ -50,11 +48,8 @@ from benchmark_service.sandbox import (
 logger = logging.getLogger(__name__)
 _dataset_version_id: TypeAdapter[str] = TypeAdapter(DatasetVersionId)
 
-class _DatasetVersionSelectionError(Exception):
-    def __init__(self, status_code: int, detail: str) -> None:
-        super().__init__(detail)
-        self.status_code = status_code
-        self.detail = detail
+class _DatasetVersionSelectionError(HTTPException):
+    pass
 
 
 async def send_json_if_connected(websocket: WebSocket, payload: dict[str, Any]) -> bool:
@@ -81,9 +76,7 @@ async def _forward_stream(
 
 
 async def _send_dataset_version_error(websocket: WebSocket, exc: _DatasetVersionSelectionError) -> None:
-    chunk = StreamDatasetVersionErrorChunk(
-        data=DatasetVersionErrorData(status_code=exc.status_code, detail=exc.detail)
-    )
+    chunk = StreamErrorChunk(type="error", data=str(exc.detail), status_code=exc.status_code)
     await send_json_if_connected(websocket, chunk.model_dump())
 
 
@@ -249,15 +242,11 @@ class BenchmarkServiceApp(FastAPI):
     ) -> AsyncGenerator[None, None]:
         values = connection.headers.getlist(DATASET_VERSION_HEADER)
         if len(values) > 1:
-            if isinstance(connection, WebSocket):
-                raise _DatasetVersionSelectionError(400, f"Supply {DATASET_VERSION_HEADER} only once")
-            raise HTTPException(status_code=400, detail=f"Supply {DATASET_VERSION_HEADER} only once")
+            raise _DatasetVersionSelectionError(400, f"Supply {DATASET_VERSION_HEADER} only once")
         try:
             version = _dataset_version_id.validate_python(values[0]) if values else None
         except ValidationError as exc:
-            if isinstance(connection, WebSocket):
-                raise _DatasetVersionSelectionError(400, f"Invalid {DATASET_VERSION_HEADER}") from exc
-            raise HTTPException(status_code=400, detail=f"Invalid {DATASET_VERSION_HEADER}") from exc
+            raise _DatasetVersionSelectionError(400, f"Invalid {DATASET_VERSION_HEADER}") from exc
 
         entered = False
         try:

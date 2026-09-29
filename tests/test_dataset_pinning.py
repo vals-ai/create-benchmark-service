@@ -248,7 +248,7 @@ async def test_raw_websocket_error_keeps_scope_until_stream_finishes(
         ),
     ],
 )
-async def test_websocket_version_selection_error_is_structured_before_acknowledgement(
+async def test_websocket_version_selection_error_has_status_before_acknowledgement(
     running_service: tuple[str, VersionedBenchmark],
     headers: list[tuple[str, str]],
     status_code: int,
@@ -261,8 +261,9 @@ async def test_websocket_version_selection_error_is_structured_before_acknowledg
     ) as ws:
         await ws.send(json.dumps({"task_id": "task-1", "response": "answer"}))
         assert json.loads(await ws.recv()) == {
-            "type": "dataset_version_error",
-            "data": {"status_code": status_code, "detail": detail},
+            "type": "error",
+            "data": detail,
+            "status_code": status_code,
         }
 
 
@@ -291,8 +292,9 @@ def test_legacy_service_requires_opt_in(monkeypatch: pytest.MonkeyPatch) -> None
         ) as ws:
             ws.send_json({"task_id": "task-1", "response": "2"})
             assert ws.receive_json() == {
-                "type": "dataset_version_error",
-                "data": {"status_code": 400, "detail": "Dataset version selection is not supported"},
+                "type": "error",
+                "data": "Dataset version selection is not supported",
+                "status_code": 400,
             }
 
 

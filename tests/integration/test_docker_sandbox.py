@@ -15,6 +15,7 @@ from benchmark_service import (
     Sandbox,
     SandboxCommandError,
     SandboxCreateRequest,
+    SandboxError,
     SandboxNotFoundError,
     SandboxProvider,
     SandboxQuery,
@@ -203,3 +204,23 @@ async def test_docker_delete_during_stream_raises_not_found(
         await asyncio.wait_for(task, timeout=30)
     assert "Failed to clean up Docker command" not in caplog.text
     await docker_provider.delete_sandbox(docker_sandbox.id)
+
+
+async def test_docker_rejects_images_without_setsid_wait(
+    docker_provider: SandboxProvider, docker_labels: dict[str, str]
+) -> None:
+    """Fail creation with an error naming setsid, and remove the container, when the image's setsid lacks --wait."""
+    with pytest.raises(SandboxError, match="setsid --wait"):
+        await docker_provider.create_sandbox(
+            SandboxCreateRequest(
+                source=ImageSource(image="alpine:3.20"),
+                resources=Resources(vcpu=1, memory=1, disk=1),
+                name="docker-busybox",
+                labels=docker_labels,
+                env_vars={},
+                auto_stop_interval=10,
+                create_timeout=120,
+            )
+        )
+
+    assert [sandbox async for sandbox in docker_provider.list_sandboxes(SandboxQuery(labels=docker_labels))] == []

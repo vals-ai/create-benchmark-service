@@ -245,6 +245,8 @@ async def test_missing_image_is_pulled_by_the_docker_cli_outside_the_creation_de
         create_timeout=1,
     )
 
+    monkeypatch.setattr(DockerSandbox, "exec", AsyncMock(return_value=ExecResult(exit_code=0, output="")))
+
     sandbox = await provider.create_sandbox(request)
 
     assert sandbox.id == "container-1"

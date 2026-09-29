@@ -170,7 +170,8 @@ request only with `CBS_DOCKER_ENABLED=true`; leave it unset on a hosted service.
 Docker context or detected local socket. For sandbox grading, also set
 `GRADING_SANDBOX_PROVIDER=docker`.
 
-Docker supports image sources whose images provide `/bin/sh` and `setsid --wait`.
+Docker supports image sources whose images provide `/bin/sh` and `setsid --wait`. Creation fails with
+`SandboxError` when they are missing, for example with the BusyBox `setsid` in Alpine images.
 A missing image is pulled with the `docker` CLI before `create_timeout` starts, so private registries
 work with the host's `docker login` and credential helpers. The `docker` CLI must be on `PATH`.
 CPU and memory limits are enforced. `Resources.disk` is accepted but does not set a

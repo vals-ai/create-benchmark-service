@@ -322,7 +322,15 @@ class DockerSandboxProvider(SandboxProvider):
             try:
                 async with asyncio.timeout(request.create_timeout):
                     container = await asyncio.shield(run)
-                    return await self.get_sandbox(container.id)
+                    sandbox = await self.get_sandbox(container.id)
+                    # Commands run under setsid --wait, which BusyBox images such as Alpine lack.
+                    check = await sandbox.exec("true")
+                    if check.exit_code:
+                        raise SandboxError(
+                            f"Docker image {config['Image']} cannot run commands; it needs /bin/sh and "
+                            f"setsid --wait (util-linux): {check.output.strip()}"
+                        )
+                    return sandbox
             except BaseException as error:
                 await _finish_cleanup(asyncio.create_task(self._cleanup_failed_creation(name, run)))
                 if isinstance(error, TimeoutError):

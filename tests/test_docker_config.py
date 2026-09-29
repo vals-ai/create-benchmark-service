@@ -1,6 +1,7 @@
 """Docker configuration and command cleanup checks; run pytest tests/test_docker_config.py."""
 
 import asyncio
+from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -146,6 +147,7 @@ async def test_timed_out_creation_deletes_a_container_docker_finishes_later() ->
     container.delete = AsyncMock(side_effect=delete)
     provider = DockerSandboxProvider.__new__(DockerSandboxProvider)
     docker = MagicMock()
+    docker.images.inspect = AsyncMock()
     docker.containers.run = run
     docker.containers.container = MagicMock(return_value=container)
     provider._docker = docker  # pyright: ignore[reportPrivateUsage]
@@ -179,6 +181,7 @@ async def test_timed_out_creation_logs_a_late_creation_failure(caplog: pytest.Lo
     container.show = AsyncMock(side_effect=DockerError(404, "No such container"))
     provider = DockerSandboxProvider.__new__(DockerSandboxProvider)
     docker = MagicMock()
+    docker.images.inspect = AsyncMock()
     docker.containers.run = run
     docker.containers.container = MagicMock(return_value=container)
     provider._docker = docker  # pyright: ignore[reportPrivateUsage]
@@ -202,3 +205,47 @@ async def test_timed_out_creation_logs_a_late_creation_failure(caplog: pytest.Lo
         for record in caplog.records
     )
     assert not any("never retrieved" in record.getMessage() for record in caplog.records)
+
+
+async def test_missing_image_is_pulled_by_the_docker_cli_outside_the_creation_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Pull a missing image with the docker CLI before creation starts, so a slow pull does not use up create_timeout."""
+    image = "registry.example.com/team/agent:1"
+    docker_cli = tmp_path / "docker"
+    docker_cli.write_text(f'#!/bin/sh\nsleep 1.2\necho "$@" > {tmp_path / "pull-args"}\n')
+    docker_cli.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:/usr/bin:/bin")
+
+    async def run(_config: object, *, name: str) -> MagicMock:
+        return MagicMock(id="container-1")
+
+    container = MagicMock(spec=DockerContainer)
+    container.show = AsyncMock(
+        return_value={
+            "Id": "container-1",
+            "Created": "2026-01-01T00:00:00Z",
+            "State": {"Status": "running"},
+            "Config": {"Labels": {_MANAGED_LABEL: "true"}},
+        }
+    )
+    provider = DockerSandboxProvider.__new__(DockerSandboxProvider)
+    docker = MagicMock()
+    docker.images.inspect = AsyncMock(side_effect=DockerError(404, "No such image"))
+    docker.containers.run = run
+    docker.containers.container = MagicMock(return_value=container)
+    provider._docker = docker  # pyright: ignore[reportPrivateUsage]
+    request = SandboxCreateRequest(
+        name="missing-image",
+        source=ImageSource(image=image),
+        resources=Resources(vcpu=1, memory=1, disk=5),
+        labels={},
+        env_vars={},
+        auto_stop_interval=5,
+        create_timeout=1,
+    )
+
+    sandbox = await provider.create_sandbox(request)
+
+    assert sandbox.id == "container-1"
+    assert (tmp_path / "pull-args").read_text().split() == ["pull", "--quiet", image]

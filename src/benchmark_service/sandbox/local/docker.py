@@ -41,6 +41,7 @@ from benchmark_service.sandbox.types import (
 logger = logging.getLogger(__name__)
 _MANAGED_LABEL = "io.vals.cbs.managed"
 _NAME_LABEL = "io.vals.cbs.name"
+_PULL_TIMEOUT_S = 1800
 
 
 class DockerProviderConfig(BaseModel):
@@ -282,8 +283,39 @@ class DockerSandboxProvider(SandboxProvider):
             container, info = await self._get_container(instance_id)
             return DockerSandbox(container, info)
 
+    async def _ensure_image(self, image: str) -> None:
+        with _docker_errors():
+            try:
+                await self._docker.images.inspect(image)
+                return
+            except DockerError as error:
+                if error.status != 404:
+                    raise
+
+        # The docker CLI applies the host's registry logins and credential helpers, which aiodocker does not read.
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "docker", "pull", "--quiet", image, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+            )
+        except OSError as error:
+            raise SandboxError("Pulling a missing Docker image requires the docker CLI on PATH") from error
+        try:
+            async with asyncio.timeout(_PULL_TIMEOUT_S):
+                output, _ = await process.communicate()
+        except TimeoutError as error:
+            raise SandboxError(f"Timed out pulling Docker image {image}") from error
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+
+        if process.returncode != 0:
+            raise SandboxError(f"Failed to pull Docker image {image}: {output.decode(errors='replace').strip()}")
+
     async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
         config = _build_container_config(request)
+        # create_timeout bounds container creation, so a large first pull must not run inside it.
+        await self._ensure_image(str(config["Image"]))
         name = f"cbs-{uuid4().hex}"
         run = asyncio.create_task(self._docker.containers.run(config, name=name))  # pyright: ignore[reportUnknownMemberType]
         with _docker_errors():

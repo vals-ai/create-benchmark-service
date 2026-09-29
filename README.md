@@ -171,6 +171,8 @@ Docker context or detected local socket. For sandbox grading, also set
 `GRADING_SANDBOX_PROVIDER=docker`.
 
 Docker supports image sources whose images provide `/bin/sh` and `setsid --wait`.
+A missing image is pulled with the `docker` CLI before `create_timeout` starts, so private registries
+work with the host's `docker login` and credential helpers. The `docker` CLI must be on `PATH`.
 CPU and memory limits are enforced. `Resources.disk` is accepted but does not set a
 filesystem quota. `auto_stop_interval` is accepted but does not set an idle timer; callers
 must delete containers after use and reconcile abandoned containers after restarting. Listing

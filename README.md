@@ -164,6 +164,8 @@ Provider compatibility notes:
 
 Local Tracker, executor, and benchmark-service processes need access to the same Docker daemon.
 Task containers do not receive the Docker socket or host-directory mounts.
+Containers run with `no-new-privileges`, so setuid programs such as `sudo` cannot gain root. An image
+whose commands call `sudo` must run as root.
 
 Select the provider with `{"type": "docker"}`. The benchmark service accepts that
 request only with `CBS_DOCKER_ENABLED=true`; leave it unset on a hosted service. Set `DOCKER_HOST` to override the

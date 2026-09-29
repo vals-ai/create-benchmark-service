@@ -78,7 +78,7 @@ _TRIAL_ALLOWED_PATH = re.compile(r"/v1/(?:evaluate|score|datasets/[^/]+/tasks)")
 
 
 def _trial_tenant_may_access_path(path: str) -> bool:
-    return _TRIAL_ALLOWED_PATH.fullmatch(path) is not None
+    return path == "/resolve-dataset" or _TRIAL_ALLOWED_PATH.fullmatch(path) is not None
 
 
 GRADING_SANDBOX_PROVIDER_ENV = "GRADING_SANDBOX_PROVIDER"
@@ -357,12 +357,14 @@ class ValsBenchmarkServiceApp(BenchmarkServiceApp):
         return response
 
     async def _v1_evaluate(self, request: Request, body: V1EvalRequest) -> V1EvalResponse:
+        _require_descope_tenant(request.state.tenant)
+        async with self._dataset_scope(request, request.state.tenant, body.dataset):
+            return await self._v1_evaluate_in_scope(request, body)
+
+    async def _v1_evaluate_in_scope(self, request: Request, body: V1EvalRequest) -> V1EvalResponse:
         if self._sentry is not None:
             self._sentry.bind_request_context(request.headers, run_id=body.run_id, task_id=body.task_id, dataset=body.dataset)
         tenant = cast(str, request.state.tenant)
-        _require_descope_tenant(tenant)
-        if not await self.service.check_dataset_access(tenant, body.dataset):
-            raise HTTPException(status_code=403, detail="Dataset not allowed")
         try:
             await self.service.validate_task_ids([body.task_id], dataset=body.dataset)
         except ValueError as exc:
@@ -530,72 +532,73 @@ class ValsBenchmarkServiceApp(BenchmarkServiceApp):
         return self.project_eval_response(tenant, response)
 
     async def _v1_submission_upload_url(self, request: Request, body: V1UploadUrlRequest) -> V1UploadUrlResponse:
-        if self._sentry is not None:
-            self._sentry.bind_request_context(request.headers, run_id=body.run_id, task_id=body.task_id, dataset=body.dataset)
-        tenant = cast(str, request.state.tenant)
-        _require_descope_tenant(tenant)
-        if not submission_artifacts.is_configured():
-            raise HTTPException(
-                status_code=503,
-                detail=(
-                    "Submission uploads are not configured on this deployment; "
-                    f"set {submission_artifacts.SUBMISSION_ARTIFACT_BUCKET_ENV} and "
-                    f"{submission_artifacts.SUBMISSION_ARTIFACT_REGION_ENV}"
-                ),
+        _require_descope_tenant(request.state.tenant)
+        async with self._dataset_scope(request, request.state.tenant, body.dataset):
+            if self._sentry is not None:
+                self._sentry.bind_request_context(request.headers, run_id=body.run_id, task_id=body.task_id, dataset=body.dataset)
+            tenant = cast(str, request.state.tenant)
+            if not submission_artifacts.is_configured():
+                raise HTTPException(
+                    status_code=503,
+                    detail=(
+                        "Submission uploads are not configured on this deployment; "
+                        f"set {submission_artifacts.SUBMISSION_ARTIFACT_BUCKET_ENV} and "
+                        f"{submission_artifacts.SUBMISSION_ARTIFACT_REGION_ENV}"
+                    ),
+                )
+            await self.service.validate_task_ids([body.task_id], dataset=body.dataset)
+            key = submission_artifacts.submission_key(
+                tenant=tenant,
+                dataset=body.dataset or "default",
+                run_id=body.run_id,
+                task_id=body.task_id,
+                filename=body.filename,
             )
-        if not await self.service.check_dataset_access(tenant, body.dataset):
-            raise HTTPException(status_code=403, detail="Dataset not allowed")
-        await self.service.validate_task_ids([body.task_id], dataset=body.dataset)
-        key = submission_artifacts.submission_key(
-            tenant=tenant,
-            dataset=body.dataset or "default",
-            run_id=body.run_id,
-            task_id=body.task_id,
-            filename=body.filename,
-        )
-        return V1UploadUrlResponse(
-            key=key,
-            url=submission_artifacts.presigned_put_url(key),
-            expires_in=submission_artifacts.DEFAULT_UPLOAD_EXPIRY_S,
-        )
+            return V1UploadUrlResponse(
+                key=key,
+                url=submission_artifacts.presigned_put_url(key),
+                expires_in=submission_artifacts.DEFAULT_UPLOAD_EXPIRY_S,
+            )
 
     async def _v1_score(self, request: Request, body: V1ScoreRequest) -> V1ScoreResponse:
-        if self._sentry is not None:
-            self._sentry.bind_request_context(request.headers, run_id=body.run_id, dataset=body.dataset)
         _require_descope_tenant(request.state.tenant)
-        if not await self.service.check_dataset_access(request.state.tenant, body.dataset):
-            raise HTTPException(status_code=403, detail="Dataset not allowed")
+        async with self._dataset_scope(request, request.state.tenant, body.dataset):
+            if self._sentry is not None:
+                self._sentry.bind_request_context(request.headers, run_id=body.run_id, dataset=body.dataset)
 
-        normalized_results = {
-            task_id: _v1_score_item_to_eval_result(task_id, item) for task_id, item in body.evaluation_results.items()
-        }
-        tasks_evaluated = await self.service.validate_task_ids(list(normalized_results.keys()), dataset=body.dataset)
-        result = await self.service.calculate_final_score(normalized_results, dataset=body.dataset)
-        response = V1ScoreResponse(
-            run_id=body.run_id,
-            tasks_evaluated=tasks_evaluated,
-            final_score=result.score,
-            metadata=result.metadata,
-        )
-        return self.project_score_response(request.state.tenant, response)
+            normalized_results = {
+                task_id: _v1_score_item_to_eval_result(task_id, item) for task_id, item in body.evaluation_results.items()
+            }
+            tasks_evaluated = await self.service.validate_task_ids(list(normalized_results.keys()), dataset=body.dataset)
+            result = await self.service.calculate_final_score(normalized_results, dataset=body.dataset)
+            response = V1ScoreResponse(
+                run_id=body.run_id,
+                tasks_evaluated=tasks_evaluated,
+                final_score=result.score,
+                metadata=result.metadata,
+            )
+            return self.project_score_response(request.state.tenant, response)
 
     async def _v1_list_dataset_tasks(self, request: Request, dataset: str) -> V1DatasetTasksResponse:
-        if self._sentry is not None:
-            self._sentry.bind_request_context(request.headers, dataset=dataset)
         _require_descope_tenant(request.state.tenant)
-        if not await self.service.check_dataset_access(request.state.tenant, dataset):
-            raise HTTPException(status_code=403, detail=f"Dataset={dataset} access not allowed")
-        try:
-            self.service.get_dataset(dataset)
-        except ValueError as exc:
-            raise HTTPException(status_code=404, detail=f"Dataset not found: {dataset}") from exc
-        try:
-            tasks = await self.service.list_tasks(dataset=dataset)
-        except NotImplementedError as exc:
-            raise HTTPException(status_code=501, detail=str(exc)) from exc
-        response = V1DatasetTasksResponse(
-            dataset=dataset,
-            dataset_version=self.service.get_dataset_version(dataset),
-            tasks=tasks,
-        )
-        return self.project_dataset_tasks_response(request.state.tenant, response)
+        async with self._dataset_scope(request, request.state.tenant, dataset):
+            if self._sentry is not None:
+                self._sentry.bind_request_context(request.headers, dataset=dataset)
+            try:
+                self.service.get_dataset(dataset)
+            except ValueError as exc:
+                raise HTTPException(status_code=404, detail=f"Dataset not found: {dataset}") from exc
+            try:
+                tasks = await self.service.list_tasks(dataset=dataset)
+            except NotImplementedError as exc:
+                raise HTTPException(status_code=501, detail=str(exc)) from exc
+            response = V1DatasetTasksResponse(
+                dataset=dataset,
+                dataset_version=(
+                    request.state.dataset_version.label
+                    if hasattr(request.state, "dataset_version")
+                    else self.service.get_dataset_version(dataset)
+                ),
+                tasks=tasks,
+            )
+            return self.project_dataset_tasks_response(request.state.tenant, response)

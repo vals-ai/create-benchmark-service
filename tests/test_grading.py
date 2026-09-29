@@ -1508,7 +1508,7 @@ async def test_v1_evaluate_orders_reservation_quota_queue_and_artifact_preflight
     app.consume_evaluation_request = consume_quota
 
     async def evaluate(run_id: str) -> Any:
-        request = Request({"type": "http"})
+        request = Request({"type": "http", "headers": []})
         request.state.tenant = "acme"
         body = V1EvalRequest(
             run_id=run_id,

@@ -7,6 +7,7 @@ a FastAPI app with your implementation.
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
+from contextlib import AbstractAsyncContextManager
 from pathlib import Path
 from typing import Any, ClassVar, Self
 
@@ -20,6 +21,7 @@ from benchmark_service.auth import (
 from benchmark_service.dataset_versioning import DatasetVersionEntry, load_dataset_versions
 from benchmark_service.sandbox import Sandbox
 from benchmark_service.schemas import (
+    DatasetVersion,
     EvalMode,
     EvaluateResponseRequest,
     FinalScoreResult,
@@ -157,6 +159,18 @@ class BenchmarkService(ABC):
     async def check_dataset_access(self, tenant: str, dataset: str | None) -> bool:
         """Return True if `tenant` may use `dataset` on this service."""
         return True
+
+    def supports_dataset_version_selection(self, dataset: str) -> bool:
+        """Whether this dataset can honor immutable version IDs on every operation."""
+        return False
+
+    def open_dataset_version(self, dataset: str, version: str | None) -> AbstractAsyncContextManager[DatasetVersion]:
+        """Bind a version to request-local state until the operation finishes.
+
+        A null selector uses the configured default. Implementations own resource
+        cleanup, including waiting for blocking preparation workers on cancellation.
+        """
+        raise NotImplementedError("Dataset version selection is not supported")
 
     def get_service_version(self) -> str | None:
         """Return a benchmark-owned service version override, if available.

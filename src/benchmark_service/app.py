@@ -10,6 +10,8 @@ from typing import Any, cast
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.responses import JSONResponse
+from pydantic import TypeAdapter, ValidationError
+from starlette.middleware.base import RequestResponseEndpoint
 from starlette.websockets import WebSocketDisconnect
 from uvicorn.protocols.utils import ClientDisconnected
 from websockets.exceptions import ConnectionClosed
@@ -19,14 +21,20 @@ from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_requ
 from benchmark_service.base import BenchmarkService
 from benchmark_service.context import sandbox_provider_scope
 from benchmark_service.schemas import (
+    DATASET_VERSION_HEADER,
+    DatasetVersion,
+    DatasetVersionId,
     EvaluateInstanceRequest,
     EvaluateResponseRequest,
     FinalScoreRequest,
     FinalScoreResponse,
     HealthCheckResponse,
     RetrieveTaskResponse,
+    ResolveDatasetRequest,
+    ResolveDatasetResponse,
     SetupTaskRequest,
     StreamChunk,
+    StreamDatasetVersionChunk,
     StreamErrorChunk,
     TaskFilter,
     VerifyTaskIdsResponse,
@@ -38,6 +46,11 @@ from benchmark_service.sandbox import (
 )
 
 logger = logging.getLogger(__name__)
+_dataset_version_id: TypeAdapter[str] = TypeAdapter(DatasetVersionId)
+
+class _DatasetVersionSelectionError(HTTPException):
+    pass
+
 
 async def send_json_if_connected(websocket: WebSocket, payload: dict[str, Any]) -> bool:
     try:
@@ -60,6 +73,11 @@ async def _forward_stream(
             if not await send_json_if_connected(websocket, chunk.model_dump()):
                 logger.warning("%s websocket disconnected before benchmark service completed", endpoint)
                 return
+
+
+async def _send_dataset_version_error(websocket: WebSocket, exc: _DatasetVersionSelectionError) -> None:
+    chunk = StreamErrorChunk(type="error", data=str(exc.detail), status_code=exc.status_code)
+    await send_json_if_connected(websocket, chunk.model_dump())
 
 
 _PUBLIC_PATHS = frozenset({"/health", "/version"})
@@ -137,7 +155,7 @@ class BenchmarkServiceApp(FastAPI):
 
     def _register_routes(self) -> None:
         @self.middleware("http")
-        async def _check_auth(request: Request, call_next):  # type: ignore[no-untyped-def]
+        async def _check_auth(request: Request, call_next: RequestResponseEndpoint) -> Response:  # pyright: ignore[reportUnusedFunction]
             self.clear_request_context()
             if self._sentry is not None:
                 self._bind_service_context(self._current_service_version())
@@ -155,7 +173,11 @@ class BenchmarkServiceApp(FastAPI):
                     self.authorize_request(tenant, request.url.path)
                 except HTTPException as exc:
                     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
-                return await call_next(request)  # type: ignore[reportUnknownVariableType]
+                response = await call_next(request)  # type: ignore[reportUnknownVariableType]
+                version = getattr(request.state, "dataset_version", None)
+                if version is not None and 200 <= response.status_code < 300:
+                    response.headers[DATASET_VERSION_HEADER] = version.id
+                return response
             finally:
                 self.clear_request_context()
 
@@ -163,6 +185,7 @@ class BenchmarkServiceApp(FastAPI):
         self.add_exception_handler(Exception, self._exception_handler)
         self.add_api_route("/health", self._health_check, methods=["GET"])
         self.add_api_route("/version", self._version, methods=["GET"])
+        self.add_api_route("/resolve-dataset", self._resolve_dataset, methods=["POST"])
         self.add_api_route("/verify-task-ids", self._verify_task_ids, methods=["GET"])
         self.add_api_route("/retrieve-task/", self._retrieve_task, methods=["GET"])
         self.add_api_websocket_route("/ws/setup-task", self._setup_task)
@@ -194,8 +217,69 @@ class BenchmarkServiceApp(FastAPI):
             service_name=self._service_name,
             service_version=self._current_service_version(),
             dataset_version=self.service.get_dataset_version(dataset),
+            dataset_version_selection=self.service.supports_dataset_version_selection(dataset or "default"),
             eval_mode=self.service.eval_mode,
         )
+
+    @asynccontextmanager
+    async def _open_dataset(
+        self, tenant: str, dataset: str | None, version: str | None
+    ) -> AsyncGenerator[DatasetVersion | None, None]:
+        if not await self.service.check_dataset_access(tenant, dataset):
+            raise HTTPException(status_code=403, detail="Dataset not allowed")
+        name = dataset or "default"
+        if not self.service.supports_dataset_version_selection(name):
+            if version is not None:
+                raise HTTPException(status_code=400, detail="Dataset version selection is not supported")
+            yield None
+            return
+        async with self.service.open_dataset_version(name, version) as resolved:
+            yield resolved
+
+    @asynccontextmanager
+    async def _dataset_scope(
+        self, connection: Request | WebSocket, tenant: str, dataset: str | None
+    ) -> AsyncGenerator[None, None]:
+        values = connection.headers.getlist(DATASET_VERSION_HEADER)
+        if len(values) > 1:
+            raise _DatasetVersionSelectionError(400, f"Supply {DATASET_VERSION_HEADER} only once")
+        try:
+            version = _dataset_version_id.validate_python(values[0]) if values else None
+        except ValidationError as exc:
+            raise _DatasetVersionSelectionError(400, f"Invalid {DATASET_VERSION_HEADER}") from exc
+
+        entered = False
+        try:
+            async with self._open_dataset(tenant, dataset, version) as resolved:
+                if version is not None:
+                    if resolved is None or resolved.id != version:
+                        raise HTTPException(status_code=409, detail="The service could not honor the dataset version")
+                    if isinstance(connection, WebSocket):
+                        await connection.send_json(StreamDatasetVersionChunk(data=resolved).model_dump())
+                    else:
+                        connection.state.dataset_version = resolved
+                entered = True
+                yield
+        except HTTPException as exc:
+            if isinstance(connection, WebSocket) and exc.status_code == 403:
+                await connection.close(code=1008, reason="Dataset not allowed")
+                raise WebSocketDisconnect(code=1008) from exc
+            if (
+                isinstance(connection, WebSocket)
+                and version is not None
+                and not entered
+                and exc.status_code in {400, 404, 409, 503}
+            ):
+                raise _DatasetVersionSelectionError(exc.status_code, str(exc.detail)) from exc
+            raise
+
+    async def _resolve_dataset(self, request: Request, body: ResolveDatasetRequest) -> ResolveDatasetResponse:
+        if request.headers.getlist(DATASET_VERSION_HEADER):
+            raise HTTPException(status_code=400, detail="Use the request body to select the dataset version")
+        async with self._open_dataset(request.state.tenant, body.dataset, body.version) as resolved:
+            if resolved is None:
+                raise HTTPException(status_code=400, detail="Dataset version selection is not supported")
+            return ResolveDatasetResponse(dataset=body.dataset, version=resolved)
 
     async def _authorize_websocket(self, websocket: WebSocket) -> str | None:
         """Authenticate a WebSocket caller. Returns tenant id, or None after closing 1008."""
@@ -248,20 +332,18 @@ class BenchmarkServiceApp(FastAPI):
     ) -> VerifyTaskIdsResponse:
         if self._sentry is not None:
             self._sentry.bind_request_context(request.headers, dataset=dataset)
-        if not await self.service.check_dataset_access(request.state.tenant, dataset):
-            raise HTTPException(status_code=403, detail="Dataset not allowed")
+        async with self._dataset_scope(request, request.state.tenant, dataset):
+            task_filter = TaskFilter()
 
-        task_filter = TaskFilter()
+            if task_ids:
+                task_filter.task_ids = list(dict.fromkeys(task_ids))
 
-        if task_ids:
-            task_filter.task_ids = list(dict.fromkeys(task_ids))
+            if slice:
+                task_filter.slice_str = slice
 
-        if slice:
-            task_filter.slice_str = slice
+            filtered_task_ids = await self.service.filter_tasks(task_filter, dataset=dataset)
 
-        filtered_task_ids = await self.service.filter_tasks(task_filter, dataset=dataset)
-
-        return VerifyTaskIdsResponse(task_ids=filtered_task_ids)
+            return VerifyTaskIdsResponse(task_ids=filtered_task_ids)
 
     async def _retrieve_task(
         self,
@@ -272,9 +354,8 @@ class BenchmarkServiceApp(FastAPI):
     ) -> RetrieveTaskResponse:
         if self._sentry is not None:
             self._sentry.bind_request_context(request.headers, task_id=task_id, dataset=dataset)
-        if not await self.service.check_dataset_access(request.state.tenant, dataset):
-            raise HTTPException(status_code=403, detail="Dataset not allowed")
-        return await self.service.retrieve_task(task_id, skip_validation, dataset=dataset)
+        async with self._dataset_scope(request, request.state.tenant, dataset):
+            return await self.service.retrieve_task(task_id, skip_validation, dataset=dataset)
 
     async def _setup_task(self, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -294,21 +375,20 @@ class BenchmarkServiceApp(FastAPI):
                 )
             sandbox_config = _request_sandbox_provider_config(request, websocket)
 
-            if not await self.service.check_dataset_access(tenant, request.dataset):
-                await websocket.close(code=1008, reason="Dataset not allowed")
-                return
+            async with self._dataset_scope(websocket, tenant, request.dataset):
+                async with sandbox_config.create_provider() as provider:
+                    sandbox = await provider.get_sandbox(request.instance_id)
 
-            async with sandbox_config.create_provider() as provider:
-                sandbox = await provider.get_sandbox(request.instance_id)
-
-                await _forward_stream(
-                    websocket,
-                    self.service.setup_task(request.task_id, sandbox, dataset=request.dataset),
-                    endpoint="setup-task",
-                )
+                    await _forward_stream(
+                        websocket,
+                        self.service.setup_task(request.task_id, sandbox, dataset=request.dataset),
+                        endpoint="setup-task",
+                    )
 
         except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
             logger.warning("setup-task websocket disconnected")
+        except _DatasetVersionSelectionError as exc:
+            await _send_dataset_version_error(websocket, exc)
         except Exception as e:
             if self._sentry is not None:
                 self._sentry.capture_exception(e)
@@ -325,10 +405,9 @@ class BenchmarkServiceApp(FastAPI):
     async def _evaluate_response(self, request: Request, body: EvaluateResponseRequest) -> Any:
         if self._sentry is not None:
             self._sentry.bind_request_context(request.headers, task_id=body.task_id, dataset=body.dataset)
-        if not await self.service.check_dataset_access(request.state.tenant, body.dataset):
-            raise HTTPException(status_code=403, detail="Dataset not allowed")
-        await self.consume_evaluation_request(cast(str, request.state.tenant))
-        return await self.service.evaluate_response(body, dataset=body.dataset)
+        async with self._dataset_scope(request, request.state.tenant, body.dataset):
+            await self.consume_evaluation_request(cast(str, request.state.tenant))
+            return await self.service.evaluate_response(body, dataset=body.dataset)
 
     async def _evaluate_response_stream(self, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -343,20 +422,20 @@ class BenchmarkServiceApp(FastAPI):
             if self._sentry is not None:
                 self._sentry.bind_request_context(websocket.headers, task_id=request.task_id, dataset=request.dataset)
 
-            if not await self.service.check_dataset_access(tenant, request.dataset):
-                await websocket.close(code=1008, reason="Dataset not allowed")
-                return
-            if not await self._admit_websocket_evaluation(websocket, tenant):
-                return
+            async with self._dataset_scope(websocket, tenant, request.dataset):
+                if not await self._admit_websocket_evaluation(websocket, tenant):
+                    return
 
-            await _forward_stream(
-                websocket,
-                self.service.stream_evaluate_response(request, dataset=request.dataset),
-                endpoint="evaluate-response",
-            )
+                await _forward_stream(
+                    websocket,
+                    self.service.stream_evaluate_response(request, dataset=request.dataset),
+                    endpoint="evaluate-response",
+                )
 
         except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
             logger.warning("evaluate-response websocket disconnected")
+        except _DatasetVersionSelectionError as exc:
+            await _send_dataset_version_error(websocket, exc)
         except Exception as e:
             if self._sentry is not None:
                 self._sentry.capture_exception(e)
@@ -388,26 +467,26 @@ class BenchmarkServiceApp(FastAPI):
                 )
             sandbox_config = _request_sandbox_provider_config(request, websocket)
 
-            if not await self.service.check_dataset_access(tenant, request.dataset):
-                await websocket.close(code=1008, reason="Dataset not allowed")
-                return
-            if not await self._admit_websocket_evaluation(websocket, tenant):
-                return
+            async with self._dataset_scope(websocket, tenant, request.dataset):
+                if not await self._admit_websocket_evaluation(websocket, tenant):
+                    return
 
-            async with sandbox_config.create_provider() as provider:
-                sandbox = await provider.get_sandbox(request.instance_id)
+                async with sandbox_config.create_provider() as provider:
+                    sandbox = await provider.get_sandbox(request.instance_id)
 
-                # Benchmarks that grade in a second sandbox read the provider
-                # from the request scope; see benchmark_service.context.
-                with sandbox_provider_scope(provider):
-                    await _forward_stream(
-                        websocket,
-                        self.service.evaluate_instance(request.task_id, sandbox, dataset=request.dataset),
-                        endpoint="evaluate-instance",
-                    )
+                    # Benchmarks that grade in a second sandbox read the provider
+                    # from the request scope; see benchmark_service.context.
+                    with sandbox_provider_scope(provider):
+                        await _forward_stream(
+                            websocket,
+                            self.service.evaluate_instance(request.task_id, sandbox, dataset=request.dataset),
+                            endpoint="evaluate-instance",
+                        )
 
         except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
             logger.warning("evaluate-instance websocket disconnected")
+        except _DatasetVersionSelectionError as exc:
+            await _send_dataset_version_error(websocket, exc)
         except Exception as e:
             if self._sentry is not None:
                 self._sentry.capture_exception(e)
@@ -424,15 +503,12 @@ class BenchmarkServiceApp(FastAPI):
     async def _final_score(self, request: Request, body: FinalScoreRequest) -> FinalScoreResponse:
         if self._sentry is not None:
             self._sentry.bind_request_context(request.headers, dataset=body.dataset)
-        if not await self.service.check_dataset_access(request.state.tenant, body.dataset):
-            raise HTTPException(status_code=403, detail="Dataset not allowed")
-
-        tasks_evaluated = list(body.evaluation_results.keys())
-        validated_task_ids = await self.service.validate_task_ids(tasks_evaluated, dataset=body.dataset)
-        result = await self.service.calculate_final_score(body.evaluation_results, dataset=body.dataset)
-
-        return FinalScoreResponse(
-            tasks_evaluated=validated_task_ids,
-            final_score=result.score,
-            metadata=result.metadata,
-        )
+        async with self._dataset_scope(request, request.state.tenant, body.dataset):
+            tasks_evaluated = list(body.evaluation_results.keys())
+            validated_task_ids = await self.service.validate_task_ids(tasks_evaluated, dataset=body.dataset)
+            result = await self.service.calculate_final_score(body.evaluation_results, dataset=body.dataset)
+            return FinalScoreResponse(
+                tasks_evaluated=validated_task_ids,
+                final_score=result.score,
+                metadata=result.metadata,
+            )

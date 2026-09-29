@@ -35,6 +35,44 @@ The base framework includes Daytona, Modal, and the OpenTelemetry API.
 {% if template == "vals-ai" %}
 
 This template selects `create-benchmark-service[vals-ai]` for S3/AWS clients, Sentry, Descope, and caching dependencies.
+
+## Shared datasets (optional)
+
+The example service keeps its tasks in `load_datasets()`. To use a published shared dataset instead, first prepare and publish task files with the [dataset format](https://github.com/vals-ai/vals-datasets/blob/main/docs/dataset-format.md) and [upload guide](https://github.com/vals-ai/vals-datasets/blob/main/docs/uploads.md). A snapshot is a saved copy of those files; its exact reference looks like `example@sha256:<digest>`. A view is an ordered selection of tasks within that snapshot.
+
+Follow the [service integration guide](https://github.com/vals-ai/vals-datasets/blob/main/docs/service-integration.md) to pin `vals-datasets[service]`, write an adapter for your task format, and map a caller-facing route such as `default` to a dataset ID and view. The adapter reads the saved files into the task objects used by this service. In this Vals template, keep both the dataset loader and the Vals policy/routes in the class hierarchy:
+
+```python
+# src/{{ benchmark_package }}/benchmark_service.py
+from vals_datasets.service import DatasetBenchmarkService
+
+from .vals_ai import ValsBenchmarkService
+from .datasets import load_snapshot_tasks
+
+
+class ExampleBenchmark(DatasetBenchmarkService, ValsBenchmarkService):
+    snapshot_adapter = staticmethod(load_snapshot_tasks)
+    # Keep the existing benchmark methods below.
+```
+
+```python
+# src/{{ benchmark_package }}/main.py
+from vals_datasets.service import DatasetBenchmarkServiceApp
+
+from .benchmark_service import ExampleBenchmark
+from .vals_ai import ValsBenchmarkServiceApp
+
+
+class ExampleApp(DatasetBenchmarkServiceApp, ValsBenchmarkServiceApp):
+    pass
+
+
+app = ExampleApp(ExampleBenchmark)
+```
+
+These are the lines to add to the generated files, not complete replacements for your benchmark methods. Implement `load_snapshot_tasks` in `datasets.py` using the integration guide's adapter contract. If all routes use snapshots, return `{}` from `load_datasets()` and continue reading tasks through `self.get_dataset(dataset)`. Configure the dataset API, cache, and route mapping as described in the integration guide. The service needs read permission for the whole snapshot, including grading files. Its adapter must choose what the agent sees. Publishing a snapshot does not change the service default or grant route access.
+
+Keep the package at a full commit pin and make sure Git access works in local installs, CI, and container builds. Services that use the in-code example do not need `vals-datasets`.
 {% endif %}
 
 ## Development

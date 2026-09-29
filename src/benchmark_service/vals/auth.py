@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_required
 
-from .allowlist import (
+from benchmark_service.vals.allowlist import (
     ALLOWLIST_CACHE_MAX_SIZE,
     DESCOPE_API_KEY_HEADER,
     CatalogAllowlistClient,

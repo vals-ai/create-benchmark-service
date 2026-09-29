@@ -44,9 +44,9 @@ uv tool install git+https://github.com/vals-ai/create-benchmark-service.git@vX.Y
 
 ### Template and dependency migration
 
-Before upgrading an existing Vals service, generate a service with `--template vals-ai` and copy its `vals_ai/` package and dependencies. Subclass `ValsBenchmarkService` from `.vals_ai` and instantiate `ValsBenchmarkServiceApp` from `<benchmark_package>.vals_ai`. These inherit the shared classes. Only the Vals app registers `/v1/*` routes; `AUTH_REQUIRED=true` enables their Descope protection.
+Install `create-benchmark-service[vals-ai]` and import `ValsBenchmarkService` and `ValsBenchmarkServiceApp` from `benchmark_service.vals`. New Vals services already use these classes. Framework dependency updates also update Vals authentication, access policy, and provider routes.
 
-Use `create-benchmark-service[vals-ai]` for the Vals dependencies. Daytona and Modal remain in the base install. Framework upgrades do not update the copied Vals files.
+Existing services with a generated local `vals_ai/` package continue to use their copied implementation. To adopt the shared implementation, replace their Vals imports with `benchmark_service.vals`. Remove the local package only after checking for service-specific changes. The generic framework remains independent of Vals policy and its optional dependencies.
 
 Both templates allow local requests without credentials by default. Hosted registry deployments set `AUTH_REQUIRED=true`. Keep that setting when upgrading; `AUTH_DISABLED` no longer controls authentication.
 

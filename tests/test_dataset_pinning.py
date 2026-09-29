@@ -25,8 +25,8 @@ from benchmark_service.schemas import (
     StreamResultChunk,
 )
 from benchmark_service.v1_schemas import V1EvalStatus, V1PayloadType, V1ScoreItem, V1Task
-from templates.vals_ai.app import ValsBenchmarkServiceApp
-from templates.vals_ai.base import ValsBenchmarkService
+from benchmark_service.vals.app import ValsBenchmarkServiceApp
+from benchmark_service.vals.base import ValsBenchmarkService
 from conftest import StubBenchmark
 
 

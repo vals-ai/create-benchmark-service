@@ -191,11 +191,5 @@ def generate_project(
     # Copy templates
     service_template = env.get_template("benchmark_service.py.jinja")
     (benchmark_package_dir / "benchmark_service.py").write_text(service_template.render(template_context))
-    if template == "vals-ai":
-        shutil.copytree(
-            templates_dir / "vals_ai",
-            benchmark_package_dir / "vals_ai",
-            ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
-        )
     copy_file(templates_dir / "Dockerfile", output_dir / "Dockerfile")
     copy_file(templates_dir / ".dockerignore", output_dir / ".dockerignore")

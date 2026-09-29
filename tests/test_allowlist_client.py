@@ -6,7 +6,7 @@ import asyncio
 
 import httpx
 import pytest
-from templates.vals_ai.allowlist import (
+from benchmark_service.vals.allowlist import (
     CatalogAllowlistClient,
     TenantConfig,
 )
@@ -207,7 +207,7 @@ async def test_request_deadline_bounds_the_whole_lookup() -> None:
 
 @pytest.mark.asyncio
 async def test_attempt_deadline_allows_a_retry_within_the_total_budget(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr("templates.vals_ai.allowlist.CATALOG_ATTEMPT_TIMEOUT_SECONDS", 0.01)
+    monkeypatch.setattr("benchmark_service.vals.allowlist.CATALOG_ATTEMPT_TIMEOUT_SECONDS", 0.01)
     requests: list[httpx.Request] = []
 
     async def handler(request: httpx.Request) -> httpx.Response:

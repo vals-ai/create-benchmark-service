@@ -60,12 +60,12 @@ The base install includes Daytona, Modal, and the OpenTelemetry API for both tem
 │   ├── base.py                # BenchmarkService base class
 │   ├── client.py              # HTTP/WebSocket client
 │   ├── schemas.py             # Pydantic models
+│   ├── vals/                  # Shared optional Vals authentication and provider API
 │   └── utils.py               # Utilities
 ├── templates/                 # Templates for generated projects
 │   ├── benchmark_service.py.jinja
 │   ├── pyproject.toml.jinja
-│   ├── README.md.jinja
-│   └── vals_ai/               # Copied only by --template vals-ai
+│   └── README.md.jinja
 ├── main.py                    # Example implementation
 ├── pyproject.toml             # CLI + framework config
 └── README.md                  # This file
@@ -368,7 +368,7 @@ For process-scoped credentials, call `sandbox.command(..., env_vars={...})`. Pro
 
 Both templates disable authentication unless `AUTH_REQUIRED=true`. Local routes, including the Vals `/v1/*` routes, work without credentials. Hosted registry deployments set `AUTH_REQUIRED=true`; the framework then authenticates every HTTP request except `/health` and `/version`, and every WebSocket route. `AUTH_DISABLED` is no longer supported and cannot override `AUTH_REQUIRED=true`.
 
-Services generated with `--template vals-ai` use `ValsBenchmarkService` and `ValsBenchmarkServiceApp`, which inherit the shared framework classes. With `AUTH_REQUIRED=true`, set `DESCOPE_PROJECT_ID` and a tenant + dataset allowlist. Requests must include a valid Descope access key in `X-Descope-Api-Key`. The key must be scoped to exactly one Descope tenant, and that tenant must appear in the service allowlist. Catalog access, quotas, and trial restrictions apply only when authentication is required.
+Services generated with `--template vals-ai` import `ValsBenchmarkService` and `ValsBenchmarkServiceApp` from `benchmark_service.vals`. These classes inherit the generic framework classes. With `AUTH_REQUIRED=true`, set `DESCOPE_PROJECT_ID` and a tenant + dataset allowlist. Requests must include a valid Descope access key in `X-Descope-Api-Key`. The key must be scoped to exactly one Descope tenant, and that tenant must appear in the service allowlist. Catalog access, quotas, and trial restrictions apply only when authentication is required.
 
 When authentication is required, the allowlist is loaded in this order:
 

@@ -3,6 +3,6 @@
 {% if template == "default" %}from benchmark_service import BenchmarkServiceApp
 
 {% endif %}from {{ benchmark_package }}.benchmark_service import ExampleBenchmark{% if template == "vals-ai" %}
-from {{ benchmark_package }}.vals_ai import ValsBenchmarkServiceApp{% endif %}
+from benchmark_service.vals import ValsBenchmarkServiceApp{% endif %}
 
 app = {% if template == "vals-ai" %}ValsBenchmarkServiceApp{% else %}BenchmarkServiceApp{% endif %}(ExampleBenchmark)

@@ -187,6 +187,8 @@ can be disabled only at creation with `network_block_all`. `modify_egress_rules`
 and `clear_egress_rules` raise `SandboxError`, so egress allowlists and staged egress policies fail
 on Docker sandboxes (#182). Docker also
 rejects snapshots, Compose, GPUs, persistent volumes, and provider-managed secrets.
+Nested Docker is not supported. Containers run unprivileged, so a benchmark that starts `dockerd` inside
+the sandbox fails on this provider, unlike on Daytona and Modal.
 
 Run the local provider checks:
 

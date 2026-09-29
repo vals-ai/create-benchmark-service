@@ -174,7 +174,7 @@ def generate_project(
     shutil.copytree(
         root / ".github",
         output_dir / ".github",
-        ignore=shutil.ignore_patterns("cli-integration.yaml", "provider-integration.yaml"),
+        ignore=shutil.ignore_patterns("cli-integration.yaml", "provider-integration.yaml", "docker-integration.yaml"),
     )
 
     # Create empty tests directory

@@ -5,7 +5,9 @@ readme = "README.md"
 requires-python = ">=3.12"
 
 dependencies = [
-    "create-benchmark-service{% if template == 'vals-ai' %}[vals-ai]{% endif %} @ git+{{ framework_repo_url }}@{{ framework_ref }}",
+{% if template == 'vals-ai' %}    "vals-datasets[service] @ git+https://github.com/vals-ai/vals-datasets.git@64e4e81d1115366854b1ed00493055112de8adfc",
+{% else %}    "create-benchmark-service @ git+{{ framework_repo_url }}@{{ framework_ref }}",
+{% endif %}
 ]
 
 [dependency-groups]

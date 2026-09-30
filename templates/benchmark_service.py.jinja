@@ -1,6 +1,7 @@
 """Example benchmark service implementation."""
 
-from collections.abc import AsyncGenerator
+{% if template == "vals-ai" %}import json
+{% endif %}from collections.abc import AsyncGenerator
 from typing import Any
 
 from benchmark_service import {% if template == "default" %}BenchmarkService, {% endif %}ImageSource, Resources, Sandbox
@@ -15,19 +16,36 @@ from benchmark_service.schemas import (
 )
 from benchmark_service.v1_schemas import V1Task{% if template == "vals-ai" %}
 
-from benchmark_service.vals import ValsBenchmarkService{% endif %}
+from vals_datasets import Snapshot
+from vals_datasets.service import DatasetBenchmarkService{% endif %}
 
 
-class ExampleBenchmark({% if template == "vals-ai" %}ValsBenchmarkService{% else %}BenchmarkService{% endif %}):
+{% if template == "vals-ai" %}def load_tasks(snapshot: Snapshot) -> dict[str, Any]:
+    tasks: dict[str, Any] = {}
+    for record in snapshot.index.tasks:
+        directory = snapshot.root / record.path
+        tasks[record.id] = {
+            "problem": (directory / "instruction.md").read_text(encoding="utf-8"),
+            "answer": json.loads((directory / "answer.json").read_text(encoding="utf-8"))["answer"],
+        }
+    return tasks
+
+
+{% endif %}class ExampleBenchmark({% if template == "vals-ai" %}DatasetBenchmarkService{% else %}BenchmarkService{% endif %}):
     """TODO: Replace this example with your benchmark implementation.
 
     This example shows a simple text-based Q&A benchmark.
     Modify it to load your own dataset and implement your evaluation logic.
     """
 
-    async def load_datasets(self) -> dict[str, dict[str, Any]]:
+{% if template == "vals-ai" %}    snapshot_adapter = staticmethod(load_tasks)
+
+{% endif %}    async def load_datasets(self) -> dict[str, dict[str, Any]]:
         """Load the benchmark datasets."""
-        return {
+{% if template == "vals-ai" %}        if not self.uses_snapshot("default"):
+            raise ValueError("Configure dataset storage, cache, and routes; use make dev for local development")
+        return {}
+{% else %}        return {
             "default": {
                 "example-task-1": {
                     "problem": "Write a function that returns 'Hello, World!'",
@@ -40,7 +58,7 @@ class ExampleBenchmark({% if template == "vals-ai" %}ValsBenchmarkService{% else
             },
         }
 
-    async def list_tasks(self, dataset: str | None = None) -> list[V1Task]:
+{% endif %}    async def list_tasks(self, dataset: str | None = None) -> list[V1Task]:
         """Expose public task inputs for benchmark runners."""
         return [V1Task(id=task_id, question=task["problem"]) for task_id, task in self.get_dataset(dataset).items()]
 

@@ -21,3 +21,5 @@ tests/
 
 # Development
 Makefile
+
+.local/

@@ -16,7 +16,7 @@ create-benchmark-service <benchmark-name>
 
 Creates a new service in `./<benchmark-name>-benchmark-service/` in your current directory.
 
-Use `--template vals-ai` to include Vals authentication, access policy, and the provider-facing `/v1/*` routes.
+Use `--template vals-ai` to include Vals authentication, access policy, provider-facing `/v1/*` routes, and saved dataset versions. The generated project includes example task files, a dataset adapter, and local snapshot targets.
 
 ```bash
 create-benchmark-service <benchmark-name> --template vals-ai
@@ -26,7 +26,7 @@ create-benchmark-service <benchmark-name> --template vals-ai
 
 The base install includes Daytona, Modal, and the OpenTelemetry API for both templates.
 
-`create-benchmark-service[vals-ai]` bundles the Vals dependencies: S3/AWS clients, Sentry, Descope, and caching. The Vals template selects this extra automatically.
+`create-benchmark-service[vals-ai]` bundles the Vals dependencies: S3/AWS clients, Sentry, Descope, and caching. The Vals template installs `vals-datasets[service]`, which supplies a compatible pinned framework with this extra.
 
 ## What Gets Generated
 
@@ -368,7 +368,7 @@ For process-scoped credentials, call `sandbox.command(..., env_vars={...})`. Pro
 
 Both templates disable authentication unless `AUTH_REQUIRED=true`. Local routes, including the Vals `/v1/*` routes, work without credentials. Hosted registry deployments set `AUTH_REQUIRED=true`; the framework then authenticates every HTTP request except `/health` and `/version`, and every WebSocket route. `AUTH_DISABLED` is no longer supported and cannot override `AUTH_REQUIRED=true`.
 
-Services generated with `--template vals-ai` import `ValsBenchmarkService` and `ValsBenchmarkServiceApp` from `benchmark_service.vals`. These classes inherit the generic framework classes. With `AUTH_REQUIRED=true`, set `DESCOPE_PROJECT_ID` and a tenant + dataset allowlist. Requests must include a valid Descope access key in `X-Descope-Api-Key`. The key must be scoped to exactly one Descope tenant, and that tenant must appear in the service allowlist. Catalog access, quotas, and trial restrictions apply only when authentication is required.
+Services generated with `--template vals-ai` use `DatasetBenchmarkService` and `DatasetBenchmarkServiceApp` from `vals_datasets.service`. These classes include the shared Vals framework classes and dataset loading. With `AUTH_REQUIRED=true`, set `DESCOPE_PROJECT_ID` and a tenant + dataset allowlist. Requests must include a valid Descope access key in `X-Descope-Api-Key`. The key must be scoped to exactly one Descope tenant, and that tenant must appear in the service allowlist. Catalog access, quotas, and trial restrictions apply only when authentication is required.
 
 When authentication is required, the allowlist is loaded in this order:
 

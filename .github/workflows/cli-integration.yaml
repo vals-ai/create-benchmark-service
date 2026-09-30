@@ -14,6 +14,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - uses: actions/setup-python@v5
         with:
@@ -38,15 +40,24 @@ jobs:
           create-benchmark-service test --template ${{ matrix.template }}
 
       - name: Point generated project at this PR's framework source
+        if: matrix.template == 'default'
         working-directory: /tmp/cli-test/test-benchmark-service
         run: |
           uv add --no-sync "create-benchmark-service${{ matrix.extras }} @ file://${GITHUB_WORKSPACE}"
 
       - name: Verify generated project installs and passes lint
         working-directory: /tmp/cli-test/test-benchmark-service
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
+          if [ -n "$GH_TOKEN" ]; then gh auth setup-git; fi
           make install
           make lint
+
+      - name: Verify generated dataset behavior
+        if: matrix.template == 'vals-ai'
+        working-directory: /tmp/cli-test/test-benchmark-service
+        run: make check snapshot
 
       - name: Boot generated service and evaluate a text task
         working-directory: /tmp/cli-test/test-benchmark-service
@@ -54,13 +65,20 @@ jobs:
           PYTHONPATH: src
           AUTH_REQUIRED: "false"
           TEMPLATE: ${{ matrix.template }}
+          VALS_DATASET_STORE: /tmp/cli-test/test-benchmark-service/.local/store
+          VALS_DATASET_CACHE: /tmp/cli-test/test-benchmark-service/.local/cache
+          VALS_DATASET_ROUTES: /tmp/cli-test/test-benchmark-service/config/routes.json
         run: |
           uv run python - <<'PYTHON'
           import os
+          from pathlib import Path
           from fastapi.testclient import TestClient
           from main import app
 
-          with TestClient(app) as client:
+          headers = {}
+          if os.environ["TEMPLATE"] == "vals-ai":
+              headers["X-Vals-Dataset-Ref"] = Path(".local/dataset-ref.txt").read_text().strip()
+          with TestClient(app, headers=headers) as client:
               response = client.post("/evaluate-response/", json={"task_id": "example-task-2", "response": "4"})
               assert response.status_code == 200, response.text
               assert response.json()["score"] == 1.0

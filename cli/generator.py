@@ -157,7 +157,7 @@ def generate_project(
         "README.md.jinja": "README.md",
     }
 
-    framework_ref = _resolve_framework_ref(benchmark_service.__version__)
+    framework_ref = _resolve_framework_ref(benchmark_service.__version__) if template == "default" else None
     template_context = {
         **names,
         "framework_ref": framework_ref,
@@ -191,5 +191,19 @@ def generate_project(
     # Copy templates
     service_template = env.get_template("benchmark_service.py.jinja")
     (benchmark_package_dir / "benchmark_service.py").write_text(service_template.render(template_context))
+    if template == "vals-ai":
+        for source, destination in (
+            ("Makefile.vals-ai.jinja", "Makefile"),
+            ("routes.json.jinja", "config/routes.json"),
+            ("test_dataset.py.jinja", "tests/test_dataset.py"),
+        ):
+            target = output_dir / destination
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(env.get_template(source).render(template_context))
+        shutil.copytree(templates_dir / "dataset", output_dir / "dataset")
+
     copy_file(templates_dir / "Dockerfile", output_dir / "Dockerfile")
     copy_file(templates_dir / ".dockerignore", output_dir / ".dockerignore")
+    if template == "vals-ai":
+        with (output_dir / ".dockerignore").open("a") as dockerignore:
+            dockerignore.write("dataset/\n")

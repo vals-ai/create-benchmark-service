@@ -1,0 +1,41 @@
+import shutil
+from pathlib import Path
+from typing import cast
+
+import httpx
+import pytest
+from fastapi.testclient import TestClient
+from vals_datasets import LocalSnapshotStore
+from vals_datasets.service import DatasetBenchmarkServiceApp
+
+from {{ benchmark_package }}.benchmark_service import ExampleBenchmark
+
+
+def test_saved_versions_keep_answers_private_and_stable(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    root = Path(__file__).resolve().parents[1]
+    source = tmp_path / "source"
+    shutil.copytree(root / "dataset", source)
+    store = LocalSnapshotStore(tmp_path / "store")
+    first = str(store.create_snapshot("{{ benchmark_name }}", source))
+    (source / "splits/public/example-task-2/answer.json").write_text('{"answer": "5"}\n')
+    second = str(store.create_snapshot("{{ benchmark_name }}", source))
+    monkeypatch.setenv("AUTH_REQUIRED", "false")
+    monkeypatch.setenv("VALS_DATASET_STORE", str(tmp_path / "store"))
+    monkeypatch.setenv("VALS_DATASET_CACHE", str(tmp_path / "cache"))
+    monkeypatch.setenv("VALS_DATASET_ROUTES", str(root / "config/routes.json"))
+
+    with TestClient(DatasetBenchmarkServiceApp(ExampleBenchmark)) as transport:
+        client = cast(httpx.Client, transport)
+        assert client.get("/v1/datasets/default/tasks").status_code == 400
+        for reference, expected_score in ((first, 1.0), (second, 0.0), (first, 1.0)):
+            headers = {"X-Vals-Dataset-Ref": reference}
+            listing = client.get("/v1/datasets/default/tasks", headers=headers)
+            assert listing.status_code == 200, listing.text
+            tasks = listing.json()["tasks"]
+            assert {task["id"] for task in tasks} == {"example-task-1", "example-task-2"}
+            assert all(set(task) <= {"id", "question", "timeout"} for task in tasks)
+            result = client.post(
+                "/evaluate-response/", headers=headers, json={"task_id": "example-task-2", "response": "4"}
+            )
+            assert result.status_code == 200, result.text
+            assert result.json()["score"] == expected_score

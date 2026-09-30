@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-from templates.vals_ai.auth import clear_allowlist_cache, get_tenant_config, load_allowlist
+from benchmark_service.vals.auth import clear_allowlist_cache, get_tenant_config, load_allowlist
 
 
 @pytest.fixture(autouse=True)

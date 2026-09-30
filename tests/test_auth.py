@@ -10,15 +10,15 @@ from unittest.mock import patch
 import pytest
 
 from benchmark_service import Sandbox
-from templates.vals_ai import auth as auth_module
-from templates.vals_ai.auth import (
+from benchmark_service.vals import auth as auth_module
+from benchmark_service.vals.auth import (
     UNAUTHENTICATED_TENANT_SENTINEL,
     clear_allowlist_cache,
     clear_auth_cache,
     resolve_caller_tenant,
     resolve_descope_tenant,
 )
-from templates.vals_ai.base import ValsBenchmarkService
+from benchmark_service.vals.base import ValsBenchmarkService
 from benchmark_service.schemas import (
     EvaluateResponseRequest,
     FinalScoreResult,

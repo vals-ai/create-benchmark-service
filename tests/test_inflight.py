@@ -8,6 +8,8 @@ import pytest
 from fastapi import FastAPI
 
 from benchmark_service.inflight import InflightMiddleware
+from benchmark_service.vals import auth as auth_module
+from benchmark_service.vals.app import ValsBenchmarkServiceApp
 
 
 @pytest.mark.asyncio
@@ -123,8 +125,6 @@ def test_only_vals_template_installs_inflight_middleware(
     from fastapi.testclient import TestClient
 
     from benchmark_service.app import BenchmarkServiceApp
-    from templates.vals_ai import auth as auth_module
-    from templates.vals_ai.app import ValsBenchmarkServiceApp
     from tests.conftest import StubBenchmark, ValsStubBenchmark
 
     monkeypatch.setenv("AUTH_REQUIRED", "true")

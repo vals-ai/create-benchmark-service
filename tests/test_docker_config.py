@@ -20,7 +20,7 @@ from benchmark_service.sandbox.local.docker import (  # pyright: ignore[reportPr
     _ContainerInfo,  # pyright: ignore[reportPrivateUsage]
 )
 from benchmark_service.sandbox.types import ExecResult, SandboxCreateRequest
-from templates.vals_ai.app import _grading_provider_config  # pyright: ignore[reportPrivateUsage]
+from benchmark_service.vals.app import _grading_provider_config  # pyright: ignore[reportPrivateUsage]
 
 
 def test_docker_grading_selects_docker(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -151,6 +151,7 @@ async def test_timed_out_creation_deletes_a_container_docker_finishes_later() ->
     docker.containers.run = run
     docker.containers.container = MagicMock(return_value=container)
     provider._docker = docker  # pyright: ignore[reportPrivateUsage]
+    provider._docker_host = None  # pyright: ignore[reportPrivateUsage]
     request = SandboxCreateRequest(
         name="slow-create",
         source=ImageSource(image="python:3.12-slim"),
@@ -185,6 +186,7 @@ async def test_timed_out_creation_logs_a_late_creation_failure(caplog: pytest.Lo
     docker.containers.run = run
     docker.containers.container = MagicMock(return_value=container)
     provider._docker = docker  # pyright: ignore[reportPrivateUsage]
+    provider._docker_host = None  # pyright: ignore[reportPrivateUsage]
     request = SandboxCreateRequest(
         name="failing-create",
         source=ImageSource(image="python:3.12-slim"),
@@ -235,6 +237,7 @@ async def test_missing_image_is_pulled_by_the_docker_cli_outside_the_creation_de
     docker.containers.run = run
     docker.containers.container = MagicMock(return_value=container)
     provider._docker = docker  # pyright: ignore[reportPrivateUsage]
+    provider._docker_host = None  # pyright: ignore[reportPrivateUsage]
     request = SandboxCreateRequest(
         name="missing-image",
         source=ImageSource(image=image),
@@ -251,3 +254,53 @@ async def test_missing_image_is_pulled_by_the_docker_cli_outside_the_creation_de
 
     assert sandbox.id == "container-1"
     assert (tmp_path / "pull-args").read_text().split() == ["pull", "--quiet", image]
+
+
+@pytest.mark.parametrize("host", ["unix:///custom/docker.sock", "tcp://docker.example:2375", None])
+async def test_image_pull_uses_the_provider_host_over_the_cli_context(
+    host: str | None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Use an explicit provider host for pulls, while retaining context selection without one."""
+    from benchmark_service.sandbox.local import docker as docker_module
+
+    if host is None:
+        monkeypatch.delenv("DOCKER_HOST", raising=False)
+    else:
+        monkeypatch.setenv("DOCKER_HOST", host)
+    monkeypatch.setenv("DOCKER_CONTEXT", "other-daemon")
+    if host is None:
+        monkeypatch.delenv("DOCKER_CONFIG", raising=False)
+    else:
+        monkeypatch.setenv("DOCKER_CONFIG", "/custom/docker-config")
+    docker = MagicMock()
+    docker.images.inspect = AsyncMock(side_effect=DockerError(404, "No such image"))
+    constructor = MagicMock(return_value=docker)
+    monkeypatch.setattr(docker_module, "Docker", constructor)
+    provider = DockerSandboxProvider()
+    constructor.assert_called_once_with(url=host)
+
+    # A later environment change must not send a pull away from the explicitly selected host.
+    if host is not None:
+        monkeypatch.setenv("DOCKER_HOST", "unix:///another/docker.sock")
+    process = MagicMock(returncode=0)
+    process.communicate = AsyncMock(return_value=(b"pulled", None))
+    spawn = AsyncMock(return_value=process)
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", spawn)
+
+    await provider._ensure_image("registry.example.com/team/agent:1")  # pyright: ignore[reportPrivateUsage]
+
+    expected_host_args = ["--host", host] if host else []
+    assert spawn.await_args is not None
+    assert spawn.await_args.args == (
+        "docker",
+        *expected_host_args,
+        "pull",
+        "--quiet",
+        "registry.example.com/team/agent:1",
+    )
+    env = spawn.await_args.kwargs["env"]
+    if host:
+        assert env["DOCKER_CONFIG"] == "/custom/docker-config"
+        assert "DOCKER_CONTEXT" not in env
+    else:
+        assert env["DOCKER_CONTEXT"] == "other-daemon"

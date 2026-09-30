@@ -269,7 +269,8 @@ def _build_container_config(request: SandboxCreateRequest) -> JSONObject:
 
 class DockerSandboxProvider(SandboxProvider):
     def __init__(self) -> None:
-        self._docker = Docker(url=os.environ.get("DOCKER_HOST"))
+        self._docker_host = os.environ.get("DOCKER_HOST")
+        self._docker = Docker(url=self._docker_host)
 
     async def _get_container(self, instance_id: str) -> tuple[DockerContainer, _ContainerInfo]:
         container = self._docker.containers.container(instance_id)  # pyright: ignore[reportUnknownMemberType]
@@ -293,9 +294,23 @@ class DockerSandboxProvider(SandboxProvider):
                     raise
 
         # The docker CLI applies the host's registry logins and credential helpers, which aiodocker does not read.
+        # DOCKER_CONTEXT overrides DOCKER_HOST in the CLI, unlike the explicit URL passed to aiodocker.
+        # Pin pulls to the same host selected when this provider was created, even if the environment changes.
+        env = os.environ.copy()
+        host_args: list[str] = []
+        if self._docker_host:
+            env.pop("DOCKER_CONTEXT", None)
+            host_args = ["--host", self._docker_host]
         try:
             process = await asyncio.create_subprocess_exec(
-                "docker", "pull", "--quiet", image, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT
+                "docker",
+                *host_args,
+                "pull",
+                "--quiet",
+                image,
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
             )
         except OSError as error:
             raise SandboxError("Pulling a missing Docker image requires the docker CLI on PATH") from error

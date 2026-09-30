@@ -21,6 +21,40 @@ from benchmark_service.sandbox.types import (
 
 _COMPOSE_LEGACY_DOCKER_IMAGE = "compose+source-required"
 _TARGETED_SNAPSHOT_LEGACY_DOCKER_IMAGE = "targeted-snapshot+source-required"
+DATASET_VERSION_HEADER = "X-Benchmark-Dataset-Version"
+
+DatasetVersionId = Annotated[str, Field(min_length=1, max_length=1024, pattern=r"^[!-~]+$")]
+
+
+class DatasetVersion(BaseModel):
+    """An immutable dataset identity and its optional display label."""
+
+    model_config = ConfigDict(frozen=True)
+
+    id: DatasetVersionId
+    label: str | None = Field(max_length=256)
+
+
+class ResolveDatasetRequest(BaseModel):
+    """Select a fixed version, or the configured default when version is null."""
+
+    dataset: str = Field(min_length=1)
+    version: str | None = Field(min_length=1, max_length=1024)
+
+
+class ResolveDatasetResponse(BaseModel):
+    """The exact version selected for a public dataset name."""
+
+    dataset: str
+    version: DatasetVersion
+
+
+class StreamDatasetVersionChunk(BaseModel):
+    """Framework acknowledgement sent before a pinned operation starts."""
+
+    type: Literal["dataset_version"] = "dataset_version"
+    data: DatasetVersion
+
 
 type JsonValue = None | bool | int | float | str | list[JsonValue] | dict[str, JsonValue]
 
@@ -343,6 +377,7 @@ class VersionResponse(BaseModel):
     service_name: str | None = None
     service_version: str | None = None
     dataset_version: str | None = None
+    dataset_version_selection: bool = Field(default=False, strict=True)
     eval_mode: EvalMode = EvalMode.TEXT
 
 
@@ -365,6 +400,7 @@ class StreamErrorChunk(BaseModel):
 
     type: Literal["error"] = Field(description="Chunk type identifier")
     data: str = Field(description="Error message")
+    status_code: int | None = Field(default=None, exclude_if=lambda value: value is None)
 
 
 class StreamEvalResumeStateChunk(BaseModel):

@@ -15,7 +15,7 @@ from benchmark_service.schemas import (
 )
 from benchmark_service.v1_schemas import V1Task{% if template == "vals-ai" %}
 
-from .vals_ai import ValsBenchmarkService{% endif %}
+from benchmark_service.vals import ValsBenchmarkService{% endif %}
 
 
 class ExampleBenchmark({% if template == "vals-ai" %}ValsBenchmarkService{% else %}BenchmarkService{% endif %}):

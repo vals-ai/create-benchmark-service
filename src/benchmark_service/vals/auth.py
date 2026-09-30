@@ -20,7 +20,7 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_required
 
-from .allowlist import (
+from benchmark_service.vals.allowlist import (
     ALLOWLIST_CACHE_MAX_SIZE,
     DESCOPE_API_KEY_HEADER,
     CatalogAllowlistClient,
@@ -209,7 +209,7 @@ def _initial_cache_ttl_seconds() -> int:
         return DEFAULT_AUTH_CACHE_TTL_SECONDS
 
 
-_auth_cache: TTLCache[tuple[str, str], str] = TTLCache(
+_auth_cache: TTLCache[tuple[str, str], str] = TTLCache[tuple[str, str], str](
     maxsize=AUTH_CACHE_MAX_SIZE,
     ttl=_initial_cache_ttl_seconds(),
 )

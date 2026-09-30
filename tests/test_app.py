@@ -10,8 +10,8 @@ from fastapi import WebSocket
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
 
-from templates.vals_ai import auth as auth_module
-from templates.vals_ai.app import ValsBenchmarkServiceApp
+from benchmark_service.vals import auth as auth_module
+from benchmark_service.vals.app import ValsBenchmarkServiceApp
 from benchmark_service.app import BenchmarkServiceApp, send_json_if_connected
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig

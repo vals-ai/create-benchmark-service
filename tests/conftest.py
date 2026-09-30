@@ -10,7 +10,8 @@ from fastapi.testclient import TestClient
 from benchmark_service import ImageSource, Resources, Sandbox
 from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.base import BenchmarkService
-from templates.vals_ai.base import ValsBenchmarkService
+from benchmark_service.vals.base import ValsBenchmarkService
+from benchmark_service.vals.auth import clear_allowlist_cache, clear_auth_cache
 from benchmark_service.client import BenchmarkServiceClient
 from benchmark_service.schemas import (
     EvaluateResponseRequest,
@@ -113,7 +114,5 @@ def client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]
 
 @pytest.fixture(autouse=True)
 def reset_auth_caches() -> None:
-    from templates.vals_ai.auth import clear_allowlist_cache, clear_auth_cache
-
     clear_allowlist_cache()
     clear_auth_cache()

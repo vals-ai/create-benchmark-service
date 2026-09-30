@@ -47,3 +47,23 @@ jobs:
         run: |
           make install
           make lint
+
+      - name: Boot generated service and evaluate a text task
+        working-directory: /tmp/cli-test/test-benchmark-service
+        env:
+          PYTHONPATH: src
+          AUTH_REQUIRED: "false"
+          TEMPLATE: ${{ matrix.template }}
+        run: |
+          uv run python - <<'PYTHON'
+          import os
+          from fastapi.testclient import TestClient
+          from main import app
+
+          with TestClient(app) as client:
+              response = client.post("/evaluate-response/", json={"task_id": "example-task-2", "response": "4"})
+              assert response.status_code == 200, response.text
+              assert response.json()["score"] == 1.0
+              tasks = client.get("/v1/datasets/default/tasks")
+              assert tasks.status_code == (200 if os.environ["TEMPLATE"] == "vals-ai" else 404)
+          PYTHON

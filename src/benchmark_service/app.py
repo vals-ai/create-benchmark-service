@@ -42,6 +42,7 @@ from benchmark_service.schemas import (
 )
 from benchmark_service.sandbox import (
     DaytonaProviderConfig,
+    DockerProviderConfig,
     SandboxProviderConfig,
 )
 
@@ -88,6 +89,15 @@ def _request_sandbox_provider_config(
     websocket: WebSocket,
 ) -> SandboxProviderConfig:
     return request.sandbox_provider or DaytonaProviderConfig.from_headers(websocket.headers)
+
+
+DOCKER_ENABLED_ENV = "CBS_DOCKER_ENABLED"
+_DOCKER_DISABLED_REASON = "Docker sandboxes are disabled on this service"
+
+
+def _request_may_use_provider(config: SandboxProviderConfig | None) -> bool:
+    """Docker needs no caller credentials and drives this host's daemon, so only an opted-in service accepts it."""
+    return not isinstance(config, DockerProviderConfig) or os.environ.get(DOCKER_ENABLED_ENV, "").lower() == "true"
 
 
 def _get_service_metadata(service_cls: type[BenchmarkService]) -> tuple[str | None, str | None]:
@@ -374,6 +384,9 @@ class BenchmarkServiceApp(FastAPI):
                     sandbox_id=request.instance_id,
                 )
             sandbox_config = _request_sandbox_provider_config(request, websocket)
+            if not _request_may_use_provider(sandbox_config):
+                await websocket.close(code=1008, reason=_DOCKER_DISABLED_REASON)
+                return
 
             async with self._dataset_scope(websocket, tenant, request.dataset):
                 async with sandbox_config.create_provider() as provider:
@@ -405,6 +418,8 @@ class BenchmarkServiceApp(FastAPI):
     async def _evaluate_response(self, request: Request, body: EvaluateResponseRequest) -> Any:
         if self._sentry is not None:
             self._sentry.bind_request_context(request.headers, task_id=body.task_id, dataset=body.dataset)
+        if not _request_may_use_provider(body.sandbox_provider):
+            raise HTTPException(status_code=403, detail=_DOCKER_DISABLED_REASON)
         async with self._dataset_scope(request, request.state.tenant, body.dataset):
             await self.consume_evaluation_request(cast(str, request.state.tenant))
             return await self.service.evaluate_response(body, dataset=body.dataset)
@@ -421,6 +436,9 @@ class BenchmarkServiceApp(FastAPI):
             request = EvaluateResponseRequest(**data)
             if self._sentry is not None:
                 self._sentry.bind_request_context(websocket.headers, task_id=request.task_id, dataset=request.dataset)
+            if not _request_may_use_provider(request.sandbox_provider):
+                await websocket.close(code=1008, reason=_DOCKER_DISABLED_REASON)
+                return
 
             async with self._dataset_scope(websocket, tenant, request.dataset):
                 if not await self._admit_websocket_evaluation(websocket, tenant):
@@ -466,6 +484,9 @@ class BenchmarkServiceApp(FastAPI):
                     sandbox_id=request.instance_id,
                 )
             sandbox_config = _request_sandbox_provider_config(request, websocket)
+            if not _request_may_use_provider(sandbox_config):
+                await websocket.close(code=1008, reason=_DOCKER_DISABLED_REASON)
+                return
 
             async with self._dataset_scope(websocket, tenant, request.dataset):
                 if not await self._admit_websocket_evaluation(websocket, tenant):

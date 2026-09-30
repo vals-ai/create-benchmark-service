@@ -155,6 +155,7 @@ def test_generated_project_includes_release_workflows_but_not_cli_integration(tm
     assert (workflows_dir / "check-pr-title.yaml").exists()
     assert not (workflows_dir / "cli-integration.yaml").exists()
     assert not (workflows_dir / "provider-integration.yaml").exists()
+    assert not (workflows_dir / "docker-integration.yaml").exists()
 
 
 @pytest.mark.parametrize("template", ["default", "vals-ai"])

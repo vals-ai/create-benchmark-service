@@ -44,7 +44,7 @@ uv tool install git+https://github.com/vals-ai/create-benchmark-service.git@vX.Y
 
 ### Template and dependency migration
 
-Install `create-benchmark-service[vals-ai]` and import `ValsBenchmarkService` and `ValsBenchmarkServiceApp` from `benchmark_service.vals`. New Vals services use `DatasetBenchmarkService` and `DatasetBenchmarkServiceApp` from `vals-datasets`, which inherit these classes and load saved datasets. Framework dependency updates also update Vals authentication, access policy, and provider routes.
+Install `create-benchmark-service[vals-ai]` and import `ValsBenchmarkService` and `ValsBenchmarkServiceApp` from `benchmark_service.vals`. New Vals services already use these classes. Framework dependency updates also update Vals authentication, access policy, and provider routes.
 
 Existing services with a generated local `vals_ai/` package continue to use their copied implementation. To adopt the shared implementation, replace their Vals imports with `benchmark_service.vals`. Remove the local package only after checking for service-specific changes. The generic framework remains independent of Vals policy and its optional dependencies.
 

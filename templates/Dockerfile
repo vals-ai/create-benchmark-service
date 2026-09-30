@@ -11,7 +11,7 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
 # Install dependencies first so this layer caches unless pyproject changes;
 # --no-install-project skips the service itself, which needs no version yet.
 COPY pyproject.toml README.md ./
-RUN --mount=type=secret,id=netrc,target=/root/.netrc uv sync --no-install-project
+RUN uv sync --no-install-project
 
 # Version is injected at build (CI passes the git tag); hatch-vcs reads
 # SETUPTOOLS_SCM_PRETEND_VERSION rather than .git, so the image needs no .git.
@@ -19,7 +19,7 @@ ARG SERVICE_VERSION=0.0.0
 ENV SETUPTOOLS_SCM_PRETEND_VERSION=${SERVICE_VERSION}
 
 COPY . .
-RUN --mount=type=secret,id=netrc,target=/root/.netrc uv sync
+RUN uv sync
 
 # Expose port
 EXPOSE 8001

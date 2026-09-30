@@ -2,18 +2,12 @@
 
 ## Getting started
 
-{% if template == "vals-ai" %}This service includes Vals authentication, provider routes, and fixed dataset versions. Follow the [benchmark onboarding guide](https://www.notion.so/vals-ai/Adding-a-New-Benchmark-to-Valkyrie-End-to-End-Guide-36e8a877dd8d816595e6cf35248cb9a6) for the full Valkyrie workflow.
-
-Replace the examples in `dataset/splits/public/`. Each task has `task.toml`, a public question in `instruction.md`, and a private expected answer in `answer.json`. Edit `load_tasks` in `src/{{ benchmark_package }}/benchmark_service.py` if your file format differs. `config/routes.json` maps the API's `default` dataset to this collection's `public` task group.
-
-The service already loads saved datasets. Adapt the execution and grading methods for your benchmark:
-{% else %}Edit `src/{{ benchmark_package }}/benchmark_service.py` and implement the six abstract methods on `ExampleBenchmark`:
-{% endif %}
+Edit `src/{{ benchmark_package }}/benchmark_service.py` and implement the six abstract methods on `ExampleBenchmark`:
 
 | Method | What to do |
 |--------|------------|
-{% if template == "default" %}| `load_datasets()` | Return `dict[dataset_name, dict[task_id, ...]]` of all datasets |
-{% endif %}| `retrieve_task()` | Return sandbox source, problem statement, and resource requirements |
+| `load_datasets()` | Return `dict[dataset_name, dict[task_id, ...]]` of all datasets |
+| `retrieve_task()` | Return sandbox source, problem statement, and resource requirements |
 | `setup_task()` | Prepare the sandbox before evaluation (upload files, run install commands) |
 | `evaluate_response()` | Score a plain-text response without a sandbox |
 | `evaluate_instance()` | Run tests / evaluation scripts in the sandbox |
@@ -24,7 +18,7 @@ The service already loads saved datasets. Adapt the execution and grading method
 ## Authentication
 
 {% if template == "vals-ai" %}
-`ExampleBenchmark` extends `DatasetBenchmarkService`; `main.py` uses `DatasetBenchmarkServiceApp`. These shared classes already include Vals authentication and `/v1/*` routes. No additional parent classes or copied authentication files are needed.
+The Vals layer comes from `benchmark_service.vals`. `ExampleBenchmark` subclasses `ValsBenchmarkService`; `main.py` uses `ValsBenchmarkServiceApp`. The Vals app adds the `/v1/*` routes.
 
 Set `AUTH_REQUIRED=true` to enable Descope authentication, catalog/allowlist access, quotas, and trial restrictions. Configure `DESCOPE_PROJECT_ID` and access through `BENCHMARK_CATALOG_API_URL` plus `SERVICE_NAME`, `DESCOPE_TENANT_ALLOWLIST_JSON`, or `DESCOPE_ALLOWLIST_PATH`. Requests then require a Descope access key in `X-Descope-Api-Key`. Quota-enabled services also require `SERVICE_NAME` and `EVALUATION_QUOTA_TABLE_NAME`.
 
@@ -40,37 +34,18 @@ Authentication is disabled by default. Hosted registry deployments set `AUTH_REQ
 The base framework includes Daytona, Modal, and the OpenTelemetry API.
 {% if template == "vals-ai" %}
 
-You need Git access to the private `vals-ai/vals-datasets` repository. For GitHub Actions, configure `GH_PAT` with read access to it; the generated workflows use this secret for dependency installation.
-
-This template pins `vals-datasets[service]`, which supplies a compatible pinned framework with the Vals dependencies. Upgrade the dataset dependency to update that shared integration.
+This template selects `create-benchmark-service[vals-ai]` for S3/AWS clients, Sentry, Descope, and caching dependencies.
 {% endif %}
 
 ## Development
 
-{% if template == "vals-ai" %}Run `make install`, then `make dev`. The development target saves a snapshot: a fixed copy of your task files. It writes the snapshot's ID to `.local/dataset-ref.txt` and starts the service at `http://127.0.0.1:8001`. Local development uses local storage without authentication. Do not expose this process through an unrestricted public URL.
-
-Check that the server grades the saved example:
-
 ```bash
-DATASET_REF="$(<.local/dataset-ref.txt)"
-curl --fail http://127.0.0.1:8001/evaluate-response/ \
-  -H 'Content-Type: application/json' \
-  -H "X-Vals-Dataset-Ref: $DATASET_REF" \
-  -d '{"task_id":"example-task-2","response":"4"}'
-```
-
-The result should contain `"score": 1.0`. Keep the same `X-Vals-Dataset-Ref` header for every request in a run and any grading retries. Editing task files does not change that saved version. After editing, run `make snapshot` and load the new ID for a new run. Run `make check` to test loading, private answer separation, and grading against saved versions. These tests make no model calls.
-
-For Valkyrie, expose the local process through a protected tunnel, then use `valkyrie config service set {{ benchmark_name }} <protected-service-url>`. Follow the onboarding guide to list tasks and run an agent, passing the saved dataset header and your tunnel's authentication header. This example supports text-response grading; implement `evaluate_instance` before running sandbox agents.
-
-For hosted use, configure authenticated shared storage using the [dataset service integration guide](https://github.com/vals-ai/vals-datasets/blob/main/docs/service-integration.md). Supply access settings, the route mapping, and a writable cache. The shared library handles loading and authorization. The Docker build excludes local snapshots and task files. Build it with `docker build --secret id=netrc,src="$HOME/.netrc" -t {{ benchmark_name }} .`, using a netrc file with GitHub credentials that can read the dataset library. BuildKit mounts this credential only during dependency installation; it is not copied into the image.
-{% else %}```bash
 make install   # install dependencies
 make dev       # run local server
 make test      # run tests
 make help      # list all commands
 ```
-{% endif %}
+
 ## Releasing
 
 Versions come from git tags (hatch-vcs). To enable the release flow in this repo:

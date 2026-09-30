@@ -45,7 +45,7 @@ from benchmark_service.observability import (
 )
 from benchmark_service.schemas import EvaluateResponseRequest
 from benchmark_service.sentry import init_sentry
-from templates.vals_ai.app import ValsBenchmarkServiceApp
+from benchmark_service.vals.app import ValsBenchmarkServiceApp
 from tests.conftest import StubBenchmark, ValsStubBenchmark
 
 

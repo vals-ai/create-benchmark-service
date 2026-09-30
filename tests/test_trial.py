@@ -8,11 +8,11 @@ from unittest.mock import patch
 import pytest
 from fastapi.testclient import TestClient
 
-from templates.vals_ai import auth as auth_module
-from templates.vals_ai.auth import clear_allowlist_cache, clear_auth_cache
-from templates.vals_ai.app import ValsBenchmarkServiceApp
+from benchmark_service.vals import auth as auth_module
+from benchmark_service.vals.auth import clear_allowlist_cache, clear_auth_cache
+from benchmark_service.vals.app import ValsBenchmarkServiceApp
 from benchmark_service.schemas import EvaluateResponseRequest, FinalScoreResult
-from templates.vals_ai.trial import (
+from benchmark_service.vals.trial import (
     sanitize_v1_eval_response,
     sanitize_v1_score_response,
 )

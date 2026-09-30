@@ -5,7 +5,7 @@ from __future__ import annotations
 import pytest
 from fastapi.testclient import TestClient
 
-from templates.vals_ai.app import ValsBenchmarkServiceApp
+from benchmark_service.vals.app import ValsBenchmarkServiceApp
 from tests.conftest import ValsStubBenchmark as StubBenchmark
 
 

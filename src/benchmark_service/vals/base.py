@@ -5,7 +5,7 @@ from typing import Any
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL
 from benchmark_service.base import BenchmarkService
 
-from .auth import check_benchmark_service_auth, get_tenant_config, resolve_caller_tenant
+from benchmark_service.vals.auth import check_benchmark_service_auth, get_tenant_config, resolve_caller_tenant
 
 
 class ValsBenchmarkService(BenchmarkService):

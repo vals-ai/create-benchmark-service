@@ -8,9 +8,9 @@ from unittest.mock import AsyncMock, patch
 import httpx
 import pytest
 
-from templates.vals_ai import auth as auth_module
-from templates.vals_ai.allowlist import CatalogAllowlistClient
-from templates.vals_ai.auth import (
+from benchmark_service.vals import auth as auth_module
+from benchmark_service.vals.allowlist import CatalogAllowlistClient
+from benchmark_service.vals.auth import (
     clear_allowlist_cache,
     clear_auth_cache,
     clear_request_tenant_config,

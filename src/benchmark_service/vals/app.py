@@ -38,15 +38,15 @@ from benchmark_service.v1_schemas import (
     V1UploadUrlResponse,
 )
 
-from . import evaluation_quota
-from .auth import (
+from benchmark_service.vals import evaluation_quota
+from benchmark_service.vals.auth import (
     clear_request_tenant_config,
     close_catalog_client,
     get_tenant_config,
     load_allowlist,
 )
-from .base import ValsBenchmarkService
-from .trial import sanitize_v1_dataset_tasks_response, sanitize_v1_eval_response, sanitize_v1_score_response
+from benchmark_service.vals.base import ValsBenchmarkService
+from benchmark_service.vals.trial import sanitize_v1_dataset_tasks_response, sanitize_v1_eval_response, sanitize_v1_score_response
 
 logger = logging.getLogger(__name__)
 

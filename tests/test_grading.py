@@ -28,16 +28,16 @@ from benchmark_service import (
     TargetedSnapshotSource,
     VolumeMount,
 )
-from templates.vals_ai import auth as auth_module
+from benchmark_service.vals import auth as auth_module
 from benchmark_service import grading, submission_artifacts
-from templates.vals_ai.app import (
+from benchmark_service.vals.app import (
     ValsBenchmarkServiceApp,
     _DuplicateGradingRequest,
     _GradingAdmission,
     _GradingCapacityExceeded,
     _grading_provider_config,
 )
-from templates.vals_ai.auth import clear_allowlist_cache, clear_auth_cache
+from benchmark_service.vals.auth import clear_allowlist_cache, clear_auth_cache
 from benchmark_service.grading import (
     SUBMISSION_ARTIFACT_SANDBOX_PATH,
     collapse_stream,
@@ -1082,7 +1082,7 @@ def _sandbox_app(monkeypatch: pytest.MonkeyPatch, service_cls: type[StubBenchmar
     monkeypatch.setenv("SUBMISSION_ARTIFACT_BUCKET", "vals-submission-artifacts")
     monkeypatch.setenv("AWS_REGION", "us-east-1")
     _FakeDaytonaConfig.provider = FakeProvider(FakeSandbox())
-    monkeypatch.setattr("templates.vals_ai.app.DaytonaProviderConfig", _FakeDaytonaConfig)
+    monkeypatch.setattr("benchmark_service.vals.app.DaytonaProviderConfig", _FakeDaytonaConfig)
     app = ValsBenchmarkServiceApp(service_cls)
     app._service_version = "stub-service-1.0"  # pyright: ignore[reportPrivateUsage]
     return app
@@ -1736,7 +1736,7 @@ def test_ws_evaluate_response_stays_sandboxless_for_sandbox_benchmarks(monkeypat
     monkeypatch.setenv("SUBMISSION_ARTIFACT_BUCKET", "vals-submission-artifacts")
     monkeypatch.setenv("AWS_REGION", "us-east-1")
     _FakeDaytonaConfig.provider = FakeProvider(FakeSandbox())
-    monkeypatch.setattr("templates.vals_ai.app.DaytonaProviderConfig", _FakeDaytonaConfig)
+    monkeypatch.setattr("benchmark_service.vals.app.DaytonaProviderConfig", _FakeDaytonaConfig)
 
     with TestClient(ValsBenchmarkServiceApp(SandboxStub)) as client:
         with client.websocket_connect("/ws/evaluate-response") as ws:

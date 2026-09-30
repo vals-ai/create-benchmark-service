@@ -9,9 +9,9 @@ import pytest
 from fastapi.testclient import TestClient
 from pydantic import BaseModel, ValidationError
 
-from templates.vals_ai import auth as auth_module
-from templates.vals_ai.app import ValsBenchmarkServiceApp
-from templates.vals_ai.auth import clear_allowlist_cache, clear_auth_cache
+from benchmark_service.vals import auth as auth_module
+from benchmark_service.vals.app import ValsBenchmarkServiceApp
+from benchmark_service.vals.auth import clear_allowlist_cache, clear_auth_cache
 from benchmark_service.schemas import FinalScoreResult
 from benchmark_service.v1_schemas import (
     V1DatasetTasksResponse,

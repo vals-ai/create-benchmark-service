@@ -201,14 +201,18 @@ DOCKER_HOST=unix:///var/run/docker.sock \
 ```
 #### Controlled generation workloads
 
-`RetrieveTaskResponse.generation_containment` is an explicit benchmark opt-in, independent of
-`agent_timeout`. It defaults to `None` (the ordinary generation path). To require the controlled
-path, declare `GenerationContainment(type="linux_pid_namespace", version=1)` (exported as
-`LINUX_PID_NAMESPACE_V1`). The caller must match this against the sandbox's
-`generation_containment` and run `await sandbox.probe_generation_containment()` before admitting
-the workload: an advertised capability does not prove the particular sandbox can create the
+`RetrieveTaskResponse.credited_generation` opts a task into credited generation timing independently of
+`agent_timeout`. It defaults to `false`; omitted and false keep the legacy execution path for
+every benchmark service. A true value selects accounting by the caller, not a sandbox capability:
+the benchmark does not prescribe a containment provider or an agent interface.
+
+For a caller using direct Daytona controlled workloads, `GenerationContainment` describes the
+provider's `linux_pid_namespace` v1 capability (exported as `LINUX_PID_NAMESPACE_V1`). Check
+`sandbox.generation_containment` and run `await sandbox.probe_generation_containment()` before
+starting that workload: an advertised capability does not prove this sandbox can create a
 namespace. Unsupported sandboxes report `None`; probing or starting a controlled workload raises
 `ControlledWorkloadUnsupportedError` rather than silently falling back to an ordinary command.
+This provider capability is not a universal task-level requirement.
 
 A direct Daytona sandbox supports `linux_pid_namespace` v1. Call
 `sandbox.controlled_workload(command, cwd=..., env_vars=...)` to start a separate PTY command under
@@ -225,7 +229,7 @@ must not proceed to independent collection on unconfirmed absence. Ordinary `San
 Process containment is separate from `BenchmarkEgressPlan`: setup, run, and evaluation egress
 policies control network access at their respective stages, not whether generation descendants
 have stopped. Run-stage deny-all or an allowlist cannot substitute for confirmed workload absence;
-opting into containment does not automatically apply an egress policy.
+using the controlled workload does not automatically apply an egress policy.
 
 Benchmark services can send `eval_resume_state` updates to the tracker while evaluation is running. The tracker stores the latest value and sends it back on eval-only retry, so the benchmark service can continue evaluation without recreating the original agent sandbox.
 
@@ -406,8 +410,8 @@ result = await client.run_with_sandbox_recovery(
 
 Pydantic models used across requests and responses:
 
-- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, optional `generation_containment`, `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
-- **`GenerationContainment`** — task-declared `type="linux_pid_namespace", version=1` for controlled Daytona generation; omission (`None`) preserves the ordinary generation path. The caller selects and probes a matching sandbox and uses its `ControlledWorkload` API; this field alone does not launch or enforce containment.
+- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `credited_generation` (default `false`; explicit task opt-in to credited timing), `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
+- **`GenerationContainment`** — sandbox-provider capability `type="linux_pid_namespace", version=1` for direct Daytona controlled workloads, not a task selection field. A caller using that capability probes the sandbox and uses its `ControlledWorkload` API; other sandbox providers retain their normal execution paths.
 - **`agent_install_order`** — `"before_setup"` installs agent dependencies before benchmark setup; `"after_setup"` lets setup prepare the environment first. It defaults to `"before_setup"`, so older task responses remain valid; lifecycle execution is the caller's responsibility.
 - **`BenchmarkEgressPlan`** — declarative `setup_task`, agent `run`, and `evaluation` policies. `"*"` is unrestricted, `[]` is deny-all, and a non-empty list is an allowlist. Setup and evaluation default to `"*"`; `run=None` means the benchmark has no run-policy opinion, preserving legacy task behavior. Applying and composing the plan is the caller's responsibility.
 - **`SandboxRecoveryPolicy`** — explicit opt-in to recreate a lost generation sandbox with the same run identity and volumes; `max_sandbox_attempts` (2–20, inclusive) includes the initial sandbox

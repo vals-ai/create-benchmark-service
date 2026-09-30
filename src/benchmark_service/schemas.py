@@ -12,7 +12,6 @@ from benchmark_service.sandbox.types import (
     BaseSandboxSource,
     ComposeSource,
     ImageSource,
-    GenerationContainment,
     Resources,
     SandboxSource,
     SnapshotSource,
@@ -212,9 +211,9 @@ class RetrieveTaskResponse(BaseModel):
     agent_timeout: float | None = Field(
         default=None, description="Agent execution max time in seconds (None for no timeout)"
     )
-    generation_containment: GenerationContainment | None = Field(
-        default=None,
-        description="Generation workload containment required by this task runtime",
+    credited_generation: bool = Field(
+        default=False,
+        description="Opt in to credited generation timing; omitted or false preserves ordinary task execution",
     )
     resources: Resources = Field(description="Computational resources needed")
     agent_install_order: AgentInstallOrder = Field(

@@ -66,27 +66,6 @@ def _task_response(max_sandbox_attempts: int | None = None) -> RetrieveTaskRespo
     )
 
 
-def test_retrieve_task_response_defaults_generation_containment_to_none() -> None:
-    response = _task_response()
-
-    assert response.generation_containment is None
-
-
-def test_retrieve_task_response_round_trips_generation_containment() -> None:
-    response = _task_response()
-    payload = response.model_dump()
-    payload["generation_containment"] = {"type": "linux_pid_namespace", "version": 1}
-
-    parsed = RetrieveTaskResponse.model_validate(payload)
-
-    assert parsed.generation_containment == GenerationContainment(
-        type="linux_pid_namespace", version=1
-    )
-    assert parsed.model_dump()["generation_containment"] == {
-        "type": "linux_pid_namespace",
-        "version": 1,
-    }
-
 @pytest.mark.parametrize("version", [0, True, "1"])
 def test_generation_containment_requires_positive_integer_version(version: object) -> None:
     with pytest.raises(ValidationError):
@@ -125,7 +104,21 @@ async def test_retrieve_task_accepts_legacy_shape(
     assert result.model_dump()["docker_image"] == "python:3.12"
     assert result.resources.model_dump() == {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None}
     assert result.agent_install_order == "before_setup"
+    assert result.credited_generation is False
     assert result.egress.model_dump() == {"setup_task": "*", "run": None, "evaluation": "*"}
+
+
+async def test_retrieve_task_accepts_credited_generation_opt_in(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    payload = _task_response().model_dump(mode="json")
+    payload["credited_generation"] = True
+    mock_http.get = AsyncMock(return_value=_mock_response(json_data=payload))
+
+    result = await client.retrieve_task("task-1")
+
+    assert result.credited_generation is True
 
 
 async def test_retrieve_task_accepts_explicit_agent_install_order(

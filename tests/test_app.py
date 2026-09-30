@@ -125,6 +125,27 @@ def test_retrieve_task(client: TestClient) -> None:
     assert data["docker_image"] == "python:3.12-slim"
     assert data["agent_install_order"] == "before_setup"
     assert data["egress"] == {"setup_task": "*", "run": None, "evaluation": "*"}
+    assert data["credited_generation"] is False
+
+
+def test_retrieve_task_credited_generation_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    class CreditedBenchmark(StubBenchmark):
+        async def retrieve_task(
+            self,
+            task_id: str,
+            skip_validation: bool = False,
+            dataset: str | None = None,
+        ) -> RetrieveTaskResponse:
+            response = await super().retrieve_task(task_id, skip_validation, dataset)
+            return response.model_copy(update={"credited_generation": True})
+
+    monkeypatch.delenv("AUTH_REQUIRED", raising=False)
+    with TestClient(BenchmarkServiceApp(CreditedBenchmark)) as client:
+        response = client.get("/retrieve-task/", params={"task_id": "task-1"})
+
+    assert response.status_code == 200
+    assert response.json()["credited_generation"] is True
+
 
 
 def test_retrieve_task_explicit_agent_install_order(monkeypatch: pytest.MonkeyPatch) -> None:

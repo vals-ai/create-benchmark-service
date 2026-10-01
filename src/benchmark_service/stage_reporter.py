@@ -33,8 +33,8 @@ class StageReporter:
             {"seq": self._seq, "event": event, "container": container},
             separators=(",", ":"),
         ).encode("ascii")
-        mac = hmac.new(self._key, payload, hashlib.sha256).hexdigest()
         frame = base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+        mac = hmac.new(self._key, frame.encode("ascii"), hashlib.sha256).hexdigest()
         print(f"VALKYRIE-STAGE/1 {frame} {mac}", file=sys.stdout, flush=True)
         ack = self._stage_dir / "ack" / str(self._seq)
         while not ack.exists():

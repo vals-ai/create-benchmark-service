@@ -231,8 +231,8 @@ evaluation or the next round. `container` is the Docker container name, or `None
 workload in the outer agent-command process tree. Frames are exactly
 `VALKYRIE-STAGE/1 <payload> <mac>\n`, where `payload` is unpadded base64url of compact
 ASCII JSON `{"seq":<int>,"event":"begin"|"end","container":<str|null>}`;
-`mac` is lowercase hex HMAC-SHA256 over the payload's ASCII bytes, keyed by the
-32 bytes decoded from `key`. Sequences start at 1, increment by 1, and alternate
+`mac` is lowercase hex HMAC-SHA256 over the base64url payload token's ASCII bytes,
+keyed by the 32 bytes decoded from `key`. Sequences start at 1, increment by 1, and alternate
 odd `begin` / even `end`. After applying each transition, Tracker publishes
 `ack/<seq>` atomically; the reporter polls at 100 ms with no timeout. Tracker
 reassembles lines across output chunks; text from the agent is never a stage event.

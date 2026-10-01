@@ -228,8 +228,9 @@ stage protocol.
 before launching that model-capable container. `end()` reports the same container only
 after confirmed absence of the container and its nested workload; it blocks until ACK before
 evaluation or the next round. `container` is the Docker container name, or `None` for a
-workload in the outer agent-command process tree. Frames are exactly
-`VALKYRIE-STAGE/1 <payload> <mac>\n`, where `payload` is unpadded base64url of compact
+workload in the outer agent-command process tree. To separate a frame from preceding output
+without a final newline, the reporter emits `\nVALKYRIE-STAGE/1 <payload> <mac>\n`;
+the stage frame itself is `VALKYRIE-STAGE/1 <payload> <mac>\n`, where `payload` is unpadded base64url of compact
 ASCII JSON `{"seq":<int>,"event":"begin"|"end","container":<str|null>}`;
 `mac` is lowercase hex HMAC-SHA256 over the base64url payload token's ASCII bytes,
 keyed by the 32 bytes decoded from `key`. Sequences start at 1, increment by 1, and alternate

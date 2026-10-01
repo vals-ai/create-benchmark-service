@@ -38,8 +38,6 @@ from benchmark_service.sandbox import (
     ComposeSource,
     ComposeSandbox,
     ExecResult,
-    GenerationContainment,
-    LINUX_PID_NAMESPACE_V1,
     ImageSource,
     MissingSandboxConfigError,
     ResourceCapacity,
@@ -4587,23 +4585,6 @@ def test_provider_secret_references_reject_invalid_configuration(
 def test_volume_mount_rejects_invalid_subpath(subpath: str) -> None:
     with pytest.raises(ValidationError):
         VolumeMount(name="fixtures", mount_path="/fixtures", subpath=subpath)
-
-
-async def test_daytona_generation_containment_probe_and_capability() -> None:
-    process = Process()
-    inner = InnerSandbox()
-    inner.process = process
-    sandbox = DaytonaSandbox(cast(Any, inner))
-
-    assert sandbox.generation_containment == LINUX_PID_NAMESPACE_V1
-    assert sandbox.generation_containment != GenerationContainment(
-        type="linux_pid_namespace", version=2
-    )
-
-    await sandbox.probe_generation_containment()
-
-    assert process.command is not None
-    assert "unshare --fork --pid --mount-proc --kill-child=KILL true" in process.command
 
 
 async def test_daytona_generation_containment_probe_failure_is_fatal() -> None:

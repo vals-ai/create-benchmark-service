@@ -7,6 +7,7 @@ import asyncio
 import httpx
 import pytest
 from benchmark_service.vals.allowlist import (
+    CatalogUnavailable,
     CatalogAllowlistClient,
     TenantConfig,
 )
@@ -136,7 +137,8 @@ async def test_transport_and_decode_failures_are_not_cached() -> None:
     )
     client = CatalogAllowlistClient("https://catalog.example.test", "example-service", transport=transport)
 
-    assert await client.get_tenant_config("key-acme", "acme") is None
+    with pytest.raises(CatalogUnavailable):
+        await client.get_tenant_config("key-acme", "acme")
     assert await client.get_tenant_config("key-acme", "acme") is not None
     assert len(requests) == 3
 
@@ -144,9 +146,8 @@ async def test_transport_and_decode_failures_are_not_cached() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure",
-    [
-        _response({}, status_code=status) for status in (408, 429, 500, 502, 503, 504)
-    ] + [httpx.ConnectError("unavailable"), httpx.ReadTimeout("timed out"), httpx.RemoteProtocolError("closed")],
+    [_response({}, status_code=status) for status in (408, 429, 500, 502, 503, 504)]
+    + [httpx.ConnectError("unavailable"), httpx.ReadTimeout("timed out"), httpx.RemoteProtocolError("closed")],
 )
 async def test_transient_failure_is_retried_and_success_cached(failure: httpx.Response | Exception) -> None:
     transport, requests = _transport(
@@ -185,7 +186,8 @@ async def test_exhausted_retries_do_not_reuse_expired_policy_or_cache_failure() 
 
     assert await client.get_tenant_config("key-acme", "acme") is not None
     clock[0] = 301.0
-    assert await client.get_tenant_config("key-acme", "acme") is None
+    with pytest.raises(CatalogUnavailable):
+        await client.get_tenant_config("key-acme", "acme")
     assert len(requests) == 4
     assert await client.get_tenant_config("key-acme", "acme") is not None
     assert len(requests) == 5
@@ -201,7 +203,8 @@ async def test_request_deadline_bounds_the_whole_lookup() -> None:
     client = CatalogAllowlistClient(
         "https://catalog.example.test", "example-service", transport=httpx.MockTransport(handler), timeout=0.01
     )
-    assert await asyncio.wait_for(client.get_tenant_config("key-acme", "acme"), timeout=1) is None
+    with pytest.raises(CatalogUnavailable):
+        await asyncio.wait_for(client.get_tenant_config("key-acme", "acme"), timeout=1)
     await client.aclose()
 
 
@@ -261,7 +264,8 @@ async def test_invalid_policy_is_rejected(payload: object) -> None:
     transport, requests = _transport([_response(payload)])
     client = CatalogAllowlistClient("https://catalog.example.test", "example-service", transport=transport)
 
-    assert await client.get_tenant_config("key-acme", "acme") is None
+    with pytest.raises(CatalogUnavailable):
+        await client.get_tenant_config("key-acme", "acme")
     assert len(requests) == 1
 
 

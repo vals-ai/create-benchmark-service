@@ -391,6 +391,7 @@ class TestAuthMiddleware:
     @pytest.fixture
     def auth_client(self, monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
         monkeypatch.setenv("AUTH_REQUIRED", "true")
+
         class AuthBenchmark(StubBenchmark):
             async def resolve_tenant(self, headers: dict[str, str]) -> str | None:
                 if headers.get("authorization") != TestAuthMiddleware.AUTH_TOKEN:
@@ -476,7 +477,9 @@ class TestUnconfiguredAuth:
         assert client.get("/health").status_code == 200
 
     def test_auth_disabled_cannot_bypass_required_auth(
-        self, monkeypatch: pytest.MonkeyPatch, client: TestClient,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        client: TestClient,
     ) -> None:
         monkeypatch.setenv("AUTH_DISABLED", "true")
         assert client.get("/verify-task-ids").status_code == 401
@@ -740,9 +743,7 @@ def test_core_app_ignores_hosted_policy_configuration(monkeypatch: pytest.Monkey
 
     with TestClient(BenchmarkServiceApp(StubBenchmark)) as client:
         assert client.get("/verify-task-ids").status_code == 200
-        response = client.post(
-            "/v1/score", json={"run_id": "local-run", "evaluation_results": {}}
-        )
+        response = client.post("/v1/score", json={"run_id": "local-run", "evaluation_results": {}})
         assert response.status_code == 404
 
 
@@ -769,3 +770,23 @@ def test_core_app_does_not_expose_provider_routes(client: TestClient, method: st
 async def test_core_dataset_access_does_not_depend_on_hosted_allowlist() -> None:
     service = await StubBenchmark.create()
     assert await service.check_dataset_access("custom-tenant", "default") is True
+
+
+def test_catalog_outage_does_not_report_invalid_credentials(monkeypatch: pytest.MonkeyPatch) -> None:
+    from benchmark_service.vals.allowlist import CatalogUnavailable
+
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
+
+    class UnavailableBenchmark(StubBenchmark):
+        async def resolve_tenant(self, headers: Mapping[str, str]) -> str | None:
+            raise CatalogUnavailable("catalog unavailable")
+
+    with TestClient(BenchmarkServiceApp(UnavailableBenchmark)) as client:
+        response = client.get("/verify-task-ids")
+        assert response.status_code == 503
+        assert response.headers["Retry-After"] == "1"
+        for path in ["/ws/setup-task", "/ws/evaluate-instance"]:
+            with client.websocket_connect(path) as websocket:
+                with pytest.raises(WebSocketDisconnect) as error:
+                    websocket.receive_json()
+            assert error.value.code == 1013

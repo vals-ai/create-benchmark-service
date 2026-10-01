@@ -199,12 +199,65 @@ Run the local provider checks:
 DOCKER_HOST=unix:///var/run/docker.sock \
   uv run pytest tests/integration/test_docker_sandbox.py
 ```
+
 #### Controlled generation workloads
 
-`RetrieveTaskResponse.credited_generation` opts a task into credited generation timing independently of
-`agent_timeout`. It defaults to `false`; omitted and false keep the legacy execution path for
-every benchmark service. A true value selects accounting by the caller, not a sandbox capability:
-the benchmark does not prescribe a containment provider or an agent interface.
+```python
+from benchmark_service import CreditedGeneration
+
+credited_generation = CreditedGeneration(allowance_seconds=5 * 60 * 60, stage_protocol="valkyrie-stage/1")
+```
+
+`RetrieveTaskResponse.credited_generation` is `None` by default (ordinary execution).
+Opt-in supplies the positive, finite base allowance `B` in seconds; `agent_timeout` remains
+published envelope metadata, not this budget. `stage_protocol=None` charges the whole agent
+command as one generation interval. `"valkyrie-stage/1"` selects benchmark-owned interval reports;
+Tracker alone arbitrates the cumulative `B + C` budget across intervals, while setup, evaluation,
+and gaps between intervals do not debit it. This does not select a containment provider.
+
+For reporting benchmarks, Tracker gives the outer agent-command process
+`VALKYRIE_STAGE_DIR=/run/valkyrie-stage`. The sandbox-private directory contains a 64-hex-character
+`key` and an initially empty `ack/` directory. During `setup_task`, upload the bytes from
+`benchmark_service.stage_reporter_source()` as `stage_reporter.py` and import `StageReporter`
+from that standalone file inside the benchmark-owned supervisor. Keep the key, directory,
+ACK path and environment variable invisible to every model-capable workload: do not mount
+or pass them into nested generation containers. If they cannot be isolated, do not use this
+stage protocol.
+
+`StageReporter().begin(container)` flushes one stdout frame and blocks until Tracker ACKs,
+before launching that model-capable container. `end()` reports the same container only
+after confirmed absence of the container and its nested workload; it blocks until ACK before
+evaluation or the next round. `container` is the Docker container name, or `None` for a
+workload in the outer agent-command process tree. Frames are exactly
+`VALKYRIE-STAGE/1 <payload> <mac>\n`, where `payload` is unpadded base64url of compact
+ASCII JSON `{"seq":<int>,"event":"begin"|"end","container":<str|null>}`;
+`mac` is lowercase hex HMAC-SHA256 over the payload's ASCII bytes, keyed by the
+32 bytes decoded from `key`. Sequences start at 1, increment by 1, and alternate
+odd `begin` / even `end`. After applying each transition, Tracker publishes
+`ack/<seq>` atomically; the reporter polls at 100 ms with no timeout. Tracker
+reassembles lines across output chunks; text from the agent is never a stage event.
+
+For a VCB 1→100-style supervisor running multiple Docker-backed rounds within one agent
+command (illustrative, not a migration of VCB):
+
+```python
+import subprocess
+from stage_reporter import StageReporter
+
+reporter = StageReporter()
+for round_number in range(1, 11):
+    container = f"generation-{round_number}"
+    reporter.begin(container)  # Tracker ACK arrives before Docker starts.
+    subprocess.run(["docker", "run", "--name", container, "benchmark-image", "generate"], check=True)
+    subprocess.run(["docker", "rm", "-f", container], check=True)
+    assert subprocess.run(["docker", "inspect", container], capture_output=True).returncode != 0
+    reporter.end()  # Only after confirmed absence; await ACK before evaluation or next round.
+    evaluate_round(round_number)
+```
+
+On failure, do not assert an END without proof of absence. Tracker owns timeout and terminal
+cleanup, including nested container inspection on abort. Neither model output nor benchmark
+code may assert a generation credit.
 
 For a caller using direct Daytona controlled workloads, `GenerationContainment` describes the
 provider's `linux_pid_namespace` v1 capability (exported as `LINUX_PID_NAMESPACE_V1`). Check
@@ -410,7 +463,7 @@ result = await client.run_with_sandbox_recovery(
 
 Pydantic models used across requests and responses:
 
-- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, `credited_generation` (default `false`; explicit task opt-in to credited timing), `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
+- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, optional `CreditedGeneration(allowance_seconds, stage_protocol)`, `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
 - **`GenerationContainment`** — sandbox-provider capability `type="linux_pid_namespace", version=1` for direct Daytona controlled workloads, not a task selection field. A caller using that capability probes the sandbox and uses its `ControlledWorkload` API; other sandbox providers retain their normal execution paths.
 - **`agent_install_order`** — `"before_setup"` installs agent dependencies before benchmark setup; `"after_setup"` lets setup prepare the environment first. It defaults to `"before_setup"`, so older task responses remain valid; lifecycle execution is the caller's responsibility.
 - **`BenchmarkEgressPlan`** — declarative `setup_task`, agent `run`, and `evaluation` policies. `"*"` is unrestricted, `[]` is deny-all, and a non-empty list is an allowlist. Setup and evaluation default to `"*"`; `run=None` means the benchmark has no run-policy opinion, preserving legacy task behavior. Applying and composing the plan is the caller's responsibility.

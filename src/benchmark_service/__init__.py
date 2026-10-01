@@ -49,6 +49,7 @@ from benchmark_service.sandbox import (
 from benchmark_service.schemas import (
     DATASET_VERSION_HEADER,
     ArtifactGradingSubmission,
+    CreditedGeneration,
     DatasetVersion,
     ResolveDatasetRequest,
     ResolveDatasetResponse,
@@ -59,9 +60,11 @@ from benchmark_service.schemas import (
     SubmissionArtifactReference,
     TextGradingSubmission,
 )
+from benchmark_service.stage_reporter import StageReporter, stage_reporter_source
 
 __all__ = [
     "DATASET_VERSION_HEADER",
+    "CreditedGeneration",
     "DatasetVersion",
     "ResolveDatasetRequest",
     "ResolveDatasetResponse",
@@ -109,6 +112,8 @@ __all__ = [
     "SandboxRecoveryPolicy",
     "SandboxSource",
     "SnapshotSource",
+    "StageReporter",
+    "stage_reporter_source",
     "SubmissionArtifactReference",
     "TargetedSnapshotSource",
     "TextGradingSubmission",

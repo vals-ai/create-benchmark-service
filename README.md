@@ -218,7 +218,7 @@ and gaps between intervals do not debit it. This does not select a containment p
 For reporting benchmarks, Tracker gives the outer agent-command process
 `VALKYRIE_STAGE_DIR=/run/valkyrie-stage`. The sandbox-private directory contains a 64-hex-character
 `key` and an initially empty `ack/` directory. During `setup_task`, upload the bytes from
-`benchmark_service.stage_reporter_source()` as `stage_reporter.py` and import `StageReporter`
+`benchmark_service.valkyrie_stage_source()` as `valkyrie_stage.py` and import `StageReporter`
 from that standalone file inside the benchmark-owned supervisor. Keep the key, directory,
 ACK path and environment variable invisible to every model-capable workload: do not mount
 or pass them into nested generation containers. If they cannot be isolated, do not use this
@@ -243,7 +243,7 @@ command (illustrative, not a migration of VCB):
 
 ```python
 import subprocess
-from stage_reporter import StageReporter
+from valkyrie_stage import StageReporter
 
 reporter = StageReporter()
 for round_number in range(1, 11):
@@ -259,6 +259,36 @@ for round_number in range(1, 11):
 On failure, do not assert an END without proof of absence. Tracker owns timeout and terminal
 cleanup, including nested container inspection on abort. Neither model output nor benchmark
 code may assert a generation credit.
+
+An opt-in episode declares `RetrieveTaskResponse.episode = Episode(command="exec python /opt/bench/orchestrator.py", parallel_agents=5)`.
+It requires `credited_generation` with `stage_protocol="valkyrie-stage/1"`; without `episode`, ordinary task execution is unchanged.
+Tracker runs the benchmark-owned `episode.command` instead of the agent command and writes the selected agent bundle to
+`$VALKYRIE_STAGE_DIR/agent.json` after setup: `run_cmd`, `turns` (`continue_cmd`, `interrupt_grace_seconds`,
+`container_name`), `parallel_agents`, and `slots_root`. The library reads this file, owns a single `StageReporter`, and
+starts each selected-agent turn in a new process group. The bundle renders `{problem_statement_path}` to that turn's
+observation file, `{slot_dir}` to `<slots_root>/<slot>`, and `{container_name}` to `container_name` with `{slot}`
+filled first. The orchestrator names slots and shares one workspace and budget across them; each slot has separate
+runtime/session/output state. More than `parallel_agents` live turns are refused. A second turn on a slot requires
+`continue_cmd`. Children inherit the orchestrator's cwd, environment, stdout and stderr.
+
+Upload `valkyrie_stage_source()` as `valkyrie_stage.py` during setup and import `Agents` there:
+
+```python
+from valkyrie_stage import Agents, Exhausted
+
+agents = Agents()
+agents.start("first", "/workspace/observations/first.txt")
+result = agents.wait_any()  # SlotResult(slot, reason, exit_code)
+agents.start("first", "/workspace/observations/next.txt")  # Requires continue_cmd.
+result = agents.stop("first")  # SIGINT grace, then SIGKILL and confirmed absence.
+```
+
+`start` reports BEGIN and waits for ACK before spawning the first slot; the last slot completes only after its
+process group is empty, any named Docker container has been removed and listed absent, and END is ACKed. Overlapping
+slots count as one union interval. `stop` returns reason `stopped`; `wait_any` returns `exited` or `exhausted` as
+appropriate. Tracker writes `$VALKYRIE_STAGE_DIR/exhausted` before its ACK when the shared budget expires. The
+library kills all running groups, completes their cleanup and END, and later `start` raises `Exhausted`. If the
+notice arrives with BEGIN ACK, no child starts and no END is sent.
 
 For a caller using direct Daytona controlled workloads, `GenerationContainment` describes the
 provider's `linux_pid_namespace` v1 capability (exported as `LINUX_PID_NAMESPACE_V1`). Check
@@ -464,7 +494,7 @@ result = await client.run_with_sandbox_recovery(
 
 Pydantic models used across requests and responses:
 
-- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, optional `CreditedGeneration(allowance_seconds, stage_protocol)`, `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
+- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, optional `CreditedGeneration(allowance_seconds, stage_protocol)`, optional `Episode(command, parallel_agents)`, `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
 - **`GenerationContainment`** — sandbox-provider capability `type="linux_pid_namespace", version=1` for direct Daytona controlled workloads, not a task selection field. A caller using that capability probes the sandbox and uses its `ControlledWorkload` API; other sandbox providers retain their normal execution paths.
 - **`agent_install_order`** — `"before_setup"` installs agent dependencies before benchmark setup; `"after_setup"` lets setup prepare the environment first. It defaults to `"before_setup"`, so older task responses remain valid; lifecycle execution is the caller's responsibility.
 - **`BenchmarkEgressPlan`** — declarative `setup_task`, agent `run`, and `evaluation` policies. `"*"` is unrestricted, `[]` is deny-all, and a non-empty list is an allowlist. Setup and evaluation default to `"*"`; `run=None` means the benchmark has no run-policy opinion, preserving legacy task behavior. Applying and composing the plan is the caller's responsibility.

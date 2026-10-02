@@ -1,5 +1,7 @@
 """Standalone stage reporting and episode agent orchestration for sandbox upload."""
 
+from __future__ import annotations
+
 import base64
 import ctypes
 import hashlib
@@ -64,6 +66,7 @@ class SlotResult:
 class _RunningSlot:
     process: subprocess.Popen[bytes]
     container: str | None
+    final_output: Path | None
 
 
 class Agents:
@@ -76,7 +79,7 @@ class Agents:
         self._continue_cmd: str | None = config["continue_cmd"]
         self._interrupt_grace_seconds: float | None = config["interrupt_grace_seconds"]
         self._container_template: str | None = config["container_name"]
-        self._final_output: Path | None = Path(config["final_output"]) if config["final_output"] is not None else None
+        self._final_output_template: str | None = config["final_output"]
         self._parallel_agents: int = config["parallel_agents"]
         self._slots_root = Path(config["slots_root"])
         if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) != 0:
@@ -115,13 +118,18 @@ class Agents:
             slot_dir=slot_dir,
             container_name=container,
         )
+        final_output = (
+            Path(self._final_output_template.format(slot_dir=slot_dir))
+            if self._final_output_template is not None
+            else None
+        )
         if not self._active:
             self._reporter.begin(container)
             if (self._stage_dir / "exhausted").exists():
                 self._exhausted = True
                 raise Exhausted
         process = subprocess.Popen(["sh", "-c", command], start_new_session=True)
-        self._active[slot] = _RunningSlot(process, container)
+        self._active[slot] = _RunningSlot(process, container, final_output)
         self._turns[slot] = self._turns.get(slot, 0) + 1
 
     def stop(self, slot: str) -> SlotResult:
@@ -219,14 +227,14 @@ class Agents:
             if (self._stage_dir / "exhausted").exists():
                 self._exhausted = True
 
-        if self._final_output is not None and self._final_output.exists():
+        if running.final_output is not None and running.final_output.exists():
             turn_dir = self._slots_root / slot / "turns" / str(self._turns[slot])
             turn_dir.parent.mkdir(parents=True, exist_ok=True)
-            if self._final_output.is_dir():
-                shutil.copytree(self._final_output, turn_dir)
+            if running.final_output.is_dir():
+                shutil.copytree(running.final_output, turn_dir)
             else:
                 turn_dir.mkdir()
-                shutil.copy2(self._final_output, turn_dir / self._final_output.name)
+                shutil.copy2(running.final_output, turn_dir / running.final_output.name)
         self._finished.append(SlotResult(slot, reason, exit_code))
 
     def _take(self, slot: str) -> SlotResult:

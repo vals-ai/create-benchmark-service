@@ -272,9 +272,11 @@ runtime/session/output state. More than `parallel_agents` live turns are refused
 `continue_cmd`. Children inherit the orchestrator's cwd, environment, stdout and stderr. After a turn's
 process group and any container are absent, the last active turn sends END and waits for its ACK before copying
 the bundle's existing `final_output` file or directory into `<slot_dir>/turns/<n>/`. A file keeps its basename;
-`n` starts at 1 per slot. Tracker archives `slots_root` as the episode output, keeping every turn distinct.
+`n` starts at 1 per slot. `final_output` may contain `{slot_dir}` and is rendered for each slot before launch;
+Tracker requires that placeholder when `parallel_agents > 1` and `final_output` is set, so parallel slots do not
+snapshot the same path. Tracker archives `slots_root` as the episode output, keeping every turn distinct.
 
-Upload `valkyrie_stage_source()` as `valkyrie_stage.py` during setup and import `Agents` there:
+Upload `valkyrie_stage_source()` as `valkyrie_stage.py` during setup and import `Agents` there with Python 3.8+:
 
 ```python
 from valkyrie_stage import Agents, Exhausted

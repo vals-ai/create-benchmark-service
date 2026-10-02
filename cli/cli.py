@@ -1,8 +1,12 @@
 """CLI entry point for create-benchmark-service."""
 
+import asyncio
+from importlib import import_module
 from pathlib import Path
 
 import click
+
+from benchmark_service.base import BenchmarkService
 
 from .generator import generate_project, transform_name
 
@@ -31,6 +35,30 @@ def main(benchmark_name: str, template: str) -> None:
     except (ValueError, FileExistsError) as e:
         print(f"Error: {e}")
         raise click.Abort()
+
+
+@click.group()
+def service() -> None:
+    """Run benchmark service commands."""
+
+
+@service.command("export-dataset")
+@click.option("--service", "service_path", required=True, help="Service class as module:ClassName.")
+@click.option("--dataset", required=True)
+@click.option("--out", "out_dir", required=True, type=click.Path(path_type=Path, file_okay=False))
+def export_dataset(service_path: str, dataset: str, out_dir: Path) -> None:
+    """Export a dataset into the vals-datasets layout."""
+    module_name, class_name = service_path.split(":")
+    cls = getattr(import_module(module_name), class_name)
+    assert issubclass(cls, BenchmarkService), "Service must inherit BenchmarkService"
+
+    async def export() -> bool:
+        instance = await cls.create()
+        out_dir.mkdir(parents=True, exist_ok=True)
+        return await instance.export_dataset(dataset, out_dir)
+
+    if not asyncio.run(export()):
+        raise click.exceptions.Exit(3)
 
 
 if __name__ == "__main__":

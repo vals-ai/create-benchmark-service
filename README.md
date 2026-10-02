@@ -105,6 +105,30 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 
 **Dispatch order.** Task order within a dataset is the order the tracker dispatches tasks in (task rows are created in `filter_tasks` order, and `?slice=` slices that same order). Set the `priority_dataset` class attribute (e.g. `priority_dataset = "vals_index"`) to stably move the tasks a dataset shares with that subset to its front, so a run of a full split finishes the index subset before the long tail. `create()` fails if the named dataset is not loaded.
 
+### Dataset export
+
+Services opt in by overriding `export_dataset`. The default returns `False`.
+For Harbor tasks, store task directories as `Path` values in `self.datasets`:
+
+```python
+from pathlib import Path
+from benchmark_service import BenchmarkService, write_harbor_split
+
+class MyBenchmark(BenchmarkService):
+    async def export_dataset(self, dataset: str, out_dir: Path) -> bool:
+        write_harbor_split(self.datasets[dataset], "validation", out_dir)
+        return True
+```
+
+Keep the other required service methods in your subclass. The helper copies
+tasks to `splits/<split>/<task-id>/` and preserves file modes. It rejects
+symlinks, invalid IDs, missing files, invalid UTF-8 TOML, and empty instructions.
+
+Run `benchmark-service export-dataset --service my_service:MyBenchmark --dataset validation --out ./export`.
+The command calls `create()` to load datasets first. Exit code `0` means the
+dataset was exported. Exit code `3` means the service does not export it.
+Other exit codes indicate an error. The command does not publish the dataset.
+
 ### FastAPI application factory (`app.py`)
 
 `BenchmarkServiceApp(service_cls)` wraps your `BenchmarkService` subclass in a fully configured FastAPI app. Pass your subclass and run the result with any ASGI server.

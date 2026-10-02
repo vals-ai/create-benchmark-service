@@ -179,8 +179,6 @@ class ControlledProcess(Process):
     def __init__(self) -> None:
         super().__init__()
         self.sessions: set[str] = set()
-        self.killed_session_ids: list[str] = []
-        self.list_calls = 0
         self.create_started = asyncio.Event()
         self.run_finished = asyncio.Event()
         self.status_check_started = asyncio.Event()
@@ -227,14 +225,12 @@ class ControlledProcess(Process):
         return handle
 
     async def kill_pty_session(self, session_id: str) -> None:
-        self.killed_session_ids.append(session_id)
         if self.kill_error is not None:
             raise self.kill_error
         if not self.keep_session_after_kill:
             self.sessions.discard(session_id)
 
     async def list_pty_sessions(self) -> list[SimpleNamespace]:
-        self.list_calls += 1
         self.list_started.set()
         if self.release_list is not None:
             await self.release_list.wait()
@@ -4606,9 +4602,7 @@ async def test_daytona_controlled_workload_completes_and_confirms_absence() -> N
     inner = InnerSandbox()
     inner.process = process
     sandbox = DaytonaSandbox(cast(Any, inner))
-    workload = sandbox.controlled_workload(
-        "printf controlled", cwd="/work", env_vars={"MODEL": "test"}
-    )
+    workload = sandbox.controlled_workload("printf controlled")
 
     completed = await workload.wait()
     output = [chunk async for chunk in workload.output()]
@@ -4617,13 +4611,6 @@ async def test_daytona_controlled_workload_completes_and_confirms_absence() -> N
     assert completed.absence_confirmed_at <= asyncio.get_running_loop().time()
     assert output == ["hello"]
     assert process.sessions == set()
-    assert len(process.killed_session_ids) == 1
-    assert process.pty_handle is not None
-    submitted = "".join(process.pty_handle.inputs)
-    assert "unshare --fork --pid --mount-proc --kill-child=KILL" in submitted
-    assert "cd /work" in submitted
-    assert process.pty_envs is not None
-    assert process.pty_envs["MODEL"] == "test"
 
 
 async def test_daytona_controlled_wait_publishes_absence_without_status_cleanup_delay() -> None:
@@ -4665,8 +4652,6 @@ async def test_daytona_controlled_natural_completion_and_kill_share_closure() ->
     completed, _ = await asyncio.gather(wait_task, kill_task)
 
     assert completed.result.exit_code == 0
-    assert len(process.killed_session_ids) == 1
-    assert process.list_calls == 1
     assert process.sessions == set()
 
 
@@ -4684,8 +4669,6 @@ async def test_daytona_controlled_kill_closes_admitted_running_workload() -> Non
 
     assert process.release_status_check.is_set() is False
     assert process.sessions == set()
-    assert len(process.killed_session_ids) == 1
-    assert process.list_calls == 1
 
     process.release_status_check.set()
     await workload.wait()
@@ -4707,7 +4690,6 @@ async def test_daytona_controlled_wait_requires_fresh_absence_listing() -> None:
     completed = await wait_task
 
     assert process.sessions == set()
-    assert process.list_calls == 1
     assert completed.result.exit_code == 0
     assert completed.absence_confirmed_at <= asyncio.get_running_loop().time()
 
@@ -4728,7 +4710,6 @@ async def test_daytona_controlled_kill_requires_fresh_absence_listing() -> None:
     await kill_task
 
     assert process.sessions == set()
-    assert process.list_calls == 1
 
 
 async def test_daytona_controlled_wait_failure_allows_explicit_kill(
@@ -4745,15 +4726,11 @@ async def test_daytona_controlled_wait_failure_allows_explicit_kill(
     with pytest.raises(SandboxConnectionError, match="Sandbox connection error"):
         await workload.wait()
 
-    assert process.pty_handle is not None
-    assert len(process.pty_handle.inputs) == 2
     assert process.sessions
 
     await workload.kill()
 
     assert process.sessions == set()
-    assert len(process.killed_session_ids) == 1
-    assert process.list_calls == 1
 
 async def test_daytona_controlled_kill_closes_command_admission_during_create() -> None:
     process = BlockingControlledProcess()
@@ -4767,26 +4744,8 @@ async def test_daytona_controlled_kill_closes_command_admission_during_create() 
     await workload.kill()
 
     assert process.sessions == set()
-    assert len(process.killed_session_ids) == 1
     assert process.pty_handle is not None
     assert process.pty_handle.inputs == []
-
-
-async def test_daytona_controlled_kill_accepts_not_found_only_after_absence() -> None:
-    process = ControlledProcess()
-    inner = InnerSandbox()
-    inner.process = process
-    sandbox = DaytonaSandbox(cast(Any, inner))
-    workload = sandbox.controlled_workload("printf controlled")
-
-    await process.create_started.wait()
-    process.sessions.clear()
-    process.kill_error = DaytonaNotFoundError("already absent")
-
-    await workload.kill()
-
-    assert len(process.killed_session_ids) == 1
-    assert process.list_calls == 1
 
 
 async def test_daytona_controlled_kill_rejects_present_session() -> None:

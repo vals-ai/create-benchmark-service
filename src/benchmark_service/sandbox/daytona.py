@@ -23,6 +23,7 @@ from daytona import (
     DaytonaNotFoundError,
     ListSandboxesQuery,
     SandboxState,
+    SessionExecuteRequest,
 )
 from daytona_api_client_async import (
     ApiClient as DaytonaApiClient,
@@ -107,6 +108,7 @@ _SOURCE_NAMES: Mapping[str | None, str] = {
 _PTY_STATUS_CHECK_ATTEMPTS = 30
 _PTY_STATUS_POLL_SECONDS = 30
 _PTY_STDOUT_TAIL_MAX_BYTES = 64 * 1024
+_SESSION_WATCH_REOPEN_SECONDS = 10
 _PTY_CREATE_MARKER_ENV = "_CBS_PTY_CREATE_MARKER"
 _PTY_ROWS = 24
 _PTY_COLS = 80
@@ -973,6 +975,10 @@ class DaytonaSandbox(Sandbox):
 
     @_PROVIDER_RETRY
     async def _check_sandbox_alive(self) -> None:
+        await self._check_sandbox_alive_once()
+
+    async def _check_sandbox_alive_once(self) -> None:
+        """Probe liveness once for controlled workload operations."""
         try:
             await _bounded("refresh_data", self._sandbox.refresh_data(), _TOOLBOX_CALL_TIMEOUT_SECONDS)
         except _SANDBOX_OPERATION_ERRORS as exc:
@@ -984,6 +990,112 @@ class DaytonaSandbox(Sandbox):
             raise SandboxError(f"Sandbox is not running: {self._sandbox_ref}, state={self.state}.")
 
 
+async def _raise_if_sandbox_gone(sandbox: DaytonaSandbox) -> None:
+    """Surface only a deleted sandbox; every other watch failure is retried."""
+    try:
+        await sandbox._check_sandbox_alive_once()  # pyright: ignore[reportPrivateUsage]
+    except SandboxNotFoundError:
+        raise
+    except SandboxError as exc:
+        logger.warning("Could not check Daytona sandbox %s while watching: %s", sandbox._sandbox_ref, exc)  # pyright: ignore[reportPrivateUsage]
+
+
+async def _watch_session_command(
+    sandbox: DaytonaSandbox,
+    session_id: str,
+    command_id: str,
+    forwarded_stdout: int,
+    forwarded_stderr: int,
+    forward: Callable[[str], None],
+    closed: asyncio.Event,
+) -> tuple[int | None, int, int]:
+    """Observe a launched command once, using only its identity and already-forwarded offsets.
+
+    Returns the exit code (None while it is unknown) and the updated offsets.
+    """
+    process = sandbox._sandbox.process  # pyright: ignore[reportPrivateUsage]
+    seen_stdout = 0
+    seen_stderr = 0
+    pending_stdout = ""
+    pending_stderr = ""
+
+    # The SDK decoder flushes an interrupted UTF-8 sequence as U+FFFD, even on a clean
+    # end. Trailing ones are withheld; a replay or the final snapshot supplies the text.
+    def consume(text: str, seen: int, pending: str, forwarded: int) -> tuple[int, str, int]:
+        combined = pending + text
+        ready = combined.rstrip("\ufffd")
+        start = seen - len(pending)
+        forward(ready[max(0, forwarded - start):])
+        return seen + len(text), combined[len(ready):], max(forwarded, start + len(ready))
+
+    async def on_stdout(text: str) -> None:
+        nonlocal seen_stdout, pending_stdout, forwarded_stdout
+        seen_stdout, pending_stdout, forwarded_stdout = consume(
+            text, seen_stdout, pending_stdout, forwarded_stdout
+        )
+
+    async def on_stderr(text: str) -> None:
+        nonlocal seen_stderr, pending_stderr, forwarded_stderr
+        seen_stderr, pending_stderr, forwarded_stderr = consume(
+            text, seen_stderr, pending_stderr, forwarded_stderr
+        )
+
+    follow_task = asyncio.create_task(
+        process.get_session_command_logs_async(session_id, command_id, on_stdout, on_stderr)
+    )
+    closed_task = asyncio.create_task(closed.wait())
+    watch_error: Exception | None = None
+    try:
+        done, _ = await asyncio.wait({follow_task, closed_task}, return_when=asyncio.FIRST_COMPLETED)
+        if closed_task in done:
+            raise SandboxError("Controlled workload closed before command exit")
+        await follow_task
+    except (*_SANDBOX_OPERATION_ERRORS, SandboxConnectionError) as exc:
+        watch_error = exc
+        await _raise_if_sandbox_gone(sandbox)
+    finally:
+        follow_task.cancel()
+        closed_task.cancel()
+        with suppress(Exception, asyncio.CancelledError):
+            await follow_task
+        with suppress(asyncio.CancelledError):
+            await closed_task
+
+    try:
+        status = await _bounded(
+            "process.get_session_command",
+            process.get_session_command(session_id, command_id),
+            _TOOLBOX_CALL_TIMEOUT_SECONDS,
+        )
+    except (*_SANDBOX_OPERATION_ERRORS, SandboxConnectionError) as exc:
+        await _raise_if_sandbox_gone(sandbox)
+        watch_error = exc
+        status = None
+    if status is not None and status.exit_code is not None:
+        try:
+            logs = await _bounded(
+                "process.get_session_command_logs",
+                process.get_session_command_logs(session_id, command_id),
+                _TOOLBOX_CALL_TIMEOUT_SECONDS,
+            )
+            stdout = logs.stdout or ""
+            stderr = logs.stderr or ""
+            forward(stdout[forwarded_stdout:])
+            forward(stderr[forwarded_stderr:])
+            forwarded_stdout = max(forwarded_stdout, len(stdout))
+            forwarded_stderr = max(forwarded_stderr, len(stderr))
+        except (*_SANDBOX_OPERATION_ERRORS, SandboxConnectionError) as exc:
+            await _raise_if_sandbox_gone(sandbox)
+            logger.warning("Daytona controlled final log snapshot failed: %s", exc)
+        return status.exit_code, forwarded_stdout, forwarded_stderr
+    logger.warning(
+        "Daytona controlled session watch ended without exit status for %s: %s",
+        sandbox._sandbox_ref,  # pyright: ignore[reportPrivateUsage]
+        watch_error,
+    )
+    return None, forwarded_stdout, forwarded_stderr
+
+
 class _DaytonaControlledWorkload(ControlledWorkload):
     def __init__(
         self,
@@ -992,18 +1104,20 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         command: str,
         env_vars: dict[str, str],
     ) -> None:
+        self._sandbox = sandbox
         self._process = sandbox._sandbox.process  # pyright: ignore[reportPrivateUsage]
         self._sandbox_ref = sandbox._sandbox_ref  # pyright: ignore[reportPrivateUsage]
         self._sandbox_error = sandbox._sandbox_error  # pyright: ignore[reportPrivateUsage]
-        self._control_exec = sandbox._control_exec  # pyright: ignore[reportPrivateUsage]
-        self._open_pty_session = sandbox._open_pty_session  # pyright: ignore[reportPrivateUsage]
-        self._reconnect_pty = sandbox._reconnect_pty  # pyright: ignore[reportPrivateUsage]
+        self._check_sandbox_alive_once = sandbox._check_sandbox_alive_once  # pyright: ignore[reportPrivateUsage]
         self._session_id = session_id
-        self._command = command
-        self._env_vars = env_vars
+        env = {"TERM": "dumb", "LANG": "C.UTF-8", **env_vars}
+        assignments = " ".join(f"{key}={shlex.quote(value)}" for key, value in env.items())
+        self._command = f"env {assignments} {command} 2>&1"
         self._output: asyncio.Queue[str] = asyncio.Queue()
-        self._create_state = _PtyCreateState(marker=uuid.uuid4().hex)
+        self._stdout: deque[str] = deque()
+        self._stdout_bytes = 0
         self._creation_done = asyncio.Event()
+        self._session_requested = False
         self._closed = asyncio.Event()
         self._close_requested = False
         self._output_closed = False
@@ -1018,11 +1132,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
             task.exception()
 
     async def output(self) -> AsyncGenerator[str, None]:
-        """Yield queued stdout through natural completion or confirmed PTY absence.
-
-        After successful kill, drain only chunks accepted before closure, without waiting
-        for a potentially stalled status probe in the producer task.
-        """
+        """Yield queued output through completion or confirmed session absence."""
         while not self._run_task.done() and not self._output_closed:
             try:
                 yield await asyncio.wait_for(self._output.get(), timeout=0.1)
@@ -1030,14 +1140,13 @@ class _DaytonaControlledWorkload(ControlledWorkload):
                 continue
         while not self._output.empty():
             yield self._output.get_nowait()
+        if self._run_task.done() and not self._run_task.cancelled() and not self._output_closed:
+            self._run_task.result()
 
     async def wait(self) -> ControlledWorkloadResult:
         result = await asyncio.shield(self._run_task)
         absence_confirmed_at = await asyncio.shield(self._ensure_closed())
-        return ControlledWorkloadResult(
-            result=result,
-            absence_confirmed_at=absence_confirmed_at,
-        )
+        return ControlledWorkloadResult(result=result, absence_confirmed_at=absence_confirmed_at)
 
     async def kill(self) -> None:
         self._close_requested = True
@@ -1052,195 +1161,116 @@ class _DaytonaControlledWorkload(ControlledWorkload):
 
     async def _close(self) -> float:
         await self._creation_done.wait()
-        kill_error: SandboxError | None = None
-        if self._create_state.owns_session:
+        if self._session_requested:
+            # A lost delete reply may still have deleted the session; only the lookup decides.
+            delete_error: Exception | None = None
             try:
                 await _bounded(
-                    "process.kill_pty_session",
-                    self._process.kill_pty_session(self._session_id),
+                    "process.delete_session",
+                    self._process.delete_session(self._session_id),
+                    _TOOLBOX_CALL_TIMEOUT_SECONDS,
+                )
+            except (*_SANDBOX_OPERATION_ERRORS, SandboxConnectionError) as exc:
+                await self._check_sandbox_alive_once()
+                delete_error = exc
+
+            try:
+                await _bounded(
+                    "process.get_session",
+                    self._process.get_session(self._session_id),
                     _TOOLBOX_CALL_TIMEOUT_SECONDS,
                 )
             except _SANDBOX_OPERATION_ERRORS as exc:
-                kill_error = self._sandbox_error(exc)
+                await self._check_sandbox_alive_once()
+                if not _is_not_found_error(exc):
+                    raise self._sandbox_error(exc) from exc
+            except SandboxConnectionError:
+                await self._check_sandbox_alive_once()
+                raise
+            else:
+                raise SandboxError(
+                    f"Daytona controlled session is still present for "
+                    f"{self._sandbox_ref}: session_id={self._session_id}"
+                ) from delete_error
 
-        try:
-            sessions = await _bounded(
-                "process.list_pty_sessions",
-                self._process.list_pty_sessions(),
-                _TOOLBOX_CALL_TIMEOUT_SECONDS,
-            )
-        except _SANDBOX_OPERATION_ERRORS as exc:
-            error = self._sandbox_error(exc)
-            if kill_error is not None:
-                raise error from kill_error
-            raise error from exc
-
-        if any(session.id == self._session_id for session in sessions):
-            error = SandboxError(
-                f"Daytona controlled PTY session is still present for "
-                f"{self._sandbox_ref}: session_id={self._session_id}"
-            )
-            if kill_error is not None:
-                raise error from kill_error
-            raise error
-
-        # Publish the fresh-list confirmation immediately. Controlled status files are
-        # sandbox-scoped and disappear with normal sandbox teardown; cleaning them here
-        # would delay the caller's deadline arbitration after absence was already proven.
-        # The producer may still be stalled on a status probe after the PTY is gone.
-        # Close only after fresh absence confirmation, preserving every queued chunk.
         self._output_closed = True
         self._closed.set()
         return asyncio.get_running_loop().time()
 
-    @property
-    def _status_path(self) -> str:
-        return f"{_STATUS_DIR}/{self._session_id.rsplit('-', 1)[-1]}.status"
-
-    @property
-    def _status_temp_path(self) -> str:
-        return f"{self._status_path}.tmp"
+    def _forward(self, text: str) -> None:
+        if not text or self._output_closed:
+            return
+        self._stdout.append(text)
+        self._stdout_bytes += len(text)
+        while self._stdout_bytes > _PTY_STDOUT_TAIL_MAX_BYTES and len(self._stdout) > 1:
+            self._stdout_bytes -= len(self._stdout.popleft())
+        self._output.put_nowait(text)
 
     async def _run(self) -> ExecResult:
-        stdout: deque[str] = deque()
-        stdout_bytes = 0
-        handle: AsyncPtyHandle | None = None
-        wait_task: asyncio.Task[PtyResult] | None = None
-        pty_envs = {
-            "TERM": "dumb",
-            "LANG": "C.UTF-8",
-            **self._env_vars,
-            _PTY_CREATE_MARKER_ENV: self._create_state.marker,
-        }
-
-        async def on_data(data: bytes) -> None:
-            nonlocal stdout_bytes
-            if self._output_closed:
-                return
-            text = data.decode("utf-8", errors="replace")
-            stdout.append(text)
-            stdout_bytes += len(text)
-            while stdout_bytes > _PTY_STDOUT_TAIL_MAX_BYTES and len(stdout) > 1:
-                stdout_bytes -= len(stdout.popleft())
-            self._output.put_nowait(text)
-
         try:
             if self._close_requested:
-                raise SandboxError("Controlled workload closed before PTY creation")
+                raise SandboxError("Controlled workload closed before session creation")
+            # A lost create reply may still have created the session, so close must check it.
+            self._session_requested = True
             try:
-                handle = await self._open_pty_session(
-                    self._session_id, on_data, pty_envs, self._create_state
+                await _bounded(
+                    "process.create_session",
+                    self._process.create_session(self._session_id),
+                    _TOOLBOX_CALL_TIMEOUT_SECONDS,
                 )
+            except _SANDBOX_OPERATION_ERRORS as exc:
+                await self._check_sandbox_alive_once()
+                if _is_not_found_error(exc):
+                    raise SandboxError(f"Daytona controlled session create failed for {self._sandbox_ref}: {exc}") from exc
+                raise self._sandbox_error(exc) from exc
+            except SandboxConnectionError:
+                await self._check_sandbox_alive_once()
+                raise
+
+            if self._close_requested:
+                raise SandboxError("Controlled workload closed before command admission")
+            try:
+                response = await _bounded(
+                    "process.execute_session_command",
+                    self._process.execute_session_command(
+                        self._session_id,
+                        SessionExecuteRequest(command=self._command, run_async=True),
+                    ),
+                    _TOOLBOX_CALL_TIMEOUT_SECONDS,
+                )
+            except _SANDBOX_OPERATION_ERRORS as exc:
+                await self._check_sandbox_alive_once()
+                if _is_not_found_error(exc):
+                    raise SandboxError(f"Daytona controlled session execute failed for {self._sandbox_ref}: {exc}") from exc
+                raise self._sandbox_error(exc) from exc
+            except SandboxConnectionError:
+                await self._check_sandbox_alive_once()
+                raise
             finally:
                 self._creation_done.set()
+            command_id = response.cmd_id
+            forwarded_stdout = 0
+            forwarded_stderr = 0
 
-            if self._close_requested:
-                raise SandboxError("Controlled workload closed before command admission")
-            await _bounded(
-                "handle.send_input",
-                handle.send_input(f"stty -echo; unset {_PTY_CREATE_MARKER_ENV}\n"),
-                _TOOLBOX_CALL_TIMEOUT_SECONDS,
-            )
-            if self._close_requested:
-                raise SandboxError("Controlled workload closed before command admission")
-            await _bounded(
-                "handle.send_input",
-                handle.send_input(
-                    f"mkdir -p {shlex.quote(_STATUS_DIR)}; {self._command}; "
-                    f"printf '%s\\n' \"$?\" > {shlex.quote(self._status_temp_path)} "
-                    f"&& mv {shlex.quote(self._status_temp_path)} {shlex.quote(self._status_path)}; exit\n"
-                ),
-                _TOOLBOX_CALL_TIMEOUT_SECONDS,
-            )
-            wait_task = asyncio.create_task(handle.wait())
-
-            reconnect_attempts = 0
-            while True:
-                done, _ = await asyncio.wait({wait_task}, timeout=_PTY_STATUS_POLL_SECONDS)
+            while not self._output_closed:
+                exit_code, forwarded_stdout, forwarded_stderr = await _watch_session_command(
+                    self._sandbox,
+                    self._session_id,
+                    command_id,
+                    forwarded_stdout,
+                    forwarded_stderr,
+                    self._forward,
+                    self._closed,
+                )
+                if exit_code is not None:
+                    return ExecResult(exit_code=exit_code, output="".join(self._stdout))
                 try:
-                    result = await self._control_exec(
-                        f"test -e {shlex.quote(self._status_path)}"
-                    )
-                except SandboxError:
-                    status_exists = False
-                    with suppress(SandboxError):
-                        result = await self._control_exec(
-                            f"test -e {shlex.quote(self._status_path)}"
-                        )
-                        status_exists = result.exit_code == 0
-                    if not status_exists:
-                        raise
-                    break
-                if result.exit_code == 0:
-                    break
-                if not done:
+                    await asyncio.wait_for(self._closed.wait(), _SESSION_WATCH_REOPEN_SECONDS)
+                except TimeoutError:
                     continue
-
-                reconnect_attempts += 1
-                if reconnect_attempts == _PTY_STATUS_CHECK_ATTEMPTS:
-                    raise SandboxConnectionError(
-                        "Daytona controlled PTY did not write an exit code for "
-                        f"{self._sandbox_ref}: session_id={self._session_id}"
-                    )
-                wait_result: PtyResult | None = None
-                with suppress(Exception):
-                    wait_result = await wait_task
-                if wait_result is not None and wait_result.exit_code not in (None, 0):
-                    raise SandboxError(
-                        "Daytona controlled PTY exited before writing command status for "
-                        f"{self._sandbox_ref}: session_id={self._session_id}, "
-                        f"{_pty_result_summary(wait_result)}"
-                    )
-                await _bounded(
-                    "handle.disconnect", handle.disconnect(), _TOOLBOX_CALL_TIMEOUT_SECONDS
-                )
-                handle = await self._reconnect_pty(
-                    self._session_id, on_data, wait_result
-                )
-                wait_task = asyncio.create_task(handle.wait())
-
-            result = await self._control_exec(f"cat {shlex.quote(self._status_path)}")
-            if result.exit_code != 0 or not result.output:
-                raise SandboxError(
-                    "Failed to read Daytona controlled PTY exit code for "
-                    f"{self._sandbox_ref}: status_path={self._status_path}"
-                )
-            # The atomic status file can become visible before the PTY delivers its
-            # final frames. Natural completion requires the transport's end-of-stream;
-            # confirmed kill instead closes output without waiting for the producer.
-            if not self._output_closed:
-                closed_task = asyncio.create_task(self._closed.wait())
-                try:
-                    done, _ = await _bounded(
-                        "handle.wait",
-                        asyncio.wait(
-                            {wait_task, closed_task}, return_when=asyncio.FIRST_COMPLETED
-                        ),
-                        _TOOLBOX_CALL_TIMEOUT_SECONDS,
-                    )
-                    if wait_task in done:
-                        await wait_task
-                finally:
-                    closed_task.cancel()
-                    with suppress(asyncio.CancelledError):
-                        await closed_task
-            return ExecResult(
-                exit_code=int(result.output.strip().splitlines()[-1]),
-                output="".join(stdout),
-            )
-        except _SANDBOX_OPERATION_ERRORS as exc:
-            raise self._sandbox_error(exc) from exc
+            raise SandboxError("Controlled workload closed before command exit")
         finally:
             self._creation_done.set()
-            if wait_task:
-                wait_task.cancel()
-                with suppress(Exception, asyncio.CancelledError):
-                    await wait_task
-            if handle:
-                with suppress(Exception):
-                    await _bounded(
-                        "handle.disconnect", handle.disconnect(), _TOOLBOX_CALL_TIMEOUT_SECONDS
-                    )
 
 
 class DaytonaSandboxProvider(SandboxProvider):

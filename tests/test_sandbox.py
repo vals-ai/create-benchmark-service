@@ -180,84 +180,86 @@ class ControlledProcess(Process):
         super().__init__()
         self.sessions: set[str] = set()
         self.create_started = asyncio.Event()
-        self.run_finished = asyncio.Event()
-        self.status_check_started = asyncio.Event()
-        self.list_started = asyncio.Event()
-        self.release_status_check: asyncio.Event | None = None
-        self.release_list: asyncio.Event | None = None
-        self.status_error: BaseException | None = None
-        self.list_error: BaseException | None = None
-        self.kill_error: BaseException | None = None
-        self.keep_session_after_kill = False
-        self.status_cleanup_started = asyncio.Event()
-        self.release_status_cleanup: asyncio.Event | None = None
+        self.execute_started = asyncio.Event()
+        self.follow_started = asyncio.Event()
+        self.get_started = asyncio.Event()
+        self.snapshot_done = asyncio.Event()
+        self.lookup_started = asyncio.Event()
+        self.release_create: asyncio.Event | None = None
+        self.release_follow: asyncio.Event | None = None
+        self.release_get: asyncio.Event | None = None
+        self.release_lookup: asyncio.Event | None = None
+        self.follow_error: BaseException | None = None
+        self.delete_error: BaseException | None = None
+        self.keep_session_after_delete = False
+        self.create_calls = 0
+        self.delete_calls = 0
+        self.lookup_calls = 0
+        self.snapshot_calls = 0
+        self.execute_calls = 0
+        self.follow_calls = 0
+        self.status_calls = 0
+        self.statuses: list[int | None] = [0]
+        self.stdout = "hello"
+        self.stderr = ""
 
-    async def exec(self, command: str) -> SimpleNamespace:
-        evaluated_command = _unwrap_shell_command(command)
-        if evaluated_command.startswith("test -e "):
-            self.status_check_started.set()
-            if self.release_status_check is not None:
-                await self.release_status_check.wait()
-            if self.status_error is not None:
-                raise self.status_error
-        result = await super().exec(command)
-        if evaluated_command.startswith("rm -f "):
-            self.status_cleanup_started.set()
-            if self.release_status_cleanup is not None:
-                await self.release_status_cleanup.wait()
-        if evaluated_command.startswith("cat "):
-            self.run_finished.set()
-        return result
-
-    async def create_pty_session(
-        self,
-        *,
-        id: str,
-        on_data: Callable[[bytes], None | Awaitable[None]],
-        envs: dict[str, str],
-        pty_size: PtySize,
-    ) -> "PtyHandle":
-        handle = await super().create_pty_session(
-            id=id, on_data=on_data, envs=envs, pty_size=pty_size
-        )
-        self.sessions.add(id)
+    async def create_session(self, session_id: str) -> None:
+        self.create_calls += 1
         self.create_started.set()
-        return handle
+        if self.release_create is not None:
+            await self.release_create.wait()
+        self.sessions.add(session_id)
 
-    async def kill_pty_session(self, session_id: str) -> None:
-        if self.kill_error is not None:
-            raise self.kill_error
-        if not self.keep_session_after_kill:
+    async def execute_session_command(self, session_id: str, req: Any) -> SimpleNamespace:
+        assert session_id in self.sessions
+        self.execute_calls += 1
+        self.execute_started.set()
+        assert req.run_async is True
+        return SimpleNamespace(cmd_id="command-1")
+
+    async def get_session_command_logs_async(
+        self,
+        session_id: str,
+        command_id: str,
+        on_stdout: Callable[[str], None | Awaitable[None]],
+        on_stderr: Callable[[str], None | Awaitable[None]],
+    ) -> None:
+        self.follow_calls += 1
+        self.follow_started.set()
+        await on_stdout(self.stdout)
+        await on_stderr(self.stderr)
+        if self.release_follow is not None:
+            await self.release_follow.wait()
+        if self.follow_error is not None:
+            raise self.follow_error
+
+    async def get_session_command(self, session_id: str, command_id: str) -> SimpleNamespace:
+        self.status_calls += 1
+        self.get_started.set()
+        if self.release_get is not None:
+            await self.release_get.wait()
+        return SimpleNamespace(exit_code=self.statuses.pop(0) if len(self.statuses) > 1 else self.statuses[0])
+
+    async def get_session_command_logs(self, session_id: str, command_id: str) -> SimpleNamespace:
+        self.snapshot_calls += 1
+        self.snapshot_done.set()
+        return SimpleNamespace(stdout=self.stdout, stderr=self.stderr)
+
+    async def delete_session(self, session_id: str) -> None:
+        self.delete_calls += 1
+        if self.delete_error is not None:
+            raise self.delete_error
+        if not self.keep_session_after_delete:
             self.sessions.discard(session_id)
 
-    async def list_pty_sessions(self) -> list[SimpleNamespace]:
-        self.list_started.set()
-        if self.release_list is not None:
-            await self.release_list.wait()
-        if self.list_error is not None:
-            raise self.list_error
-        return [SimpleNamespace(id=session_id) for session_id in sorted(self.sessions)]
-
-
-class BlockingControlledProcess(ControlledProcess):
-    def __init__(self) -> None:
-        super().__init__()
-        self.release_create = asyncio.Event()
-
-    async def create_pty_session(
-        self,
-        *,
-        id: str,
-        on_data: Callable[[bytes], None | Awaitable[None]],
-        envs: dict[str, str],
-        pty_size: PtySize,
-    ) -> "PtyHandle":
-        self.create_started.set()
-        await self.release_create.wait()
-        return await super().create_pty_session(
-            id=id, on_data=on_data, envs=envs, pty_size=pty_size
-        )
-
+    async def get_session(self, session_id: str) -> SimpleNamespace:
+        self.lookup_calls += 1
+        self.lookup_started.set()
+        if self.release_lookup is not None:
+            await self.release_lookup.wait()
+        if session_id not in self.sessions:
+            raise DaytonaNotFoundError("session not found")
+        return SimpleNamespace(session_id=session_id)
 
 class RetryingProcess(Process):
     def __init__(self, errors: list[BaseException]) -> None:
@@ -4601,255 +4603,158 @@ async def test_daytona_controlled_workload_completes_and_confirms_absence() -> N
     process = ControlledProcess()
     inner = InnerSandbox()
     inner.process = process
-    sandbox = DaytonaSandbox(cast(Any, inner))
-    workload = sandbox.controlled_workload("printf controlled")
+    workload = DaytonaSandbox(cast(Any, inner)).controlled_workload(
+        "printf controlled", cwd="/work folder", env_vars={"AGENT_SECRET": "a b"}
+    )
 
     completed = await workload.wait()
-    output = [chunk async for chunk in workload.output()]
-
     assert completed.result == ExecResult(exit_code=0, output="hello")
     assert completed.absence_confirmed_at <= asyncio.get_running_loop().time()
-    assert output == ["hello"]
+    assert [chunk async for chunk in workload.output()] == ["hello"]
     assert process.sessions == set()
-
-
-async def test_daytona_controlled_wait_publishes_absence_without_status_cleanup_delay() -> None:
-    process = ControlledProcess()
-    process.release_list = asyncio.Event()
-    process.release_status_cleanup = asyncio.Event()
-    inner = InnerSandbox()
-    inner.process = process
-    sandbox = DaytonaSandbox(cast(Any, inner))
-    workload = sandbox.controlled_workload("printf controlled")
-    wait_task = asyncio.create_task(workload.wait())
-
-    await process.list_started.wait()
-    assert wait_task.done() is False
-    process.release_list.set()
-
-    try:
-        completed = await asyncio.wait_for(asyncio.shield(wait_task), timeout=1)
-    finally:
-        process.release_status_cleanup.set()
-        if not wait_task.done():
-            await wait_task
-
-    assert completed.result.exit_code == 0
-    assert completed.absence_confirmed_at <= asyncio.get_running_loop().time()
-    assert process.status_cleanup_started.is_set() is False
 
 
 async def test_daytona_controlled_natural_completion_and_kill_share_closure() -> None:
     process = ControlledProcess()
+    process.release_get = asyncio.Event()
     inner = InnerSandbox()
     inner.process = process
-    sandbox = DaytonaSandbox(cast(Any, inner))
-    workload = sandbox.controlled_workload("printf controlled")
-
-    await process.run_finished.wait()
-    wait_task = asyncio.create_task(workload.wait())
-    kill_task = asyncio.create_task(workload.kill())
-    completed, _ = await asyncio.gather(wait_task, kill_task)
-
+    workload = DaytonaSandbox(cast(Any, inner)).controlled_workload("printf controlled")
+    await process.get_started.wait()
+    process.release_get.set()
+    await process.snapshot_done.wait()
+    completed, _ = await asyncio.gather(workload.wait(), workload.kill())
     assert completed.result.exit_code == 0
     assert process.sessions == set()
 
 
 async def test_daytona_controlled_kill_closes_admitted_running_workload() -> None:
     process = ControlledProcess()
-    process.release_status_check = asyncio.Event()
+    process.statuses = [None]
     inner = InnerSandbox()
     inner.process = process
-    sandbox = DaytonaSandbox(cast(Any, inner))
-    workload = sandbox.controlled_workload("long-running")
-
-    await process.status_check_started.wait()
-    kill_task = asyncio.create_task(workload.kill())
-    await kill_task
-
-    assert process.release_status_check.is_set() is False
-    assert process.sessions == set()
-
-    process.release_status_check.set()
-    await workload.wait()
-
-
-async def test_daytona_controlled_wait_requires_fresh_absence_listing() -> None:
-    process = ControlledProcess()
-    process.release_list = asyncio.Event()
-    inner = InnerSandbox()
-    inner.process = process
-    sandbox = DaytonaSandbox(cast(Any, inner))
-    workload = sandbox.controlled_workload("printf controlled")
-    wait_task = asyncio.create_task(workload.wait())
-
-    await process.list_started.wait()
-    assert wait_task.done() is False
-
-    process.release_list.set()
-    completed = await wait_task
-
-    assert process.sessions == set()
-    assert completed.result.exit_code == 0
-    assert completed.absence_confirmed_at <= asyncio.get_running_loop().time()
-
-
-async def test_daytona_controlled_kill_requires_fresh_absence_listing() -> None:
-    process = ControlledProcess()
-    process.release_list = asyncio.Event()
-    inner = InnerSandbox()
-    inner.process = process
-    sandbox = DaytonaSandbox(cast(Any, inner))
-    workload = sandbox.controlled_workload("printf controlled")
-    kill_task = asyncio.create_task(workload.kill())
-
-    await process.list_started.wait()
-    assert kill_task.done() is False
-
-    process.release_list.set()
-    await kill_task
-
-    assert process.sessions == set()
-
-
-async def test_daytona_controlled_wait_failure_allows_explicit_kill(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    _skip_retry_sleep(monkeypatch, DaytonaSandbox._control_exec)  # pyright: ignore[reportPrivateUsage]
-    process = ControlledProcess()
-    process.status_error = DaytonaConnectionError("status unavailable")
-    inner = InnerSandbox()
-    inner.process = process
-    sandbox = DaytonaSandbox(cast(Any, inner))
-    workload = sandbox.controlled_workload("printf controlled")
-
-    with pytest.raises(SandboxConnectionError, match="Sandbox connection error"):
-        await workload.wait()
-
-    assert process.sessions
-
+    workload = DaytonaSandbox(cast(Any, inner)).controlled_workload("long-running")
+    await process.get_started.wait()
     await workload.kill()
-
     assert process.sessions == set()
+    assert [chunk async for chunk in workload.output()] == ["hello"]
+    with pytest.raises(SandboxError, match="closed before command exit"):
+        await asyncio.wait_for(workload.wait(), 1)
 
-async def test_daytona_controlled_kill_closes_command_admission_during_create() -> None:
-    process = BlockingControlledProcess()
+
+async def test_daytona_controlled_kill_waits_for_create_before_command_admission() -> None:
+    process = ControlledProcess()
+    process.release_create = asyncio.Event()
     inner = InnerSandbox()
     inner.process = process
-    sandbox = DaytonaSandbox(cast(Any, inner))
-    workload = sandbox.controlled_workload("must-not-run")
-
+    workload = DaytonaSandbox(cast(Any, inner)).controlled_workload("must-not-run")
     await process.create_started.wait()
-    asyncio.get_running_loop().call_soon(process.release_create.set)
-    await workload.kill()
-
+    kill_task = asyncio.create_task(workload.kill())
+    assert kill_task.done() is False
+    process.release_create.set()
+    await kill_task
     assert process.sessions == set()
-    assert process.pty_handle is not None
-    assert process.pty_handle.inputs == []
+    assert process.execute_calls == 0
+
+
+async def test_daytona_controlled_kill_waits_for_execute_attempt() -> None:
+    class DelayedExecuteProcess(ControlledProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.release_execute = asyncio.Event()
+
+        async def execute_session_command(self, session_id: str, req: Any) -> SimpleNamespace:
+            self.execute_started.set()
+            await self.release_execute.wait()
+            return await super().execute_session_command(session_id, req)
+
+    process = DelayedExecuteProcess()
+    inner = InnerSandbox()
+    inner.process = process
+    workload = DaytonaSandbox(cast(Any, inner)).controlled_workload("printf controlled")
+    await process.execute_started.wait()
+    kill_task = asyncio.create_task(workload.kill())
+    await asyncio.sleep(0)
+    assert not kill_task.done()
+    assert process.sessions
+    process.release_execute.set()
+    await kill_task
+    assert process.execute_calls == 1
+    assert process.sessions == set()
 
 
 async def test_daytona_controlled_kill_rejects_present_session() -> None:
     process = ControlledProcess()
-    process.keep_session_after_kill = True
+    process.keep_session_after_delete = True
     inner = InnerSandbox()
     inner.process = process
-    sandbox = DaytonaSandbox(cast(Any, inner))
-    workload = sandbox.controlled_workload("printf controlled")
-
+    workload = DaytonaSandbox(cast(Any, inner)).controlled_workload("printf controlled")
     with pytest.raises(SandboxError, match="still present"):
         await workload.wait()
 
 
-async def test_daytona_controlled_kill_rejects_failed_absence_listing() -> None:
+async def test_daytona_controlled_kill_rejects_failed_delete() -> None:
     process = ControlledProcess()
-    process.list_error = DaytonaConnectionError("list unavailable")
+    process.delete_error = DaytonaConnectionError("delete failed")
     inner = InnerSandbox()
     inner.process = process
-    sandbox = DaytonaSandbox(cast(Any, inner))
-    workload = sandbox.controlled_workload("printf controlled")
-
-    with pytest.raises(SandboxConnectionError, match="Sandbox connection error"):
+    workload = DaytonaSandbox(cast(Any, inner)).controlled_workload("printf controlled")
+    with pytest.raises(SandboxError, match="still present"):
         await workload.wait()
+
+    class LostDeleteReplyProcess(ControlledProcess):
+        async def delete_session(self, session_id: str) -> None:
+            await super().delete_session(session_id)
+            raise DaytonaConnectionError("lost delete reply")
+
+    deleted = LostDeleteReplyProcess()
+    inner = InnerSandbox()
+    inner.process = deleted
+    workload = DaytonaSandbox(cast(Any, inner)).controlled_workload("printf controlled")
+    await deleted.snapshot_done.wait()
+    await workload.kill()
+    assert deleted.sessions == set()
+    assert deleted.delete_calls == 1
+    assert deleted.lookup_calls == 1
 
 
 async def test_daytona_controlled_output_cancellation_does_not_stop_workload() -> None:
-    process = BlockingControlledProcess()
+    process = ControlledProcess()
+    process.release_create = asyncio.Event()
     inner = InnerSandbox()
     inner.process = process
-    sandbox = DaytonaSandbox(cast(Any, inner))
-    workload = sandbox.controlled_workload("printf controlled")
+    workload = DaytonaSandbox(cast(Any, inner)).controlled_workload("printf controlled")
     stream = workload.output()
     consumer = asyncio.create_task(anext(stream))
-
     await process.create_started.wait()
     consumer.cancel()
     with pytest.raises(asyncio.CancelledError):
         await consumer
     await stream.aclose()
-
     process.release_create.set()
-    completed = await workload.wait()
-
-    assert completed.result.exit_code == 0
-    assert process.sessions == set()
+    assert (await workload.wait()).result.exit_code == 0
 
 
-async def test_daytona_controlled_output_drains_buffer_after_confirmed_kill_with_stalled_producer() -> None:
+async def test_daytona_controlled_output_drains_buffer_after_confirmed_kill() -> None:
     process = ControlledProcess()
-    process.release_status_check = asyncio.Event()
+    process.release_follow = asyncio.Event()
     inner = InnerSandbox()
     inner.process = process
     workload = DaytonaSandbox(cast(Any, inner)).controlled_workload("printf controlled")
-
-    await process.status_check_started.wait()
-    assert process.pty_handle is not None
-    await process.pty_handle.emit(b"buffered before kill")
-    try:
-        await workload.kill()
-        stream = workload.output()
-        assert await asyncio.wait_for(anext(stream), 0.5) == "hello"
-        assert await asyncio.wait_for(anext(stream), 0.5) == "buffered before kill"
-        with pytest.raises(StopAsyncIteration):
-            await asyncio.wait_for(anext(stream), 0.5)
-    finally:
-        process.release_status_check.set()
-        await workload.wait()
-
-
-async def test_daytona_controlled_output_waiting_consumer_ends_at_kill_boundary() -> None:
-    process = ControlledProcess()
-    process.release_status_check = asyncio.Event()
-    inner = InnerSandbox()
-    inner.process = process
-    workload = DaytonaSandbox(cast(Any, inner)).controlled_workload("printf controlled")
-    stream = workload.output()
-    first = asyncio.create_task(anext(stream))
-
-    await process.status_check_started.wait()
-    assert await first == "hello"
-    next_chunk = asyncio.create_task(anext(stream))
-    try:
-        await workload.kill()
-        assert process.pty_handle is not None
-        await process.pty_handle.emit(b"after confirmed kill")
-        with pytest.raises(StopAsyncIteration):
-            await asyncio.wait_for(next_chunk, 0.5)
-    finally:
-        process.release_status_check.set()
-        await stream.aclose()
-        await workload.wait()
+    await process.follow_started.wait()
+    await workload.kill()
+    assert [chunk async for chunk in workload.output()] == ["hello"]
 
 
 async def test_daytona_controlled_failed_kill_does_not_complete_output_stream() -> None:
     process = ControlledProcess()
-    process.keep_session_after_kill = True
-    process.release_status_check = asyncio.Event()
+    process.keep_session_after_delete = True
+    process.release_follow = asyncio.Event()
     inner = InnerSandbox()
     inner.process = process
     workload = DaytonaSandbox(cast(Any, inner)).controlled_workload("printf controlled")
+    await process.follow_started.wait()
     stream = workload.output()
-
-    await process.status_check_started.wait()
     assert await anext(stream) == "hello"
     with pytest.raises(SandboxError, match="still present"):
         await workload.kill()
@@ -4862,130 +4767,213 @@ async def test_daytona_controlled_failed_kill_does_not_complete_output_stream() 
         with pytest.raises(asyncio.CancelledError):
             await pending
         await stream.aclose()
-        process.release_status_check.set()
-        with pytest.raises(SandboxError, match="still present"):
-            await workload.wait()
+        process.release_follow.set()
 
 
-async def test_daytona_controlled_natural_output_drains_queued_tail() -> None:
+async def test_daytona_controlled_wait_requires_fresh_absence_lookup() -> None:
     process = ControlledProcess()
-    process.release_status_check = asyncio.Event()
-    inner = InnerSandbox()
-    inner.process = process
-    workload = DaytonaSandbox(cast(Any, inner)).controlled_workload("printf controlled")
-
-    await process.status_check_started.wait()
-    assert process.pty_handle is not None
-    await process.pty_handle.emit(b"tail before completion")
-    process.release_status_check.set()
-    await workload.wait()
-
-    assert [chunk async for chunk in workload.output()] == ["hello", "tail before completion"]
-
-
-async def test_daytona_controlled_natural_completion_waits_for_final_pty_frame(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(daytona_module, "_PTY_STATUS_POLL_SECONDS", 0)
-
-    class StatusFirstHandle(PtyHandle):
-        def __init__(self, on_data: Callable[[bytes], None | Awaitable[None]]) -> None:
-            super().__init__(on_data)
-            self.release_close = asyncio.Event()
-
-        async def wait(self) -> PtyResult | None:
-            await self.release_close.wait()
-            await self.emit(b" final frame")
-            return None
-
-    class StatusFirstProcess(ControlledProcess):
-        def __init__(self) -> None:
-            super().__init__()
-            self.status_read = asyncio.Event()
-            self.handle: StatusFirstHandle | None = None
-
-        async def exec(self, command: str) -> SimpleNamespace:
-            result = await super().exec(command)
-            if _unwrap_shell_command(command).startswith("cat "):
-                self.status_read.set()
-            return result
-
-        async def create_pty_session(
-            self,
-            *,
-            id: str,
-            on_data: Callable[[bytes], None | Awaitable[None]],
-            envs: dict[str, str],
-            pty_size: PtySize,
-        ) -> StatusFirstHandle:
-            _assert_pty_create_config(envs, pty_size)
-            self.handle = StatusFirstHandle(on_data)
-            self.pty_handle = self.handle
-            self.sessions.add(id)
-            self.create_started.set()
-            return self.handle
-
-    process = StatusFirstProcess()
+    process.release_lookup = asyncio.Event()
     inner = InnerSandbox()
     inner.process = process
     workload = DaytonaSandbox(cast(Any, inner)).controlled_workload("printf controlled")
     wait_task = asyncio.create_task(workload.wait())
-
-    try:
-        await asyncio.wait_for(process.status_read.wait(), 1)
-        assert not wait_task.done(), "status file alone must not complete the output stream"
-    finally:
-        assert process.handle is not None
-        process.handle.release_close.set()
-
-    completed = await asyncio.wait_for(wait_task, 1)
-    assert completed.result == ExecResult(exit_code=0, output="hello final frame")
-    assert [chunk async for chunk in workload.output()] == ["hello", " final frame"]
+    await process.lookup_started.wait()
+    assert not wait_task.done()
+    process.release_lookup.set()
+    completed = await wait_task
+    assert completed.result.exit_code == 0
+    assert completed.absence_confirmed_at <= asyncio.get_running_loop().time()
 
 
-async def test_daytona_controlled_kill_interrupts_natural_pty_drain(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(daytona_module, "_PTY_STATUS_POLL_SECONDS", 0)
+async def test_daytona_controlled_final_snapshot_delivers_tail() -> None:
+    class FinalFrameProcess(ControlledProcess):
+        async def get_session_command_logs(self, session_id: str, command_id: str) -> SimpleNamespace:
+            logs = await super().get_session_command_logs(session_id, command_id)
+            logs.stdout = "hello final frame"
+            return logs
 
-    class StatusFirstProcess(ControlledProcess):
-        def __init__(self) -> None:
-            super().__init__()
-            self.status_read = asyncio.Event()
-
-        async def exec(self, command: str) -> SimpleNamespace:
-            result = await super().exec(command)
-            if _unwrap_shell_command(command).startswith("cat "):
-                self.status_read.set()
-            return result
-
-        async def create_pty_session(
-            self,
-            *,
-            id: str,
-            on_data: Callable[[bytes], None | Awaitable[None]],
-            envs: dict[str, str],
-            pty_size: PtySize,
-        ) -> PtyHandle:
-            handle = await super().create_pty_session(
-                id=id, on_data=on_data, envs=envs, pty_size=pty_size
-            )
-
-            async def stalled_wait() -> PtyResult | None:
-                await asyncio.Event().wait()
-                return None
-
-            monkeypatch.setattr(handle, "wait", stalled_wait)
-            return handle
-
-    process = StatusFirstProcess()
+    process = FinalFrameProcess()
     inner = InnerSandbox()
     inner.process = process
     workload = DaytonaSandbox(cast(Any, inner)).controlled_workload("printf controlled")
+    completed = await workload.wait()
+    assert completed.result == ExecResult(exit_code=0, output="hello final frame")
+    assert [chunk async for chunk in workload.output()] == ["hello", " final frame"]
+    assert process.snapshot_calls == 1
 
-    await asyncio.wait_for(process.status_read.wait(), 1)
-    await asyncio.wait_for(workload.kill(), 1)
-    completed = await asyncio.wait_for(workload.wait(), 1)
 
+async def test_daytona_controlled_waiting_output_consumer_ends_at_kill_boundary() -> None:
+    process = ControlledProcess()
+    process.release_follow = asyncio.Event()
+    inner = InnerSandbox()
+    inner.process = process
+    workload = DaytonaSandbox(cast(Any, inner)).controlled_workload("printf controlled")
+    stream = workload.output()
+    assert await anext(stream) == "hello"
+    waiting = asyncio.create_task(anext(stream))
+    await workload.kill()
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(waiting, 0.5)
+    await stream.aclose()
+
+
+async def test_daytona_controlled_snapshot_failure_keeps_known_exit(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class FailedSnapshotProcess(ControlledProcess):
+        async def get_session_command_logs(self, session_id: str, command_id: str) -> SimpleNamespace:
+            self.snapshot_calls += 1
+            raise DaytonaConnectionError("snapshot unavailable")
+
+    process = FailedSnapshotProcess()
+    inner = InnerSandbox()
+    inner.process = process
+    workload = DaytonaSandbox(cast(Any, inner)).controlled_workload("printf controlled")
+    completed = await workload.wait()
+    assert completed.result == ExecResult(exit_code=0, output="hello")
+    assert "controlled final log snapshot failed" in caplog.text
+    assert process.snapshot_calls == 1
+
+
+async def test_daytona_controlled_replayed_follow_does_not_duplicate_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(daytona_module, "_SESSION_WATCH_REOPEN_SECONDS", 0)
+    marker = "VALKYRIE-STAGE/1 " + "YWJj" + " " + "a" * 64 + "\n"
+
+    class ReplayProcess(ControlledProcess):
+        async def get_session_command_logs_async(
+            self,
+            session_id: str,
+            command_id: str,
+            on_stdout: Callable[[str], None | Awaitable[None]],
+            on_stderr: Callable[[str], None | Awaitable[None]],
+        ) -> None:
+            self.follow_calls += 1
+            if self.follow_calls == 1:
+                await on_stdout("prefix\n" + marker[:25])
+                await on_stdout(marker[25:] + "\ufffd")
+                raise DaytonaConnectionError("observation dropped")
+            await on_stdout("prefix\n" + marker + "界done\n")
+
+    process = ReplayProcess()
+    process.statuses = [None, 0]
+    process.stdout = "prefix\n" + marker + "界done\n"
+    inner = InnerSandbox()
+    inner.process = process
+    workload = DaytonaSandbox(cast(Any, inner)).controlled_workload("printf controlled")
+    completed = await workload.wait()
+    output = "".join([chunk async for chunk in workload.output()])
+    assert completed.result.output == output == process.stdout
+    assert output.count(marker) == 1
+    assert process.follow_calls == 2
+    assert process.execute_calls == 1
+
+    class CleanEOFProcess(ReplayProcess):
+        async def get_session_command_logs_async(
+            self,
+            session_id: str,
+            command_id: str,
+            on_stdout: Callable[[str], None | Awaitable[None]],
+            on_stderr: Callable[[str], None | Awaitable[None]],
+        ) -> None:
+            if self.follow_calls == 0:
+                self.follow_calls += 1
+                await on_stdout("prefix\n" + marker + "\ufffd")
+                return
+            await super().get_session_command_logs_async(session_id, command_id, on_stdout, on_stderr)
+
+    clean = CleanEOFProcess()
+    clean.statuses = [None, 0]
+    clean.stdout = "prefix\n" + marker + "界done\n"
+    inner = InnerSandbox()
+    inner.process = clean
+    workload = DaytonaSandbox(cast(Any, inner)).controlled_workload("printf controlled")
+    completed = await workload.wait()
+    output = "".join([chunk async for chunk in workload.output()])
+    assert completed.result.output == output == clean.stdout
+    assert output.count("界") == 1
+    assert "\ufffd" not in output
+    assert clean.follow_calls == 2
+
+
+async def test_daytona_controlled_missing_exit_reopens_without_reexecuting(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(daytona_module, "_SESSION_WATCH_REOPEN_SECONDS", 0)
+
+    class MissingStatusOnceProcess(ControlledProcess):
+        async def get_session_command(self, session_id: str, command_id: str) -> SimpleNamespace:
+            if self.status_calls == 0:
+                self.status_calls += 1
+                raise DaytonaNotFoundError("session command not found")
+            return await super().get_session_command(session_id, command_id)
+
+    process = MissingStatusOnceProcess()
+    process.statuses = [None, 0]
+    inner = InnerSandbox()
+    inner.process = process
+    workload = DaytonaSandbox(cast(Any, inner)).controlled_workload("printf controlled")
+    completed = await workload.wait()
     assert completed.result == ExecResult(exit_code=0, output="hello")
     assert [chunk async for chunk in workload.output()] == ["hello"]
+    assert process.follow_calls == 3
+    assert process.status_calls == 3
+    assert process.execute_calls == 1
+
+
+async def test_daytona_controlled_execute_failure_never_reconciles_or_resends() -> None:
+    class LostReplyProcess(ControlledProcess):
+        async def execute_session_command(self, session_id: str, req: Any) -> SimpleNamespace:
+            await super().execute_session_command(session_id, req)
+            raise DaytonaConnectionError("lost execute reply")
+
+    process = LostReplyProcess()
+    inner = InnerSandbox()
+    inner.process = process
+    workload = DaytonaSandbox(cast(Any, inner)).controlled_workload("printf controlled")
+    with pytest.raises(SandboxConnectionError, match="Sandbox connection error"):
+        await workload.wait()
+    assert process.execute_calls == 1
+    assert process.status_calls == 0
+    assert process.follow_calls == 0
+    assert process.sessions
+    await workload.kill()
+
+    class LostCreateReplyProcess(ControlledProcess):
+        async def create_session(self, session_id: str) -> None:
+            await super().create_session(session_id)
+            raise DaytonaConnectionError("lost create reply")
+
+    create = LostCreateReplyProcess()
+    inner = InnerSandbox()
+    inner.process = create
+    workload = DaytonaSandbox(cast(Any, inner)).controlled_workload("printf controlled")
+    with pytest.raises(SandboxConnectionError, match="Sandbox connection error"):
+        await workload.wait()
+    assert create.create_calls == 1
+    assert create.execute_calls == 0
+    assert create.status_calls == 0
+    assert create.sessions
+    await workload.kill()
+    assert create.delete_calls == 1
+    assert create.lookup_calls == 1
+    assert create.sessions == set()
+
+
+async def test_daytona_controlled_sandbox_gone_during_watching_stops_observation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(daytona_module, "_SESSION_WATCH_REOPEN_SECONDS", 0)
+    process = ControlledProcess()
+    process.follow_error = DaytonaConnectionError("observation dropped")
+    inner = RemovedInnerSandbox()
+    inner.process = process
+    workload = DaytonaSandbox(cast(Any, inner)).controlled_workload("printf controlled")
+    with pytest.raises(SandboxNotFoundError):
+        await workload.wait()
+    stream = workload.output()
+    assert await anext(stream) == "hello"
+    with pytest.raises(SandboxNotFoundError):
+        await anext(stream)
+    assert process.follow_calls == 1

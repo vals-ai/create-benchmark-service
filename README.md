@@ -269,12 +269,14 @@ namespace. Unsupported sandboxes report `None`; probing or starting a controlled
 This provider capability is not a universal task-level requirement.
 
 A direct Daytona sandbox supports `linux_pid_namespace` v1. Call
-`sandbox.controlled_workload(command, cwd=..., env_vars=...)` to start a separate PTY command under
-`unshare --fork --pid --mount-proc --kill-child=KILL`, and consume `workload.output()` for streamed
-text. On natural completion, `await workload.wait()` returns
+`sandbox.controlled_workload(command, cwd=..., env_vars=...)` to start a native async session
+command under `unshare --fork --pid --mount-proc --kill-child=KILL`, and consume
+`workload.output()` for streamed text. A dropped observation connection reopens the session
+log stream without executing the command again or duplicating replayed output. On natural
+completion, `await workload.wait()` returns
 `ControlledWorkloadResult(result=ExecResult(exit_code, output), absence_confirmed_at=...)` only
-after the PTY session is absent from a fresh provider listing. On a deadline or other abort,
-`await workload.kill()` requests PTY termination and likewise confirms absence before returning.
+after the session is confirmed absent by a fresh provider lookup. On a deadline or other abort,
+`await workload.kill()` requests session deletion and likewise confirms absence before returning.
 If confirmation fails, it raises rather than claiming the workload stopped. The absence timestamp
 is event-loop monotonic time, not a wall-clock datetime. The caller owns deadline arbitration and
 must not proceed to independent collection on unconfirmed absence. Ordinary `Sandbox.command()` and

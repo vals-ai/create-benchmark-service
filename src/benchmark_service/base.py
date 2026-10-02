@@ -131,6 +131,10 @@ class BenchmarkService(ABC):
         """
         ...
 
+    async def export_dataset(self, dataset: str, out_dir: Path) -> bool:
+        """Write a vals-datasets tree into out_dir. Return False to skip export."""
+        return False
+
     async def check_auth(self, headers: dict[str, str]) -> bool:
         """Validate request authorization.
 

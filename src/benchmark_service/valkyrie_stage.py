@@ -138,6 +138,8 @@ class Agents:
 
     def _stop(self, slot: str) -> SlotResult:
         self._collect()
+        if slot not in self._active:
+            return self._take(slot)
         running = self._active[slot]
         if self._interrupt_grace_seconds is not None:
             self._signal_group(running.process.pid, signal.SIGINT)
@@ -231,7 +233,16 @@ class Agents:
             turn_dir = self._slots_root / slot / "turns" / str(self._turns[slot])
             turn_dir.parent.mkdir(parents=True, exist_ok=True)
             if running.final_output.is_dir():
-                shutil.copytree(running.final_output, turn_dir)
+                slot_dir = self._slots_root / slot
+
+                def ignore_turns(directory: str, names: list[str]) -> set[str]:
+                    return {"turns"} if Path(directory) == slot_dir and "turns" in names else set()
+
+                shutil.copytree(
+                    running.final_output,
+                    turn_dir,
+                    ignore=ignore_turns if running.final_output in turn_dir.parents else None,
+                )
             else:
                 turn_dir.mkdir()
                 shutil.copy2(running.final_output, turn_dir / running.final_output.name)

@@ -274,7 +274,8 @@ process group and any container are absent, the last active turn sends END and w
 the bundle's existing `final_output` file or directory into `<slot_dir>/turns/<n>/`. A file keeps its basename;
 `n` starts at 1 per slot. `final_output` may contain `{slot_dir}` and is rendered for each slot before launch;
 Tracker requires that placeholder when `parallel_agents > 1` and `final_output` is set, so parallel slots do not
-snapshot the same path. Tracker archives `slots_root` as the episode output, keeping every turn distinct.
+snapshot the same path. When `final_output` is the slot directory itself, previous `turns/` snapshots are excluded
+from each new copy. Tracker archives `slots_root` as the episode output, keeping every turn distinct.
 
 Upload `valkyrie_stage_source()` as `valkyrie_stage.py` during setup and import `Agents` there with Python 3.8+:
 

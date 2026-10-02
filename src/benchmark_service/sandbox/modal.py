@@ -572,9 +572,8 @@ class ModalSandboxProvider(SandboxProvider):
             "outbound_cidr_allowlist": list(_ALLOW_ALL_CIDRS) if allow_all_egress else None,
             "outbound_domain_allowlist": list(_ALLOW_ALL_DOMAINS) if allow_all_egress else None,
             "client": client,
-            "experimental_options": (
-                {"vm_runtime": True} if self._config.runtime == "vm" else {"enable_docker": True}
-            ),
+            "runtime": self._config.runtime,
+            "experimental_options": {"enable_docker": True} if self._config.runtime == "gvisor" else None,
         }
         if request.volumes:
             create_kwargs["volumes"] = self._resolve_volumes(request.volumes, client, request.labels)

@@ -630,6 +630,7 @@ async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> N
     assert captured["block_network"] is False
     assert captured["outbound_cidr_allowlist"] == ["0.0.0.0/0"]
     assert captured["outbound_domain_allowlist"] == ["*"]
+    assert captured["runtime"] == "gvisor"
     assert captured["experimental_options"] == {"enable_docker": True}
     assert captured["gpu"] is None
 
@@ -646,7 +647,8 @@ async def test_create_sandbox_uses_vm_runtime(monkeypatch: pytest.MonkeyPatch) -
 
     await provider.create_sandbox(_request())
 
-    assert captured["experimental_options"] == {"vm_runtime": True}
+    assert captured["runtime"] == "vm"
+    assert captured["experimental_options"] is None
 
 
 async def test_create_sandbox_maps_gpu_request(monkeypatch: pytest.MonkeyPatch) -> None:

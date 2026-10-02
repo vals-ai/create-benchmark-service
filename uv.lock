@@ -513,7 +513,7 @@ requires-dist = [
     { name = "fastapi", extras = ["standard-no-fastapi-cloud-cli"], specifier = ">=0.135.3" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "jinja2", specifier = ">=3.1.6" },
-    { name = "modal", specifier = ">=1.5.2" },
+    { name = "modal", specifier = ">=1.6.0" },
     { name = "opentelemetry-api", specifier = ">=1.20.0" },
     { name = "pydantic", specifier = ">=2.12" },
     { name = "pyyaml", specifier = ">=6.0.2" },
@@ -1190,7 +1190,7 @@ wheels = [
 
 [[package]]
 name = "modal"
-version = "1.5.2"
+version = "1.6.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -1207,9 +1207,9 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "watchfiles" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b8/e6/44f609084472d16a3acf7748c184e23d3009944eed5860e855aaafc61065/modal-1.5.2.tar.gz", hash = "sha256:ac0d2983ecccacb80c54385906404d75f37a3751f1374c750974cd7853c0008a", size = 818040, upload-time = "2026-07-10T18:12:55.164Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/3a/e5/eb665f233679ed6cde1b24a7daa68b14eec02cb25046983426145fd3d32c/modal-1.6.0.tar.gz", hash = "sha256:c5dd551b5e0a283f3c764476c0a4ebe5bdef1e4a69432fa27e1b1ad8ca5e0817", size = 936653, upload-time = "2026-09-29T01:17:11.866Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e3/fe/7e284d889eb3ea2c307e48828eccdd9a984beb2e096bce5577ef796592e9/modal-1.5.2-py3-none-any.whl", hash = "sha256:7508a44f8742c6f26be4d28da71f46092ef3bcc07d0f27cbd0ea8c9d6d9fc873", size = 932258, upload-time = "2026-07-10T18:12:52.219Z" },
+    { url = "https://files.pythonhosted.org/packages/04/64/7ed6259ab64f18c65fa5136b89054a7ecdfb2fc3ac325e61883af1c16b8f/modal-1.6.0-py3-none-any.whl", hash = "sha256:2f5981ba656570ad96379d29f0ddff876880708c84966024ce130e9e1794fa68", size = 1057597, upload-time = "2026-09-29T01:17:09.043Z" },
 ]
 
 [[package]]

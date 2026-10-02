@@ -215,7 +215,7 @@ command as one generation interval. `"valkyrie-stage/1"` selects benchmark-owned
 Tracker alone arbitrates the cumulative `B + C` budget across intervals, while setup, evaluation,
 and gaps between intervals do not debit it. This does not select a containment provider.
 
-For reporting benchmarks, Tracker gives the outer agent-command process
+For reporting benchmarks, Tracker gives the outer controlled workload (agent command or episode orchestrator)
 `VALKYRIE_STAGE_DIR=/run/valkyrie-stage`. The sandbox-private directory contains a 64-hex-character
 `key` and an initially empty `ack/` directory. During `setup_task`, upload the bytes from
 `benchmark_service.valkyrie_stage_source()` as `valkyrie_stage.py` and import `StageReporter`
@@ -228,7 +228,7 @@ stage protocol.
 before launching that model-capable container. `end()` reports the same container only
 after confirmed absence of the container and its nested workload; it blocks until ACK before
 evaluation or the next round. `container` is the Docker container name, or `None` for a
-workload in the outer agent-command process tree. To separate a frame from preceding output
+workload in the outer controlled-workload process tree. To separate a frame from preceding output
 without a final newline, the reporter emits `\nVALKYRIE-STAGE/1 <payload> <mac>\n`;
 the stage frame itself is `VALKYRIE-STAGE/1 <payload> <mac>\n`, where `payload` is unpadded base64url of compact
 ASCII JSON `{"seq":<int>,"event":"begin"|"end","container":<str|null>}`;
@@ -269,9 +269,10 @@ and starts each selected-agent turn in a new process group. The bundle renders `
 observation file, `{slot_dir}` to `<slots_root>/<slot>`, and `{container_name}` to `container_name` with `{slot}`
 filled first. The orchestrator names slots and shares one workspace and budget across them; each slot has separate
 runtime/session/output state. More than `parallel_agents` live turns are refused. A second turn on a slot requires
-`continue_cmd`. Children inherit the orchestrator's cwd, environment, stdout and stderr. When the bundle's
-`final_output` directory exists, each completed turn copies it to `<slot_dir>/turns/<n>/` before END; `n` starts
-at 1 per slot. Tracker archives `slots_root` as the episode output, keeping every turn distinct.
+`continue_cmd`. Children inherit the orchestrator's cwd, environment, stdout and stderr. After a turn's
+process group and any container are absent, the last active turn sends END and waits for its ACK before copying
+the bundle's existing `final_output` file or directory into `<slot_dir>/turns/<n>/`. A file keeps its basename;
+`n` starts at 1 per slot. Tracker archives `slots_root` as the episode output, keeping every turn distinct.
 
 Upload `valkyrie_stage_source()` as `valkyrie_stage.py` during setup and import `Agents` there:
 

@@ -1,6 +1,7 @@
 """Standalone stage reporting and episode agent orchestration for sandbox upload."""
 
 import base64
+import ctypes
 import hashlib
 import hmac
 import json
@@ -78,6 +79,8 @@ class Agents:
         self._final_output: Path | None = Path(config["final_output"]) if config["final_output"] is not None else None
         self._parallel_agents: int = config["parallel_agents"]
         self._slots_root = Path(config["slots_root"])
+        if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) != 0:
+            raise OSError(ctypes.get_errno(), "PR_SET_CHILD_SUBREAPER")
         self._lock = threading.RLock()
         self._reporter = StageReporter()
         self._active: dict[str, _RunningSlot] = {}
@@ -131,7 +134,10 @@ class Agents:
         if self._interrupt_grace_seconds is not None:
             self._signal_group(running.process.pid, signal.SIGINT)
             deadline = time.monotonic() + self._interrupt_grace_seconds
-            while running.process.poll() is None and time.monotonic() < deadline:
+            while time.monotonic() < deadline:
+                running.process.poll()
+                if self._group_empty(running.process.pid):
+                    break
                 if (self._stage_dir / "exhausted").exists():
                     self._exhaust_all()
                     return self._take(slot)
@@ -170,15 +176,30 @@ class Agents:
         except ProcessLookupError:
             pass  # An exited group is already absent.
 
+    @staticmethod
+    def _group_empty(pgid: int) -> bool:
+        empty = True
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdecimal():
+                continue
+            try:
+                stat = (entry / "stat").read_text()
+            except FileNotFoundError:
+                continue  # Process exited during the scan.
+            state, parent, group, _ = stat.rpartition(") ")[2].split(" ", 3)
+            if int(group) != pgid:
+                continue
+            if state == "Z" and int(parent) == os.getpid():
+                if os.waitpid(int(entry.name), os.WNOHANG)[0] != 0:
+                    continue
+            empty = False
+        return empty
+
     def _complete(self, slot: str, reason: Literal["exited", "stopped", "exhausted"]) -> None:
         running = self._active[slot]
         self._signal_group(running.process.pid, signal.SIGKILL)
         exit_code = running.process.wait()
-        while True:
-            try:
-                os.killpg(running.process.pid, 0)
-            except ProcessLookupError:
-                break
+        while not self._group_empty(running.process.pid):
             time.sleep(0.1)
 
         if running.container is not None:
@@ -192,16 +213,20 @@ class Agents:
             if running.container in listed.stdout.splitlines():
                 raise RuntimeError(f"container {running.container!r} is still present")
 
-        if self._final_output is not None and self._final_output.exists():
-            turn_dir = self._slots_root / slot / "turns" / str(self._turns[slot])
-            turn_dir.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copytree(self._final_output, turn_dir)
-
         del self._active[slot]
         if not self._active:
             self._reporter.end()
             if (self._stage_dir / "exhausted").exists():
                 self._exhausted = True
+
+        if self._final_output is not None and self._final_output.exists():
+            turn_dir = self._slots_root / slot / "turns" / str(self._turns[slot])
+            turn_dir.parent.mkdir(parents=True, exist_ok=True)
+            if self._final_output.is_dir():
+                shutil.copytree(self._final_output, turn_dir)
+            else:
+                turn_dir.mkdir()
+                shutil.copy2(self._final_output, turn_dir / self._final_output.name)
         self._finished.append(SlotResult(slot, reason, exit_code))
 
     def _take(self, slot: str) -> SlotResult:

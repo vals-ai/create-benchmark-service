@@ -104,7 +104,7 @@ class Agents:
         if len(self._active) >= self._parallel_agents:
             raise ValueError("parallel_agents limit reached")
 
-        slot_dir = self._slots_root / slot
+        slot_dir = self._slots_root / slot / "agent"
         slot_dir.mkdir(parents=True, exist_ok=True)
         container = self._container_template.format(slot=slot) if self._container_template is not None else None
         if slot in self._turns:
@@ -199,8 +199,10 @@ class Agents:
             state, parent, group, _ = stat.rpartition(") ")[2].split(" ", 3)
             if int(group) != pgid:
                 continue
-            if state == "Z" and int(parent) == os.getpid():
-                if os.waitpid(int(entry.name), os.WNOHANG)[0] != 0:
+            if state == "Z":
+                if int(entry.name) == pgid:
+                    continue  # Popen owns the direct child's exit status.
+                if int(parent) == os.getpid() and os.waitpid(int(entry.name), os.WNOHANG)[0] != 0:
                     continue
             empty = False
         return empty
@@ -233,16 +235,7 @@ class Agents:
             turn_dir = self._slots_root / slot / "turns" / str(self._turns[slot])
             turn_dir.parent.mkdir(parents=True, exist_ok=True)
             if running.final_output.is_dir():
-                slot_dir = self._slots_root / slot
-
-                def ignore_turns(directory: str, names: list[str]) -> set[str]:
-                    return {"turns"} if Path(directory) == slot_dir and "turns" in names else set()
-
-                shutil.copytree(
-                    running.final_output,
-                    turn_dir,
-                    ignore=ignore_turns if running.final_output in turn_dir.parents else None,
-                )
+                shutil.copytree(running.final_output, turn_dir)
             else:
                 turn_dir.mkdir()
                 shutil.copy2(running.final_output, turn_dir / running.final_output.name)

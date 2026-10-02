@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -71,16 +72,16 @@ class Agents:
         self._stage_dir = Path(os.environ["VALKYRIE_STAGE_DIR"])
         config = json.loads((self._stage_dir / "agent.json").read_text())
         self._run_cmd: str = config["run_cmd"]
-        turns = config["turns"]
-        self._continue_cmd: str | None = turns["continue_cmd"]
-        self._interrupt_grace_seconds: float = turns["interrupt_grace_seconds"]
-        self._container_template: str | None = turns["container_name"]
+        self._continue_cmd: str | None = config["continue_cmd"]
+        self._interrupt_grace_seconds: float | None = config["interrupt_grace_seconds"]
+        self._container_template: str | None = config["container_name"]
+        self._final_output: Path | None = Path(config["final_output"]) if config["final_output"] is not None else None
         self._parallel_agents: int = config["parallel_agents"]
         self._slots_root = Path(config["slots_root"])
         self._lock = threading.RLock()
         self._reporter = StageReporter()
         self._active: dict[str, _RunningSlot] = {}
-        self._started: set[str] = set()
+        self._turns: dict[str, int] = {}
         self._finished: deque[SlotResult] = deque()
         self._exhausted = False
 
@@ -100,7 +101,7 @@ class Agents:
         slot_dir = self._slots_root / slot
         slot_dir.mkdir(parents=True, exist_ok=True)
         container = self._container_template.format(slot=slot) if self._container_template is not None else None
-        if slot in self._started:
+        if slot in self._turns:
             if self._continue_cmd is None:
                 raise ValueError(f"slot {slot!r} has no continue_cmd")
             template = self._continue_cmd
@@ -118,7 +119,7 @@ class Agents:
                 raise Exhausted
         process = subprocess.Popen(["sh", "-c", command], start_new_session=True)
         self._active[slot] = _RunningSlot(process, container)
-        self._started.add(slot)
+        self._turns[slot] = self._turns.get(slot, 0) + 1
 
     def stop(self, slot: str) -> SlotResult:
         with self._lock:
@@ -127,13 +128,14 @@ class Agents:
     def _stop(self, slot: str) -> SlotResult:
         self._collect()
         running = self._active[slot]
-        self._signal_group(running.process.pid, signal.SIGINT)
-        deadline = time.monotonic() + self._interrupt_grace_seconds
-        while running.process.poll() is None and time.monotonic() < deadline:
-            if (self._stage_dir / "exhausted").exists():
-                self._exhaust_all()
-                return self._take(slot)
-            time.sleep(0.1)
+        if self._interrupt_grace_seconds is not None:
+            self._signal_group(running.process.pid, signal.SIGINT)
+            deadline = time.monotonic() + self._interrupt_grace_seconds
+            while running.process.poll() is None and time.monotonic() < deadline:
+                if (self._stage_dir / "exhausted").exists():
+                    self._exhaust_all()
+                    return self._take(slot)
+                time.sleep(0.1)
         self._complete(slot, "stopped")
         return self._take(slot)
 
@@ -189,6 +191,11 @@ class Agents:
             )
             if running.container in listed.stdout.splitlines():
                 raise RuntimeError(f"container {running.container!r} is still present")
+
+        if self._final_output is not None and self._final_output.exists():
+            turn_dir = self._slots_root / slot / "turns" / str(self._turns[slot])
+            turn_dir.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copytree(self._final_output, turn_dir)
 
         del self._active[slot]
         if not self._active:

@@ -263,13 +263,15 @@ code may assert a generation credit.
 An opt-in episode declares `RetrieveTaskResponse.episode = Episode(command="exec python /opt/bench/orchestrator.py", parallel_agents=5)`.
 It requires `credited_generation` with `stage_protocol="valkyrie-stage/1"`; without `episode`, ordinary task execution is unchanged.
 Tracker runs the benchmark-owned `episode.command` instead of the agent command and writes the selected agent bundle to
-`$VALKYRIE_STAGE_DIR/agent.json` after setup: `run_cmd`, `turns` (`continue_cmd`, `interrupt_grace_seconds`,
-`container_name`), `parallel_agents`, and `slots_root`. The library reads this file, owns a single `StageReporter`, and
-starts each selected-agent turn in a new process group. The bundle renders `{problem_statement_path}` to that turn's
+`$VALKYRIE_STAGE_DIR/agent.json` after setup: `run_cmd`, `continue_cmd`, `interrupt_grace_seconds`,
+`container_name`, `final_output`, `parallel_agents`, and `slots_root`. The library owns a single `StageReporter`
+and starts each selected-agent turn in a new process group. The bundle renders `{problem_statement_path}` to that turn's
 observation file, `{slot_dir}` to `<slots_root>/<slot>`, and `{container_name}` to `container_name` with `{slot}`
 filled first. The orchestrator names slots and shares one workspace and budget across them; each slot has separate
 runtime/session/output state. More than `parallel_agents` live turns are refused. A second turn on a slot requires
-`continue_cmd`. Children inherit the orchestrator's cwd, environment, stdout and stderr.
+`continue_cmd`. Children inherit the orchestrator's cwd, environment, stdout and stderr. When the bundle's
+`final_output` directory exists, each completed turn copies it to `<slot_dir>/turns/<n>/` before END; `n` starts
+at 1 per slot. Tracker archives `slots_root` as the episode output, keeping every turn distinct.
 
 Upload `valkyrie_stage_source()` as `valkyrie_stage.py` during setup and import `Agents` there:
 
@@ -280,7 +282,7 @@ agents = Agents()
 agents.start("first", "/workspace/observations/first.txt")
 result = agents.wait_any()  # SlotResult(slot, reason, exit_code)
 agents.start("first", "/workspace/observations/next.txt")  # Requires continue_cmd.
-result = agents.stop("first")  # SIGINT grace, then SIGKILL and confirmed absence.
+result = agents.stop("first")  # SIGINT grace (or immediate SIGKILL for null), then confirmed absence.
 ```
 
 `start` reports BEGIN and waits for ACK before spawning the first slot; the last slot completes only after its

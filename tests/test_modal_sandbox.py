@@ -211,12 +211,6 @@ def _request(
     )
 
 
-@pytest.fixture(autouse=True)
-def reset_create_limiter(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(modal_module, "_create_limiter", None)
-    monkeypatch.setenv(modal_module._CREATES_PER_SECOND_ENV, "100000")
-
-
 def _provider(monkeypatch: pytest.MonkeyPatch, sdk_sandbox: Any) -> ModalSandboxProvider:
     client = SimpleNamespace(_close=_aio(_noop))
     app = SimpleNamespace(app_id="ap-1")
@@ -630,6 +624,7 @@ async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> N
     assert captured["block_network"] is False
     assert captured["outbound_cidr_allowlist"] == ["0.0.0.0/0"]
     assert captured["outbound_domain_allowlist"] == ["*"]
+    assert captured["runtime"] == "gvisor"
     assert captured["experimental_options"] == {"enable_docker": True}
     assert captured["gpu"] is None
 
@@ -646,7 +641,8 @@ async def test_create_sandbox_uses_vm_runtime(monkeypatch: pytest.MonkeyPatch) -
 
     await provider.create_sandbox(_request())
 
-    assert captured["experimental_options"] == {"vm_runtime": True}
+    assert captured["runtime"] == "vm"
+    assert captured["experimental_options"] is None
 
 
 async def test_create_sandbox_maps_gpu_request(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -928,113 +924,11 @@ async def test_create_sandbox_reuses_running_sandbox_with_same_name(monkeypatch:
     assert created == []
 
 
-async def test_create_rate_limiter_spaces_bursts_evenly() -> None:
-    limiter = modal_module._CreateRateLimiter(per_second=50)
-
-    started = time.monotonic()
-    await asyncio.gather(*(limiter.acquire() for _ in range(6)))
-    elapsed = time.monotonic() - started
-
-    # Six creates at 50/s: the last slot is 5 intervals (100ms) after the first.
-    assert 0.09 <= elapsed < 1.0
-
-
-async def test_create_rate_limiter_does_not_bank_idle_time() -> None:
-    limiter = modal_module._CreateRateLimiter(per_second=20)
-
-    await limiter.acquire()
-    await asyncio.sleep(0.2)  # idle for four intervals
-    started = time.monotonic()
-    await asyncio.gather(limiter.acquire(), limiter.acquire())
-    elapsed = time.monotonic() - started
-
-    # First call is immediate; the second still waits one interval (no burst credit).
-    assert 0.04 <= elapsed < 0.5
-
-
-async def test_create_rate_limiter_cancelled_waiters_leave_no_hole() -> None:
-    limiter = modal_module._CreateRateLimiter(per_second=2)
-
-    await limiter.acquire()  # sets the next slot 0.5s out
-    waiters = [asyncio.create_task(limiter.acquire()) for _ in range(5)]
-    await asyncio.sleep(0)  # let them queue up behind the lock
-    for waiter in waiters:
-        waiter.cancel()
-    await asyncio.gather(*waiters, return_exceptions=True)
-
-    started = time.monotonic()
-    await limiter.acquire()
-    elapsed = time.monotonic() - started
-
-    # Only the first release counts: one interval to wait, not six.
-    assert elapsed < 0.6
-
-
-def test_create_rate_limiter_reads_env_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(modal_module._CREATES_PER_SECOND_ENV, "4")
-    first = modal_module._create_rate_limiter()
-    monkeypatch.setenv(modal_module._CREATES_PER_SECOND_ENV, "1")
-
-    assert modal_module._create_rate_limiter() is first
-    assert first._interval == 0.25
-
-
-def test_create_rate_limiter_defaults_when_env_unset(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(modal_module._CREATES_PER_SECOND_ENV)
-
-    limiter = modal_module._create_rate_limiter()
-
-    assert limiter._interval == 1 / modal_module._DEFAULT_CREATES_PER_SECOND
-
-
-@pytest.mark.parametrize("value", ["0", "-1"])
-def test_create_rate_limiter_rejects_non_positive_rate(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
-    monkeypatch.setenv(modal_module._CREATES_PER_SECOND_ENV, value)
-
-    with pytest.raises(ValueError, match=modal_module._CREATES_PER_SECOND_ENV):
-        modal_module._create_rate_limiter()
-
-
-async def test_create_sandbox_takes_a_rate_limit_slot_only_for_real_creates(monkeypatch: pytest.MonkeyPatch) -> None:
-    acquired = 0
-
-    async def acquire(self: Any) -> None:
-        nonlocal acquired
-        acquired += 1
-
-    monkeypatch.setattr(modal_module._CreateRateLimiter, "acquire", acquire)
-    running = FakeInnerSandbox(object_id="sb-existing")
-    names = iter(["task-1"])
-
-    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
-        return FakeInnerSandbox(object_id="sb-new")
-
-    async def from_name(app_name: str, name: str, **kwargs: Any) -> FakeInnerSandbox:
-        if next(names, None) is None:
-            raise ModalNotFoundError("no sandbox with that name")
-        return running
-
-    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create), from_name=_aio(from_name)))
-
-    reused = await provider.create_sandbox(_request())
-    created = await provider.create_sandbox(_request())
-
-    assert (reused.id, created.id) == ("sb-existing", "sb-new")
-    assert acquired == 1
-
-
 async def test_create_sandbox_retries_rate_limited_creates_with_backoff(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(modal_module, "_RATE_LIMIT_RETRY_BASE_SECONDS", 0.01)
     monkeypatch.setattr(modal_module, "_RATE_LIMIT_RETRY_MAX_SECONDS", 0.02)
-    acquired = 0
-
-    async def acquire(self: Any) -> None:
-        nonlocal acquired
-        acquired += 1
-
-    monkeypatch.setattr(modal_module._CreateRateLimiter, "acquire", acquire)
     attempts = 0
 
     async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
@@ -1049,8 +943,7 @@ async def test_create_sandbox_retries_rate_limited_creates_with_backoff(
     sandbox = await provider.create_sandbox(_request())
 
     assert sandbox.id == "sb-new"
-    # Every attempt is a real create RPC, so each one takes a pacer slot.
-    assert (attempts, acquired) == (3, 3)
+    assert attempts == 3
 
 
 async def test_create_sandbox_gives_up_on_rate_limit_at_create_timeout(
@@ -1074,29 +967,6 @@ async def test_create_sandbox_gives_up_on_rate_limit_at_create_timeout(
     # Attempt at t=0, sleep 0.6, attempt at t=0.6, then 0.6 + 1.2 >= 1 so no third attempt.
     assert attempts == 2
     assert time.monotonic() - started < 1.5
-
-
-async def test_create_sandbox_timeout_covers_pacer_wait(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def acquire(self: Any) -> None:
-        await asyncio.sleep(5)
-
-    monkeypatch.setattr(modal_module._CreateRateLimiter, "acquire", acquire)
-    attempts = 0
-
-    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
-        nonlocal attempts
-        attempts += 1
-        return FakeInnerSandbox()
-
-    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
-    request = _request().model_copy(update={"create_timeout": 1})
-
-    started = time.monotonic()
-    with pytest.raises(SandboxError, match="Failed to create Modal sandbox within 1s"):
-        await provider.create_sandbox(request)
-
-    assert attempts == 0
-    assert time.monotonic() - started < 2
 
 
 async def test_create_sandbox_ignores_finished_sandbox_with_same_name(monkeypatch: pytest.MonkeyPatch) -> None:

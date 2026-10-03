@@ -5,7 +5,6 @@ import hashlib
 import os
 import re
 import shlex
-import time
 from collections.abc import AsyncGenerator, Awaitable, Mapping
 from typing import Any, Literal, cast
 
@@ -50,14 +49,6 @@ _COMMAND_STATUS_POLL_SECONDS = 10
 _MAX_NAME_LENGTH = 64
 _INVALID_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_.-]")
 _APP_ID_PATTERN = re.compile(r"^ap-[a-zA-Z0-9]{22}$")
-# Modal admits five sandbox creates per second per workspace (plus a burst
-# allowance), shared by every process that creates them (tracker executors,
-# service verifiers). The pacer keeps one process from spiking past the refill
-# rate; when several processes exhaust the burst together, Modal rejects some
-# creates outright with no retry hint, so those are retried here with backoff
-# for as long as the request's create_timeout allows.
-_CREATES_PER_SECOND_ENV = "MODAL_SANDBOX_CREATES_PER_SECOND"
-_DEFAULT_CREATES_PER_SECOND = 5.0
 _RATE_LIMIT_RETRY_BASE_SECONDS = 1.0
 _RATE_LIMIT_RETRY_MAX_SECONDS = 10.0
 
@@ -100,42 +91,6 @@ class ModalProviderConfig(BaseModel):
 
     def create_provider(self) -> SandboxProvider:
         return ModalSandboxProvider(self)
-
-
-class _CreateRateLimiter:
-    """Space sandbox creates evenly at a fixed rate.
-
-    Callers are released one at a time in arrival order, each at least one
-    interval after the previous release, so a burst of N creates spreads over
-    N / per_second seconds instead of landing at once. Only a release claims
-    the schedule: a caller cancelled while waiting leaves no hole behind.
-    Process-wide: one instance covers every provider.
-    """
-
-    def __init__(self, per_second: float) -> None:
-        if per_second <= 0:
-            raise ValueError(f"{_CREATES_PER_SECOND_ENV} must be > 0")
-        self._interval = 1 / per_second
-        self._next_slot = 0.0
-        self._lock = asyncio.Lock()
-
-    async def acquire(self) -> None:
-        async with self._lock:
-            delay = self._next_slot - time.monotonic()
-            if delay > 0:
-                await asyncio.sleep(delay)
-            self._next_slot = time.monotonic() + self._interval
-
-
-_create_limiter: _CreateRateLimiter | None = None
-
-
-def _create_rate_limiter() -> _CreateRateLimiter:
-    global _create_limiter
-    if _create_limiter is None:
-        per_second = float(os.environ.get(_CREATES_PER_SECOND_ENV) or _DEFAULT_CREATES_PER_SECOND)
-        _create_limiter = _CreateRateLimiter(per_second)
-    return _create_limiter
 
 
 def _sandbox_error(exc: ModalError) -> SandboxError:
@@ -582,10 +537,8 @@ class ModalSandboxProvider(SandboxProvider):
         deadline = loop.time() + request.create_timeout
         retry_delay = _RATE_LIMIT_RETRY_BASE_SECONDS
         try:
-            # create_timeout covers pacer waits and rate-limit retries too, not just the create RPC.
             async with asyncio.timeout_at(deadline):
                 while True:
-                    await _create_rate_limiter().acquire()
                     try:
                         # No entrypoint args: an argless Modal sandbox idles until timeout.
                         inner = await ModalSdkSandbox.create.aio(**create_kwargs)  # pyright: ignore[reportUnknownMemberType]

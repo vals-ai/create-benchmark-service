@@ -24,6 +24,7 @@ from benchmark_service.vals.allowlist import (
     ALLOWLIST_CACHE_MAX_SIZE,
     DESCOPE_API_KEY_HEADER,
     CatalogAllowlistClient,
+    CatalogUnavailable,
     EvaluationQuotaConfig as EvaluationQuotaConfig,
     EvaluationQuotaPeriod as EvaluationQuotaPeriod,
     TenantConfig,
@@ -118,10 +119,20 @@ async def _fetch_api_tenant_config(access_key: str, tenant: str) -> TenantConfig
     client = _get_catalog_client()
     if client is None:
         return None
-    config = await client.get_tenant_config(access_key, tenant)
-    if config is not None:
-        _request_tenant_config.set((tenant, config))
-    return config
+    try:
+        async with asyncio.timeout(15):
+            for attempt in range(3):
+                try:
+                    config = await client.get_tenant_config(access_key, tenant)
+                    if config is not None:
+                        _request_tenant_config.set((tenant, config))
+                    return config
+                except CatalogUnavailable:
+                    if attempt == 2:
+                        raise
+    except TimeoutError as error:
+        raise CatalogUnavailable("Benchmark catalog is unavailable") from error
+    raise AssertionError("Catalog retry loop did not return")
 
 
 def load_allowlist() -> AllowlistConfig:

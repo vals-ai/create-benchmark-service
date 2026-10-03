@@ -11,7 +11,7 @@ from urllib.parse import quote
 import httpx
 from cachetools import TTLCache
 from pydantic import BaseModel, ConfigDict, Field, PositiveInt
-from tenacity import retry, retry_if_exception_type, retry_if_result, stop_after_attempt, wait_random_exponential
+from tenacity import RetryError, retry, retry_if_exception_type, retry_if_result, stop_after_attempt, wait_random_exponential
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +77,10 @@ class _NonClosingTransport(httpx.AsyncBaseTransport):
 
 def _transient_catalog_response(response: httpx.Response) -> bool:
     return response.status_code in (408, 429) or 500 <= response.status_code < 600
+
+
+class CatalogUnavailable(Exception):
+    """The catalog could not return an authorization decision."""
 
 
 class CatalogAllowlistClient:
@@ -148,7 +152,7 @@ class CatalogAllowlistClient:
             return await self._client.get(self.endpoint, headers={DESCOPE_API_KEY_HEADER: access_key})
 
     async def get_tenant_config(self, access_key: str, tenant: str) -> TenantConfig | None:
-        """Fetch a tenant policy, returning ``None`` for misses or failures."""
+        """Fetch a tenant policy, returning ``None`` for explicit denials."""
         cached = self._cache.get(tenant)
         if cached is not None:
             return cached
@@ -156,9 +160,8 @@ class CatalogAllowlistClient:
         try:
             async with asyncio.timeout(self._request_timeout):
                 response = await self._fetch_policy(access_key)
-        except Exception:
-            logger.warning("Failed to fetch tenant policy from benchmark catalog API", exc_info=True)
-            return None
+        except (TimeoutError, httpx.TransportError, RetryError) as error:
+            raise CatalogUnavailable("Benchmark catalog is unavailable") from error
 
         if response.status_code != 200:
             logger.warning("Benchmark catalog API returned status %s", response.status_code)
@@ -166,13 +169,11 @@ class CatalogAllowlistClient:
 
         try:
             payload = _CatalogAllowlistResponse.model_validate(response.json())
-        except Exception:
-            logger.warning("Benchmark catalog API returned a malformed tenant policy", exc_info=True)
-            return None
+        except ValueError as error:
+            raise CatalogUnavailable("Benchmark catalog returned a malformed tenant policy") from error
 
         if payload.name != self.service_name:
-            logger.warning("Benchmark catalog API returned policy for unexpected service %s", payload.name)
-            return None
+            raise CatalogUnavailable("Benchmark catalog returned a policy for another service")
 
         config = TenantConfig(
             datasets=payload.datasets,

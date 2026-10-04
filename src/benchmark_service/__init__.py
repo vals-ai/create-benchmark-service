@@ -3,6 +3,7 @@
 from benchmark_service._version import __version__
 from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.base import BenchmarkService
+from benchmark_service.dataset_export import write_harbor_split
 from benchmark_service.context import current_sandbox_provider, sandbox_provider_scope
 from benchmark_service.client import (
     BenchmarkServiceClient,
@@ -62,6 +63,7 @@ __all__ = [
     "ResolveDatasetResponse",
     "BenchmarkServiceApp",
     "BenchmarkService",
+    "write_harbor_split",
     "current_sandbox_provider",
     "BenchmarkServiceUnauthenticatedError",
     "BenchmarkServiceClient",

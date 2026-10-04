@@ -24,6 +24,7 @@ dependencies = [
 
 [project.scripts]
 create-benchmark-service = "cli.cli:main"
+benchmark-service = "cli.cli:service"
 
 [project.optional-dependencies]
 vals-ai = [

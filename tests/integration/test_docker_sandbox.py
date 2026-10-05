@@ -92,6 +92,38 @@ async def test_docker_commands_and_binary_files(docker_sandbox: Sandbox) -> None
     assert result.output == "payload"
 
 
+async def test_docker_controlled_natural_status_stream_and_tail(docker_sandbox: Sandbox) -> None:
+    await docker_sandbox.probe_generation_containment()
+    workload = docker_sandbox.controlled_workload(
+        "printf '\\316'; sleep 0.05; printf '\\261'; printf ' stderr' >&2; exit 7",
+        env_vars={"CUSTOM": "present"},
+    )
+    output = "".join([part async for part in workload.output()])
+    result = await workload.wait()
+    assert result.result.exit_code == 7
+    assert output == result.result.output == "α stderr"
+    assert result.absence_confirmed_at <= asyncio.get_running_loop().time()
+
+    large = docker_sandbox.controlled_workload("head -c 80000 /dev/zero | tr '\\000' x")
+    tail = await large.wait()
+    assert tail.result.exit_code == 0
+    assert tail.result.output == "x" * (64 * 1024)
+    assert (await docker_sandbox.exec("printf collection")).output == "collection"
+
+
+async def test_docker_controlled_early_kill_unblocks_reader_and_keeps_container(docker_sandbox: Sandbox) -> None:
+    workload = docker_sandbox.controlled_workload("(sleep 3; touch /tmp/controlled-child-survived) & sleep 3")
+    reader = asyncio.create_task(anext(workload.output(), None))
+    await asyncio.wait_for(workload.kill(), timeout=5)
+    await workload.kill()
+    assert await asyncio.wait_for(reader, timeout=5) is None
+    result = await asyncio.wait_for(workload.wait(), timeout=5)
+    assert result.result.exit_code != 0
+    assert result.absence_confirmed_at <= asyncio.get_running_loop().time()
+    assert (await docker_sandbox.exec("test ! -e /tmp/controlled-child-survived")).exit_code == 0
+    assert (await docker_sandbox.exec("printf collection")).output == "collection"
+
+
 async def test_docker_timeout_and_cancel_kill_commands(docker_sandbox: Sandbox) -> None:
     """Stop command process groups on timeout and caller cancellation."""
     stream = docker_sandbox.command("echo ready; sleep 2; touch /tmp/timed-out", timeout=0.2)

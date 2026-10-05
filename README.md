@@ -185,7 +185,9 @@ must delete containers after use and reconcile abandoned containers after restar
 and deletion include only containers marked as managed by this provider.
 
 Commands stream output and preserve exit codes. Timeouts and cancelled streams terminate
-the command's process group. File upload and download support binary data. Network access
+the command's process group. Controlled workloads use a separate process group inside the
+same local task container; group stop leaves that container available for collection and
+evaluation. File upload and download support binary data. Network access
 can be disabled only at creation with `network_block_all`. `modify_egress_rules`, `block_all_egress`
 and `clear_egress_rules` raise `SandboxError`, so egress allowlists and staged egress policies fail
 on Docker sandboxes (#182). Docker also
@@ -326,11 +328,12 @@ main service and sidecars running for collection and evaluation. The effective s
 needs `/bin/sh`, `setsid`, shell group signaling, a writable `/tmp`, and `/proc` process
 status; the probe checks session creation, marker write/removal, and proc visibility before launch.
 
-Native Modal also advertises `linux_process_group` v1, probes the same group boundary,
-and runs controlled commands through its own provider process transport. Stop targets the
-workload group, not the reusable Modal sandbox (including the selected VM runtime).
-Confirmation covers live members of the marked process group in the same PID namespace;
-it does not cover independently detached processes or Docker-daemon-owned descendants.
+Native Modal and local Docker also advertise `linux_process_group` v1, probe the same group
+boundary, and run controlled commands through their own provider process transports. Stop
+targets the workload group, not the reusable Modal sandbox (including the selected VM runtime)
+or local Docker task container. Confirmation covers live members of the marked process group
+in the same PID namespace; it does not cover independently detached processes or
+Docker-daemon-owned descendants.
 
 Consume `workload.output()` for streamed text. `await workload.wait()` returns
 `ControlledWorkloadResult(result=ExecResult(exit_code, output), absence_confirmed_at=...)`
@@ -339,8 +342,8 @@ after its backend-specific stop boundary is confirmed. On a deadline or other ab
 cannot be confirmed. The timestamp is event-loop monotonic time, not a wall-clock
 datetime. The caller owns deadline arbitration and must not proceed to independent
 collection on unconfirmed stop. Ordinary `Sandbox.command()` and `Sandbox.exec()`
-do not provide this contract. On native Modal, `result.output` is a bounded tail;
-consume `workload.output()` while running for the full stream.
+do not provide this contract. On native Modal and local Docker, `result.output` is a bounded
+tail; consume `workload.output()` while running for the full stream.
 
 Process containment is separate from `BenchmarkEgressPlan`: setup, run, and evaluation egress
 policies control network access at their respective stages, not whether generation descendants
@@ -527,7 +530,7 @@ result = await client.run_with_sandbox_recovery(
 Pydantic models used across requests and responses:
 
 - **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, optional `CreditedGeneration(allowance_seconds, stage_protocol)`, optional `Episode(command, parallel_agents)`, `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
-- **`GenerationContainment`** — effective-sandbox capability: `linux_pid_namespace` v1 for direct Daytona or `linux_process_group` v1 for Compose service and native Modal workloads. Tracker probes the effective sandbox for every task before its `ControlledWorkload` and does not fall back to `Sandbox.command()` on unsupported providers.
+- **`GenerationContainment`** — effective-sandbox capability: `linux_pid_namespace` v1 for direct Daytona or `linux_process_group` v1 for Compose service, native Modal, and local Docker workloads. Tracker probes the effective sandbox for every task before its `ControlledWorkload` and does not fall back to `Sandbox.command()` on unsupported providers.
 - **`agent_install_order`** — `"before_setup"` installs agent dependencies before benchmark setup; `"after_setup"` lets setup prepare the environment first. It defaults to `"before_setup"`, so older task responses remain valid; lifecycle execution is the caller's responsibility.
 - **`BenchmarkEgressPlan`** — declarative `setup_task`, agent `run`, and `evaluation` policies. `"*"` is unrestricted, `[]` is deny-all, and a non-empty list is an allowlist. Setup and evaluation default to `"*"`; `run=None` means the benchmark has no run-policy opinion, preserving legacy task behavior. Applying and composing the plan is the caller's responsibility.
 - **`SandboxRecoveryPolicy`** — explicit opt-in to recreate a lost generation sandbox with the same run identity and volumes; `max_sandbox_attempts` (2–20, inclusive) includes the initial sandbox

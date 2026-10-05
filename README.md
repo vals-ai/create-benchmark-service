@@ -208,15 +208,25 @@ from benchmark_service import CreditedGeneration
 credited_generation = CreditedGeneration(allowance_seconds=5 * 60 * 60, stage_protocol="valkyrie-stage/1")
 ```
 
-`RetrieveTaskResponse.credited_generation` is `None` by default (ordinary execution).
-Opt-in supplies the positive, finite base allowance `B` in seconds; `agent_timeout` remains
-published envelope metadata, not this budget. `stage_protocol=None` charges the whole agent
-command as one generation interval. `"valkyrie-stage/1"` selects benchmark-owned interval reports;
-Tracker alone arbitrates the cumulative `B + C` budget across intervals, while setup, evaluation,
-and gaps between intervals do not debit it. This does not select a containment provider.
+`RetrieveTaskResponse.credited_generation` is `None` by default. Tracker uses one cumulative
+active-generation clock for every task: an explicit credited allowance takes precedence,
+otherwise `agent_timeout` supplies the allowance, otherwise there is no generation deadline.
+The explicit credited allowance is positive and finite; `stage_protocol=None` charges the whole
+command interval, while `"valkyrie-stage/1"` selects benchmark-owned intervals and requires
+that finite credited allowance. Tracker arbitrates a finite base `B` plus capped optional SSP
+credit `C` across intervals; setup, evaluation, and gaps between intervals do not debit the
+clock. In Tracker task results, null base/effective allowances mean no generation deadline;
+`generation_elapsed_seconds` is still measured at sealing. A null elapsed value instead means
+no generation-time measurement was recorded. The independent 166-hour whole-task wall
+applies to every selected task, including those without a generation deadline.
+Modal separately limits each sandbox to a 24-hour provider lifetime. SSP is optional
+and independent of whether `credited_generation` is present; it needs configured gateway
+controls, a resolved native Gateway URL and key, and an attested model. Missing eligibility
+uses the base clock; failure of an eligible configured SSP session does not fall back.
+An SSP session with no base allowance remains without a generation deadline.
 
-For reporting benchmarks, Tracker gives the outer controlled workload (agent command or episode orchestrator)
-`VALKYRIE_STAGE_DIR=/run/valkyrie-stage`. The sandbox-private directory contains a 64-hex-character
+When an explicit finite credited allowance selects `stage_protocol="valkyrie-stage/1"`, Tracker
+gives the outer controlled workload (agent command or episode orchestrator) `VALKYRIE_STAGE_DIR=/run/valkyrie-stage`. The sandbox-private directory contains a 64-hex-character
 `key` and an initially empty `ack/` directory. During `setup_task`, upload the bytes from
 `benchmark_service.valkyrie_stage_source()` as `valkyrie_stage.py` and import `StageReporter`
 from that standalone file inside the benchmark-owned supervisor. Keep the key, directory,
@@ -261,7 +271,7 @@ cleanup, including nested container inspection on abort. Neither model output no
 code may assert a generation credit.
 
 An opt-in episode declares `RetrieveTaskResponse.episode = Episode(command="exec python /opt/bench/orchestrator.py", parallel_agents=5)`.
-It requires `credited_generation` with `stage_protocol="valkyrie-stage/1"`; without `episode`, ordinary task execution is unchanged.
+It requires `credited_generation` with `stage_protocol="valkyrie-stage/1"`; without an episode, Tracker runs the agent command directly.
 Tracker runs the benchmark-owned `episode.command` instead of the agent command and writes the selected agent bundle to
 `$VALKYRIE_STAGE_DIR/agent.json` after setup: `run_cmd`, `continue_cmd`, `interrupt_grace_seconds`,
 `container_name`, `final_output`, `parallel_agents`, and `slots_root`. The library owns a single `StageReporter`
@@ -296,13 +306,11 @@ appropriate. Tracker writes `$VALKYRIE_STAGE_DIR/exhausted` before its ACK when 
 library kills all running groups, completes their cleanup and END, and later `start` raises `Exhausted`. If the
 notice arrives with BEGIN ACK, no child starts and no END is sent.
 
-For controlled generation, check `sandbox.generation_containment` and run
-`await sandbox.probe_generation_containment()` before starting a workload. An advertised
-capability does not prove the effective sandbox can start it. Backends that do not
-advertise controlled workloads report `None`; an advertised Compose capability still
-requires a usable outer transport and effective inner service. Unsupported probes or
-starts raise rather than silently falling back to an ordinary command. This capability
-is not a universal task-level requirement.
+For every task, check `sandbox.generation_containment` and run
+`await sandbox.probe_generation_containment()` before starting a controlled workload. An advertised
+capability alone does not prove the effective sandbox can start it. A Compose capability still
+requires a usable outer transport and effective inner service. Unsupported probes or starts
+raise rather than silently falling back to an ordinary command.
 
 A direct Daytona sandbox supports `linux_pid_namespace` v1 (`LINUX_PID_NAMESPACE_V1`).
 `sandbox.controlled_workload(command, cwd=..., env_vars=...)` starts a separate PTY
@@ -514,7 +522,7 @@ result = await client.run_with_sandbox_recovery(
 Pydantic models used across requests and responses:
 
 - **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, optional `CreditedGeneration(allowance_seconds, stage_protocol)`, optional `Episode(command, parallel_agents)`, `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
-- **`GenerationContainment`** — effective-sandbox capability: `linux_pid_namespace` v1 for direct Daytona controlled workloads or `linux_process_group` v1 for Compose controlled workloads. It is not a task selection field. Callers probe the effective sandbox before using its `ControlledWorkload` API; unsupported sandboxes retain their normal execution paths.
+- **`GenerationContainment`** — effective-sandbox capability: `linux_pid_namespace` v1 for direct Daytona or `linux_process_group` v1 for Compose service workloads. Tracker probes the effective sandbox for every task before its `ControlledWorkload` and does not fall back to `Sandbox.command()` on unsupported providers.
 - **`agent_install_order`** — `"before_setup"` installs agent dependencies before benchmark setup; `"after_setup"` lets setup prepare the environment first. It defaults to `"before_setup"`, so older task responses remain valid; lifecycle execution is the caller's responsibility.
 - **`BenchmarkEgressPlan`** — declarative `setup_task`, agent `run`, and `evaluation` policies. `"*"` is unrestricted, `[]` is deny-all, and a non-empty list is an allowlist. Setup and evaluation default to `"*"`; `run=None` means the benchmark has no run-policy opinion, preserving legacy task behavior. Applying and composing the plan is the caller's responsibility.
 - **`SandboxRecoveryPolicy`** — explicit opt-in to recreate a lost generation sandbox with the same run identity and volumes; `max_sandbox_attempts` (2–20, inclusive) includes the initial sandbox

@@ -296,25 +296,38 @@ appropriate. Tracker writes `$VALKYRIE_STAGE_DIR/exhausted` before its ACK when 
 library kills all running groups, completes their cleanup and END, and later `start` raises `Exhausted`. If the
 notice arrives with BEGIN ACK, no child starts and no END is sent.
 
-For a caller using direct Daytona controlled workloads, `GenerationContainment` describes the
-provider's `linux_pid_namespace` v1 capability (exported as `LINUX_PID_NAMESPACE_V1`). Check
-`sandbox.generation_containment` and run `await sandbox.probe_generation_containment()` before
-starting that workload: an advertised capability does not prove this sandbox can create a
-namespace. Unsupported sandboxes report `None`; probing or starting a controlled workload raises
-`ControlledWorkloadUnsupportedError` rather than silently falling back to an ordinary command.
-This provider capability is not a universal task-level requirement.
+For controlled generation, check `sandbox.generation_containment` and run
+`await sandbox.probe_generation_containment()` before starting a workload. An advertised
+capability does not prove the effective sandbox can start it. Backends that do not
+advertise controlled workloads report `None`; an advertised Compose capability still
+requires a usable outer transport and effective inner service. Unsupported probes or
+starts raise rather than silently falling back to an ordinary command. This capability
+is not a universal task-level requirement.
 
-A direct Daytona sandbox supports `linux_pid_namespace` v1. Call
-`sandbox.controlled_workload(command, cwd=..., env_vars=...)` to start a separate PTY command under
-`unshare --fork --pid --mount-proc --kill-child=KILL`, and consume `workload.output()` for streamed
-text. On natural completion, `await workload.wait()` returns
-`ControlledWorkloadResult(result=ExecResult(exit_code, output), absence_confirmed_at=...)` only
-after the PTY session is absent from a fresh provider listing. On a deadline or other abort,
-`await workload.kill()` requests PTY termination and likewise confirms absence before returning.
-If confirmation fails, it raises rather than claiming the workload stopped. The absence timestamp
-is event-loop monotonic time, not a wall-clock datetime. The caller owns deadline arbitration and
-must not proceed to independent collection on unconfirmed absence. Ordinary `Sandbox.command()` and
-`Sandbox.exec()` do not provide this contract. Modal and `ComposeSandbox` do not implement it.
+A direct Daytona sandbox supports `linux_pid_namespace` v1 (`LINUX_PID_NAMESPACE_V1`).
+`sandbox.controlled_workload(command, cwd=..., env_vars=...)` starts a separate PTY
+command under `unshare --fork --pid --mount-proc --kill-child=KILL`. Its natural
+completion and kill confirm the PTY session absent from a fresh provider listing.
+
+`ComposeSandbox` supports `linux_process_group` v1 (`LINUX_PROCESS_GROUP_V1`).
+It pins the running service container, starts the command in a new process group inside
+that container, and streams its output through the outer controlled workload transport.
+Natural completion retains the command's exit status and output; `kill()` targets that
+in-container group independently of the outer Docker client. The group stop leaves the
+main service and sidecars running for collection and evaluation. This boundary is the
+process group, **not** a guarantee about children that leave it for another session.
+The effective service image needs `/bin/sh`, `setsid`, shell group signaling, a
+writable `/tmp`, and `/proc` process status; the probe checks session creation,
+marker write/removal, and proc visibility before launch.
+
+Consume `workload.output()` for streamed text. `await workload.wait()` returns
+`ControlledWorkloadResult(result=ExecResult(exit_code, output), absence_confirmed_at=...)`
+after its backend-specific stop boundary is confirmed. On a deadline or other abort,
+`await workload.kill()` stops that boundary before returning and raises if the stop
+cannot be confirmed. The timestamp is event-loop monotonic time, not a wall-clock
+datetime. The caller owns deadline arbitration and must not proceed to independent
+collection on unconfirmed stop. Ordinary `Sandbox.command()` and `Sandbox.exec()`
+do not provide this contract; Modal does not implement it.
 
 Process containment is separate from `BenchmarkEgressPlan`: setup, run, and evaluation egress
 policies control network access at their respective stages, not whether generation descendants
@@ -501,7 +514,7 @@ result = await client.run_with_sandbox_recovery(
 Pydantic models used across requests and responses:
 
 - **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, optional `CreditedGeneration(allowance_seconds, stage_protocol)`, optional `Episode(command, parallel_agents)`, `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
-- **`GenerationContainment`** — sandbox-provider capability `type="linux_pid_namespace", version=1` for direct Daytona controlled workloads, not a task selection field. A caller using that capability probes the sandbox and uses its `ControlledWorkload` API; other sandbox providers retain their normal execution paths.
+- **`GenerationContainment`** — effective-sandbox capability: `linux_pid_namespace` v1 for direct Daytona controlled workloads or `linux_process_group` v1 for Compose controlled workloads. It is not a task selection field. Callers probe the effective sandbox before using its `ControlledWorkload` API; unsupported sandboxes retain their normal execution paths.
 - **`agent_install_order`** — `"before_setup"` installs agent dependencies before benchmark setup; `"after_setup"` lets setup prepare the environment first. It defaults to `"before_setup"`, so older task responses remain valid; lifecycle execution is the caller's responsibility.
 - **`BenchmarkEgressPlan`** — declarative `setup_task`, agent `run`, and `evaluation` policies. `"*"` is unrestricted, `[]` is deny-all, and a non-empty list is an allowlist. Setup and evaluation default to `"*"`; `run=None` means the benchmark has no run-policy opinion, preserving legacy task behavior. Applying and composing the plan is the caller's responsibility.
 - **`SandboxRecoveryPolicy`** — explicit opt-in to recreate a lost generation sandbox with the same run identity and volumes; `max_sandbox_attempts` (2–20, inclusive) includes the initial sandbox

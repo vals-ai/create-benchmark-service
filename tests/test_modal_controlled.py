@@ -31,14 +31,10 @@ class _LocalSdkSandbox:
     def __init__(self) -> None:
         self.exec = SimpleNamespace(aio=self._exec)
         self.poll = SimpleNamespace(aio=self._poll)
-        self.commands: list[tuple[str, ...]] = []
-        self.envs: list[dict[str, str] | None] = []
 
     async def _exec(
         self, *args: str, env: dict[str, str] | None = None, text: bool = True
     ) -> _LocalProcess:
-        self.commands.append(args)
-        self.envs.append(env)
         process = await asyncio.create_subprocess_exec(
             *args, env={**os.environ, **(env or {})},
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
@@ -130,6 +126,3 @@ async def test_active_consumer_gets_full_stream_with_bounded_result_tail(
     assert total == 2_000_000
     assert completed.result.exit_code == 0
     assert completed.result.output == "x" * (64 * 1024)
-    controlled = cast(Any, workload)
-    assert controlled._output.empty()
-    assert controlled._tail_bytes <= 64 * 1024

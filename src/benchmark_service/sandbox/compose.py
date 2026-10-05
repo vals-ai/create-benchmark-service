@@ -231,7 +231,7 @@ class _ComposeControlledWorkload(ControlledWorkload):
             )
             + (
                 f"; status=$?; if test -s {shlex.quote(self._marker)}; then "
-                f"kill -KILL -- -$(cat {shlex.quote(self._marker)}) 2>/dev/null || :; "
+                f"kill -s KILL -- -$(cat {shlex.quote(self._marker)}) 2>/dev/null || :; "
                 'fi; exit "$status"'
             )
         )

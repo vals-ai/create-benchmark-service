@@ -6,6 +6,8 @@ import os
 import re
 import shlex
 import time
+import uuid
+from collections import deque
 from collections.abc import AsyncGenerator, Awaitable, Mapping
 from typing import Any, Literal, cast
 
@@ -20,10 +22,15 @@ from modal.exception import ResourceExhaustedError as ModalResourceExhaustedErro
 from pydantic import BaseModel
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
+from benchmark_service.sandbox._process_group import probe_command, stop_command
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
+    ControlledWorkload,
+    ControlledWorkloadResult,
     ExecResult,
+    GenerationContainment,
     ImageSource,
+    LINUX_PROCESS_GROUP_V1,
     MissingSandboxConfigError,
     Sandbox,
     SandboxCommandError,
@@ -47,6 +54,7 @@ _MAX_LIFETIME_SECONDS = 24 * 60 * 60
 _ALLOW_ALL_CIDRS = ("0.0.0.0/0",)
 _ALLOW_ALL_DOMAINS = ("*",)
 _COMMAND_STATUS_POLL_SECONDS = 10
+_CONTROLLED_OUTPUT_TAIL_BYTES = 64 * 1024
 _MAX_NAME_LENGTH = 64
 _INVALID_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_.-]")
 _APP_ID_PATTERN = re.compile(r"^ap-[a-zA-Z0-9]{22}$")
@@ -203,6 +211,21 @@ class ModalSandbox(Sandbox):
     def state(self) -> str:
         # Modal does not expose a cached lifecycle state on the sandbox handle.
         return "unknown"
+
+    @property
+    def generation_containment(self) -> GenerationContainment:
+        return LINUX_PROCESS_GROUP_V1
+
+    async def probe_generation_containment(self) -> None:
+        marker = f"/tmp/.cbs-probe-{uuid.uuid4().hex}"
+        result = await self.exec(probe_command(marker))
+        if result.exit_code != 0:
+            raise SandboxError(f"Modal sandbox does not support process groups: {result.output}")
+
+    def controlled_workload(
+        self, command: str, *, cwd: str | None = None, env_vars: Mapping[str, str] | None = None
+    ) -> ControlledWorkload:
+        return _ModalControlledWorkload(self, command, cwd, validate_command_env(env_vars))
 
     @_PROVIDER_RETRY
     async def _raise_if_finished(self, *, attempts: int = 1, wait_seconds: float = 0) -> None:
@@ -445,6 +468,128 @@ for domain in {domains_to_resolve!r}:
         # Modal rejects switching a running sandbox to OPEN. An allow-all
         # allowlist provides the same access without that unsupported transition.
         await self._set_outbound_network_policy(list(_ALLOW_ALL_CIDRS), list(_ALLOW_ALL_DOMAINS))
+
+class _ModalControlledWorkload(ControlledWorkload):
+    def __init__(self, sandbox: ModalSandbox, command: str, cwd: str | None, env_vars: dict[str, str]) -> None:
+        self._sandbox = sandbox
+        self._command = command
+        self._cwd = cwd
+        self._env_vars = env_vars
+        self._marker = f"/tmp/.cbs-controlled-{uuid.uuid4().hex}"
+        self._output: asyncio.Queue[str] = asyncio.Queue()
+        self._tail: deque[str] = deque()
+        self._tail_bytes = 0
+        self._output_changed = asyncio.Event()
+        self._launch_task = asyncio.create_task(self._launch())
+        self._wait_task = asyncio.create_task(self._finish())
+        self._stop_task: asyncio.Task[float] | None = None
+        self._read_task: asyncio.Task[None] | None = None
+        self._process_wait_task: asyncio.Task[int] | None = None
+
+    async def _launch(self) -> None:
+        await self._sandbox._raise_if_finished()
+        inner = (
+            "setsid sh -c "
+            + shlex.quote(
+                f'printf "%s\n" "$$" > {shlex.quote(self._marker)} && '
+                f"exec sh -lc {shlex.quote(_command(self._command, self._cwd, None))}"
+            )
+            + "; exit $?"
+        )
+        try:
+            # Do not use _start_process: its retry could create another workload on an ambiguous exec failure.
+            process = await self._sandbox._sandbox.exec.aio(
+                "/bin/sh", "-lc", inner, env=self._env_vars, text=True
+            )
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
+        self._read_task = asyncio.create_task(self._read_output(process))
+        self._process_wait_task = asyncio.create_task(process.wait.aio())
+
+    async def _read_output(self, process: Any) -> None:
+        try:
+            async for chunk in process.stdout:
+                text = str(chunk)
+                self._output.put_nowait(text)
+                self._tail.append(text)
+                self._tail_bytes += len(text.encode("utf-8"))
+                while self._tail_bytes > _CONTROLLED_OUTPUT_TAIL_BYTES:
+                    excess = self._tail_bytes - _CONTROLLED_OUTPUT_TAIL_BYTES
+                    first = self._tail[0].encode("utf-8")
+                    if len(first) <= excess:
+                        self._tail_bytes -= len(first)
+                        self._tail.popleft()
+                    else:
+                        self._tail[0] = first[excess:].decode("utf-8", errors="ignore")
+                        self._tail_bytes -= len(first) - len(self._tail[0].encode("utf-8"))
+                self._output_changed.set()
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
+        finally:
+            self._output_changed.set()
+
+    async def output(self) -> AsyncGenerator[str, None]:
+        await asyncio.shield(self._launch_task)
+        assert self._read_task is not None
+        while True:
+            if not self._output.empty():
+                yield self._output.get_nowait()
+                continue
+            if self._read_task.done():
+                await self._read_task
+                return
+            self._output_changed.clear()
+            await self._output_changed.wait()
+
+    async def _finish(self) -> ControlledWorkloadResult:
+        await self._launch_task
+        assert self._process_wait_task is not None
+        assert self._read_task is not None
+        try:
+            exit_code = await self._process_wait_task
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
+        stopped_at = await self._ensure_stopped()
+        await self._read_task
+        return ControlledWorkloadResult(ExecResult(exit_code=exit_code, output="".join(self._tail)), stopped_at)
+
+    async def wait(self) -> ControlledWorkloadResult:
+        return await asyncio.shield(self._wait_task)
+
+    async def kill(self) -> None:
+        await asyncio.shield(self._launch_task)
+        await asyncio.shield(self._ensure_stopped())
+
+    async def _ensure_stopped(self) -> float:
+        if self._stop_task is None:
+            self._stop_task = asyncio.create_task(self._stop())
+        return await self._stop_task
+
+    async def _stop(self) -> float:
+        await self._launch_task
+        assert self._process_wait_task is not None
+        marker_command = (
+            f"if test -s {shlex.quote(self._marker)}; then "
+            f"cat {shlex.quote(self._marker)}; else exit 75; fi"
+        )
+        while True:
+            marker = await self._sandbox.exec(marker_command)
+            if marker.exit_code == 0:
+                group_id = int(marker.output.strip())
+                break
+            if marker.exit_code != 75:
+                raise SandboxError(f"Modal controlled marker read failed: {marker.output}")
+            if self._process_wait_task.done():
+                await self._process_wait_task
+                return asyncio.get_running_loop().time()
+            await asyncio.sleep(0.05)
+        stopped = await self._sandbox.exec(stop_command(group_id, self._marker))
+        if stopped.exit_code != 0:
+            raise SandboxError(f"Modal process group did not stop: {stopped.output}")
+        return asyncio.get_running_loop().time()
+
+
+
 
 
 class ModalSandboxProvider(SandboxProvider):

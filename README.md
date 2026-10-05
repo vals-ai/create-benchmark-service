@@ -322,11 +322,15 @@ It pins the running service container, starts the command in a new process group
 that container, and streams its output through the outer controlled workload transport.
 Natural completion retains the command's exit status and output; `kill()` targets that
 in-container group independently of the outer Docker client. The group stop leaves the
-main service and sidecars running for collection and evaluation. This boundary is the
-process group, **not** a guarantee about children that leave it for another session.
-The effective service image needs `/bin/sh`, `setsid`, shell group signaling, a
-writable `/tmp`, and `/proc` process status; the probe checks session creation,
-marker write/removal, and proc visibility before launch.
+main service and sidecars running for collection and evaluation. The effective service image
+needs `/bin/sh`, `setsid`, shell group signaling, a writable `/tmp`, and `/proc` process
+status; the probe checks session creation, marker write/removal, and proc visibility before launch.
+
+Native Modal also advertises `linux_process_group` v1, probes the same group boundary,
+and runs controlled commands through its own provider process transport. Stop targets the
+workload group, not the reusable Modal sandbox (including the selected VM runtime).
+Confirmation covers live members of the marked process group in the same PID namespace;
+it does not cover independently detached processes or Docker-daemon-owned descendants.
 
 Consume `workload.output()` for streamed text. `await workload.wait()` returns
 `ControlledWorkloadResult(result=ExecResult(exit_code, output), absence_confirmed_at=...)`
@@ -335,7 +339,8 @@ after its backend-specific stop boundary is confirmed. On a deadline or other ab
 cannot be confirmed. The timestamp is event-loop monotonic time, not a wall-clock
 datetime. The caller owns deadline arbitration and must not proceed to independent
 collection on unconfirmed stop. Ordinary `Sandbox.command()` and `Sandbox.exec()`
-do not provide this contract; Modal does not implement it.
+do not provide this contract. On native Modal, `result.output` is a bounded tail;
+consume `workload.output()` while running for the full stream.
 
 Process containment is separate from `BenchmarkEgressPlan`: setup, run, and evaluation egress
 policies control network access at their respective stages, not whether generation descendants
@@ -522,7 +527,7 @@ result = await client.run_with_sandbox_recovery(
 Pydantic models used across requests and responses:
 
 - **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, optional `CreditedGeneration(allowance_seconds, stage_protocol)`, optional `Episode(command, parallel_agents)`, `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
-- **`GenerationContainment`** — effective-sandbox capability: `linux_pid_namespace` v1 for direct Daytona or `linux_process_group` v1 for Compose service workloads. Tracker probes the effective sandbox for every task before its `ControlledWorkload` and does not fall back to `Sandbox.command()` on unsupported providers.
+- **`GenerationContainment`** — effective-sandbox capability: `linux_pid_namespace` v1 for direct Daytona or `linux_process_group` v1 for Compose service and native Modal workloads. Tracker probes the effective sandbox for every task before its `ControlledWorkload` and does not fall back to `Sandbox.command()` on unsupported providers.
 - **`agent_install_order`** — `"before_setup"` installs agent dependencies before benchmark setup; `"after_setup"` lets setup prepare the environment first. It defaults to `"before_setup"`, so older task responses remain valid; lifecycle execution is the caller's responsibility.
 - **`BenchmarkEgressPlan`** — declarative `setup_task`, agent `run`, and `evaluation` policies. `"*"` is unrestricted, `[]` is deny-all, and a non-empty list is an allowlist. Setup and evaluation default to `"*"`; `run=None` means the benchmark has no run-policy opinion, preserving legacy task behavior. Applying and composing the plan is the caller's responsibility.
 - **`SandboxRecoveryPolicy`** — explicit opt-in to recreate a lost generation sandbox with the same run identity and volumes; `max_sandbox_attempts` (2–20, inclusive) includes the initial sandbox

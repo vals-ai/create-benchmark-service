@@ -4800,8 +4800,15 @@ class KilledLocalShellCgroupProcess(LocalShellCgroupProcess):
     async def exec(self, command: str) -> SimpleNamespace:
         plain = _unwrap_shell_command(command)
         if plain.startswith("d=/sys/fs/cgroup/cbs-"):
-            pid = int((self.group / "cgroup.procs").read_text().strip())
-            os.kill(pid, signal.SIGKILL)
+            def subtree_pids(pid: int) -> list[int]:
+                pids = [pid]
+                for child in Path(f"/proc/{pid}/task/{pid}/children").read_text().split():
+                    pids.extend(subtree_pids(int(child)))
+                return pids
+
+            pids = subtree_pids(int((self.group / "cgroup.procs").read_text().strip()))
+            for pid in pids:
+                os.kill(pid, signal.SIGKILL)
         return await super().exec(command)
 
     async def create_pty_session(
@@ -4822,10 +4829,12 @@ async def test_daytona_intentional_kill_retains_shell_exit_status_before_pty_sig
     tmp_path: Path,
 ) -> None:
     process = KilledLocalShellCgroupProcess(tmp_path)
-    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    marker = tmp_path / "running"
+    command = f"printf ready > {shlex.quote(str(marker))}; exec sleep 30"
+    workload = _cgroup_sandbox(process).controlled_workload(command)
     await asyncio.wait_for(process.command_admitted.wait(), 2)
     async with asyncio.timeout(2):
-        while not (process.group / "cgroup.procs").read_text().strip():
+        while not marker.exists() or marker.read_text() != "ready":
             await asyncio.sleep(0.01)
     await asyncio.wait_for(workload.kill(), 5)
     completed = await asyncio.wait_for(workload.wait(), 5)

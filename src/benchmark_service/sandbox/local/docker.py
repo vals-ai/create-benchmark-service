@@ -15,7 +15,7 @@ from collections.abc import AsyncGenerator, Generator, Mapping
 from contextlib import aclosing, contextmanager
 from datetime import datetime
 from pathlib import PurePosixPath
-from typing import Literal
+from typing import Awaitable, Callable, Literal
 from uuid import uuid4
 
 from aiodocker import Docker
@@ -129,7 +129,9 @@ class DockerSandbox(Sandbox):
         cwd: str | None = None,
         env_vars: Mapping[str, str] | None = None,
     ) -> ControlledWorkload:
-        return _DockerControlledWorkload(self, command, cwd, validate_command_env(env_vars))
+        return _DockerControlledWorkload(
+            self._container, self._raise_if_finished, command, cwd, validate_command_env(env_vars)
+        )
 
     async def _raise_if_finished(self) -> None:
         # Docker reports a killed command's exit before it marks the container stopped.
@@ -275,8 +277,16 @@ class DockerSandbox(Sandbox):
 
 
 class _DockerControlledWorkload(ControlledWorkload):
-    def __init__(self, sandbox: DockerSandbox, command: str, cwd: str | None, env_vars: dict[str, str]) -> None:
-        self._sandbox = sandbox
+    def __init__(
+        self,
+        container: DockerContainer,
+        raise_if_finished: Callable[[], Awaitable[None]],
+        command: str,
+        cwd: str | None,
+        env_vars: dict[str, str],
+    ) -> None:
+        self._container = container
+        self._raise_if_finished = raise_if_finished
         self._command = command
         self._cwd = cwd
         self._env_vars = env_vars
@@ -310,10 +320,14 @@ class _DockerControlledWorkload(ControlledWorkload):
     async def _drain(self, stream: Stream) -> None:
         try:
             with _docker_errors():
-                decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+                decoders: dict[int, codecs.IncrementalDecoder] = {}
                 while (message := await stream.read_out()) is not None:
+                    decoder = decoders.get(message.stream)
+                    if decoder is None:
+                        decoder = decoders[message.stream] = codecs.getincrementaldecoder("utf-8")(errors="replace")
                     self._accept(decoder.decode(message.data))
-                self._accept(decoder.decode(b"", final=True))
+                for decoder in decoders.values():
+                    self._accept(decoder.decode(b"", final=True))
         finally:
             self._output.put_nowait(None)
 
@@ -326,7 +340,7 @@ class _DockerControlledWorkload(ControlledWorkload):
         if not isinstance(exit_code, int):
             raise SandboxError("Docker controlled command finished without an exit code")
         if exit_code == 137:
-            await self._sandbox._raise_if_finished()
+            await self._raise_if_finished()
         self._status_done.set()
         return exit_code
 
@@ -337,7 +351,7 @@ class _DockerControlledWorkload(ControlledWorkload):
         )
         with _docker_errors():
             try:
-                execution = await self._sandbox._container.exec(
+                execution = await self._container.exec(
                     ["setsid", "--wait", "/bin/sh", "-c", script],
                     environment=self._env_vars,
                     workdir=self._cwd,
@@ -382,7 +396,7 @@ class _DockerControlledWorkload(ControlledWorkload):
 
     async def _control_exec(self, command: str) -> ExecResult:
         with _docker_errors():
-            execution = await self._sandbox._container.exec(["/bin/sh", "-c", command])
+            execution = await self._container.exec(["/bin/sh", "-c", command])
             output: list[bytes] = []
             async with execution.start() as stream:
                 while (message := await stream.read_out()) is not None:

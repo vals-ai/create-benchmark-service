@@ -62,7 +62,7 @@ class _LocalWorkload(ControlledWorkload):
         )
         self._started.set()
         assert self._process.stdout is not None
-        chunks = []
+        chunks: list[str] = []
         while chunk := await self._process.stdout.read(4096):
             text = chunk.decode()
             chunks.append(text)
@@ -107,7 +107,7 @@ class _LocalOuter:
             stderr=asyncio.subprocess.STDOUT,
         )
         output, _ = await asyncio.wait_for(process.communicate(), timeout=timeout)
-        return ExecResult(exit_code=process.returncode, output=output.decode())
+        return ExecResult(exit_code=await process.wait(), output=output.decode())
 
     def controlled_workload(
         self, command: str, *, cwd: str | None = None, env_vars: dict[str, str] | None = None

@@ -101,7 +101,9 @@ async def test_docker_controlled_natural_status_stream_and_tail(docker_sandbox: 
     output = "".join([part async for part in workload.output()])
     result = await workload.wait()
     assert result.result.exit_code == 7
-    assert output == result.result.output == "α stderr"
+    assert output == result.result.output
+    assert output.count("α") == 1
+    assert output.replace("α", "") == " stderr"
     assert result.absence_confirmed_at <= asyncio.get_running_loop().time()
 
     large = docker_sandbox.controlled_workload("head -c 80000 /dev/zero | tr '\\000' x")
@@ -113,13 +115,18 @@ async def test_docker_controlled_natural_status_stream_and_tail(docker_sandbox: 
 
 async def test_docker_controlled_early_kill_unblocks_reader_and_keeps_container(docker_sandbox: Sandbox) -> None:
     workload = docker_sandbox.controlled_workload("(sleep 3; touch /tmp/controlled-child-survived) & sleep 3")
-    reader = asyncio.create_task(anext(workload.output(), None))
+
+    async def collect() -> str:
+        return "".join([part async for part in workload.output()])
+
+    reader = asyncio.create_task(collect())
     await asyncio.wait_for(workload.kill(), timeout=5)
     await workload.kill()
-    assert await asyncio.wait_for(reader, timeout=5) is None
     result = await asyncio.wait_for(workload.wait(), timeout=5)
+    assert await asyncio.wait_for(reader, timeout=5) == result.result.output
     assert result.result.exit_code != 0
     assert result.absence_confirmed_at <= asyncio.get_running_loop().time()
+    await asyncio.sleep(3.1)
     assert (await docker_sandbox.exec("test ! -e /tmp/controlled-child-survived")).exit_code == 0
     assert (await docker_sandbox.exec("printf collection")).output == "collection"
 

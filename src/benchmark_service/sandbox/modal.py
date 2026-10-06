@@ -8,7 +8,7 @@ import shlex
 import time
 import uuid
 from collections import deque
-from collections.abc import AsyncGenerator, Awaitable, Mapping
+from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable, Coroutine, Mapping
 from typing import Any, Literal, cast
 
 from modal import App, Client, Image, Volume
@@ -225,7 +225,21 @@ class ModalSandbox(Sandbox):
     def controlled_workload(
         self, command: str, *, cwd: str | None = None, env_vars: Mapping[str, str] | None = None
     ) -> ControlledWorkload:
-        return _ModalControlledWorkload(self, command, cwd, validate_command_env(env_vars))
+        return _ModalControlledWorkload(
+            self, command, cwd, validate_command_env(env_vars), self._start_controlled_process
+        )
+
+    async def _start_controlled_process(
+        self, command: str, env_vars: dict[str, str]
+    ) -> tuple[AsyncIterable[str], Coroutine[Any, Any, int]]:
+        await self._raise_if_finished()
+        modal_env: dict[str, str | None] = {name: value for name, value in env_vars.items()}
+        try:
+            # Do not use _start_process: its retry could create another workload on an ambiguous exec failure.
+            process = await self._sandbox.exec.aio("/bin/sh", "-lc", command, env=modal_env, text=True)
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
+        return process.stdout, process.wait.aio()
 
     @_PROVIDER_RETRY
     async def _raise_if_finished(self, *, attempts: int = 1, wait_seconds: float = 0) -> None:
@@ -470,11 +484,21 @@ for domain in {domains_to_resolve!r}:
         await self._set_outbound_network_policy(list(_ALLOW_ALL_CIDRS), list(_ALLOW_ALL_DOMAINS))
 
 class _ModalControlledWorkload(ControlledWorkload):
-    def __init__(self, sandbox: ModalSandbox, command: str, cwd: str | None, env_vars: dict[str, str]) -> None:
+    def __init__(
+        self,
+        sandbox: ModalSandbox,
+        command: str,
+        cwd: str | None,
+        env_vars: dict[str, str],
+        start_process: Callable[
+            [str, dict[str, str]], Awaitable[tuple[AsyncIterable[str], Coroutine[Any, Any, int]]]
+        ],
+    ) -> None:
         self._sandbox = sandbox
         self._command = command
         self._cwd = cwd
         self._env_vars = env_vars
+        self._start_process = start_process
         self._marker = f"/tmp/.cbs-controlled-{uuid.uuid4().hex}"
         self._output: asyncio.Queue[str] = asyncio.Queue()
         self._tail: deque[str] = deque()
@@ -487,7 +511,6 @@ class _ModalControlledWorkload(ControlledWorkload):
         self._process_wait_task: asyncio.Task[int] | None = None
 
     async def _launch(self) -> None:
-        await self._sandbox._raise_if_finished()
         inner = (
             "setsid sh -c "
             + shlex.quote(
@@ -496,20 +519,13 @@ class _ModalControlledWorkload(ControlledWorkload):
             )
             + "; exit $?"
         )
-        try:
-            # Do not use _start_process: its retry could create another workload on an ambiguous exec failure.
-            process = await self._sandbox._sandbox.exec.aio(
-                "/bin/sh", "-lc", inner, env=self._env_vars, text=True
-            )
-        except ModalError as exc:
-            raise _sandbox_error(exc) from exc
-        self._read_task = asyncio.create_task(self._read_output(process))
-        self._process_wait_task = asyncio.create_task(process.wait.aio())
+        output, process_wait = await self._start_process(inner, self._env_vars)
+        self._read_task = asyncio.create_task(self._read_output(output))
+        self._process_wait_task = asyncio.create_task(process_wait)
 
-    async def _read_output(self, process: Any) -> None:
+    async def _read_output(self, output: AsyncIterable[str]) -> None:
         try:
-            async for chunk in process.stdout:
-                text = str(chunk)
+            async for text in output:
                 self._output.put_nowait(text)
                 self._tail.append(text)
                 self._tail_bytes += len(text.encode("utf-8"))

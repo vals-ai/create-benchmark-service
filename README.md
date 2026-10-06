@@ -348,6 +348,8 @@ datetime. The caller owns deadline arbitration and must not proceed to independe
 collection on unconfirmed stop. Ordinary `Sandbox.command()` and `Sandbox.exec()`
 do not provide this contract. On native Modal and local Docker, `result.output` is a bounded
 tail; consume `workload.output()` while running for the full stream.
+Local Docker decodes UTF-8 independently for stdout and stderr; their relative ordering
+is not guaranteed.
 
 Process containment is separate from `BenchmarkEgressPlan`: setup, run, and evaluation egress
 policies control network access at their respective stages, not whether generation descendants

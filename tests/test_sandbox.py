@@ -4507,6 +4507,7 @@ def test_volume_mount_rejects_invalid_subpath(subpath: str) -> None:
 class CgroupProcess(Process):
     def __init__(self) -> None:
         super().__init__()
+        self.handle: CgroupPtyHandle
         self.group_created = asyncio.Event()
         self.allow_creation = asyncio.Event()
         self.command_admitted = asyncio.Event()
@@ -4554,7 +4555,7 @@ class CgroupProcess(Process):
         _assert_pty_create_config(envs, pty_size)
         self.sessions.add(id)
         handle = CgroupPtyHandle(on_data, self)
-        self.pty_handle = handle
+        self.handle = handle
         return handle
 
     async def kill_pty_session(self, session_id: str) -> None:
@@ -4731,9 +4732,9 @@ class LocalShellCgroupProcess(CgroupProcess):
         return LocalShellCgroupPtyHandle(on_data, self)
 
 
-class LocalShellCgroupPtyHandle(PtyHandle):
+class LocalShellCgroupPtyHandle(CgroupPtyHandle):
     def __init__(self, on_data: Callable[[bytes], None | Awaitable[None]], process: LocalShellCgroupProcess) -> None:
-        super().__init__(on_data)
+        super().__init__(on_data, process)
         self.process = process
 
     async def send_input(self, data: str) -> None:
@@ -4855,7 +4856,7 @@ async def test_daytona_confirmed_kill_preserves_already_buffered_output() -> Non
     process.allow_removal.set()
     workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
     await asyncio.wait_for(process.command_admitted.wait(), 2)
-    await process.pty_handle.emit(b"buffered-tail")
+    await process.handle.emit(b"buffered-tail")
     await asyncio.wait_for(workload.kill(), 2)
     chunks = [chunk async for chunk in workload.output()]
     assert "".join(chunks).endswith("buffered-tail")
@@ -4883,7 +4884,9 @@ async def test_daytona_failed_kill_keeps_waiting_output_consumer_open() -> None:
     process.user_finished.set()
     process.release_seen.set()
     process.allow_final_frame.set()
-    await asyncio.wait_for(workload._run_task, 2)  # pyright: ignore[reportPrivateUsage]
+    async with asyncio.timeout(2):
+        chunks = [chunk async for chunk in workload.output()]
+    assert "final frame" in "".join(chunks)
 
 
 async def test_daytona_natural_completion_drains_queued_and_final_pty_frames() -> None:
@@ -4893,7 +4896,7 @@ async def test_daytona_natural_completion_drains_queued_and_final_pty_frames() -
     process.allow_final_frame.set()
     workload = _cgroup_sandbox(process).controlled_workload("exit 7")
     await asyncio.wait_for(process.command_admitted.wait(), 2)
-    await process.pty_handle.emit(b"queued-tail")
+    await process.handle.emit(b"queued-tail")
     process.user_finished.set()
     completed = await asyncio.wait_for(workload.wait(), 2)
     chunks = [chunk async for chunk in workload.output()]
@@ -4947,9 +4950,10 @@ async def test_daytona_confirmed_kill_does_not_wait_for_stalled_status_probe(
     await asyncio.wait_for(workload.kill(), 2)
     assert not process.group_exists
     assert process.sessions == set()
-    assert not workload._run_task.done()  # pyright: ignore[reportPrivateUsage]
+    waiting = asyncio.create_task(workload.wait())
+    assert not waiting.done()
     process.status_allowed.set()
-    await asyncio.wait_for(workload._run_task, 2)  # pyright: ignore[reportPrivateUsage]
+    await asyncio.wait_for(waiting, 2)
 
 
 class NestedCgroupProcess(CgroupProcess):
@@ -5028,6 +5032,12 @@ class ResultCgroupProcess(CgroupProcess):
 
 
 class ResultCgroupPtyHandle(CgroupPtyHandle):
+    def __init__(
+        self, on_data: Callable[[bytes], None | Awaitable[None]], process: ResultCgroupProcess
+    ) -> None:
+        super().__init__(on_data, process)
+        self.process = process
+
     async def wait(self) -> PtyResult:
         await super().wait()
         return self.process.pty_result

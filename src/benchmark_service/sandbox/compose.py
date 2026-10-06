@@ -235,7 +235,7 @@ class _ComposeControlledWorkload(ControlledWorkload):
                 'fi; exit "$status"'
             )
         )
-        args = []
+        args: list[str] = []
         for name in self._env_vars:
             args.extend(["-e", name])
         if self._cwd:

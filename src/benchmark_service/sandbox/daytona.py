@@ -11,7 +11,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, 
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Any, Literal, TypeVar, cast
+from typing import Any, Literal, Self, TypeVar, cast
 
 from aiohttp import ClientConnectionError, ClientError, ClientPayloadError, ClientResponseError, InvalidURL
 from daytona import (
@@ -32,6 +32,7 @@ from daytona_api_client_async import (
     SandboxClass,
 )
 from daytona_api_client_async.exceptions import NotFoundException, OpenApiException
+from daytona_api_client_async.models.region_type import RegionType
 from daytona_api_client_async.models.region_usage_overview import RegionUsageOverview
 from daytona import (
     GpuType,
@@ -56,7 +57,7 @@ from daytona.common.errors import (
 from daytona.common.pty import PtyResult, PtySize
 from daytona.handle.async_pty_handle import AsyncPtyHandle
 from daytona_toolbox_api_client_async.models.pty_session_info import PtySessionInfo
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from tenacity import (
     RetryCallState,
     retry,
@@ -212,11 +213,22 @@ def _resolve_daytona_allowed_addresses(allowed_addresses: list[str]) -> tuple[li
 
 
 class DaytonaProviderConfig(BaseModel):
-    type: Literal["daytona"] = "daytona"
+    model_config = ConfigDict(hide_input_in_errors=True)
+
+    type: Literal["daytona", "daytona-byoc"] = "daytona"
     DAYTONA_API_KEY: str
     DAYTONA_API_URL: str
     DAYTONA_TARGET: str
     DAYTONA_ORGANIZATION_ID: str | None = Field(default=None, exclude_if=lambda value: value is None)
+
+    @model_validator(mode="after")
+    def require_explicit_byoc_region(self) -> Self:
+        if self.type == "daytona-byoc":
+            for value in (self.DAYTONA_API_KEY, self.DAYTONA_API_URL, self.DAYTONA_TARGET, self.DAYTONA_ORGANIZATION_ID):
+                if not value or value != value.strip():
+                    raise ValueError("BYOC requires a nonblank API key, API URL, region ID, and organization ID")
+
+        return self
 
     @field_validator("DAYTONA_API_URL")
     @classmethod
@@ -939,6 +951,8 @@ class DaytonaSandbox(Sandbox):
 class DaytonaSandboxProvider(SandboxProvider):
     def __init__(self, config: DaytonaProviderConfig) -> None:
         self._config = config
+        self._byoc_verified = False
+        self._byoc_lock = asyncio.Lock()
         self._target = config.DAYTONA_TARGET.strip()
         if not self._target:
             raise MissingSandboxConfigError("DAYTONA_TARGET must not be blank")
@@ -952,6 +966,50 @@ class DaytonaSandboxProvider(SandboxProvider):
         )
         self._daytona = _daytona_client(config, self._target)
         self._daytona_by_target = {self._target: self._daytona}
+
+    async def _verify_byoc_region(self) -> None:
+        if self._config.type != "daytona-byoc" or self._byoc_verified:
+            return
+
+        async with self._byoc_lock:
+            if self._byoc_verified:
+                return
+
+            try:
+                async with (
+                    asyncio.timeout(_ADMISSION_TIMEOUT_SECONDS),
+                    DaytonaApiClient(
+                        self._target_api_configuration,
+                        header_name="X-Daytona-Organization-ID",
+                        header_value=self._organization_id,
+                    ) as api_client,
+                ):
+                    region = await OrganizationsApi(api_client).get_region_by_id(self._target)
+            except (OpenApiException, ClientError, TimeoutError, ValueError):
+                raise SandboxError("Unable to verify the configured Daytona BYOC region") from None
+
+            if (
+                region.id != self._target
+                or region.region_type != RegionType.CUSTOM
+                or region.organization_id != self._organization_id
+            ):
+                raise SandboxError("Daytona BYOC requires a custom region ID owned by the configured organization")
+
+            self._byoc_verified = True
+
+    def _validate_byoc_source(self, source: SandboxSource) -> None:
+        if self._config.type != "daytona-byoc":
+            return
+
+        if isinstance(source, ComposeSource):
+            source = source.outer
+
+        if isinstance(source, TargetedSnapshotSource) and source.target != self._target:
+            raise SandboxError("BYOC snapshot region does not match the configured region")
+
+    def _validate_byoc_placement(self, sandbox: AsyncSandbox) -> None:
+        if self._config.type == "daytona-byoc" and sandbox.target != self._target:
+            raise SandboxError(f"BYOC sandbox placement does not match the configured region: {sandbox.id}")
 
     def _client_for_target(self, target: str) -> AsyncDaytona:
         if target not in self._daytona_by_target:
@@ -1019,6 +1077,7 @@ class DaytonaSandboxProvider(SandboxProvider):
             return matches[0]
 
     async def get_capacity(self) -> SandboxCapacity | None:
+        await self._verify_byoc_region()
         if self._organization_id is None:
             return None
         try:
@@ -1033,6 +1092,7 @@ class DaytonaSandboxProvider(SandboxProvider):
             raise SandboxError("Daytona capacity is unavailable") from None
 
     async def get_capacity_domains(self) -> list[SandboxCapacityDomain] | None:
+        await self._verify_byoc_region()
         if self._organization_id is None:
             return None
         try:
@@ -1044,6 +1104,9 @@ class DaytonaSandboxProvider(SandboxProvider):
                 domains: list[SandboxCapacityDomain] = []
                 keys: set[tuple[str, str]] = set()
                 for usage in overview.region_usage:
+                    if self._config.type == "daytona-byoc" and usage.region_id != self._target:
+                        continue
+
                     if usage.sandbox_class == SandboxClass.UNKNOWN_DEFAULT_OPEN_API:
                         raise SandboxError("Daytona capacity metadata is invalid")
                     key = (usage.region_id, usage.sandbox_class.value)
@@ -1068,6 +1131,9 @@ class DaytonaSandboxProvider(SandboxProvider):
         source: SandboxSource,
         resources: Resources,
     ) -> bool:
+        self._validate_byoc_source(source)
+        await self._verify_byoc_region()
+
         if isinstance(source, ComposeSource):
             source = source.outer
         if self._organization_id is None:
@@ -1228,6 +1294,9 @@ class DaytonaSandboxProvider(SandboxProvider):
 
     @_PROVIDER_RETRY
     async def create_sandbox(self, request: SandboxCreateRequest) -> DaytonaSandbox:
+        self._validate_byoc_source(request.source)
+        await self._verify_byoc_region()
+
         daytona = self._daytona
         if isinstance(request.source, TargetedSnapshotSource):
             daytona = self._client_for_target(request.source.target)
@@ -1292,6 +1361,8 @@ class DaytonaSandboxProvider(SandboxProvider):
                 await self._delete_failed_sandbox(request.name, daytona)
             raise self._sandbox_error(exc) from exc
 
+        self._validate_byoc_placement(inner)
+
         return DaytonaSandbox(inner)
 
     async def _delete_failed_sandbox(self, name: str, daytona: AsyncDaytona) -> None:
@@ -1301,6 +1372,8 @@ class DaytonaSandboxProvider(SandboxProvider):
             return
         except DaytonaError as exc:
             raise self._sandbox_error(exc) from exc
+
+        self._validate_byoc_placement(sandbox)
 
         if sandbox.state in _FAILED_SANDBOX_STATES:
             await self.delete_sandbox(sandbox.id)
@@ -1312,6 +1385,8 @@ class DaytonaSandboxProvider(SandboxProvider):
             return None
         except DaytonaError as exc:
             raise self._sandbox_error(exc) from exc
+
+        self._validate_byoc_placement(sandbox)
 
         try:
             if sandbox.state in _FAILED_SANDBOX_STATES:
@@ -1330,10 +1405,12 @@ class DaytonaSandboxProvider(SandboxProvider):
 
     @_PROVIDER_RETRY
     async def get_sandbox(self, instance_id: str) -> DaytonaSandbox:
+        await self._verify_byoc_region()
         try:
-            return DaytonaSandbox(
-                await _bounded("daytona.get", self._daytona.get(instance_id), _TOOLBOX_CALL_TIMEOUT_SECONDS)
-            )
+            sandbox = await _bounded("daytona.get", self._daytona.get(instance_id), _TOOLBOX_CALL_TIMEOUT_SECONDS)
+            self._validate_byoc_placement(sandbox)
+
+            return DaytonaSandbox(sandbox)
         except DaytonaNotFoundError as exc:
             raise SandboxNotFoundError(f"Sandbox not found: id_or_name={instance_id}.") from exc
         except DaytonaError as exc:
@@ -1341,8 +1418,11 @@ class DaytonaSandboxProvider(SandboxProvider):
 
     @_PROVIDER_RETRY
     async def delete_sandbox(self, instance_id: str) -> None:
+        await self._verify_byoc_region()
         try:
             sandbox = await _bounded("daytona.get", self._daytona.get(instance_id), _TOOLBOX_CALL_TIMEOUT_SECONDS)
+            self._validate_byoc_placement(sandbox)
+
             if sandbox.state in _REMOVED_SANDBOX_STATES:
                 return
             await self._daytona.delete(sandbox)
@@ -1356,7 +1436,10 @@ class DaytonaSandboxProvider(SandboxProvider):
             raise self._sandbox_error(exc) from exc
 
     async def list_sandboxes(self, query: SandboxQuery) -> AsyncGenerator[DaytonaSandbox, None]:
+        await self._verify_byoc_region()
         for sandbox in await self._list_sandboxes(query):
+            self._validate_byoc_placement(sandbox)
+
             if sandbox.state in (SandboxState.DESTROYING, SandboxState.DESTROYED):
                 continue
             yield DaytonaSandbox(sandbox)

@@ -23,6 +23,7 @@ from tenacity import (
 )
 from websockets.exceptions import ConnectionClosed
 
+from benchmark_service.context import SANDBOX_PROVIDER_HEADER
 from benchmark_service.observability import correlation_scope, request_headers, websocket_request_span
 from benchmark_service.sandbox import SandboxNotFoundError, SandboxProvider, SandboxProviderConfig
 from benchmark_service.schemas import (
@@ -565,18 +566,24 @@ class BenchmarkServiceClient:
 
     @_retry_http
     async def retrieve_task(
-        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+        self,
+        task_id: str,
+        skip_validation: bool = False,
+        dataset: str | None = None,
+        sandbox_provider: str | None = None,
     ) -> RetrieveTaskResponse:
         """Retrieve a task by ID.
 
         Args:
             task_id: The task to retrieve.
             skip_validation: If True, skip task validation.
+            sandbox_provider: Provider name the run uses, such as "modal" or "daytona".
         """
         params: dict[str, Any] = {"task_id": task_id, "skip_validation": skip_validation}
         if dataset is not None:
             params["dataset"] = dataset
-        response = await self._http_client.get(f"{self._url}/retrieve-task/", params=params)
+        headers = {SANDBOX_PROVIDER_HEADER: sandbox_provider} if sandbox_provider is not None else None
+        response = await self._http_client.get(f"{self._url}/retrieve-task/", params=params, headers=headers)
 
         if response.status_code == 401:
             raise _unauthenticated_error(response)
@@ -596,6 +603,7 @@ class BenchmarkServiceClient:
         operation: Callable[[SandboxRecoveryAttempt], Awaitable[_RecoveryResult]],
         *,
         dataset: str | None = None,
+        sandbox_provider: str | None = None,
         retryable_attempt_errors: tuple[type[Exception], ...] = (),
         default_max_attempts: int = 1,
         retry_delay_s: float = 2.0,
@@ -632,7 +640,9 @@ class BenchmarkServiceClient:
             state = _SandboxRecoveryState(
                 run_id=run_id,
                 task_id=task_id,
-                load_task=lambda: self.retrieve_task(task_id=task_id, dataset=dataset),
+                load_task=lambda: self.retrieve_task(
+                    task_id=task_id, dataset=dataset, sandbox_provider=sandbox_provider
+                ),
                 default_max_attempts=default_max_attempts,
             )
 

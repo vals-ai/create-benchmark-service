@@ -19,8 +19,13 @@ from contextvars import ContextVar
 
 from benchmark_service.sandbox import SandboxProvider
 
+SANDBOX_PROVIDER_HEADER = "X-Vals-Sandbox-Provider"
+
 _current_sandbox_provider: ContextVar[SandboxProvider | None] = ContextVar(
     "benchmark_service_sandbox_provider", default=None
+)
+_requested_sandbox_provider: ContextVar[str | None] = ContextVar(
+    "benchmark_service_requested_sandbox_provider", default=None
 )
 
 
@@ -37,3 +42,18 @@ def sandbox_provider_scope(provider: SandboxProvider | None) -> Iterator[None]:
         yield
     finally:
         _current_sandbox_provider.reset(token)
+
+
+def requested_sandbox_provider() -> str | None:
+    """Return the provider name the caller sent to retrieve-task, or None."""
+    return _requested_sandbox_provider.get()
+
+
+@contextmanager
+def requested_sandbox_provider_scope(provider: str | None) -> Iterator[None]:
+    """Bind the caller's requested provider name for one retrieve-task request."""
+    token = _requested_sandbox_provider.set(provider)
+    try:
+        yield
+    finally:
+        _requested_sandbox_provider.reset(token)

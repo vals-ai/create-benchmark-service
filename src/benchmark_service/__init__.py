@@ -3,7 +3,12 @@
 from benchmark_service._version import __version__
 from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.base import BenchmarkService
-from benchmark_service.context import current_sandbox_provider, sandbox_provider_scope
+from benchmark_service.context import (
+    SANDBOX_PROVIDER_HEADER,
+    current_sandbox_provider,
+    requested_sandbox_provider,
+    sandbox_provider_scope,
+)
 from benchmark_service.client import (
     BenchmarkServiceClient,
     BenchmarkServiceError,
@@ -63,6 +68,8 @@ __all__ = [
     "BenchmarkServiceApp",
     "BenchmarkService",
     "current_sandbox_provider",
+    "requested_sandbox_provider",
+    "SANDBOX_PROVIDER_HEADER",
     "BenchmarkServiceUnauthenticatedError",
     "BenchmarkServiceClient",
     "BenchmarkServiceError",

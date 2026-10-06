@@ -786,7 +786,9 @@ async def test_retrieve_task_with_dataset(
     await client.retrieve_task("task-1", dataset="mydata")
 
     mock_http.get.assert_called_once_with(
-        f"{BASE_URL}/retrieve-task/", params={"task_id": "task-1", "skip_validation": False, "dataset": "mydata"}
+        f"{BASE_URL}/retrieve-task/",
+        params={"task_id": "task-1", "skip_validation": False, "dataset": "mydata"},
+        headers=None,
     )
 
 
@@ -1483,3 +1485,33 @@ async def test_client_v1_mutations_do_not_retry_after_response_transport_failure
         await getattr(client, method)(**kwargs)
 
     mock_http.post.assert_awaited_once()
+
+
+async def test_retrieve_task_sends_sandbox_provider_header(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    mock_http.get = AsyncMock(return_value=_mock_response(json_data=_task_response(3).model_dump(mode="json")))
+
+    await client.retrieve_task("task-1", sandbox_provider="daytona")
+    await client.retrieve_task("task-1")
+
+    assert mock_http.get.await_args_list[0].kwargs["headers"] == {"X-Vals-Sandbox-Provider": "daytona"}
+    assert mock_http.get.await_args_list[1].kwargs["headers"] is None
+
+
+async def test_sandbox_recovery_passes_sandbox_provider_to_retrieve_task(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client, _mock_http = benchmark_client
+    retrieve_task = AsyncMock(return_value=_task_response(3))
+    monkeypatch.setattr(client, "retrieve_task", retrieve_task)
+
+    async def operation(attempt: SandboxRecoveryAttempt) -> int:
+        await attempt.retrieve_task()
+        return attempt.number
+
+    await client.run_with_sandbox_recovery("task-1", "run-1", operation, sandbox_provider="modal", retry_delay_s=0)
+
+    retrieve_task.assert_awaited_once_with(task_id="task-1", dataset=None, sandbox_provider="modal")

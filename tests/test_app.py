@@ -12,6 +12,7 @@ from starlette.websockets import WebSocketDisconnect
 
 from benchmark_service.vals import auth as auth_module
 from benchmark_service.vals.app import ValsBenchmarkServiceApp
+from benchmark_service import requested_sandbox_provider
 from benchmark_service.app import BenchmarkServiceApp, send_json_if_connected
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
@@ -769,3 +770,26 @@ def test_core_app_does_not_expose_provider_routes(client: TestClient, method: st
 async def test_core_dataset_access_does_not_depend_on_hosted_allowlist() -> None:
     service = await StubBenchmark.create()
     assert await service.check_dataset_access("custom-tenant", "default") is True
+
+
+def test_retrieve_task_exposes_requested_sandbox_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    class ProviderEchoBenchmark(StubBenchmark):
+        async def retrieve_task(
+            self,
+            task_id: str,
+            skip_validation: bool = False,
+            dataset: str | None = None,
+        ) -> RetrieveTaskResponse:
+            response = await super().retrieve_task(task_id, skip_validation, dataset)
+            return response.model_copy(update={"cwd": str(requested_sandbox_provider())})
+
+    monkeypatch.delenv("AUTH_REQUIRED", raising=False)
+    with TestClient(BenchmarkServiceApp(ProviderEchoBenchmark)) as client:
+        with_header = client.get(
+            "/retrieve-task/", params={"task_id": "task-1"}, headers={"X-Vals-Sandbox-Provider": " Daytona "}
+        )
+        without_header = client.get("/retrieve-task/", params={"task_id": "task-1"})
+
+    assert with_header.json()["cwd"] == "daytona"
+    assert without_header.json()["cwd"] == "None"
+    assert requested_sandbox_provider() is None

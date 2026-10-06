@@ -19,7 +19,11 @@ from websockets.exceptions import ConnectionClosed
 from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_required
 from benchmark_service.base import BenchmarkService
-from benchmark_service.context import sandbox_provider_scope
+from benchmark_service.context import (
+    SANDBOX_PROVIDER_HEADER,
+    requested_sandbox_provider_scope,
+    sandbox_provider_scope,
+)
 from benchmark_service.schemas import (
     DATASET_VERSION_HEADER,
     DatasetVersion,
@@ -364,8 +368,10 @@ class BenchmarkServiceApp(FastAPI):
     ) -> RetrieveTaskResponse:
         if self._sentry is not None:
             self._sentry.bind_request_context(request.headers, task_id=task_id, dataset=dataset)
+        provider = request.headers.get(SANDBOX_PROVIDER_HEADER, "").strip().lower() or None
         async with self._dataset_scope(request, request.state.tenant, dataset):
-            return await self.service.retrieve_task(task_id, skip_validation, dataset=dataset)
+            with requested_sandbox_provider_scope(provider):
+                return await self.service.retrieve_task(task_id, skip_validation, dataset=dataset)
 
     async def _setup_task(self, websocket: WebSocket) -> None:
         await websocket.accept()

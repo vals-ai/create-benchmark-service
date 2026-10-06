@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import shlex
+import signal
 import subprocess
 from collections.abc import AsyncGenerator, Mapping
 from contextlib import nullcontext
@@ -4542,6 +4543,8 @@ class CgroupProcess(Process):
             if self.removal_fails:
                 return SimpleNamespace(exit_code=1, result="cgroup still populated")
             self.group_exists = False
+            if self.command_admitted.is_set():
+                self.user_finished.set()
             return SimpleNamespace(exit_code=0, result="")
         if command.startswith(": > ") and command.endswith(".release"):
             self.release_seen.set()
@@ -4774,6 +4777,63 @@ async def test_daytona_controlled_nonnull_cwd_runs_real_shell_and_preserves_exit
     assert process.sessions == set()
 
 
+class UnwritableStatusLocalShellProcess(LocalShellCgroupProcess):
+    async def create_pty_session(
+        self, *, id: str, on_data: Callable[[bytes], None | Awaitable[None]],
+        envs: dict[str, str], pty_size: PtySize,
+    ) -> "LocalShellCgroupPtyHandle":
+        self.status.mkdir(exist_ok=True)
+        (self.status / f"{id.rsplit('-', 1)[-1]}.status.tmp").mkdir()
+        return await super().create_pty_session(id=id, on_data=on_data, envs=envs, pty_size=pty_size)
+
+
+async def test_daytona_status_write_failure_does_not_report_workload_result(tmp_path: Path) -> None:
+    process = UnwritableStatusLocalShellProcess(tmp_path)
+    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
+    with pytest.raises(SandboxError, match="PTY exited before writing command status"):
+        await asyncio.wait_for(workload.wait(), 5)
+    assert not process.group_exists
+    assert process.sessions == set()
+
+
+class KilledLocalShellCgroupProcess(LocalShellCgroupProcess):
+    async def exec(self, command: str) -> SimpleNamespace:
+        plain = _unwrap_shell_command(command)
+        if plain.startswith("d=/sys/fs/cgroup/cbs-"):
+            pid = int((self.group / "cgroup.procs").read_text().strip())
+            os.kill(pid, signal.SIGKILL)
+        return await super().exec(command)
+
+    async def create_pty_session(
+        self, *, id: str, on_data: Callable[[bytes], None | Awaitable[None]],
+        envs: dict[str, str], pty_size: PtySize,
+    ) -> "LocalShellCgroupPtyHandle":
+        handle = await super().create_pty_session(id=id, on_data=on_data, envs=envs, pty_size=pty_size)
+        self.local_handle = handle
+        return handle
+
+    async def kill_pty_session(self, session_id: str) -> None:
+        self.local_handle.worker.kill()
+        await self.local_handle.worker.wait()
+        await super().kill_pty_session(session_id)
+
+
+async def test_daytona_intentional_kill_retains_shell_exit_status_before_pty_sigkill(
+    tmp_path: Path,
+) -> None:
+    process = KilledLocalShellCgroupProcess(tmp_path)
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    async with asyncio.timeout(2):
+        while not (process.group / "cgroup.procs").read_text().strip():
+            await asyncio.sleep(0.01)
+    await asyncio.wait_for(workload.kill(), 5)
+    completed = await asyncio.wait_for(workload.wait(), 5)
+    assert completed.result.exit_code == 137
+    assert not process.group_exists
+    assert process.sessions == set()
+
+
 class ListedCgroupProcess(CgroupProcess):
     def __init__(self) -> None:
         super().__init__()
@@ -4998,6 +5058,8 @@ class NestedCgroupProcess(CgroupProcess):
             )
             output, _ = await process.communicate()
             self.group_exists = self.root.exists()
+            if process.returncode == 0 and self.command_admitted.is_set():
+                self.user_finished.set()
             return SimpleNamespace(exit_code=process.returncode, result=output.decode())
         return await super().exec(command)
 

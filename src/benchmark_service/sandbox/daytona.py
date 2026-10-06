@@ -1008,7 +1008,9 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         child = f"echo $$ > {shlex.quote(self._group)}/cgroup.procs || exit 1; {command}"
         self._command = (
             f"sh -c {shlex.quote(child)} & child=$!; wait \"$child\"; code=$?; "
-            f": > {shlex.quote(self._complete)}; "
+            f"printf '%s\\n' \"$code\" > {shlex.quote(self._status_temp_path)} "
+            f"&& mv {shlex.quote(self._status_temp_path)} {shlex.quote(self._status_path)} "
+            f"&& : > {shlex.quote(self._complete)} || exit 1; "
             f"while ! test -e {shlex.quote(self._release)}; do sleep 0.05; done; (exit \"$code\")"
         )
         self._env_vars = env_vars
@@ -1081,7 +1083,16 @@ class _DaytonaControlledWorkload(ControlledWorkload):
             raise
 
         stopped_at = await self._stop_group()
-        if self._close_requested or self._run_task.done():
+        if self._close_requested:
+            # The shell runs outside the child cgroup. Give it time to publish the
+            # child's actual exit status before terminating the PTY transport.
+            while not self._run_task.done():
+                result = await self._control_exec(f"test -e {shlex.quote(self._complete)}")
+                if result.exit_code == 0:
+                    break
+                await asyncio.sleep(0.05)
+            await self._ensure_closed()
+        elif self._run_task.done():
             await self._ensure_closed()
         else:
             result = await self._control_exec(f": > {shlex.quote(self._release)}")
@@ -1211,11 +1222,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
                 raise SandboxError("Controlled workload closed before command admission")
             await _bounded(
                 "handle.send_input",
-                handle.send_input(
-                    f"mkdir -p {shlex.quote(_STATUS_DIR)}; {self._command}; "
-                    f"printf '%s\\n' \"$?\" > {shlex.quote(self._status_temp_path)} "
-                    f"&& mv {shlex.quote(self._status_temp_path)} {shlex.quote(self._status_path)}; exit\n"
-                ),
+                handle.send_input(f"mkdir -p {shlex.quote(_STATUS_DIR)}; {self._command}; exit\n"),
                 _TOOLBOX_CALL_TIMEOUT_SECONDS,
             )
             wait_task = asyncio.create_task(handle.wait())

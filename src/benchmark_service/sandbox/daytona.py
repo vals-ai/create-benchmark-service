@@ -74,7 +74,7 @@ from benchmark_service.sandbox.types import (
     ControlledWorkloadResult,
     ExecResult,
     GenerationContainment,
-    LINUX_PID_NAMESPACE_V1,
+    LINUX_CGROUP_V2_V1,
     ImageSource,
     MissingSandboxConfigError,
     ResourceCapacity,
@@ -543,16 +543,22 @@ class DaytonaSandbox(Sandbox):
 
     @property
     def generation_containment(self) -> GenerationContainment:
-        return LINUX_PID_NAMESPACE_V1
+        return LINUX_CGROUP_V2_V1
 
     async def probe_generation_containment(self) -> None:
+        group = f"/sys/fs/cgroup/cbs-probe-{uuid.uuid4().hex}"
+        quoted = shlex.quote(group)
         result = await self._control_exec(
-            "unshare --fork --pid --mount-proc --kill-child=KILL true"
+            f'd={quoted}; mkdir "$d" || exit 1; '
+            "sh -c 'echo $$ > \"$1/cgroup.procs\"' sh \"$d\"; admitted=$?; "
+            'echo 1 > "$d/cgroup.kill" || exit 1; '
+            "grep -qx 'populated 0' \"$d/cgroup.events\" || exit 1; "
+            'rmdir "$d" || exit 1; test "$admitted" -eq 0'
         )
         if result.exit_code != 0:
             raise SandboxError(
-                f"Daytona sandbox does not support {LINUX_PID_NAMESPACE_V1.type} v"
-                f"{LINUX_PID_NAMESPACE_V1.version}: {self._sandbox_ref}"
+                f"Daytona sandbox does not support {LINUX_CGROUP_V2_V1.type} v"
+                f"{LINUX_CGROUP_V2_V1.version}: {self._sandbox_ref}"
             )
 
     def controlled_workload(
@@ -563,13 +569,8 @@ class DaytonaSandbox(Sandbox):
         env_vars: Mapping[str, str] | None = None,
     ) -> ControlledWorkload:
         env = validate_command_env(env_vars)
-        session_id = f"{self.id}:controlled-{uuid.uuid4().hex}"
-        inner_command = _command(command, cwd, None)
-        contained_command = (
-            "unshare --fork --pid --mount-proc --kill-child=KILL "
-            f"sh -c {shlex.quote(inner_command)}"
-        )
-        return _DaytonaControlledWorkload(self, session_id, contained_command, env)
+        ident = uuid.uuid4().hex
+        return _DaytonaControlledWorkload(self, f"{self.id}:controlled-{ident}", _command(command, cwd, None), env)
 
     def _parse_created_at(self, value: str | None) -> datetime | None:
         if value is None:
@@ -999,11 +1000,23 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         self._open_pty_session = sandbox._open_pty_session  # pyright: ignore[reportPrivateUsage]
         self._reconnect_pty = sandbox._reconnect_pty  # pyright: ignore[reportPrivateUsage]
         self._session_id = session_id
-        self._command = command
+        ident = session_id.rsplit("-", 1)[-1]
+        self._group = f"/sys/fs/cgroup/cbs-{ident}"
+        self._complete = f"{_STATUS_DIR}/{ident}.complete"
+        self._release = f"{_STATUS_DIR}/{ident}.release"
+        # The PTY shell stays outside the child cgroup to report the foreground exit after cleanup.
+        child = f"echo $$ > {shlex.quote(self._group)}/cgroup.procs || exit 1; {command}"
+        self._command = (
+            f"sh -c {shlex.quote(child)} & child=$!; wait \"$child\"; code=$?; "
+            f": > {shlex.quote(self._complete)}; "
+            f"while ! test -e {shlex.quote(self._release)}; do sleep 0.05; done; (exit \"$code\")"
+        )
         self._env_vars = env_vars
         self._output: asyncio.Queue[str] = asyncio.Queue()
         self._create_state = _PtyCreateState(marker=uuid.uuid4().hex)
         self._creation_done = asyncio.Event()
+        self._group_created = False
+        self._group_stopped_at: float | None = None
         self._closed = asyncio.Event()
         self._close_requested = False
         self._output_closed = False
@@ -1011,9 +1024,11 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         self._close_task: asyncio.Task[float] | None = None
         self._run_task = asyncio.create_task(self._run())
         self._run_task.add_done_callback(self._consume_run_exception)
+        self._finish_task = asyncio.create_task(self._finish())
+        self._finish_task.add_done_callback(self._consume_run_exception)
 
     @staticmethod
-    def _consume_run_exception(task: asyncio.Task[ExecResult]) -> None:
+    def _consume_run_exception(task: asyncio.Task[Any]) -> None:
         if not task.cancelled():
             task.exception()
 
@@ -1032,16 +1047,62 @@ class _DaytonaControlledWorkload(ControlledWorkload):
             yield self._output.get_nowait()
 
     async def wait(self) -> ControlledWorkloadResult:
+        group_stopped_at = await asyncio.shield(self._finish_task)
         result = await asyncio.shield(self._run_task)
-        absence_confirmed_at = await asyncio.shield(self._ensure_closed())
-        return ControlledWorkloadResult(
-            result=result,
-            absence_confirmed_at=absence_confirmed_at,
-        )
+        pty_absent_at = await asyncio.shield(self._ensure_closed())
+        return ControlledWorkloadResult(result=result, absence_confirmed_at=max(group_stopped_at, pty_absent_at))
 
     async def kill(self) -> None:
         self._close_requested = True
+        try:
+            await asyncio.shield(self._finish_task)
+        except SandboxError:
+            if self._group_stopped_at is None:
+                raise
         await asyncio.shield(self._ensure_closed())
+
+    async def _finish(self) -> float:
+        while not self._group_created and not self._run_task.done():
+            await asyncio.sleep(0.05)
+        if not self._group_created:
+            await self._run_task
+            raise SandboxError(f"Daytona controlled cgroup was not created: {self._group}")
+
+        try:
+            while not self._close_requested and not self._run_task.done():
+                result = await self._control_exec(f"test -e {shlex.quote(self._complete)}")
+                if result.exit_code == 0:
+                    break
+                await asyncio.sleep(0.05)
+        except SandboxError:
+            self._close_requested = True
+            await self._stop_group()
+            await self._ensure_closed()
+            raise
+
+        stopped_at = await self._stop_group()
+        if self._close_requested or self._run_task.done():
+            await self._ensure_closed()
+        else:
+            result = await self._control_exec(f": > {shlex.quote(self._release)}")
+            if result.exit_code != 0:
+                raise SandboxError(f"Daytona controlled PTY release failed: {self._session_id}")
+        return stopped_at
+
+    async def _stop_group(self) -> float:
+        # Remove descendants first; root removal fences a child that has not migrated yet.
+        group = shlex.quote(self._group)
+        result = await self._control_exec(
+            f'd={group}; if test ! -e "$d"; then exit 0; fi; '
+            'while :; do echo 1 > "$d/cgroup.kill" || exit 1; '
+            "if grep -qx 'populated 0' \"$d/cgroup.events\" && "
+            'find "$d" -depth -type d -exec rmdir {} \\; && test ! -e "$d"; then '
+            'exit 0; fi; sleep 0.05; done'
+        )
+        if result.exit_code != 0:
+            raise SandboxError(f"Daytona controlled cgroup removal failed: {self._group}: {result.output}")
+        self._group_stopped_at = asyncio.get_running_loop().time()
+        return self._group_stopped_at
 
     async def _ensure_closed(self) -> float:
         async with self._close_lock:
@@ -1106,6 +1167,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         stdout_bytes = 0
         handle: AsyncPtyHandle | None = None
         wait_task: asyncio.Task[PtyResult] | None = None
+        status_closed_task: asyncio.Task[bool] | None = None
         pty_envs = {
             "TERM": "dumb",
             "LANG": "C.UTF-8",
@@ -1125,6 +1187,10 @@ class _DaytonaControlledWorkload(ControlledWorkload):
             self._output.put_nowait(text)
 
         try:
+            created = await self._control_exec(f"mkdir {shlex.quote(self._group)}")
+            if created.exit_code != 0:
+                raise SandboxError(f"Daytona controlled cgroup creation failed: {self._group}: {created.output}")
+            self._group_created = True
             if self._close_requested:
                 raise SandboxError("Controlled workload closed before PTY creation")
             try:
@@ -1154,9 +1220,16 @@ class _DaytonaControlledWorkload(ControlledWorkload):
             )
             wait_task = asyncio.create_task(handle.wait())
 
+            status_closed_task = asyncio.create_task(self._closed.wait())
+            closure_observed = False
             reconnect_attempts = 0
             while True:
-                done, _ = await asyncio.wait({wait_task}, timeout=_PTY_STATUS_POLL_SECONDS)
+                waiters: set[asyncio.Task[Any]] = {wait_task}
+                if not closure_observed:
+                    waiters.add(status_closed_task)
+                done, _ = await asyncio.wait(
+                    waiters, timeout=_PTY_STATUS_POLL_SECONDS, return_when=asyncio.FIRST_COMPLETED
+                )
                 try:
                     result = await self._control_exec(
                         f"test -e {shlex.quote(self._status_path)}"
@@ -1173,7 +1246,9 @@ class _DaytonaControlledWorkload(ControlledWorkload):
                     break
                 if result.exit_code == 0:
                     break
-                if not done:
+                if status_closed_task in done:
+                    closure_observed = True
+                if wait_task not in done:
                     continue
 
                 reconnect_attempts += 1
@@ -1219,7 +1294,22 @@ class _DaytonaControlledWorkload(ControlledWorkload):
                         _TOOLBOX_CALL_TIMEOUT_SECONDS,
                     )
                     if wait_task in done:
-                        await wait_task
+                        wait_result = await wait_task
+                        if not self._close_requested and (
+                            wait_result.exit_code is None
+                            or wait_result.error == "WebSocket error"
+                            or (
+                                wait_result.error is not None
+                                and wait_result.error.startswith(
+                                    ("WebSocket error:", "Unexpected error:")
+                                )
+                            )
+                        ):
+                            raise SandboxConnectionError(
+                                "Daytona controlled PTY output stream ended without confirmed "
+                                f"delivery for {self._sandbox_ref}: session_id={self._session_id}, "
+                                f"{_pty_result_summary(wait_result)}"
+                            )
                 finally:
                     closed_task.cancel()
                     with suppress(asyncio.CancelledError):
@@ -1231,6 +1321,10 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
         finally:
+            if status_closed_task:
+                status_closed_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await status_closed_task
             self._creation_done.set()
             if wait_task:
                 wait_task.cancel()

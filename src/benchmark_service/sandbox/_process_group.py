@@ -5,7 +5,7 @@ import shlex
 
 def probe_command(marker: str) -> str:
     probe = (
-        f"kill -s 0 -- -$$ && printf ok > {shlex.quote(marker)} "
+        f"kill -0 -$$ && printf ok > {shlex.quote(marker)} "
         f"&& rm -f {shlex.quote(marker)} && test -r /proc/self/stat"
     )
     return f"setsid sh -c {shlex.quote(probe)}; exit $?"
@@ -24,7 +24,7 @@ def stop_command(group_id: int, marker: str) -> str:
         '  done\n'
         '  return 1\n'
         '}\n'
-        f'kill -s KILL -- -{group_id} 2>/dev/null || :\n'
+        f'kill -KILL -{group_id} 2>/dev/null || :\n'
         'n=0\n'
         'while alive; do\n'
         '  n=$((n + 1))\n'

@@ -70,7 +70,7 @@ def _task_response(max_sandbox_attempts: int | None = None) -> RetrieveTaskRespo
 def test_generation_containment_requires_positive_integer_version(version: object) -> None:
     with pytest.raises(ValidationError):
         GenerationContainment.model_validate(
-            {"type": "linux_pid_namespace", "version": version}
+            {"type": "linux_cgroup_v2", "version": version}
         )
 
 

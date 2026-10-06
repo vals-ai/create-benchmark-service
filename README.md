@@ -314,19 +314,23 @@ capability alone does not prove the effective sandbox can start it. A Compose ca
 requires a usable outer transport and effective inner service. Unsupported probes or starts
 raise rather than silently falling back to an ordinary command.
 
-A direct Daytona sandbox supports `linux_pid_namespace` v1 (`LINUX_PID_NAMESPACE_V1`).
-`sandbox.controlled_workload(command, cwd=..., env_vars=...)` starts a separate PTY
-command under `unshare --fork --pid --mount-proc --kill-child=KILL`. Its natural
-completion and kill confirm the PTY session absent from a fresh provider listing.
+A direct Daytona sandbox supports `LINUX_CGROUP_V2_V1` (`linux_cgroup_v2` v1).
+`sandbox.controlled_workload(command, cwd=..., env_vars=...)` starts a PTY command
+whose child enters a dedicated cgroup v2 subgroup. Natural completion and `kill()`
+use `cgroup.kill`, confirm `populated 0` and remove the subgroup; the PTY session
+is also confirmed absent. The probe requires writable cgroup v2 delegation with
+`cgroup.kill`; the sandbox's other services remain outside the workload subgroup.
 
 `ComposeSandbox` supports `linux_process_group` v1 (`LINUX_PROCESS_GROUP_V1`).
 It pins the running service container, starts the command in a new process group inside
 that container, and streams its output through the outer controlled workload transport.
 Natural completion retains the command's exit status and output; `kill()` targets that
-in-container group independently of the outer Docker client. The group stop leaves the
-main service and sidecars running for collection and evaluation. The effective service image
-needs `/bin/sh`, `setsid`, shell group signaling, a writable `/tmp`, and `/proc` process
-status; the probe checks session creation, marker write/removal, and proc visibility before launch.
+in-container group independently of the outer Docker client. Docker-client completion
+without the service process-group marker raises rather than confirming absence.
+The group stop leaves the main service and sidecars running for collection and evaluation.
+The effective service image needs `/bin/sh`, `setsid`, shell group signaling, a writable
+`/tmp`, and `/proc` process status; the probe checks session creation, marker write/removal,
+and proc visibility before launch.
 
 Native Modal and local Docker also advertise `linux_process_group` v1, probe the same group
 boundary, and run controlled commands through their own provider process transports. Stop
@@ -530,7 +534,7 @@ result = await client.run_with_sandbox_recovery(
 Pydantic models used across requests and responses:
 
 - **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, optional `CreditedGeneration(allowance_seconds, stage_protocol)`, optional `Episode(command, parallel_agents)`, `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
-- **`GenerationContainment`** — effective-sandbox capability: `linux_pid_namespace` v1 for direct Daytona or `linux_process_group` v1 for Compose service, native Modal, and local Docker workloads. Tracker probes the effective sandbox for every task before its `ControlledWorkload` and does not fall back to `Sandbox.command()` on unsupported providers.
+- **`GenerationContainment`** — effective-sandbox capability: `linux_cgroup_v2` v1 for direct Daytona or `linux_process_group` v1 for Compose service, native Modal, and local Docker workloads. Tracker probes the effective sandbox for every task before its `ControlledWorkload` and does not fall back to `Sandbox.command()` on unsupported providers.
 - **`agent_install_order`** — `"before_setup"` installs agent dependencies before benchmark setup; `"after_setup"` lets setup prepare the environment first. It defaults to `"before_setup"`, so older task responses remain valid; lifecycle execution is the caller's responsibility.
 - **`BenchmarkEgressPlan`** — declarative `setup_task`, agent `run`, and `evaluation` policies. `"*"` is unrestricted, `[]` is deny-all, and a non-empty list is an allowlist. Setup and evaluation default to `"*"`; `run=None` means the benchmark has no run-policy opinion, preserving legacy task behavior. Applying and composing the plan is the caller's responsibility.
 - **`SandboxRecoveryPolicy`** — explicit opt-in to recreate a lost generation sandbox with the same run identity and volumes; `max_sandbox_attempts` (2–20, inclusive) includes the initial sandbox

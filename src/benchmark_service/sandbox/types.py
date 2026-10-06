@@ -47,11 +47,11 @@ SandboxSource = Annotated[
 class GenerationContainment(BaseModel):
     model_config = ConfigDict(frozen=True)
 
-    type: Literal["linux_pid_namespace", "linux_process_group"]
+    type: Literal["linux_cgroup_v2", "linux_process_group"]
     version: int = Field(strict=True, ge=1)
 
 
-LINUX_PID_NAMESPACE_V1 = GenerationContainment(type="linux_pid_namespace", version=1)
+LINUX_CGROUP_V2_V1 = GenerationContainment(type="linux_cgroup_v2", version=1)
 LINUX_PROCESS_GROUP_V1 = GenerationContainment(type="linux_process_group", version=1)
 _ENV_VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _RESERVED_COMMAND_ENV_NAMES = frozenset({"LANG", "TERM"})

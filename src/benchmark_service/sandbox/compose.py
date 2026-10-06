@@ -231,7 +231,7 @@ class _ComposeControlledWorkload(ControlledWorkload):
             )
             + (
                 f"; status=$?; if test -s {shlex.quote(self._marker)}; then "
-                f"kill -s KILL -- -$(cat {shlex.quote(self._marker)}) 2>/dev/null || :; "
+                f"kill -KILL -$(cat {shlex.quote(self._marker)}) 2>/dev/null || :; "
                 'fi; exit "$status"'
             )
         )
@@ -292,7 +292,7 @@ class _ComposeControlledWorkload(ControlledWorkload):
                 raise SandboxError(f"Compose controlled marker read failed: {marker.output}")
             if self._result_task.done():
                 await self._result_task
-                return asyncio.get_running_loop().time()
+                raise SandboxError("Compose workload finished without a service process-group marker")
             await asyncio.sleep(0.05)
 
         command = stop_command(group_id, self._marker)

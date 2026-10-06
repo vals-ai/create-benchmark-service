@@ -16,6 +16,7 @@ from benchmark_service.sandbox import (
     ImageSource,
     LINUX_PROCESS_GROUP_V1,
     Sandbox,
+    SandboxError,
 )
 
 
@@ -199,3 +200,29 @@ async def test_compose_controlled_kill_before_launch_does_not_wait_for_output(
     workload = compose_sandbox.controlled_workload("exec sleep 10")
     await asyncio.wait_for(workload.kill(), 5)
     assert (await compose_sandbox.exec("printf service-alive")).output == "service-alive"
+
+
+async def test_compose_client_exits_before_service_admission_cannot_confirm_stop(
+    tmp_path: Path,
+) -> None:
+    docker = tmp_path / "docker"
+    docker.write_text(_DOCKER_SHIM)
+    docker.chmod(0o700)
+
+    class LostClientOuter(_LocalOuter):
+        def controlled_workload(
+            self, command: str, *, cwd: str | None = None, env_vars: dict[str, str] | None = None
+        ) -> ControlledWorkload:
+            return _LocalWorkload("exit 137", {**self.env, **(env_vars or {})})
+
+    sandbox = ComposeSandbox(
+        cast(Sandbox, LostClientOuter(tmp_path)),
+        ComposeSource(outer=ImageSource(image="local")),
+    )
+    workload = sandbox.controlled_workload("printf must-not-run")
+
+    with pytest.raises(SandboxError, match="without a service process-group marker"):
+        await asyncio.wait_for(workload.kill(), 5)
+    with pytest.raises(SandboxError, match="without a service process-group marker"):
+        await asyncio.wait_for(workload.wait(), 5)
+    assert (await sandbox.exec("printf service-alive")).output == "service-alive"

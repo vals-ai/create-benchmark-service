@@ -211,10 +211,6 @@ class RetrieveTaskResponse(BaseModel):
     agent_timeout: float | None = Field(
         default=None, description="Agent execution max time in seconds (None for no timeout)"
     )
-    evaluate_on_agent_failure: bool = Field(
-        default=False,
-        description="Whether a nonzero agent exit still proceeds to evaluation instead of failing the task",
-    )
     resources: Resources = Field(description="Computational resources needed")
     agent_install_order: AgentInstallOrder = Field(
         default="before_setup",

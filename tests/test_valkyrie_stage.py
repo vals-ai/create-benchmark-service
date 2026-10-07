@@ -1,12 +1,20 @@
 """Exercise standalone agent rendering and process-group lifecycle."""
 
+import base64
 import ctypes
 import errno
+import io
 import json
 import os
+import queue
+import shlex
 import signal
+import subprocess
+import sys
+import threading
 import time
 from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -205,3 +213,104 @@ def test_parallel_exhaustion_and_graceful_stop(tmp_path: Path, monkeypatch: pyte
         for slot in ("one", "two"):
             if slot in started_slots:
                 worker.stop(slot)
+
+
+def test_generation_children_use_generation_gateway_while_evaluation_uses_native(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generation_hits: queue.Queue[str] = queue.Queue()
+    native_hits: queue.Queue[str] = queue.Queue()
+    release_generation = threading.Event()
+
+    class GenerationHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            generation_hits.put(self.path)
+            release_generation.wait(5)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"generation")
+
+    class NativeHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            native_hits.put(self.path)
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"native")
+
+    with (
+        ThreadingHTTPServer(("127.0.0.1", 0), GenerationHandler) as generation_server,
+        ThreadingHTTPServer(("127.0.0.1", 0), NativeHandler) as native_server,
+    ):
+        generation_thread = threading.Thread(target=generation_server.serve_forever)
+        native_thread = threading.Thread(target=native_server.serve_forever)
+        generation_thread.start()
+        native_thread.start()
+        active: set[str] = set()
+        evaluator: subprocess.Popen[bytes] | None = None
+        try:
+            native_url = f"http://127.0.0.1:{native_server.server_port}"
+            generation_url = f"http://127.0.0.1:{generation_server.server_port}"
+            monkeypatch.setenv("MODEL_GATEWAY_URL", native_url)
+            monkeypatch.setenv("VALKYRIE_GENERATION_MODEL_GATEWAY_URL", generation_url)
+            client = (
+                "import os, sys, urllib.request; "
+                "urllib.request.urlopen(os.environ['MODEL_GATEWAY_URL'] + '/' + sys.argv[1], timeout=5).read()"
+            )
+            stage_reporter = valkyrie_stage.StageReporter
+            agents(
+                tmp_path, monkeypatch,
+                run_cmd=f"{shlex.quote(sys.executable)} -c {shlex.quote(client)} '{{problem_statement_path}}'",
+            )
+            stage_dir = tmp_path / "stage"
+            (stage_dir / "key").write_text("11" * 32)
+            (stage_dir / "ack").mkdir()
+            events: list[str] = []
+
+            class AckOutput(io.StringIO):
+                def write(self, text: str) -> int:
+                    size = super().write(text)
+                    if text.startswith("\nVALKYRIE-STAGE/1 "):
+                        _, payload, _ = text.strip().split(" ")
+                        frame = json.loads(base64.urlsafe_b64decode(payload + "==="))
+                        events.append(frame["event"])
+                        (stage_dir / "ack" / str(frame["seq"])).touch()
+                    return size
+
+            monkeypatch.setattr(sys, "stdout", AckOutput())
+            monkeypatch.setattr(valkyrie_stage, "StageReporter", stage_reporter)
+            worker = valkyrie_stage.Agents()
+            worker.start("one", "one")
+            active.add("one")
+            worker.start("two", "two")
+            active.add("two")
+            evaluator = subprocess.Popen([sys.executable, "-c", client, "evaluation"])
+            assert {generation_hits.get(timeout=5), generation_hits.get(timeout=5)} == {"/one", "/two"}
+            assert native_hits.get(timeout=5) == "/evaluation"
+            assert events == ["begin"]
+            release_generation.set()
+            assert evaluator.wait(timeout=5) == 0
+            assert {worker.wait_any(), worker.wait_any()} == {
+                valkyrie_stage.SlotResult("one", "exited", 0),
+                valkyrie_stage.SlotResult("two", "exited", 0),
+            }
+            active.clear()
+            assert events == ["begin", "end"]
+
+            monkeypatch.delenv("VALKYRIE_GENERATION_MODEL_GATEWAY_URL")
+            worker.start("three", "native-child")
+            active.add("three")
+            assert native_hits.get(timeout=5) == "/native-child"
+            assert worker.wait_any() == valkyrie_stage.SlotResult("three", "exited", 0)
+            active.clear()
+            assert events == ["begin", "end"] * 2
+        finally:
+            release_generation.set()
+            if evaluator is not None and evaluator.poll() is None:
+                evaluator.terminate()
+                evaluator.wait(timeout=5)
+            for slot in active:
+                worker.stop(slot)
+            generation_server.shutdown()
+            native_server.shutdown()
+            generation_thread.join()
+            native_thread.join()

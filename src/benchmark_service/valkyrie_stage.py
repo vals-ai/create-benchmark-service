@@ -132,7 +132,12 @@ class Agents:
             if (self._stage_dir / "exhausted").exists():
                 self._exhausted = True
                 raise Exhausted
-        process = subprocess.Popen(["sh", "-c", command], start_new_session=True)
+        generation_gateway_url = os.environ.get("VALKYRIE_GENERATION_MODEL_GATEWAY_URL")
+        child_env = None
+        if generation_gateway_url is not None:
+            child_env = os.environ.copy()
+            child_env["MODEL_GATEWAY_URL"] = generation_gateway_url
+        process = subprocess.Popen(["sh", "-c", command], env=child_env, start_new_session=True)
         self._active[slot] = _RunningSlot(process, container, final_output)
         self._turns[slot] = self._turns.get(slot, 0) + 1
 

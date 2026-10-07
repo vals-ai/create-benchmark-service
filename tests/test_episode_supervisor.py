@@ -7,7 +7,9 @@ import socket
 import subprocess
 import sys
 import time
+from collections.abc import Mapping
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -15,7 +17,9 @@ from benchmark_service.sandbox.episode import controlled_episode_workload
 from benchmark_service.sandbox.types import (
     ControlledWorkloadResult,
     ExecResult,
+    GenerationContainment,
     LINUX_PROCESS_GROUP_V1,
+    Sandbox,
     SandboxError,
 )
 
@@ -46,7 +50,7 @@ def _request_stop(directory: Path) -> bytes:
         return control.recv(7)
 
 
-def _finish_owner(process: subprocess.Popen, directory: Path) -> None:
+def _finish_owner(process: subprocess.Popen[bytes], directory: Path) -> None:
     ready = directory / "READY"
     deadline = time.monotonic() + 5
     while not ready.exists() and process.poll() is None:
@@ -176,7 +180,7 @@ class _Native:
 
 
 class _Sandbox:
-    def __init__(self, containment, state: str) -> None:
+    def __init__(self, containment: GenerationContainment, state: str) -> None:
         self.generation_containment = containment
         self.state = state
         self.native = _Native(ControlledWorkloadResult(ExecResult(exit_code=23), 42.0))
@@ -189,13 +193,16 @@ class _Sandbox:
     async def upload_file(self, path: str, content: bytes) -> None:
         return None
 
-    def controlled_workload(self, command: str, *, cwd=None, env_vars=None):
+    def controlled_workload(
+        self, command: str, *, cwd: str | None = None, env_vars: Mapping[str, str] | None = None
+    ) -> _Native:
         return self.native
+
 
 @pytest.mark.asyncio
 async def test_ready_without_drained_cannot_be_native_success() -> None:
     pg = _Sandbox(LINUX_PROCESS_GROUP_V1, "READY")
-    workload = await controlled_episode_workload(pg, "echo hi")
+    workload = await controlled_episode_workload(cast(Sandbox, pg), "echo hi")
     with pytest.raises(SandboxError, match="without confirmed descendant drain"):
         await workload.wait()
     with pytest.raises(SandboxError, match="without confirmed descendant drain"):
@@ -214,7 +221,7 @@ async def test_kill_rechecks_pre_ready_state_after_native_exit() -> None:
             return await super().exec(command)
 
     pg = RacingSandbox(LINUX_PROCESS_GROUP_V1, "PENDING")
-    workload = await controlled_episode_workload(pg, "echo hi")
+    workload = await controlled_episode_workload(cast(Sandbox, pg), "echo hi")
     await asyncio.sleep(0)
     with pytest.raises(SandboxError, match="without confirmed descendant drain"):
         await workload.kill()

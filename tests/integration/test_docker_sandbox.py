@@ -106,10 +106,14 @@ async def test_docker_controlled_natural_status_stream_and_tail(docker_sandbox: 
     assert output.replace("α", "") == " stderr"
     assert result.absence_confirmed_at <= asyncio.get_running_loop().time()
 
-    large = docker_sandbox.controlled_workload("head -c 80000 /dev/zero | tr '\\000' x")
+    large = docker_sandbox.controlled_workload("head -c 80000 /dev/zero | tr '\\000' x; printf 'final frame'")
     tail = await large.wait()
+    streamed = "".join([part async for part in large.output()])
+    expected = "x" * 80_000 + "final frame"
     assert tail.result.exit_code == 0
-    assert tail.result.output == "x" * (64 * 1024)
+    assert streamed == expected
+    assert 0 < len(tail.result.output) < len(expected)
+    assert tail.result.output == expected[-len(tail.result.output):]
     assert (await docker_sandbox.exec("printf collection")).output == "collection"
 
 

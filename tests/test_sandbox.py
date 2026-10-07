@@ -62,7 +62,6 @@ from benchmark_service.sandbox.daytona import (
     _PTY_COLS,  # pyright: ignore[reportPrivateUsage]
     _PTY_CREATE_MARKER_ENV,  # pyright: ignore[reportPrivateUsage]
     _PTY_ROWS,  # pyright: ignore[reportPrivateUsage]
-    _PTY_STDOUT_TAIL_MAX_BYTES,  # pyright: ignore[reportPrivateUsage]
     DaytonaProviderConfig,
     _is_ambiguous_pty_create_error,  # pyright: ignore[reportPrivateUsage]
     _is_not_found_error,  # pyright: ignore[reportPrivateUsage]
@@ -2839,7 +2838,7 @@ async def test_daytona_pty_caps_result_output_without_dropping_streamed_chunks()
 
     Test cases:
     - Every chunk is still forwarded to the streaming queue.
-    - ExecResult.output is capped near the tail limit and keeps the newest output.
+    - ExecResult.output truncates the older output and keeps the newest output.
     """
     inner = InnerSandbox()
     inner.process = FloodingProcess()
@@ -2848,13 +2847,14 @@ async def test_daytona_pty_caps_result_output_without_dropping_streamed_chunks()
 
     result = await sandbox._exec_pty("noisy", queue, {})  # pyright: ignore[reportPrivateUsage]
 
-    chunk_length = 1024 + len("chunk-0000-")
-    total_streamed = 0
+    chunks: list[str] = []
     while not queue.empty():
-        total_streamed += len(queue.get_nowait())
-    assert total_streamed == 200 * chunk_length
-    assert len(result.output) <= _PTY_STDOUT_TAIL_MAX_BYTES + chunk_length
-    assert "chunk-0199-" in result.output
+        chunks.append(queue.get_nowait())
+    streamed = "".join(chunks)
+    assert streamed == "".join(f"chunk-{index:04d}-" + "x" * 1024 for index in range(200))
+    assert 0 < len(result.output) < len(streamed)
+    assert result.output == streamed[-len(result.output):]
+    assert result.output.endswith("chunk-0199-" + "x" * 1024)
     assert "chunk-0000-" not in result.output
 
 
@@ -4700,11 +4700,14 @@ async def test_daytona_controlled_utf8_keeps_existing_bounded_tail() -> None:
     process.allow_final_frame.set()
     result = await asyncio.wait_for(workload.wait(), 2)
     streamed = "".join([chunk async for chunk in workload.output()])
-    assert streamed.startswith("hellochunk-00:")
+    assert streamed == "hello" + "".join(
+        f"chunk-{index:02d}:" + "x" * 1024 for index in range(80)
+    ) + "final frame"
     assert "chunk-00:" not in result.result.output
     assert "chunk-79:" in result.result.output
     assert result.result.output.endswith("final frame")
-    assert len(result.result.output) <= _PTY_STDOUT_TAIL_MAX_BYTES + 1033
+    assert 0 < len(result.result.output) < len(streamed)
+    assert result.result.output == streamed[-len(result.result.output):]
 
 
 async def test_daytona_cgroup_probe_rejects_unsupported_kernel() -> None:

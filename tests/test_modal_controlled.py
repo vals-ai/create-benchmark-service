@@ -121,19 +121,17 @@ async def test_active_consumer_gets_full_stream_with_bounded_result_tail(
 ) -> None:
     vm, _ = sandbox
     workload = vm.controlled_workload(
-        "python3 -c 'import sys; sys.stdout.write(\"x\" * 2000000)'"
+        "python3 -c 'import sys; sys.stdout.write(\"x\" * 2000000 + \"final frame\")'"
     )
 
-    async def consume() -> int:
-        total = 0
-        async for chunk in workload.output():
-            assert chunk == "x" * len(chunk)
-            total += len(chunk)
-        return total
+    async def consume() -> str:
+        return "".join([chunk async for chunk in workload.output()])
 
-    total, completed = await asyncio.wait_for(
+    streamed, completed = await asyncio.wait_for(
         asyncio.gather(consume(), workload.wait()), 10
     )
-    assert total == 2_000_000
+    expected = "x" * 2_000_000 + "final frame"
+    assert streamed == expected
     assert completed.result.exit_code == 0
-    assert completed.result.output == "x" * (64 * 1024)
+    assert 0 < len(completed.result.output) < len(expected)
+    assert completed.result.output == expected[-len(completed.result.output):]

@@ -26,7 +26,9 @@ def owner_command(command: str, control_dir: str, shell: str) -> str:
         f"printf '%s\n' \"$status\" > {directory}/status\n"
         "kill -KILL 0"
     )
-    return f"setsid sh -c {shlex.quote(script)}; exit $?"
+    # Keep the waiting shell's signal notification off the workload stream;
+    # the child restores stderr and closes FD 4 before becoming the owner.
+    return f"exec 4>&2 2>/dev/null; ( exec setsid sh -c {shlex.quote(script)} 2>&4 4>&- ); exit $?"
 
 
 def stop_command(group_id: int, control_dir: str) -> str:

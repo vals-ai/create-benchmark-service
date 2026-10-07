@@ -1,5 +1,7 @@
 """Standalone Linux/Python 3.8 episode owner, uploaded into a sandbox."""
 
+from __future__ import annotations
+
 import argparse
 import ctypes
 import os
@@ -15,18 +17,18 @@ PR_SET_CHILD_SUBREAPER = 36
 
 
 
-def publish(directory, name, value):
+def publish(directory: str, name: str, value: str) -> None:
     with open(os.path.join(directory, name), "w") as stream:
         stream.write(value)
 
 
-def children():
+def children() -> list[int]:
     path = "/proc/self/task/{}/children".format(os.getpid())
     with open(path) as stream:
         return [int(pid) for pid in stream.read().split()]
 
 
-def drain(child):
+def drain(child: subprocess.Popen[bytes] | None) -> None:
     root_pid = child.pid if child is not None else None
     while True:
         owned = [pid for pid in children() if pid != root_pid]
@@ -43,11 +45,9 @@ def drain(child):
             except ChildProcessError:
                 pass
         time.sleep(0.01)
-    if child is not None:
-        return child.wait()
 
 
-def main():
+def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("directory")
     parser.add_argument("command")
@@ -68,7 +68,8 @@ def main():
     while True:
         status = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
         if status is not None:
-            returncode = drain(child)
+            drain(child)
+            returncode = child.wait()
             code = returncode if returncode >= 0 else 128 - returncode
             publish(args.directory, "DRAINED", "drained\n")
             return code
@@ -81,6 +82,7 @@ def main():
                         os.kill(child.pid, signal.SIGKILL)
                         os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
                     drain(child)
+                    child.wait()
                     publish(args.directory, "DRAINED", "drained\n")
                     connection.sendall(b"DRAINED")
                     return 137

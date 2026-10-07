@@ -179,20 +179,24 @@ async def test_compose_controlled_deadline_stops_group_but_keeps_service(
 ) -> None:
     service = await asyncio.create_subprocess_exec("sleep", "30", start_new_session=True)
     try:
-        workload = compose_sandbox.controlled_workload('printf "started\\n"; sh -c "sleep 10 & wait"')
-        stream = workload.output()
-        first = await asyncio.wait_for(anext(stream), 5)
-        assert "started\n" in first
-        await asyncio.wait_for(workload.kill(), 5)
-        await asyncio.wait_for(workload.kill(), 5)
-        assert service.returncode is None
-        assert (await compose_sandbox.exec("printf service-alive")).output == "service-alive"
-        completed = await asyncio.wait_for(workload.wait(), 5)
-        assert completed.result.exit_code != 0
-        assert "started\n" in completed.result.output
+        workload = compose_sandbox.controlled_workload('printf "started\n"; sh -c "sleep 10 & wait"')
+        try:
+            stream = workload.output()
+            try:
+                first = await asyncio.wait_for(anext(stream), 5)
+                assert "started\n" in first
+                await asyncio.wait_for(workload.kill(), 5)
+                await asyncio.wait_for(workload.kill(), 5)
+                assert service.returncode is None
+                assert (await compose_sandbox.exec("printf service-alive")).output == "service-alive"
+                completed = await asyncio.wait_for(workload.wait(), 5)
+                assert completed.result.exit_code != 0
+                assert "started\n" in completed.result.output
+            finally:
+                await stream.aclose()
+        finally:
+            await asyncio.wait_for(workload.kill(), 5)
     finally:
-        await asyncio.wait_for(workload.kill(), 5)
-        await stream.aclose()
         service.terminate()
         await service.wait()
 

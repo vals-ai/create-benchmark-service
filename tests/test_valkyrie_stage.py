@@ -15,7 +15,7 @@ from benchmark_service import valkyrie_stage
 
 
 @pytest.fixture(autouse=True)
-def _restore_subreaper() -> Iterator[None]:
+def restore_subreaper() -> Iterator[None]:
     libc = ctypes.CDLL(None, use_errno=True)
     original = ctypes.c_int()
     if libc.prctl(37, ctypes.byref(original), 0, 0, 0) != 0:
@@ -116,7 +116,7 @@ def test_natural_exit_keeps_leader_until_group_cleanup(tmp_path: Path, monkeypat
             "read ready < '{slot_dir}/go'; exit 23"
         ),
     )
-    original_signal = worker._signal_group
+    original_signal = os.killpg
     observed: list[int] = []
 
     def signal_group(pid: int, sig: signal.Signals) -> None:
@@ -125,7 +125,7 @@ def test_natural_exit_keeps_leader_until_group_cleanup(tmp_path: Path, monkeypat
             observed.append(pid)
         original_signal(pid, sig)
 
-    monkeypatch.setattr(worker, "_signal_group", signal_group)
+    monkeypatch.setattr(os, "killpg", signal_group)
     child_pid_file = gate.parent / "child.pid"
     libc = ctypes.CDLL(None, use_errno=True)
     leader_fd: int | None = None
@@ -133,8 +133,8 @@ def test_natural_exit_keeps_leader_until_group_cleanup(tmp_path: Path, monkeypat
     child_pid: int | None = None
     released = False
     worker.start("one", "observation")
+    leader = worker._active["one"].process  # pyright: ignore[reportPrivateUsage]
     try:
-        leader = worker._active["one"].process
         leader_fd = libc.pidfd_open(leader.pid, 0)
         if leader_fd == -1:
             raise OSError(ctypes.get_errno(), "pidfd_open")
@@ -154,12 +154,10 @@ def test_natural_exit_keeps_leader_until_group_cleanup(tmp_path: Path, monkeypat
         assert not (Path("/proc") / str(child_pid)).exists()
         assert reporter.events == [("begin", None), ("end", None)]
     finally:
-        monkeypatch.setattr(worker, "_signal_group", original_signal)
+        monkeypatch.setattr(os, "killpg", original_signal)
         try:
             if not released:
                 original_signal(leader.pid, signal.SIGKILL)
-                while not worker._group_empty(leader.pid):
-                    time.sleep(0.01)
             else:
                 try:
                     stopped = libc.pidfd_send_signal(child_fd, signal.SIGKILL, None, 0)
@@ -191,14 +189,19 @@ def test_parallel_exhaustion_and_graceful_stop(tmp_path: Path, monkeypatch: pyte
         tmp_path, monkeypatch, run_cmd="sleep 30", interrupt_grace_seconds=0.2,
     )
     worker.start("one", "observation")
+    started_slots = {"one"}
     try:
         worker.start("two", "observation")
+        started_slots.add("two")
         assert reporter.events == [("begin", None)]
         assert worker.stop("one").reason == "stopped"
+        started_slots.remove("one")
         assert reporter.events == [("begin", None)]
         (tmp_path / "stage" / "exhausted").touch()
         assert worker.wait_any().reason == "exhausted"
+        started_slots.clear()
         assert reporter.events == [("begin", None), ("end", None)]
     finally:
-        for slot in list(worker._active):
-            worker.stop(slot)
+        for slot in ("one", "two"):
+            if slot in started_slots:
+                worker.stop(slot)

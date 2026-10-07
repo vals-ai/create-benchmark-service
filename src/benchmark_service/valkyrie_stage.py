@@ -202,7 +202,7 @@ class Agents:
                 continue
             try:
                 stat = (entry / "stat").read_text()
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
                 continue  # Process exited during the scan.
             state, parent, group, _ = stat.rpartition(") ")[2].split(" ", 3)
             if int(group) != pgid:

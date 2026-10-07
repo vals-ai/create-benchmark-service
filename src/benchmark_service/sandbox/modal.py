@@ -31,6 +31,7 @@ from benchmark_service.sandbox.types import (
     GenerationContainment,
     ImageSource,
     LINUX_PROCESS_GROUP_V1,
+    MAX_SANDBOX_LIFETIME_SECONDS,
     MissingSandboxConfigError,
     Sandbox,
     SandboxCommandError,
@@ -50,7 +51,7 @@ from benchmark_service.sandbox.types import (
 # Modal sandboxes must belong to an app; all benchmark sandboxes share one.
 _APP_NAME = "benchmark-service"
 # Modal's default sandbox timeout is 5 minutes; benchmark tasks run for hours.
-_MAX_LIFETIME_SECONDS = 24 * 60 * 60
+_MAX_LIFETIME_SECONDS = min(MAX_SANDBOX_LIFETIME_SECONDS, 24 * 60 * 60)
 _ALLOW_ALL_CIDRS = ("0.0.0.0/0",)
 _ALLOW_ALL_DOMAINS = ("*",)
 _COMMAND_STATUS_POLL_SECONDS = 10

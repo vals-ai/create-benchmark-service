@@ -105,6 +105,8 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 
 **Dispatch order.** Task order within a dataset is the order the tracker dispatches tasks in (task rows are created in `filter_tasks` order, and `?slice=` slices that same order). Set the `priority_dataset` class attribute (e.g. `priority_dataset = "vals_index"`) to stably move the tasks a dataset shares with that subset to its front, so a run of a full split finishes the index subset before the long tail. `create()` fails if the named dataset is not loaded.
 
+**Sandbox providers.** A service that serves more than one sandbox provider declares `sandbox_providers` (for example `("modal", "daytona")`) and `default_sandbox_provider`. Its `retrieve_task` then accepts a `sandbox_provider` keyword and returns the source for that provider. Callers pass the run's provider as the `sandbox_provider` query parameter (`BenchmarkServiceClient.retrieve_task(..., sandbox_provider=...)`); a missing value uses the default, and an undeclared provider gets 400. `/version` reports both attributes. A service that declares no providers keeps the old `retrieve_task` signature and ignores the parameter.
+
 ### FastAPI application factory (`app.py`)
 
 `BenchmarkServiceApp(service_cls)` wraps your `BenchmarkService` subclass in a fully configured FastAPI app. Pass your subclass and run the result with any ASGI server.

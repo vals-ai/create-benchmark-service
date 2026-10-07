@@ -4,7 +4,7 @@ import importlib.metadata
 import logging
 import os
 import traceback
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import aclosing, asynccontextmanager, nullcontext, suppress
 from typing import Any, cast
 
@@ -32,6 +32,7 @@ from benchmark_service.schemas import (
     RetrieveTaskResponse,
     ResolveDatasetRequest,
     ResolveDatasetResponse,
+    SandboxProviderName,
     SetupTaskRequest,
     StreamChunk,
     StreamDatasetVersionChunk,
@@ -123,6 +124,10 @@ class BenchmarkServiceApp(FastAPI):
     service: BenchmarkService
 
     def __init__(self, service_cls: type[BenchmarkService]) -> None:
+        if service_cls.sandbox_providers and service_cls.default_sandbox_provider not in service_cls.sandbox_providers:
+            raise ValueError(
+                f"{service_cls.__name__}.default_sandbox_provider must be one of {service_cls.sandbox_providers}"
+            )
         self._service_cls = service_cls
         self._service_name, self._service_version = _get_service_metadata(service_cls)
         configured_deployment_name = os.getenv("SERVICE_NAME", "").strip()
@@ -229,6 +234,8 @@ class BenchmarkServiceApp(FastAPI):
             dataset_version=self.service.get_dataset_version(dataset),
             dataset_version_selection=self.service.supports_dataset_version_selection(dataset or "default"),
             eval_mode=self.service.eval_mode,
+            sandbox_providers=list(self.service.sandbox_providers),
+            default_sandbox_provider=self.service.default_sandbox_provider,
         )
 
     @asynccontextmanager
@@ -361,11 +368,24 @@ class BenchmarkServiceApp(FastAPI):
         task_id: str = Query(..., description="Task ID to retrieve"),
         skip_validation: bool = Query(False, description="Skip validation of task existence"),
         dataset: str | None = Query(default=None, description="Dataset name to use (defaults to 'default')"),
+        sandbox_provider: SandboxProviderName | None = Query(
+            default=None, description="Sandbox provider the run uses (defaults to the service default)"
+        ),
     ) -> RetrieveTaskResponse:
         if self._sentry is not None:
             self._sentry.bind_request_context(request.headers, task_id=task_id, dataset=dataset)
+        providers = self.service.sandbox_providers
+        provider = sandbox_provider or self.service.default_sandbox_provider
+        if providers and provider not in providers:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Sandbox provider '{provider}' is not supported; this service supports {', '.join(providers)}",
+            )
         async with self._dataset_scope(request, request.state.tenant, dataset):
-            return await self.service.retrieve_task(task_id, skip_validation, dataset=dataset)
+            if not providers:
+                return await self.service.retrieve_task(task_id, skip_validation, dataset=dataset)
+            retrieve_task = cast(Callable[..., Awaitable[RetrieveTaskResponse]], self.service.retrieve_task)
+            return await retrieve_task(task_id, skip_validation, dataset=dataset, sandbox_provider=provider)
 
     async def _setup_task(self, websocket: WebSocket) -> None:
         await websocket.accept()

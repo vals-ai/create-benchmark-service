@@ -349,6 +349,9 @@ class HealthCheckResponse(BaseModel):
     status: str = Field(description="Status of the service ('ok' if running)")
 
 
+SandboxProviderName = Literal["daytona", "docker", "modal"]
+
+
 class EvalMode(StrEnum):
     """How a benchmark is evaluated on /v1/evaluate.
 
@@ -379,6 +382,8 @@ class VersionResponse(BaseModel):
     dataset_version: str | None = None
     dataset_version_selection: bool = Field(default=False, strict=True)
     eval_mode: EvalMode = EvalMode.TEXT
+    sandbox_providers: list[SandboxProviderName] = Field(default_factory=list)
+    default_sandbox_provider: SandboxProviderName | None = None
 
 
 class StreamMessageChunk(BaseModel):

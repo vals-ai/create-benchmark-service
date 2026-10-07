@@ -34,6 +34,7 @@ from benchmark_service.schemas import (
     HealthCheckResponse,
     JsonValue,
     RetrieveTaskResponse,
+    SandboxProviderName,
     ResolveDatasetRequest,
     ResolveDatasetResponse,
     SetupTaskRequest,
@@ -565,17 +566,24 @@ class BenchmarkServiceClient:
 
     @_retry_http
     async def retrieve_task(
-        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+        self,
+        task_id: str,
+        skip_validation: bool = False,
+        dataset: str | None = None,
+        sandbox_provider: SandboxProviderName | None = None,
     ) -> RetrieveTaskResponse:
         """Retrieve a task by ID.
 
         Args:
             task_id: The task to retrieve.
             skip_validation: If True, skip task validation.
+            sandbox_provider: Provider the run uses. Services that declare providers return its source.
         """
         params: dict[str, Any] = {"task_id": task_id, "skip_validation": skip_validation}
         if dataset is not None:
             params["dataset"] = dataset
+        if sandbox_provider is not None:
+            params["sandbox_provider"] = sandbox_provider
         response = await self._http_client.get(f"{self._url}/retrieve-task/", params=params)
 
         if response.status_code == 401:
@@ -596,6 +604,7 @@ class BenchmarkServiceClient:
         operation: Callable[[SandboxRecoveryAttempt], Awaitable[_RecoveryResult]],
         *,
         dataset: str | None = None,
+        sandbox_provider: SandboxProviderName | None = None,
         retryable_attempt_errors: tuple[type[Exception], ...] = (),
         default_max_attempts: int = 1,
         retry_delay_s: float = 2.0,
@@ -632,7 +641,9 @@ class BenchmarkServiceClient:
             state = _SandboxRecoveryState(
                 run_id=run_id,
                 task_id=task_id,
-                load_task=lambda: self.retrieve_task(task_id=task_id, dataset=dataset),
+                load_task=lambda: self.retrieve_task(
+                    task_id=task_id, dataset=dataset, sandbox_provider=sandbox_provider
+                ),
                 default_max_attempts=default_max_attempts,
             )
 

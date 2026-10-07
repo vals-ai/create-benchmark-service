@@ -28,6 +28,7 @@ from benchmark_service.schemas import (
     GradingSubmission,
     MaterializedSubmissionArtifact,
     RetrieveTaskResponse,
+    SandboxProviderName,
     StreamChunk,
     StreamResultChunk,
     TaskFilter,
@@ -70,6 +71,12 @@ class BenchmarkService(ABC):
     # come first, e.g. so a run of the full split finishes the index subset
     # before the long tail.
     priority_dataset: ClassVar[str | None] = None
+
+    # Providers whose sandbox source this service can return. A service that
+    # declares providers receives the run's provider as the `sandbox_provider`
+    # keyword of `retrieve_task`; the default serves callers that send none.
+    sandbox_providers: ClassVar[tuple[SandboxProviderName, ...]] = ()
+    default_sandbox_provider: ClassVar[SandboxProviderName | None] = None
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -261,6 +268,10 @@ class BenchmarkService(ABC):
 
         The problem_path is the path inside the sandbox where setup_task will
         write the problem statement file.
+
+        A service that sets ``sandbox_providers`` must also accept a
+        ``sandbox_provider`` keyword: the run's provider, or
+        ``default_sandbox_provider`` when the caller sends none.
 
         Args:
             task_id: The task to retrieve metadata for

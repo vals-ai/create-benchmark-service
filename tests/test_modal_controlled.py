@@ -60,12 +60,14 @@ async def test_natural_exit_preserves_output_exit_status_and_vm(
     await vm.probe_generation_containment()
     workload = vm.controlled_workload('printf "%s:%s\\n" "$VALUE" "$PWD"; exit ' + str(code),
                                       cwd=str(tmp_path), env_vars={"VALUE": "hello"})
-    completed = await asyncio.wait_for(workload.wait(), 5)
-    assert completed.result.exit_code == code
-    assert completed.result.output == f"hello:{tmp_path}\n"
-    assert "".join([chunk async for chunk in workload.output()]) == completed.result.output
-    await workload.kill()
-    assert (await vm.exec("printf vm-alive")).output == "vm-alive"
+    try:
+        completed = await asyncio.wait_for(workload.wait(), 5)
+        assert completed.result.exit_code == code
+        assert completed.result.output == f"hello:{tmp_path}\n"
+        assert "".join([chunk async for chunk in workload.output()]) == completed.result.output
+        assert (await vm.exec("printf vm-alive")).output == "vm-alive"
+    finally:
+        await workload.kill()
 
 
 async def test_deadline_kills_group_child_and_reuses_vm(
@@ -74,17 +76,20 @@ async def test_deadline_kills_group_child_and_reuses_vm(
     vm, _ = sandbox
     workload = vm.controlled_workload("sh -c 'sleep 30 & child=$!; echo child:$child; wait'")
     stream = workload.output()
-    first = await asyncio.wait_for(anext(stream), 5)
-    child = int(first.strip().split("child:")[1])
-    await asyncio.wait_for(workload.kill(), 5)
-    completed = await asyncio.wait_for(workload.wait(), 5)
-    assert completed.result.exit_code != 0
-    assert first in completed.result.output
-    await asyncio.wait_for(workload.kill(), 5)
-    assert (await vm.exec(f"test ! -e /proc/{child}/stat || "
-                          f"test $(cut -d ' ' -f 3 /proc/{child}/stat) = Z")).exit_code == 0
-    assert (await vm.exec("printf vm-alive")).output == "vm-alive"
-    await stream.aclose()
+    try:
+        first = await asyncio.wait_for(anext(stream), 5)
+        child = int(first.strip().split("child:")[1])
+        await asyncio.wait_for(workload.kill(), 5)
+        completed = await asyncio.wait_for(workload.wait(), 5)
+        assert completed.result.exit_code != 0
+        assert first in completed.result.output
+        await asyncio.wait_for(workload.kill(), 5)
+        assert (await vm.exec(f"test ! -e /proc/{child}/stat || "
+                              f"test $(cut -d ' ' -f 3 /proc/{child}/stat) = Z")).exit_code == 0
+        assert (await vm.exec("printf vm-alive")).output == "vm-alive"
+    finally:
+        await asyncio.wait_for(workload.kill(), 5)
+        await stream.aclose()
 
 
 async def test_wait_and_kill_concurrently_then_early_kill_without_output(
@@ -93,16 +98,22 @@ async def test_wait_and_kill_concurrently_then_early_kill_without_output(
     vm, _ = sandbox
     workload = vm.controlled_workload('printf "started\\n"; exec sleep 30')
     output = workload.output()
-    assert await asyncio.wait_for(anext(output), 5) == "started\n"
-    waiting = asyncio.create_task(workload.wait())
-    killing = asyncio.create_task(workload.kill())
-    completed, _ = await asyncio.wait_for(asyncio.gather(waiting, killing), 5)
-    assert completed.result.exit_code != 0
-    await output.aclose()
+    try:
+        assert await asyncio.wait_for(anext(output), 5) == "started\n"
+        waiting = asyncio.create_task(workload.wait())
+        killing = asyncio.create_task(workload.kill())
+        completed, _ = await asyncio.wait_for(asyncio.gather(waiting, killing), 5)
+        assert completed.result.exit_code != 0
+    finally:
+        await asyncio.wait_for(workload.kill(), 5)
+        await output.aclose()
     early = vm.controlled_workload("exec sleep 30")
-    await asyncio.wait_for(early.kill(), 5)
-    assert (await asyncio.wait_for(early.wait(), 5)).result.exit_code != 0
-    assert (await vm.exec("printf reused")).output == "reused"
+    try:
+        await asyncio.wait_for(early.kill(), 5)
+        assert (await asyncio.wait_for(early.wait(), 5)).result.exit_code != 0
+        assert (await vm.exec("printf reused")).output == "reused"
+    finally:
+        await asyncio.wait_for(early.kill(), 5)
 
 
 async def test_active_consumer_gets_full_stream_with_bounded_result_tail(

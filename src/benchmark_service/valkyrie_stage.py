@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import shutil
 import signal
 import subprocess
@@ -106,20 +107,23 @@ class Agents:
 
         slot_dir = self._slots_root / slot / "agent"
         slot_dir.mkdir(parents=True, exist_ok=True)
-        container = self._container_template.format(slot=slot) if self._container_template is not None else None
+        container = self._container_template.replace("{slot}", slot) if self._container_template is not None else None
         if slot in self._turns:
             if self._continue_cmd is None:
                 raise ValueError(f"slot {slot!r} has no continue_cmd")
             template = self._continue_cmd
         else:
             template = self._run_cmd
-        command = template.format(
-            problem_statement_path=observation_path,
-            slot_dir=slot_dir,
-            container_name=container,
+        bindings = {"problem_statement_path": observation_path, "slot_dir": str(slot_dir)}
+        if container is not None:
+            bindings["container_name"] = container
+        command = re.sub(
+            "|".join(re.escape("{" + name + "}") for name in bindings),
+            lambda match: bindings[match.group()[1:-1]],
+            template,
         )
         final_output = (
-            Path(self._final_output_template.format(slot_dir=slot_dir))
+            Path(self._final_output_template.replace("{slot_dir}", str(slot_dir)))
             if self._final_output_template is not None
             else None
         )
@@ -145,7 +149,7 @@ class Agents:
             self._signal_group(running.process.pid, signal.SIGINT)
             deadline = time.monotonic() + self._interrupt_grace_seconds
             while time.monotonic() < deadline:
-                running.process.poll()
+                self._observe_exit(running.process)
                 if self._group_empty(running.process.pid):
                     break
                 if (self._stage_dir / "exhausted").exists():
@@ -169,8 +173,12 @@ class Agents:
         if (self._stage_dir / "exhausted").exists():
             self._exhaust_all()
         for slot, running in list(self._active.items()):
-            if running.process.poll() is not None:
+            if self._observe_exit(running.process):
                 self._complete(slot, "exited")
+
+    @staticmethod
+    def _observe_exit(process: subprocess.Popen[bytes]) -> bool:
+        return os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
 
     def _exhaust_all(self) -> None:
         self._exhausted = True
@@ -210,9 +218,9 @@ class Agents:
     def _complete(self, slot: str, reason: Literal["exited", "stopped", "exhausted"]) -> None:
         running = self._active[slot]
         self._signal_group(running.process.pid, signal.SIGKILL)
-        exit_code = running.process.wait()
         while not self._group_empty(running.process.pid):
             time.sleep(0.1)
+        exit_code = running.process.wait()
 
         if running.container is not None:
             subprocess.run(["docker", "rm", "-f", running.container], capture_output=True, check=False)

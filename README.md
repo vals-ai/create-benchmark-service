@@ -272,14 +272,24 @@ On failure, do not assert an END without proof of absence. Tracker owns timeout 
 cleanup, including nested container inspection on abort. Neither model output nor benchmark
 code may assert a generation credit.
 
-An opt-in episode declares `RetrieveTaskResponse.episode = Episode(command="exec python /opt/bench/orchestrator.py", parallel_agents=5)`.
-It requires `credited_generation` with `stage_protocol="valkyrie-stage/1"`; without an episode, Tracker runs the agent command directly.
-Tracker runs the benchmark-owned `episode.command` instead of the agent command and writes the selected agent bundle to
+An opt-in episode declares
+`RetrieveTaskResponse.episode = Episode(command="exec python /opt/bench/orchestrator.py", parallel_agents=5)`.
+It requires `credited_generation` with `stage_protocol="valkyrie-stage/1"`; without an episode,
+Tracker runs the agent command directly. In a `linux_process_group` sandbox, the image must
+provide Python 3.8+ as `python3` on `PATH` for the CBS-owned episode supervisor; the benchmark
+orchestrator still owns its command and interpreter. Native Daytona cgroup episodes use their
+native controlled workload unchanged. Tracker runs the benchmark-owned `episode.command`
+instead of the agent command and writes the selected agent bundle to
 `$VALKYRIE_STAGE_DIR/agent.json` after setup: `run_cmd`, `continue_cmd`, `interrupt_grace_seconds`,
 `container_name`, `final_output`, `parallel_agents`, and `slots_root`. The library owns a single `StageReporter`
 and starts each selected-agent turn in a new process group. The bundle renders `{problem_statement_path}` to that turn's
-observation file, `{slot_dir}` to `<slots_root>/<slot>/agent`, and `{container_name}` to `container_name`
-with `{slot}` filled first. The orchestrator names slots and shares one workspace and budget across them; each slot has separate
+observation file and `{slot_dir}` to `<slots_root>/<slot>/agent`. When `container_name` is
+configured, `{container_name}` is bound to that template with `{slot}` filled first; otherwise
+it remains literal in the command. Other unbound tokens also remain literal. These are
+bound token replacements, not arbitrary format-string interpolation; inserted values
+containing braces remain opaque. In `final_output`, `{slot_dir}` is replaced for each
+configured path. The orchestrator names slots and shares one workspace and budget across
+multiple slots; each slot has separate
 runtime/session/output state. More than `parallel_agents` live turns are refused. A second turn on a slot requires
 `continue_cmd`. Children inherit the orchestrator's cwd, environment, stdout and stderr. After a turn's
 process group and any container are absent, the last active turn sends END and waits for its ACK before copying

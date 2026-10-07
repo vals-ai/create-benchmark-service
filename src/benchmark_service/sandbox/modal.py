@@ -22,7 +22,7 @@ from modal.exception import ResourceExhaustedError as ModalResourceExhaustedErro
 from pydantic import BaseModel
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
-from benchmark_service.sandbox._process_group import probe_command, stop_command
+from benchmark_service.sandbox._process_group import cleanup_command, owner_command, probe_command, stop_command
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
     ControlledWorkload,
@@ -506,19 +506,14 @@ class _ModalControlledWorkload(ControlledWorkload):
         self._output_changed = asyncio.Event()
         self._launch_task = asyncio.create_task(self._launch())
         self._wait_task = asyncio.create_task(self._finish())
-        self._stop_task: asyncio.Task[float] | None = None
+        self._stop_task: asyncio.Task[tuple[float, int | None]] | None = None
+        self._cleanup_task: asyncio.Task[None] | None = None
         self._read_task: asyncio.Task[None] | None = None
         self._process_wait_task: asyncio.Task[int] | None = None
 
     async def _launch(self) -> None:
-        inner = (
-            "setsid sh -c "
-            + shlex.quote(
-                f'printf "%s\n" "$$" > {shlex.quote(self._marker)} && '
-                f"exec sh -lc {shlex.quote(_command(self._command, self._cwd, None))}"
-            )
-            + "; exit $?"
-        )
+        command = f"cd {shlex.quote(self._cwd)} && {self._command}" if self._cwd else self._command
+        inner = owner_command(command, self._marker, "sh -lc")
         output, process_wait = await self._start_process(inner, self._env_vars)
         self._read_task = asyncio.create_task(self._read_output(output))
         self._process_wait_task = asyncio.create_task(process_wait)
@@ -565,9 +560,16 @@ class _ModalControlledWorkload(ControlledWorkload):
             exit_code = await self._process_wait_task
         except ModalError as exc:
             raise _sandbox_error(exc) from exc
-        stopped_at = await self._ensure_stopped()
+        stopped_at, status = await self._ensure_stopped()
+        assert self._cleanup_task is not None
+        await self._cleanup_task
         await self._read_task
-        return ControlledWorkloadResult(ExecResult(exit_code=exit_code, output="".join(self._tail)), stopped_at)
+        if status is None and exit_code == 0:
+            raise SandboxError("Modal workload exited without a foreground status")
+        return ControlledWorkloadResult(
+            ExecResult(exit_code=status if status is not None else exit_code, output="".join(self._tail)),
+            stopped_at,
+        )
 
     async def wait(self) -> ControlledWorkloadResult:
         return await asyncio.shield(self._wait_task)
@@ -576,17 +578,17 @@ class _ModalControlledWorkload(ControlledWorkload):
         await asyncio.shield(self._launch_task)
         await asyncio.shield(self._ensure_stopped())
 
-    async def _ensure_stopped(self) -> float:
+    async def _ensure_stopped(self) -> tuple[float, int | None]:
         if self._stop_task is None:
             self._stop_task = asyncio.create_task(self._stop())
         return await self._stop_task
 
-    async def _stop(self) -> float:
+    async def _stop(self) -> tuple[float, int | None]:
         await self._launch_task
         assert self._process_wait_task is not None
         marker_command = (
-            f"if test -s {shlex.quote(self._marker)}; then "
-            f"cat {shlex.quote(self._marker)}; else exit 75; fi"
+            f"if test -s {shlex.quote(self._marker)}/pgid; then "
+            f"cat {shlex.quote(self._marker)}/pgid; else exit 75; fi"
         )
         while True:
             marker = await self._sandbox.exec(marker_command)
@@ -597,12 +599,21 @@ class _ModalControlledWorkload(ControlledWorkload):
                 raise SandboxError(f"Modal controlled marker read failed: {marker.output}")
             if self._process_wait_task.done():
                 await self._process_wait_task
-                return asyncio.get_running_loop().time()
+                raise SandboxError("Modal workload finished without a process-group marker")
             await asyncio.sleep(0.05)
         stopped = await self._sandbox.exec(stop_command(group_id, self._marker))
         if stopped.exit_code != 0:
             raise SandboxError(f"Modal process group did not stop: {stopped.output}")
-        return asyncio.get_running_loop().time()
+        self._cleanup_task = asyncio.create_task(self._cleanup())
+        return asyncio.get_running_loop().time(), int(stopped.output.strip()) if stopped.output.strip() else None
+
+    async def _cleanup(self) -> None:
+        assert self._process_wait_task is not None
+        assert self._read_task is not None
+        await asyncio.gather(self._process_wait_task, self._read_task, return_exceptions=True)
+        removed = await self._sandbox.exec(cleanup_command(self._marker))
+        if removed.exit_code != 0:
+            raise SandboxError(f"Modal process-group control cleanup failed: {removed.output}")
 
 
 

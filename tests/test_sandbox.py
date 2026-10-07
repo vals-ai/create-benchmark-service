@@ -4593,6 +4593,120 @@ def _cgroup_sandbox(process: CgroupProcess) -> DaytonaSandbox:
     return DaytonaSandbox(cast(Any, inner))
 
 
+async def test_daytona_controlled_utf8_spans_callbacks_and_reconnect_and_flushes_at_completion() -> None:
+    class FirstHandle(CgroupPtyHandle):
+        async def wait(self) -> PtyResult:
+            await self.process.command_admitted.wait()
+            await self.emit(b"before-\xe2")
+            return PtyResult(exit_code=None, error="WebSocket error")
+
+    class LastHandle(CgroupPtyHandle):
+        async def wait(self) -> PtyResult:
+            await self.process.release_seen.wait()
+            await self.process.allow_final_frame.wait()
+            await self.emit(b"\xf0\x9f")
+            return PtyResult(exit_code=0, error=None)
+
+    class SplitProcess(CgroupProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reconnected = asyncio.Event()
+
+        async def create_pty_session(
+            self, *, id: str, on_data: Callable[[bytes], None | Awaitable[None]],
+            envs: dict[str, str], pty_size: PtySize,
+        ) -> CgroupPtyHandle:
+            _assert_pty_create_config(envs, pty_size)
+            self.sessions.add(id)
+            self.handle = FirstHandle(on_data, self)
+            return self.handle
+
+        async def get_pty_session_info(self, session_id: str) -> SimpleNamespace:
+            assert session_id in self.sessions
+            return SimpleNamespace(id=session_id)
+
+        async def connect_pty_session(
+            self, session_id: str, on_data: Callable[[bytes], None | Awaitable[None]],
+        ) -> CgroupPtyHandle:
+            assert session_id in self.sessions
+            self.handle = LastHandle(on_data, self)
+            await self.handle.emit(b"\x82\xac-after-")
+            self.reconnected.set()
+            return self.handle
+
+    process = SplitProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
+    await asyncio.wait_for(process.reconnected.wait(), 2)
+    process.user_finished.set()
+    process.allow_final_frame.set()
+    result = await asyncio.wait_for(workload.wait(), 2)
+    assert result.result.exit_code == 7
+    assert result.result.output == "hellobefore-€-after-�"
+    assert "".join([chunk async for chunk in workload.output()]) == result.result.output
+    await process.handle.emit(b"late")
+    assert "".join([chunk async for chunk in workload.output()]) == ""
+
+
+async def test_daytona_controlled_utf8_flushes_once_at_confirmed_forced_close() -> None:
+    process = CgroupProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    await process.handle.emit(b"start-\xe2\x82")
+    await asyncio.wait_for(workload.kill(), 2)
+    assert "".join([chunk async for chunk in workload.output()]) == "hellostart-�"
+    await process.handle.emit(b"late")
+    assert "".join([chunk async for chunk in workload.output()]) == ""
+
+
+async def test_daytona_controlled_utf8_flushes_on_terminal_status_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(daytona_module, "_PTY_STATUS_POLL_SECONDS", 0.01)
+
+    class FailedStatusProcess(CgroupProcess):
+        async def exec(self, command: str) -> SimpleNamespace:
+            command = _unwrap_shell_command(command)
+            if command.startswith("cat ") and command.endswith(".status"):
+                return SimpleNamespace(exit_code=1, result="")
+            return await super().exec(command)
+
+    process = FailedStatusProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    await process.handle.emit(b"unfinished-\xc3")
+    process.user_finished.set()
+    with pytest.raises(SandboxError, match="Failed to read Daytona controlled PTY exit code"):
+        await asyncio.wait_for(workload.wait(), 2)
+    assert "".join([chunk async for chunk in workload.output()]) == "hellounfinished-�"
+    await process.handle.emit(b"late")
+    assert "".join([chunk async for chunk in workload.output()]) == ""
+
+
+async def test_daytona_controlled_utf8_keeps_existing_bounded_tail() -> None:
+    process = CgroupProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    for index in range(80):
+        await process.handle.emit(f"chunk-{index:02d}:".encode() + b"x" * 1024)
+    process.user_finished.set()
+    process.allow_final_frame.set()
+    result = await asyncio.wait_for(workload.wait(), 2)
+    streamed = "".join([chunk async for chunk in workload.output()])
+    assert streamed.startswith("hellochunk-00:")
+    assert "chunk-00:" not in result.result.output
+    assert "chunk-79:" in result.result.output
+    assert result.result.output.endswith("final frame")
+    assert len(result.result.output) <= _PTY_STDOUT_TAIL_MAX_BYTES + 1033
+
+
 async def test_daytona_cgroup_probe_rejects_unsupported_kernel() -> None:
     class UnsupportedProcess(Process):
         async def exec(self, command: str) -> SimpleNamespace:

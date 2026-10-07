@@ -137,13 +137,15 @@ async def test_compose_controlled_natural_exit_preserves_status_and_output(
     assert compose_sandbox.generation_containment == LINUX_PROCESS_GROUP_V1
     await compose_sandbox.probe_generation_containment()
     workload = compose_sandbox.controlled_workload(f'printf "agent output\\n"; exit {code}')
-    completed = await asyncio.wait_for(workload.wait(), 5)
-    output = "".join([chunk async for chunk in workload.output()])
+    try:
+        completed = await asyncio.wait_for(workload.wait(), 5)
+        output = "".join([chunk async for chunk in workload.output()])
 
-    assert completed.result.exit_code == code
-    assert completed.result.output == "agent output\n"
-    assert output == completed.result.output
-    await workload.kill()
+        assert completed.result.exit_code == code
+        assert completed.result.output == "agent output\n"
+        assert output == completed.result.output
+    finally:
+        await asyncio.wait_for(workload.kill(), 5)
 
 
 
@@ -188,8 +190,9 @@ async def test_compose_controlled_deadline_stops_group_but_keeps_service(
         completed = await asyncio.wait_for(workload.wait(), 5)
         assert completed.result.exit_code != 0
         assert "started\n" in completed.result.output
-        await stream.aclose()
     finally:
+        await asyncio.wait_for(workload.kill(), 5)
+        await stream.aclose()
         service.terminate()
         await service.wait()
 
@@ -198,8 +201,11 @@ async def test_compose_controlled_kill_before_launch_does_not_wait_for_output(
     compose_sandbox: ComposeSandbox,
 ) -> None:
     workload = compose_sandbox.controlled_workload("exec sleep 10")
-    await asyncio.wait_for(workload.kill(), 5)
-    assert (await compose_sandbox.exec("printf service-alive")).output == "service-alive"
+    try:
+        await asyncio.wait_for(workload.kill(), 5)
+        assert (await compose_sandbox.exec("printf service-alive")).output == "service-alive"
+    finally:
+        await asyncio.wait_for(workload.kill(), 5)
 
 
 async def test_compose_client_exits_before_service_admission_cannot_confirm_stop(

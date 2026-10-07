@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import codecs
 import logging
 import math
 import os
@@ -1015,6 +1016,9 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         )
         self._env_vars = env_vars
         self._output: asyncio.Queue[str] = asyncio.Queue()
+        self._stdout: deque[str] = deque()
+        self._stdout_bytes = 0
+        self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._create_state = _PtyCreateState(marker=uuid.uuid4().hex)
         self._creation_done = asyncio.Event()
         self._group_created = False
@@ -1033,6 +1037,20 @@ class _DaytonaControlledWorkload(ControlledWorkload):
     def _consume_run_exception(task: asyncio.Task[Any]) -> None:
         if not task.cancelled():
             task.exception()
+
+    def _append_output(self, text: str) -> None:
+        if not text:
+            return
+        self._stdout.append(text)
+        self._stdout_bytes += len(text)
+        while self._stdout_bytes > _PTY_STDOUT_TAIL_MAX_BYTES and len(self._stdout) > 1:
+            self._stdout_bytes -= len(self._stdout.popleft())
+        self._output.put_nowait(text)
+
+    def _finalize_output(self) -> None:
+        if not self._output_closed:
+            self._append_output(self._decoder.decode(b"", final=True))
+            self._output_closed = True
 
     async def output(self) -> AsyncGenerator[str, None]:
         """Yield queued stdout through natural completion or confirmed PTY absence.
@@ -1161,7 +1179,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         # would delay the caller's deadline arbitration after absence was already proven.
         # The producer may still be stalled on a status probe after the PTY is gone.
         # Close only after fresh absence confirmation, preserving every queued chunk.
-        self._output_closed = True
+        self._finalize_output()
         self._closed.set()
         return asyncio.get_running_loop().time()
 
@@ -1174,8 +1192,6 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         return f"{self._status_path}.tmp"
 
     async def _run(self) -> ExecResult:
-        stdout: deque[str] = deque()
-        stdout_bytes = 0
         handle: AsyncPtyHandle | None = None
         wait_task: asyncio.Task[PtyResult] | None = None
         status_closed_task: asyncio.Task[bool] | None = None
@@ -1187,15 +1203,9 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         }
 
         async def on_data(data: bytes) -> None:
-            nonlocal stdout_bytes
             if self._output_closed:
                 return
-            text = data.decode("utf-8", errors="replace")
-            stdout.append(text)
-            stdout_bytes += len(text)
-            while stdout_bytes > _PTY_STDOUT_TAIL_MAX_BYTES and len(stdout) > 1:
-                stdout_bytes -= len(stdout.popleft())
-            self._output.put_nowait(text)
+            self._append_output(self._decoder.decode(data))
 
         try:
             created = await self._control_exec(f"mkdir {shlex.quote(self._group)}")
@@ -1321,13 +1331,15 @@ class _DaytonaControlledWorkload(ControlledWorkload):
                     closed_task.cancel()
                     with suppress(asyncio.CancelledError):
                         await closed_task
+            self._finalize_output()
             return ExecResult(
                 exit_code=int(result.output.strip().splitlines()[-1]),
-                output="".join(stdout),
+                output="".join(self._stdout),
             )
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
         finally:
+            self._finalize_output()
             if status_closed_task:
                 status_closed_task.cancel()
                 with suppress(asyncio.CancelledError):

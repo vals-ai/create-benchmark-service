@@ -27,7 +27,7 @@ from aiodocker.types import JSONObject
 from aiohttp import ClientError
 from pydantic import AliasPath, BaseModel, Field
 
-from benchmark_service.sandbox._process_group import probe_command, stop_command
+from benchmark_service.sandbox._process_group import cleanup_command, owner_command, probe_command, stop_command
 from benchmark_service.sandbox.types import (
     ControlledWorkload,
     ControlledWorkloadResult,
@@ -298,7 +298,8 @@ class _DockerControlledWorkload(ControlledWorkload):
         self._drain_task: asyncio.Task[None] | None = None
         self._tail: deque[str] = deque()
         self._tail_bytes = 0
-        self._stop_task: asyncio.Task[float] | None = None
+        self._stop_task: asyncio.Task[tuple[float, int | None]] | None = None
+        self._cleanup_task: asyncio.Task[None] | None = None
         self._result_task = asyncio.create_task(self._run())
 
     def _accept(self, text: str) -> None:
@@ -345,14 +346,11 @@ class _DockerControlledWorkload(ControlledWorkload):
         return exit_code
 
     async def _run(self) -> ControlledWorkloadResult:
-        script = (
-            f"printf '%s\\n' \"$$\" > {shlex.quote(self._marker)} && "
-            f"exec /bin/sh -c {shlex.quote(self._command)}"
-        )
+        script = owner_command(self._command, self._marker, "/bin/sh -c")
         with _docker_errors():
             try:
                 execution = await self._container.exec(
-                    ["setsid", "--wait", "/bin/sh", "-c", script],
+                    ["/bin/sh", "-c", script],
                     environment=self._env_vars,
                     workdir=self._cwd,
                 )
@@ -367,11 +365,17 @@ class _DockerControlledWorkload(ControlledWorkload):
                         if drain in done:
                             await drain
                         exit_code = await status
-                        absence_confirmed_at = await self._ensure_stopped()
+                        absence_confirmed_at, foreground_status = await self._ensure_stopped()
                         await drain
-                        return ControlledWorkloadResult(
-                            ExecResult(exit_code=exit_code, output="".join(self._tail)), absence_confirmed_at
+                        assert self._cleanup_task is not None
+                        await self._cleanup_task
+                        if foreground_status is None and exit_code == 0:
+                            raise SandboxError("Docker workload exited without a foreground status")
+                        result = ExecResult(
+                            exit_code=foreground_status if foreground_status is not None else exit_code,
+                            output="".join(self._tail),
                         )
+                        return ControlledWorkloadResult(result, absence_confirmed_at)
                     except Exception:
                         status_failed = status.done() and not status.cancelled() and status.exception() is not None
                         drain_failed = drain.done() and not drain.cancelled() and drain.exception() is not None
@@ -410,14 +414,14 @@ class _DockerControlledWorkload(ControlledWorkload):
                 raise SandboxError("Docker control command finished without an exit code")
             return ExecResult(exit_code=exit_code, output=b"".join(output).decode(errors="replace"))
 
-    async def _stop(self) -> float:
+    async def _stop(self) -> tuple[float, int | None]:
         await self._started.wait()
         if self._execution is None:
             await self._result_task
             raise SandboxError("Docker controlled command did not start")
         marker_command = (
-            f"if test -s {shlex.quote(self._marker)}; then "
-            f"cat {shlex.quote(self._marker)}; else exit 75; fi"
+            f"if test -s {shlex.quote(self._marker)}/pgid; then "
+            f"cat {shlex.quote(self._marker)}/pgid; else exit 75; fi"
         )
         while True:
             marker = await self._control_exec(marker_command)
@@ -427,14 +431,24 @@ class _DockerControlledWorkload(ControlledWorkload):
             if marker.exit_code != 75:
                 raise SandboxError(f"Docker controlled marker read failed: {marker.output}")
             if self._status_done.is_set():
-                return asyncio.get_running_loop().time()
+                raise SandboxError("Docker workload finished without a process-group marker")
             await asyncio.sleep(0.05)
         stopped = await self._control_exec(stop_command(group_id, self._marker))
         if stopped.exit_code:
             raise SandboxError(f"Docker process group did not stop: {stopped.output}")
-        return asyncio.get_running_loop().time()
+        self._cleanup_task = asyncio.create_task(self._cleanup())
+        return asyncio.get_running_loop().time(), int(stopped.output.strip()) if stopped.output.strip() else None
 
-    async def _ensure_stopped(self) -> float:
+    async def _cleanup(self) -> None:
+        if self._drain_task is None:
+            await asyncio.gather(self._result_task, return_exceptions=True)
+        else:
+            await asyncio.gather(self._drain_task, return_exceptions=True)
+        removed = await self._control_exec(cleanup_command(self._marker))
+        if removed.exit_code != 0:
+            raise SandboxError(f"Docker process-group control cleanup failed: {removed.output}")
+
+    async def _ensure_stopped(self) -> tuple[float, int | None]:
         if self._stop_task is None:
             self._stop_task = asyncio.create_task(self._stop())
         return await asyncio.shield(self._stop_task)

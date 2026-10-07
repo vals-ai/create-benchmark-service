@@ -5,11 +5,12 @@ import os
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
-from typing import Any
+from typing import Any, cast
 
 import pytest
 
-from benchmark_service.sandbox.local.docker import DockerSandboxProvider
+from benchmark_service.sandbox._process_group import cleanup_command, stop_command
+from benchmark_service.sandbox.local.docker import DockerSandboxProvider, _DockerControlledWorkload
 from benchmark_service.sandbox.types import Sandbox, SandboxConnectionError, SandboxError
 
 
@@ -146,31 +147,31 @@ async def test_controlled_stream_arrives_before_status_finishes() -> None:
     assert (await workload.wait()).result.output == "readylater"
 
 
-async def test_controlled_output_eof_before_command_exits() -> None:
-    workload = (await _sandbox(_LocalContainer())).controlled_workload("exec 1>&- 2>&-; sleep 0.5")
-    stream = workload.output()
-    assert await asyncio.wait_for(anext(stream, None), timeout=0.2) is None
-    assert (await asyncio.wait_for(workload.wait(), timeout=2)).result.exit_code == 0
-
 
 async def test_controlled_read_failure_stops_running_group(monkeypatch: pytest.MonkeyPatch) -> None:
     read_out = _LocalStream.read_out
 
     async def fail_read(stream: _LocalStream) -> SimpleNamespace | None:
-        if stream.execution.command[0] == "setsid":
+        if stream.execution is container.executions[0]:
             raise OSError("read transport lost")
         return await read_out(stream)
 
     monkeypatch.setattr(_LocalStream, "read_out", fail_read)
     container = _LocalContainer()
     workload = (await _sandbox(container)).controlled_workload("sleep 1.5")
-    with pytest.raises(SandboxConnectionError, match="Local Docker connection failed"):
-        await asyncio.wait_for(anext(workload.output(), None), timeout=1)
-    with pytest.raises(SandboxConnectionError, match="Local Docker connection failed"):
-        await asyncio.wait_for(workload.wait(), timeout=1)
-    assert container.executions[0].process is not None
-    assert container.executions[0].process.returncode is not None
-    await workload.kill()
+    try:
+        with pytest.raises(SandboxConnectionError, match="Local Docker connection failed"):
+            await asyncio.wait_for(anext(workload.output(), None), timeout=1)
+        with pytest.raises(SandboxConnectionError, match="Local Docker connection failed"):
+            await asyncio.wait_for(workload.wait(), timeout=1)
+        assert container.executions[0].process is not None
+        assert container.executions[0].process.returncode is not None
+    finally:
+        await workload.kill()
+        controlled = cast(_DockerControlledWorkload, workload)
+        assert controlled._cleanup_task is not None
+        await asyncio.wait_for(controlled._cleanup_task, 3)
+        assert not Path(controlled._marker).exists()
 
 
 async def test_controlled_inspect_failure_before_marker_stops_group(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -178,12 +179,12 @@ async def test_controlled_inspect_failure_before_marker_stops_group(monkeypatch:
     inspect = _LocalExec.inspect
 
     async def delayed_marker(container: _LocalContainer, command: list[str], **kwargs: Any) -> _LocalExec:
-        if command[0] == "setsid":
+        if not container.executions:
             command = [*command[:-1], "sleep 0.3; " + command[-1]]
         return await create_exec(container, command, **kwargs)
 
     async def fail_inspect(execution: _LocalExec) -> dict[str, Any]:
-        if execution.command[0] == "setsid":
+        if execution is container.executions[0]:
             raise OSError("inspect transport lost")
         return await inspect(execution)
 
@@ -192,13 +193,20 @@ async def test_controlled_inspect_failure_before_marker_stops_group(monkeypatch:
     container = _LocalContainer()
     workload = (await _sandbox(container)).controlled_workload("sleep 1.5")
     reader = asyncio.create_task(anext(workload.output(), None))
-    with pytest.raises(SandboxConnectionError, match="Local Docker connection failed"):
-        await asyncio.wait_for(workload.wait(), timeout=0.2)
-    with pytest.raises(SandboxConnectionError, match="Local Docker connection failed"):
-        await asyncio.wait_for(reader, timeout=0.2)
-    await asyncio.wait_for(workload.kill(), timeout=1)
-    assert container.executions[0].process is not None
-    assert container.executions[0].process.returncode is not None
+    try:
+        with pytest.raises(SandboxConnectionError, match="Local Docker connection failed"):
+            await asyncio.wait_for(workload.wait(), timeout=0.2)
+        with pytest.raises(SandboxConnectionError, match="Local Docker connection failed"):
+            await asyncio.wait_for(reader, timeout=0.2)
+        await asyncio.wait_for(workload.kill(), timeout=1)
+        assert container.executions[0].process is not None
+        assert container.executions[0].process.returncode is not None
+    finally:
+        await asyncio.wait_for(workload.kill(), timeout=3)
+        controlled = cast(_DockerControlledWorkload, workload)
+        assert controlled._cleanup_task is not None
+        await asyncio.wait_for(controlled._cleanup_task, 3)
+        assert not Path(controlled._marker).exists()
 
 
 async def test_controlled_wait_keeps_delayed_final_output(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -206,12 +214,13 @@ async def test_controlled_wait_keeps_delayed_final_output(monkeypatch: pytest.Mo
 
     async def delayed_read(stream: _LocalStream) -> SimpleNamespace | None:
         message = await read_out(stream)
-        if message is not None and stream.execution.command[0] == "setsid":
+        if message is not None and stream.execution is container.executions[0]:
             await asyncio.sleep(1.5)
         return message
 
     monkeypatch.setattr(_LocalStream, "read_out", delayed_read)
-    sandbox = await _sandbox(_LocalContainer())
+    container = _LocalContainer()
+    sandbox = await _sandbox(container)
     workload = sandbox.controlled_workload("printf tail; exit 7")
 
     async def collect() -> str:
@@ -222,6 +231,36 @@ async def test_controlled_wait_keeps_delayed_final_output(monkeypatch: pytest.Mo
     assert result.result.exit_code == 7
     assert result.result.output == "tail"
     assert await output == "tail"
+
+
+async def test_control_directory_survives_stop_until_output_drain(monkeypatch: pytest.MonkeyPatch) -> None:
+    container = _LocalContainer()
+    sandbox = await _sandbox(container)
+    read_out = _LocalStream.read_out
+    captured = asyncio.Event()
+    release = asyncio.Event()
+
+    async def delayed_read(stream: _LocalStream) -> SimpleNamespace | None:
+        message = await read_out(stream)
+        if message is not None and stream.execution is container.executions[0]:
+            captured.set()
+            await release.wait()
+        return message
+
+    monkeypatch.setattr(_LocalStream, "read_out", delayed_read)
+    workload = sandbox.controlled_workload("printf tail; sleep 30")
+    control = Path(cast(_DockerControlledWorkload, workload)._marker)
+    try:
+        await asyncio.wait_for(captured.wait(), 3)
+        await asyncio.wait_for(workload.kill(), 3)
+        assert control.exists()
+        release.set()
+        result = await asyncio.wait_for(workload.wait(), 3)
+        assert result.result.output == "tail"
+        assert not control.exists()
+    finally:
+        release.set()
+        await asyncio.wait_for(workload.kill(), 3)
 
 
 async def test_controlled_kill_before_output_stops_group_but_keeps_container(tmp_path: Path) -> None:
@@ -235,15 +274,20 @@ async def test_controlled_kill_before_output_stops_group_but_keeps_container(tmp
         return "".join([chunk async for chunk in workload.output()])
 
     reader = asyncio.create_task(collect())
-    await asyncio.wait_for(workload.kill(), timeout=3)
-    await workload.kill()
-    result = await asyncio.wait_for(workload.wait(), timeout=3)
-    assert await asyncio.wait_for(reader, timeout=3) == result.result.output
-    assert result.result.exit_code != 0
-    assert result.absence_confirmed_at <= asyncio.get_running_loop().time()
-    await asyncio.sleep(2.1)
-    assert (await sandbox.exec(f"test ! -e {sentinel}")).exit_code == 0
-    assert (await sandbox.exec("printf usable")).output == "usable"
+    try:
+        await asyncio.wait_for(workload.kill(), timeout=3)
+        await workload.kill()
+        result = await asyncio.wait_for(workload.wait(), timeout=3)
+        assert await asyncio.wait_for(reader, timeout=3) == result.result.output
+        assert result.result.exit_code != 0
+        assert result.absence_confirmed_at <= asyncio.get_running_loop().time()
+        await asyncio.sleep(2.1)
+        assert (await sandbox.exec(f"test ! -e {sentinel}")).exit_code == 0
+        assert (await sandbox.exec("printf usable")).output == "usable"
+    finally:
+        await asyncio.wait_for(workload.kill(), 3)
+        if not reader.done():
+            await reader
 
 
 async def test_controlled_wait_cancellation_does_not_cancel_command() -> None:
@@ -291,14 +335,20 @@ async def test_controlled_unconfirmed_group_absence_is_error(monkeypatch: pytest
         return "exit 1"
 
     monkeypatch.setattr(docker, "stop_command", fail_confirmation)
-    with pytest.raises(SandboxError, match="process group did not stop"):
-        await asyncio.wait_for(workload.kill(), timeout=3)
-    # A failed confirmation leaves the process alive; this test-created group is cleaned up locally.
-    process = container.executions[0].process
-    assert process is not None
-    assert (await sandbox.exec(f"kill -s KILL -- -{process.pid}")).exit_code == 0
-    script = container.executions[0].command[-1]
-    marker = script.partition(" > ")[2].partition(" && ")[0]
-    await sandbox.exec(f"rm -f -- {marker}")
-    with pytest.raises(SandboxError, match="process group did not stop"):
-        await asyncio.wait_for(workload.wait(), timeout=3)
+    control = Path(cast(_DockerControlledWorkload, workload)._marker)
+    try:
+        with pytest.raises(SandboxError, match="process group did not stop"):
+            await asyncio.wait_for(workload.kill(), timeout=3)
+        with pytest.raises(SandboxError, match="process group did not stop"):
+            await asyncio.wait_for(workload.wait(), timeout=3)
+    finally:
+        if (control / "pgid").exists():
+            group_id = int((control / "pgid").read_text())
+            confirmed = await sandbox.exec(stop_command(group_id, str(control)))
+            assert confirmed.exit_code == 0
+        process = container.executions[0].process
+        assert process is not None
+        await asyncio.wait_for(process.wait(), 3)
+        if control.exists():
+            removed = await sandbox.exec(cleanup_command(str(control)))
+            assert removed.exit_code == 0

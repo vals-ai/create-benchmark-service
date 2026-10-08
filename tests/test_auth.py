@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import AsyncGenerator
 from typing import Any
 from unittest.mock import patch
@@ -55,8 +56,35 @@ def descope_env(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def _mock_jwt_response(tenants: list[str]) -> dict[str, Any]:
-    return {"tenants": {t: {} for t in tenants}}
+def _mock_jwt_response(tenants: list[str], expires_in: float | None = 3 * 3600) -> dict[str, Any]:
+    session_token = {} if expires_in is None else {"exp": time.time() + expires_in}
+    return {"tenants": {t: {} for t in tenants}, "sessionToken": session_token}
+
+
+async def _resolve_twice(response: dict[str, Any]) -> int:
+    headers = {"x-descope-api-key": "key-acme"}
+    with patch.object(auth_module, "_exchange_descope_access_key", return_value=response) as exchange:
+        assert await resolve_descope_tenant(headers) == "acme-corp"
+        assert await resolve_descope_tenant(headers) == "acme-corp"
+    return exchange.call_count
+
+
+@pytest.mark.usefixtures("descope_env")
+async def test_resolved_tenant_is_cached_while_the_token_is_valid() -> None:
+    assert await _resolve_twice(_mock_jwt_response(["acme-corp"])) == 1
+
+
+@pytest.mark.usefixtures("descope_env")
+@pytest.mark.parametrize("expires_in", [None, 0.5, -60])
+async def test_tenant_is_not_cached_past_the_token_expiry(expires_in: float | None) -> None:
+    assert await _resolve_twice(_mock_jwt_response(["acme-corp"], expires_in)) == 2
+
+
+@pytest.mark.usefixtures("descope_env")
+async def test_cache_ttl_bounds_long_lived_tokens(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert auth_module.DEFAULT_AUTH_CACHE_TTL_SECONDS == 7200
+    monkeypatch.setattr(auth_module, "_auth_cache_ttl_seconds", 0)
+    assert await _resolve_twice(_mock_jwt_response(["acme-corp"], 30 * 24 * 3600)) == 2
 
 
 @pytest.mark.usefixtures("descope_env")

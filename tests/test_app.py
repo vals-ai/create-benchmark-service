@@ -1,6 +1,7 @@
 """Tests for FastAPI app endpoints."""
 
 import json
+import time
 from collections.abc import AsyncGenerator, Generator, Mapping
 from typing import Any, cast
 from unittest.mock import patch
@@ -557,10 +558,10 @@ class TestDescopeAuth:
 
         calls: list[tuple[str, str]] = []
 
-        async def exchange(project_id: str, access_key: str) -> dict[str, dict[str, dict[str, str]]]:
+        async def exchange(project_id: str, access_key: str) -> dict[str, Any]:
             calls.append((project_id, access_key))
             if access_key == "valid-key":
-                return {"tenants": {"tenant-a": {}}}
+                return {"tenants": {"tenant-a": {}}, "sessionToken": {"exp": time.time() + 3600}}
             if access_key == "multi-tenant-key":
                 return {"tenants": {"tenant-a": {}, "tenant-b": {}}}
             raise RuntimeError("invalid access key")

@@ -215,17 +215,19 @@ active-generation clock for every task: an explicit credited allowance takes pre
 otherwise `agent_timeout` supplies the allowance, otherwise there is no generation deadline.
 The explicit credited allowance is positive and finite; `stage_protocol=None` charges the whole
 command interval, while `"valkyrie-stage/1"` selects benchmark-owned intervals and requires
-that finite credited allowance. Tracker arbitrates a finite base `B` plus capped optional SSP
+that finite credited allowance. Tracker charges a finite base `B` plus capped optional SSP
 credit `C` across intervals; setup, evaluation, and gaps between intervals do not debit the
-clock. In Tracker task results, null base/effective allowances mean no generation deadline;
-`generation_elapsed_seconds` is still measured at sealing. A null elapsed value instead means
-no generation-time measurement was recorded. The independent 166-hour whole-task wall
-applies to every selected task, including those without a generation deadline.
-Modal separately limits each sandbox to a 24-hour provider lifetime. SSP is optional
-and independent of whether `credited_generation` is present; it needs configured gateway
-controls, a resolved native Gateway URL and key, and an attested model. Missing eligibility
-uses the base clock; failure of an eligible configured SSP session does not fall back.
-An SSP session with no base allowance remains without a generation deadline.
+clock. SSP passively counts neutral overhead for the native Gateway bearer; Tracker alone reads
+the counter during generation and, unless exhaustion has frozen the accepted credit, after confirmed stop.
+In Tracker task results, null base/effective
+allowances mean no generation deadline; `generation_elapsed_seconds` is still measured at terminal
+finalization. A null elapsed value instead means no generation-time measurement was recorded.
+The independent 166-hour whole-task wall applies to every selected task, including those without
+a generation deadline. Modal separately limits each sandbox to a 24-hour provider lifetime.
+SSP is optional and independent of whether `credited_generation` is present; eligibility needs
+configured SSP access, a resolved native Gateway URL and key, and an attested model. Missing
+eligibility uses the base clock; failure of an eligible counter read does not silently fall back.
+Without a base allowance, optional SSP credit does not create a generation deadline.
 
 When an explicit finite credited allowance selects `stage_protocol="valkyrie-stage/1"`, Tracker
 gives the outer controlled workload (agent command or episode orchestrator) `VALKYRIE_STAGE_DIR=/run/valkyrie-stage`. The sandbox-private directory contains a 64-hex-character
@@ -291,7 +293,13 @@ containing braces remain opaque. In `final_output`, `{slot_dir}` is replaced for
 configured path. The orchestrator names slots and shares one workspace and budget across
 multiple slots; each slot has separate
 runtime/session/output state. More than `parallel_agents` live turns are refused. A second turn on a slot requires
-`continue_cmd`. Children inherit the orchestrator's cwd, environment, stdout and stderr. After a turn's
+`continue_cmd`. Children inherit the orchestrator's cwd, stdout and stderr. When
+`VALKYRIE_GENERATION_MODEL_GATEWAY_URL` is configured, `Agents` copies the environment for each
+selected-agent child and sets only its `MODEL_GATEWAY_URL` to that generation URL just before launch;
+the orchestrator and evaluation processes retain the native `MODEL_GATEWAY_URL`. Without the explicit
+generation URL, children inherit the native route. Custom staged orchestrators must likewise route
+generation clients and children through the explicit generation URL while preserving the native route
+for evaluation, including when generation and evaluation overlap. After a turn's
 process group and any container are absent, the last active turn sends END and waits for its ACK before copying
 the bundle's existing `final_output` file or directory into `<slots_root>/<slot>/turns/<n>/`. A file keeps its basename;
 `n` starts at 1 per slot. `final_output` may contain `{slot_dir}` and is rendered for each slot before launch;

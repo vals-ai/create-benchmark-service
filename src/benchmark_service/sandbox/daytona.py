@@ -80,6 +80,7 @@ from benchmark_service.sandbox.types import (
     ExecResult,
     GenerationContainment,
     LINUX_CGROUP_V2_V1,
+    MAX_SANDBOX_LIFETIME_SECONDS,
     ImageSource,
     MissingSandboxConfigError,
     ResourceCapacity,
@@ -1760,6 +1761,7 @@ class DaytonaSandboxProvider(SandboxProvider):
                 params = CreateSandboxFromImageParams(
                     auto_stop_interval=request.auto_stop_interval,
                     auto_delete_interval=0,
+                    ttl_minutes=MAX_SANDBOX_LIFETIME_SECONDS // 60,
                     name=request.name,
                     labels=request.labels,
                     image=image,
@@ -1777,6 +1779,7 @@ class DaytonaSandboxProvider(SandboxProvider):
                 params = CreateSandboxFromSnapshotParams(
                     auto_stop_interval=request.auto_stop_interval,
                     auto_delete_interval=0,
+                    ttl_minutes=MAX_SANDBOX_LIFETIME_SECONDS // 60,
                     name=request.name,
                     labels=request.labels,
                     snapshot=snapshot,

@@ -35,6 +35,7 @@ from benchmark_service.sandbox.types import (
     GenerationContainment,
     ImageSource,
     LINUX_PROCESS_GROUP_V1,
+    MAX_SANDBOX_LIFETIME_SECONDS,
     Sandbox,
     SandboxCommandError,
     SandboxConnectionError,
@@ -478,7 +479,7 @@ def _build_container_config(request: SandboxCreateRequest) -> JSONObject:
     return {
         "Image": request.source.image,
         "Entrypoint": ["/bin/sh", "-c"],
-        "Cmd": ["trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done"],
+        "Cmd": [f"trap 'exit 0' TERM INT; sleep {MAX_SANDBOX_LIFETIME_SECONDS} & wait $!"],
         "Env": [f"{key}={value}" for key, value in request.env_vars.items()],
         "Labels": labels,
         "HostConfig": {

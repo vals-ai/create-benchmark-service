@@ -967,13 +967,15 @@ class DaytonaClient:
         self.closed = False
         self.deleted = False
         self.listed_query: Any | None = None
+        self.create_params: Any = None
 
     async def get(self, instance_id: str) -> InnerSandbox:
         assert instance_id == self.sandbox.name
         return self.sandbox
 
-    async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
+    async def create(self, params: object, *_args: object, **_kwargs: object) -> InnerSandbox:
         self.created = True
+        self.create_params = params
         return self.sandbox
 
     async def delete(self, sandbox: InnerSandbox) -> None:
@@ -3606,6 +3608,7 @@ async def test_daytona_provider_creates_fresh_sandbox() -> None:
 
     assert sandbox.id == inner.id
     assert daytona.created is True
+    assert daytona.create_params.ttl_minutes == 167 * 60
 
 
 def test_daytona_sandbox_exposes_inventory_metadata() -> None:

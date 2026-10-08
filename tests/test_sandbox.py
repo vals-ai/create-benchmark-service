@@ -4531,15 +4531,12 @@ class CgroupProcess(Process):
         super().__init__()
         self._language = "python"
         self._api_client = self
-        self.group_created = asyncio.Event()
         self.allow_creation = asyncio.Event()
         self.command_admitted = asyncio.Event()
         self.user_finished = asyncio.Event()
         self.removal_started = asyncio.Event()
         self.allow_removal = asyncio.Event()
         self.release_seen = asyncio.Event()
-        self.allow_final_frame = asyncio.Event()
-        self.allow_final_frame.set()
         self.group_exists = False
         self.removal_fails = False
         self.sessions: set[str] = set()
@@ -4553,7 +4550,6 @@ class CgroupProcess(Process):
         self.stdout = "hello"
         self.stderr = ""
         self.exit_code = 7
-        self.command = ""
 
     def _get_session_command_logs_serialize(
         self, session_id: str, command_id: str, **kwargs: Any,
@@ -4567,7 +4563,6 @@ class CgroupProcess(Process):
         if command.startswith("mkdir /sys/fs/cgroup/cbs-"):
             await self.allow_creation.wait()
             self.group_exists = True
-            self.group_created.set()
             return SimpleNamespace(exit_code=0, result="")
         if command.startswith("test -e ") and command.endswith(".complete"):
             self.marker_polled.set()
@@ -4611,7 +4606,6 @@ class CgroupProcess(Process):
             self.follow_error = False
             raise DaytonaConnectionError("follow dropped")
         await self.release_seen.wait()
-        await self.allow_final_frame.wait()
         self.stdout += "final frame"
         await on_stdout("final frame")
 
@@ -4949,7 +4943,6 @@ class LocalNativeShellCgroupProcess(CgroupProcess):
             self.group.mkdir()
             (self.group / "cgroup.procs").touch()
             self.group_exists = True
-            self.group_created.set()
             return SimpleNamespace(exit_code=0, result="")
         if plain.startswith("test -e ") and plain.endswith(".complete"):
             path = self._local_path(shlex.split(plain)[-1])
@@ -5187,6 +5180,73 @@ async def test_daytona_failed_cgroup_stop_keeps_output_consumer_open() -> None:
     assert await asyncio.wait_for(pending, 2) == "final frame"
     await stream.aclose()
 
+@pytest.mark.usefixtures("_fake_cgroup_follow")
+async def test_daytona_cancelled_wait_does_not_interrupt_shared_kill_cleanup() -> None:
+    class PausedDeleteProcess(CgroupProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.delete_started = asyncio.Event()
+            self.allow_delete = asyncio.Event()
+            self.delete_calls = 0
+
+        async def delete_session(self, session_id: str) -> None:
+            self.delete_calls += 1
+            self.delete_started.set()
+            await self.allow_delete.wait()
+            await super().delete_session(session_id)
+
+    process = PausedDeleteProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    waiting = asyncio.create_task(workload.wait())
+    killing = asyncio.create_task(workload.kill())
+    try:
+        await asyncio.wait_for(process.delete_started.wait(), 2)
+        waiting.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiting
+    finally:
+        process.allow_delete.set()
+    await asyncio.wait_for(killing, 2)
+    assert not process.group_exists
+    assert process.sessions == set()
+    assert process.delete_calls == 1
+
+
+@pytest.mark.usefixtures("_fake_cgroup_follow")
+async def test_daytona_queued_output_remains_consumable_after_confirmed_stop() -> None:
+    class BufferedOutputProcess(CgroupProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.output_buffered = asyncio.Event()
+
+        async def get_session_command_logs_async(
+            self, session_id: str, command_id: str,
+            on_stdout: Callable[[str], Awaitable[None]],
+            on_stderr: Callable[[str], Awaitable[None]],
+        ) -> None:
+            async def buffered_stdout(text: str) -> None:
+                await on_stdout(text)
+                self.output_buffered.set()
+
+            await super().get_session_command_logs_async(
+                session_id, command_id, buffered_stdout, on_stderr,
+            )
+
+    process = BufferedOutputProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    await asyncio.wait_for(process.output_buffered.wait(), 2)
+    await asyncio.wait_for(workload.kill(), 2)
+    assert not process.group_exists
+    assert process.sessions == set()
+    stream = workload.output()
+    assert await asyncio.wait_for(anext(stream), 2) == "hello"
+    await stream.aclose()
+
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
 async def test_daytona_kill_when_observer_is_disconnected() -> None:
@@ -5294,7 +5354,6 @@ class NestedCgroupProcess(CgroupProcess):
                 (directory / "cgroup.kill").touch()
                 (directory / "cgroup.procs").touch()
             self.group_exists = True
-            self.group_created.set()
             return SimpleNamespace(exit_code=0, result="")
         if plain.startswith("d=/sys/fs/cgroup/cbs-"):
             self.removal_started.set()

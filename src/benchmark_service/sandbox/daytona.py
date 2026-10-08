@@ -1221,10 +1221,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         self._group_created = False
         self._group_stopped_at: float | None = None
         self._closed = asyncio.Event()
-        self._close_requested = False
         self._stop_requested = asyncio.Event()
-        self._output_closed = False
-        self._close_lock = asyncio.Lock()
         self._close_task: asyncio.Task[float] | None = None
         self._run_task = asyncio.create_task(self._run())
         self._run_task.add_done_callback(self._consume_run_exception)
@@ -1245,13 +1242,9 @@ class _DaytonaControlledWorkload(ControlledWorkload):
             self._stdout_bytes -= len(self._stdout.popleft())
         self._output.put_nowait(text)
 
-    def _finalize_output(self) -> None:
-        if not self._output_closed:
-            self._output_closed = True
-
     async def output(self) -> AsyncGenerator[str, None]:
         """Yield queued output through completion or confirmed native-session absence."""
-        while not self._run_task.done() and not self._output_closed:
+        while not self._run_task.done() and not self._closed.is_set():
             try:
                 yield await asyncio.wait_for(self._output.get(), timeout=0.1)
             except TimeoutError:
@@ -1266,7 +1259,6 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         return ControlledWorkloadResult(result=result, absence_confirmed_at=max(group_stopped_at, session_absent_at))
 
     async def kill(self) -> None:
-        self._close_requested = True
         self._stop_requested.set()
         try:
             await asyncio.shield(self._finish_task)
@@ -1309,7 +1301,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
                 await stop_task
 
         stopped_at = await self._stop_group()
-        if self._close_requested or self._run_task.done():
+        if self._stop_requested.is_set() or self._run_task.done():
             await self._ensure_closed()
         else:
             result = await self._control_exec(f": > {shlex.quote(self._release)}")
@@ -1343,11 +1335,9 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         return self._group_stopped_at
 
     async def _ensure_closed(self) -> float:
-        async with self._close_lock:
-            if self._close_task is None:
-                self._close_task = asyncio.create_task(self._close())
-            close_task = self._close_task
-        return await close_task
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(self._close())
+        return await self._close_task
 
     async def _close(self) -> float:
         await self._creation_done.wait()
@@ -1383,11 +1373,10 @@ class _DaytonaControlledWorkload(ControlledWorkload):
                     f"{self._sandbox_ref}: session_id={self._session_id}"
                 ) from delete_error
 
-        self._finalize_output()
         self._closed.set()
         return asyncio.get_running_loop().time()
 
-    async def _run(self) -> ExecResult:
+    async def _launch(self) -> str:
         try:
             created = await self._control_exec(f"mkdir {shlex.quote(self._group)}")
             if created.exit_code != 0:
@@ -1396,7 +1385,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
             prepared = await self._control_exec(f"mkdir -p {shlex.quote(_STATUS_DIR)}")
             if prepared.exit_code != 0:
                 raise SandboxError(f"Daytona controlled marker directory creation failed: {_STATUS_DIR}")
-            if self._close_requested:
+            if self._stop_requested.is_set():
                 raise SandboxError("Controlled workload closed before session creation")
             self._session_requested = True
             try:
@@ -1408,7 +1397,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
             except _SANDBOX_OPERATION_ERRORS as exc:
                 await _raise_if_sandbox_gone(self._sandbox._daytona, self._sandbox.id)  # pyright: ignore[reportPrivateUsage]
                 raise self._sandbox_error(exc) from exc
-            if self._close_requested:
+            if self._stop_requested.is_set():
                 raise SandboxError("Controlled workload closed before command admission")
             try:
                 response = await _bounded(
@@ -1422,25 +1411,26 @@ class _DaytonaControlledWorkload(ControlledWorkload):
             except _SANDBOX_OPERATION_ERRORS as exc:
                 await _raise_if_sandbox_gone(self._sandbox._daytona, self._sandbox.id)  # pyright: ignore[reportPrivateUsage]
                 raise self._sandbox_error(exc) from exc
-            finally:
-                self._creation_done.set()
-            command_id = response.cmd_id
-            forwarded_stdout = 0
-            forwarded_stderr = 0
-            while not self._output_closed:
-                exit_code, forwarded_stdout, forwarded_stderr = await _watch_session_command(
-                    self._sandbox._daytona, self._sandbox.id, self._session_id, command_id,  # pyright: ignore[reportPrivateUsage]
-                    forwarded_stdout, forwarded_stderr, self._append_output, self._closed,
-                )
-                if exit_code is not None:
-                    return ExecResult(exit_code=exit_code, output="".join(self._stdout))
-                try:
-                    await asyncio.wait_for(self._closed.wait(), _SESSION_WATCH_REOPEN_SECONDS)
-                except TimeoutError:
-                    continue
-            raise SandboxError("Controlled workload closed before command exit")
+            return response.cmd_id
         finally:
             self._creation_done.set()
+
+    async def _run(self) -> ExecResult:
+        command_id = await self._launch()
+        forwarded_stdout = 0
+        forwarded_stderr = 0
+        while not self._closed.is_set():
+            exit_code, forwarded_stdout, forwarded_stderr = await _watch_session_command(
+                self._sandbox._daytona, self._sandbox.id, self._session_id, command_id,  # pyright: ignore[reportPrivateUsage]
+                forwarded_stdout, forwarded_stderr, self._append_output, self._closed,
+            )
+            if exit_code is not None:
+                return ExecResult(exit_code=exit_code, output="".join(self._stdout))
+            try:
+                await asyncio.wait_for(self._closed.wait(), _SESSION_WATCH_REOPEN_SECONDS)
+            except TimeoutError:
+                continue
+        raise SandboxError("Controlled workload closed before command exit")
 
 
 class DaytonaSandboxProvider(SandboxProvider):

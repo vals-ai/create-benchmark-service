@@ -1009,7 +1009,7 @@ async def _raise_if_sandbox_gone(client: AsyncDaytona, sandbox_id: str) -> None:
         raise SandboxNotFoundError(f"Sandbox not found: id={sandbox_id}.")
 
 class _NativeSessionLogProcess(AsyncProcess):
-    # Remove after upgrading Daytona to a version with fixed marker parsing and interrupted-stream flushing.
+    # Remove after upgrading Daytona to a version with fixed marker parsing and unconfirmed-stream buffering.
     async def _consume_log_websocket(
         self,
         url: str,
@@ -1083,12 +1083,6 @@ class _NativeSessionLogProcess(AsyncProcess):
                     del buffer[: marker_at + len(marker)]
                     stream = next_stream
 
-            await emit(bytes(buffer))
-            for decoder, handler in ((stdout_decoder, on_stdout), (stderr_decoder, on_stderr)):
-                if (text := decoder.decode(b"", final=True)):
-                    result = handler(text)
-                    if inspect.isawaitable(result):
-                        await result
         finally:
             if not ws.closed:
                 await ws.close()
@@ -1123,7 +1117,7 @@ async def _watch_session_command(
     seen_stderr = 0
 
     def consume(text: str, seen: int, forwarded: int) -> tuple[int, int]:
-        forward(text[max(0, forwarded - seen):])
+        forward(text[forwarded - seen:])
         return seen + len(text), max(forwarded, seen + len(text))
 
     async def on_stdout(text: str) -> None:

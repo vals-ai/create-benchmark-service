@@ -4654,6 +4654,17 @@ def _cgroup_sandbox(process: CgroupProcess) -> DaytonaSandbox:
     return DaytonaSandbox(cast(Any, inner), cast(Any, CgroupDaytonaClient(inner, process)))
 
 
+async def test_daytona_cgroup_probe_rejects_unsupported_kernel() -> None:
+    class UnsupportedProcess(Process):
+        async def exec(self, command: str) -> SimpleNamespace:
+            return SimpleNamespace(exit_code=1, result="cgroup.kill unavailable")
+
+    inner = InnerSandbox()
+    inner.process = UnsupportedProcess()
+    with pytest.raises(SandboxError, match="linux_cgroup_v2"):
+        await _daytona_sandbox(cast(Any, inner)).probe_generation_containment()
+
+
 @pytest.mark.usefixtures("_fake_cgroup_follow")
 async def test_daytona_native_reopens_same_command_and_forwards_each_stream_once(
     monkeypatch: pytest.MonkeyPatch,
@@ -4800,21 +4811,6 @@ async def test_native_log_reader_does_not_flush_incomplete_data_on_failed_receiv
     assert socket.closed
 
 
-async def test_native_log_reader_preserves_literal_replacement_and_controls_on_eof(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    socket = RawLogWebSocket([
-        _raw_log_frame(b"\x01\x01\x01" + "\ufffd".encode() + b"\x01\x02\x02\x02err\x02"),
-        _normal_log_close(),
-    ])
-    reader = _raw_log_reader(monkeypatch, socket)
-    stdout: list[str] = []
-    stderr: list[str] = []
-    await reader.get_session_command_logs_async("session", "command", stdout.append, stderr.append)
-    assert "".join(stdout) == "\ufffd\x01"
-    assert "".join(stderr) == "err\x02"
-    assert socket.closed
-
 
 async def test_native_log_reader_non_normal_close_reports_error_without_partial_flush(
     monkeypatch: pytest.MonkeyPatch,
@@ -4847,6 +4843,48 @@ async def test_native_log_reader_callback_failure_does_not_reemit_buffer(
     assert isinstance(error.value.__cause__, RuntimeError)
     assert received == ["ok\n"]
     assert socket.closed
+
+
+@pytest.mark.parametrize(
+    ("first_frame", "canonical"),
+    [
+        (b"\x01\x01\x01ok\n\xe2\x82", "ok\n€done\n"),
+        (b"\x01\x01\x01ok\n\x02\x02", "ok\n\x02\x02done\n"),
+        (b"\x01\x01\x01ok\n\x01", "ok\n\x01"),
+    ],
+    ids=["utf8-tail", "framing-prefix", "terminal-literal-control"],
+)
+async def test_daytona_native_watcher_normal_follow_close_replays_uncommitted_tail_from_snapshot(
+    monkeypatch: pytest.MonkeyPatch, first_frame: bytes, canonical: str,
+) -> None:
+    first = RawLogWebSocket([_raw_log_frame(first_frame), _normal_log_close()])
+    second = RawLogWebSocket([_raw_log_frame(b"\x01\x01\x01" + canonical.encode()), _normal_log_close()])
+    sockets = iter([first, second])
+
+    async def open_ws(self: Any, url: str, headers: dict[str, str]) -> RawLogWebSocket:
+        return next(sockets)
+
+    monkeypatch.setattr(daytona_module._NativeSessionLogProcess, "_open_ws", open_ws)  # pyright: ignore[reportPrivateUsage]
+    process = CgroupProcess()
+    process.stdout = canonical
+    inner = InnerSandbox()
+    inner.process = process
+    client = CgroupDaytonaClient(inner, process)
+    forwarded: list[str] = []
+    closed = asyncio.Event()
+    first_result = await daytona_module._watch_session_command(  # pyright: ignore[reportPrivateUsage]
+        cast(Any, client), inner.id, "session", "command", 0, 0, forwarded.append, closed,
+    )
+    assert first_result[0] is None
+    assert "".join(forwarded) == "ok\n"
+    process.release_seen.set()
+    second_result = await daytona_module._watch_session_command(  # pyright: ignore[reportPrivateUsage]
+        cast(Any, client), inner.id, "session", "command", first_result[1], first_result[2],
+        forwarded.append, closed,
+    )
+    assert second_result[0] == 7
+    assert "".join(forwarded) == canonical
+    assert first.closed and second.closed
 
 
 async def test_daytona_native_watcher_replays_exact_stage_frame_after_raw_receive_drop(

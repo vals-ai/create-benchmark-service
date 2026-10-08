@@ -52,16 +52,20 @@ def agents(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **config: object) ->
     reporter = Reporter()
     monkeypatch.setenv("VALKYRIE_STAGE_DIR", str(stage_dir))
     monkeypatch.setattr(valkyrie_stage, "StageReporter", lambda: reporter)
-    (stage_dir / "agent.json").write_text(json.dumps({
-        "run_cmd": "exit 0",
-        "continue_cmd": None,
-        "interrupt_grace_seconds": None,
-        "container_name": None,
-        "final_output": None,
-        "parallel_agents": 2,
-        "slots_root": str(tmp_path / "slots"),
-        **config,
-    }))
+    (stage_dir / "agent.json").write_text(
+        json.dumps(
+            {
+                "run_cmd": "exit 0",
+                "continue_cmd": None,
+                "interrupt_grace_seconds": None,
+                "container_name": None,
+                "final_output": None,
+                "parallel_agents": 2,
+                "slots_root": str(tmp_path / "slots"),
+                **config,
+            }
+        )
+    )
     return valkyrie_stage.Agents(), reporter
 
 
@@ -72,8 +76,12 @@ def test_commands_render_only_bound_tokens_once(tmp_path: Path, monkeypatch: pyt
     first = "printf '%s\\n' '{\"json\": {\"ok\": true}}' '{problem_statement_path}' > '{slot_dir}/first'"
     continuation = "printf '%s\\n' '{\"json\": {\"ok\": true}}' '{problem_statement_path}' > '{slot_dir}/next'"
     worker, reporter = agents(
-        tmp_path, monkeypatch, run_cmd=first, continue_cmd=continuation,
-        slots_root=str(slot_root), final_output="{slot_dir}/first",
+        tmp_path,
+        monkeypatch,
+        run_cmd=first,
+        continue_cmd=continuation,
+        slots_root=str(slot_root),
+        final_output="{slot_dir}/first",
     )
     slot_dir = slot_root / "one" / "agent"
     worker.start("one", str(observation))
@@ -94,14 +102,18 @@ def test_container_is_bound_only_when_configured(tmp_path: Path, monkeypatch: py
 
 
 def test_configured_container_binding_keeps_inserted_braces_opaque(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     docker = tmp_path / "docker"
-    docker.write_text("#!/bin/sh\nif [ \"$1\" = rm ]; then printf '%s' \"$3\" > '" + str(tmp_path / "removed") + "'; fi\n")
+    docker.write_text(
+        '#!/bin/sh\nif [ "$1" = rm ]; then printf \'%s\' "$3" > \'' + str(tmp_path / "removed") + "'; fi\n"
+    )
     docker.chmod(0o755)
     monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
     worker, reporter = agents(
-        tmp_path, monkeypatch,
+        tmp_path,
+        monkeypatch,
         container_name="box-{slot}-{slot_dir}",
         run_cmd="printf '%s' '{container_name}' > '{slot_dir}/name'",
     )
@@ -117,7 +129,8 @@ def test_natural_exit_keeps_leader_until_group_cleanup(tmp_path: Path, monkeypat
     gate.parent.mkdir(parents=True)
     os.mkfifo(gate)
     worker, reporter = agents(
-        tmp_path, monkeypatch,
+        tmp_path,
+        monkeypatch,
         run_cmd=(
             "sleep 30 & printf '%s' \"$!\" > '{slot_dir}/child.pid.tmp'; "
             "mv '{slot_dir}/child.pid.tmp' '{slot_dir}/child.pid'; "
@@ -194,7 +207,10 @@ def test_natural_exit_keeps_leader_until_group_cleanup(tmp_path: Path, monkeypat
 
 def test_parallel_exhaustion_and_graceful_stop(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     worker, reporter = agents(
-        tmp_path, monkeypatch, run_cmd="sleep 30", interrupt_grace_seconds=0.2,
+        tmp_path,
+        monkeypatch,
+        run_cmd="sleep 30",
+        interrupt_grace_seconds=0.2,
     )
     worker.start("one", "observation")
     started_slots = {"one"}
@@ -216,7 +232,8 @@ def test_parallel_exhaustion_and_graceful_stop(tmp_path: Path, monkeypatch: pyte
 
 
 def test_generation_children_use_generation_gateway_while_evaluation_uses_native(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     generation_hits: queue.Queue[str] = queue.Queue()
     native_hits: queue.Queue[str] = queue.Queue()
@@ -258,7 +275,8 @@ def test_generation_children_use_generation_gateway_while_evaluation_uses_native
             )
             stage_reporter = valkyrie_stage.StageReporter
             agents(
-                tmp_path, monkeypatch,
+                tmp_path,
+                monkeypatch,
                 run_cmd=f"{shlex.quote(sys.executable)} -c {shlex.quote(client)} '{{problem_statement_path}}'",
             )
             stage_dir = tmp_path / "stage"
@@ -279,37 +297,39 @@ def test_generation_children_use_generation_gateway_while_evaluation_uses_native
             monkeypatch.setattr(sys, "stdout", AckOutput())
             monkeypatch.setattr(valkyrie_stage, "StageReporter", stage_reporter)
             worker = valkyrie_stage.Agents()
-            worker.start("one", "one")
-            active.add("one")
-            worker.start("two", "two")
-            active.add("two")
-            evaluator = subprocess.Popen([sys.executable, "-c", client, "evaluation"])
-            assert {generation_hits.get(timeout=5), generation_hits.get(timeout=5)} == {"/one", "/two"}
-            assert native_hits.get(timeout=5) == "/evaluation"
-            assert events == ["begin"]
-            release_generation.set()
-            assert evaluator.wait(timeout=5) == 0
-            assert {worker.wait_any(), worker.wait_any()} == {
-                valkyrie_stage.SlotResult("one", "exited", 0),
-                valkyrie_stage.SlotResult("two", "exited", 0),
-            }
-            active.clear()
-            assert events == ["begin", "end"]
+            try:
+                worker.start("one", "one")
+                active.add("one")
+                worker.start("two", "two")
+                active.add("two")
+                evaluator = subprocess.Popen([sys.executable, "-c", client, "evaluation"])
+                assert {generation_hits.get(timeout=5), generation_hits.get(timeout=5)} == {"/one", "/two"}
+                assert native_hits.get(timeout=5) == "/evaluation"
+                assert events == ["begin"]
+                release_generation.set()
+                assert evaluator.wait(timeout=5) == 0
+                assert {worker.wait_any(), worker.wait_any()} == {
+                    valkyrie_stage.SlotResult("one", "exited", 0),
+                    valkyrie_stage.SlotResult("two", "exited", 0),
+                }
+                active.clear()
+                assert events == ["begin", "end"]
 
-            monkeypatch.delenv("VALKYRIE_GENERATION_MODEL_GATEWAY_URL")
-            worker.start("three", "native-child")
-            active.add("three")
-            assert native_hits.get(timeout=5) == "/native-child"
-            assert worker.wait_any() == valkyrie_stage.SlotResult("three", "exited", 0)
-            active.clear()
-            assert events == ["begin", "end"] * 2
+                monkeypatch.delenv("VALKYRIE_GENERATION_MODEL_GATEWAY_URL")
+                worker.start("three", "native-child")
+                active.add("three")
+                assert native_hits.get(timeout=5) == "/native-child"
+                assert worker.wait_any() == valkyrie_stage.SlotResult("three", "exited", 0)
+                active.clear()
+                assert events == ["begin", "end"] * 2
+            finally:
+                for slot in active:
+                    worker.stop(slot)
         finally:
             release_generation.set()
             if evaluator is not None and evaluator.poll() is None:
                 evaluator.terminate()
                 evaluator.wait(timeout=5)
-            for slot in active:
-                worker.stop(slot)
             generation_server.shutdown()
             native_server.shutdown()
             generation_thread.join()

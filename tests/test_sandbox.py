@@ -1135,6 +1135,11 @@ class UnexpectedRemoveDaytonaClient(DaytonaClient):
 
 def _provider(daytona: DaytonaClient) -> DaytonaSandboxProvider:
     provider = DaytonaSandboxProvider.__new__(DaytonaSandboxProvider)
+    provider._config = DaytonaProviderConfig(  # pyright: ignore[reportPrivateUsage]
+        DAYTONA_API_KEY="test-key",
+        DAYTONA_API_URL="https://daytona.example/api",
+        DAYTONA_TARGET="us",
+    )
     provider._daytona = cast(Any, daytona)  # pyright: ignore[reportPrivateUsage]
     return provider
 

@@ -53,6 +53,9 @@ class GenerationContainment(BaseModel):
 
 LINUX_CGROUP_V2_V1 = GenerationContainment(type="linux_cgroup_v2", version=1)
 LINUX_PROCESS_GROUP_V1 = GenerationContainment(type="linux_process_group", version=1)
+
+MAX_SANDBOX_LIFETIME_SECONDS = 167 * 60 * 60
+
 _ENV_VAR_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _RESERVED_COMMAND_ENV_NAMES = frozenset({"LANG", "TERM"})
 _VOLUME_SUBPATH_FORMATTER = Formatter()

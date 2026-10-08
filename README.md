@@ -325,11 +325,16 @@ requires a usable outer transport and effective inner service. Unsupported probe
 raise rather than silently falling back to an ordinary command.
 
 A direct Daytona sandbox supports `LINUX_CGROUP_V2_V1` (`linux_cgroup_v2` v1).
-`sandbox.controlled_workload(command, cwd=..., env_vars=...)` starts a PTY command
-whose child enters a dedicated cgroup v2 subgroup. Natural completion and `kill()`
-use `cgroup.kill`, confirm `populated 0` and remove the subgroup; the PTY session
-is also confirmed absent. The probe requires writable cgroup v2 delegation with
-`cgroup.kill`; the sandbox's other services remain outside the workload subgroup.
+`sandbox.controlled_workload(command, cwd=..., env_vars=...)` launches one native
+asynchronous Daytona session command whose child enters a dedicated cgroup v2
+subgroup. The shell stays outside the subgroup and publishes completion before
+release, so descendants are fenced before the native exit status and final output
+are returned. Natural completion and `kill()` use `cgroup.kill`, confirm
+`populated 0`, and remove the subgroup; the native session is also confirmed absent.
+Transient output, status, and completion-marker observation failures reopen the
+same command without restarting it or stopping the workload. The caller still owns
+the deadline and explicit stop. The probe requires writable cgroup v2 delegation
+with `cgroup.kill`; the sandbox's other services remain outside the subgroup.
 
 `ComposeSandbox` supports `linux_process_group` v1 (`LINUX_PROCESS_GROUP_V1`).
 It pins the running service container, starts the command in a new process group inside
@@ -547,7 +552,7 @@ result = await client.run_with_sandbox_recovery(
 Pydantic models used across requests and responses:
 
 - **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, optional `CreditedGeneration(allowance_seconds, stage_protocol)`, optional `Episode(command, parallel_agents)`, `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
-- **`GenerationContainment`** — effective-sandbox capability: `linux_cgroup_v2` v1 for direct Daytona or `linux_process_group` v1 for Compose service, native Modal, and local Docker workloads. Tracker probes the effective sandbox for every task before its `ControlledWorkload` and does not fall back to `Sandbox.command()` on unsupported providers.
+- **`GenerationContainment`** — effective-sandbox capability: `linux_cgroup_v2` v1 for direct Daytona native-session commands fenced by cgroup v2, or `linux_process_group` v1 for Compose service, native Modal, and local Docker workloads. Tracker probes the effective sandbox for every task before its `ControlledWorkload` and does not fall back to `Sandbox.command()` on unsupported providers.
 - **`agent_install_order`** — `"before_setup"` installs agent dependencies before benchmark setup; `"after_setup"` lets setup prepare the environment first. It defaults to `"before_setup"`, so older task responses remain valid; lifecycle execution is the caller's responsibility.
 - **`BenchmarkEgressPlan`** — declarative `setup_task`, agent `run`, and `evaluation` policies. `"*"` is unrestricted, `[]` is deny-all, and a non-empty list is an allowlist. Setup and evaluation default to `"*"`; `run=None` means the benchmark has no run-policy opinion, preserving legacy task behavior. Applying and composing the plan is the caller's responsibility.
 - **`SandboxRecoveryPolicy`** — explicit opt-in to recreate a lost generation sandbox with the same run identity and volumes; `max_sandbox_attempts` (2–20, inclusive) includes the initial sandbox

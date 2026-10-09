@@ -1134,13 +1134,36 @@ async def _watch_session_command(
     closed_task = asyncio.create_task(closed.wait())
     watch_error: Exception | None = None
     try:
-        done, _ = await asyncio.wait({follow_task, closed_task}, return_when=asyncio.FIRST_COMPLETED)
-        if closed_task in done:
-            raise SandboxError("Controlled workload closed before command exit")
-        await follow_task
-    except (*_SANDBOX_OPERATION_ERRORS, SandboxConnectionError) as exc:
-        watch_error = exc
-        await _raise_if_sandbox_gone(client, sandbox_id)
+        while True:
+            done, _ = await asyncio.wait(
+                {follow_task, closed_task},
+                timeout=_SESSION_WATCH_REOPEN_SECONDS,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if closed_task in done:
+                raise SandboxError("Controlled workload closed before command exit")
+            if follow_task in done:
+                try:
+                    await follow_task
+                except (*_SANDBOX_OPERATION_ERRORS, SandboxConnectionError) as exc:
+                    watch_error = exc
+                    await _raise_if_sandbox_gone(client, sandbox_id)
+            try:
+                status = await _bounded(
+                    "process.get_session_command",
+                    process.get_session_command(session_id, command_id),
+                    _TOOLBOX_CALL_TIMEOUT_SECONDS,
+                )
+            except (*_SANDBOX_OPERATION_ERRORS, SandboxConnectionError) as exc:
+                if closed.is_set():
+                    raise SandboxError("Controlled workload closed before command exit") from exc
+                await _raise_if_sandbox_gone(client, sandbox_id)
+                watch_error = exc
+                status = None
+            if closed.is_set():
+                raise SandboxError("Controlled workload closed before command exit")
+            if follow_task in done or status is None or status.exit_code is not None:
+                break
     finally:
         follow_task.cancel()
         closed_task.cancel()
@@ -1149,16 +1172,8 @@ async def _watch_session_command(
         with suppress(asyncio.CancelledError):
             await closed_task
 
-    try:
-        status = await _bounded(
-            "process.get_session_command",
-            process.get_session_command(session_id, command_id),
-            _TOOLBOX_CALL_TIMEOUT_SECONDS,
-        )
-    except (*_SANDBOX_OPERATION_ERRORS, SandboxConnectionError) as exc:
-        await _raise_if_sandbox_gone(client, sandbox_id)
-        watch_error = exc
-        status = None
+    if closed.is_set():
+        raise SandboxError("Controlled workload closed before command exit")
     if status is not None and status.exit_code is not None:
         try:
             logs = await _bounded(

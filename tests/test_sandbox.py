@@ -5023,6 +5023,138 @@ async def test_daytona_natural_completion_fences_group_before_release_and_final_
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
+async def test_daytona_native_exit_completes_while_follow_reader_is_open(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(daytona_module, "_SESSION_WATCH_REOPEN_SECONDS", 0.01)
+
+    class OpenReaderProcess(CgroupProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.follow_started = asyncio.Event()
+            self.allow_follow_close = asyncio.Event()
+            self.follow_returned = asyncio.Event()
+            self.status_polled = asyncio.Event()
+
+        async def get_session_command_logs_async(
+            self, session_id: str, command_id: str,
+            on_stdout: Callable[[str], Awaitable[None]],
+            on_stderr: Callable[[str], Awaitable[None]],
+        ) -> None:
+            self.follow_calls += 1
+            await on_stdout(self.stdout)
+            await on_stderr(self.stderr)
+            self.follow_started.set()
+            await self.allow_follow_close.wait()
+            self.follow_returned.set()
+
+        async def get_session_command(self, session_id: str, command_id: str) -> SimpleNamespace:
+            self.status_polled.set()
+            return await super().get_session_command(session_id, command_id)
+
+    process = OpenReaderProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
+    try:
+        await asyncio.wait_for(process.follow_started.wait(), 2)
+        assert not process.release_seen.is_set()
+        process.stdout = "hellofinal frame"
+        process.user_finished.set()
+        completed = await asyncio.wait_for(workload.wait(), 2)
+        assert process.marker_polled.is_set()
+        assert process.release_seen.is_set()
+        assert process.status_polled.is_set()
+        assert not process.follow_returned.is_set()
+        assert completed.result.exit_code == 7
+        assert completed.result.output == "hellofinal frame"
+        assert process.follow_calls == 1
+        assert process.execute_calls == 1
+        assert not process.group_exists
+        assert process.sessions == set()
+    finally:
+        process.allow_follow_close.set()
+        if process.sessions:
+            await asyncio.wait_for(workload.kill(), 2)
+
+
+@pytest.mark.usefixtures("_fake_cgroup_follow")
+async def test_daytona_stop_wins_over_inflight_status_reply(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(daytona_module, "_SESSION_WATCH_REOPEN_SECONDS", 0.01)
+
+    class PausedStatusProcess(CgroupProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.status_started = asyncio.Event()
+            self.allow_status = asyncio.Event()
+
+        async def get_session_command(self, session_id: str, command_id: str) -> SimpleNamespace:
+            self.status_started.set()
+            await self.allow_status.wait()
+            return SimpleNamespace(exit_code=7)
+
+    process = PausedStatusProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    waiting = asyncio.create_task(workload.wait())
+    try:
+        await asyncio.wait_for(process.status_started.wait(), 2)
+        await asyncio.wait_for(workload.kill(), 2)
+        assert not process.group_exists
+        assert process.sessions == set()
+    finally:
+        process.allow_status.set()
+    with pytest.raises(SandboxError, match="closed before command exit"):
+        await asyncio.wait_for(waiting, 2)
+
+
+@pytest.mark.usefixtures("_fake_cgroup_follow")
+async def test_daytona_stop_wins_during_follow_cancel_join(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(daytona_module, "_SESSION_WATCH_REOPEN_SECONDS", 0.01)
+
+    class PausedFollowCancelProcess(CgroupProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.cancel_started = asyncio.Event()
+            self.allow_cancel = asyncio.Event()
+            self.allow_follow_close = asyncio.Event()
+
+        async def get_session_command_logs_async(
+            self, session_id: str, command_id: str,
+            on_stdout: Callable[[str], Awaitable[None]],
+            on_stderr: Callable[[str], Awaitable[None]],
+        ) -> None:
+            await on_stdout("hello")
+            try:
+                await self.allow_follow_close.wait()
+            except asyncio.CancelledError:
+                self.cancel_started.set()
+                await self.allow_cancel.wait()
+                raise
+
+    process = PausedFollowCancelProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
+    waiting = asyncio.create_task(workload.wait())
+    try:
+        await asyncio.wait_for(process.command_admitted.wait(), 2)
+        process.user_finished.set()
+        await asyncio.wait_for(process.cancel_started.wait(), 2)
+        assert process.marker_polled.is_set()
+        assert process.release_seen.is_set()
+        await asyncio.wait_for(workload.kill(), 2)
+        assert not process.group_exists
+        assert process.sessions == set()
+    finally:
+        process.allow_cancel.set()
+        process.allow_follow_close.set()
+    with pytest.raises(SandboxError, match="closed before command exit"):
+        await asyncio.wait_for(waiting, 2)
+
+
+@pytest.mark.usefixtures("_fake_cgroup_follow")
 async def test_daytona_transient_marker_observation_recovers_without_stop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

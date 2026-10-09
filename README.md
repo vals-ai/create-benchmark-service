@@ -339,10 +339,17 @@ subgroup. The shell stays outside the subgroup and publishes completion before
 release, so descendants are fenced before the native exit status and final output
 are returned. Natural completion and `kill()` use `cgroup.kill`, confirm
 `populated 0`, and remove the subgroup; the native session is also confirmed absent.
-Transient output, status, and completion-marker observation failures reopen the
-same command without restarting it or stopping the workload. The caller still owns
-the deadline and explicit stop. The probe requires writable cgroup v2 delegation
-with `cgroup.kill`; the sandbox's other services remain outside the subgroup.
+The watcher checks command status about every 10 seconds while following logs,
+and whenever the follower ends. A known exit does not depend on the log connection
+closing. After exit, the watcher cancels and joins the reader, then makes one final
+log snapshot request. Confirmed sandbox loss still raises `SandboxNotFoundError`;
+other handled snapshot failures warn without retrying or changing the command exit
+result.
+Transient output and status observation failures reopen the same command without
+restarting it or stopping the workload. Completion-marker observation retries
+independently. The caller still owns the deadline and explicit stop. The probe
+requires writable cgroup v2 delegation with `cgroup.kill`; other sandbox services
+remain outside the subgroup.
 
 Launch setup is a one-shot phase, separate from repeated observation. Completion
 and stop handling run independently of the log watcher. `wait()` and `kill()` share

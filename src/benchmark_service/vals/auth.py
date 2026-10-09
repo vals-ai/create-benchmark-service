@@ -234,12 +234,6 @@ def _token_expiry(jwt_response: Mapping[str, Any]) -> float:
     return expires_at if math.isfinite(expires_at) else 0.0
 
 
-def _cache_deadline(expires_at: float) -> float:
-    """Keep a result for the configured TTL, but never past the exchanged token's expiry."""
-    remaining = expires_at - time.time() - _TOKEN_EXPIRY_SKEW_SECONDS
-    return time.monotonic() + min(_auth_cache_ttl_seconds, max(0.0, remaining))
-
-
 @dataclass(frozen=True)
 class AuthSettings:
     """Runtime auth settings loaded from environment variables."""
@@ -316,9 +310,9 @@ async def resolve_descope_tenant(headers: Mapping[str, str]) -> str | None:
             logger.info("Descope tenant %s is not in the service allowlist", tenant)
             return None
 
-    deadline = _cache_deadline(_token_expiry(jwt_response))
-    if deadline > time.monotonic():
-        _auth_cache[cache_key] = (tenant, deadline)
+    ttl = min(_auth_cache_ttl_seconds, _token_expiry(jwt_response) - time.time() - _TOKEN_EXPIRY_SKEW_SECONDS)
+    if ttl > 0:
+        _auth_cache[cache_key] = (tenant, time.monotonic() + ttl)
     return tenant
 
 

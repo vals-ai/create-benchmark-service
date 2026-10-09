@@ -70,14 +70,9 @@ async def _resolve_twice(response: dict[str, Any]) -> int:
 
 
 @pytest.mark.usefixtures("descope_env")
-async def test_resolved_tenant_is_cached_while_the_token_is_valid() -> None:
-    assert await _resolve_twice(_mock_jwt_response(["acme-corp"])) == 1
-
-
-@pytest.mark.usefixtures("descope_env")
-@pytest.mark.parametrize("expires_in", [None, 0.5, -60])
-async def test_tenant_is_not_cached_past_the_token_expiry(expires_in: float | None) -> None:
-    assert await _resolve_twice(_mock_jwt_response(["acme-corp"], expires_in)) == 2
+@pytest.mark.parametrize(("expires_in", "exchanges"), [(3 * 3600, 1), (None, 2), (0.5, 2), (-60, 2)])
+async def test_tenant_is_cached_only_while_the_token_is_valid(expires_in: float | None, exchanges: int) -> None:
+    assert await _resolve_twice(_mock_jwt_response(["acme-corp"], expires_in)) == exchanges
 
 
 @pytest.mark.usefixtures("descope_env")

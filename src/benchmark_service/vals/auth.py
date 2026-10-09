@@ -5,16 +5,18 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
+import time
 from collections.abc import Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import yaml
-from cachetools import TTLCache
+from cachetools import TLRUCache
 from descope.descope_client import DescopeClient
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -44,7 +46,8 @@ class AllowlistConfig(BaseModel):
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_AUTH_CACHE_TTL_SECONDS = 3600
+DEFAULT_AUTH_CACHE_TTL_SECONDS = 7200
+_TOKEN_EXPIRY_SKEW_SECONDS = 1.0
 AUTH_CACHE_MAX_SIZE = ALLOWLIST_CACHE_MAX_SIZE
 
 
@@ -209,10 +212,26 @@ def _initial_cache_ttl_seconds() -> int:
         return DEFAULT_AUTH_CACHE_TTL_SECONDS
 
 
-_auth_cache: TTLCache[tuple[str, str], str] = TTLCache[tuple[str, str], str](
+_auth_cache_ttl_seconds = _initial_cache_ttl_seconds()
+_auth_cache: TLRUCache[tuple[str, str], tuple[str, float]] = TLRUCache(
     maxsize=AUTH_CACHE_MAX_SIZE,
-    ttl=_initial_cache_ttl_seconds(),
+    ttu=lambda _key, value, _now: value[1],
+    timer=time.monotonic,
 )
+
+
+def _token_expiry(jwt_response: Mapping[str, Any]) -> float:
+    session_token = jwt_response.get("sessionToken")
+    expires_at = cast(Mapping[str, Any], session_token).get("exp") if isinstance(session_token, Mapping) else None
+    if expires_at is None:
+        expires_at = jwt_response.get("exp")
+    if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
+        return 0.0
+    try:
+        expires_at = float(expires_at)
+    except OverflowError:
+        return 0.0
+    return expires_at if math.isfinite(expires_at) else 0.0
 
 
 @dataclass(frozen=True)
@@ -257,7 +276,8 @@ async def resolve_descope_tenant(headers: Mapping[str, str]) -> str | None:
         return None
 
     cache_key = (settings.descope_project_id, access_key)
-    cached = _auth_cache.get(cache_key)
+    cached_entry = _auth_cache.get(cache_key)
+    cached = cached_entry[0] if cached_entry is not None else None
     if cached is not None:
         if _catalog_api_url() is None:
             return cached
@@ -290,7 +310,9 @@ async def resolve_descope_tenant(headers: Mapping[str, str]) -> str | None:
             logger.info("Descope tenant %s is not in the service allowlist", tenant)
             return None
 
-    _auth_cache[cache_key] = tenant
+    ttl = min(_auth_cache_ttl_seconds, _token_expiry(jwt_response) - time.time() - _TOKEN_EXPIRY_SKEW_SECONDS)
+    if ttl > 0:
+        _auth_cache[cache_key] = (tenant, time.monotonic() + ttl)
     return tenant
 
 

@@ -2397,6 +2397,50 @@ def test_daytona_temporary_authentication_errors_are_transient(message: str) -> 
     assert _is_transient_daytona_error(DaytonaError(message))
 
 
+@pytest.mark.parametrize(
+    ("message", "transient"),
+    [
+        ("Failed to update network settings: An operation is already in progress for this resource", True),
+        ("failed to update network settings: an operation is ALREADY IN PROGRESS", True),
+        ("Failed to update network settings: invalid CIDR", False),
+        ("Failed to start sandbox: An operation is already in progress for this resource", False),
+    ],
+)
+def test_daytona_network_settings_conflict_is_transient(message: str, transient: bool) -> None:
+    assert _is_transient_daytona_error(DaytonaError(message)) is transient
+
+
+@pytest.mark.parametrize(
+    ("method_name", "args"),
+    [("modify_egress_rules", (["api.openai.com"],)), ("block_all_egress", ()), ("clear_egress_rules", ())],
+)
+async def test_daytona_egress_update_retries_network_settings_conflict(
+    monkeypatch: pytest.MonkeyPatch,
+    method_name: str,
+    args: tuple[object, ...],
+) -> None:
+    inner = InnerSandbox()
+    attempts = 0
+    record_update = inner.update_network_settings
+
+    async def conflict_once(**kwargs: Any) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise DaytonaError(
+                "Failed to update network settings: An operation is already in progress for this resource"
+            )
+        await record_update(**kwargs)
+
+    monkeypatch.setattr(inner, "update_network_settings", conflict_once)
+    _skip_retry_sleep(monkeypatch, getattr(DaytonaSandbox, method_name))
+
+    await getattr(DaytonaSandbox(cast(Any, inner)), method_name)(*args)
+
+    assert attempts == 2
+    assert len(inner.network_settings) == 1
+
+
 def test_daytona_throttled_unauthorized_errors_are_transient() -> None:
     exc = DaytonaError(
         "Failed to execute command: unauthorized: authentication failed: Bearer token validation error: "

@@ -119,6 +119,9 @@ _TRANSIENT_DAYTONA_ERRORS = (DaytonaConnectionError, DaytonaRateLimitError, Dayt
 _RETRY_AFTER_PREFIX = "retry-after-"
 _KNOWN_THROTTLERS = ("sandbox-create", "sandbox-lifecycle", "authenticated", "anonymous")
 _DELETE_CONFLICT_MESSAGES = ("state change in progress", "modified by another operation")
+# Daytona rejects a network-settings update while another operation on the sandbox is still being
+# applied. Both substrings must match so unrelated "already in progress" errors are not retried.
+_NETWORK_SETTINGS_CONFLICT_MESSAGES = ("failed to update network settings", "an operation is already in progress")
 _REMOVED_SANDBOX_CLIENT_STATUSES = (404, 502)
 _RETRYABLE_PROVIDER_STATUSES = (408, 429, 500, 502, 503, 504)
 _FAILED_EXECUTE_COMMAND_PREFIX = "failed to execute command:"
@@ -353,6 +356,11 @@ def _is_delete_conflict(exc: DaytonaConflictError) -> bool:
     return _message_contains(exc, _DELETE_CONFLICT_MESSAGES)
 
 
+def _is_network_settings_conflict(exc: BaseException) -> bool:
+    error = str(exc).lower()
+    return all(message in error for message in _NETWORK_SETTINGS_CONFLICT_MESSAGES)
+
+
 def _is_not_found_error(exc: DaytonaError | ClientResponseError) -> bool:
     if isinstance(exc, ClientResponseError):
         return exc.status in _REMOVED_SANDBOX_CLIENT_STATUSES
@@ -393,7 +401,7 @@ def _is_transient_daytona_error(exc: DaytonaError | ClientResponseError) -> bool
         return True
     if _provider_status_code(exc) in _RETRYABLE_PROVIDER_STATUSES:
         return True
-    if _is_throttled_error(exc):
+    if _is_throttled_error(exc) or _is_network_settings_conflict(exc):
         return True
     return _message_contains(exc, _TRANSPORT_ERROR_MESSAGES)
 

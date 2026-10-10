@@ -5022,7 +5022,8 @@ async def test_daytona_native_command_gets_stdin_eof_with_parent_pipe_open(
             )
             completed = await asyncio.wait_for(workload.wait(), 5)
         assert completed.result.exit_code == 0
-        assert completed.result.output == "stdin-eof\n"
+        # Bash can append a job-completion notice after the child reports EOF.
+        assert completed.result.output.splitlines()[0] == "stdin-eof"
         assert process.execute_calls == 1
     finally:
         os.close(read_fd)

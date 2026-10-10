@@ -325,8 +325,8 @@ async def test_controlled_wait_cancellation_does_not_cancel_command(tmp_path: Pa
         f"exec 5<> {shlex.quote(str(release))}; printf ready; read line <&5; exec 5>&-; printf %s \"$CUSTOM\"",
         env_vars={"CUSTOM": "ok"},
     )
+    stream = workload.output()
     try:
-        stream = workload.output()
         assert await asyncio.wait_for(anext(stream), timeout=3) == "ready"
         entered = asyncio.Event()
 

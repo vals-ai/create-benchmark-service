@@ -34,4 +34,4 @@ async def controlled_episode_workload(
         raise SandboxError(f"Episode directory preparation failed: {result.output}")
     script = f"{directory}/supervisor.py"
     await sandbox.upload_file(script, Path(__file__).with_name("episode_supervisor.py").read_bytes())
-    return sandbox._controlled_episode_workload(command, script, cwd=cwd, env_vars=env_vars)
+    return sandbox._controlled_episode_workload(command, script, cwd=cwd, env_vars=env_vars)  # pyright: ignore[reportPrivateUsage]

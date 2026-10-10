@@ -1017,7 +1017,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         )
         self._env_vars = env_vars
         self._output: asyncio.Queue[str] = asyncio.Queue()
-        self._stdout: deque[str] = deque()
+        self._stdout: deque[bytes] = deque()
         self._stdout_bytes = 0
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._create_state = _PtyCreateState(marker=uuid.uuid4().hex)
@@ -1042,10 +1042,18 @@ class _DaytonaControlledWorkload(ControlledWorkload):
     def _append_output(self, text: str) -> None:
         if not text:
             return
-        self._stdout.append(text)
-        self._stdout_bytes += len(text)
-        while self._stdout_bytes > _PTY_STDOUT_TAIL_MAX_BYTES and len(self._stdout) > 1:
-            self._stdout_bytes -= len(self._stdout.popleft())
+        encoded = text.encode("utf-8")
+        self._stdout.append(encoded)
+        self._stdout_bytes += len(encoded)
+        while self._stdout_bytes > _PTY_STDOUT_TAIL_MAX_BYTES:
+            oldest = self._stdout.popleft()
+            excess = self._stdout_bytes - _PTY_STDOUT_TAIL_MAX_BYTES
+            if len(oldest) > excess:
+                suffix = oldest[excess:].decode("utf-8", errors="ignore").encode("utf-8")
+                self._stdout.appendleft(suffix)
+                self._stdout_bytes -= len(oldest) - len(suffix)
+            else:
+                self._stdout_bytes -= len(oldest)
         self._output.put_nowait(text)
 
     def _finalize_output(self) -> None:
@@ -1335,7 +1343,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
             self._finalize_output()
             return ExecResult(
                 exit_code=int(result.output.strip().splitlines()[-1]),
-                output="".join(self._stdout),
+                output=b"".join(self._stdout).decode("utf-8"),
             )
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc

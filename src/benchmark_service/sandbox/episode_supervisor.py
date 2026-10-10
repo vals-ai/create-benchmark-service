@@ -1,5 +1,4 @@
-"""Standalone Linux/Python 3.8 episode owner, uploaded into a sandbox."""
-
+"""Linux process-group owner for an episode, uploaded before native launch."""
 from __future__ import annotations
 
 import argparse
@@ -7,24 +6,15 @@ import ctypes
 import os
 import select
 import signal
-import socket
 import subprocess
 import sys
 import time
 
-
 PR_SET_CHILD_SUBREAPER = 36
 
 
-
-def publish(directory: str, name: str, value: str) -> None:
-    with open(os.path.join(directory, name), "w") as stream:
-        stream.write(value)
-
-
 def children() -> list[int]:
-    path = "/proc/self/task/{}/children".format(os.getpid())
-    with open(path) as stream:
+    with open(f"/proc/self/task/{os.getpid()}/children") as stream:
         return [int(pid) for pid in stream.read().split()]
 
 
@@ -47,6 +37,15 @@ def drain(child: subprocess.Popen[bytes] | None) -> None:
         time.sleep(0.01)
 
 
+def finish(directory: str, status: int) -> int:
+    with open(os.path.join(directory, "status"), "w") as stream:
+        stream.write(f"{status}\n")
+    # The shell owner terminates its own group after status publication. The
+    # Python owner does the same so native transport completion stays 137.
+    os.killpg(os.getpgrp(), signal.SIGKILL)
+    return status
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("directory")
@@ -54,38 +53,29 @@ def main() -> int:
     args = parser.parse_args()
     if ctypes.CDLL(None, use_errno=True).prctl(PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) != 0:
         raise OSError(ctypes.get_errno(), "PR_SET_CHILD_SUBREAPER")
-    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    listener.bind(os.path.join(args.directory, "control"))
-    listener.listen(1)
-    publish(args.directory, "READY", "ready\n")
+    # The exec-replaced group leader inherited held FIFO FD 3 and its PGID.
+    control = 3
+    os.unlink(os.path.join(args.directory, "status"))
     try:
         child = subprocess.Popen(["/bin/sh", "-c", args.command], start_new_session=True)
     except OSError as exc:
-        print("episode launch failed: {}".format(exc), file=sys.stderr, flush=True)
+        print(f"episode launch failed: {exc}", file=sys.stderr, flush=True)
         drain(None)
-        publish(args.directory, "DRAINED", "drained\n")
-        return 127
+        return finish(args.directory, 127)
     while True:
-        status = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
-        if status is not None:
+        exited = os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG)
+        if exited is not None:
             drain(child)
             returncode = child.wait()
             code = returncode if returncode >= 0 else 128 - returncode
-            publish(args.directory, "DRAINED", "drained\n")
-            return code
-        readable, _, _ = select.select([listener], [], [], 0.05)
-        if readable:
-            connection, _ = listener.accept()
-            with connection:
-                if connection.recv(4) == b"STOP":
-                    if os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT | os.WNOHANG) is None:
-                        os.kill(child.pid, signal.SIGKILL)
-                        os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
-                    drain(child)
-                    child.wait()
-                    publish(args.directory, "DRAINED", "drained\n")
-                    connection.sendall(b"DRAINED")
-                    return 137
+            return finish(args.directory, code)
+        readable, _, _ = select.select([control], [], [], 0.05)
+        if readable and os.read(control, 4096):
+            os.kill(child.pid, signal.SIGKILL)
+            os.waitid(os.P_PID, child.pid, os.WEXITED | os.WNOWAIT)
+            drain(child)
+            child.wait()
+            return finish(args.directory, 137)
 
 
 if __name__ == "__main__":

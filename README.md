@@ -280,9 +280,13 @@ An opt-in episode declares
 It requires `credited_generation` with `stage_protocol="valkyrie-stage/1"`; without an episode,
 Tracker runs the agent command directly. In a `linux_process_group` sandbox, the image must
 provide Python 3.8+ as `python3` on `PATH` for the CBS-owned episode supervisor; the benchmark
-orchestrator owns its command and interpreter. Native Daytona cgroup episodes run
-inside a dedicated cgroup v2 subgroup. Tracker runs the benchmark-owned `episode.command`
-in place of the agent command and writes the selected agent bundle to
+orchestrator owns its command and interpreter. CBS uploads the supervisor before constructing
+the native workload. A single process-group leader publishes a FIFO and PGID, then replaces
+itself with the Python subreaper. An episode stop waits for that owner to drain its adopted
+descendants and publish a numeric status; a missing status after launch is not confirmation.
+Native Daytona cgroup episodes run inside a dedicated cgroup v2 subgroup. Tracker runs the
+benchmark-owned `episode.command` in place of the agent command and writes the selected agent
+bundle to
 `$VALKYRIE_STAGE_DIR/agent.json` after setup: `run_cmd`, `continue_cmd`, `interrupt_grace_seconds`,
 `container_name`, `final_output`, `parallel_agents`, and `slots_root`. The library owns a single `StageReporter`
 and starts each selected-agent turn in a new process group. The bundle renders `{problem_statement_path}` to that turn's
@@ -322,10 +326,11 @@ result = agents.stop("first")  # SIGINT grace (or immediate SIGKILL for null), t
 
 `start` reports BEGIN and waits for ACK before spawning the first slot; the last slot completes only after its
 process group is empty, any named Docker container has been removed and listed absent, and END is ACKed. Overlapping
-slots count as one union interval. `stop` returns reason `stopped`; `wait_any` returns `exited` or `exhausted` as
-appropriate. Tracker writes `$VALKYRIE_STAGE_DIR/exhausted` before its ACK when the shared budget expires. The
-library kills all running groups, completes their cleanup and END, and later `start` raises `Exhausted`. If the
-notice arrives with BEGIN ACK, no child starts and no END is sent.
+slots count as one union interval. `stop` returns `stopped` when it stops an active slot, `exited` if collection
+already found natural completion, or `exhausted` if the shared limit won. `wait_any` returns `exited` or
+`exhausted` as appropriate. Tracker writes `$VALKYRIE_STAGE_DIR/exhausted` before its ACK when the shared
+budget expires. The library kills all running groups, completes their cleanup and END, and later `start` raises
+`Exhausted`. If the notice arrives with BEGIN ACK, no child starts and no END is sent.
 
 For every task, check `sandbox.generation_containment` and run
 `await sandbox.probe_generation_containment()` before starting a controlled workload. An advertised
@@ -354,9 +359,10 @@ and proc visibility before launch.
 Native Modal and local Docker also advertise `linux_process_group` v1, probe the same group
 boundary, and run controlled commands through their own provider process transports. Stop
 targets the workload group, not the reusable Modal sandbox (including the selected VM runtime)
-or local Docker task container. Confirmation covers live members of the marked process group
-in the same PID namespace; it does not cover independently detached processes or
-Docker-daemon-owned descendants.
+or local Docker task container. For ordinary controlled commands, confirmation covers live
+members of the marked process group in the same PID namespace, not independently detached
+processes. For supervised process-group episodes, the subreaper also drains adopted
+descendants before confirmation; Docker-daemon-owned descendants remain outside that boundary.
 
 Consume `workload.output()` for streamed text. `await workload.wait()` returns
 `ControlledWorkloadResult(result=ExecResult(exit_code, output), absence_confirmed_at=...)`
@@ -365,8 +371,8 @@ after its backend-specific stop boundary is confirmed. On a deadline or other ab
 cannot be confirmed. The timestamp is event-loop monotonic time, not a wall-clock
 datetime. The caller owns deadline arbitration and must not proceed to independent
 collection on unconfirmed stop. Ordinary `Sandbox.command()` and `Sandbox.exec()`
-do not provide this contract. On native Modal and local Docker, `result.output` is a bounded
-tail; consume `workload.output()` while running for the full stream.
+do not provide this contract. On Daytona, native Modal, and local Docker, `result.output` is a bounded
+tail (at most 64 KiB of UTF-8 bytes for Daytona); consume `workload.output()` while running for the full stream.
 For process-group backends (Compose, native Modal, and local Docker), a waiting shell's synthetic signal-exit notice is excluded from controlled output while the workload's actual stderr is preserved.
 Local Docker decodes UTF-8 independently for stdout and stderr; their relative ordering
 is not guaranteed.

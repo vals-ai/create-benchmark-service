@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import shlex
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -126,9 +127,9 @@ def _record_control_dirs(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     observed: list[str] = []
     original = docker.stop_command
 
-    def record(group_id: int, control_dir: str) -> str:
+    def record(control_dir: str, *, episode_owner: bool) -> str:
         observed.append(control_dir)
-        return original(group_id, control_dir)
+        return original(control_dir, episode_owner=episode_owner)
 
     monkeypatch.setattr(docker, "stop_command", record)
     return observed
@@ -316,17 +317,51 @@ async def test_controlled_kill_before_output_stops_group_but_keeps_container(tmp
             await reader
 
 
-async def test_controlled_wait_cancellation_does_not_cancel_command() -> None:
+async def test_controlled_wait_cancellation_does_not_cancel_command(tmp_path: Path) -> None:
     sandbox = await _sandbox(_LocalContainer())
-    workload = sandbox.controlled_workload('sleep 0.2; printf %s "$CUSTOM"', env_vars={"CUSTOM": "ok"})
-    pending = asyncio.create_task(workload.wait())
-    pending.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await pending
-    result = await asyncio.wait_for(workload.wait(), timeout=3)
-    assert result.result.exit_code == 0
-    assert result.result.output == "ok"
-    assert "".join([chunk async for chunk in workload.output()]) == "ok"
+    release = tmp_path / "release"
+    os.mkfifo(release)
+    workload = sandbox.controlled_workload(
+        f"exec 5<> {shlex.quote(str(release))}; printf ready; read line <&5; exec 5>&-; printf %s \"$CUSTOM\"",
+        env_vars={"CUSTOM": "ok"},
+    )
+    try:
+        stream = workload.output()
+        assert await asyncio.wait_for(anext(stream), timeout=3) == "ready"
+        entered = asyncio.Event()
+
+        async def wait_for_result():
+            entered.set()
+            return await workload.wait()
+
+        pending = asyncio.create_task(wait_for_result())
+        try:
+            await asyncio.wait_for(entered.wait(), timeout=3)
+            assert not pending.done()
+            pending.cancel()
+            done, _ = await asyncio.wait({pending}, timeout=3)
+            assert pending in done
+            with pytest.raises(asyncio.CancelledError):
+                await pending
+
+            with release.open("r+b", buffering=0) as gate:
+                gate.write(b"release\n")
+
+            result = await asyncio.wait_for(workload.wait(), timeout=3)
+            assert result.result.exit_code == 0
+            assert result.result.output == "readyok"
+            assert "".join([chunk async for chunk in stream]) == "ok"
+        finally:
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+    finally:
+        try:
+            await asyncio.wait_for(workload.kill(), timeout=3)
+        finally:
+            try:
+                await asyncio.wait_for(asyncio.gather(workload.wait(), return_exceptions=True), timeout=3)
+            finally:
+                await stream.aclose()
 
 
 async def test_controlled_result_tail_is_finite_without_output_consumer() -> None:
@@ -358,12 +393,12 @@ async def test_controlled_launch_failure_wakes_output_reader(monkeypatch: pytest
 async def test_controlled_unconfirmed_group_absence_is_error(monkeypatch: pytest.MonkeyPatch) -> None:
     container = _LocalContainer()
     sandbox = await _sandbox(container)
-    confirmations: list[tuple[int, str]] = []
+    confirmations: list[str] = []
     workload = sandbox.controlled_workload("sleep 2")
     from benchmark_service.sandbox.local import docker
 
-    def fail_confirmation(group_id: int, control_dir: str) -> str:
-        confirmations.append((group_id, control_dir))
+    def fail_confirmation(control_dir: str, *, episode_owner: bool) -> str:
+        confirmations.append(control_dir)
         return "exit 1"
 
     monkeypatch.setattr(docker, "stop_command", fail_confirmation)
@@ -371,8 +406,8 @@ async def test_controlled_unconfirmed_group_absence_is_error(monkeypatch: pytest
         with pytest.raises(SandboxError, match="process group did not stop"):
             await asyncio.wait_for(workload.kill(), timeout=3)
     finally:
-        group_id, control_dir = confirmations[-1]
-        confirmed = await sandbox.exec(stop_command(group_id, control_dir))
+        control_dir = confirmations[-1]
+        confirmed = await sandbox.exec(stop_command(control_dir, episode_owner=False))
         assert confirmed.exit_code == 0
         try:
             with pytest.raises(SandboxError, match="process group did not stop"):

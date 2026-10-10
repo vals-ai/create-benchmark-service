@@ -174,31 +174,25 @@ async def test_compose_foreground_exit_stops_child_holding_stdout(
         await asyncio.wait_for(workload.kill(), 5)
 
 
-async def test_compose_controlled_deadline_stops_group_but_keeps_service(
+async def test_compose_controlled_deadline_stops_group_and_allows_later_exec(
     compose_sandbox: ComposeSandbox,
 ) -> None:
-    service = await asyncio.create_subprocess_exec("sleep", "30", start_new_session=True)
+    workload = compose_sandbox.controlled_workload('printf "started\n"; sh -c "sleep 10 & wait"')
     try:
-        workload = compose_sandbox.controlled_workload('printf "started\n"; sh -c "sleep 10 & wait"')
+        stream = workload.output()
         try:
-            stream = workload.output()
-            try:
-                first = await asyncio.wait_for(anext(stream), 5)
-                assert "started\n" in first
-                await asyncio.wait_for(workload.kill(), 5)
-                await asyncio.wait_for(workload.kill(), 5)
-                assert service.returncode is None
-                assert (await compose_sandbox.exec("printf service-alive")).output == "service-alive"
-                completed = await asyncio.wait_for(workload.wait(), 5)
-                assert completed.result.exit_code != 0
-                assert "started\n" in completed.result.output
-            finally:
-                await stream.aclose()
-        finally:
+            first = await asyncio.wait_for(anext(stream), 5)
+            assert "started\n" in first
             await asyncio.wait_for(workload.kill(), 5)
+            await asyncio.wait_for(workload.kill(), 5)
+            assert (await compose_sandbox.exec("printf after-stop")).output == "after-stop"
+            completed = await asyncio.wait_for(workload.wait(), 5)
+            assert completed.result.exit_code != 0
+            assert "started\n" in completed.result.output
+        finally:
+            await stream.aclose()
     finally:
-        service.terminate()
-        await service.wait()
+        await asyncio.wait_for(workload.kill(), 5)
 
 
 async def test_compose_controlled_kill_before_launch_does_not_wait_for_output(

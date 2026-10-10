@@ -31,15 +31,43 @@ def owner_command(command: str, control_dir: str, shell: str) -> str:
     return f"exec 4>&2 2>/dev/null; ( exec setsid sh -c {shlex.quote(script)} 2>&4 4>&- ); exit $?"
 
 
-def stop_command(group_id: int, control_dir: str) -> str:
+def episode_owner_command(command: str, control_dir: str, uploaded_script: str) -> str:
     directory = shlex.quote(control_dir)
+    launch = shlex.join(["python3", uploaded_script, control_dir, command])
+    # The one group leader is a shell only until exec replaces it with Python.
+    # PRELAUNCH is removed before Popen eligibility; it is never a drain proof.
+    script = (
+        f"umask 077; mkdir {directory} || exit 1\n"
+        f"mkfifo {directory}/stop || exit 1\n"
+        f"exec 3<>{directory}/stop || exit 1\n"
+        f"printf 'PRELAUNCH\n' > {directory}/status || exit 1\n"
+        f"printf '%s\n' $$ > {directory}/pgid || exit 1\n"
+        f"exec {launch}"
+    )
+    # Preserve workload stderr, suppressing only the waiting shell's kill notice.
+    return f"exec 4>&2 2>/dev/null; ( exec setsid sh -c {shlex.quote(script)} 2>&4 4>&- ); exit $?"
+
+
+def stop_command(control_dir: str, *, episode_owner: bool) -> str:
+    directory = shlex.quote(control_dir)
+    proof = (
+        f'if [ ! -s {directory}/status ]; then exit 76; fi\n'
+        f'IFS= read -r state < {directory}/status || exit 76\n'
+        f'if [ "$state" != PRELAUNCH ]; then cat {directory}/status; fi'
+        if episode_owner else
+        f'if [ -s {directory}/status ]; then cat {directory}/status; fi'
+    )
+    wait_init = '' if episode_owner else 'n=0\n'
+    wait_limit = '' if episode_owner else '  n=$((n + 1))\n  [ "$n" -lt 20 ] || exit 1\n'
     return (
+        f'if [ ! -s {directory}/pgid ]; then exit 75; fi\n'
+        f'IFS= read -r group_id < {directory}/pgid || exit 1\n'
         "alive() {\n"
         "  for stat in /proc/[0-9]*/stat; do\n"
         '    IFS= read -r line 2>/dev/null < "$stat" || continue\n'
         '    fields=${line##*) }\n'
         '    set -- $fields\n'
-        f'    if [ "$3" = "{group_id}" ]; then\n'
+        '    if [ "$3" = "$group_id" ]; then\n'
         '      case "$1" in Z|X) ;; *) return 0 ;; esac\n'
         '    fi\n'
         '  done\n'
@@ -50,13 +78,12 @@ def stop_command(group_id: int, control_dir: str) -> str:
         "  printf 'stop\n' >&3 || exit 1\n"
         '  exec 3>&-\n'
         'fi\n'
-        'n=0\n'
-        'while alive; do\n'
-        '  n=$((n + 1))\n'
-        '  [ "$n" -lt 20 ] || exit 1\n'
-        '  sleep 0.05\n'
+        + wait_init
+        + 'while alive; do\n'
+        + wait_limit
+        + '  sleep 0.05\n'
         'done\n'
-        f'if [ -s {directory}/status ]; then cat {directory}/status; fi'
+        + proof
     )
 
 

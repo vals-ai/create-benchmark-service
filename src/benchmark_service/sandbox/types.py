@@ -342,6 +342,17 @@ class Sandbox(ABC):
         cwd: str | None = None,
         env_vars: Mapping[str, str] | None = None,
     ) -> ControlledWorkload:
+        return self._process_group_workload(command, None, cwd=cwd, env_vars=env_vars)
+
+    def _controlled_episode_workload(
+        self, command: str, script: str, *, cwd: str | None, env_vars: Mapping[str, str] | None
+    ) -> ControlledWorkload:
+        return self._process_group_workload(command, script, cwd=cwd, env_vars=env_vars)
+
+    def _process_group_workload(
+        self, command: str, episode_script: str | None, *, cwd: str | None,
+        env_vars: Mapping[str, str] | None
+    ) -> ControlledWorkload:
         raise ControlledWorkloadUnsupportedError(
             f"{type(self).__name__} does not support controlled generation workloads"
         )

@@ -22,7 +22,9 @@ from modal.exception import ResourceExhaustedError as ModalResourceExhaustedErro
 from pydantic import BaseModel
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
-from benchmark_service.sandbox._process_group import cleanup_command, owner_command, probe_command, stop_command
+from benchmark_service.sandbox._process_group import (
+    cleanup_command, episode_owner_command, owner_command, probe_command, stop_command,
+)
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
     ControlledWorkload,
@@ -223,11 +225,12 @@ class ModalSandbox(Sandbox):
         if result.exit_code != 0:
             raise SandboxError(f"Modal sandbox does not support process groups: {result.output}")
 
-    def controlled_workload(
-        self, command: str, *, cwd: str | None = None, env_vars: Mapping[str, str] | None = None
+    def _process_group_workload(
+        self, command: str, episode_script: str | None, *, cwd: str | None,
+        env_vars: Mapping[str, str] | None
     ) -> ControlledWorkload:
         return _ModalControlledWorkload(
-            self, command, cwd, validate_command_env(env_vars), self._start_controlled_process
+            self, command, cwd, validate_command_env(env_vars), self._start_controlled_process, episode_script
         )
 
     async def _start_controlled_process(
@@ -494,12 +497,14 @@ class _ModalControlledWorkload(ControlledWorkload):
         start_process: Callable[
             [str, dict[str, str]], Awaitable[tuple[AsyncIterable[str], Coroutine[Any, Any, int]]]
         ],
+        episode_script: str | None,
     ) -> None:
         self._sandbox = sandbox
         self._command = command
         self._cwd = cwd
         self._env_vars = env_vars
         self._start_process = start_process
+        self._episode_script = episode_script
         self._marker = f"/tmp/.cbs-controlled-{uuid.uuid4().hex}"
         self._output: asyncio.Queue[str] = asyncio.Queue()
         self._tail: deque[str] = deque()
@@ -514,7 +519,14 @@ class _ModalControlledWorkload(ControlledWorkload):
 
     async def _launch(self) -> None:
         command = f"cd {shlex.quote(self._cwd)} && {self._command}" if self._cwd else self._command
-        inner = owner_command(command, self._marker, "sh -lc")
+        # Modal exposes separate stdout/stderr pipes. Merge them before either
+        # owner; the shell owner saves FD 4 to suppress its own kill notice.
+        owner = (
+            episode_owner_command(command, self._marker, self._episode_script)
+            if self._episode_script is not None
+            else owner_command(command, self._marker, "sh -lc")
+        )
+        inner = f"exec 2>&1; {owner}"
         output, process_wait = await self._start_process(inner, self._env_vars)
         self._read_task = asyncio.create_task(self._read_output(output))
         self._process_wait_task = asyncio.create_task(process_wait)
@@ -587,24 +599,17 @@ class _ModalControlledWorkload(ControlledWorkload):
     async def _stop(self) -> tuple[float, int | None]:
         await self._launch_task
         assert self._process_wait_task is not None
-        marker_command = (
-            f"if test -s {shlex.quote(self._marker)}/pgid; then "
-            f"cat {shlex.quote(self._marker)}/pgid; else exit 75; fi"
-        )
+        command = stop_command(self._marker, episode_owner=self._episode_script is not None)
         while True:
-            marker = await self._sandbox.exec(marker_command)
-            if marker.exit_code == 0:
-                group_id = int(marker.output.strip())
+            stopped = await self._sandbox.exec(command)
+            if stopped.exit_code == 0:
                 break
-            if marker.exit_code != 75:
-                raise SandboxError(f"Modal controlled marker read failed: {marker.output}")
+            if stopped.exit_code != 75:
+                raise SandboxError(f"Modal process group did not stop: {stopped.output}")
             if self._process_wait_task.done():
                 await self._process_wait_task
                 raise SandboxError("Modal workload finished without a process-group marker")
             await asyncio.sleep(0.05)
-        stopped = await self._sandbox.exec(stop_command(group_id, self._marker))
-        if stopped.exit_code != 0:
-            raise SandboxError(f"Modal process group did not stop: {stopped.output}")
         self._cleanup_task = asyncio.create_task(self._cleanup())
         return asyncio.get_running_loop().time(), int(stopped.output.strip()) if stopped.output.strip() else None
 

@@ -5003,6 +5003,40 @@ async def test_daytona_native_shell_preserves_cwd_env_and_exit(tmp_path: Path) -
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
+async def test_daytona_native_command_gets_stdin_eof_with_parent_pipe_open(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process = LocalNativeShellCgroupProcess(tmp_path)
+    read_fd, write_fd = os.pipe()
+    create_subprocess_exec = asyncio.create_subprocess_exec
+    executed: list[str] = []
+
+    async def spawn_with_parent_pipe(*args: str, **kwargs: Any) -> asyncio.subprocess.Process:
+        executed.append(args[2])
+        # Noninteractive /bin/sh otherwise substitutes /dev/null for background stdin.
+        return await create_subprocess_exec(*args[:2], f"set -m; {args[2]}", stdin=read_fd, **kwargs)
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(asyncio, "create_subprocess_exec", spawn_with_parent_pipe)
+            workload = _cgroup_sandbox(process).controlled_workload(
+                'if IFS= read -r line; then printf "unexpected input\n"; else printf "stdin-eof\n"; fi'
+            )
+            completed = await asyncio.wait_for(workload.wait(), 5)
+        assert executed == [process.command.replace(
+            process.remote_group, str(process.group),
+        ).replace(daytona_module._STATUS_DIR, str(process.status))]  # pyright: ignore[reportPrivateUsage]
+        assert completed.result.exit_code == 0
+        assert completed.result.output == "stdin-eof\n"
+        assert process.execute_calls == 1
+    finally:
+        os.close(read_fd)
+        os.close(write_fd)
+        if hasattr(process, "worker"):
+            await asyncio.wait_for(process.worker.wait(), 5)
+
+
+@pytest.mark.usefixtures("_fake_cgroup_follow")
 async def test_daytona_natural_completion_fences_group_before_release_and_final_output() -> None:
     process = CgroupProcess()
     process.allow_creation.set()

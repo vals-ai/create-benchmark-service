@@ -1224,7 +1224,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         payload = f"env {assignments} sh -c {shlex.quote(command)}"
         child = f"echo $$ > {shlex.quote(self._group)}/cgroup.procs || exit 1; {payload}"
         self._command = (
-            f"sh -c {shlex.quote(child)} & child=$!; wait \"$child\"; code=$?; "
+            f"exec </dev/null; sh -c {shlex.quote(child)} & child=$!; wait \"$child\"; code=$?; "
             f": > {shlex.quote(self._complete)} || exit 1; "
             f"while ! test -e {shlex.quote(self._release)}; do sleep 0.05; done; (exit \"$code\")"
         )

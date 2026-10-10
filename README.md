@@ -335,7 +335,8 @@ raise rather than silently falling back to an ordinary command.
 A direct Daytona sandbox supports `LINUX_CGROUP_V2_V1` (`linux_cgroup_v2` v1).
 `sandbox.controlled_workload(command, cwd=..., env_vars=...)` launches one native
 asynchronous Daytona session command whose child enters a dedicated cgroup v2
-subgroup. The shell stays outside the subgroup and publishes completion before
+subgroup. Its stdin is `/dev/null`, so noninteractive readers see EOF at launch.
+The shell stays outside the subgroup and publishes completion before
 release, so descendants are fenced before the native exit status and final output
 are returned. Natural completion and `kill()` use `cgroup.kill`, confirm
 `populated 0`, and remove the subgroup; the native session is also confirmed absent.

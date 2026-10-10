@@ -23,7 +23,7 @@ from pydantic import BaseModel
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
 from benchmark_service.sandbox._process_group import (
-    cleanup_command, owner_command, probe_command, stop_command,
+    cleanup_command, episode_owner_command, owner_command, probe_command, stop_command,
 )
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
@@ -182,11 +182,11 @@ class ModalSandbox(Sandbox):
             raise SandboxError(f"Modal sandbox does not support process groups: {result.output}")
 
     def _process_group_workload(
-        self, command: str, *, cwd: str | None,
+        self, command: str, episode_script: str | None, *, cwd: str | None,
         env_vars: Mapping[str, str] | None
     ) -> ControlledWorkload:
         return _ModalControlledWorkload(
-            self, command, cwd, validate_command_env(env_vars), self._start_controlled_process
+            self, command, cwd, validate_command_env(env_vars), self._start_controlled_process, episode_script
         )
 
     async def _start_controlled_process(
@@ -453,12 +453,14 @@ class _ModalControlledWorkload(ControlledWorkload):
         start_process: Callable[
             [str, dict[str, str]], Awaitable[tuple[AsyncIterable[str], Coroutine[Any, Any, int]]]
         ],
+        episode_script: str | None,
     ) -> None:
         self._sandbox = sandbox
         self._command = command
         self._cwd = cwd
         self._env_vars = env_vars
         self._start_process = start_process
+        self._episode_script = episode_script
         self._marker = f"/tmp/.cbs-controlled-{uuid.uuid4().hex}"
         self._output: asyncio.Queue[str] = asyncio.Queue()
         self._tail: deque[str] = deque()
@@ -475,7 +477,11 @@ class _ModalControlledWorkload(ControlledWorkload):
         command = f"cd {shlex.quote(self._cwd)} && {self._command}" if self._cwd else self._command
         # Modal exposes separate stdout/stderr pipes. Merge them before either
         # owner; the shell owner saves FD 4 to suppress its own kill notice.
-        owner = owner_command(command, self._marker, "sh -lc")
+        owner = (
+            episode_owner_command(command, self._marker, self._episode_script)
+            if self._episode_script is not None
+            else owner_command(command, self._marker, "sh -lc")
+        )
         inner = f"exec 2>&1; {owner}"
         output, process_wait = await self._start_process(inner, self._env_vars)
         self._read_task = asyncio.create_task(self._read_output(output))
@@ -549,7 +555,7 @@ class _ModalControlledWorkload(ControlledWorkload):
     async def _stop(self) -> tuple[float, int | None]:
         await self._launch_task
         assert self._process_wait_task is not None
-        command = stop_command(self._marker)
+        command = stop_command(self._marker, episode_owner=self._episode_script is not None)
         while True:
             stopped = await self._sandbox.exec(command)
             if stopped.exit_code == 0:

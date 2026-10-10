@@ -28,7 +28,7 @@ from aiohttp import ClientError
 from pydantic import AliasPath, BaseModel, Field
 
 from benchmark_service.sandbox._process_group import (
-    cleanup_command, owner_command, probe_command, stop_command,
+    cleanup_command, episode_owner_command, owner_command, probe_command, stop_command,
 )
 from benchmark_service.sandbox.types import (
     ControlledWorkload,
@@ -126,12 +126,12 @@ class DockerSandbox(Sandbox):
             raise SandboxError(f"Docker container does not support process groups: {result.output}")
 
     def _process_group_workload(
-        self, command: str, *, cwd: str | None,
+        self, command: str, episode_script: str | None, *, cwd: str | None,
         env_vars: Mapping[str, str] | None
     ) -> ControlledWorkload:
         return _DockerControlledWorkload(
             self._container, self._raise_if_finished, command, cwd,
-            validate_command_env(env_vars)
+            validate_command_env(env_vars), episode_script
         )
 
     async def _raise_if_finished(self) -> None:
@@ -285,12 +285,14 @@ class _DockerControlledWorkload(ControlledWorkload):
         command: str,
         cwd: str | None,
         env_vars: dict[str, str],
+        episode_script: str | None,
     ) -> None:
         self._container = container
         self._raise_if_finished = raise_if_finished
         self._command = command
         self._cwd = cwd
         self._env_vars = env_vars
+        self._episode_script = episode_script
         self._marker = f"/tmp/.cbs-controlled-{uuid4().hex}"
         self._started = asyncio.Event()
         self._status_done = asyncio.Event()
@@ -347,7 +349,11 @@ class _DockerControlledWorkload(ControlledWorkload):
         return exit_code
 
     async def _run(self) -> ControlledWorkloadResult:
-        script = owner_command(self._command, self._marker, "/bin/sh -c")
+        script = (
+            episode_owner_command(self._command, self._marker, self._episode_script)
+            if self._episode_script is not None
+            else owner_command(self._command, self._marker, "/bin/sh -c")
+        )
         with _docker_errors():
             try:
                 execution = await self._container.exec(
@@ -420,7 +426,7 @@ class _DockerControlledWorkload(ControlledWorkload):
         if self._execution is None:
             await self._result_task
             raise SandboxError("Docker controlled command did not start")
-        command = stop_command(self._marker)
+        command = stop_command(self._marker, episode_owner=self._episode_script is not None)
         while True:
             stopped = await self._control_exec(command)
             if stopped.exit_code == 0:

@@ -90,7 +90,6 @@ class Agents:
         self._active: dict[str, _RunningSlot] = {}
         self._turns: dict[str, int] = {}
         self._finished: deque[SlotResult] = deque()
-        self._exhausted = False
 
     def start(self, slot: str, observation_path: str) -> None:
         with self._lock:
@@ -98,7 +97,8 @@ class Agents:
 
     def _start(self, slot: str, observation_path: str) -> None:
         self._collect()
-        if self._exhausted:
+        if (self._stage_dir / "exhausted").exists():
+            self._exhaust_all()
             raise Exhausted
         if slot in self._active:
             raise ValueError(f"slot {slot!r} is already running")
@@ -130,7 +130,6 @@ class Agents:
         if not self._active:
             self._reporter.begin(container)
             if (self._stage_dir / "exhausted").exists():
-                self._exhausted = True
                 raise Exhausted
         generation_gateway_url = os.environ.get("VALKYRIE_GENERATION_MODEL_GATEWAY_URL")
         child_env = None
@@ -146,9 +145,10 @@ class Agents:
             return self._stop(slot)
 
     def _stop(self, slot: str) -> SlotResult:
+        active_at_entry = slot in self._active
         self._collect()
         if slot not in self._active:
-            return self._take(slot)
+            return self._take(slot, active_at_entry)
         running = self._active[slot]
         if self._interrupt_grace_seconds is not None:
             self._signal_group(running.process.pid, signal.SIGINT)
@@ -159,10 +159,10 @@ class Agents:
                     break
                 if (self._stage_dir / "exhausted").exists():
                     self._exhaust_all()
-                    return self._take(slot)
+                    return self._take(slot, active_at_entry)
                 time.sleep(0.1)
         self._complete(slot, "stopped")
-        return self._take(slot)
+        return self._take(slot, active_at_entry)
 
     def wait_any(self) -> SlotResult:
         while True:
@@ -186,7 +186,6 @@ class Agents:
         return os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
 
     def _exhaust_all(self) -> None:
-        self._exhausted = True
         for running in self._active.values():
             self._signal_group(running.process.pid, signal.SIGKILL)
         for slot in list(self._active):
@@ -241,8 +240,6 @@ class Agents:
         del self._active[slot]
         if not self._active:
             self._reporter.end()
-            if (self._stage_dir / "exhausted").exists():
-                self._exhausted = True
 
         if running.final_output is not None and running.final_output.exists():
             turn_dir = self._slots_root / slot / "turns" / str(self._turns[slot])
@@ -254,10 +251,12 @@ class Agents:
                 shutil.copy2(running.final_output, turn_dir / running.final_output.name)
         self._finished.append(SlotResult(slot, reason, exit_code))
 
-    def _take(self, slot: str) -> SlotResult:
-        for result in self._finished:
+    def _take(self, slot: str, newest: bool) -> SlotResult:
+        indices = range(len(self._finished) - 1, -1, -1) if newest else range(len(self._finished))
+        for index in indices:
+            result = self._finished[index]
             if result.slot == slot:
-                self._finished.remove(result)
+                del self._finished[index]
                 return result
         raise ValueError(f"slot {slot!r} has no completed turn")
 

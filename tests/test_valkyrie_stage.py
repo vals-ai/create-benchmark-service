@@ -231,6 +231,131 @@ def test_parallel_exhaustion_and_graceful_stop(tmp_path: Path, monkeypatch: pyte
                 worker.stop(slot)
 
 
+def _wait_for_exit(process: subprocess.Popen[bytes]) -> None:
+    deadline = time.monotonic() + 5
+    while os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+
+
+@pytest.mark.parametrize(
+    ("mode", "expected"),
+    [
+        ("live", valkyrie_stage.SlotResult("one", "stopped", -9)),
+        ("exited", valkyrie_stage.SlotResult("one", "exited", 22)),
+        ("exhausted", valkyrie_stage.SlotResult("one", "exhausted", -9)),
+        ("grace_exhausted", valkyrie_stage.SlotResult("one", "exhausted", -9)),
+    ],
+)
+def test_stop_returns_current_turn_without_consuming_older_completion(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str, expected: valkyrie_stage.SlotResult
+) -> None:
+    ready = tmp_path / "slots" / "one" / "agent" / "ready"
+    command = "exit 22" if mode == "exited" else f"trap '' INT; touch {shlex.quote(str(ready))}; exec sleep 30"
+    worker, _ = agents(
+        tmp_path,
+        monkeypatch,
+        run_cmd="exit 11",
+        continue_cmd=command,
+        interrupt_grace_seconds=1.0 if mode == "grace_exhausted" else None,
+    )
+    worker.start("one", "observation")
+    _wait_for_exit(worker._active["one"].process)
+    worker.start("one", "observation")
+    try:
+        if mode != "exited":
+            deadline = time.monotonic() + 5
+            while not ready.exists():
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+        if mode == "exited":
+            _wait_for_exit(worker._active["one"].process)
+        elif mode == "exhausted":
+            (tmp_path / "stage" / "exhausted").touch()
+        elif mode == "grace_exhausted":
+            signal_group = worker._signal_group
+
+            def exhaust_during_grace(pid: int, sig: signal.Signals) -> None:
+                signal_group(pid, sig)
+                if sig == signal.SIGINT:
+                    (tmp_path / "stage" / "exhausted").touch()
+
+            monkeypatch.setattr(worker, "_signal_group", exhaust_during_grace)
+        result = worker.stop("one")
+        assert result == expected
+        assert worker.wait_any() == valkyrie_stage.SlotResult("one", "exited", 11)
+    finally:
+        if "one" in worker._active:
+            worker.stop("one")
+
+
+def test_stop_selects_current_turn_when_outcomes_are_equal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    worker, _ = agents(tmp_path, monkeypatch, run_cmd="exit 11", continue_cmd="exit 11")
+    worker.start("one", "observation")
+    _wait_for_exit(worker._active["one"].process)
+    worker.start("one", "observation")
+    older = worker._finished[0]
+    _wait_for_exit(worker._active["one"].process)
+    current = worker.stop("one")
+    assert current == older
+    assert current is not older
+    assert worker.wait_any() is older
+
+
+def test_stop_of_inactive_slot_preserves_fifo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    worker, _ = agents(tmp_path, monkeypatch, run_cmd="exit 11", continue_cmd="exit 22")
+    worker.start("one", "observation")
+    _wait_for_exit(worker._active["one"].process)
+    worker.start("one", "observation")
+    _wait_for_exit(worker._active["one"].process)
+    worker._collect()
+    assert worker.stop("one") == valkyrie_stage.SlotResult("one", "exited", 11)
+    assert worker.wait_any() == valkyrie_stage.SlotResult("one", "exited", 22)
+
+
+def test_start_exhausts_active_group_when_marker_arrives_after_collection(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ready = tmp_path / "slots" / "one" / "agent" / "ready"
+    worker, reporter = agents(tmp_path, monkeypatch, run_cmd=f"touch {shlex.quote(str(ready))}; exec sleep 30")
+    worker.start("one", "observation")
+    process = worker._active["one"].process
+    try:
+        libc = ctypes.CDLL(None, use_errno=True)
+        leader_fd = libc.pidfd_open(process.pid, 0)
+        if leader_fd == -1:
+            raise OSError(ctypes.get_errno(), "pidfd_open")
+        try:
+            deadline = time.monotonic() + 5
+            while not ready.exists():
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+            collect = worker._collect
+
+            def collect_then_exhaust() -> None:
+                collect()
+                (tmp_path / "stage" / "exhausted").touch()
+
+            with monkeypatch.context() as patch:
+                patch.setattr(worker, "_collect", collect_then_exhaust)
+                with pytest.raises(valkyrie_stage.Exhausted):
+                    worker.start("two", "observation")
+            assert process.returncode == -9
+            assert libc.pidfd_send_signal(leader_fd, 0, None, 0) == -1
+            assert ctypes.get_errno() == errno.ESRCH
+            assert reporter.events == [("begin", None), ("end", None)]
+            assert worker.wait_any() == valkyrie_stage.SlotResult("one", "exhausted", -9)
+        finally:
+            os.close(leader_fd)
+    finally:
+        owned_processes = {process}
+        owned_processes.update(running.process for running in worker._active.values())
+        for owned in owned_processes:
+            owned.kill()
+        for owned in owned_processes:
+            owned.wait()
+
+
 def test_generation_children_use_generation_gateway_while_evaluation_uses_native(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

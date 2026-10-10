@@ -196,6 +196,13 @@ class BenchmarkEgressPlan(BaseModel):
     evaluation: EgressPolicy = "*"
 
 
+class CreditedGeneration(BaseModel):
+    """Tracker-owned generation allowance and optional stage reporting protocol."""
+
+    allowance_seconds: float = Field(gt=0, allow_inf_nan=False)
+    stage_protocol: Literal["valkyrie-stage/1"] | None
+
+
 class RetrieveTaskResponse(BaseModel):
     """
     Response containing task metadata and setup requirements.
@@ -211,6 +218,7 @@ class RetrieveTaskResponse(BaseModel):
     agent_timeout: float | None = Field(
         default=None, description="Agent execution max time in seconds (None for no timeout)"
     )
+    credited_generation: CreditedGeneration | None = None
     resources: Resources = Field(description="Computational resources needed")
     agent_install_order: AgentInstallOrder = Field(
         default="before_setup",

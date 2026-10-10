@@ -225,13 +225,11 @@ def _token_expiry(jwt_response: Mapping[str, Any]) -> float:
     expires_at = cast(Mapping[str, Any], session_token).get("exp") if isinstance(session_token, Mapping) else None
     if expires_at is None:
         expires_at = jwt_response.get("exp")
-    if isinstance(expires_at, bool) or not isinstance(expires_at, (int, float)):
-        return 0.0
     try:
-        expires_at = float(expires_at)
+        expiry = float(expires_at) if isinstance(expires_at, (int, float)) else 0.0
     except OverflowError:
-        return 0.0
-    return expires_at if math.isfinite(expires_at) else 0.0
+        expiry = 0.0
+    return expiry if math.isfinite(expiry) else 0.0
 
 
 @dataclass(frozen=True)
@@ -311,8 +309,7 @@ async def resolve_descope_tenant(headers: Mapping[str, str]) -> str | None:
             return None
 
     ttl = min(_auth_cache_ttl_seconds, _token_expiry(jwt_response) - time.time() - _TOKEN_EXPIRY_SKEW_SECONDS)
-    if ttl > 0:
-        _auth_cache[cache_key] = (tenant, time.monotonic() + ttl)
+    _auth_cache[cache_key] = (tenant, time.monotonic() + ttl)
     return tenant
 
 

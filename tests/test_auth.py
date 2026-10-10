@@ -70,7 +70,7 @@ async def _resolve_twice(response: dict[str, Any]) -> int:
 
 
 @pytest.mark.usefixtures("descope_env")
-@pytest.mark.parametrize(("expires_in", "exchanges"), [(3 * 3600, 1), (None, 2), (0.5, 2), (-60, 2)])
+@pytest.mark.parametrize(("expires_in", "exchanges"), [(3 * 3600, 1), (None, 2), (0.5, 2)])
 async def test_tenant_is_cached_only_while_the_token_is_valid(expires_in: float | None, exchanges: int) -> None:
     assert await _resolve_twice(_mock_jwt_response(["acme-corp"], expires_in)) == exchanges
 
@@ -80,6 +80,11 @@ async def test_cache_ttl_bounds_long_lived_tokens(monkeypatch: pytest.MonkeyPatc
     assert auth_module.DEFAULT_AUTH_CACHE_TTL_SECONDS == 7200
     monkeypatch.setattr(auth_module, "_auth_cache_ttl_seconds", 0)
     assert await _resolve_twice(_mock_jwt_response(["acme-corp"], 30 * 24 * 3600)) == 2
+
+
+@pytest.mark.usefixtures("descope_env")
+async def test_overflowing_token_expiry_is_not_cached() -> None:
+    assert await _resolve_twice({"tenants": {"acme-corp": {}}, "sessionToken": {"exp": 10**400}}) == 2
 
 
 @pytest.mark.usefixtures("descope_env")

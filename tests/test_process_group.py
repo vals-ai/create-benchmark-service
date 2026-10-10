@@ -36,7 +36,7 @@ async def _finish_owned_process(process: asyncio.subprocess.Process, control: Pa
                 await asyncio.sleep(0.01)
         if published.endswith('\n'):
             group_id = int(published)
-            stop = await asyncio.create_subprocess_exec('/bin/sh', '-c', stop_command(str(control)))
+            stop = await asyncio.create_subprocess_exec('/bin/sh', '-c', stop_command(str(control), episode_owner=False))
             assert await asyncio.wait_for(stop.wait(), 5) == 0
             stopped = True
     finally:
@@ -66,7 +66,7 @@ async def _finish_owned_process(process: asyncio.subprocess.Process, control: Pa
 
 async def test_stop_requires_published_marker(tmp_path: Path) -> None:
     stop = await asyncio.create_subprocess_exec(
-        "/bin/sh", "-c", stop_command(str(tmp_path / "not-admitted")),
+        "/bin/sh", "-c", stop_command(str(tmp_path / "not-admitted"), episode_owner=False),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
     )
     output, _ = await asyncio.wait_for(stop.communicate(), 5)
@@ -101,7 +101,7 @@ async def test_probe_and_stop_negative_process_group(tmp_path: Path, session_lea
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(process.wait(), 0.05)
         stop = await asyncio.create_subprocess_exec(
-            str(shell), "-c", stop_command(str(control)),
+            str(shell), "-c", stop_command(str(control), episode_owner=False),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         )
         output, _ = await asyncio.wait_for(stop.communicate(), 5)
@@ -133,7 +133,7 @@ async def test_natural_owner_preserves_foreground_stdin_status_and_output(
         assert output == b"got:hello\n"
         assert process.returncode != 0
         completed = await asyncio.create_subprocess_exec(
-            "/bin/sh", "-c", stop_command(str(control)),
+            "/bin/sh", "-c", stop_command(str(control), episode_owner=False),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         )
         status, _ = await asyncio.wait_for(completed.communicate(), 5)
@@ -164,7 +164,7 @@ async def test_failed_assertion_cleanup_spares_unrelated_sibling(tmp_path: Path)
                     assert False, "intentional"
             finally:
                 cleanup = await asyncio.create_subprocess_exec(
-                    "/bin/sh", "-c", stop_command(str(control)),
+                    "/bin/sh", "-c", stop_command(str(control), episode_owner=False),
                 )
                 assert await asyncio.wait_for(cleanup.wait(), 5) == 0
             owned_stat = Path(f"/proc/{owned_pid}/stat")

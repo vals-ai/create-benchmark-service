@@ -230,12 +230,14 @@ eligibility uses the base clock; failure of an eligible counter read does not si
 Without a base allowance, optional accounting credit does not create a generation deadline.
 
 When an explicit finite credited allowance selects `stage_protocol="valkyrie-stage/1"`, Tracker
-gives the outer controlled agent command `VALKYRIE_STAGE_DIR=/run/valkyrie-stage`. The sandbox-private directory contains a 64-hex-character
+gives the outer controlled workload (agent command or episode orchestrator) `VALKYRIE_STAGE_DIR=/run/valkyrie-stage`. The sandbox-private directory contains a 64-hex-character
 `key` and an initially empty `ack/` directory. During `setup_task`, upload the bytes from
 `benchmark_service.valkyrie_stage_source()` as `valkyrie_stage.py` and import `StageReporter`
-from that standalone file inside the benchmark-owned agent command. The benchmark owns stage
+from that standalone file inside the benchmark-owned supervisor. The supervisor owns stage
 reporting: BEGIN precedes model-capable execution, and END follows confirmed absence. Nested
-Docker workloads should not receive the reporter key or stage directory.
+Docker workloads should not receive the reporter key or stage directory. The `Agents` helper
+copies the orchestrator environment into selected-agent child subprocesses, including
+`VALKYRIE_STAGE_DIR`; it does not isolate those children from the stage files.
 
 `StageReporter().begin(container)` flushes one stdout frame and blocks until Tracker ACKs,
 before launching that model-capable container. `end()` reports the same container only
@@ -273,6 +275,63 @@ On failure, do not assert an END without proof of absence. Tracker owns timeout 
 cleanup, including nested container inspection on abort. Neither model output nor benchmark
 code may assert a generation credit.
 
+An opt-in episode declares
+`RetrieveTaskResponse.episode = Episode(command="exec python /opt/bench/orchestrator.py", parallel_agents=5)`.
+It requires `credited_generation` with `stage_protocol="valkyrie-stage/1"`; without an episode,
+Tracker runs the agent command directly. In a `linux_process_group` sandbox, the image must
+provide Python 3.8+ as `python3` on `PATH` for the CBS-owned episode supervisor; the benchmark
+orchestrator owns its command and interpreter. CBS uploads the supervisor before constructing
+the native workload. A single process-group leader publishes a FIFO and PGID, then replaces
+itself with the Python subreaper. An episode stop waits for that owner to drain its adopted
+descendants and publish a numeric status; a missing status after launch is not confirmation.
+Native Daytona cgroup episodes run inside a dedicated cgroup v2 subgroup. Tracker runs the
+benchmark-owned `episode.command` in place of the agent command and writes the selected agent
+bundle to
+`$VALKYRIE_STAGE_DIR/agent.json` after setup: `run_cmd`, `continue_cmd`, `interrupt_grace_seconds`,
+`container_name`, `final_output`, `parallel_agents`, and `slots_root`. The library owns a single `StageReporter`
+and starts each selected-agent turn in a new process group. The bundle renders `{problem_statement_path}` to that turn's
+observation file and `{slot_dir}` to `<slots_root>/<slot>/agent`. When `container_name` is
+configured, `{container_name}` is bound to that template with `{slot}` filled first; otherwise
+it remains literal in the command. Other unbound tokens also remain literal. Bound token
+replacements insert values opaquely, including any braces they contain. In `final_output`,
+`{slot_dir}` is replaced for each
+configured path. The orchestrator names slots and shares one workspace and budget across
+multiple slots; each slot has separate
+runtime/session/output state. More than `parallel_agents` live turns are refused. A second turn on a slot requires
+`continue_cmd`. Children inherit the orchestrator's cwd, stdout and stderr. When
+`VALKYRIE_GENERATION_MODEL_GATEWAY_URL` is configured, `Agents` copies the environment for each
+selected-agent child and sets only its `MODEL_GATEWAY_URL` to that generation URL just before launch;
+the orchestrator and evaluation processes retain the native `MODEL_GATEWAY_URL`. Without the explicit
+generation URL, children inherit the native route. Custom staged orchestrators must likewise route
+generation clients and children through the explicit generation URL while preserving the native route
+for evaluation, including when generation and evaluation overlap. After a turn's
+process group and any container are absent, the last active turn sends END and waits for its ACK before copying
+the bundle's existing `final_output` file or directory into `<slots_root>/<slot>/turns/<n>/`. A file keeps its basename;
+`n` starts at 1 per slot. `final_output` may contain `{slot_dir}` and is rendered for each slot before launch;
+Tracker requires that placeholder when `parallel_agents > 1` and `final_output` is set, so parallel slots do not
+snapshot the same path. The agent workspace and turn snapshots are siblings, so a `final_output` of `{slot_dir}`
+or `{slot_dir}/turns` cannot recursively include earlier snapshots. Tracker archives `slots_root` as the episode output.
+
+Upload `valkyrie_stage_source()` as `valkyrie_stage.py` during setup and import `Agents` there with Python 3.8+:
+
+```python
+from valkyrie_stage import Agents, Exhausted
+
+agents = Agents()
+agents.start("first", "/workspace/observations/first.txt")
+result = agents.wait_any()  # SlotResult(slot, reason, exit_code)
+agents.start("first", "/workspace/observations/next.txt")  # Requires continue_cmd.
+result = agents.stop("first")  # SIGINT grace (or immediate SIGKILL for null), then confirmed absence.
+```
+
+`start` reports BEGIN and waits for ACK before spawning the first slot; the last slot completes only after its
+process group is empty, any named Docker container has been removed and listed absent, and END is ACKed. Overlapping
+slots count as one union interval. `stop` returns `stopped` when it stops an active slot, `exited` if collection
+already found natural completion, or `exhausted` if the shared limit won. `wait_any` returns `exited` or
+`exhausted` as appropriate. Tracker writes `$VALKYRIE_STAGE_DIR/exhausted` before its ACK when the shared
+budget expires. The library kills all running groups, completes their cleanup and END, and later `start` raises
+`Exhausted`. If the notice arrives with BEGIN ACK, no child starts and no END is sent.
+
 For every task, check `sandbox.generation_containment` and run
 `await sandbox.probe_generation_containment()` before starting a controlled workload. An advertised
 capability alone does not prove the effective sandbox can start it. A Compose capability still
@@ -302,7 +361,8 @@ boundary, and run controlled commands through their own provider process transpo
 targets the workload group, not the reusable Modal sandbox (including the selected VM runtime)
 or local Docker task container. For ordinary controlled commands, confirmation covers live
 members of the marked process group in the same PID namespace, not independently detached
-processes. Docker-daemon-owned descendants remain outside that boundary.
+processes. For supervised process-group episodes, the subreaper also drains adopted
+descendants before confirmation; Docker-daemon-owned descendants remain outside that boundary.
 
 Consume `workload.output()` for streamed text. `await workload.wait()` returns
 `ControlledWorkloadResult(result=ExecResult(exit_code, output), absence_confirmed_at=...)`
@@ -501,7 +561,7 @@ result = await client.run_with_sandbox_recovery(
 
 Pydantic models used across requests and responses:
 
-- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, optional `CreditedGeneration(allowance_seconds, stage_protocol)`, `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
+- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, optional `CreditedGeneration(allowance_seconds, stage_protocol)`, optional `Episode(command, parallel_agents)`, `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
 - **`GenerationContainment`** — effective-sandbox capability: `linux_cgroup_v2` v1 for direct Daytona or `linux_process_group` v1 for Compose service, native Modal, and local Docker workloads. Tracker probes the effective sandbox for every task before its `ControlledWorkload` and does not fall back to `Sandbox.command()` on unsupported providers.
 - **`agent_install_order`** — `"before_setup"` installs agent dependencies before benchmark setup; `"after_setup"` lets setup prepare the environment first. The default is `"before_setup"`; lifecycle execution is the caller's responsibility.
 - **`BenchmarkEgressPlan`** — declarative `setup_task`, agent `run`, and `evaluation` policies. `"*"` is unrestricted, `[]` is deny-all, and a non-empty list is an allowlist. Setup and evaluation default to `"*"`; `run=None` leaves the benchmark without a run-policy opinion. Applying and composing the plan is the caller's responsibility.

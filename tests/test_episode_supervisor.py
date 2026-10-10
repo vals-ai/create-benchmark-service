@@ -75,7 +75,7 @@ def _finish_owner(process: subprocess.Popen[bytes], directory: Path) -> None:
             if published.endswith('\n'):
                 owner_group = int(published)
         child_group = int(child_marker.read_text()) if child_marker.exists() else None
-        groups = set()
+        groups: set[int] = set()
         if child_group is not None and _live(child_group):
             groups.add(child_group)
         if not stopped and owner_group is not None:

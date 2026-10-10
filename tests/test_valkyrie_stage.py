@@ -1,5 +1,5 @@
 """Exercise standalone agent rendering and process-group lifecycle."""
-
+# pyright: reportPrivateUsage=false
 import base64
 import ctypes
 import errno
@@ -154,7 +154,7 @@ def test_natural_exit_keeps_leader_until_group_cleanup(tmp_path: Path, monkeypat
     child_pid: int | None = None
     released = False
     worker.start("one", "observation")
-    leader = worker._active["one"].process  # pyright: ignore[reportPrivateUsage]
+    leader = worker._active["one"].process
     try:
         leader_fd = libc.pidfd_open(leader.pid, 0)
         if leader_fd == -1:

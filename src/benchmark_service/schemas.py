@@ -203,6 +203,13 @@ class CreditedGeneration(BaseModel):
     stage_protocol: Literal["valkyrie-stage/1"] | None
 
 
+class Episode(BaseModel):
+    """Benchmark-owned orchestration command and concurrent agent-slot limit."""
+
+    command: str
+    parallel_agents: int = Field(ge=1)
+
+
 class RetrieveTaskResponse(BaseModel):
     """
     Response containing task metadata and setup requirements.
@@ -219,6 +226,7 @@ class RetrieveTaskResponse(BaseModel):
         default=None, description="Agent execution max time in seconds (None for no timeout)"
     )
     credited_generation: CreditedGeneration | None = None
+    episode: Episode | None = None
     resources: Resources = Field(description="Computational resources needed")
     agent_install_order: AgentInstallOrder = Field(
         default="before_setup",
@@ -248,6 +256,14 @@ class RetrieveTaskResponse(BaseModel):
     eval_sandbox: EvalSandboxSpec | None = Field(
         default=None, description="Grading-sandbox overrides for eval_mode == SANDBOX; None uses generation values"
     )
+
+    @model_validator(mode="after")
+    def require_episode_stage_protocol(self) -> "RetrieveTaskResponse":
+        if self.episode is not None and (
+            self.credited_generation is None or self.credited_generation.stage_protocol != "valkyrie-stage/1"
+        ):
+            raise ValueError("episode requires credited_generation with stage_protocol='valkyrie-stage/1'")
+        return self
 
     @computed_field(description="Legacy sandbox image field for older Valkyrie clients")
     @property

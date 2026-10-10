@@ -6,7 +6,7 @@ import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping
 
 from benchmark_service.sandbox._process_group import (
-    cleanup_command, owner_command, probe_command, stop_command,
+    cleanup_command, episode_owner_command, owner_command, probe_command, stop_command,
 )
 from benchmark_service.sandbox.types import (
     ComposeSource,
@@ -79,10 +79,10 @@ class ComposeSandbox(Sandbox):
             raise SandboxError(f"Compose service does not support process groups: {result.output}")
 
     def _process_group_workload(
-        self, command: str, *, cwd: str | None,
+        self, command: str, episode_script: str | None, *, cwd: str | None,
         env_vars: Mapping[str, str] | None
     ) -> ControlledWorkload:
-        return _ComposeControlledWorkload(self, command, cwd, validate_command_env(env_vars))
+        return _ComposeControlledWorkload(self, command, cwd, validate_command_env(env_vars), episode_script)
 
     def _compose_command(self, parts: list[str]) -> str:
         return f"{self._compose_command_prefix} {shlex.join(parts)}"
@@ -200,11 +200,13 @@ class _ComposeControlledWorkload(ControlledWorkload):
         command: str,
         cwd: str | None,
         env_vars: dict[str, str],
+        episode_script: str | None,
     ) -> None:
         self._sandbox = sandbox
         self._command = command
         self._cwd = cwd
         self._env_vars = env_vars
+        self._episode_script = episode_script
         self._marker = f"/tmp/.cbs-controlled-{uuid.uuid4().hex}"
         self._launch_task = asyncio.create_task(self._launch())
         self._result_task: asyncio.Task[ControlledWorkloadResult] | None = None
@@ -223,7 +225,11 @@ class _ComposeControlledWorkload(ControlledWorkload):
 
         # The inner owner stops its group after foreground exit, before inherited
         # stdout can hold docker exec open.
-        inner = owner_command(self._command, self._marker, "sh -lc")
+        inner = (
+            episode_owner_command(self._command, self._marker, self._episode_script)
+            if self._episode_script is not None
+            else owner_command(self._command, self._marker, "sh -lc")
+        )
         args: list[str] = []
         for name in self._env_vars:
             args.extend(["-e", name])
@@ -273,7 +279,7 @@ class _ComposeControlledWorkload(ControlledWorkload):
         _, container_id = await self._launch_task
         outer = self._sandbox._outer  # pyright: ignore[reportPrivateUsage]
         assert self._result_task is not None
-        command = stop_command(self._marker)
+        command = stop_command(self._marker, episode_owner=self._episode_script is not None)
         while True:
             stopped = await outer.exec(
                 f"docker exec {shlex.quote(container_id)} sh -c {shlex.quote(command)}",

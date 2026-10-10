@@ -127,9 +127,9 @@ def _record_control_dirs(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     observed: list[str] = []
     original = docker.stop_command
 
-    def record(control_dir: str) -> str:
+    def record(control_dir: str, *, episode_owner: bool) -> str:
         observed.append(control_dir)
-        return original(control_dir)
+        return original(control_dir, episode_owner=episode_owner)
 
     monkeypatch.setattr(docker, "stop_command", record)
     return observed
@@ -397,7 +397,7 @@ async def test_controlled_unconfirmed_group_absence_is_error(monkeypatch: pytest
     workload = sandbox.controlled_workload("sleep 2")
     from benchmark_service.sandbox.local import docker
 
-    def fail_confirmation(control_dir: str) -> str:
+    def fail_confirmation(control_dir: str, *, episode_owner: bool) -> str:
         confirmations.append(control_dir)
         return "exit 1"
 
@@ -407,7 +407,7 @@ async def test_controlled_unconfirmed_group_absence_is_error(monkeypatch: pytest
             await asyncio.wait_for(workload.kill(), timeout=3)
     finally:
         control_dir = confirmations[-1]
-        confirmed = await sandbox.exec(stop_command(control_dir))
+        confirmed = await sandbox.exec(stop_command(control_dir, episode_owner=False))
         assert confirmed.exit_code == 0
         try:
             with pytest.raises(SandboxError, match="process group did not stop"):

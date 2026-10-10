@@ -10,23 +10,34 @@ import math
 import os
 import shlex
 import tarfile
+from collections import deque
 from collections.abc import AsyncGenerator, Generator, Mapping
 from contextlib import aclosing, contextmanager
 from datetime import datetime
 from pathlib import PurePosixPath
-from typing import Literal
+from typing import Awaitable, Callable, Literal
 from uuid import uuid4
 
 from aiodocker import Docker
 from aiodocker.containers import DockerContainer
 from aiodocker.exceptions import DockerError
+from aiodocker.execs import Exec
+from aiodocker.stream import Stream
 from aiodocker.types import JSONObject
 from aiohttp import ClientError
 from pydantic import AliasPath, BaseModel, Field
 
+from benchmark_service.sandbox._process_group import (
+    cleanup_command, owner_command, probe_command, stop_command,
+)
 from benchmark_service.sandbox.types import (
+    ControlledWorkload,
+    ControlledWorkloadResult,
     ExecResult,
+    GenerationContainment,
     ImageSource,
+    LINUX_PROCESS_GROUP_V1,
+    MAX_SANDBOX_LIFETIME_SECONDS,
     Sandbox,
     SandboxCommandError,
     SandboxConnectionError,
@@ -42,6 +53,7 @@ logger = logging.getLogger(__name__)
 _MANAGED_LABEL = "io.vals.cbs.managed"
 _NAME_LABEL = "io.vals.cbs.name"
 _PULL_TIMEOUT_S = 1800
+_CONTROLLED_TAIL_BYTES = 64 * 1024
 
 
 class DockerProviderConfig(BaseModel):
@@ -102,6 +114,25 @@ class DockerSandbox(Sandbox):
     @property
     def state(self) -> str:
         return self._info.state
+
+    @property
+    def generation_containment(self) -> GenerationContainment:
+        return LINUX_PROCESS_GROUP_V1
+
+    async def probe_generation_containment(self) -> None:
+        marker = f"/tmp/.cbs-probe-{uuid4().hex}"
+        result = await self.exec(probe_command(marker))
+        if result.exit_code:
+            raise SandboxError(f"Docker container does not support process groups: {result.output}")
+
+    def _process_group_workload(
+        self, command: str, *, cwd: str | None,
+        env_vars: Mapping[str, str] | None
+    ) -> ControlledWorkload:
+        return _DockerControlledWorkload(
+            self._container, self._raise_if_finished, command, cwd,
+            validate_command_env(env_vars)
+        )
 
     async def _raise_if_finished(self) -> None:
         # Docker reports a killed command's exit before it marks the container stopped.
@@ -245,6 +276,192 @@ class DockerSandbox(Sandbox):
         return self._command_bytes(f"cat -- {shlex.quote(str(path))}")
 
 
+
+class _DockerControlledWorkload(ControlledWorkload):
+    def __init__(
+        self,
+        container: DockerContainer,
+        raise_if_finished: Callable[[], Awaitable[None]],
+        command: str,
+        cwd: str | None,
+        env_vars: dict[str, str],
+    ) -> None:
+        self._container = container
+        self._raise_if_finished = raise_if_finished
+        self._command = command
+        self._cwd = cwd
+        self._env_vars = env_vars
+        self._marker = f"/tmp/.cbs-controlled-{uuid4().hex}"
+        self._started = asyncio.Event()
+        self._status_done = asyncio.Event()
+        self._execution: Exec | None = None
+        self._output: asyncio.Queue[str | None] = asyncio.Queue()
+        self._drain_task: asyncio.Task[None] | None = None
+        self._tail: deque[str] = deque()
+        self._tail_bytes = 0
+        self._stop_task: asyncio.Task[tuple[float, int | None]] | None = None
+        self._cleanup_task: asyncio.Task[None] | None = None
+        self._result_task = asyncio.create_task(self._run())
+
+    def _accept(self, text: str) -> None:
+        if not text:
+            return
+        self._output.put_nowait(text)
+        self._tail.append(text)
+        self._tail_bytes += len(text.encode("utf-8"))
+        while self._tail_bytes > _CONTROLLED_TAIL_BYTES:
+            excess = self._tail_bytes - _CONTROLLED_TAIL_BYTES
+            first = self._tail[0].encode("utf-8")
+            if len(first) <= excess:
+                self._tail_bytes -= len(first)
+                self._tail.popleft()
+            else:
+                self._tail[0] = first[excess:].decode("utf-8", errors="ignore")
+                self._tail_bytes -= len(first) - len(self._tail[0].encode("utf-8"))
+
+    async def _drain(self, stream: Stream) -> None:
+        try:
+            with _docker_errors():
+                decoders: dict[int, codecs.IncrementalDecoder] = {}
+                while (message := await stream.read_out()) is not None:
+                    decoder = decoders.get(message.stream)
+                    if decoder is None:
+                        decoder = decoders[message.stream] = codecs.getincrementaldecoder("utf-8")(errors="replace")
+                    self._accept(decoder.decode(message.data))
+                for decoder in decoders.values():
+                    self._accept(decoder.decode(b"", final=True))
+        finally:
+            self._output.put_nowait(None)
+
+    async def _status(self, execution: Exec) -> int:
+        info = await execution.inspect()
+        while info.get("Running"):
+            await asyncio.sleep(0.05)
+            info = await execution.inspect()
+        exit_code = info.get("ExitCode")
+        if not isinstance(exit_code, int):
+            raise SandboxError("Docker controlled command finished without an exit code")
+        if exit_code == 137:
+            await self._raise_if_finished()
+        self._status_done.set()
+        return exit_code
+
+    async def _run(self) -> ControlledWorkloadResult:
+        script = owner_command(self._command, self._marker, "/bin/sh -c")
+        with _docker_errors():
+            try:
+                execution = await self._container.exec(
+                    ["/bin/sh", "-c", script],
+                    environment=self._env_vars,
+                    workdir=self._cwd,
+                )
+                stream = execution.start()
+                async with stream:
+                    self._execution = execution
+                    self._started.set()
+                    drain = self._drain_task = asyncio.create_task(self._drain(stream))
+                    status = asyncio.create_task(self._status(execution))
+                    try:
+                        done, _ = await asyncio.wait((status, drain), return_when=asyncio.FIRST_COMPLETED)
+                        if drain in done:
+                            await drain
+                        exit_code = await status
+                        absence_confirmed_at, foreground_status = await self._ensure_stopped()
+                        await drain
+                        assert self._cleanup_task is not None
+                        await self._cleanup_task
+                        if foreground_status is None and exit_code == 0:
+                            raise SandboxError("Docker workload exited without a foreground status")
+                        result = ExecResult(
+                            exit_code=foreground_status if foreground_status is not None else exit_code,
+                            output="".join(self._tail),
+                        )
+                        return ControlledWorkloadResult(result, absence_confirmed_at)
+                    except Exception:
+                        status_failed = status.done() and not status.cancelled() and status.exception() is not None
+                        drain_failed = drain.done() and not drain.cancelled() and drain.exception() is not None
+                        if not status.done():
+                            status.cancel()
+                        await asyncio.gather(status, return_exceptions=True)
+                        if status_failed and not drain_failed:
+                            if not drain.done():
+                                self._drain_task = None
+                            raise
+                        await self._ensure_stopped()
+                        await drain
+                        raise
+                    finally:
+                        if not drain.done():
+                            drain.cancel()
+                            await asyncio.gather(drain, return_exceptions=True)
+            finally:
+                self._started.set()
+                if self._drain_task is None:
+                    self._output.put_nowait(None)
+
+    async def _control_exec(self, command: str) -> ExecResult:
+        with _docker_errors():
+            execution = await self._container.exec(["/bin/sh", "-c", command])
+            output: list[bytes] = []
+            async with execution.start() as stream:
+                while (message := await stream.read_out()) is not None:
+                    output.append(message.data)
+            info = await execution.inspect()
+            while info.get("Running"):
+                await asyncio.sleep(0.01)
+                info = await execution.inspect()
+            exit_code = info.get("ExitCode")
+            if not isinstance(exit_code, int):
+                raise SandboxError("Docker control command finished without an exit code")
+            return ExecResult(exit_code=exit_code, output=b"".join(output).decode(errors="replace"))
+
+    async def _stop(self) -> tuple[float, int | None]:
+        await self._started.wait()
+        if self._execution is None:
+            await self._result_task
+            raise SandboxError("Docker controlled command did not start")
+        command = stop_command(self._marker)
+        while True:
+            stopped = await self._control_exec(command)
+            if stopped.exit_code == 0:
+                break
+            if stopped.exit_code != 75:
+                raise SandboxError(f"Docker process group did not stop: {stopped.output}")
+            if self._status_done.is_set():
+                raise SandboxError("Docker workload finished without a process-group marker")
+            await asyncio.sleep(0.05)
+        self._cleanup_task = asyncio.create_task(self._cleanup())
+        return asyncio.get_running_loop().time(), int(stopped.output.strip()) if stopped.output.strip() else None
+
+    async def _cleanup(self) -> None:
+        if self._drain_task is None:
+            await asyncio.gather(self._result_task, return_exceptions=True)
+        else:
+            await asyncio.gather(self._drain_task, return_exceptions=True)
+        removed = await self._control_exec(cleanup_command(self._marker))
+        if removed.exit_code != 0:
+            raise SandboxError(f"Docker process-group control cleanup failed: {removed.output}")
+
+    async def _ensure_stopped(self) -> tuple[float, int | None]:
+        if self._stop_task is None:
+            self._stop_task = asyncio.create_task(self._stop())
+        return await asyncio.shield(self._stop_task)
+
+    async def output(self) -> AsyncGenerator[str, None]:
+        while (chunk := await self._output.get()) is not None:
+            yield chunk
+        if self._drain_task is None:
+            await asyncio.shield(self._result_task)
+        else:
+            await asyncio.shield(self._drain_task)
+
+    async def wait(self) -> ControlledWorkloadResult:
+        return await asyncio.shield(self._result_task)
+
+    async def kill(self) -> None:
+        await self._ensure_stopped()
+
+
 def _build_container_config(request: SandboxCreateRequest) -> JSONObject:
     """Validate Docker support and build the container creation settings."""
     if not isinstance(request.source, ImageSource):
@@ -255,7 +472,7 @@ def _build_container_config(request: SandboxCreateRequest) -> JSONObject:
     return {
         "Image": request.source.image,
         "Entrypoint": ["/bin/sh", "-c"],
-        "Cmd": ["trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done"],
+        "Cmd": [f"trap 'exit 0' TERM INT; sleep {MAX_SANDBOX_LIFETIME_SECONDS} & wait $!"],
         "Env": [f"{key}={value}" for key, value in request.env_vars.items()],
         "Labels": labels,
         "HostConfig": {

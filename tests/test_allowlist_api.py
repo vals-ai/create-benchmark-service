@@ -9,7 +9,7 @@ import httpx
 import pytest
 
 from benchmark_service.vals import auth as auth_module
-from benchmark_service.vals.allowlist import CatalogAllowlistClient
+from benchmark_service.vals.allowlist import CatalogAllowlistClient, CatalogUnavailable
 from benchmark_service.vals.auth import (
     clear_allowlist_cache,
     clear_auth_cache,
@@ -154,9 +154,34 @@ async def test_catalog_failure_does_not_fall_back_to_legacy_policy(
         "_exchange_descope_access_key",
         new=AsyncMock(return_value={"tenants": {"acme": {}}}),
     ):
-        assert await resolve_descope_tenant({"x-descope-api-key": "key-acme"}) is None
+        with pytest.raises(CatalogUnavailable):
+            await resolve_descope_tenant({"x-descope-api-key": "key-acme"})
 
     assert load_allowlist().tenants == {}
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        httpx.Response(200, content=b"not-json"),
+        httpx.Response(200, json={"name": "other-service", "datasets": ["default"], "trial_mode": False}),
+    ],
+)
+async def test_invalid_catalog_policy_reports_outage(response: httpx.Response, monkeypatch: pytest.MonkeyPatch) -> None:
+    transport, requests = _transport(response)
+    _configure_api(monkeypatch, transport)
+
+    with (
+        patch.object(
+            auth_module,
+            "_exchange_descope_access_key",
+            new=AsyncMock(return_value={"tenants": {"acme": {}}}),
+        ),
+    ):
+        with pytest.raises(CatalogUnavailable):
+            await resolve_descope_tenant({"x-descope-api-key": "key-acme"})
+
+    assert len(requests) == 3
 
 
 @pytest.mark.asyncio

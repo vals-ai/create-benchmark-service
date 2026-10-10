@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import AsyncGenerator
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -18,6 +19,7 @@ from benchmark_service.vals.auth import (
     resolve_caller_tenant,
     resolve_descope_tenant,
 )
+from benchmark_service.vals.allowlist import CatalogUnavailable, TenantConfig
 from benchmark_service.vals.base import ValsBenchmarkService
 from benchmark_service.schemas import (
     EvaluateResponseRequest,
@@ -126,7 +128,8 @@ async def test_resolve_caller_tenant_rejects_static_bearer_key(
 
 @pytest.mark.parametrize("auth_required", [None, "false"])
 async def test_resolve_caller_tenant_returns_sentinel_when_auth_not_required(
-    monkeypatch: pytest.MonkeyPatch, auth_required: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+    auth_required: str | None,
 ) -> None:
     if auth_required is None:
         monkeypatch.delenv("AUTH_REQUIRED", raising=False)
@@ -196,3 +199,52 @@ async def test_check_dataset_access_unauthenticated_sentinel_always_allowed() ->
     service = _BareBenchmark()
     assert await service.check_dataset_access(UNAUTHENTICATED_TENANT_SENTINEL, "anything") is True
     assert await service.check_dataset_access(UNAUTHENTICATED_TENANT_SENTINEL, None) is True
+
+
+@pytest.mark.parametrize("failures", [0, 1, 2, 3])
+async def test_catalog_preauth_retries_only_unavailable(monkeypatch: pytest.MonkeyPatch, failures: int) -> None:
+    client = AsyncMock()
+    policy = TenantConfig(datasets=["default"])
+    client.get_tenant_config.side_effect = [CatalogUnavailable("outage")] * failures + [policy]
+    monkeypatch.setattr(auth_module, "_get_catalog_client", lambda: client)
+    if failures == 3:
+        with pytest.raises(CatalogUnavailable):
+            await auth_module._fetch_api_tenant_config("key", "tenant")  # pyright: ignore[reportPrivateUsage]
+    else:
+        assert await auth_module._fetch_api_tenant_config("key", "tenant") == policy  # pyright: ignore[reportPrivateUsage]
+    assert client.get_tenant_config.await_count == min(failures + 1, 3)
+
+
+async def test_catalog_preauth_denial_and_cancellation_are_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = AsyncMock()
+    monkeypatch.setattr(auth_module, "_get_catalog_client", lambda: client)
+    client.get_tenant_config.return_value = None
+    assert await auth_module._fetch_api_tenant_config("key", "tenant") is None  # pyright: ignore[reportPrivateUsage]
+    assert client.get_tenant_config.await_count == 1
+    client.get_tenant_config.reset_mock()
+    client.get_tenant_config.side_effect = asyncio.CancelledError()
+    with pytest.raises(asyncio.CancelledError):
+        await auth_module._fetch_api_tenant_config("key", "tenant")  # pyright: ignore[reportPrivateUsage]
+    assert client.get_tenant_config.await_count == 1
+
+
+async def test_catalog_preauth_total_deadline(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = AsyncMock()
+
+    async def stalled(*args: object) -> None:
+        await asyncio.sleep(1)
+
+    client.get_tenant_config.side_effect = stalled
+    monkeypatch.setattr(auth_module, "_get_catalog_client", lambda: client)
+    timeout = asyncio.timeout
+    budgets: list[float] = []
+
+    def short_timeout(seconds: float) -> asyncio.Timeout:
+        budgets.append(seconds)
+        return timeout(0.01)
+
+    monkeypatch.setattr(auth_module.asyncio, "timeout", short_timeout)
+    with pytest.raises(CatalogUnavailable):
+        await auth_module._fetch_api_tenant_config("key", "tenant")  # pyright: ignore[reportPrivateUsage]
+    assert budgets == [15]
+    assert client.get_tenant_config.await_count == 1

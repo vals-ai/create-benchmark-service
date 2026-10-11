@@ -407,14 +407,21 @@ async def test_controlled_unconfirmed_group_absence_is_error(monkeypatch: pytest
             await asyncio.wait_for(workload.kill(), timeout=3)
     finally:
         control_dir = confirmations[-1]
-        confirmed = await sandbox.exec(stop_command(control_dir))
-        assert confirmed.exit_code == 0
         try:
+            pgid = Path(control_dir) / "pgid"
+            deadline = asyncio.get_running_loop().time() + 3
+            while not pgid.exists() or pgid.stat().st_size == 0:
+                assert asyncio.get_running_loop().time() < deadline
+                await asyncio.sleep(0.01)
+            confirmed = await sandbox.exec(stop_command(control_dir))
+            assert confirmed.exit_code == 0
             with pytest.raises(SandboxError, match="process group did not stop"):
                 await asyncio.wait_for(workload.wait(), timeout=3)
         finally:
             process = container.executions[0].process
             assert process is not None
-            await asyncio.wait_for(process.wait(), 3)
-            removed = await sandbox.exec(cleanup_command(control_dir))
-            assert removed.exit_code == 0
+            try:
+                await asyncio.wait_for(process.wait(), 3)
+            finally:
+                removed = await sandbox.exec(cleanup_command(control_dir))
+                assert removed.exit_code == 0

@@ -83,6 +83,22 @@ async def test_cache_ttl_bounds_long_lived_tokens(monkeypatch: pytest.MonkeyPatc
 
 
 @pytest.mark.usefixtures("descope_env")
+@pytest.mark.parametrize(
+    ("cache_ttl", "expires_in", "lifetime"),
+    [(7200, 3 * 3600, 7200), (7200, 3600, 3599), (600, 3 * 3600, 600)],
+)
+async def test_cached_entries_end_at_the_ttl_or_the_token_expiry(
+    monkeypatch: pytest.MonkeyPatch, cache_ttl: int, expires_in: float, lifetime: float
+) -> None:
+    monkeypatch.setattr(auth_module, "_auth_cache_ttl_seconds", cache_ttl)
+
+    assert await _resolve_twice(_mock_jwt_response(["acme-corp"], expires_in)) == 1
+
+    ((_tenant, deadline),) = auth_module._auth_cache.values()
+    assert deadline - time.monotonic() == pytest.approx(lifetime, abs=5)
+
+
+@pytest.mark.usefixtures("descope_env")
 async def test_overflowing_token_expiry_is_not_cached() -> None:
     assert await _resolve_twice({"tenants": {"acme-corp": {}}, "sessionToken": {"exp": 10**400}}) == 2
 
@@ -154,7 +170,8 @@ async def test_resolve_caller_tenant_rejects_static_bearer_key(
 
 @pytest.mark.parametrize("auth_required", [None, "false"])
 async def test_resolve_caller_tenant_returns_sentinel_when_auth_not_required(
-    monkeypatch: pytest.MonkeyPatch, auth_required: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+    auth_required: str | None,
 ) -> None:
     if auth_required is None:
         monkeypatch.delenv("AUTH_REQUIRED", raising=False)

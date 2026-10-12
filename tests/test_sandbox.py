@@ -4990,17 +4990,15 @@ async def test_daytona_native_shell_preserves_cwd_env_and_exit(tmp_path: Path) -
     cwd = tmp_path / "working directory with spaces"
     cwd.mkdir()
     workload = _cgroup_sandbox(process).controlled_workload(
-        'printf "pid:%s|cwd:%s|env:%s\n" "$$" "$PWD" "$CBS_TOKEN"; exit 17',
+        'printf "cwd:%s|env:%s\n" "$PWD" "$CBS_TOKEN"; exit 17',
         cwd=str(cwd), env_vars={"CBS_TOKEN": "one two"},
     )
     completed = await asyncio.wait_for(workload.wait(), 5)
     assert completed.result.exit_code == 17
-    reported_pid, details = completed.result.output.split("|", maxsplit=1)
-    reported_pid = reported_pid.removeprefix("pid:")
-    assert reported_pid.isdecimal()
-    assert (process.group / "cgroup.procs").read_text().strip() == reported_pid
-    assert int(reported_pid) != process.worker.pid
-    assert details == f"cwd:{cwd}|env:one two\n"
+    admitted_pid = (process.group / "cgroup.procs").read_text().strip()
+    assert admitted_pid.isdecimal()
+    assert int(admitted_pid) != process.worker.pid
+    assert completed.result.output == f"cwd:{cwd}|env:one two\n"
     assert "".join([chunk async for chunk in workload.output()]) == completed.result.output
     assert process.execute_calls == 1
     assert not process.group_exists

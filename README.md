@@ -357,6 +357,9 @@ and stop handling run independently of the log watcher. `wait()` and `kill()` sh
 session cleanup, which waits for the launch attempt to settle before deleting the
 session and confirming absence.
 
+See the [Daytona reconnect diagram](docs/diagrams/daytona-reconnect.png)
+([editable Excalidraw source](docs/diagrams/daytona-reconnect.excalidraw)).
+
 `ComposeSandbox` supports `linux_process_group` v1 (`LINUX_PROCESS_GROUP_V1`).
 It pins the running service container, starts the command in a new process group inside
 that container, and streams its output through the outer controlled workload transport.

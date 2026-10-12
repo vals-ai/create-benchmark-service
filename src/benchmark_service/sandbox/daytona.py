@@ -112,7 +112,7 @@ _SOURCE_NAMES: Mapping[str | None, str] = {
 }
 _PTY_STATUS_CHECK_ATTEMPTS = 30
 _PTY_STATUS_POLL_SECONDS = 30
-_STDOUT_TAIL_MAX_BYTES = 64 * 1024
+_PTY_STDOUT_TAIL_MAX_BYTES = 64 * 1024
 _SESSION_WATCH_REOPEN_SECONDS = 10
 _PTY_CREATE_MARKER_ENV = "_CBS_PTY_CREATE_MARKER"
 _PTY_ROWS = 24
@@ -762,7 +762,7 @@ class DaytonaSandbox(Sandbox):
             text = data.decode("utf-8", errors="replace")
             stdout.append(text)
             stdout_bytes += len(text)
-            while stdout_bytes > _STDOUT_TAIL_MAX_BYTES and len(stdout) > 1:
+            while stdout_bytes > _PTY_STDOUT_TAIL_MAX_BYTES and len(stdout) > 1:
                 stdout_bytes -= len(stdout.popleft())
             output.put_nowait(text)
 
@@ -1230,7 +1230,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         )
         self._session_requested = False
         self._output: asyncio.Queue[str] = asyncio.Queue()
-        self._stdout: deque[str] = deque()
+        self._stdout: deque[bytes] = deque()
         self._stdout_bytes = 0
         self._creation_done = asyncio.Event()
         self._group_created = False
@@ -1251,10 +1251,18 @@ class _DaytonaControlledWorkload(ControlledWorkload):
     def _append_output(self, text: str) -> None:
         if not text:
             return
-        self._stdout.append(text)
-        self._stdout_bytes += len(text)
-        while self._stdout_bytes > _STDOUT_TAIL_MAX_BYTES and len(self._stdout) > 1:
-            self._stdout_bytes -= len(self._stdout.popleft())
+        encoded = text.encode("utf-8")
+        self._stdout.append(encoded)
+        self._stdout_bytes += len(encoded)
+        while self._stdout_bytes > _PTY_STDOUT_TAIL_MAX_BYTES:
+            oldest = self._stdout.popleft()
+            excess = self._stdout_bytes - _PTY_STDOUT_TAIL_MAX_BYTES
+            if len(oldest) > excess:
+                suffix = oldest[excess:].decode("utf-8", errors="ignore").encode("utf-8")
+                self._stdout.appendleft(suffix)
+                self._stdout_bytes -= len(oldest) - len(suffix)
+            else:
+                self._stdout_bytes -= len(oldest)
         self._output.put_nowait(text)
 
     async def output(self) -> AsyncGenerator[str, None]:
@@ -1440,7 +1448,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
                 forwarded_stdout, forwarded_stderr, self._append_output, self._closed,
             )
             if exit_code is not None:
-                return ExecResult(exit_code=exit_code, output="".join(self._stdout))
+                return ExecResult(exit_code=exit_code, output=b"".join(self._stdout).decode("utf-8"))
             try:
                 await asyncio.wait_for(self._closed.wait(), _SESSION_WATCH_REOPEN_SECONDS)
             except TimeoutError:

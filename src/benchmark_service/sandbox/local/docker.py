@@ -27,7 +27,9 @@ from aiodocker.types import JSONObject
 from aiohttp import ClientError
 from pydantic import AliasPath, BaseModel, Field
 
-from benchmark_service.sandbox._process_group import cleanup_command, owner_command, probe_command, stop_command
+from benchmark_service.sandbox._process_group import (
+    cleanup_command, owner_command, probe_command, stop_command,
+)
 from benchmark_service.sandbox.types import (
     ControlledWorkload,
     ControlledWorkloadResult,
@@ -123,15 +125,13 @@ class DockerSandbox(Sandbox):
         if result.exit_code:
             raise SandboxError(f"Docker container does not support process groups: {result.output}")
 
-    def controlled_workload(
-        self,
-        command: str,
-        *,
-        cwd: str | None = None,
-        env_vars: Mapping[str, str] | None = None,
+    def _process_group_workload(
+        self, command: str, *, cwd: str | None,
+        env_vars: Mapping[str, str] | None
     ) -> ControlledWorkload:
         return _DockerControlledWorkload(
-            self._container, self._raise_if_finished, command, cwd, validate_command_env(env_vars)
+            self._container, self._raise_if_finished, command, cwd,
+            validate_command_env(env_vars)
         )
 
     async def _raise_if_finished(self) -> None:
@@ -420,23 +420,16 @@ class _DockerControlledWorkload(ControlledWorkload):
         if self._execution is None:
             await self._result_task
             raise SandboxError("Docker controlled command did not start")
-        marker_command = (
-            f"if test -s {shlex.quote(self._marker)}/pgid; then "
-            f"cat {shlex.quote(self._marker)}/pgid; else exit 75; fi"
-        )
+        command = stop_command(self._marker)
         while True:
-            marker = await self._control_exec(marker_command)
-            if marker.exit_code == 0:
-                group_id = int(marker.output.strip())
+            stopped = await self._control_exec(command)
+            if stopped.exit_code == 0:
                 break
-            if marker.exit_code != 75:
-                raise SandboxError(f"Docker controlled marker read failed: {marker.output}")
+            if stopped.exit_code != 75:
+                raise SandboxError(f"Docker process group did not stop: {stopped.output}")
             if self._status_done.is_set():
                 raise SandboxError("Docker workload finished without a process-group marker")
             await asyncio.sleep(0.05)
-        stopped = await self._control_exec(stop_command(group_id, self._marker))
-        if stopped.exit_code:
-            raise SandboxError(f"Docker process group did not stop: {stopped.output}")
         self._cleanup_task = asyncio.create_task(self._cleanup())
         return asyncio.get_running_loop().time(), int(stopped.output.strip()) if stopped.output.strip() else None
 

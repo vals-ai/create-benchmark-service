@@ -5,7 +5,9 @@ import shlex
 import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping
 
-from benchmark_service.sandbox._process_group import cleanup_command, owner_command, probe_command, stop_command
+from benchmark_service.sandbox._process_group import (
+    cleanup_command, owner_command, probe_command, stop_command,
+)
 from benchmark_service.sandbox.types import (
     ComposeSource,
     ControlledWorkload,
@@ -76,12 +78,9 @@ class ComposeSandbox(Sandbox):
         if result.exit_code != 0:
             raise SandboxError(f"Compose service does not support process groups: {result.output}")
 
-    def controlled_workload(
-        self,
-        command: str,
-        *,
-        cwd: str | None = None,
-        env_vars: Mapping[str, str] | None = None,
+    def _process_group_workload(
+        self, command: str, *, cwd: str | None,
+        env_vars: Mapping[str, str] | None
     ) -> ControlledWorkload:
         return _ComposeControlledWorkload(self, command, cwd, validate_command_env(env_vars))
 
@@ -274,32 +273,20 @@ class _ComposeControlledWorkload(ControlledWorkload):
         _, container_id = await self._launch_task
         outer = self._sandbox._outer  # pyright: ignore[reportPrivateUsage]
         assert self._result_task is not None
-        marker_command = (
-            f"if test -s {shlex.quote(self._marker)}/pgid; then "
-            f"cat {shlex.quote(self._marker)}/pgid; else exit 75; fi"
-        )
+        command = stop_command(self._marker)
         while True:
-            marker = await outer.exec(
-                f"docker exec {shlex.quote(container_id)} sh -c {shlex.quote(marker_command)}",
+            stopped = await outer.exec(
+                f"docker exec {shlex.quote(container_id)} sh -c {shlex.quote(command)}",
                 timeout=10,
             )
-            if marker.exit_code == 0:
-                group_id = int(marker.output.strip())
+            if stopped.exit_code == 0:
                 break
-            if marker.exit_code != 75:
-                raise SandboxError(f"Compose controlled marker read failed: {marker.output}")
+            if stopped.exit_code != 75:
+                raise SandboxError(f"Compose process group did not stop: {stopped.output}")
             if self._result_task.done():
                 await self._result_task
                 raise SandboxError("Compose workload finished without a service process-group marker")
             await asyncio.sleep(0.05)
-
-        command = stop_command(group_id, self._marker)
-        stopped = await outer.exec(
-            f"docker exec {shlex.quote(container_id)} sh -c {shlex.quote(command)}",
-            timeout=10,
-        )
-        if stopped.exit_code != 0:
-            raise SandboxError(f"Compose process group did not stop: {stopped.output}")
         self._cleanup_task = asyncio.create_task(self._cleanup(container_id))
         return asyncio.get_running_loop().time(), int(stopped.output.strip()) if stopped.output.strip() else None
 

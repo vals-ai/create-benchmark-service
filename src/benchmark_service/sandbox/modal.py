@@ -5,7 +5,6 @@ import hashlib
 import os
 import re
 import shlex
-import time
 import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable, Coroutine, Mapping
@@ -22,7 +21,9 @@ from modal.exception import ResourceExhaustedError as ModalResourceExhaustedErro
 from pydantic import BaseModel
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
-from benchmark_service.sandbox._process_group import cleanup_command, owner_command, probe_command, stop_command
+from benchmark_service.sandbox._process_group import (
+    cleanup_command, owner_command, probe_command, stop_command,
+)
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
     ControlledWorkload,
@@ -59,14 +60,6 @@ _CONTROLLED_OUTPUT_TAIL_BYTES = 64 * 1024
 _MAX_NAME_LENGTH = 64
 _INVALID_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_.-]")
 _APP_ID_PATTERN = re.compile(r"^ap-[a-zA-Z0-9]{22}$")
-# Modal admits five sandbox creates per second per workspace (plus a burst
-# allowance), shared by every process that creates them (tracker executors,
-# service verifiers). The pacer keeps one process from spiking past the refill
-# rate; when several processes exhaust the burst together, Modal rejects some
-# creates outright with no retry hint, so those are retried here with backoff
-# for as long as the request's create_timeout allows.
-_CREATES_PER_SECOND_ENV = "MODAL_SANDBOX_CREATES_PER_SECOND"
-_DEFAULT_CREATES_PER_SECOND = 5.0
 _RATE_LIMIT_RETRY_BASE_SECONDS = 1.0
 _RATE_LIMIT_RETRY_MAX_SECONDS = 10.0
 
@@ -109,42 +102,6 @@ class ModalProviderConfig(BaseModel):
 
     def create_provider(self) -> SandboxProvider:
         return ModalSandboxProvider(self)
-
-
-class _CreateRateLimiter:
-    """Space sandbox creates evenly at a fixed rate.
-
-    Callers are released one at a time in arrival order, each at least one
-    interval after the previous release, so a burst of N creates spreads over
-    N / per_second seconds instead of landing at once. Only a release claims
-    the schedule: a caller cancelled while waiting leaves no hole behind.
-    Process-wide: one instance covers every provider.
-    """
-
-    def __init__(self, per_second: float) -> None:
-        if per_second <= 0:
-            raise ValueError(f"{_CREATES_PER_SECOND_ENV} must be > 0")
-        self._interval = 1 / per_second
-        self._next_slot = 0.0
-        self._lock = asyncio.Lock()
-
-    async def acquire(self) -> None:
-        async with self._lock:
-            delay = self._next_slot - time.monotonic()
-            if delay > 0:
-                await asyncio.sleep(delay)
-            self._next_slot = time.monotonic() + self._interval
-
-
-_create_limiter: _CreateRateLimiter | None = None
-
-
-def _create_rate_limiter() -> _CreateRateLimiter:
-    global _create_limiter
-    if _create_limiter is None:
-        per_second = float(os.environ.get(_CREATES_PER_SECOND_ENV) or _DEFAULT_CREATES_PER_SECOND)
-        _create_limiter = _CreateRateLimiter(per_second)
-    return _create_limiter
 
 
 def _sandbox_error(exc: ModalError) -> SandboxError:
@@ -223,8 +180,9 @@ class ModalSandbox(Sandbox):
         if result.exit_code != 0:
             raise SandboxError(f"Modal sandbox does not support process groups: {result.output}")
 
-    def controlled_workload(
-        self, command: str, *, cwd: str | None = None, env_vars: Mapping[str, str] | None = None
+    def _process_group_workload(
+        self, command: str, *, cwd: str | None,
+        env_vars: Mapping[str, str] | None
     ) -> ControlledWorkload:
         return _ModalControlledWorkload(
             self, command, cwd, validate_command_env(env_vars), self._start_controlled_process
@@ -514,7 +472,10 @@ class _ModalControlledWorkload(ControlledWorkload):
 
     async def _launch(self) -> None:
         command = f"cd {shlex.quote(self._cwd)} && {self._command}" if self._cwd else self._command
-        inner = owner_command(command, self._marker, "sh -lc")
+        # Modal exposes separate stdout/stderr pipes. Merge them before either
+        # owner; the shell owner saves FD 4 to suppress its own kill notice.
+        owner = owner_command(command, self._marker, "sh -lc")
+        inner = f"exec 2>&1; {owner}"
         output, process_wait = await self._start_process(inner, self._env_vars)
         self._read_task = asyncio.create_task(self._read_output(output))
         self._process_wait_task = asyncio.create_task(process_wait)
@@ -587,24 +548,17 @@ class _ModalControlledWorkload(ControlledWorkload):
     async def _stop(self) -> tuple[float, int | None]:
         await self._launch_task
         assert self._process_wait_task is not None
-        marker_command = (
-            f"if test -s {shlex.quote(self._marker)}/pgid; then "
-            f"cat {shlex.quote(self._marker)}/pgid; else exit 75; fi"
-        )
+        command = stop_command(self._marker)
         while True:
-            marker = await self._sandbox.exec(marker_command)
-            if marker.exit_code == 0:
-                group_id = int(marker.output.strip())
+            stopped = await self._sandbox.exec(command)
+            if stopped.exit_code == 0:
                 break
-            if marker.exit_code != 75:
-                raise SandboxError(f"Modal controlled marker read failed: {marker.output}")
+            if stopped.exit_code != 75:
+                raise SandboxError(f"Modal process group did not stop: {stopped.output}")
             if self._process_wait_task.done():
                 await self._process_wait_task
                 raise SandboxError("Modal workload finished without a process-group marker")
             await asyncio.sleep(0.05)
-        stopped = await self._sandbox.exec(stop_command(group_id, self._marker))
-        if stopped.exit_code != 0:
-            raise SandboxError(f"Modal process group did not stop: {stopped.output}")
         self._cleanup_task = asyncio.create_task(self._cleanup())
         return asyncio.get_running_loop().time(), int(stopped.output.strip()) if stopped.output.strip() else None
 
@@ -745,9 +699,8 @@ class ModalSandboxProvider(SandboxProvider):
             "outbound_cidr_allowlist": list(_ALLOW_ALL_CIDRS) if allow_all_egress else None,
             "outbound_domain_allowlist": list(_ALLOW_ALL_DOMAINS) if allow_all_egress else None,
             "client": client,
-            "experimental_options": (
-                {"vm_runtime": True} if self._config.runtime == "vm" else {"enable_docker": True}
-            ),
+            "runtime": self._config.runtime,
+            "experimental_options": {"enable_docker": True} if self._config.runtime == "gvisor" else None,
         }
         if request.volumes:
             create_kwargs["volumes"] = self._resolve_volumes(request.volumes, client, request.labels)
@@ -756,10 +709,8 @@ class ModalSandboxProvider(SandboxProvider):
         deadline = loop.time() + request.create_timeout
         retry_delay = _RATE_LIMIT_RETRY_BASE_SECONDS
         try:
-            # create_timeout covers pacer waits and rate-limit retries too, not just the create RPC.
             async with asyncio.timeout_at(deadline):
                 while True:
-                    await _create_rate_limiter().acquire()
                     try:
                         # No entrypoint args: an argless Modal sandbox idles until timeout.
                         inner = await ModalSdkSandbox.create.aio(**create_kwargs)  # pyright: ignore[reportUnknownMemberType]

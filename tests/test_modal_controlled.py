@@ -37,7 +37,7 @@ class _LocalSdkSandbox:
     ) -> _LocalProcess:
         process = await asyncio.create_subprocess_exec(
             *args, env={**os.environ, **(env or {})},
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
         )
         return _LocalProcess(process)
 
@@ -58,12 +58,14 @@ async def test_natural_exit_preserves_output_exit_status_and_vm(
     vm, _ = sandbox
     assert vm.generation_containment == LINUX_PROCESS_GROUP_V1
     await vm.probe_generation_containment()
-    workload = vm.controlled_workload('printf "%s:%s\\n" "$VALUE" "$PWD"; exit ' + str(code),
-                                      cwd=str(tmp_path), env_vars={"VALUE": "hello"})
+    workload = vm.controlled_workload(
+        'printf "%s:%s\n" "$VALUE" "$PWD"; printf "agent-stderr\n" >&2; exit ' + str(code),
+        cwd=str(tmp_path), env_vars={"VALUE": "hello"},
+    )
     try:
         completed = await asyncio.wait_for(workload.wait(), 5)
         assert completed.result.exit_code == code
-        assert completed.result.output == f"hello:{tmp_path}\n"
+        assert completed.result.output == f"hello:{tmp_path}\nagent-stderr\n"
         assert "".join([chunk async for chunk in workload.output()]) == completed.result.output
         assert (await vm.exec("printf vm-alive")).output == "vm-alive"
     finally:
@@ -83,6 +85,7 @@ async def test_deadline_kills_group_child_and_reuses_vm(
         completed = await asyncio.wait_for(workload.wait(), 5)
         assert completed.result.exit_code != 0
         assert first in completed.result.output
+        assert "Killed" not in completed.result.output
         await asyncio.wait_for(workload.kill(), 5)
         assert (await vm.exec(f"test ! -e /proc/{child}/stat || "
                               f"test $(cut -d ' ' -f 3 /proc/{child}/stat) = Z")).exit_code == 0

@@ -31,15 +31,18 @@ def owner_command(command: str, control_dir: str, shell: str) -> str:
     return f"exec 4>&2 2>/dev/null; ( exec setsid sh -c {shlex.quote(script)} 2>&4 4>&- ); exit $?"
 
 
-def stop_command(group_id: int, control_dir: str) -> str:
+def stop_command(control_dir: str) -> str:
     directory = shlex.quote(control_dir)
+    proof = f'if [ -s {directory}/status ]; then cat {directory}/status; fi'
     return (
+        f'if [ ! -s {directory}/pgid ]; then exit 75; fi\n'
+        f'IFS= read -r group_id < {directory}/pgid || exit 1\n'
         "alive() {\n"
         "  for stat in /proc/[0-9]*/stat; do\n"
         '    IFS= read -r line 2>/dev/null < "$stat" || continue\n'
         '    fields=${line##*) }\n'
         '    set -- $fields\n'
-        f'    if [ "$3" = "{group_id}" ]; then\n'
+        '    if [ "$3" = "$group_id" ]; then\n'
         '      case "$1" in Z|X) ;; *) return 0 ;; esac\n'
         '    fi\n'
         '  done\n'
@@ -56,7 +59,7 @@ def stop_command(group_id: int, control_dir: str) -> str:
         '  [ "$n" -lt 20 ] || exit 1\n'
         '  sleep 0.05\n'
         'done\n'
-        f'if [ -s {directory}/status ]; then cat {directory}/status; fi'
+        + proof
     )
 
 

@@ -141,8 +141,8 @@ Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` 
 ```
 
 When a setup or evaluate-instance request omits `sandbox_provider`, the Daytona header fallback reads
-`x-api-key`, `x-api-url`, and `x-target`, plus optional `x-organization-id`. The legacy
-`daytona_api_key`, `daytona_api_url`, and `daytona_target` aliases remain accepted.
+`x-api-key`, `x-api-url`, and `x-target`, plus optional `x-organization-id`. The
+`daytona_api_key`, `daytona_api_url`, and `daytona_target` aliases are also accepted.
 Providing the organization ID enables organization-scoped capacity admission; omitting it preserves direct creation.
 `SandboxProvider.get_capacity_domains()` reports Daytona CPU, memory, disk, and aggregate GPU usage plus allowed GPU
 types separately for every canonical target and sandbox class; `get_capacity()` retains its configured-target container
@@ -156,10 +156,10 @@ Provider compatibility notes:
 - `Sandbox.modify_egress_rules(addresses)` applies a non-empty allowlist, `Sandbox.block_all_egress()` denies all outbound access, and `Sandbox.clear_egress_rules()` restores unrestricted access. Deny-all is a separate provider-native operation; do not represent it as `modify_egress_rules([])`. `ComposeSandbox` forwards all three operations to its outer sandbox.
 - `Sandbox.labels` and `Sandbox.created_at` expose provider inventory metadata when available; unsupported metadata is `None`, and creation times are timezone-aware UTC. `SandboxQuery.created_at_lte` is an inclusive creation-time bound. Daytona supports it and always limits listing to the provider's configured target, which may be a Daytona region name or ID. Modal rejects creation-time-bounded listing.
 - Modal supports both `ImageSource` (registry pull) and `SnapshotSource` (a Modal filesystem snapshot created via `Sandbox.snapshot_filesystem()`, restored by image id). `TargetedSnapshotSource` is Daytona-only.
-- Daytona uses `TargetedSnapshotSource(snapshot=..., target=...)` to select the target for admission and creation. Admission uses the snapshot's CPU, memory, disk, and sandbox class with the exact target's organization-usage row; GPU snapshots retain unmetered GPU admission. Its legacy `docker_image` value is intentionally invalid because that field cannot preserve the target.
+- Daytona uses `TargetedSnapshotSource(snapshot=..., target=...)` to select the target for admission and creation. Admission uses the snapshot's CPU, memory, disk, and sandbox class with the exact target's organization-usage row; GPU snapshots retain unmetered GPU admission. `docker_image` is invalid on targeted snapshots because that field cannot preserve the target.
 - Modal sandboxes do not expose a disk-size parameter; `Resources.disk` is accepted for schema compatibility but not enforced.
 - GPUs are requested via `Resources.gpu` (count) and `Resources.gpu_type`. Modal requires `gpu_type` (any Modal GPU name, e.g. `H100`, `A100-80GB`, `T4`) and passes `"<type>:<count>"` to the sandbox. Daytona accepts a count with an optional type restricted to its `GpuType` enum (`H100`, `H200`, `RTX-PRO-6000`, `RTX-4090`, `RTX-5090`); GPU requests are rejected for Daytona snapshot sandboxes because snapshot resources are fixed at snapshot creation.
-- Nested Docker (Docker-in-Docker) capability is granted on every sandbox for Daytona and Modal — Daytona supports it natively and the Modal adapter requests it unconditionally — so benchmarks never configure it. The benchmark service still owns the Docker-capable image, dockerd startup flags, compose workflow, and cleanup.
+- Nested Docker (Docker-in-Docker) capability is granted on every sandbox for Daytona and Modal — Daytona supports it natively and the Modal adapter requests it unconditionally — so benchmarks never configure it. The benchmark service owns the Docker-capable image, dockerd startup flags, compose workflow, and cleanup.
 - Transient Modal connection errors are retried up to three attempts, matching the Daytona adapter's provider-level retry shape. Non-transient command failures still surface as `SandboxCommandError` with the command exit code.
 
 ### Local Docker sandboxes
@@ -215,28 +215,27 @@ active-generation clock for every task: an explicit credited allowance takes pre
 otherwise `agent_timeout` supplies the allowance, otherwise there is no generation deadline.
 The explicit credited allowance is positive and finite; `stage_protocol=None` charges the whole
 command interval, while `"valkyrie-stage/1"` selects benchmark-owned intervals and requires
-that finite credited allowance. Tracker charges a finite base `B` plus capped optional SSP
+that finite credited allowance. Tracker charges a finite base `B` plus capped optional accounting
 credit `C` across intervals; setup, evaluation, and gaps between intervals do not debit the
-clock. SSP passively counts neutral overhead for the native Gateway bearer; Tracker alone reads
-the counter during generation and, unless exhaustion has frozen the accepted credit, after confirmed stop.
+clock. A configured accounting proxy counts neutral overhead for the native Gateway bearer.
+Tracker reads the counter during generation and, unless exhaustion has frozen the accepted credit, after confirmed stop.
 In Tracker task results, null base/effective
 allowances mean no generation deadline; `generation_elapsed_seconds` is still measured at terminal
 finalization. A null elapsed value instead means no generation-time measurement was recorded.
 The independent 166-hour whole-task wall applies to every selected task, including those without
 a generation deadline. Modal separately limits each sandbox to a 24-hour provider lifetime.
-SSP is optional and independent of whether `credited_generation` is present; eligibility needs
-configured SSP access, a resolved native Gateway URL and key, and an attested model. Missing
+Accounting credit is optional and independent of whether `credited_generation` is present; eligibility needs
+configured proxy access, a resolved native Gateway URL and key, and an attested model. Missing
 eligibility uses the base clock; failure of an eligible counter read does not silently fall back.
-Without a base allowance, optional SSP credit does not create a generation deadline.
+Without a base allowance, optional accounting credit does not create a generation deadline.
 
 When an explicit finite credited allowance selects `stage_protocol="valkyrie-stage/1"`, Tracker
-gives the outer controlled workload (agent command or episode orchestrator) `VALKYRIE_STAGE_DIR=/run/valkyrie-stage`. The sandbox-private directory contains a 64-hex-character
+gives the outer controlled agent command `VALKYRIE_STAGE_DIR=/run/valkyrie-stage`. The sandbox-private directory contains a 64-hex-character
 `key` and an initially empty `ack/` directory. During `setup_task`, upload the bytes from
 `benchmark_service.valkyrie_stage_source()` as `valkyrie_stage.py` and import `StageReporter`
-from that standalone file inside the benchmark-owned supervisor. Keep the key, directory,
-ACK path and environment variable invisible to every model-capable workload: do not mount
-or pass them into nested generation containers. If they cannot be isolated, do not use this
-stage protocol.
+from that standalone file inside the benchmark-owned agent command. The benchmark owns stage
+reporting: BEGIN precedes model-capable execution, and END follows confirmed absence. Nested
+Docker workloads should not receive the reporter key or stage directory.
 
 `StageReporter().begin(container)` flushes one stdout frame and blocks until Tracker ACKs,
 before launching that model-capable container. `end()` reports the same container only
@@ -252,8 +251,8 @@ odd `begin` / even `end`. After applying each transition, Tracker publishes
 `ack/<seq>` atomically; the reporter polls at 100 ms with no timeout. Tracker
 reassembles lines across output chunks; text from the agent is never a stage event.
 
-For a VCB 1→100-style supervisor running multiple Docker-backed rounds within one agent
-command (illustrative, not a migration of VCB):
+For a benchmark-owned supervisor running multiple Docker-backed rounds within one agent
+command:
 
 ```python
 import subprocess
@@ -273,58 +272,6 @@ for round_number in range(1, 11):
 On failure, do not assert an END without proof of absence. Tracker owns timeout and terminal
 cleanup, including nested container inspection on abort. Neither model output nor benchmark
 code may assert a generation credit.
-
-An opt-in episode declares
-`RetrieveTaskResponse.episode = Episode(command="exec python /opt/bench/orchestrator.py", parallel_agents=5)`.
-It requires `credited_generation` with `stage_protocol="valkyrie-stage/1"`; without an episode,
-Tracker runs the agent command directly. In a `linux_process_group` sandbox, the image must
-provide Python 3.8+ as `python3` on `PATH` for the CBS-owned episode supervisor; the benchmark
-orchestrator still owns its command and interpreter. Native Daytona cgroup episodes use their
-native controlled workload unchanged. Tracker runs the benchmark-owned `episode.command`
-instead of the agent command and writes the selected agent bundle to
-`$VALKYRIE_STAGE_DIR/agent.json` after setup: `run_cmd`, `continue_cmd`, `interrupt_grace_seconds`,
-`container_name`, `final_output`, `parallel_agents`, and `slots_root`. The library owns a single `StageReporter`
-and starts each selected-agent turn in a new process group. The bundle renders `{problem_statement_path}` to that turn's
-observation file and `{slot_dir}` to `<slots_root>/<slot>/agent`. When `container_name` is
-configured, `{container_name}` is bound to that template with `{slot}` filled first; otherwise
-it remains literal in the command. Other unbound tokens also remain literal. These are
-bound token replacements, not arbitrary format-string interpolation; inserted values
-containing braces remain opaque. In `final_output`, `{slot_dir}` is replaced for each
-configured path. The orchestrator names slots and shares one workspace and budget across
-multiple slots; each slot has separate
-runtime/session/output state. More than `parallel_agents` live turns are refused. A second turn on a slot requires
-`continue_cmd`. Children inherit the orchestrator's cwd, stdout and stderr. When
-`VALKYRIE_GENERATION_MODEL_GATEWAY_URL` is configured, `Agents` copies the environment for each
-selected-agent child and sets only its `MODEL_GATEWAY_URL` to that generation URL just before launch;
-the orchestrator and evaluation processes retain the native `MODEL_GATEWAY_URL`. Without the explicit
-generation URL, children inherit the native route. Custom staged orchestrators must likewise route
-generation clients and children through the explicit generation URL while preserving the native route
-for evaluation, including when generation and evaluation overlap. After a turn's
-process group and any container are absent, the last active turn sends END and waits for its ACK before copying
-the bundle's existing `final_output` file or directory into `<slots_root>/<slot>/turns/<n>/`. A file keeps its basename;
-`n` starts at 1 per slot. `final_output` may contain `{slot_dir}` and is rendered for each slot before launch;
-Tracker requires that placeholder when `parallel_agents > 1` and `final_output` is set, so parallel slots do not
-snapshot the same path. The agent workspace and turn snapshots are siblings, so a `final_output` of `{slot_dir}`
-or `{slot_dir}/turns` cannot recursively include earlier snapshots. Tracker archives `slots_root` as the episode output.
-
-Upload `valkyrie_stage_source()` as `valkyrie_stage.py` during setup and import `Agents` there with Python 3.8+:
-
-```python
-from valkyrie_stage import Agents, Exhausted
-
-agents = Agents()
-agents.start("first", "/workspace/observations/first.txt")
-result = agents.wait_any()  # SlotResult(slot, reason, exit_code)
-agents.start("first", "/workspace/observations/next.txt")  # Requires continue_cmd.
-result = agents.stop("first")  # SIGINT grace (or immediate SIGKILL for null), then confirmed absence.
-```
-
-`start` reports BEGIN and waits for ACK before spawning the first slot; the last slot completes only after its
-process group is empty, any named Docker container has been removed and listed absent, and END is ACKed. Overlapping
-slots count as one union interval. `stop` returns reason `stopped`; `wait_any` returns `exited` or `exhausted` as
-appropriate. Tracker writes `$VALKYRIE_STAGE_DIR/exhausted` before its ACK when the shared budget expires. The
-library kills all running groups, completes their cleanup and END, and later `start` raises `Exhausted`. If the
-notice arrives with BEGIN ACK, no child starts and no END is sent.
 
 For every task, check `sandbox.generation_containment` and run
 `await sandbox.probe_generation_containment()` before starting a controlled workload. An advertised
@@ -374,9 +321,9 @@ and proc visibility before launch.
 Native Modal and local Docker also advertise `linux_process_group` v1, probe the same group
 boundary, and run controlled commands through their own provider process transports. Stop
 targets the workload group, not the reusable Modal sandbox (including the selected VM runtime)
-or local Docker task container. Confirmation covers live members of the marked process group
-in the same PID namespace; it does not cover independently detached processes or
-Docker-daemon-owned descendants.
+or local Docker task container. For ordinary controlled commands, confirmation covers live
+members of the marked process group in the same PID namespace, not independently detached
+processes. Docker-daemon-owned descendants remain outside that boundary.
 
 Consume `workload.output()` for streamed text. `await workload.wait()` returns
 `ControlledWorkloadResult(result=ExecResult(exit_code, output), absence_confirmed_at=...)`
@@ -385,8 +332,8 @@ after its backend-specific stop boundary is confirmed. On a deadline or other ab
 cannot be confirmed. The timestamp is event-loop monotonic time, not a wall-clock
 datetime. The caller owns deadline arbitration and must not proceed to independent
 collection on unconfirmed stop. Ordinary `Sandbox.command()` and `Sandbox.exec()`
-do not provide this contract. On native Modal and local Docker, `result.output` is a bounded
-tail; consume `workload.output()` while running for the full stream.
+do not provide this contract. On Daytona, native Modal, and local Docker, `result.output` is a bounded
+tail (at most 64 KiB of UTF-8 bytes for Daytona); consume `workload.output()` while running for the full stream.
 For process-group backends (Compose, native Modal, and local Docker), a waiting shell's synthetic signal-exit notice is excluded from controlled output while the workload's actual stderr is preserved.
 Local Docker decodes UTF-8 independently for stdout and stderr; their relative ordering
 is not guaranteed.
@@ -435,8 +382,8 @@ object key, bucket, or tenant credential.
 
 These deployments require `SUBMISSION_ARTIFACT_BUCKET` and `AWS_REGION`.
 Artifact admission and evaluation share the normal grading concurrency and
-duplicate-request limits. Text evaluation and the websocket resume endpoints
-remain unchanged.
+duplicate-request limits. Text evaluation and WebSocket resume use their own
+routes and stream contracts.
 
 ### Sandbox-based evaluation (`eval_mode = SANDBOX`)
 
@@ -546,7 +493,7 @@ Status codes: 403 when authentication is required but the caller lacks an allowe
 
 ### Client-owned sandbox recovery
 
-`BenchmarkServiceClient.run_with_sandbox_recovery(...)` owns the bounded loop for tasks that opt in with `SandboxRecoveryPolicy`. It loads the task once, retries only provider-confirmed `SandboxNotFoundError` losses, and counts every fresh-sandbox attempt against one overall cap. Callers can explicitly include setup errors that also require a fresh sandbox; `default_max_attempts` retains the legacy fallback cap for benchmarks without a recovery policy and bounds consecutive setup attempts when a policy is present.
+`BenchmarkServiceClient.run_with_sandbox_recovery(...)` owns the bounded loop for tasks that opt in with `SandboxRecoveryPolicy`. It loads the task once, retries only provider-confirmed `SandboxNotFoundError` losses, and counts every fresh-sandbox attempt against one overall cap. Callers can explicitly include setup errors that also require a fresh sandbox; `default_max_attempts` supplies the cap for benchmarks without a recovery policy and bounds consecutive setup attempts when a policy is present.
 
 The operation receives a `SandboxRecoveryAttempt`. Merge its `environment` into the sandbox environment, then call `mark_replacement_ready()` only after benchmark setup has durably recorded the outage. A failed replacement setup therefore carries the same outage ID into the next sandbox, while a later provider loss gets a globally unique ID that cannot collide after a runner restart. `sandbox_loss_retry_available` lets a runner persist its normal terminal task error without duplicating the policy calculation.
 
@@ -575,10 +522,10 @@ result = await client.run_with_sandbox_recovery(
 
 Pydantic models used across requests and responses:
 
-- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, optional `CreditedGeneration(allowance_seconds, stage_protocol)`, optional `Episode(command, parallel_agents)`, `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
+- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, optional `CreditedGeneration(allowance_seconds, stage_protocol)`, `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
 - **`GenerationContainment`** — effective-sandbox capability: `linux_cgroup_v2` v1 for direct Daytona native-session commands fenced by cgroup v2, or `linux_process_group` v1 for Compose service, native Modal, and local Docker workloads. Tracker probes the effective sandbox for every task before its `ControlledWorkload` and does not fall back to `Sandbox.command()` on unsupported providers.
-- **`agent_install_order`** — `"before_setup"` installs agent dependencies before benchmark setup; `"after_setup"` lets setup prepare the environment first. It defaults to `"before_setup"`, so older task responses remain valid; lifecycle execution is the caller's responsibility.
-- **`BenchmarkEgressPlan`** — declarative `setup_task`, agent `run`, and `evaluation` policies. `"*"` is unrestricted, `[]` is deny-all, and a non-empty list is an allowlist. Setup and evaluation default to `"*"`; `run=None` means the benchmark has no run-policy opinion, preserving legacy task behavior. Applying and composing the plan is the caller's responsibility.
+- **`agent_install_order`** — `"before_setup"` installs agent dependencies before benchmark setup; `"after_setup"` lets setup prepare the environment first. The default is `"before_setup"`; lifecycle execution is the caller's responsibility.
+- **`BenchmarkEgressPlan`** — declarative `setup_task`, agent `run`, and `evaluation` policies. `"*"` is unrestricted, `[]` is deny-all, and a non-empty list is an allowlist. Setup and evaluation default to `"*"`; `run=None` leaves the benchmark without a run-policy opinion. Applying and composing the plan is the caller's responsibility.
 - **`SandboxRecoveryPolicy`** — explicit opt-in to recreate a lost generation sandbox with the same run identity and volumes; `max_sandbox_attempts` (2–20, inclusive) includes the initial sandbox
 - **`SandboxSource`** — `ImageSource`, `SnapshotSource`, top-level Daytona-only `TargetedSnapshotSource`, or `ComposeSource` with an outer image/snapshot
 - **`EvalSandboxSpec`** — grading overrides whose optional `source` is an image or snapshot, never `ComposeSource`
@@ -684,7 +631,7 @@ class MyBenchmarkService(BenchmarkService):
 
 Header names are lowercase per HTTP convention. Requests that fail auth receive a `401 Unauthorized` response automatically.
 
-Valkyrie users normally configure their Descope credential once via the CLI. Legacy/custom service credentials can still be configured separately:
+Valkyrie users configure their Descope credential via the CLI. Service-specific credentials can be configured separately:
 
 ```bash
 valkyrie config auth set <benchmark-name> <credential>

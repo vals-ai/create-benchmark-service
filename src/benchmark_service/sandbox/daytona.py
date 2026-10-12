@@ -119,6 +119,7 @@ _TRANSIENT_DAYTONA_ERRORS = (DaytonaConnectionError, DaytonaRateLimitError, Dayt
 _RETRY_AFTER_PREFIX = "retry-after-"
 _KNOWN_THROTTLERS = ("sandbox-create", "sandbox-lifecycle", "authenticated", "anonymous")
 _DELETE_CONFLICT_MESSAGES = ("state change in progress", "modified by another operation")
+_NETWORK_SETTINGS_IN_PROGRESS_MESSAGES = ("operation is already in progress",)
 _REMOVED_SANDBOX_CLIENT_STATUSES = (404, 502)
 _RETRYABLE_PROVIDER_STATUSES = (408, 429, 500, 502, 503, 504)
 _FAILED_EXECUTE_COMMAND_PREFIX = "failed to execute command:"
@@ -563,6 +564,20 @@ class DaytonaSandbox(Sandbox):
             return SandboxConnectionError(f"Sandbox connection error for {self._sandbox_ref}: {exc}")
         return SandboxError(f"Sandbox operation failed for {self._sandbox_ref}: {exc}")
 
+    async def _update_network_settings(self, update: Callable[[], Awaitable[None]]) -> None:
+        for conflict_attempt in range(2):
+            try:
+                await _bounded(
+                    "update_network_settings", update(), _TOOLBOX_CALL_TIMEOUT_SECONDS
+                )
+                return
+            except _SANDBOX_OPERATION_ERRORS as exc:
+                if conflict_attempt == 0 and _message_contains(
+                    exc, _NETWORK_SETTINGS_IN_PROGRESS_MESSAGES
+                ):
+                    continue
+                raise self._sandbox_error(exc) from exc
+
     @_PROVIDER_RETRY
     async def exec(
         self,
@@ -655,44 +670,29 @@ class DaytonaSandbox(Sandbox):
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
         network_allow_list, domain_allow_list = _resolve_daytona_allowed_addresses(allowed_addresses)
 
-        try:
-            await _bounded(
-                "update_network_settings",
-                self._sandbox.update_network_settings(
-                    network_block_all=False,
-                    network_allow_list=",".join(network_allow_list),
-                    domain_allow_list=",".join(domain_allow_list),
-                ),
-                _TOOLBOX_CALL_TIMEOUT_SECONDS,
+        await self._update_network_settings(
+            lambda: self._sandbox.update_network_settings(
+                network_block_all=False,
+                network_allow_list=",".join(network_allow_list),
+                domain_allow_list=",".join(domain_allow_list),
             )
-        except _SANDBOX_OPERATION_ERRORS as exc:
-            raise self._sandbox_error(exc) from exc
+        )
 
     @_PROVIDER_RETRY
     async def block_all_egress(self) -> None:
-        try:
-            await _bounded(
-                "update_network_settings",
-                self._sandbox.update_network_settings(network_block_all=True),
-                _TOOLBOX_CALL_TIMEOUT_SECONDS,
-            )
-        except _SANDBOX_OPERATION_ERRORS as exc:
-            raise self._sandbox_error(exc) from exc
+        await self._update_network_settings(
+            lambda: self._sandbox.update_network_settings(network_block_all=True)
+        )
 
     @_PROVIDER_RETRY
     async def clear_egress_rules(self) -> None:
-        try:
-            await _bounded(
-                "update_network_settings",
-                self._sandbox.update_network_settings(
-                    network_block_all=False,
-                    network_allow_list="",
-                    domain_allow_list="",
-                ),
-                _TOOLBOX_CALL_TIMEOUT_SECONDS,
+        await self._update_network_settings(
+            lambda: self._sandbox.update_network_settings(
+                network_block_all=False,
+                network_allow_list="",
+                domain_allow_list="",
             )
-        except _SANDBOX_OPERATION_ERRORS as exc:
-            raise self._sandbox_error(exc) from exc
+        )
 
     async def _exec_pty(self, command: str, output: asyncio.Queue[str], env_vars: dict[str, str]) -> ExecResult:
         session_id = f"{self.id}:exec-{uuid.uuid4().hex}"

@@ -851,6 +851,31 @@ class InnerSandbox:
         self.refresh_count += 1
 
 
+class NetworkSettingsInProgressSandbox(InnerSandbox):
+    def __init__(self, failures: int = 1) -> None:
+        super().__init__()
+        self._failures = failures
+        self.network_settings_attempts = 0
+
+    async def update_network_settings(
+        self,
+        *,
+        network_block_all: bool | None = None,
+        network_allow_list: str | None = None,
+        domain_allow_list: str | None = None,
+    ) -> None:
+        self.network_settings_attempts += 1
+        if self.network_settings_attempts <= self._failures:
+            raise DaytonaError(
+                "Failed to update network settings: operation is already in progress"
+            )
+        await super().update_network_settings(
+            network_block_all=network_block_all,
+            network_allow_list=network_allow_list,
+            domain_allow_list=domain_allow_list,
+        )
+
+
 class RemovedInnerSandbox(InnerSandbox):
     async def refresh_data(self) -> None:
         raise DaytonaNotFoundError("sandbox not found")
@@ -4097,6 +4122,72 @@ def test_daytona_provider_rejects_blank_target() -> None:
                 DAYTONA_TARGET="   ",
             )
         )
+
+
+@pytest.mark.parametrize(
+    ("operation", "arguments", "expected_settings"),
+    [
+        pytest.param(
+            "modify_egress_rules",
+            (["api.openai.com"],),
+            {
+                "network_block_all": False,
+                "network_allow_list": "",
+                "domain_allow_list": "api.openai.com",
+            },
+            id="modify",
+        ),
+        pytest.param(
+            "block_all_egress",
+            (),
+            {
+                "network_block_all": True,
+                "network_allow_list": None,
+                "domain_allow_list": None,
+            },
+            id="block",
+        ),
+        pytest.param(
+            "clear_egress_rules",
+            (),
+            {
+                "network_block_all": False,
+                "network_allow_list": "",
+                "domain_allow_list": "",
+            },
+            id="clear",
+        ),
+    ],
+)
+async def test_daytona_retries_network_settings_already_in_progress(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: str,
+    arguments: tuple[object, ...],
+    expected_settings: dict[str, str | bool | None],
+) -> None:
+    inner = NetworkSettingsInProgressSandbox()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+    method = cast(Callable[..., Awaitable[None]], getattr(sandbox, operation))
+    _skip_retry_sleep(monkeypatch, getattr(DaytonaSandbox, operation))
+
+    await method(*arguments)
+
+    assert inner.network_settings_attempts == 2
+    assert inner.network_settings == [expected_settings]
+
+
+async def test_daytona_retries_network_settings_already_in_progress_only_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    inner = NetworkSettingsInProgressSandbox(failures=2)
+    sandbox = DaytonaSandbox(cast(Any, inner))
+    _skip_retry_sleep(monkeypatch, DaytonaSandbox.block_all_egress)
+
+    with pytest.raises(SandboxError, match="operation is already in progress"):
+        await sandbox.block_all_egress()
+
+    assert inner.network_settings_attempts == 2
+    assert inner.network_settings == []
 
 
 async def test_daytona_updates_egress_rules() -> None:

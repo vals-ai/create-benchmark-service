@@ -239,7 +239,7 @@ Docker workloads should not receive the reporter key or stage directory. The `Ag
 copies the orchestrator environment into selected-agent child subprocesses, including
 `VALKYRIE_STAGE_DIR`; it does not isolate those children from the stage files.
 
-`StageReporter().begin(container)` flushes one stdout frame and blocks until Tracker ACKs,
+`StageReporter().begin(container)` flushes an initial stdout frame and blocks until Tracker ACKs,
 before launching that model-capable container. `end()` reports the same container only
 after confirmed absence of the container and its nested workload; it blocks until ACK before
 evaluation or the next round. `container` is the Docker container name, or `None` for a
@@ -250,8 +250,11 @@ ASCII JSON `{"seq":<int>,"event":"begin"|"end","container":<str|null>}`;
 `mac` is lowercase hex HMAC-SHA256 over the base64url payload token's ASCII bytes,
 keyed by the 32 bytes decoded from `key`. Sequences start at 1, increment by 1, and alternate
 odd `begin` / even `end`. After applying each transition, Tracker publishes
-`ack/<seq>` atomically; the reporter polls at 100 ms with no timeout. Tracker
-reassembles lines across output chunks; text from the agent is never a stage event.
+`ack/<seq>` atomically. Until ACK, the reporter retransmits the identical signed frame
+every 3 monotonic seconds and polls ACK every 100 ms with no reporter timeout. A later
+copy can reach a live Tracker after an earlier frame is lost; ordinary agent output
+is not replayed. Tracker reassembles lines across output chunks; text from the agent
+is never a stage event.
 
 For a benchmark-owned supervisor running multiple Docker-backed rounds within one agent
 command:
@@ -344,6 +347,8 @@ whose child enters a dedicated cgroup v2 subgroup. Natural completion and `kill(
 use `cgroup.kill`, confirm `populated 0` and remove the subgroup; the PTY session
 is also confirmed absent. The probe requires writable cgroup v2 delegation with
 `cgroup.kill`; the sandbox's other services remain outside the workload subgroup.
+The command runs as a foreground PTY job; shell setup and job-control text are not
+part of its streamed output, while workload stdout and stderr remain included.
 
 `ComposeSandbox` supports `linux_process_group` v1 (`LINUX_PROCESS_GROUP_V1`).
 It pins the running service container, starts the command in a new process group inside

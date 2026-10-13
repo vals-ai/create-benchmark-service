@@ -46,9 +46,14 @@ class StageReporter:
         ).encode("ascii")
         frame = base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
         mac = hmac.new(self._key, frame.encode("ascii"), hashlib.sha256).hexdigest()
-        print(f"\nVALKYRIE-STAGE/1 {frame} {mac}", file=sys.stdout, flush=True)
+        wire = f"\nVALKYRIE-STAGE/1 {frame} {mac}"
+        print(wire, file=sys.stdout, flush=True)
         ack = self._stage_dir / "ack" / str(self._seq)
+        retry_at = time.monotonic() + 3
         while not ack.exists():
+            if time.monotonic() >= retry_at:
+                print(wire, file=sys.stdout, flush=True)
+                retry_at = time.monotonic() + 3
             time.sleep(0.1)
 
 

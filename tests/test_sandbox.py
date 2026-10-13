@@ -5,7 +5,7 @@ import shlex
 import signal
 import subprocess
 from collections.abc import AsyncGenerator, Mapping
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -4515,6 +4515,7 @@ class CgroupProcess(Process):
         self.removal_fails = False
         self.sessions: set[str] = set()
         self.poll_error = False
+        self.pty_marker: str
 
     async def exec(self, command: str) -> SimpleNamespace:
         command = _unwrap_shell_command(command)
@@ -4551,6 +4552,7 @@ class CgroupProcess(Process):
     ) -> "CgroupPtyHandle":
         _assert_pty_create_config(envs, pty_size)
         self.sessions.add(id)
+        self.pty_marker = envs[_PTY_CREATE_MARKER_ENV]
         handle = CgroupPtyHandle(on_data, self)
         self.handle = handle
         return handle
@@ -4571,7 +4573,9 @@ class CgroupPtyHandle(PtyHandle):
 
     async def send_input(self, data: str) -> None:
         await super().send_input(data)
-        if not data.startswith("stty"):
+        if data.startswith("stty"):
+            await self.emit(self.process.pty_marker.encode() + b"\r\n")
+        else:
             self.process.command_admitted.set()
 
     async def wait(self) -> PtyResult:
@@ -4588,7 +4592,25 @@ def _cgroup_sandbox(process: CgroupProcess) -> DaytonaSandbox:
 
 
 async def test_daytona_controlled_utf8_spans_callbacks_and_reconnect_and_flushes_at_completion() -> None:
+    class InitialHandle(CgroupPtyHandle):
+        async def send_input(self, data: str) -> None:
+            self.inputs.append(data)
+            self.process.setup_sent.set()
+
+        async def wait(self) -> PtyResult:
+            await self.process.setup_sent.wait()
+            return PtyResult(exit_code=None, error="WebSocket error")
+
     class FirstHandle(CgroupPtyHandle):
+        async def send_input(self, data: str) -> None:
+            if data.startswith("stty"):
+                self.inputs.append(data)
+                await self.emit(b"stty -echo && setup shell text\r\n")
+                marker = self.process.pty_marker.encode()
+                await self.emit(marker[:11])
+                await self.emit(marker[11:] + b"\r\n")
+            else:
+                await super().send_input(data)
         async def wait(self) -> PtyResult:
             await self.process.command_admitted.wait()
             await self.emit(b"before-\xe2")
@@ -4605,6 +4627,8 @@ async def test_daytona_controlled_utf8_spans_callbacks_and_reconnect_and_flushes
         def __init__(self) -> None:
             super().__init__()
             self.reconnected = asyncio.Event()
+            self.setup_sent = asyncio.Event()
+            self.reconnect_count = 0
 
         async def create_pty_session(
             self, *, id: str, on_data: Callable[[bytes], None | Awaitable[None]],
@@ -4612,7 +4636,8 @@ async def test_daytona_controlled_utf8_spans_callbacks_and_reconnect_and_flushes
         ) -> CgroupPtyHandle:
             _assert_pty_create_config(envs, pty_size)
             self.sessions.add(id)
-            self.handle = FirstHandle(on_data, self)
+            self.pty_marker = envs[_PTY_CREATE_MARKER_ENV]
+            self.handle = InitialHandle(on_data, self)
             return self.handle
 
         async def get_pty_session_info(self, session_id: str) -> SimpleNamespace:
@@ -4623,9 +4648,13 @@ async def test_daytona_controlled_utf8_spans_callbacks_and_reconnect_and_flushes
             self, session_id: str, on_data: Callable[[bytes], None | Awaitable[None]],
         ) -> CgroupPtyHandle:
             assert session_id in self.sessions
-            self.handle = LastHandle(on_data, self)
-            await self.handle.emit(b"\x82\xac-after-")
-            self.reconnected.set()
+            self.reconnect_count += 1
+            if self.reconnect_count == 1:
+                self.handle = FirstHandle(on_data, self)
+            else:
+                self.handle = LastHandle(on_data, self)
+                await self.handle.emit(b"\x82\xac-after-")
+                self.reconnected.set()
             return self.handle
 
     process = SplitProcess()
@@ -4637,6 +4666,7 @@ async def test_daytona_controlled_utf8_spans_callbacks_and_reconnect_and_flushes
     process.allow_final_frame.set()
     result = await asyncio.wait_for(workload.wait(), 2)
     assert result.result.exit_code == 7
+    assert process.reconnect_count == 2
     assert result.result.output == "before-€-after-�"
     assert "".join([chunk async for chunk in workload.output()]) == result.result.output
     await process.handle.emit(b"late")
@@ -4776,7 +4806,7 @@ async def test_daytona_unconfirmed_group_removal_never_reports_absence() -> None
     process.allow_final_frame.set()
 
 
-async def test_daytona_kill_during_group_creation_prevents_command_admission() -> None:
+async def test_daytona_kill_before_command_admission() -> None:
     process = CgroupProcess()
     process.allow_removal.set()
     workload = _cgroup_sandbox(process).controlled_workload("must-not-run")
@@ -4787,6 +4817,38 @@ async def test_daytona_kill_during_group_creation_prevents_command_admission() -
     assert not process.command_admitted.is_set()
     assert not process.group_exists
     assert process.sessions == set()
+
+    class NoMarkerHandle(CgroupPtyHandle):
+        async def send_input(self, data: str) -> None:
+            self.inputs.append(data)
+            self.process.setup_sent.set()
+
+        async def wait(self) -> PtyResult:
+            await self.process.setup_sent.wait()
+            return PtyResult(exit_code=None, error="WebSocket error")
+
+    class NoMarkerProcess(CgroupProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.setup_sent = asyncio.Event()
+
+        async def create_pty_session(
+            self, *, id: str, on_data: Callable[[bytes], None | Awaitable[None]],
+            envs: dict[str, str], pty_size: PtySize,
+        ) -> CgroupPtyHandle:
+            _assert_pty_create_config(envs, pty_size)
+            self.sessions.add(id)
+            return NoMarkerHandle(on_data, self)
+
+    stalled = NoMarkerProcess()
+    stalled.allow_creation.set()
+    stalled.allow_removal.set()
+    stopped = _cgroup_sandbox(stalled).controlled_workload("must-not-run")
+    await asyncio.wait_for(stalled.setup_sent.wait(), 2)
+    await asyncio.wait_for(stopped.kill(), 2)
+    assert not stalled.command_admitted.is_set()
+    assert not stalled.group_exists
+    assert stalled.sessions == set()
 
 
 async def test_daytona_control_poll_failure_can_still_be_stopped_explicitly(
@@ -4864,6 +4926,7 @@ class LocalShellCgroupProcess(CgroupProcess):
     ) -> "LocalShellCgroupPtyHandle":
         _assert_pty_create_config(envs, pty_size)
         self.sessions.add(id)
+        self.pty_marker = envs[_PTY_CREATE_MARKER_ENV]
         return LocalShellCgroupPtyHandle(on_data, self)
 
 
@@ -4874,8 +4937,10 @@ class LocalShellCgroupPtyHandle(CgroupPtyHandle):
 
     async def send_input(self, data: str) -> None:
         if data.startswith("stty"):
+            await self.emit(self.process.pty_marker.encode() + b"\r\n")
             return
-        local_command = data.replace(
+        local_command = shlex.split(data.removeprefix(f"unset {_PTY_CREATE_MARKER_ENV}; "))[3]
+        local_command = local_command.replace(
             f"{self.process.group_name}/cgroup.procs", str(self.process.group / "cgroup.procs")
         )
         local_command = local_command.replace(
@@ -4890,6 +4955,7 @@ class LocalShellCgroupPtyHandle(CgroupPtyHandle):
         self.process.command_admitted.set()
 
     async def wait(self) -> PtyResult:
+        await self.process.command_admitted.wait()
         output, _ = await self.worker.communicate()
         await self.emit(output)
         return PtyResult(exit_code=self.worker.returncode, error=None)
@@ -4919,6 +4985,67 @@ async def test_daytona_controlled_nonnull_cwd_runs_real_shell_and_preserves_exit
         assert process.sessions == set()
     finally:
         await _finish_local_workers(process)
+
+async def _generated_daytona_command_in_host_pty(command: str, tmp_path: Path) -> tuple[int, str]:
+    process = CgroupProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    process.allow_final_frame.set()
+    workload = _cgroup_sandbox(process).controlled_workload(command)
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    generated = process.handle.inputs[1]
+    group = workload._group
+    status = workload._status_path
+    paths = {
+        group: tmp_path / "group",
+        status: tmp_path / "status",
+        workload._status_temp_path: tmp_path / "status.tmp",
+        workload._complete: tmp_path / "complete",
+        workload._release: tmp_path / "release",
+    }
+    process.user_finished.set()
+    await asyncio.wait_for(workload.wait(), 2)
+
+    paths[group].mkdir()
+    paths[workload._release].touch()
+    for original, local in paths.items():
+        generated = generated.replace(original, str(local))
+    prelude = f"stty -echo; {generated}"
+    shell = f"/bin/bash --noprofile --norc -ic {shlex.quote(prelude)}"
+    child = subprocess.Popen(
+        ["script", "-q", "-e", "-c", shell, "/dev/null"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "TERM": "dumb"},
+    )
+    try:
+        output, _ = child.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        # The generated child can be in a different PTY process group from `script`.
+        group_pid_file = paths[group] / "cgroup.procs"
+        if group_pid_file.exists():
+            with suppress(ProcessLookupError):
+                os.killpg(os.getpgid(int(group_pid_file.read_text())), signal.SIGKILL)
+        with suppress(ProcessLookupError):
+            os.killpg(child.pid, signal.SIGKILL)
+        raise
+    finally:
+        child.wait(timeout=5)
+    assert child.returncode == int(paths[status].read_text())
+    return child.returncode, output
+
+
+async def test_daytona_controlled_pty_command_can_use_terminal_modes(tmp_path: Path) -> None:
+    exit_code, _ = await _generated_daytona_command_in_host_pty("stty sane", tmp_path)
+    assert exit_code == 0
+
+
+async def test_daytona_controlled_pty_output_has_no_shell_job_notice(tmp_path: Path) -> None:
+    exit_code, output = await _generated_daytona_command_in_host_pty(
+        "printf agent-output; printf agent-error >&2", tmp_path
+    )
+    assert exit_code == 0
+    assert output.strip() == "agent-outputagent-error"
+
 
 
 class UnwritableStatusLocalShellProcess(LocalShellCgroupProcess):
@@ -5253,6 +5380,7 @@ class ResultCgroupProcess(CgroupProcess):
     ) -> "ResultCgroupPtyHandle":
         _assert_pty_create_config(envs, pty_size)
         self.sessions.add(id)
+        self.pty_marker = envs[_PTY_CREATE_MARKER_ENV]
         return ResultCgroupPtyHandle(on_data, self)
 
 

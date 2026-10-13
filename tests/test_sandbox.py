@@ -59,6 +59,7 @@ from benchmark_service.sandbox import (
     VolumeMount,
 )
 from benchmark_service.sandbox.daytona import (
+    _DaytonaControlledWorkload,  # pyright: ignore[reportPrivateUsage]
     _PTY_COLS,  # pyright: ignore[reportPrivateUsage]
     _PTY_CREATE_MARKER_ENV,  # pyright: ignore[reportPrivateUsage]
     _PTY_ROWS,  # pyright: ignore[reportPrivateUsage]
@@ -4592,13 +4593,15 @@ def _cgroup_sandbox(process: CgroupProcess) -> DaytonaSandbox:
 
 
 async def test_daytona_controlled_utf8_spans_callbacks_and_reconnect_and_flushes_at_completion() -> None:
+    setup_sent = asyncio.Event()
+
     class InitialHandle(CgroupPtyHandle):
         async def send_input(self, data: str) -> None:
             self.inputs.append(data)
-            self.process.setup_sent.set()
+            setup_sent.set()
 
         async def wait(self) -> PtyResult:
-            await self.process.setup_sent.wait()
+            await setup_sent.wait()
             return PtyResult(exit_code=None, error="WebSocket error")
 
     class FirstHandle(CgroupPtyHandle):
@@ -4627,7 +4630,6 @@ async def test_daytona_controlled_utf8_spans_callbacks_and_reconnect_and_flushes
         def __init__(self) -> None:
             super().__init__()
             self.reconnected = asyncio.Event()
-            self.setup_sent = asyncio.Event()
             self.reconnect_count = 0
 
         async def create_pty_session(
@@ -4818,20 +4820,18 @@ async def test_daytona_kill_before_command_admission() -> None:
     assert not process.group_exists
     assert process.sessions == set()
 
+    setup_sent = asyncio.Event()
+
     class NoMarkerHandle(CgroupPtyHandle):
         async def send_input(self, data: str) -> None:
             self.inputs.append(data)
-            self.process.setup_sent.set()
+            setup_sent.set()
 
         async def wait(self) -> PtyResult:
-            await self.process.setup_sent.wait()
+            await setup_sent.wait()
             return PtyResult(exit_code=None, error="WebSocket error")
 
     class NoMarkerProcess(CgroupProcess):
-        def __init__(self) -> None:
-            super().__init__()
-            self.setup_sent = asyncio.Event()
-
         async def create_pty_session(
             self, *, id: str, on_data: Callable[[bytes], None | Awaitable[None]],
             envs: dict[str, str], pty_size: PtySize,
@@ -4844,7 +4844,7 @@ async def test_daytona_kill_before_command_admission() -> None:
     stalled.allow_creation.set()
     stalled.allow_removal.set()
     stopped = _cgroup_sandbox(stalled).controlled_workload("must-not-run")
-    await asyncio.wait_for(stalled.setup_sent.wait(), 2)
+    await asyncio.wait_for(setup_sent.wait(), 2)
     await asyncio.wait_for(stopped.kill(), 2)
     assert not stalled.command_admitted.is_set()
     assert not stalled.group_exists
@@ -4991,23 +4991,23 @@ async def _generated_daytona_command_in_host_pty(command: str, tmp_path: Path) -
     process.allow_creation.set()
     process.allow_removal.set()
     process.allow_final_frame.set()
-    workload = _cgroup_sandbox(process).controlled_workload(command)
+    workload = cast(_DaytonaControlledWorkload, _cgroup_sandbox(process).controlled_workload(command))
     await asyncio.wait_for(process.command_admitted.wait(), 2)
     generated = process.handle.inputs[1]
-    group = workload._group
-    status = workload._status_path
+    group = workload._group  # pyright: ignore[reportPrivateUsage]
+    status = workload._status_path  # pyright: ignore[reportPrivateUsage]
     paths = {
         group: tmp_path / "group",
         status: tmp_path / "status",
-        workload._status_temp_path: tmp_path / "status.tmp",
-        workload._complete: tmp_path / "complete",
-        workload._release: tmp_path / "release",
+        workload._status_temp_path: tmp_path / "status.tmp",  # pyright: ignore[reportPrivateUsage]
+        workload._complete: tmp_path / "complete",  # pyright: ignore[reportPrivateUsage]
+        workload._release: tmp_path / "release",  # pyright: ignore[reportPrivateUsage]
     }
     process.user_finished.set()
     await asyncio.wait_for(workload.wait(), 2)
 
     paths[group].mkdir()
-    paths[workload._release].touch()
+    paths[workload._release].touch()  # pyright: ignore[reportPrivateUsage]
     for original, local in paths.items():
         generated = generated.replace(original, str(local))
     prelude = f"stty -echo; {generated}"

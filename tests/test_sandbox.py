@@ -4517,8 +4517,6 @@ class CgroupProcess(Process):
         self.poll_error = False
         self.pty_marker: str
 
-        self.pty_marker: str
-
     async def exec(self, command: str) -> SimpleNamespace:
         command = _unwrap_shell_command(command)
         if command.startswith("mkdir /sys/fs/cgroup/cbs-"):

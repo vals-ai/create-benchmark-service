@@ -175,7 +175,16 @@ class BenchmarkServiceApp(FastAPI):
                     return await call_next(request)  # type: ignore[reportUnknownVariableType]
                 tenant = UNAUTHENTICATED_TENANT_SENTINEL
                 if is_auth_required():
-                    tenant = await self.service.resolve_tenant(dict(request.headers))
+                    from benchmark_service.vals.allowlist import CatalogUnavailable
+
+                    try:
+                        tenant = await self.service.resolve_tenant(dict(request.headers))
+                    except CatalogUnavailable:
+                        return JSONResponse(
+                            status_code=503,
+                            content={"detail": "Benchmark catalog is unavailable"},
+                            headers={"Retry-After": "1"},
+                        )
                 if tenant is None:
                     return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
                 request.state.tenant = tenant
@@ -292,12 +301,18 @@ class BenchmarkServiceApp(FastAPI):
             return ResolveDatasetResponse(dataset=body.dataset, version=resolved)
 
     async def _authorize_websocket(self, websocket: WebSocket) -> str | None:
-        """Authenticate a WebSocket caller. Returns tenant id, or None after closing 1008."""
+        """Authenticate a WebSocket caller. Returns tenant id, or None after closing."""
         self.clear_request_context()
         self._bind_service_context(self._current_service_version())
         tenant = UNAUTHENTICATED_TENANT_SENTINEL
         if is_auth_required():
-            tenant = await self.service.resolve_tenant(dict(websocket.headers))
+            from benchmark_service.vals.allowlist import CatalogUnavailable
+
+            try:
+                tenant = await self.service.resolve_tenant(dict(websocket.headers))
+            except CatalogUnavailable:
+                await websocket.close(code=1013, reason="Benchmark catalog is unavailable")
+                return None
         if tenant is None:
             await websocket.close(code=1008, reason="Unauthorized")
             return None

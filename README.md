@@ -237,7 +237,7 @@ from that standalone file inside the benchmark-owned agent command. The benchmar
 reporting: BEGIN precedes model-capable execution, and END follows confirmed absence. Nested
 Docker workloads should not receive the reporter key or stage directory.
 
-`StageReporter().begin(container)` flushes one stdout frame and blocks until Tracker ACKs,
+`StageReporter().begin(container)` flushes an initial stdout frame and blocks until Tracker ACKs,
 before launching that model-capable container. `end()` reports the same container only
 after confirmed absence of the container and its nested workload; it blocks until ACK before
 evaluation or the next round. `container` is the Docker container name, or `None` for a
@@ -248,8 +248,11 @@ ASCII JSON `{"seq":<int>,"event":"begin"|"end","container":<str|null>}`;
 `mac` is lowercase hex HMAC-SHA256 over the base64url payload token's ASCII bytes,
 keyed by the 32 bytes decoded from `key`. Sequences start at 1, increment by 1, and alternate
 odd `begin` / even `end`. After applying each transition, Tracker publishes
-`ack/<seq>` atomically; the reporter polls at 100 ms with no timeout. Tracker
-reassembles lines across output chunks; text from the agent is never a stage event.
+`ack/<seq>` atomically. Until ACK, the reporter retransmits the identical signed frame
+every 3 monotonic seconds and polls ACK every 100 ms with no reporter timeout. A later
+copy can reach a live Tracker after an earlier frame is lost; ordinary agent output
+is not replayed. Tracker reassembles lines across output chunks; text from the agent
+is never a stage event.
 
 For a benchmark-owned supervisor running multiple Docker-backed rounds within one agent
 command:
@@ -290,19 +293,27 @@ are returned. Natural completion and `kill()` use `cgroup.kill`, confirm
 The watcher checks command status about every 10 seconds while following logs,
 and whenever the follower ends. A known exit does not depend on the log connection
 closing. After exit, the watcher cancels and joins the reader, then makes one final
-log snapshot request. Confirmed sandbox loss still raises `SandboxNotFoundError`;
+log snapshot request. Confirmed sandbox removal raises `SandboxNotFoundError`;
 other handled snapshot failures warn without retrying or changing the command exit
-result.
-Transient output and status observation failures reopen the same command without
-restarting it or stopping the workload. Completion-marker observation retries
-independently. The caller still owns the deadline and explicit stop. The probe
+result. While command exit is unknown, an observed sandbox `STOPPED` or `ERROR`
+ends the watcher with `SandboxError`; `wait()` reports that observed failure promptly
+even if independent cgroup and session cleanup is still pending. A later cleanup
+failure is logged. If cleanup fails after a separate observed sandbox loss,
+`wait()` raises the original `SandboxNotFoundError` and logs the distinct cleanup
+failure once; a mirrored copy of the same exception is not a second failure.
+Other failures retain cleanup-first ordering. Success still waits for cleanup and
+confirmed absence. Transient output and status observation
+failures reopen the same command without restarting it or stopping the workload.
+Completion-marker observation retries independently.
+The caller still owns the deadline and explicit stop. The probe
 requires writable cgroup v2 delegation with `cgroup.kill`; other sandbox services
 remain outside the subgroup.
 
 Launch setup is a one-shot phase, separate from repeated observation. Completion
 and stop handling run independently of the log watcher. `wait()` and `kill()` share
 session cleanup, which waits for the launch attempt to settle before deleting the
-session and confirming absence.
+session and confirming absence. A prompt watcher failure does not cancel cleanup;
+`kill()` still waits for stop and absence confirmation.
 
 See the [Daytona reconnect diagram](docs/diagrams/daytona-reconnect.png)
 ([editable Excalidraw source](docs/diagrams/daytona-reconnect.excalidraw)).

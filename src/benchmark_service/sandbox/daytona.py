@@ -996,8 +996,8 @@ class DaytonaSandbox(Sandbox):
             raise SandboxError(f"Sandbox is not running: {self._sandbox_ref}, state={self.state}.")
 
 
-async def _raise_if_sandbox_gone(client: AsyncDaytona, sandbox_id: str) -> None:
-    """Surface only a deleted sandbox; every other watch failure is retried."""
+async def _raise_if_sandbox_gone(client: AsyncDaytona, sandbox_id: str) -> AsyncSandbox | None:
+    """Return an observed sandbox or surface confirmed removal; retry observation failures."""
     try:
         sandbox = await _bounded("daytona.get", client.get(sandbox_id), _TOOLBOX_CALL_TIMEOUT_SECONDS)
     except DaytonaNotFoundError as exc:
@@ -1007,6 +1007,19 @@ async def _raise_if_sandbox_gone(client: AsyncDaytona, sandbox_id: str) -> None:
         return
     if sandbox.state in _REMOVED_SANDBOX_STATES:
         raise SandboxNotFoundError(f"Sandbox not found: id={sandbox_id}.")
+    return sandbox
+
+
+class _WatchedSandboxStoppedError(SandboxError):
+    """A pending command's watcher observed a stopped or failed sandbox."""
+
+
+async def _get_watched_sandbox(client: AsyncDaytona, sandbox_id: str) -> AsyncSandbox | None:
+    sandbox = await _raise_if_sandbox_gone(client, sandbox_id)
+    if sandbox is not None and sandbox.state in (SandboxState.STOPPED, SandboxState.ERROR):
+        raise _WatchedSandboxStoppedError(f"Sandbox is not running: id={sandbox_id}, state={sandbox.state}.")
+    return sandbox
+
 
 class _NativeSessionLogProcess(AsyncProcess):
     # Remove after upgrading Daytona to a version with fixed marker parsing and unconfirmed-stream buffering.
@@ -1102,15 +1115,9 @@ async def _watch_session_command(
 
     Returns the exit code (None while it is unknown) and the updated offsets.
     """
-    try:
-        sandbox = await _bounded("daytona.get", client.get(sandbox_id), _TOOLBOX_CALL_TIMEOUT_SECONDS)
-    except DaytonaNotFoundError as exc:
-        raise SandboxNotFoundError(f"Sandbox not found: id={sandbox_id}.") from exc
-    except (*_SANDBOX_OPERATION_ERRORS, SandboxConnectionError) as exc:
-        logger.warning("Could not reopen Daytona sandbox %s while watching: %s", sandbox_id, exc)
+    sandbox = await _get_watched_sandbox(client, sandbox_id)
+    if sandbox is None:
         return None, forwarded_stdout, forwarded_stderr
-    if sandbox.state in _REMOVED_SANDBOX_STATES:
-        raise SandboxNotFoundError(f"Sandbox not found: id={sandbox_id}.")
     process = sandbox.process
     log_process = _NativeSessionLogProcess(process._language, process._api_client)  # pyright: ignore[reportPrivateUsage]
     seen_stdout = 0
@@ -1147,7 +1154,7 @@ async def _watch_session_command(
                     await follow_task
                 except (*_SANDBOX_OPERATION_ERRORS, SandboxConnectionError) as exc:
                     watch_error = exc
-                    await _raise_if_sandbox_gone(client, sandbox_id)
+                    await _get_watched_sandbox(client, sandbox_id)
             try:
                 status = await _bounded(
                     "process.get_session_command",
@@ -1157,7 +1164,7 @@ async def _watch_session_command(
             except (*_SANDBOX_OPERATION_ERRORS, SandboxConnectionError) as exc:
                 if closed.is_set():
                     raise SandboxError("Controlled workload closed before command exit") from exc
-                await _raise_if_sandbox_gone(client, sandbox_id)
+                await _get_watched_sandbox(client, sandbox_id)
                 watch_error = exc
                 status = None
             if closed.is_set():
@@ -1238,15 +1245,34 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         self._closed = asyncio.Event()
         self._stop_requested = asyncio.Event()
         self._close_task: asyncio.Task[float] | None = None
+        self._run_failure_reported = False
+        self._cleanup_failure_logged = False
         self._run_task = asyncio.create_task(self._run())
         self._run_task.add_done_callback(self._consume_run_exception)
         self._finish_task = asyncio.create_task(self._finish())
-        self._finish_task.add_done_callback(self._consume_run_exception)
+        self._finish_task.add_done_callback(self._consume_finish_exception)
 
     @staticmethod
     def _consume_run_exception(task: asyncio.Task[Any]) -> None:
         if not task.cancelled():
             task.exception()
+
+    def _consume_finish_exception(self, task: asyncio.Task[float]) -> None:
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if (
+            exc is not None
+            and self._run_failure_reported
+            and exc is not self._run_task.exception()
+            and not self._cleanup_failure_logged
+        ):
+            self._cleanup_failure_logged = True
+            logger.error(
+                "Daytona controlled cleanup failed after reported sandbox failure %s: %s",
+                self._sandbox_ref,
+                exc,
+            )
 
     def _append_output(self, text: str) -> None:
         if not text:
@@ -1276,7 +1302,24 @@ class _DaytonaControlledWorkload(ControlledWorkload):
             yield self._output.get_nowait()
 
     async def wait(self) -> ControlledWorkloadResult:
-        group_stopped_at = await asyncio.shield(self._finish_task)
+        await asyncio.wait({self._run_task, self._finish_task}, return_when=asyncio.FIRST_COMPLETED)
+        if self._run_task.done():
+            error = self._run_task.exception()
+            if isinstance(error, _WatchedSandboxStoppedError):
+                self._run_failure_reported = True
+                if self._finish_task.done():
+                    self._consume_finish_exception(self._finish_task)
+                raise error
+        try:
+            group_stopped_at = await asyncio.shield(self._finish_task)
+        except Exception:
+            if self._run_task.done():
+                error = self._run_task.exception()
+                if isinstance(error, SandboxNotFoundError):
+                    self._run_failure_reported = True
+                    self._consume_finish_exception(self._finish_task)
+                    raise error
+            raise
         result = await asyncio.shield(self._run_task)
         session_absent_at = await asyncio.shield(self._ensure_closed())
         return ControlledWorkloadResult(result=result, absence_confirmed_at=max(group_stopped_at, session_absent_at))

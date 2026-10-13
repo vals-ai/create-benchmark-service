@@ -4,7 +4,7 @@ import os
 import shlex
 import subprocess
 from collections.abc import AsyncGenerator, Mapping
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -5496,6 +5496,117 @@ async def test_daytona_confirmed_sandbox_loss_surfaces_not_found() -> None:
     inner.state = SandboxState.DESTROYED
     with pytest.raises(SandboxNotFoundError):
         await asyncio.wait_for(workload.wait(), 2)
+
+
+@pytest.mark.usefixtures("_fake_cgroup_follow")
+async def test_daytona_sandbox_loss_precedes_distinct_cgroup_cleanup_failure(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    class LostSandboxProcess(CgroupProcess):
+        async def get_session_command_logs_async(
+            self, session_id: str, command_id: str,
+            on_stdout: Callable[[str], Awaitable[None]],
+            on_stderr: Callable[[str], Awaitable[None]],
+        ) -> None:
+            raise DaytonaConnectionError("follow unavailable")
+
+    process = LostSandboxProcess()
+    process.allow_creation.set()
+    process.removal_fails = True
+    inner = InnerSandbox()
+    inner.process = process
+    workload = DaytonaSandbox(cast(Any, inner), cast(Any, CgroupDaytonaClient(inner, process))).controlled_workload(
+        "exec sleep 30"
+    )
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    inner.state = SandboxState.DESTROYED
+    waiting = asyncio.create_task(workload.wait())
+    with caplog.at_level(logging.ERROR, logger=daytona_module.__name__):
+        await asyncio.wait_for(process.removal_started.wait(), 2)
+        assert not waiting.done()
+        inner.state = SandboxState.STARTED
+        process.allow_removal.set()
+        with pytest.raises(SandboxNotFoundError) as raised:
+            await asyncio.wait_for(waiting, 2)
+    assert raised.value is workload._run_task.exception()  # pyright: ignore[reportPrivateUsage]
+    cleanup_errors = [
+        record for record in caplog.records
+        if record.name == daytona_module.__name__ and record.levelno == logging.ERROR
+    ]
+    assert len(cleanup_errors) == 1
+    assert isinstance(cleanup_errors[0].args[-1], SandboxError)
+    assert cleanup_errors[0].args[-1] is not raised.value
+
+
+@pytest.mark.usefixtures("_fake_cgroup_follow")
+@pytest.mark.parametrize("state", [SandboxState.STOPPED, SandboxState.ERROR])
+async def test_daytona_native_watcher_terminates_on_existing_dead_sandbox_state(
+    monkeypatch: pytest.MonkeyPatch, state: SandboxState,
+) -> None:
+    monkeypatch.setattr(daytona_module, "_SESSION_WATCH_REOPEN_SECONDS", 0.01)
+
+    class UnavailableProcess(CgroupProcess):
+        async def get_session_command(self, session_id: str, command_id: str) -> SimpleNamespace:
+            raise DaytonaConnectionError("status unavailable")
+
+    class ObservedClient(CgroupDaytonaClient):
+        def __init__(self, sandbox: InnerSandbox, native: CgroupProcess) -> None:
+            super().__init__(sandbox, native)
+            self.get_calls = 0
+            self.started_after_error = asyncio.Event()
+            self.dead_observed = asyncio.Event()
+
+        async def get(self, sandbox_id: str) -> InnerSandbox:
+            observed = await super().get(sandbox_id)
+            self.get_calls += 1
+            if self.get_calls >= 2 and observed.state == SandboxState.STARTED:
+                self.started_after_error.set()
+            if observed.state == state:
+                self.dead_observed.set()
+            return observed
+    process = UnavailableProcess()
+    process.allow_creation.set()
+    inner = InnerSandbox()
+    inner.process = process
+    client = ObservedClient(inner, process)
+    workload = DaytonaSandbox(cast(Any, inner), cast(Any, client)).controlled_workload("exec sleep 30")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    waiting = asyncio.create_task(workload.wait())
+    try:
+        await asyncio.wait_for(client.started_after_error.wait(), 2)
+        assert not waiting.done()
+        assert process.group_exists
+        inner.state = state
+        with pytest.raises(SandboxError, match="Sandbox is not running"):
+            await asyncio.wait_for(waiting, 0.3)
+        await asyncio.wait_for(process.removal_started.wait(), 2)
+        assert process.group_exists
+        assert client.dead_observed.is_set()
+        assert process.execute_calls == 1
+    finally:
+        inner.state = SandboxState.STARTED
+        process.allow_removal.set()
+        process.user_finished.set()
+        with suppress(SandboxError):
+            await asyncio.wait_for(workload.kill(), 2)
+
+
+@pytest.mark.usefixtures("_fake_cgroup_follow")
+async def test_daytona_native_watcher_reconnects_transient_started_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(daytona_module, "_SESSION_WATCH_REOPEN_SECONDS", 0.01)
+    process = CgroupProcess()
+    process.follow_error = True
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    process.user_finished.set()
+    completed = await asyncio.wait_for(workload.wait(), 2)
+    assert completed.result.exit_code == 7
+    assert process.execute_calls == 1
+    assert process.follow_calls >= 2
 
 
 class NestedCgroupProcess(CgroupProcess):

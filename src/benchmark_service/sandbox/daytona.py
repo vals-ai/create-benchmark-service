@@ -1009,7 +1009,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         # The PTY shell stays outside the child cgroup to report the foreground exit after cleanup.
         child = f"echo $$ > {shlex.quote(self._group)}/cgroup.procs || exit 1; {command}"
         self._command = (
-            f"sh -c {shlex.quote(child)} & child=$!; wait \"$child\"; code=$?; "
+            f"sh -c {shlex.quote(child)}; code=$?; "
             f"printf '%s\\n' \"$code\" > {shlex.quote(self._status_temp_path)} "
             f"&& mv {shlex.quote(self._status_temp_path)} {shlex.quote(self._status_path)} "
             f"&& : > {shlex.quote(self._complete)} || exit 1; "
@@ -1021,7 +1021,11 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         self._stdout_bytes = 0
         self._decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         self._create_state = _PtyCreateState(marker=uuid.uuid4().hex)
+        self._output_start = self._create_state.marker.encode() + b"\r\n"
+        self._setup_output = bytearray()
+        self._setup_done = asyncio.Event()
         self._creation_done = asyncio.Event()
+        self._command_admitted = asyncio.Event()
         self._group_created = False
         self._group_stopped_at: float | None = None
         self._closed = asyncio.Event()
@@ -1098,6 +1102,12 @@ class _DaytonaControlledWorkload(ControlledWorkload):
             raise SandboxError(f"Daytona controlled cgroup was not created: {self._group}")
 
         try:
+            while (
+                not self._close_requested
+                and not self._run_task.done()
+                and not self._command_admitted.is_set()
+            ):
+                await asyncio.sleep(0.05)
             while not self._close_requested and not self._run_task.done():
                 result = await self._control_exec(f"test -e {shlex.quote(self._complete)}")
                 if result.exit_code == 0:
@@ -1111,14 +1121,17 @@ class _DaytonaControlledWorkload(ControlledWorkload):
 
         stopped_at = await self._stop_group()
         if self._close_requested:
-            # The shell runs outside the child cgroup. Give it time to publish the
-            # child's actual exit status before terminating the PTY transport.
-            while not self._run_task.done():
-                result = await self._control_exec(f"test -e {shlex.quote(self._complete)}")
-                if result.exit_code == 0:
-                    break
-                await asyncio.sleep(0.05)
-            await self._ensure_closed()
+            if not self._command_admitted.is_set():
+                await self._ensure_closed()
+            else:
+                # The shell runs outside the child cgroup. Give it time to publish the
+                # child's actual exit status before terminating the PTY transport.
+                while not self._run_task.done():
+                    result = await self._control_exec(f"test -e {shlex.quote(self._complete)}")
+                    if result.exit_code == 0:
+                        break
+                    await asyncio.sleep(0.05)
+                await self._ensure_closed()
         elif self._run_task.done():
             await self._ensure_closed()
         else:
@@ -1204,6 +1217,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         handle: AsyncPtyHandle | None = None
         wait_task: asyncio.Task[PtyResult] | None = None
         status_closed_task: asyncio.Task[bool] | None = None
+        setup_task: asyncio.Task[bool] | None = None
         pty_envs = {
             "TERM": "dumb",
             "LANG": "C.UTF-8",
@@ -1214,6 +1228,15 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         async def on_data(data: bytes) -> None:
             if self._output_closed:
                 return
+            # The setup marker separates echoed shell input from real command bytes.
+            if not self._setup_done.is_set():
+                self._setup_output.extend(data)
+                boundary = self._setup_output.find(self._output_start)
+                if boundary < 0:
+                    return
+                data = bytes(self._setup_output[boundary + len(self._output_start):])
+                self._setup_output.clear()
+                self._setup_done.set()
             self._append_output(self._decoder.decode(data))
 
         try:
@@ -1230,23 +1253,68 @@ class _DaytonaControlledWorkload(ControlledWorkload):
             finally:
                 self._creation_done.set()
 
-            if self._close_requested:
-                raise SandboxError("Controlled workload closed before command admission")
-            await _bounded(
-                "handle.send_input",
-                handle.send_input(f"stty -echo; unset {_PTY_CREATE_MARKER_ENV}\n"),
-                _TOOLBOX_CALL_TIMEOUT_SECONDS,
-            )
-            if self._close_requested:
-                raise SandboxError("Controlled workload closed before command admission")
-            await _bounded(
-                "handle.send_input",
-                handle.send_input(f"mkdir -p {shlex.quote(_STATUS_DIR)}; {self._command}; exit\n"),
-                _TOOLBOX_CALL_TIMEOUT_SECONDS,
-            )
-            wait_task = asyncio.create_task(handle.wait())
-
             status_closed_task = asyncio.create_task(self._closed.wait())
+            setup_task = asyncio.create_task(self._setup_done.wait())
+            wait_task = asyncio.create_task(handle.wait())
+            setup_reconnects = 0
+            while True:
+                if self._close_requested:
+                    raise SandboxError("Controlled workload closed before command admission")
+                await _bounded(
+                    "handle.send_input",
+                    handle.send_input(
+                        f"stty -echo && PS1= && PROMPT_COMMAND= && "
+                        f"printf '%s\\n' \"${_PTY_CREATE_MARKER_ENV}\"\n"
+                    ),
+                    _TOOLBOX_CALL_TIMEOUT_SECONDS,
+                )
+                done, _ = await _bounded(
+                    "PTY shell setup",
+                    asyncio.wait(
+                        {setup_task, wait_task, status_closed_task},
+                        return_when=asyncio.FIRST_COMPLETED,
+                    ),
+                    _TOOLBOX_CALL_TIMEOUT_SECONDS,
+                )
+                if self._close_requested or status_closed_task in done:
+                    raise SandboxError("Controlled workload closed before command admission")
+                if wait_task in done:
+                    setup_reconnects += 1
+                    if setup_reconnects == _PTY_STATUS_CHECK_ATTEMPTS:
+                        raise SandboxConnectionError(
+                            f"Daytona PTY shell setup did not complete for {self._sandbox_ref}: "
+                            f"session_id={self._session_id}"
+                        )
+                    wait_result = await wait_task
+                    if wait_result.exit_code not in (None, 0):
+                        raise SandboxError(
+                            "Daytona controlled PTY exited before command admission for "
+                            f"{self._sandbox_ref}: session_id={self._session_id}, "
+                            f"{_pty_result_summary(wait_result)}"
+                        )
+                    await _bounded(
+                        "handle.disconnect", handle.disconnect(), _TOOLBOX_CALL_TIMEOUT_SECONDS
+                    )
+                    handle = await self._reconnect_pty(
+                        self._session_id, on_data, wait_result
+                    )
+                    wait_task = asyncio.create_task(handle.wait())
+                    if setup_task in done:
+                        break
+                    self._setup_output.clear()
+                    continue
+                break
+            if self._close_requested:
+                raise SandboxError("Controlled workload closed before command admission")
+            launch_command = f"mkdir -p {shlex.quote(_STATUS_DIR)}; {self._command}"
+            await _bounded(
+                "handle.send_input",
+                handle.send_input(
+                    f"unset {_PTY_CREATE_MARKER_ENV}; exec sh -c {shlex.quote(launch_command)}\n"
+                ),
+                _TOOLBOX_CALL_TIMEOUT_SECONDS,
+            )
+            self._command_admitted.set()
             closure_observed = False
             reconnect_attempts = 0
             while True:
@@ -1349,6 +1417,10 @@ class _DaytonaControlledWorkload(ControlledWorkload):
             raise self._sandbox_error(exc) from exc
         finally:
             self._finalize_output()
+            if setup_task:
+                setup_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await setup_task
             if status_closed_task:
                 status_closed_task.cancel()
                 with suppress(asyncio.CancelledError):

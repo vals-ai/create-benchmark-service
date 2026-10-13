@@ -5,7 +5,7 @@ import shlex
 import signal
 import subprocess
 from collections.abc import AsyncGenerator, Mapping
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -4515,6 +4515,7 @@ class CgroupProcess(Process):
         self.removal_fails = False
         self.sessions: set[str] = set()
         self.poll_error = False
+        self.pty_marker: str
 
         self.pty_marker: str
 
@@ -4807,7 +4808,7 @@ async def test_daytona_unconfirmed_group_removal_never_reports_absence() -> None
     process.allow_final_frame.set()
 
 
-async def test_daytona_kill_during_group_creation_prevents_command_admission() -> None:
+async def test_daytona_kill_before_command_admission() -> None:
     process = CgroupProcess()
     process.allow_removal.set()
     workload = _cgroup_sandbox(process).controlled_workload("must-not-run")
@@ -4986,6 +4987,67 @@ async def test_daytona_controlled_nonnull_cwd_runs_real_shell_and_preserves_exit
         assert process.sessions == set()
     finally:
         await _finish_local_workers(process)
+
+async def _generated_daytona_command_in_host_pty(command: str, tmp_path: Path) -> tuple[int, str]:
+    process = CgroupProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    process.allow_final_frame.set()
+    workload = _cgroup_sandbox(process).controlled_workload(command)
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    generated = process.handle.inputs[1]
+    group = workload._group
+    status = workload._status_path
+    paths = {
+        group: tmp_path / "group",
+        status: tmp_path / "status",
+        workload._status_temp_path: tmp_path / "status.tmp",
+        workload._complete: tmp_path / "complete",
+        workload._release: tmp_path / "release",
+    }
+    process.user_finished.set()
+    await asyncio.wait_for(workload.wait(), 2)
+
+    paths[group].mkdir()
+    paths[workload._release].touch()
+    for original, local in paths.items():
+        generated = generated.replace(original, str(local))
+    prelude = f"stty -echo; {generated}"
+    shell = f"/bin/bash --noprofile --norc -ic {shlex.quote(prelude)}"
+    child = subprocess.Popen(
+        ["script", "-q", "-e", "-c", shell, "/dev/null"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "TERM": "dumb"},
+    )
+    try:
+        output, _ = child.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        # The generated child can be in a different PTY process group from `script`.
+        group_pid_file = paths[group] / "cgroup.procs"
+        if group_pid_file.exists():
+            with suppress(ProcessLookupError):
+                os.killpg(os.getpgid(int(group_pid_file.read_text())), signal.SIGKILL)
+        with suppress(ProcessLookupError):
+            os.killpg(child.pid, signal.SIGKILL)
+        raise
+    finally:
+        child.wait(timeout=5)
+    assert child.returncode == int(paths[status].read_text())
+    return child.returncode, output
+
+
+async def test_daytona_controlled_pty_command_can_use_terminal_modes(tmp_path: Path) -> None:
+    exit_code, _ = await _generated_daytona_command_in_host_pty("stty sane", tmp_path)
+    assert exit_code == 0
+
+
+async def test_daytona_controlled_pty_output_has_no_shell_job_notice(tmp_path: Path) -> None:
+    exit_code, output = await _generated_daytona_command_in_host_pty(
+        "printf agent-output; printf agent-error >&2", tmp_path
+    )
+    assert exit_code == 0
+    assert output.strip() == "agent-outputagent-error"
+
 
 
 class UnwritableStatusLocalShellProcess(LocalShellCgroupProcess):

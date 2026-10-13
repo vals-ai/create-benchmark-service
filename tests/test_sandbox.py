@@ -5528,14 +5528,16 @@ async def test_daytona_sandbox_loss_precedes_distinct_cgroup_cleanup_failure(
         process.allow_removal.set()
         with pytest.raises(SandboxNotFoundError) as raised:
             await asyncio.wait_for(waiting, 2)
-    assert raised.value is workload._run_task.exception()  # pyright: ignore[reportPrivateUsage]
+    native_workload = cast(daytona_module._DaytonaControlledWorkload, workload)  # pyright: ignore[reportPrivateUsage]
+    assert raised.value is native_workload._run_task.exception()  # pyright: ignore[reportPrivateUsage]
     cleanup_errors = [
         record for record in caplog.records
         if record.name == daytona_module.__name__ and record.levelno == logging.ERROR
     ]
     assert len(cleanup_errors) == 1
-    assert isinstance(cleanup_errors[0].args[-1], SandboxError)
-    assert cleanup_errors[0].args[-1] is not raised.value
+    cleanup_args = cast(tuple[object, ...], cleanup_errors[0].args)
+    assert isinstance(cleanup_args[-1], SandboxError)
+    assert cleanup_args[-1] is not raised.value
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")

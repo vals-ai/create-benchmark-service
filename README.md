@@ -293,8 +293,8 @@ bundle to
 `$VALKYRIE_STAGE_DIR/agent.json` after setup: `run_cmd`, `continue_cmd`, `interrupt_grace_seconds`,
 `container_name`, `final_output`, `parallel_agents`, and `slots_root`. The library owns a single `StageReporter`
 and starts each selected-agent turn in a new process group. The bundle renders `{problem_statement_path}` to that turn's
-observation file and `{slot_dir}` to `<slots_root>/<slot>/agent`. When `container_name` is
-configured, `{container_name}` is bound to that template with `{slot}` filled first; otherwise
+observation file and `{slot_dir}` to `<slots_root>/<slot>/agent`. A configured `container_name` requires
+`parallel_agents=1`; `{container_name}` is bound to that template with `{slot}` filled first. Otherwise
 it remains literal in the command. Other unbound tokens also remain literal. Bound token
 replacements insert values opaquely, including any braces they contain. In `final_output`,
 `{slot_dir}` is replaced for each
@@ -307,13 +307,14 @@ selected-agent child and sets only its `MODEL_GATEWAY_URL` to that generation UR
 the orchestrator and evaluation processes retain the native `MODEL_GATEWAY_URL`. Without the explicit
 generation URL, children inherit the native route. Custom staged orchestrators must likewise route
 generation clients and children through the explicit generation URL while preserving the native route
-for evaluation, including when generation and evaluation overlap. After a turn's
-process group and any container are absent, the last active turn sends END and waits for its ACK before copying
-the bundle's existing `final_output` file or directory into `<slots_root>/<slot>/turns/<n>/`. A file keeps its basename;
-`n` starts at 1 per slot. `final_output` may contain `{slot_dir}` and is rendered for each slot before launch;
-Tracker requires that placeholder when `parallel_agents > 1` and `final_output` is set, so parallel slots do not
-snapshot the same path. The agent workspace and turn snapshots are siblings, so a `final_output` of `{slot_dir}`
-or `{slot_dir}/turns` cannot recursively include earlier snapshots. Tracker archives `slots_root` as the episode output.
+for evaluation, including when generation and evaluation overlap. If a turn’s configured `final_output` exists,
+it is snapshotted after its descendants and any configured named Docker container are confirmed absent. When
+the last active turn completes, END is sent and ACKed before its snapshot; other turns may be snapshotted
+while generation remains active. The file or directory is copied into `<slots_root>/<slot>/turns/<n>/`.
+A file keeps its basename; `n` starts at 1 per slot. `final_output` may contain `{slot_dir}` and is rendered before
+launch. Tracker requires that placeholder when `parallel_agents > 1` and `final_output` is set, so parallel slots
+do not snapshot the same path. The agent workspace and turn snapshots are sibling directories; snapshots
+are stored outside the agent workspace. Tracker archives `slots_root` as the episode output.
 
 Upload `valkyrie_stage_source()` as `valkyrie_stage.py` during setup and import `Agents` there with Python 3.8+:
 
@@ -327,12 +328,14 @@ agents.start("first", "/workspace/observations/next.txt")  # Requires continue_c
 result = agents.stop("first")  # SIGINT grace (or immediate SIGKILL for null), then confirmed absence.
 ```
 
-`start` reports BEGIN and waits for ACK before spawning the first slot; the last slot completes only after its
-process group is empty, any named Docker container has been removed and listed absent, and END is ACKed. Overlapping
-slots count as one union interval. `stop` returns `stopped` when it stops an active slot, `exited` if collection
-already found natural completion, or `exhausted` if the shared limit won. `wait_any` returns `exited` or
-`exhausted` as appropriate. Tracker writes `$VALKYRIE_STAGE_DIR/exhausted` before its ACK when the shared
-budget expires. The library kills all running groups, completes their cleanup and END, and later `start` raises
+`start` reports BEGIN and waits for ACK before spawning the first slot. Each selected-agent turn has its own
+process owner, which stops and reaps that turn's descendants, including those that leave its process group, before
+the turn completes or END is sent. The root command's exit status remains `SlotResult.exit_code`. Configured SIGINT
+grace still applies to the group during `stop` even when the root exits mid-stop; null grace means immediate
+SIGKILL. Overlapping slots count as one union interval. `stop` returns `stopped` when it stops an active slot,
+`exited` if collection already found natural completion, or `exhausted` if the shared limit won. `wait_any`
+returns `exited` or `exhausted` as appropriate. Tracker writes `$VALKYRIE_STAGE_DIR/exhausted` before its ACK when the shared
+budget expires. The library stops all active turns, completes their cleanup and END, and later `start` raises
 `Exhausted`. If the notice arrives with BEGIN ACK, no child starts and no END is sent.
 
 For every task, check `sandbox.generation_containment` and run

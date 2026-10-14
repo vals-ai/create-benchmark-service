@@ -9,6 +9,7 @@ import hmac
 import json
 import os
 import re
+import select
 import shutil
 import signal
 import subprocess
@@ -71,8 +72,11 @@ class SlotResult:
 @dataclass
 class _RunningSlot:
     process: subprocess.Popen[bytes]
+    control_fd: int
+    result_fd: int
     container: str | None
     final_output: Path | None
+    kill_requested: bool = False
 
 
 class Agents:
@@ -88,8 +92,6 @@ class Agents:
         self._final_output_template: str | None = config["final_output"]
         self._parallel_agents: int = config["parallel_agents"]
         self._slots_root = Path(config["slots_root"])
-        if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) != 0:
-            raise OSError(ctypes.get_errno(), "PR_SET_CHILD_SUBREAPER")
         self._lock = threading.RLock()
         self._reporter = StageReporter()
         self._active: dict[str, _RunningSlot] = {}
@@ -141,8 +143,31 @@ class Agents:
         if generation_gateway_url is not None:
             child_env = os.environ.copy()
             child_env["MODEL_GATEWAY_URL"] = generation_gateway_url
-        process = subprocess.Popen(["sh", "-c", command], env=child_env, start_new_session=True)
-        self._active[slot] = _RunningSlot(process, container, final_output)
+        control_read, control_write = os.pipe()
+        result_read, result_write = os.pipe()
+        try:
+            process = subprocess.Popen(
+                [sys.executable, __file__, "--turn-owner", str(control_read), str(result_write), command],
+                env=child_env,
+                pass_fds=(control_read, result_write),
+            )
+        except OSError:
+            os.close(control_write)
+            os.close(result_read)
+            raise
+        finally:
+            os.close(control_read)
+            os.close(result_write)
+        ready = os.read(result_read, 1)
+        if ready != b"B":
+            process.wait()
+            with os.fdopen(result_read) as stream:
+                failure = json.load(stream) if ready == b"F" else None
+            os.close(control_write)
+            if failure is not None:
+                raise OSError(failure["errno"], failure["strerror"], failure["filename"])
+            raise RuntimeError("turn owner exited before root launch")
+        self._active[slot] = _RunningSlot(process, control_write, result_read, container, final_output)
         self._turns[slot] = self._turns.get(slot, 0) + 1
 
     def stop(self, slot: str) -> SlotResult:
@@ -156,11 +181,10 @@ class Agents:
             return self._take(slot, active_at_entry)
         running = self._active[slot]
         if self._interrupt_grace_seconds is not None:
-            self._signal_group(running.process.pid, signal.SIGINT)
+            os.write(running.control_fd, b"I")
             deadline = time.monotonic() + self._interrupt_grace_seconds
             while time.monotonic() < deadline:
-                self._observe_exit(running.process)
-                if self._group_empty(running.process.pid):
+                if self._group_empty(running):
                     break
                 if (self._stage_dir / "exhausted").exists():
                     self._exhaust_all()
@@ -183,53 +207,37 @@ class Agents:
         if (self._stage_dir / "exhausted").exists():
             self._exhaust_all()
         for slot, running in list(self._active.items()):
-            if self._observe_exit(running.process):
+            if self._turn_status(running) != b"A":
                 self._complete(slot, "exited")
 
     @staticmethod
-    def _observe_exit(process: subprocess.Popen[bytes]) -> bool:
-        return os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None
+    def _turn_status(running: _RunningSlot) -> bytes:
+        os.write(running.control_fd, b"Q")
+        return os.read(running.result_fd, 1)
+
+    def _group_empty(self, running: _RunningSlot) -> bool:
+        return self._turn_status(running) == b"G"
+
+    @staticmethod
+    def _request_kill(running: _RunningSlot) -> None:
+        os.write(running.control_fd, b"K")
+        running.kill_requested = True
 
     def _exhaust_all(self) -> None:
         for running in self._active.values():
-            self._signal_group(running.process.pid, signal.SIGKILL)
+            self._request_kill(running)
         for slot in list(self._active):
             self._complete(slot, "exhausted")
 
-    @staticmethod
-    def _signal_group(pid: int, sig: signal.Signals) -> None:
-        try:
-            os.killpg(pid, sig)
-        except ProcessLookupError:
-            pass  # An exited group is already absent.
-
-    @staticmethod
-    def _group_empty(pgid: int) -> bool:
-        empty = True
-        for entry in Path("/proc").iterdir():
-            if not entry.name.isdecimal():
-                continue
-            try:
-                stat = (entry / "stat").read_text()
-            except (FileNotFoundError, ProcessLookupError):
-                continue  # Process exited during the scan.
-            state, parent, group, _ = stat.rpartition(") ")[2].split(" ", 3)
-            if int(group) != pgid:
-                continue
-            if state == "Z":
-                if int(entry.name) == pgid:
-                    continue  # Popen owns the direct child's exit status.
-                if int(parent) == os.getpid() and os.waitpid(int(entry.name), os.WNOHANG)[0] != 0:
-                    continue
-            empty = False
-        return empty
-
     def _complete(self, slot: str, reason: Literal["exited", "stopped", "exhausted"]) -> None:
         running = self._active[slot]
-        self._signal_group(running.process.pid, signal.SIGKILL)
-        while not self._group_empty(running.process.pid):
-            time.sleep(0.1)
-        exit_code = running.process.wait()
+        if not running.kill_requested:
+            self._request_kill(running)
+        running.process.wait()
+        with os.fdopen(running.result_fd) as stream:
+            result = json.load(stream)
+        os.close(running.control_fd)
+        exit_code = result["exit_code"]
 
         if running.container is not None:
             subprocess.run(["docker", "rm", "-f", running.container], capture_output=True, check=False)
@@ -269,3 +277,92 @@ class Agents:
 def valkyrie_stage_source() -> bytes:
     """Return this standalone module's bytes for upload into a sandbox."""
     return Path(__file__).read_bytes()
+
+
+def _turn_children(root_pid: int) -> list[int]:
+    with open(f"/proc/self/task/{os.getpid()}/children") as stream:
+        return [int(pid) for pid in stream.read().split() if int(pid) != root_pid]
+
+
+def _drain_turn(root_pid: int) -> None:
+    while owned := _turn_children(root_pid):
+        for pid in owned:
+            os.kill(pid, signal.SIGKILL)
+        for pid in owned:
+            os.waitpid(pid, os.WNOHANG)
+        time.sleep(0.01)
+
+
+def _signal_turn(pgid: int, sig: signal.Signals) -> None:
+    try:
+        os.killpg(pgid, sig)
+    except ProcessLookupError:
+        pass  # An exited group is already absent.
+
+
+def _turn_group_empty(root_pid: int) -> bool:
+    empty = True
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdecimal():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+        except (FileNotFoundError, ProcessLookupError):
+            continue  # Process exited during the scan.
+        state, parent, group, _ = stat.rpartition(") ")[2].split(" ", 3)
+        if int(group) != root_pid:
+            continue
+        if state == "Z":
+            if int(entry.name) == root_pid:
+                continue  # Popen owns the direct child's exit status.
+            if int(parent) == os.getpid() and os.waitpid(int(entry.name), os.WNOHANG)[0] != 0:
+                continue
+        empty = False
+    return empty
+
+
+def _finish_turn(root: subprocess.Popen[bytes], result_fd: int) -> None:
+    _signal_turn(root.pid, signal.SIGKILL)
+    os.waitid(os.P_PID, root.pid, os.WEXITED | os.WNOWAIT)
+    _drain_turn(root.pid)
+    os.write(result_fd, json.dumps({"exit_code": root.wait()}).encode())
+
+
+def _turn_owner(control_fd: int, result_fd: int, command: str) -> None:
+    try:
+        if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) != 0:
+            raise OSError(ctypes.get_errno(), "PR_SET_CHILD_SUBREAPER")
+        root = subprocess.Popen(["sh", "-c", command], start_new_session=True)
+    except OSError as exc:
+        os.write(result_fd, b"F" + json.dumps({"errno": exc.errno, "strerror": exc.strerror, "filename": exc.filename}).encode())
+        return
+    os.write(result_fd, b"B")
+
+    while True:
+        if control_fd == -1:
+            if os.waitid(os.P_PID, root.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                _finish_turn(root, result_fd)
+                return
+            time.sleep(0.05)
+            continue
+        readable, _, _ = select.select([control_fd], [], [], 0.05)
+        if readable:
+            action = os.read(control_fd, 1)
+            if not action:
+                os.close(control_fd)
+                control_fd = -1
+            elif b"Q" in action:
+                if os.waitid(os.P_PID, root.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is None:
+                    status = b"A"
+                else:
+                    status = b"G" if _turn_group_empty(root.pid) else b"E"
+                os.write(result_fd, status)
+            elif b"K" in action:
+                _finish_turn(root, result_fd)
+                return
+            elif b"I" in action:
+                _signal_turn(root.pid, signal.SIGINT)
+
+
+if __name__ == "__main__" and sys.argv[1:2] == ["--turn-owner"]:
+    _turn_owner(int(sys.argv[2]), int(sys.argv[3]), sys.argv[4])

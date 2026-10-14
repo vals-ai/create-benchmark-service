@@ -49,6 +49,7 @@ from benchmark_service.sandbox import (
     SandboxCreateRequest,
     SandboxError,
     SandboxNotFoundError,
+    SandboxProvider,
     SandboxQuery,
     SandboxSource,
     SnapshotSource,
@@ -1683,6 +1684,118 @@ async def test_daytona_targeted_gpu_snapshot_checks_target_scope_before_unmetere
             await decision
     assert requested == []
     assert region_requests == (["list_available_regions"] if resolves_target else [])
+
+
+def _demand_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    snapshot: Exception | SimpleNamespace,
+    **config: object,
+) -> tuple[DaytonaSandboxProvider, list[str], list[str]]:
+    provider = _configured_daytona_provider(**config)
+    target_requests, snapshot_requests = _targeted_snapshot_result(monkeypatch, provider, snapshot)
+    return provider, target_requests, snapshot_requests
+
+
+async def test_default_provider_reserves_only_gpu_free_image_demand() -> None:
+    class Provider(SandboxProvider):
+        async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
+            raise NotImplementedError
+
+        async def get_sandbox(self, instance_id: str) -> Sandbox:
+            raise NotImplementedError
+
+        async def delete_sandbox(self, instance_id: str) -> None:
+            raise NotImplementedError
+
+        def list_sandboxes(self, query: SandboxQuery) -> AsyncGenerator[Sandbox, None]:
+            raise NotImplementedError
+
+    provider = Provider()
+
+    assert await provider.reservable_demand(_ADMISSION_IMAGE, _ADMISSION_RESOURCES) == _ADMISSION_RESOURCES
+    assert (
+        await provider.reservable_demand(ComposeSource(outer=_ADMISSION_IMAGE), _ADMISSION_RESOURCES)
+        == _ADMISSION_RESOURCES
+    )
+    assert await provider.reservable_demand(_ADMISSION_IMAGE, Resources(vcpu=2, memory=4, disk=10, gpu=1)) is None
+    assert await provider.reservable_demand(SnapshotSource(snapshot="snapshot"), _ADMISSION_RESOURCES) is None
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        SnapshotSource(snapshot="snap"),
+        TargetedSnapshotSource(snapshot="snap", target="us"),
+        ComposeSource(outer=SnapshotSource(snapshot="snap")),
+    ],
+    ids=["snapshot", "targeted_snapshot", "compose_snapshot"],
+)
+async def test_daytona_reservable_demand_reads_container_snapshot_size(
+    monkeypatch: pytest.MonkeyPatch,
+    source: SandboxSource,
+) -> None:
+    provider, target_requests, snapshot_requests = _demand_provider(
+        monkeypatch,
+        _snapshot_metadata(cpu=4.0, mem=8.0, disk=20.5, sandbox_class=SandboxClass.CONTAINER.value),
+    )
+
+    assert await provider.reservable_demand(source, _ADMISSION_RESOURCES) == Resources(vcpu=4, memory=8, disk=21)
+    assert target_requests == ["us"]
+    assert snapshot_requests == ["snap"]
+
+
+async def test_daytona_reservable_demand_passes_image_resources_without_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, target_requests, _snapshots = _demand_provider(monkeypatch, AssertionError("images carry demand"))
+
+    assert await provider.reservable_demand(_ADMISSION_IMAGE, _ADMISSION_RESOURCES) == _ADMISSION_RESOURCES
+    assert await provider.reservable_demand(_ADMISSION_IMAGE, Resources(vcpu=2, memory=4, disk=10, gpu=1)) is None
+    assert target_requests == []
+
+
+@pytest.mark.parametrize(
+    ("source", "snapshot", "config"),
+    [
+        (TargetedSnapshotSource(snapshot="snap", target="eu"), _snapshot_metadata(), {}),
+        (SnapshotSource(snapshot="snap"), _snapshot_metadata(), {"DAYTONA_ORGANIZATION_ID": None}),
+        (SnapshotSource(snapshot="snap"), _snapshot_metadata(sandbox_class=SandboxClass.CONTAINER.value, gpu=1), {}),
+        (SnapshotSource(snapshot="snap"), _snapshot_metadata(sandbox_class=SandboxClass.LINUX_VM.value), {}),
+    ],
+    ids=["other_target", "no_organization", "gpu_snapshot", "vm_snapshot"],
+)
+async def test_daytona_reservable_demand_is_unknown_outside_the_container_pool(
+    monkeypatch: pytest.MonkeyPatch,
+    source: SandboxSource,
+    snapshot: SimpleNamespace,
+    config: dict[str, object],
+) -> None:
+    provider, _targets, _snapshots = _demand_provider(monkeypatch, snapshot, **config)
+
+    assert await provider.reservable_demand(source, _ADMISSION_RESOURCES) is None
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "match"),
+    [
+        (_snapshot_metadata(cpu=0, sandbox_class=SandboxClass.CONTAINER.value), "capacity metadata is invalid"),
+        (_snapshot_metadata(sandbox_class=None), "capacity metadata is invalid"),
+        (TimeoutError(), "metadata is unavailable"),
+        (DaytonaError("temporary", status_code=503), "metadata is unavailable"),
+        (DaytonaError("not found", status_code=404), "rejected the snapshot metadata request"),
+    ],
+    ids=["zero_cpu", "no_class", "timeout", "transient", "not_found"],
+)
+async def test_daytona_reservable_demand_raises_sandbox_error_for_unreadable_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+    snapshot: Exception | SimpleNamespace,
+    match: str,
+) -> None:
+    provider, _targets, _snapshots = _demand_provider(monkeypatch, snapshot)
+
+    with pytest.raises(SandboxError, match=match) as error:
+        await provider.reservable_demand(SnapshotSource(snapshot="snap"), _ADMISSION_RESOURCES)
+    assert "secret" not in str(error.value).lower()
 
 
 async def test_daytona_capacity_preserves_provider_values_and_clamps_oversubscription(

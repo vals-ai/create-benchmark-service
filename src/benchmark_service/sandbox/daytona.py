@@ -1172,23 +1172,40 @@ class DaytonaSandboxProvider(SandboxProvider):
             source = source.outer
         if isinstance(source, ImageSource):
             return None if resources.gpu else resources
-        if isinstance(source, TargetedSnapshotSource) and source.target != self._target:
-            return None
         if self._organization_id is None:
             return None
         try:
             async with asyncio.timeout(_ADMISSION_TIMEOUT_SECONDS):
+                if isinstance(source, TargetedSnapshotSource) and not await self._is_configured_target(source.target):
+                    return None
                 snapshot = await self._client_for_target(self._target).snapshot.get(source.snapshot)
         except DaytonaError as exc:
             if _is_transient_daytona_error(exc):
                 raise SandboxError("Daytona snapshot metadata is unavailable") from None
             raise SandboxError("Daytona rejected the snapshot metadata request") from exc
+        except (OpenApiException, ClientResponseError) as exc:
+            raise SandboxError("Daytona rejected the target metadata request") from exc
         except (TimeoutError, ClientError):
             raise SandboxError("Daytona snapshot metadata is unavailable") from None
         (cpu, memory, disk), sandbox_class = _snapshot_capacity_metadata(snapshot)
         if snapshot.gpu or sandbox_class != SandboxClass.CONTAINER:
             return None
         return Resources(vcpu=math.ceil(cpu), memory=math.ceil(memory), disk=math.ceil(disk))
+
+    async def _is_configured_target(self, target: str) -> bool:
+        """``get_capacity()`` accepts the configured target by name or ID, so compare resolved IDs."""
+        if target == self._target:
+            return True
+        async with DaytonaApiClient(self._target_api_configuration) as api_client:
+            list_available_regions = OrganizationsApi(api_client).list_available_regions
+            configured = await self._resolve_target_id_using(list_available_regions)
+            try:
+                requested = await self._resolve_capacity_target_id(
+                    target, list_available_regions, cache_configured_target=False
+                )
+            except SandboxError:
+                return False
+        return configured == requested
 
     def _sandbox_error(self, exc: DaytonaError) -> SandboxError:
         if _is_not_found_error(exc):

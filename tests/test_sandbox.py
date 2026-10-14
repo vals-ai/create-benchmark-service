@@ -1693,6 +1693,18 @@ def _demand_provider(
 ) -> tuple[DaytonaSandboxProvider, list[str], list[str]]:
     provider = _configured_daytona_provider(**config)
     target_requests, snapshot_requests = _targeted_snapshot_result(monkeypatch, provider, snapshot)
+
+    async def list_available_regions() -> list[SimpleNamespace]:
+        return [SimpleNamespace(id="us-id", name="us"), SimpleNamespace(id="eu-id", name="eu")]
+
+    def api_client(_value: object) -> nullcontext[None]:
+        return nullcontext()
+
+    def organizations_api(_value: object) -> SimpleNamespace:
+        return SimpleNamespace(list_available_regions=list_available_regions)
+
+    monkeypatch.setattr("benchmark_service.sandbox.daytona.DaytonaApiClient", api_client)
+    monkeypatch.setattr("benchmark_service.sandbox.daytona.OrganizationsApi", organizations_api)
     return provider, target_requests, snapshot_requests
 
 
@@ -1726,9 +1738,10 @@ async def test_default_provider_reserves_only_gpu_free_image_demand() -> None:
     [
         SnapshotSource(snapshot="snap"),
         TargetedSnapshotSource(snapshot="snap", target="us"),
+        TargetedSnapshotSource(snapshot="snap", target="us-id"),
         ComposeSource(outer=SnapshotSource(snapshot="snap")),
     ],
-    ids=["snapshot", "targeted_snapshot", "compose_snapshot"],
+    ids=["snapshot", "targeted_snapshot", "targeted_snapshot_by_region_id", "compose_snapshot"],
 )
 async def test_daytona_reservable_demand_reads_container_snapshot_size(
     monkeypatch: pytest.MonkeyPatch,
@@ -1758,11 +1771,13 @@ async def test_daytona_reservable_demand_passes_image_resources_without_lookup(
     ("source", "snapshot", "config"),
     [
         (TargetedSnapshotSource(snapshot="snap", target="eu"), _snapshot_metadata(), {}),
+        (TargetedSnapshotSource(snapshot="snap", target="eu-id"), _snapshot_metadata(), {}),
+        (TargetedSnapshotSource(snapshot="snap", target="mars"), _snapshot_metadata(), {}),
         (SnapshotSource(snapshot="snap"), _snapshot_metadata(), {"DAYTONA_ORGANIZATION_ID": None}),
         (SnapshotSource(snapshot="snap"), _snapshot_metadata(sandbox_class=SandboxClass.CONTAINER.value, gpu=1), {}),
         (SnapshotSource(snapshot="snap"), _snapshot_metadata(sandbox_class=SandboxClass.LINUX_VM.value), {}),
     ],
-    ids=["other_target", "no_organization", "gpu_snapshot", "vm_snapshot"],
+    ids=["other_target", "other_target_id", "unknown_target", "no_organization", "gpu_snapshot", "vm_snapshot"],
 )
 async def test_daytona_reservable_demand_is_unknown_outside_the_container_pool(
     monkeypatch: pytest.MonkeyPatch,

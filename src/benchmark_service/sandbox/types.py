@@ -345,6 +345,18 @@ class SandboxProvider(ABC):
     ) -> bool:
         return True
 
+    async def reservable_demand(
+        self,
+        source: SandboxSource,
+        resources: Resources,
+    ) -> Resources | None:
+        """Return the usage this sandbox will take from ``get_capacity()``, or None when unknown."""
+        if isinstance(source, ComposeSource):
+            source = source.outer
+        if isinstance(source, ImageSource) and not resources.gpu:
+            return resources
+        return None
+
     async def get_capacity(self) -> SandboxCapacity | None:
         return None
 

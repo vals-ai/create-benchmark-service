@@ -146,8 +146,10 @@ When a setup or evaluate-instance request omits `sandbox_provider`, the Daytona 
 Providing the organization ID enables organization-scoped capacity admission; omitting it preserves direct creation.
 `SandboxProvider.get_capacity_domains()` reports Daytona CPU, memory, disk, and aggregate GPU usage plus allowed GPU
 types separately for every canonical target and sandbox class; `get_capacity()` retains its configured-target container
-view. Capacity is observational and is not reserved. The API key must be able to read organization usage. Targeted snapshot admission also requires
-snapshot-read access.
+view. Capacity is observational and is not reserved. `reservable_demand()` returns the usage a sandbox will take from that
+view (the run's resources for GPU-free images, the snapshot's own size for container snapshots in the configured target)
+so callers can account for builds still being created; it returns `None` when the demand is unknown. The API key must be
+able to read organization usage. Targeted snapshot admission and snapshot demand also require snapshot-read access.
 When the target is a region name instead of its ID, the key must be able to list regions so admission can resolve
 the canonical ID.
 

@@ -305,6 +305,23 @@ def _admission_pool_id(*, organization_id: str, api_url: str) -> str:
     return f"daytona:{uuid.uuid5(uuid.NAMESPACE_URL, scope)}"
 
 
+def _snapshot_capacity_metadata(snapshot: Any) -> tuple[tuple[float, float, float], SandboxClass]:
+    resources = (snapshot.cpu, snapshot.mem, snapshot.disk)
+    if any(not math.isfinite(value) or value <= 0 for value in resources) or (
+        not math.isfinite(snapshot.gpu) or snapshot.gpu < 0
+    ):
+        raise SandboxError("Daytona targeted snapshot capacity metadata is invalid")
+    if snapshot.sandbox_class is None:
+        raise SandboxError("Daytona targeted snapshot capacity metadata is invalid")
+    try:
+        sandbox_class = SandboxClass(snapshot.sandbox_class)
+    except ValueError:
+        raise SandboxError("Daytona targeted snapshot capacity metadata is invalid") from None
+    if sandbox_class == SandboxClass.UNKNOWN_DEFAULT_OPEN_API:
+        raise SandboxError("Daytona targeted snapshot capacity metadata is invalid")
+    return resources, sandbox_class
+
+
 def _capacity_from_usage(usage: RegionUsageOverview) -> SandboxCapacity:
     allowed_gpu_types = usage.allowed_gpu_types
     return SandboxCapacity(
@@ -1086,19 +1103,7 @@ class DaytonaSandboxProvider(SandboxProvider):
                 target = source.target
                 async with asyncio.timeout(_ADMISSION_TIMEOUT_SECONDS):
                     snapshot = await self._client_for_target(target).snapshot.get(source.snapshot)
-                    snapshot_resources = (snapshot.cpu, snapshot.mem, snapshot.disk)
-                    if any(not math.isfinite(value) or value <= 0 for value in snapshot_resources) or (
-                        not math.isfinite(snapshot.gpu) or snapshot.gpu < 0
-                    ):
-                        raise SandboxError("Daytona targeted snapshot capacity metadata is invalid")
-                    if snapshot.sandbox_class is None:
-                        raise SandboxError("Daytona targeted snapshot capacity metadata is invalid")
-                    try:
-                        sandbox_class = SandboxClass(snapshot.sandbox_class)
-                    except ValueError:
-                        raise SandboxError("Daytona targeted snapshot capacity metadata is invalid") from None
-                    if sandbox_class == SandboxClass.UNKNOWN_DEFAULT_OPEN_API:
-                        raise SandboxError("Daytona targeted snapshot capacity metadata is invalid")
+                    snapshot_resources, sandbox_class = _snapshot_capacity_metadata(snapshot)
                     if snapshot.gpu:
                         target_id = target
                         if snapshot.region_ids is None or target not in snapshot.region_ids:
@@ -1156,6 +1161,34 @@ class DaytonaSandboxProvider(SandboxProvider):
             total[2] - used[2],
         )
         return all(requested <= capacity for requested, capacity in zip(demand, available, strict=True))
+
+    async def reservable_demand(
+        self,
+        source: SandboxSource,
+        resources: Resources,
+    ) -> Resources | None:
+        """Snapshots carry their own size; expose it when it lands in ``get_capacity()``'s pool."""
+        if isinstance(source, ComposeSource):
+            source = source.outer
+        if isinstance(source, ImageSource):
+            return None if resources.gpu else resources
+        if isinstance(source, TargetedSnapshotSource) and source.target != self._target:
+            return None
+        if self._organization_id is None:
+            return None
+        try:
+            async with asyncio.timeout(_ADMISSION_TIMEOUT_SECONDS):
+                snapshot = await self._client_for_target(self._target).snapshot.get(source.snapshot)
+        except DaytonaError as exc:
+            if _is_transient_daytona_error(exc):
+                raise SandboxError("Daytona snapshot metadata is unavailable") from None
+            raise SandboxError("Daytona rejected the snapshot metadata request") from exc
+        except (TimeoutError, ClientError):
+            raise SandboxError("Daytona snapshot metadata is unavailable") from None
+        (cpu, memory, disk), sandbox_class = _snapshot_capacity_metadata(snapshot)
+        if snapshot.gpu or sandbox_class != SandboxClass.CONTAINER:
+            return None
+        return Resources(vcpu=math.ceil(cpu), memory=math.ceil(memory), disk=math.ceil(disk))
 
     def _sandbox_error(self, exc: DaytonaError) -> SandboxError:
         if _is_not_found_error(exc):

@@ -5234,6 +5234,139 @@ async def test_daytona_kill_rejects_session_still_present_after_cgroup_stop() ->
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
+async def test_daytona_kill_retries_failed_native_close_in_same_call() -> None:
+    class InitiallyPresentProcess(CgroupProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.delete_calls = 0
+            self.lookup_calls = 0
+            self.removal_calls = 0
+
+        async def exec(self, command: str) -> SimpleNamespace:
+            if _unwrap_shell_command(command).startswith("d=/sys/fs/cgroup/cbs-"):
+                self.removal_calls += 1
+            return await super().exec(command)
+
+        async def delete_session(self, session_id: str) -> None:
+            self.delete_calls += 1
+            if self.delete_calls == 1:
+                self.release_seen.set()
+                return
+            await super().delete_session(session_id)
+
+        async def get_session(self, session_id: str) -> SimpleNamespace:
+            self.lookup_calls += 1
+            return await super().get_session(session_id)
+
+    process = InitiallyPresentProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    await asyncio.wait_for(workload.kill(), 2)
+    assert process.delete_calls == process.lookup_calls == 2
+    assert process.removal_calls == 1
+    assert process.execute_calls == 1
+    assert not process.group_exists
+    assert process.sessions == set()
+
+
+@pytest.mark.usefixtures("_fake_cgroup_follow")
+async def test_daytona_later_kill_retries_failed_native_close_without_restoring_failed_wait() -> None:
+    class RecoveringProcess(CgroupProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.delete_calls = 0
+            self.lookup_calls = 0
+            self.removal_calls = 0
+            self.can_delete = False
+
+        async def exec(self, command: str) -> SimpleNamespace:
+            if _unwrap_shell_command(command).startswith("d=/sys/fs/cgroup/cbs-"):
+                self.removal_calls += 1
+            return await super().exec(command)
+
+        async def delete_session(self, session_id: str) -> None:
+            self.delete_calls += 1
+            self.release_seen.set()
+            if self.can_delete:
+                await super().delete_session(session_id)
+
+        async def get_session(self, session_id: str) -> SimpleNamespace:
+            self.lookup_calls += 1
+            return await super().get_session(session_id)
+
+    process = RecoveringProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    with pytest.raises(SandboxError, match="session is still present"):
+        await asyncio.wait_for(workload.kill(), 2)
+    assert process.delete_calls == process.lookup_calls == 2
+    assert process.sessions
+    process.can_delete = True
+    await asyncio.wait_for(workload.kill(), 2)
+    assert process.delete_calls == process.lookup_calls == 3
+    assert process.removal_calls == 1
+    assert process.execute_calls == 1
+    assert not process.group_exists
+    assert process.sessions == set()
+    with pytest.raises(SandboxError, match="session is still present"):
+        await asyncio.wait_for(workload.wait(), 2)
+
+
+@pytest.mark.usefixtures("_fake_cgroup_follow")
+async def test_daytona_concurrent_kills_share_native_close_replacement_after_cancelled_waiter() -> None:
+    class PausedRecoveryProcess(CgroupProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.delete_calls = 0
+            self.lookup_calls = 0
+            self.retry_started = asyncio.Event()
+            self.allow_retry = asyncio.Event()
+
+        async def delete_session(self, session_id: str) -> None:
+            self.delete_calls += 1
+            if self.delete_calls < 3:
+                self.release_seen.set()
+                return
+            self.retry_started.set()
+            await self.allow_retry.wait()
+            await super().delete_session(session_id)
+
+        async def get_session(self, session_id: str) -> SimpleNamespace:
+            self.lookup_calls += 1
+            return await super().get_session(session_id)
+
+    process = PausedRecoveryProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    with pytest.raises(SandboxError, match="session is still present"):
+        await asyncio.wait_for(workload.kill(), 2)
+
+    first = asyncio.create_task(workload.kill())
+    try:
+        await asyncio.wait_for(process.retry_started.wait(), 2)
+        assert process.sessions
+        second = asyncio.create_task(workload.kill())
+        await asyncio.sleep(0)
+        second.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await second
+        assert process.sessions
+    finally:
+        process.allow_retry.set()
+    await asyncio.wait_for(first, 2)
+    assert process.delete_calls == process.lookup_calls == 3
+    assert process.execute_calls == 1
+    assert not process.group_exists
+    assert process.sessions == set()
+
+
+@pytest.mark.usefixtures("_fake_cgroup_follow")
 async def test_daytona_control_poll_failure_does_not_stop_without_owner_request() -> None:
     process = CgroupProcess()
     process.allow_creation.set()

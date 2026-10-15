@@ -1401,7 +1401,14 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         return self._group_stopped_at
 
     async def _ensure_closed(self) -> float:
-        if self._close_task is None:
+        if (
+            self._close_task is None
+            or (
+                self._close_task.done()
+                and not self._close_task.cancelled()
+                and self._close_task.exception() is not None
+            )
+        ):
             self._close_task = asyncio.create_task(self._close())
         return await self._close_task
 

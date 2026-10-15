@@ -314,6 +314,9 @@ and stop handling run independently of the log watcher. `wait()` and `kill()` sh
 session cleanup, which waits for the launch attempt to settle before deleting the
 session and confirming absence. A prompt watcher failure does not cancel cleanup;
 `kill()` still waits for stop and absence confirmation.
+A completed failed session close may be retried by `kill()` but still requires fresh
+absence confirmation, without replaying the command, recovering its result, or
+extending the caller's deadline.
 
 See the [Daytona reconnect diagram](docs/diagrams/daytona-reconnect.png)
 ([editable Excalidraw source](docs/diagrams/daytona-reconnect.excalidraw)).

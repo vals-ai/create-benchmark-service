@@ -1157,7 +1157,11 @@ class _DaytonaControlledWorkload(ControlledWorkload):
 
     async def _ensure_closed(self) -> float:
         async with self._close_lock:
-            if self._close_task is None:
+            if self._close_task is None or (
+                self._close_task.done()
+                and not self._close_task.cancelled()
+                and self._close_task.exception() is not None
+            ):
                 self._close_task = asyncio.create_task(self._close())
             close_task = self._close_task
         return await close_task

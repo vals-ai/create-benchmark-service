@@ -11,7 +11,11 @@ from benchmark_service.sandbox.local.docker import DockerProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
 from benchmark_service.sandbox.types import (
     ComposeSource,
+    ControlledWorkload,
+    ControlledWorkloadResult,
+    ControlledWorkloadUnsupportedError,
     ExecResult,
+    GenerationContainment,
     ImageSource,
     MissingSandboxConfigError,
     ResourceCapacity,
@@ -25,6 +29,8 @@ from benchmark_service.sandbox.types import (
     SandboxError,
     SandboxNotFoundError,
     SandboxProvider,
+    LINUX_CGROUP_V2_V1,
+    LINUX_PROCESS_GROUP_V1,
     SandboxQuery,
     SandboxSource,
     SnapshotSource,
@@ -45,11 +51,17 @@ def sandbox_provider_config_from_mapping(data: Mapping[str, Any]) -> SandboxProv
 
 __all__ = [
     "ComposeSource",
+    "ControlledWorkload",
+    "ControlledWorkloadResult",
+    "ControlledWorkloadUnsupportedError",
     "ComposeSandbox",
     "DaytonaProviderConfig",
     "DockerProviderConfig",
     "ExecResult",
+    "GenerationContainment",
     "ImageSource",
+    "LINUX_CGROUP_V2_V1",
+    "LINUX_PROCESS_GROUP_V1",
     "MissingSandboxConfigError",
     "ModalProviderConfig",
     "ResourceCapacity",

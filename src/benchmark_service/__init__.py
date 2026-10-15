@@ -16,10 +16,15 @@ from benchmark_service.client import (
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.sandbox import (
     ComposeSource,
+    ControlledWorkload,
+    ControlledWorkloadResult,
+    ControlledWorkloadUnsupportedError,
     ComposeSandbox,
     DaytonaProviderConfig,
     DockerProviderConfig,
     ExecResult,
+    GenerationContainment,
+    LINUX_CGROUP_V2_V1,
     ImageSource,
     ModalProviderConfig,
     ResourceCapacity,
@@ -44,6 +49,7 @@ from benchmark_service.sandbox import (
 from benchmark_service.schemas import (
     DATASET_VERSION_HEADER,
     ArtifactGradingSubmission,
+    CreditedGeneration,
     DatasetVersion,
     ResolveDatasetRequest,
     ResolveDatasetResponse,
@@ -54,9 +60,11 @@ from benchmark_service.schemas import (
     SubmissionArtifactReference,
     TextGradingSubmission,
 )
+from benchmark_service.valkyrie_stage import StageReporter, valkyrie_stage_source
 
 __all__ = [
     "DATASET_VERSION_HEADER",
+    "CreditedGeneration",
     "DatasetVersion",
     "ResolveDatasetRequest",
     "ResolveDatasetResponse",
@@ -72,12 +80,17 @@ __all__ = [
     "SandboxRecoveryAttempt",
     "ArtifactGradingSubmission",
     "ComposeSource",
+    "ControlledWorkload",
+    "ControlledWorkloadResult",
+    "ControlledWorkloadUnsupportedError",
     "ComposeSandbox",
     "DaytonaProviderConfig",
     "DockerProviderConfig",
     "EvalMode",
     "GradingSubmission",
     "ExecResult",
+    "GenerationContainment",
+    "LINUX_CGROUP_V2_V1",
     "ImageSource",
     "InflightMiddleware",
     "ModalProviderConfig",
@@ -99,6 +112,8 @@ __all__ = [
     "SandboxRecoveryPolicy",
     "SandboxSource",
     "SnapshotSource",
+    "StageReporter",
+    "valkyrie_stage_source",
     "SubmissionArtifactReference",
     "TargetedSnapshotSource",
     "TextGradingSubmission",

@@ -283,13 +283,43 @@ requires a usable outer transport and effective inner service. Unsupported probe
 raise rather than silently falling back to an ordinary command.
 
 A direct Daytona sandbox supports `LINUX_CGROUP_V2_V1` (`linux_cgroup_v2` v1).
-`sandbox.controlled_workload(command, cwd=..., env_vars=...)` starts a PTY command
-whose child enters a dedicated cgroup v2 subgroup. Natural completion and `kill()`
-use `cgroup.kill`, confirm `populated 0` and remove the subgroup; the PTY session
-is also confirmed absent. The probe requires writable cgroup v2 delegation with
-`cgroup.kill`; the sandbox's other services remain outside the workload subgroup.
-The command runs as a foreground PTY job; shell setup and job-control text are not
-part of its streamed output, while workload stdout and stderr remain included.
+`sandbox.controlled_workload(command, cwd=..., env_vars=...)` launches one native
+asynchronous Daytona session command whose child enters a dedicated cgroup v2
+subgroup. Its stdin is `/dev/null`, so noninteractive readers see EOF at launch.
+The shell stays outside the subgroup and publishes completion before
+release, so descendants are fenced before the native exit status and final output
+are returned. Natural completion and `kill()` use `cgroup.kill`, confirm
+`populated 0`, and remove the subgroup; the native session is also confirmed absent.
+The watcher checks command status about every 10 seconds while following logs,
+and whenever the follower ends. A known exit does not depend on the log connection
+closing. After exit, the watcher cancels and joins the reader, then makes one final
+log snapshot request. Confirmed sandbox removal raises `SandboxNotFoundError`;
+other handled snapshot failures warn without retrying or changing the command exit
+result. While command exit is unknown, an observed sandbox `STOPPED` or `ERROR`
+ends the watcher with `SandboxError`; `wait()` reports that observed failure promptly
+even if independent cgroup and session cleanup is still pending. A later cleanup
+failure is logged. If cleanup fails after a separate observed sandbox loss,
+`wait()` raises the original `SandboxNotFoundError` and logs the distinct cleanup
+failure once; a mirrored copy of the same exception is not a second failure.
+Other failures retain cleanup-first ordering. Success still waits for cleanup and
+confirmed absence. Transient output and status observation
+failures reopen the same command without restarting it or stopping the workload.
+Completion-marker observation retries independently.
+The caller still owns the deadline and explicit stop. The probe
+requires writable cgroup v2 delegation with `cgroup.kill`; other sandbox services
+remain outside the subgroup.
+
+Launch setup is a one-shot phase, separate from repeated observation. Completion
+and stop handling run independently of the log watcher. `wait()` and `kill()` share
+session cleanup, which waits for the launch attempt to settle before deleting the
+session and confirming absence. A prompt watcher failure does not cancel cleanup;
+`kill()` still waits for stop and absence confirmation.
+A completed failed session close may be retried by `kill()` but still requires fresh
+absence confirmation, without replaying the command, recovering its result, or
+extending the caller's deadline.
+
+See the [Daytona reconnect diagram](docs/diagrams/daytona-reconnect.png)
+([editable Excalidraw source](docs/diagrams/daytona-reconnect.excalidraw)).
 
 `ComposeSandbox` supports `linux_process_group` v1 (`LINUX_PROCESS_GROUP_V1`).
 It pins the running service container, starts the command in a new process group inside
@@ -313,7 +343,7 @@ Consume `workload.output()` for streamed text. `await workload.wait()` returns
 `ControlledWorkloadResult(result=ExecResult(exit_code, output), absence_confirmed_at=...)`
 after its backend-specific stop boundary is confirmed. On a deadline or other abort,
 `await workload.kill()` stops that boundary before returning and raises if the stop
-cannot be confirmed. On Daytona, cleanup may retry a completed failed PTY close when
+cannot be confirmed. On Daytona, cleanup may retry a completed failed session close when
 it reaches the close step again, including within the same `kill()` call. A retry
 still requires fresh confirmation of absence and does not turn an earlier workload
 failure into success. The timestamp is event-loop monotonic time, not a wall-clock
@@ -510,7 +540,7 @@ result = await client.run_with_sandbox_recovery(
 Pydantic models used across requests and responses:
 
 - **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, optional `CreditedGeneration(allowance_seconds, stage_protocol)`, `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
-- **`GenerationContainment`** — effective-sandbox capability: `linux_cgroup_v2` v1 for direct Daytona or `linux_process_group` v1 for Compose service, native Modal, and local Docker workloads. Tracker probes the effective sandbox for every task before its `ControlledWorkload` and does not fall back to `Sandbox.command()` on unsupported providers.
+- **`GenerationContainment`** — effective-sandbox capability: `linux_cgroup_v2` v1 for direct Daytona native-session commands fenced by cgroup v2, or `linux_process_group` v1 for Compose service, native Modal, and local Docker workloads. Tracker probes the effective sandbox for every task before its `ControlledWorkload` and does not fall back to `Sandbox.command()` on unsupported providers.
 - **`agent_install_order`** — `"before_setup"` installs agent dependencies before benchmark setup; `"after_setup"` lets setup prepare the environment first. The default is `"before_setup"`; lifecycle execution is the caller's responsibility.
 - **`BenchmarkEgressPlan`** — declarative `setup_task`, agent `run`, and `evaluation` policies. `"*"` is unrestricted, `[]` is deny-all, and a non-empty list is an allowlist. Setup and evaluation default to `"*"`; `run=None` leaves the benchmark without a run-policy opinion. Applying and composing the plan is the caller's responsibility.
 - **`SandboxRecoveryPolicy`** — explicit opt-in to recreate a lost generation sandbox with the same run identity and volumes; `max_sandbox_attempts` (2–20, inclusive) includes the initial sandbox

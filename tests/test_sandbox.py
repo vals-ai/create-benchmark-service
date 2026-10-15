@@ -5173,8 +5173,49 @@ async def test_daytona_kill_rejects_unconfirmed_pty_absence(failure: str) -> Non
     error = SandboxConnectionError if failure == "error" else SandboxError
     with pytest.raises(error):
         await asyncio.wait_for(workload.kill(), 2)
-    assert process.list_calls == 1
+    assert process.list_calls == 2
     assert not process.group_exists
+
+
+async def test_daytona_cleanup_retries_failed_close_after_provider_recovers() -> None:
+    process = ListedCgroupProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    process.allow_final_frame.set()
+    process.list_error = True
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    with pytest.raises(SandboxConnectionError, match="PTY listing unavailable"):
+        await asyncio.wait_for(workload.kill(), 2)
+    assert process.list_calls == 2
+    assert process.sessions == set()
+
+    process.list_error = False
+    await asyncio.wait_for(workload.kill(), 2)
+    assert process.list_calls == 3
+    with pytest.raises(SandboxConnectionError, match="PTY listing unavailable"):
+        await asyncio.wait_for(workload.wait(), 2)
+    assert process.list_calls == 3
+
+
+async def test_daytona_kill_retries_internal_failed_close_in_final_step() -> None:
+    class FirstListingFailsProcess(ListedCgroupProcess):
+        async def list_pty_sessions(self) -> list[SimpleNamespace]:
+            self.list_error = self.list_calls == 0
+            return await super().list_pty_sessions()
+
+    process = FirstListingFailsProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    await asyncio.wait_for(workload.kill(), 2)
+    assert process.list_calls == 2
+    assert process.sessions == set()
+    assert not process.group_exists
+    with pytest.raises(SandboxConnectionError, match="PTY listing unavailable"):
+        await asyncio.wait_for(workload.wait(), 2)
+    assert process.list_calls == 2
 
 
 async def test_daytona_output_cancellation_does_not_stop_admitted_work() -> None:

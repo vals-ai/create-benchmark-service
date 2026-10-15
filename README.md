@@ -313,7 +313,10 @@ Consume `workload.output()` for streamed text. `await workload.wait()` returns
 `ControlledWorkloadResult(result=ExecResult(exit_code, output), absence_confirmed_at=...)`
 after its backend-specific stop boundary is confirmed. On a deadline or other abort,
 `await workload.kill()` stops that boundary before returning and raises if the stop
-cannot be confirmed. The timestamp is event-loop monotonic time, not a wall-clock
+cannot be confirmed. On Daytona, cleanup may retry a completed failed PTY close when
+it reaches the close step again, including within the same `kill()` call. A retry
+still requires fresh confirmation of absence and does not turn an earlier workload
+failure into success. The timestamp is event-loop monotonic time, not a wall-clock
 datetime. The caller owns deadline arbitration and must not proceed to independent
 collection on unconfirmed stop. Ordinary `Sandbox.command()` and `Sandbox.exec()`
 do not provide this contract. On Daytona, native Modal, and local Docker, `result.output` is a bounded

@@ -118,7 +118,14 @@ _SANDBOX_OPERATION_ERRORS = (DaytonaError, ClientResponseError)
 _TRANSIENT_DAYTONA_ERRORS = (DaytonaConnectionError, DaytonaRateLimitError, DaytonaTimeoutError)
 _RETRY_AFTER_PREFIX = "retry-after-"
 _KNOWN_THROTTLERS = ("sandbox-create", "sandbox-lifecycle", "authenticated", "anonymous")
-_DELETE_CONFLICT_MESSAGES = ("state change in progress", "modified by another operation")
+# Daytona serialises mutations per sandbox and answers 409 while another one holds the lock
+# (network-settings updates, state changes, optimistic-lock saves). The rejected call never ran,
+# so it is safe to retry; a 409 for an existing name or PTY session is a real conflict and is not.
+_CONCURRENT_OPERATION_MESSAGES = (
+    "operation is already in progress",
+    "modified by another operation",
+    "state change in progress",
+)
 _REMOVED_SANDBOX_CLIENT_STATUSES = (404, 502)
 _RETRYABLE_PROVIDER_STATUSES = (408, 429, 500, 502, 503, 504)
 _FAILED_EXECUTE_COMMAND_PREFIX = "failed to execute command:"
@@ -366,10 +373,6 @@ def _message_contains(exc: BaseException, messages: tuple[str, ...]) -> bool:
     return any(message in error for message in messages)
 
 
-def _is_delete_conflict(exc: DaytonaConflictError) -> bool:
-    return _message_contains(exc, _DELETE_CONFLICT_MESSAGES)
-
-
 def _is_not_found_error(exc: DaytonaError | ClientResponseError) -> bool:
     if isinstance(exc, ClientResponseError):
         return exc.status in _REMOVED_SANDBOX_CLIENT_STATUSES
@@ -405,12 +408,17 @@ def _is_throttled_error(exc: DaytonaError | ClientResponseError) -> bool:
     return _message_contains(exc, _THROTTLED_ERROR_MESSAGES)
 
 
+def _is_concurrent_operation_conflict(exc: DaytonaError | ClientResponseError) -> bool:
+    is_conflict = isinstance(exc, DaytonaConflictError) or _provider_status_code(exc) == 409
+    return is_conflict and _message_contains(exc, _CONCURRENT_OPERATION_MESSAGES)
+
+
 def _is_transient_daytona_error(exc: DaytonaError | ClientResponseError) -> bool:
     if isinstance(exc, _TRANSIENT_DAYTONA_ERRORS) or _has_retryable_cause(exc):
         return True
     if _provider_status_code(exc) in _RETRYABLE_PROVIDER_STATUSES:
         return True
-    if _is_throttled_error(exc):
+    if _is_throttled_error(exc) or _is_concurrent_operation_conflict(exc):
         return True
     return _message_contains(exc, _TRANSPORT_ERROR_MESSAGES)
 
@@ -1398,10 +1406,6 @@ class DaytonaSandboxProvider(SandboxProvider):
             await self._daytona.delete(sandbox)
         except DaytonaNotFoundError:
             return
-        except DaytonaConflictError as exc:
-            if _is_delete_conflict(exc):
-                raise SandboxConnectionError(str(exc)) from exc
-            raise self._sandbox_error(exc) from exc
         except DaytonaError as exc:
             raise self._sandbox_error(exc) from exc
 

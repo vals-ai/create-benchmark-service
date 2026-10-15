@@ -5366,6 +5366,69 @@ async def test_daytona_concurrent_kills_share_native_close_replacement_after_can
     assert process.sessions == set()
 
 
+
+@pytest.mark.usefixtures("_fake_cgroup_follow")
+async def test_daytona_cleanup_retries_failed_close_after_provider_recovers() -> None:
+    class FailedConfirmationProcess(CgroupProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lookup_calls = 0
+            self.lookup_error = True
+
+        async def get_session(self, session_id: str) -> SimpleNamespace:
+            self.lookup_calls += 1
+            if self.lookup_error:
+                raise DaytonaConnectionError("session lookup unavailable")
+            return await super().get_session(session_id)
+
+    process = FailedConfirmationProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    with pytest.raises(SandboxConnectionError, match="session lookup unavailable"):
+        await asyncio.wait_for(workload.kill(), 2)
+    assert process.lookup_calls == 2
+    assert process.sessions == set()
+    assert not process.group_exists
+
+    process.lookup_error = False
+    await asyncio.wait_for(workload.kill(), 2)
+    assert process.lookup_calls == 3
+    assert process.execute_calls == 1
+    with pytest.raises(SandboxConnectionError, match="session lookup unavailable"):
+        await asyncio.wait_for(workload.wait(), 2)
+    assert process.lookup_calls == 3
+
+
+@pytest.mark.usefixtures("_fake_cgroup_follow")
+async def test_daytona_kill_retries_internal_failed_close_in_final_step() -> None:
+    class FirstConfirmationFailsProcess(CgroupProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.lookup_calls = 0
+
+        async def get_session(self, session_id: str) -> SimpleNamespace:
+            self.lookup_calls += 1
+            if self.lookup_calls == 1:
+                raise DaytonaConnectionError("session lookup unavailable")
+            return await super().get_session(session_id)
+
+    process = FirstConfirmationFailsProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    await asyncio.wait_for(workload.kill(), 2)
+    assert process.lookup_calls == 2
+    assert process.sessions == set()
+    assert not process.group_exists
+    assert process.execute_calls == 1
+    with pytest.raises(SandboxConnectionError, match="session lookup unavailable"):
+        await asyncio.wait_for(workload.wait(), 2)
+    assert process.lookup_calls == 2
+
+
 @pytest.mark.usefixtures("_fake_cgroup_follow")
 async def test_daytona_control_poll_failure_does_not_stop_without_owner_request() -> None:
     process = CgroupProcess()

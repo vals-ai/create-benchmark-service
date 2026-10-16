@@ -22,7 +22,12 @@ from benchmark_service.sandbox.types import (
     SandboxProvider,
     SandboxQuery,
 )
-from benchmark_service.schemas import BenchmarkEgressPlan, RetrieveTaskResponse, StreamResultChunk
+from benchmark_service.schemas import (
+    BenchmarkEgressPlan,
+    EvaluateResponseRequest,
+    RetrieveTaskResponse,
+    StreamResultChunk,
+)
 from tests.conftest import StubBenchmark, ValsStubBenchmark
 
 
@@ -299,6 +304,58 @@ def test_websocket_evaluate_response_with_eval_resume_state(client: TestClient) 
         }
 
 
+@pytest.mark.parametrize("stream", [False, True])
+def test_resume_keeps_caller_owned_sandbox_outside_saved_state(monkeypatch: pytest.MonkeyPatch, stream: bool) -> None:
+    class BorrowedSandboxBenchmark(StubBenchmark):
+        async def evaluate_response(self, request: EvaluateResponseRequest, dataset: str | None = None) -> Any:
+            return {
+                "instance_id": getattr(request, "instance_id", None),
+                "state": request.eval_resume_state,
+                "dataset": dataset,
+            }
+
+    monkeypatch.delenv("AUTH_REQUIRED", raising=False)
+    state = {"checkpoint": "immutable-artifact"}
+    body = {"task_id": "task-1", "eval_resume_state": state, "instance_id": "owned-grader", "dataset": "default"}
+    with TestClient(BenchmarkServiceApp(BorrowedSandboxBenchmark)) as client:
+        if stream:
+            with client.websocket_connect("/ws/evaluate-response") as websocket:
+                websocket.send_json(body)
+                result = websocket.receive_json()
+                assert result["type"] == "result"
+                observed = result["data"]
+        else:
+            response = client.post("/evaluate-response/", json=body)
+            assert response.status_code == 200
+            observed = response.json()
+
+    assert observed == {"instance_id": "owned-grader", "state": state, "dataset": "default"}
+
+
+def test_resume_sandbox_metadata_reuses_the_existing_resource_spec(monkeypatch: pytest.MonkeyPatch) -> None:
+    declaration = {"source": None, "resources": None, "timeout_s": 30, "network_block_all": True}
+
+    class FreshResumeBenchmark(StubBenchmark):
+        async def retrieve_task(
+            self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+        ) -> RetrieveTaskResponse:
+            response = await super().retrieve_task(task_id, skip_validation, dataset)
+            return RetrieveTaskResponse.model_validate({**response.model_dump(), "resume_sandbox": declaration})
+
+    monkeypatch.delenv("AUTH_REQUIRED", raising=False)
+    with TestClient(BenchmarkServiceApp(FreshResumeBenchmark)) as client:
+        response = client.get("/retrieve-task/", params={"task_id": "task-1"})
+        assert response.status_code == 200
+        assert response.json().get("resume_sandbox") == declaration
+
+
+def test_text_evaluation_cannot_borrow_a_resume_sandbox(client: TestClient) -> None:
+    response = client.post(
+        "/evaluate-response/", json={"task_id": "task-1", "response": "answer", "instance_id": "owned-grader"}
+    )
+    assert response.status_code == 422
+
+
 def test_websocket_setup_task_resolves_sandbox_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -391,6 +448,7 @@ class TestAuthMiddleware:
     @pytest.fixture
     def auth_client(self, monkeypatch: pytest.MonkeyPatch) -> Generator[TestClient, None, None]:
         monkeypatch.setenv("AUTH_REQUIRED", "true")
+
         class AuthBenchmark(StubBenchmark):
             async def resolve_tenant(self, headers: dict[str, str]) -> str | None:
                 if headers.get("authorization") != TestAuthMiddleware.AUTH_TOKEN:
@@ -476,7 +534,9 @@ class TestUnconfiguredAuth:
         assert client.get("/health").status_code == 200
 
     def test_auth_disabled_cannot_bypass_required_auth(
-        self, monkeypatch: pytest.MonkeyPatch, client: TestClient,
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        client: TestClient,
     ) -> None:
         monkeypatch.setenv("AUTH_DISABLED", "true")
         assert client.get("/verify-task-ids").status_code == 401
@@ -671,7 +731,7 @@ def test_request_docker_provider_requires_service_opt_in(
                     {
                         "task_id": "task-1",
                         "instance_id": "i-1",
-                        "response": "answer",
+                        "eval_resume_state": {"checkpoint": "saved"},
                         "sandbox_provider": {"type": "docker"},
                         "dataset": "alt",
                     }
@@ -740,9 +800,7 @@ def test_core_app_ignores_hosted_policy_configuration(monkeypatch: pytest.Monkey
 
     with TestClient(BenchmarkServiceApp(StubBenchmark)) as client:
         assert client.get("/verify-task-ids").status_code == 200
-        response = client.post(
-            "/v1/score", json={"run_id": "local-run", "evaluation_results": {}}
-        )
+        response = client.post("/v1/score", json={"run_id": "local-run", "evaluation_results": {}})
         assert response.status_code == 404
 
 

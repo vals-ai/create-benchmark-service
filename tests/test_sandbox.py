@@ -2550,6 +2550,35 @@ def test_daytona_permanent_http_statuses_are_not_transient(status_code: int) -> 
     assert not _is_transient_daytona_error(DaytonaError("provider request failed", status_code=status_code))
 
 
+@pytest.mark.parametrize(
+    "exc",
+    [
+        DaytonaConflictError(
+            "Failed to update network settings: An operation is already in progress for this resource"
+        ),
+        DaytonaConflictError("Sandbox was modified by another operation, please try again"),
+        DaytonaConflictError("Failed to remove sandbox: State change in progress"),
+        DaytonaError("Failed to update network settings: An operation is already in progress", status_code=409),
+        _client_response_error(409, "Sandbox was modified by another operation"),
+    ],
+)
+def test_daytona_concurrent_operation_conflicts_are_transient(exc: DaytonaError | ClientResponseError) -> None:
+    assert _is_transient_daytona_error(exc)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        DaytonaConflictError("Sandbox with name both__task_1 already exists"),
+        DaytonaConflictError("PTY session already exists"),
+        DaytonaError("Failed to execute command: an operation is already in progress", status_code=400),
+        DaytonaError("Setup script failed: migration already in progress"),
+    ],
+)
+def test_daytona_other_conflicts_and_unrelated_in_progress_errors_are_not_transient(exc: DaytonaError) -> None:
+    assert not _is_transient_daytona_error(exc)
+
+
 def test_daytona_not_found_classification_uses_structured_code_and_status_fallback() -> None:
     assert _is_not_found_error(DaytonaError("sandbox missing", code="NOT_FOUND"))
     assert _is_not_found_error(DaytonaError("sandbox missing", status_code=404))
@@ -4225,6 +4254,68 @@ def test_daytona_provider_rejects_blank_target() -> None:
                 DAYTONA_TARGET="   ",
             )
         )
+
+
+class ConflictThenApplyNetworkSettingsSandbox(InnerSandbox):
+    def __init__(self) -> None:
+        super().__init__()
+        self.update_attempts = 0
+
+    async def update_network_settings(
+        self,
+        *,
+        network_block_all: bool | None = None,
+        network_allow_list: str | None = None,
+        domain_allow_list: str | None = None,
+    ) -> None:
+        self.update_attempts += 1
+        if self.update_attempts == 1:
+            raise DaytonaConflictError(
+                "Failed to update network settings: An operation is already in progress for this resource"
+            )
+        await super().update_network_settings(
+            network_block_all=network_block_all,
+            network_allow_list=network_allow_list,
+            domain_allow_list=domain_allow_list,
+        )
+
+
+async def _modify_egress(sandbox: DaytonaSandbox) -> None:
+    await sandbox.modify_egress_rules(["github.com"])
+
+
+async def _block_egress(sandbox: DaytonaSandbox) -> None:
+    await sandbox.block_all_egress()
+
+
+async def _clear_egress(sandbox: DaytonaSandbox) -> None:
+    await sandbox.clear_egress_rules()
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_settings"),
+    [
+        (_modify_egress, {"network_block_all": False, "network_allow_list": "", "domain_allow_list": "github.com"}),
+        (_block_egress, {"network_block_all": True, "network_allow_list": None, "domain_allow_list": None}),
+        (_clear_egress, {"network_block_all": False, "network_allow_list": "", "domain_allow_list": ""}),
+    ],
+    ids=["modify", "block", "clear"],
+)
+async def test_daytona_egress_updates_retry_concurrent_operation_conflicts(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: Callable[[DaytonaSandbox], Awaitable[None]],
+    expected_settings: dict[str, str | bool | None],
+) -> None:
+    """A 409 raised while Daytona still holds the sandbox lock is retried on the provider ladder."""
+    inner = ConflictThenApplyNetworkSettingsSandbox()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+    for method in (sandbox.modify_egress_rules, sandbox.block_all_egress, sandbox.clear_egress_rules):
+        _skip_retry_sleep(monkeypatch, method)
+
+    await operation(sandbox)
+
+    assert inner.update_attempts == 2
+    assert inner.network_settings == [expected_settings]
 
 
 async def test_daytona_updates_egress_rules() -> None:

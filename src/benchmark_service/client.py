@@ -758,16 +758,19 @@ class BenchmarkServiceClient:
         dataset: str | None = None,
         on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
         sandbox_provider: SandboxProviderConfig | None = None,
+        instance_id: str | None = None,
     ) -> JsonValue:
         """Resume evaluation from state previously streamed by the benchmark service.
 
-        ``sandbox_provider`` is sent only with this request; benchmark-owned
-        ``eval_resume_state`` remains independently persistable.
+        ``sandbox_provider`` and ``instance_id`` are request-only. The caller
+        owns admission and cleanup of a supplied sandbox; ``eval_resume_state``
+        remains independently persistable.
         """
         request = EvaluateResponseRequest(
             task_id=task_id,
             eval_resume_state=eval_resume_state,
             sandbox_provider=sandbox_provider,
+            instance_id=instance_id,
             dataset=dataset,
         )
         return await self._websocket_request("evaluate-response", request, on_message, on_eval_resume_state)

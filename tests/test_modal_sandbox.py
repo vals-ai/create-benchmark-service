@@ -1015,9 +1015,7 @@ async def test_create_sandbox_mounts_named_volumes(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(modal_module, "Volume", SimpleNamespace(from_name=from_name))
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
 
-    await provider.create_sandbox(
-        _request(volumes=[VolumeMount(name="kspbench-steam", mount_path="/vol")])
-    )
+    await provider.create_sandbox(_request(volumes=[VolumeMount(name="kspbench-steam", mount_path="/vol")]))
 
     assert captured["volumes"] == {"/vol": "vol::kspbench-steam"}
     assert looked_up == [("kspbench-steam", False)]

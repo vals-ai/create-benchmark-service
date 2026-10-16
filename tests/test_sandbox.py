@@ -1770,14 +1770,23 @@ async def test_daytona_reservable_demand_reads_exact_snapshot_size_and_class(
     provider, target_requests, snapshot_requests = _demand_provider(
         monkeypatch,
         _snapshot_metadata(
-            cpu=4.5, mem=8.5, disk=20.5, sandbox_class=sandbox_class.value, region_ids=[target_id],
+            cpu=4.5,
+            mem=8.5,
+            disk=20.5,
+            sandbox_class=sandbox_class.value,
+            region_ids=[target_id],
         ),
     )
     original_source = source.model_dump()
     original_resources = _ADMISSION_RESOURCES.model_dump()
 
     assert await provider.reservable_demand(source, _ADMISSION_RESOURCES) == SandboxReservationDemand(
-        target_id=target_id, sandbox_class=sandbox_class.value, vcpu=4.5, memory=8.5, disk=20.5, gpu=0,
+        target_id=target_id,
+        sandbox_class=sandbox_class.value,
+        vcpu=4.5,
+        memory=8.5,
+        disk=20.5,
+        gpu=0,
     )
     assert target_requests == [target]
     assert snapshot_requests == ["snap"]
@@ -1787,8 +1796,14 @@ async def test_daytona_reservable_demand_reads_exact_snapshot_size_and_class(
 
 @pytest.mark.parametrize(
     ("target", "target_id"),
-    [("us", "us-id"), ("us-id", "us-id"), ("eu", "eu-id"), ("eu-id", "eu-id"),
-     ("custom", "custom-id"), ("custom-id", "custom-id")],
+    [
+        ("us", "us-id"),
+        ("us-id", "us-id"),
+        ("eu", "eu-id"),
+        ("eu-id", "eu-id"),
+        ("custom", "custom-id"),
+        ("custom-id", "custom-id"),
+    ],
 )
 @pytest.mark.parametrize("gpu", [0, 2])
 @pytest.mark.parametrize("compose", [False, True], ids=["image", "compose_image"])
@@ -1800,7 +1815,9 @@ async def test_daytona_reservable_image_demand_resolves_quota_domain_without_sna
     compose: bool,
 ) -> None:
     provider, targets, snapshots = _demand_provider(
-        monkeypatch, AssertionError("images carry demand"), DAYTONA_TARGET=target,
+        monkeypatch,
+        AssertionError("images carry demand"),
+        DAYTONA_TARGET=target,
     )
     resources = Resources(vcpu=2, memory=4, disk=10, gpu=gpu)
     original_resources = resources.model_dump()
@@ -1844,9 +1861,15 @@ async def test_daytona_reservable_gpu_snapshot_charges_actual_gpus_in_its_domain
     )
 
     assert await provider.reservable_demand(
-        TargetedSnapshotSource(snapshot="snap", target=target), _ADMISSION_RESOURCES,
+        TargetedSnapshotSource(snapshot="snap", target=target),
+        _ADMISSION_RESOURCES,
     ) == SandboxReservationDemand(
-        target_id=target_id, sandbox_class=sandbox_class.value, vcpu=0, memory=0, disk=0, gpu=2,
+        target_id=target_id,
+        sandbox_class=sandbox_class.value,
+        vcpu=0,
+        memory=0,
+        disk=0,
+        gpu=2,
     )
     assert targets == [target]
     assert snapshots == ["snap"]

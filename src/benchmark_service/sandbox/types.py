@@ -123,6 +123,19 @@ class SandboxCapacityDomain(BaseModel):
     capacity: SandboxCapacity
 
 
+class SandboxReservationDemand(BaseModel):
+    """Quota charge in one capacity domain, not the resources sent to creation."""
+
+    model_config = ConfigDict(frozen=True)
+
+    target_id: str = Field(min_length=1)
+    sandbox_class: str = Field(min_length=1)
+    vcpu: FiniteFloat = Field(ge=0)
+    memory: FiniteFloat = Field(ge=0)
+    disk: FiniteFloat = Field(ge=0)
+    gpu: FiniteFloat = Field(ge=0)
+
+
 class VolumeMount(BaseModel):
     """A named, persistent volume attached to a sandbox at a fixed path.
 
@@ -349,13 +362,9 @@ class SandboxProvider(ABC):
         self,
         source: SandboxSource,
         resources: Resources,
-    ) -> Resources | None:
-        """Return the usage this sandbox will take from ``get_capacity()``, or None when unknown."""
-        if isinstance(source, ComposeSource):
-            source = source.outer
-        if isinstance(source, ImageSource) and not resources.gpu:
-            return resources
-        return None
+    ) -> SandboxReservationDemand:
+        """Return the exact quota charge and domain for queued provider admission."""
+        raise NotImplementedError
 
     async def get_capacity(self) -> SandboxCapacity | None:
         return None

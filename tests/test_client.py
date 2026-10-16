@@ -844,6 +844,24 @@ async def test_resume_evaluation_with_eval_resume_state(
     on_eval_resume_state.assert_called_once_with(state)
 
 
+async def test_resume_evaluation_forwards_an_owned_sandbox_without_changing_state(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, _ = benchmark_client
+    state = {"checkpoint": "immutable-artifact"}
+    mock_connect = _ws_mock([json.dumps({"type": "result", "data": {"score": 1.0}})])
+    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+        result = await client.resume_evaluation(
+            "task-1", state, sandbox_provider=DAYTONA_CONFIG, instance_id="owned-grader"
+        )
+
+    body = json.loads(mock_connect.__aenter__.return_value.send.call_args.args[0])
+    assert body["instance_id"] == "owned-grader"
+    assert body["eval_resume_state"] == state
+    assert body["sandbox_provider"]["DAYTONA_API_KEY"] == "key"
+    assert result == {"score": 1.0}
+
+
 async def test_evaluate_response_includes_optional_provider_config(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:

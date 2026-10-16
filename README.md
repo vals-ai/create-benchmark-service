@@ -146,19 +146,21 @@ When a setup or evaluate-instance request omits `sandbox_provider`, the Daytona 
 Providing the organization ID enables organization-scoped capacity admission; omitting it preserves direct creation.
 `SandboxProvider.get_capacity_domains()` reports Daytona CPU, memory, disk, and aggregate GPU usage plus allowed GPU
 types separately for every canonical target and sandbox class; `get_capacity()` retains its configured-target container
-view. Capacity is observational and is not reserved. `reservable_demand()` returns the usage a sandbox will take from that
-view (the run's resources for GPU-free images, the snapshot's own size for container snapshots in the configured target)
-so callers can account for builds still being created; it returns `None` when the demand is unknown. The API key must be
-able to read organization usage. Targeted snapshot admission and snapshot demand also require snapshot-read access.
-When the target is a region name instead of its ID, the key must be able to list regions so admission can resolve
-the canonical ID.
+view. Capacity is observational and is not reserved. Daytona's `reservable_demand()` returns a frozen
+`SandboxReservationDemand` containing the canonical `target_id`, `sandbox_class`, and CPU, memory, disk, and GPU quota
+charges. Image demand comes from the creation request; snapshot demand uses its own metadata, including fractional
+amounts. GPU builds charge GPU quota without charging attached CPU, memory, or disk against ordinary compute quota;
+shared GPU targets use `earth`, while dedicated and custom targets retain their region ID. Unreadable metadata raises
+an error rather than substituting requested resources. Providers without this capability raise `NotImplementedError`.
+The API key must be able to read organization usage and list regions to resolve canonical quota domains. Targeted
+snapshot admission and snapshot demand also require snapshot-read access.
 
 Provider compatibility notes:
 
 - `Sandbox.modify_egress_rules(addresses)` applies a non-empty allowlist, `Sandbox.block_all_egress()` denies all outbound access, and `Sandbox.clear_egress_rules()` restores unrestricted access. Deny-all is a separate provider-native operation; do not represent it as `modify_egress_rules([])`. `ComposeSandbox` forwards all three operations to its outer sandbox.
 - `Sandbox.labels` and `Sandbox.created_at` expose provider inventory metadata when available; unsupported metadata is `None`, and creation times are timezone-aware UTC. `SandboxQuery.created_at_lte` is an inclusive creation-time bound. Daytona supports it and always limits listing to the provider's configured target, which may be a Daytona region name or ID. Modal rejects creation-time-bounded listing.
 - Modal supports both `ImageSource` (registry pull) and `SnapshotSource` (a Modal filesystem snapshot created via `Sandbox.snapshot_filesystem()`, restored by image id). `TargetedSnapshotSource` is Daytona-only.
-- Daytona uses `TargetedSnapshotSource(snapshot=..., target=...)` to select the target for admission and creation. Admission uses the snapshot's CPU, memory, disk, and sandbox class with the exact target's organization-usage row; GPU snapshots retain unmetered GPU admission. Its legacy `docker_image` value is intentionally invalid because that field cannot preserve the target.
+- Daytona uses `TargetedSnapshotSource(snapshot=..., target=...)` to select the target for admission and creation. CPU snapshot admission uses the snapshot's CPU, memory, disk, and sandbox class with the exact target's organization-usage row. GPU snapshot prechecks validate target availability; `reservable_demand()` reports their GPU quota charge. Its legacy `docker_image` value is intentionally invalid because that field cannot preserve the target.
 - Modal sandboxes do not expose a disk-size parameter; `Resources.disk` is accepted for schema compatibility but not enforced.
 - GPUs are requested via `Resources.gpu` (count) and `Resources.gpu_type`. Modal requires `gpu_type` (any Modal GPU name, e.g. `H100`, `A100-80GB`, `T4`) and passes `"<type>:<count>"` to the sandbox. Daytona accepts a count with an optional type restricted to its `GpuType` enum (`H100`, `H200`, `RTX-PRO-6000`, `RTX-4090`, `RTX-5090`); GPU requests are rejected for Daytona snapshot sandboxes because snapshot resources are fixed at snapshot creation.
 - Nested Docker (Docker-in-Docker) capability is granted on every sandbox for Daytona and Modal — Daytona supports it natively and the Modal adapter requests it unconditionally — so benchmarks never configure it. The benchmark service still owns the Docker-capable image, dockerd startup flags, compose workflow, and cleanup.

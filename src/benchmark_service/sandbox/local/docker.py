@@ -28,6 +28,7 @@ from benchmark_service.sandbox.types import (
     ExecResult,
     ImageSource,
     Sandbox,
+    SandboxCapabilities,
     SandboxCommandError,
     SandboxConnectionError,
     SandboxCreateRequest,
@@ -35,6 +36,7 @@ from benchmark_service.sandbox.types import (
     SandboxNotFoundError,
     SandboxProvider,
     SandboxQuery,
+    SnapshotSource,
     validate_command_env,
 )
 
@@ -244,16 +246,24 @@ class DockerSandbox(Sandbox):
         path = PurePosixPath(remote_path)
         return self._command_bytes(f"cat -- {shlex.quote(str(path))}")
 
+    async def snapshot(self, name: str) -> SnapshotSource:
+        with _docker_errors():
+            image = await self._container.commit(pause=True)
+        return SnapshotSource(snapshot=image["Id"])
+
 
 def _build_container_config(request: SandboxCreateRequest) -> JSONObject:
     """Validate Docker support and build the container creation settings."""
-    if not isinstance(request.source, ImageSource):
-        raise SandboxError("Local Docker supports image sources only; snapshots and Compose are not supported")
+    match request.source:
+        case ImageSource(image=image) | SnapshotSource(snapshot=image):
+            pass
+        case _:
+            raise SandboxError("Local Docker supports image and local snapshot sources only")
     if request.resources.gpu or request.volumes or request.sandbox_secrets:
         raise SandboxError("Local Docker does not support GPUs, persistent volumes, or provider-managed secrets")
     labels = {**request.labels, _MANAGED_LABEL: "true", _NAME_LABEL: request.name}
     return {
-        "Image": request.source.image,
+        "Image": image,
         "Entrypoint": ["/bin/sh", "-c"],
         "Cmd": ["trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done"],
         "Env": [f"{key}={value}" for key, value in request.env_vars.items()],
@@ -271,6 +281,17 @@ class DockerSandboxProvider(SandboxProvider):
     def __init__(self) -> None:
         self._docker_host = os.environ.get("DOCKER_HOST")
         self._docker = Docker(url=self._docker_host)
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities(snapshot=True)
+
+    async def delete_snapshot(self, snapshot: SnapshotSource) -> None:
+        try:
+            with _docker_errors():
+                await self._docker.images.delete(snapshot.snapshot, force=True)
+        except SandboxNotFoundError:
+            return
 
     async def _get_container(self, instance_id: str) -> tuple[DockerContainer, _ContainerInfo]:
         container = self._docker.containers.container(instance_id)  # pyright: ignore[reportUnknownMemberType]

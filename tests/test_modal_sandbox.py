@@ -24,6 +24,7 @@ from benchmark_service.sandbox.modal import ModalProviderConfig, ModalSandbox, M
 from benchmark_service.sandbox.types import (
     ImageSource,
     Resources,
+    SandboxCapabilities,
     SandboxCommandError,
     SandboxConnectionError,
     SandboxCreateRequest,
@@ -133,6 +134,12 @@ class FakeInnerSandbox:
         self.poll = _aio(self._poll)
         self.get_tags = _aio(self._get_tags)
         self._experimental_set_outbound_network_policy = _aio(self._set_outbound_network_policy)
+        self.snapshot_timeouts: list[int] = []
+        self.snapshot_filesystem = _aio(self._snapshot_filesystem)
+
+    async def _snapshot_filesystem(self, timeout: int) -> SimpleNamespace:
+        self.snapshot_timeouts.append(timeout)
+        return SimpleNamespace(object_id="im-snap-1")
 
     async def _exec(
         self,
@@ -810,6 +817,32 @@ async def test_create_sandbox_restores_snapshot_source(monkeypatch: pytest.Monke
 
     assert sandbox.id == "sb-123"
     assert captured["image"] == ("snapshot", "im-123")
+
+
+async def test_snapshot_returns_filesystem_image_id() -> None:
+    inner = FakeInnerSandbox()
+
+    assert await _sandbox(inner).snapshot("ignored-by-modal") == SnapshotSource(snapshot="im-snap-1")
+    assert inner.snapshot_timeouts == [600]
+
+
+async def test_delete_snapshot_ignores_missing_image(monkeypatch: pytest.MonkeyPatch) -> None:
+    deleted: list[str] = []
+
+    async def image_delete(image_id: str, *, client: Any) -> None:
+        assert client is not None
+        if image_id == "im-missing":
+            raise ModalNotFoundError("image not found")
+        deleted.append(image_id)
+
+    monkeypatch.setattr(modal_module, "modal_experimental", SimpleNamespace(image_delete=_aio(image_delete)))
+    provider = _provider(monkeypatch, SimpleNamespace())
+    assert provider.capabilities == SandboxCapabilities(snapshot=True)
+
+    await provider.delete_snapshot(SnapshotSource(snapshot="im-snap-1"))
+    await provider.delete_snapshot(SnapshotSource(snapshot="im-missing"))
+
+    assert deleted == ["im-snap-1"]
 
 
 async def test_create_sandbox_rejects_targeted_snapshot_source(monkeypatch: pytest.MonkeyPatch) -> None:

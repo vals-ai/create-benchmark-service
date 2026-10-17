@@ -43,6 +43,7 @@ from benchmark_service.sandbox import (
     ResourceCapacity,
     Resources,
     Sandbox,
+    SandboxCapabilities,
     SandboxCapacity,
     SandboxCommandError,
     SandboxConnectionError,
@@ -809,6 +810,53 @@ async def test_sandbox_block_all_egress_defaults_to_unsupported() -> None:
         await Sandbox.block_all_egress(RecordingSandbox())
 
 
+async def test_daytona_snapshot_captures_running_sandbox_without_stopping_it() -> None:
+    inner = SnapshottingInnerSandbox()
+
+    snapshot = await DaytonaSandbox(cast(Any, inner)).snapshot("task-1-post-gen")
+
+    assert snapshot == SnapshotSource(snapshot="task-1-post-gen")
+    assert inner.snapshots == [("task-1-post-gen", 600.0)]
+    assert inner.state == SandboxState.STARTED
+
+
+async def test_daytona_snapshot_failure_maps_to_sandbox_error() -> None:
+    with pytest.raises(SandboxError, match="snapshot quota exceeded"):
+        await DaytonaSandbox(cast(Any, SnapshotFailingInnerSandbox())).snapshot("task-1-post-gen")
+
+
+async def test_daytona_delete_snapshot_ignores_missing_snapshot() -> None:
+    deleted: list[str] = []
+
+    async def get(name: str) -> SimpleNamespace:
+        if name == "missing":
+            raise DaytonaNotFoundError("snapshot not found")
+        return SimpleNamespace(name=name)
+
+    async def delete(snapshot: SimpleNamespace) -> None:
+        deleted.append(snapshot.name)
+
+    daytona = DaytonaClient(InnerSandbox())
+    daytona.snapshot = SimpleNamespace(get=get, delete=delete)  # pyright: ignore[reportAttributeAccessIssue]
+    provider = _provider(daytona)
+    assert provider.capabilities == SandboxCapabilities(snapshot=True)
+
+    await provider.delete_snapshot(SnapshotSource(snapshot="kept"))
+    await provider.delete_snapshot(SnapshotSource(snapshot="missing"))
+
+    assert deleted == ["kept"]
+
+
+async def test_snapshot_defaults_to_unsupported() -> None:
+    provider = cast(SandboxProvider, SimpleNamespace())
+
+    assert SandboxProvider.capabilities.fget(provider) == SandboxCapabilities()  # pyright: ignore[reportOptionalCall]
+    with pytest.raises(SandboxError, match="does not support snapshots"):
+        await Sandbox.snapshot(RecordingSandbox(), "snap")
+    with pytest.raises(SandboxError, match="does not support snapshots"):
+        await SandboxProvider.delete_snapshot(provider, SnapshotSource(snapshot="snap"))
+
+
 class InnerSandbox:
     id = "sandbox-id"
     name = "sandbox-name"
@@ -851,6 +899,23 @@ class InnerSandbox:
 
     async def refresh_data(self) -> None:
         self.refresh_count += 1
+
+
+class SnapshottingInnerSandbox(InnerSandbox):
+    def __init__(self) -> None:
+        super().__init__()
+        self.snapshots: list[tuple[str, float | None]] = []
+
+    async def stop(self, timeout: float | None = 60, force: bool = False) -> None:
+        raise AssertionError("stopping a CBS sandbox deletes it (auto_delete_interval=0)")
+
+    async def create_snapshot(self, name: str, timeout: float | None = 60) -> None:
+        self.snapshots.append((name, timeout))
+
+
+class SnapshotFailingInnerSandbox(SnapshottingInnerSandbox):
+    async def create_snapshot(self, name: str, timeout: float | None = 60) -> None:
+        raise DaytonaError("snapshot quota exceeded")
 
 
 class RemovedInnerSandbox(InnerSandbox):

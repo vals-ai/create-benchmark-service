@@ -22,6 +22,9 @@ from benchmark_service import (
 )
 
 
+_COUNT_SLEEPERS = "cat /proc/[0-9]*/cmdline 2>/dev/null | tr '\\0' ' ' | grep -o 'sleep 30[0]' | wc -l"
+
+
 @pytest.fixture
 def docker_labels() -> dict[str, str]:
     """Identify only containers belonging to this test."""
@@ -224,3 +227,34 @@ async def test_docker_rejects_images_without_setsid_wait(
         )
 
     assert [sandbox async for sandbox in docker_provider.list_sandboxes(SandboxQuery(labels=docker_labels))] == []
+
+
+async def test_docker_snapshot_restores_files_without_disturbing_original(
+    docker_provider: SandboxProvider, docker_sandbox: Sandbox, docker_labels: dict[str, str]
+) -> None:
+    assert docker_provider.capabilities.snapshot
+    await docker_sandbox.exec("echo kept > /tmp/marker && (sleep 300 >/dev/null 2>&1 &)")
+
+    snapshot = await docker_sandbox.snapshot("docker-contract")
+    try:
+        restored = await docker_provider.create_sandbox(
+            SandboxCreateRequest(
+                source=snapshot,
+                resources=Resources(vcpu=1, memory=1, disk=1),
+                name="docker-contract-restored",
+                labels=docker_labels,
+                env_vars={},
+                auto_stop_interval=10,
+                create_timeout=120,
+                network_block_all=True,
+            )
+        )
+        assert (await restored.exec("cat /tmp/marker")).output.strip() == "kept"
+        assert (await restored.exec(_COUNT_SLEEPERS)).output.strip() == "0"
+        assert (await docker_sandbox.exec(_COUNT_SLEEPERS)).output.strip() == "1"
+    finally:
+        async for sandbox in docker_provider.list_sandboxes(SandboxQuery(labels=docker_labels)):
+            if sandbox.id != docker_sandbox.id:
+                await docker_provider.delete_sandbox(sandbox.id)
+        await docker_provider.delete_snapshot(snapshot)
+    await docker_provider.delete_snapshot(snapshot)

@@ -8,6 +8,7 @@ import shlex
 from collections.abc import AsyncGenerator, Awaitable, Mapping
 from typing import Any, Literal, cast
 
+import modal.experimental as modal_experimental
 from modal import App, Client, Image, Volume
 from modal import Sandbox as ModalSdkSandbox
 from modal.exception import ConflictError as ModalConflictError
@@ -25,6 +26,7 @@ from benchmark_service.sandbox.types import (
     ImageSource,
     MissingSandboxConfigError,
     Sandbox,
+    SandboxCapabilities,
     SandboxCommandError,
     SandboxConnectionError,
     SandboxCreateRequest,
@@ -46,6 +48,7 @@ _MAX_LIFETIME_SECONDS = 24 * 60 * 60
 _ALLOW_ALL_CIDRS = ("0.0.0.0/0",)
 _ALLOW_ALL_DOMAINS = ("*",)
 _COMMAND_STATUS_POLL_SECONDS = 10
+_SNAPSHOT_TIMEOUT_SECONDS = 600
 _MAX_NAME_LENGTH = 64
 _INVALID_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_.-]")
 _APP_ID_PATTERN = re.compile(r"^ap-[a-zA-Z0-9]{22}$")
@@ -397,6 +400,13 @@ for domain in {domains_to_resolve!r}:
     async def block_all_egress(self) -> None:
         await self._set_outbound_network_policy([], [])
 
+    async def snapshot(self, name: str) -> SnapshotSource:
+        try:
+            image = await self._sandbox.snapshot_filesystem.aio(timeout=_SNAPSHOT_TIMEOUT_SECONDS)
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
+        return SnapshotSource(snapshot=image.object_id)
+
     async def clear_egress_rules(self) -> None:
         # Modal rejects switching a running sandbox to OPEN. An allow-all
         # allowlist provides the same access without that unsupported transition.
@@ -408,6 +418,20 @@ class ModalSandboxProvider(SandboxProvider):
         self._config = config
         self._client: Client | None = None
         self._app: App | None = None
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities(snapshot=True)
+
+    async def delete_snapshot(self, snapshot: SnapshotSource) -> None:
+        client, _ = await self._connect()
+        try:
+            # modal.experimental has no stubs, so the .aio variant is untyped.
+            await cast(Any, modal_experimental.image_delete).aio(snapshot.snapshot, client=client)
+        except ModalNotFoundError:
+            return
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
 
     async def _connect(self) -> tuple[Client, App]:
         if self._client is None or self._app is None:

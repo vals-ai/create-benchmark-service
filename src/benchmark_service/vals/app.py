@@ -95,8 +95,15 @@ def _grading_provider_config() -> SandboxProviderConfig:
     provider_type = os.environ.get(GRADING_SANDBOX_PROVIDER_ENV) or "daytona"
     if provider_type == "daytona":
         return DaytonaProviderConfig.from_env()
+
+    if provider_type == "daytona-byoc":
+        return sandbox_provider_config_from_mapping(
+            {**DaytonaProviderConfig.from_env().model_dump(), "type": provider_type}
+        )
+
     if provider_type == "modal":
         return ModalProviderConfig.from_env()
+
     return sandbox_provider_config_from_mapping({"type": provider_type})
 
 

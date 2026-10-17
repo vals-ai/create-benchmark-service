@@ -214,6 +214,30 @@ Eval-only retry flow:
 3. If evaluation fails after that point, retry calls `/ws/evaluate-response` with the saved state and, when needed, the request-scoped sandbox provider config.
 4. The benchmark service decides what the state means and streams a new result, plus any newer checkpoint state.
 
+### Fault injection
+
+`FaultySandboxProvider` wraps any real provider and fails scripted calls the way providers fail under infra trouble, so retry and resume logic can be tested against a sandbox that otherwise behaves normally. Select it with a provider config of `type: "faulty"`:
+
+```python
+FaultyProviderConfig(
+    inner=DockerProviderConfig(),
+    faults=[
+        Fault(at="create_sandbox", effect="connection_error", times=2),
+        Fault(at="exec", effect="command_failure", exit_code=1,
+              message="docker daemon is not ready inside the sandbox"),
+        Fault(at="command", when="after", command_contains="run-agent", message="websocket closed"),
+        Fault(at="get_sandbox", effect="not_found"),
+    ],
+).create_provider()
+```
+
+- `at` is the call that fails: `create_sandbox`, `get_sandbox`, `delete_sandbox`, `exec`, `command`, `upload_file`, `download_file`, `modify_egress_rules`, `block_all_egress`, `clear_egress_rules`, `snapshot`.
+- `effect` is what the caller sees: `connection_error` (`SandboxConnectionError`), `not_found` (`SandboxNotFoundError`), `error` (`SandboxError`), or `command_failure` (an `ExecResult` with `exit_code`/`message` from `exec`, or `message` then `SandboxCommandError` from `command`).
+- `when="after"` lets the real call complete first and then reports the failure, like a reply lost after the agent already ran; the default `"before"` never touches the sandbox.
+- Faults fire in plan order, `times` each (default once), then calls pass through. `provider.injected` lists what fired and `provider.pending` what has not.
+
+The `faulty` config is accepted wherever a `SandboxProviderConfig` is; a Docker inner provider still requires `CBS_DOCKER_ENABLED=true` on the service.
+
 ### Streaming protocol
 
 The WebSocket endpoints and generators communicate via four chunk types:

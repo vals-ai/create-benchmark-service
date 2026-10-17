@@ -10,10 +10,13 @@ from aiodocker import Docker
 
 from benchmark_service import (
     DockerProviderConfig,
+    Fault,
+    FaultyProviderConfig,
     ImageSource,
     Resources,
     Sandbox,
     SandboxCommandError,
+    SandboxConnectionError,
     SandboxCreateRequest,
     SandboxError,
     SandboxNotFoundError,
@@ -258,3 +261,44 @@ async def test_docker_snapshot_restores_files_without_disturbing_original(
                 await docker_provider.delete_sandbox(sandbox.id)
         await docker_provider.delete_snapshot(snapshot)
     await docker_provider.delete_snapshot(snapshot)
+
+
+async def test_docker_faulty_provider_after_fault_keeps_side_effects(
+    docker_labels: dict[str, str],
+) -> None:
+    """A lost reply after the agent ran must leave its work in the sandbox for a resume to find."""
+    provider = FaultyProviderConfig(
+        inner=DockerProviderConfig(),
+        faults=[
+            Fault(at="create_sandbox", effect="connection_error", message="dial tcp: connection refused"),
+            Fault(at="command", when="after", command_contains="agent", message="websocket closed"),
+        ],
+    ).create_provider()
+    request = SandboxCreateRequest(
+        source=ImageSource(image="python:3.12-slim"),
+        resources=Resources(vcpu=1, memory=1, disk=1),
+        name="docker-faulty",
+        labels=docker_labels,
+        env_vars={},
+        auto_stop_interval=10,
+        create_timeout=120,
+        network_block_all=True,
+    )
+    try:
+        with pytest.raises(SandboxConnectionError, match="connection refused"):
+            await provider.create_sandbox(request)
+        assert [sandbox async for sandbox in provider.list_sandboxes(SandboxQuery(labels=docker_labels))] == []
+
+        sandbox = await provider.create_sandbox(request)
+        chunks: list[str] = []
+        with pytest.raises(SandboxConnectionError, match="websocket closed"):
+            async for chunk in sandbox.command("echo agent-ran > /tmp/agent-output && echo agent done"):
+                chunks.append(chunk)
+        assert "agent done" in "".join(chunks)
+
+        recovered = await provider.get_sandbox(sandbox.id)
+        assert (await recovered.exec("cat /tmp/agent-output")).output.strip() == "agent-ran"
+    finally:
+        async for sandbox in provider.list_sandboxes(SandboxQuery(labels=docker_labels)):
+            await provider.delete_sandbox(sandbox.id)
+        await provider.close()

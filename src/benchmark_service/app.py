@@ -43,6 +43,7 @@ from benchmark_service.schemas import (
 from benchmark_service.sandbox import (
     DaytonaProviderConfig,
     DockerProviderConfig,
+    FaultyProviderConfig,
     SandboxProviderConfig,
 )
 
@@ -97,6 +98,8 @@ _DOCKER_DISABLED_REASON = "Docker sandboxes are disabled on this service"
 
 def _request_may_use_provider(config: SandboxProviderConfig | None) -> bool:
     """Docker needs no caller credentials and drives this host's daemon, so only an opted-in service accepts it."""
+    if isinstance(config, FaultyProviderConfig):
+        config = config.inner
     return not isinstance(config, DockerProviderConfig) or os.environ.get(DOCKER_ENABLED_ENV, "").lower() == "true"
 
 

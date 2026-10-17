@@ -7,6 +7,14 @@ from pydantic import Field, TypeAdapter
 
 from benchmark_service.sandbox.compose import ComposeSandbox
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
+from benchmark_service.sandbox.fault import (
+    Fault,
+    FaultPoint,
+    FaultyProviderConfig,
+    FaultySandbox,
+    FaultySandboxProvider,
+    InjectedFault,
+)
 from benchmark_service.sandbox.local.docker import DockerProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
 from benchmark_service.sandbox.types import (
@@ -35,7 +43,8 @@ from benchmark_service.sandbox.types import (
 )
 
 SandboxProviderConfig = Annotated[
-    DaytonaProviderConfig | ModalProviderConfig | DockerProviderConfig, Field(discriminator="type")
+    DaytonaProviderConfig | ModalProviderConfig | DockerProviderConfig | FaultyProviderConfig,
+    Field(discriminator="type"),
 ]
 
 _provider_config_adapter: TypeAdapter[SandboxProviderConfig] = TypeAdapter(SandboxProviderConfig)
@@ -50,6 +59,12 @@ __all__ = [
     "ComposeSandbox",
     "DaytonaProviderConfig",
     "DockerProviderConfig",
+    "Fault",
+    "FaultPoint",
+    "FaultyProviderConfig",
+    "FaultySandbox",
+    "FaultySandboxProvider",
+    "InjectedFault",
     "ExecResult",
     "ImageSource",
     "MissingSandboxConfigError",

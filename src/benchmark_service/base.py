@@ -160,6 +160,14 @@ class BenchmarkService(ABC):
         """Return True if `tenant` may use `dataset` on this service."""
         return True
 
+    async def list_datasets(self) -> list[str]:
+        """Return available dataset names without loading tasks or selecting a version.
+
+        Override for datasets discovered outside ``self.datasets``. The HTTP
+        endpoint filters these names through ``check_dataset_access``.
+        """
+        return list(self.datasets)
+
     def supports_dataset_version_selection(self, dataset: str) -> bool:
         """Whether this dataset can honor immutable version IDs on every operation."""
         return False

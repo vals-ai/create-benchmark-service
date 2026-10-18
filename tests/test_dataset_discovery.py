@@ -21,7 +21,7 @@ from tests.conftest import StubBenchmark, ValsStubBenchmark
 
 
 def test_lists_names_without_task_content(client: TestClient) -> None:
-    response = client.get("/datasets")
+    response = client.get("/v1/datasets")
     assert response.status_code == 200
     assert response.json() == {"datasets": ["alt", "default"]}
 
@@ -43,7 +43,7 @@ def test_dynamic_discovery_does_not_load_or_resolve_datasets(monkeypatch: pytest
         monkeypatch.setattr(app.service, "load_datasets", load)
         monkeypatch.setattr(app.service, "get_dataset", load)
         monkeypatch.setattr(app.service, "open_dataset_version", load)
-        response = client.get("/datasets")
+        response = client.get("/v1/datasets")
         assert response.status_code == 200
         assert response.json() == {"datasets": ["another", "remote"]}
         load.assert_not_called()
@@ -61,7 +61,7 @@ def test_empty_inventory(monkeypatch: pytest.MonkeyPatch, names: list[str]) -> N
             return False
 
     with TestClient(BenchmarkServiceApp(EmptyBenchmark)) as client:
-        response = client.get("/datasets")
+        response = client.get("/v1/datasets")
         assert response.status_code == 200
         assert response.json() == {"datasets": []}
 
@@ -97,7 +97,7 @@ def test_hosted_discovery_obeys_authentication_and_dataset_grants(
     with TestClient(app) as client:
         discovery = AsyncMock(wraps=app.service.list_datasets)
         monkeypatch.setattr(app.service, "list_datasets", discovery)
-        response = client.get("/datasets", headers={"x-descope-api-key": "test-key"} if tenant else {})
+        response = client.get("/v1/datasets", headers={"x-descope-api-key": "test-key"} if tenant else {})
         if expected is None:
             assert response.status_code == 401
             discovery.assert_not_called()
@@ -136,7 +136,7 @@ async def test_client_preserves_errors_including_older_services(
     with pytest.raises(error_type) as failure:
         await client.list_datasets()
     assert failure.value.status_code == status
-    http.get.assert_called_once_with("http://localhost:8000/datasets")
+    http.get.assert_called_once_with("http://localhost:8000/v1/datasets")
 
 
 @pytest.mark.parametrize("body", [{}, {"datasets": [123]}, {"datasets": "default"}])
@@ -147,3 +147,18 @@ async def test_client_validates_discovery_response(
     http.get.return_value = httpx.Response(200, json=body)
     with pytest.raises(ValidationError):
         await client.list_datasets()
+
+
+def test_discovery_preserves_service_owned_datasets_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("AUTH_REQUIRED", raising=False)
+    app = BenchmarkServiceApp(StubBenchmark)
+
+    async def legacy_datasets() -> list[dict[str, str]]:
+        return [{"dataset_id": "existing", "dataset_uri": "s3://example/manifest.json"}]
+
+    app.add_api_route("/datasets", legacy_datasets, methods=["GET"])
+    with TestClient(app) as client:
+        assert client.get("/datasets").json() == [
+            {"dataset_id": "existing", "dataset_uri": "s3://example/manifest.json"}
+        ]
+        assert client.get("/v1/datasets").json() == {"datasets": ["alt", "default"]}

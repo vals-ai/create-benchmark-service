@@ -763,7 +763,8 @@ def test_core_app_does_not_expose_provider_routes(client: TestClient, method: st
     - OpenAPI omits all provider routes.
     """
     assert client.request(method, path).status_code == 404
-    assert not any(route.startswith("/v1/") for route in client.get("/openapi.json").json()["paths"])
+    provider_paths = {"/v1/evaluate", "/v1/score", "/v1/submissions/upload-url", "/v1/datasets/{dataset}/tasks"}
+    assert provider_paths.isdisjoint(client.get("/openapi.json").json()["paths"])
 
 
 async def test_core_dataset_access_does_not_depend_on_hosted_allowlist() -> None:

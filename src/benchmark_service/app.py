@@ -196,7 +196,7 @@ class BenchmarkServiceApp(FastAPI):
         self.add_exception_handler(Exception, self._exception_handler)
         self.add_api_route("/health", self._health_check, methods=["GET"])
         self.add_api_route("/version", self._version, methods=["GET"])
-        self.add_api_route("/datasets", self._list_datasets, methods=["GET"], response_model=ListDatasetsResponse)
+        self.add_api_route("/v1/datasets", self._list_datasets, methods=["GET"], response_model=ListDatasetsResponse)
         self.add_api_route("/resolve-dataset", self._resolve_dataset, methods=["POST"])
         self.add_api_route("/verify-task-ids", self._verify_task_ids, methods=["GET"])
         self.add_api_route("/retrieve-task/", self._retrieve_task, methods=["GET"])

@@ -116,7 +116,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 |--------|------|-------------|
 | `GET` | `/health` | Returns `{"status": "ok"}` |
 | `GET` | `/version` | Returns framework, service, and dataset versions plus the benchmark's `eval_mode` |
-| `GET` | `/datasets` | Returns `{"datasets": ["default", "validation"]}` with the caller's accessible dataset names |
+| `GET` | `/v1/datasets` | Returns `{"datasets": ["default", "validation"]}` with the caller's accessible dataset names |
 | `POST` | `/resolve-dataset` | Resolves a dataset default or fixed release to an immutable version ID |
 | `GET` | `/verify-task-ids` | Return task IDs filtered by `?task_ids=…` or `?slice=start:stop:step` (optional `?dataset=…`) |
 | `GET` | `/retrieve-task/?task_id=…` | Return task metadata for a given task ID (optional `?dataset=…`) |
@@ -130,7 +130,7 @@ async with BenchmarkServiceClient(service_url, headers=auth_headers) as client:
     names = (await client.list_datasets()).datasets
 ```
 
-Services must upgrade to a framework release containing `/datasets` before clients can discover their names. Older services return 404, which the client exposes as `BenchmarkServiceError` rather than an empty inventory.
+Services must upgrade to a framework release containing `/v1/datasets` before clients can discover their names. Older services return 404, which the client exposes as `BenchmarkServiceError` rather than an empty inventory.
 
 **WebSocket endpoints** (stream `StreamChunk` JSON objects):
 
@@ -359,7 +359,7 @@ The service role needs `s3:PutObject` and `s3:GetObject` on `arn:aws:s3:::BUCKET
 
 Status codes: 403 when authentication is required but the caller lacks an allowed tenant identity for the dataset; 404 if access is allowed but the service's `load_datasets()` doesn't load the dataset; 501 if the benchmark has not implemented `list_tasks`. The base `BenchmarkService.list_tasks` does not infer a public task shape from internal task objects because those objects often include evaluator-only data (`answer`, `checks`, rubrics, grader config). Benchmarks must explicitly map their loaded tasks to `V1Task(id, question, timeout, ...)`. `V1Task` allows benchmark-specific extras, so benchmarks that need to surface additional per-task fields (e.g. SWE-bench's `repo`/`base_commit`) can include them when constructing the `V1Task` — document them in your benchmark's README and validate on the runner side with a typed `Task` subclass.
 
-**Trial mode (Vals template only).** A tenant with `trial_mode: true` in its allowlist entry receives score-only responses on `/v1/evaluate` and `/v1/score`. Benchmarks enabling trial mode must implement `project_trial_result(result)` to return the audited per-task fields trial callers may see and resubmit to `/v1/score`; include any field `calculate_final_score` needs for aggregation. The Vals layer removes `evaluator_version` and error text from `/v1/evaluate` (the error *count* survives as generic `"error"` entries), and `/v1/score` `metadata` is emptied while `final_score` and `tasks_evaluated` remain. The sanitizer builds fresh response objects from allowlisted fields, so fields added later do not leak to trial callers by default. Unhandled server errors return a generic `{"detail": "Internal server error"}` 500 (no traceback) for every caller, not just trial tenants. Trial tenants may access only `/datasets`, `/resolve-dataset`, `/v1/evaluate`, `/v1/score`, and `GET /v1/datasets/{dataset}/tasks`; other `/v1/*`, internal `/evaluate-response/`, `/final-score/`, and `/ws/*` endpoints are denied (403). For trial tenants, the dataset task list is projected to `id`, `question`, and `timeout` even if the benchmark's normal `V1Task` includes extras.
+**Trial mode (Vals template only).** A tenant with `trial_mode: true` in its allowlist entry receives score-only responses on `/v1/evaluate` and `/v1/score`. Benchmarks enabling trial mode must implement `project_trial_result(result)` to return the audited per-task fields trial callers may see and resubmit to `/v1/score`; include any field `calculate_final_score` needs for aggregation. The Vals layer removes `evaluator_version` and error text from `/v1/evaluate` (the error *count* survives as generic `"error"` entries), and `/v1/score` `metadata` is emptied while `final_score` and `tasks_evaluated` remain. The sanitizer builds fresh response objects from allowlisted fields, so fields added later do not leak to trial callers by default. Unhandled server errors return a generic `{"detail": "Internal server error"}` 500 (no traceback) for every caller, not just trial tenants. Trial tenants may access only `/v1/datasets`, `/resolve-dataset`, `/v1/evaluate`, `/v1/score`, and `GET /v1/datasets/{dataset}/tasks`; other `/v1/*`, internal `/evaluate-response/`, `/final-score/`, and `/ws/*` endpoints are denied (403). For trial tenants, the dataset task list is projected to `id`, `question`, and `timeout` even if the benchmark's normal `V1Task` includes extras.
 
 **Deferred to follow-on plans.** `GET /v1/schema`, `GET /v1/tasks/{task_id}` (single-task lookup), `/ws/v1/evaluate` (streamed judges), async/`poll_url` response shape, idempotency on `(run_id, task_id)`.
 

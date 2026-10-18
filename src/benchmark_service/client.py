@@ -352,7 +352,7 @@ class BenchmarkServiceClient:
         if self._dataset_version is None or not response.is_success:
             return
         if response.request.url.path in {
-            httpx.URL(f"{self._url}/{path}").path for path in ("health", "version", "datasets")
+            httpx.URL(f"{self._url}/{path}").path for path in ("health", "version", "v1/datasets")
         }:
             return
         if response.headers.get_list(DATASET_VERSION_HEADER) != [self._dataset_version]:
@@ -519,7 +519,7 @@ class BenchmarkServiceClient:
     @_retry_http
     async def list_datasets(self) -> ListDatasetsResponse:
         """List dataset names visible to this caller, independently of a version pin."""
-        response = await self._http_client.get(f"{self._url}/datasets")
+        response = await self._http_client.get(f"{self._url}/v1/datasets")
         if response.status_code == 401:
             raise _unauthenticated_error(response)
         if response.status_code != 200:

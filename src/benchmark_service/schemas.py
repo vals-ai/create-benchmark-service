@@ -49,6 +49,12 @@ class ResolveDatasetResponse(BaseModel):
     version: DatasetVersion
 
 
+class ListDatasetsResponse(BaseModel):
+    """Dataset names visible to the caller, without task content."""
+
+    datasets: list[str]
+
+
 class StreamDatasetVersionChunk(BaseModel):
     """Framework acknowledgement sent before a pinned operation starts."""
 

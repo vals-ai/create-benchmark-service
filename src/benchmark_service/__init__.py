@@ -46,6 +46,7 @@ from benchmark_service.schemas import (
     DATASET_VERSION_HEADER,
     ArtifactGradingSubmission,
     DatasetVersion,
+    ListDatasetsResponse,
     ResolveDatasetRequest,
     ResolveDatasetResponse,
     EvalMode,
@@ -59,6 +60,7 @@ from benchmark_service.schemas import (
 __all__ = [
     "DATASET_VERSION_HEADER",
     "DatasetVersion",
+    "ListDatasetsResponse",
     "ResolveDatasetRequest",
     "ResolveDatasetResponse",
     "BenchmarkServiceApp",

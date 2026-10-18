@@ -33,6 +33,7 @@ from benchmark_service.schemas import (
     FinalScoreResponse,
     HealthCheckResponse,
     JsonValue,
+    ListDatasetsResponse,
     RetrieveTaskResponse,
     ResolveDatasetRequest,
     ResolveDatasetResponse,
@@ -350,7 +351,9 @@ class BenchmarkServiceClient:
     async def _check_dataset_version(self, response: httpx.Response) -> None:
         if self._dataset_version is None or not response.is_success:
             return
-        if response.request.url.path in {httpx.URL(f"{self._url}/{path}").path for path in ("health", "version")}:
+        if response.request.url.path in {
+            httpx.URL(f"{self._url}/{path}").path for path in ("health", "version", "datasets")
+        }:
             return
         if response.headers.get_list(DATASET_VERSION_HEADER) != [self._dataset_version]:
             raise BenchmarkServiceError("The service did not acknowledge the requested dataset version")
@@ -512,6 +515,19 @@ class BenchmarkServiceClient:
             )
 
         return VersionResponse.model_validate(response.json())
+
+    @_retry_http
+    async def list_datasets(self) -> ListDatasetsResponse:
+        """List dataset names visible to this caller, independently of a version pin."""
+        response = await self._http_client.get(f"{self._url}/datasets")
+        if response.status_code == 401:
+            raise _unauthenticated_error(response)
+        if response.status_code != 200:
+            raise BenchmarkServiceError(
+                f"Dataset listing failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
+            )
+        return ListDatasetsResponse.model_validate(response.json())
 
     @_retry_http
     async def resolve_dataset(self, dataset: str, version: str | None = None) -> ResolveDatasetResponse:

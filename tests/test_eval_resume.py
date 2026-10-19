@@ -135,10 +135,12 @@ async def test_default_client_is_built_off_the_event_loop(monkeypatch: pytest.Mo
         return s3
 
     monkeypatch.setattr("benchmark_service.eval_resume._default_s3_client", slow_default_client)
-    store = EvalResumeStore(bucket_env=BUCKET_ENV, object_prefix="snap/eval-resume")
-    checkpoint = await _save(store, b"grading input")
-    assert await store.load(checkpoint, task_id="both__t1", dataset="test", judge_identity=JUDGE) == b"grading input"
-    assert built_on_loop == [False]
+    checkpoint = await _save(EvalResumeStore(bucket_env=BUCKET_ENV, object_prefix="snap/eval-resume"), b"grading input")
+    # A retry runs in a fresh process, so its store builds its own client on the first load.
+    retry_store = EvalResumeStore(bucket_env=BUCKET_ENV, object_prefix="snap/eval-resume")
+    loaded = await retry_store.load(checkpoint, task_id="both__t1", dataset="test", judge_identity=JUDGE)
+    assert loaded == b"grading input"
+    assert built_on_loop == [False, False]
 
 
 async def test_load_refuses_a_checkpoint_saved_under_another_judge(store: EvalResumeStore, s3: _FakeS3) -> None:

@@ -206,6 +206,14 @@ async def test_load_refuses_a_checkpoint_saved_by_another_tenant(store: EvalResu
     assert s3.bodies == []
 
 
+async def test_an_unsafe_tenant_is_refused_rather_than_aliased(store: EvalResumeStore, s3: _FakeS3) -> None:
+    """Digesting ``org/name`` would share a namespace with a tenant whose id is that digest."""
+    with tenant_scope("org/name"):
+        with pytest.raises(EvalResumeError, match="tenant is not a valid object-key segment"):
+            await _save(store)
+    assert s3.puts == []
+
+
 async def test_save_and_load_require_an_authenticated_tenant(store: EvalResumeStore, s3: _FakeS3) -> None:
     checkpoint = await _save(store)
 

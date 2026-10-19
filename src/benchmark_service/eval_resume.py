@@ -134,7 +134,11 @@ def _caller_tenant() -> str:
         raise RuntimeError(
             "no authenticated tenant is bound; call eval-resume save and load from inside a service request"
         )
-    return _key_component(tenant)
+    # Rejected rather than digested, as submission_artifacts._require_tenant_key does: a digested
+    # tenant could share a namespace with a tenant whose id is that digest.
+    if not _SAFE_COMPONENT.fullmatch(tenant):
+        raise EvalResumeError("tenant is not a valid object-key segment")
+    return tenant
 
 
 def _binding(dataset: str, judge_identity: str) -> str:
@@ -210,8 +214,8 @@ class EvalResumeStore:
         """The only key a checkpoint with these fields may point at, for the current tenant.
 
         Layout: ``<prefix>/<tenant>/<benchmark_id>/<task_id>/<digest of dataset and judge>/<sha256>``.
-        A tenant or task id that is not a safe path segment (``org/name``) is stored under a
-        digest of it; the checkpoint keeps the task id as is.
+        A task id that is not a safe path segment (``org/name``) is stored under a digest of it;
+        the checkpoint keeps it as is. A tenant that is not a safe path segment is refused.
         """
         tenant = _caller_tenant()
         binding = _binding(dataset, judge_identity)

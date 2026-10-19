@@ -89,12 +89,8 @@ class BenchmarkService(ABC):
         return super().__new__(cls)
 
     @classmethod
-    def _implemented_grading_hooks(cls) -> list[str]:
-        return [hook for hook in _GRADING_HOOKS if getattr(cls, hook) is not getattr(BenchmarkService, hook)]
-
-    @classmethod
     def _grades_input(cls) -> bool:
-        return len(cls._implemented_grading_hooks()) == len(_GRADING_HOOKS)
+        return all(getattr(cls, hook) is not getattr(BenchmarkService, hook) for hook in _GRADING_HOOKS)
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -484,8 +480,6 @@ class BenchmarkService(ABC):
             **self._checkpoint_binding(task_id, dataset),
         )
         yield StreamEvalResumeStateChunk(type="eval_resume_state", data=checkpoint.model_dump(mode="json"))
-        # aclosing: a consumer that stops at the result closes this stream, and the grader's
-        # cleanup must finish before that close returns, not later on the event loop.
         async with aclosing(self.grade_input(task_id, content, dataset=dataset)) as chunks:
             async for chunk in chunks:
                 yield chunk

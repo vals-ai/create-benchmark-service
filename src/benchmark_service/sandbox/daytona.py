@@ -114,6 +114,7 @@ _PTY_STATUS_CHECK_ATTEMPTS = 30
 _PTY_STATUS_POLL_SECONDS = 30
 _PTY_STDOUT_TAIL_MAX_BYTES = 64 * 1024
 _SESSION_WATCH_REOPEN_SECONDS = 10
+_INVALID_UTF8_BYTES = dict.fromkeys(range(0xDC80, 0xDD00), "\ufffd")
 _PTY_CREATE_MARKER_ENV = "_CBS_PTY_CREATE_MARKER"
 _PTY_ROWS = 24
 _PTY_COLS = 80
@@ -1022,7 +1023,7 @@ async def _get_watched_sandbox(client: AsyncDaytona, sandbox_id: str) -> AsyncSa
 
 
 class _NativeSessionLogProcess(AsyncProcess):
-    # Remove after upgrading Daytona to a version with fixed marker parsing and unconfirmed-stream buffering.
+    # Retain until the SDK handles markers, unconfirmed streams, and malformed-byte follow/snapshot parity.
     async def _consume_log_websocket(
         self,
         url: str,
@@ -1033,8 +1034,8 @@ class _NativeSessionLogProcess(AsyncProcess):
         ws = await self._open_ws(url, headers)
         buffer = bytearray()
         stream: str | None = None
-        stdout_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
-        stderr_decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        stdout_decoder = codecs.getincrementaldecoder("utf-8")(errors="surrogateescape")
+        stderr_decoder = codecs.getincrementaldecoder("utf-8")(errors="surrogateescape")
 
         async def emit(payload: bytes) -> None:
             if stream == "stdout":
@@ -1045,8 +1046,9 @@ class _NativeSessionLogProcess(AsyncProcess):
                 handler = on_stderr
             else:
                 return
+            # Daytona snapshots replace each malformed source byte before text offsets are counted.
             if text:
-                result = handler(text)
+                result = handler(text.translate(_INVALID_UTF8_BYTES))
                 if inspect.isawaitable(result):
                     await result
 
@@ -1139,9 +1141,9 @@ async def _watch_session_command(
         log_process.get_session_command_logs_async(session_id, command_id, on_stdout, on_stderr)
     )
     closed_task = asyncio.create_task(closed.wait())
-    watch_error: Exception | None = None
     try:
         while True:
+            watch_error: Exception | None = None
             done, _ = await asyncio.wait(
                 {follow_task, closed_task},
                 timeout=_SESSION_WATCH_REOPEN_SECONDS,
@@ -1169,7 +1171,7 @@ async def _watch_session_command(
                 status = None
             if closed.is_set():
                 raise SandboxError("Controlled workload closed before command exit")
-            if follow_task in done or status is None or status.exit_code is not None:
+            if follow_task in done or (status is not None and status.exit_code is not None):
                 break
     finally:
         follow_task.cancel()
@@ -1196,12 +1198,20 @@ async def _watch_session_command(
             forwarded_stderr = max(forwarded_stderr, len(stderr))
         except (*_SANDBOX_OPERATION_ERRORS, SandboxConnectionError) as exc:
             await _raise_if_sandbox_gone(client, sandbox_id)
-            logger.warning("Daytona controlled final log snapshot failed: %s", exc)
+            logger.warning(
+                "Daytona controlled final log snapshot failed for sandbox=%s session=%s command=%s: %s",
+                sandbox_id,
+                session_id,
+                command_id,
+                exc,
+            )
         return status.exit_code, forwarded_stdout, forwarded_stderr
     logger.warning(
-        "Daytona controlled session watch ended without exit status for %s: %s",
+        "Daytona controlled session watch ended without exit status for sandbox=%s session=%s command=%s: %s",
         sandbox_id,
-        watch_error,
+        session_id,
+        command_id,
+        watch_error if watch_error is not None else "log stream closed",
     )
     return None, forwarded_stdout, forwarded_stderr
 

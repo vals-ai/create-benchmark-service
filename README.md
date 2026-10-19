@@ -286,24 +286,39 @@ A direct Daytona sandbox supports `LINUX_CGROUP_V2_V1` (`linux_cgroup_v2` v1).
 `sandbox.controlled_workload(command, cwd=..., env_vars=...)` launches one native
 asynchronous Daytona session command whose child enters a dedicated cgroup v2
 subgroup. Its stdin is `/dev/null`, so noninteractive readers see EOF at launch.
+Stdout and stderr use pipes, not a PTY. Agents must flush output when they need
+logs delivered promptly; output still buffered inside the agent can be lost when
+it is killed. CBS does not force unbuffered mode.
 The shell stays outside the subgroup and publishes completion before
 release, so descendants are fenced before the native exit status and final output
 are returned. Natural completion and `kill()` use `cgroup.kill`, confirm
 `populated 0`, and remove the subgroup; the native session is also confirmed absent.
-The watcher checks command status about every 10 seconds while following logs,
-and whenever the follower ends. A known exit does not depend on the log connection
-closing. After exit, the watcher cancels and joins the reader, then makes one final
+The watcher checks command status on a 10-second idle interval while following logs,
+and whenever the follower ends. Network calls can add time; the interval is not a
+latency bound. A known exit does not depend on the log connection closing.
+After exit, the watcher cancels and joins the reader, then makes one final
 log snapshot request. Confirmed sandbox removal raises `SandboxNotFoundError`;
-other handled snapshot failures warn without retrying or changing the command exit
-result. While command exit is unknown, an observed sandbox `STOPPED` or `ERROR`
+other handled snapshot failures warn with sandbox, session, and command identifiers
+without retrying or changing the command exit result; any tail not already followed
+can then be lost. Native Daytona follow keeps
+incomplete UTF-8 sequences across chunks and replaces each malformed byte with
+`U+FFFD` before forwarding, consistent with the observed final snapshot text.
+Reopen and final-snapshot suffixes use separate stdout/stderr character offsets;
+this text stream does not preserve the original malformed bytes. While command exit
+is unknown, an observed sandbox `STOPPED` or `ERROR`
 ends the watcher with `SandboxError`; `wait()` reports that observed failure promptly
 even if independent cgroup and session cleanup is still pending. A later cleanup
 failure is logged. If cleanup fails after a separate observed sandbox loss,
 `wait()` raises the original `SandboxNotFoundError` and logs the distinct cleanup
 failure once; a mirrored copy of the same exception is not a second failure.
 Other failures retain cleanup-first ordering. Success still waits for cleanup and
-confirmed absence. Transient output and status observation
-failures reopen the same command without restarting it or stopping the workload.
+confirmed absence. After a handled status-query error with a pending log follower,
+if the existing sandbox-state check does not establish confirmed loss or
+`STOPPED`/`ERROR`, the watcher retains that follower and retries status on the
+same idle interval. If the follower ends without a known exit, the watcher reopens
+it for the same command at saved forwarded offsets, without restarting or stopping
+the workload. Its warning identifies sandbox, session, and command, and reports
+the captured watcher error or that the log stream closed.
 Completion-marker observation retries independently.
 The caller still owns the deadline and explicit stop. The probe
 requires writable cgroup v2 delegation with `cgroup.kill`; other sandbox services

@@ -4685,6 +4685,69 @@ async def test_daytona_native_reopens_same_command_and_forwards_each_stream_once
     assert not process.group_exists
     assert process.sessions == set()
 
+@pytest.mark.usefixtures("_fake_cgroup_follow")
+async def test_daytona_native_status_failure_keeps_pending_follow(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(daytona_module, "_SESSION_WATCH_REOPEN_SECONDS", 0.01)
+
+    class PendingFollowProcess(CgroupProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.status_error = True
+            self.stdout = "before-"
+            self.recovered_status = asyncio.Event()
+            self.send_later_output = asyncio.Event()
+            self.later_output_sent = asyncio.Event()
+            self.status_calls = 0
+
+        async def get_session_command_logs_async(
+            self, session_id: str, command_id: str,
+            on_stdout: Callable[[str], Awaitable[None]],
+            on_stderr: Callable[[str], Awaitable[None]],
+        ) -> None:
+            self.follow_calls += 1
+            await on_stdout(self.stdout)
+            await self.send_later_output.wait()
+            self.stdout += "after-status-"
+            await on_stdout("after-status-")
+            self.later_output_sent.set()
+            await self.release_seen.wait()
+            self.stdout += "final frame"
+            await on_stdout("final frame")
+
+        async def get_session_command(self, session_id: str, command_id: str) -> SimpleNamespace:
+            self.status_calls += 1
+            status = await super().get_session_command(session_id, command_id)
+            if status.exit_code is None:
+                self.recovered_status.set()
+            return status
+
+    process = PendingFollowProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
+    try:
+        await asyncio.wait_for(process.recovered_status.wait(), 2)
+        assert process.status_calls >= 2
+        assert process.follow_calls == 1
+        process.send_later_output.set()
+        await asyncio.wait_for(process.later_output_sent.wait(), 2)
+        assert process.follow_calls == 1
+        process.user_finished.set()
+        completed = await asyncio.wait_for(workload.wait(), 2)
+        streamed = "".join([chunk async for chunk in workload.output()])
+        assert completed.result.exit_code == 7
+        assert streamed == "before-after-status-final frame"
+        assert process.execute_calls == 1
+        assert process.follow_calls == 1
+        assert not process.group_exists
+        assert process.sessions == set()
+    finally:
+        process.send_later_output.set()
+        if process.sessions:
+            await asyncio.wait_for(workload.kill(), 2)
+
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
 async def test_daytona_reopen_from_ids_survives_discarded_launch_adapter(
@@ -4878,6 +4941,52 @@ async def test_daytona_native_watcher_normal_follow_close_replays_uncommitted_ta
     )
     assert second_result[0] == 7
     assert "".join(forwarded) == canonical
+    assert first.closed and second.closed
+
+async def test_daytona_native_watcher_malformed_follow_matches_final_snapshot_after_reopen(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stdout = "A\ufffd\ufffdB\ufffd\ufffdC|TAIL-9Z\n"
+    stderr = "E\ufffd\ufffdZ|ERR-TAIL-9Z\n"
+    raw_stdout = b"A\xe2\x82B\xe2\x82C|TAIL-9Z\n"
+    raw_stderr = b"E\xf0\x90Z|ERR-TAIL-9Z\n"
+    first = RawLogWebSocket([
+        _raw_log_frame(b"\x01\x01\x01A\xe2"),
+        _raw_log_frame(b"\x82B\xe2\x82C|TAIL-9Z\n\x02\x02\x02" + raw_stderr),
+        _normal_log_close(),
+    ])
+    second = RawLogWebSocket([
+        _raw_log_frame(b"\x01\x01\x01" + raw_stdout + b"\x02\x02\x02" + raw_stderr),
+        _normal_log_close(),
+    ])
+    sockets = iter([first, second])
+
+    async def open_ws(self: Any, url: str, headers: dict[str, str]) -> RawLogWebSocket:
+        return next(sockets)
+
+    monkeypatch.setattr(daytona_module._NativeSessionLogProcess, "_open_ws", open_ws)  # pyright: ignore[reportPrivateUsage]
+    process = CgroupProcess()
+    process.stdout = stdout
+    process.stderr = stderr
+    inner = InnerSandbox()
+    inner.process = process
+    client = CgroupDaytonaClient(inner, process)
+    forwarded: list[str] = []
+    closed = asyncio.Event()
+
+    first_result = await daytona_module._watch_session_command(  # pyright: ignore[reportPrivateUsage]
+        cast(Any, client), inner.id, "session", "command", 0, 0, forwarded.append, closed,
+    )
+    assert first_result == (None, len(stdout), len(stderr))
+    assert "".join(forwarded) == stdout + stderr
+
+    process.release_seen.set()
+    second_result = await daytona_module._watch_session_command(  # pyright: ignore[reportPrivateUsage]
+        cast(Any, client), inner.id, "session", "command", first_result[1], first_result[2],
+        forwarded.append, closed,
+    )
+    assert second_result == (7, len(stdout), len(stderr))
+    assert "".join(forwarded) == process.stdout + process.stderr
     assert first.closed and second.closed
 
 

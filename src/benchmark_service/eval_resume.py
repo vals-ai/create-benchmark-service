@@ -1,16 +1,16 @@
 """Durable grading input for eval-only retry.
 
-A benchmark that grades after its agent finishes can lose the grade to a judge
+A benchmark that grades after its agent finishes can lose the grade to a grader
 error or a dropped connection. Before grading, the service saves the exact bytes
 it is about to grade to S3 and streams a small pointer to them as
 ``eval_resume_state``. On ``/ws/evaluate-response`` the service loads those
 bytes back, checks their size and SHA-256 against the pointer, and refuses the
-retry when the judge it would use now is not the judge the pointer was saved
+retry when the grader it would use now is not the grader the pointer was saved
 under, so a retry grades what the first attempt would have graded.
 
 Every object key names the authenticated tenant that saved it and a digest of
-the checkpoint's task, dataset and judge, so a checkpoint replayed by another tenant,
-or edited to claim the current judge, never resolves to the saved bytes. The
+the checkpoint's task, dataset and grader, so a checkpoint replayed by another tenant,
+or edited to claim the current grader, never resolves to the saved bytes. The
 store reads the tenant the framework binds for each request
 (``benchmark_service.context.current_tenant``); call ``save`` and ``load`` from
 inside ``evaluate_instance`` or ``stream_evaluate_response``.
@@ -23,19 +23,19 @@ Usage::
 
     STORE = EvalResumeStore(bucket_env="MY_EVAL_STATE_BUCKET", object_prefix="my-bench/eval-resume")
 
-    # evaluate_instance, before the judge call
+    # evaluate_instance, before grading
     checkpoint = await STORE.save(
         benchmark_id=benchmark_id_from_sandbox(sandbox),
         task_id=task_id,
         dataset=dataset_name,
         content=grading_input,
-        judge_identity=judge_identity({"model": eval_model, "test_revision": test_revision}),
+        grader_identity=grader_identity({"model": eval_model, "test_revision": test_revision}),
     )
     yield StreamEvalResumeStateChunk(type="eval_resume_state", data=checkpoint.model_dump(mode="json"))
 
     # stream_evaluate_response, when request.eval_resume_state is set
     grading_input = await STORE.load(
-        request.eval_resume_state, task_id=request.task_id, dataset=dataset_name, judge_identity=current_identity
+        request.eval_resume_state, task_id=request.task_id, dataset=dataset_name, grader_identity=current_identity
     )
 """
 
@@ -69,7 +69,7 @@ class EvalResumeError(ValueError):
 
 
 class EvalResumeIdentityError(EvalResumeError):
-    """The checkpoint was saved for a different task, dataset, or judge."""
+    """The checkpoint was saved for a different task, dataset, or grader."""
 
 
 class EvalResumeIntegrityError(EvalResumeError):
@@ -88,7 +88,7 @@ class EvalResumeCheckpoint(BaseModel):
     s3_key: str
     sha256: str
     size_bytes: int = Field(ge=0)
-    judge_identity: str
+    grader_identity: str
 
     @field_validator("version", "size_bytes", mode="before")
     @classmethod
@@ -104,7 +104,7 @@ class EvalResumeCheckpoint(BaseModel):
             raise ValueError("benchmark_id may contain only letters, numbers, '.', '_', and '-'")
         return value
 
-    @field_validator("sha256", "judge_identity")
+    @field_validator("sha256", "grader_identity")
     @classmethod
     def _sha256(cls, value: str) -> str:
         if not _SHA256.fullmatch(value):
@@ -112,13 +112,20 @@ class EvalResumeCheckpoint(BaseModel):
         return value
 
 
-def judge_identity(parts: Mapping[str, Any]) -> str:
+def grader_identity(parts: Mapping[str, Any]) -> str:
     """SHA-256 of everything besides the agent's output that decides a grade.
 
-    Pass the judge model, the test or rubric revision, and anything else whose
-    change should make a saved checkpoint ungradeable. Values must be JSON
-    serializable; key order does not matter.
+    A judge-graded benchmark passes the judge model and the rubric revision. A
+    deterministic grader (tests run against the agent's output) passes the test or
+    rubric revision, the grader image digest, and a hash of the grading code. Include
+    anything else whose change should make a saved checkpoint ungradeable. Values must
+    be JSON serializable; key order does not matter.
+
+    Raises ``ValueError`` for an empty mapping: it hashes to one constant, so a
+    changed grader would still pass the retry check.
     """
+    if not parts:
+        raise ValueError("grader_identity needs at least one part that identifies the grader")
     encoded = json.dumps(parts, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode()).hexdigest()
 
@@ -143,12 +150,12 @@ def _caller_tenant() -> str:
     return tenant
 
 
-def _binding(task_id: str, dataset: str, judge_identity: str) -> str:
+def _binding(task_id: str, dataset: str, grader_identity: str) -> str:
     """Digest of the fields ``load`` checks but the key's readable segments do not pin.
 
     The task id is included because its key segment may be a digest of it, which a task
     literally named that digest would share."""
-    fields = {"task_id": task_id, "dataset": dataset, "judge_identity": judge_identity}
+    fields = {"task_id": task_id, "dataset": dataset, "grader_identity": grader_identity}
     encoded = json.dumps(fields, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode()).hexdigest()[:32]
 
@@ -216,15 +223,15 @@ class EvalResumeStore:
         self.content_type = content_type
         self._s3_client = s3_client
 
-    def key(self, *, benchmark_id: str, task_id: str, dataset: str, judge_identity: str, sha256: str) -> str:
+    def key(self, *, benchmark_id: str, task_id: str, dataset: str, grader_identity: str, sha256: str) -> str:
         """The only key a checkpoint with these fields may point at, for the current tenant.
 
-        Layout: ``<prefix>/<tenant>/<benchmark_id>/<task_id>/<digest of task, dataset and judge>/<sha256>``.
+        Layout: ``<prefix>/<tenant>/<benchmark_id>/<task_id>/<digest of task, dataset and grader>/<sha256>``.
         A task id that is not a safe path segment (``org/name``) is stored under a digest of it;
         the checkpoint keeps it as is. A tenant that is not a safe path segment is refused.
         """
         tenant = _caller_tenant()
-        binding = _binding(task_id, dataset, judge_identity)
+        binding = _binding(task_id, dataset, grader_identity)
         return f"{self.object_prefix}/{tenant}/{benchmark_id}/{_key_component(task_id)}/{binding}/{sha256}"
 
     async def save(
@@ -234,7 +241,7 @@ class EvalResumeStore:
         task_id: str,
         dataset: str,
         content: bytes,
-        judge_identity: str,
+        grader_identity: str,
     ) -> EvalResumeCheckpoint:
         """Write ``content`` to S3 and return the checkpoint that points at it."""
         if len(content) > self.max_bytes:
@@ -248,12 +255,12 @@ class EvalResumeStore:
                 benchmark_id=benchmark_id,
                 task_id=task_id,
                 dataset=dataset,
-                judge_identity=judge_identity,
+                grader_identity=grader_identity,
                 sha256=sha256,
             ),
             sha256=sha256,
             size_bytes=len(content),
-            judge_identity=judge_identity,
+            grader_identity=grader_identity,
         )
         bucket = self._bucket()
 
@@ -276,12 +283,12 @@ class EvalResumeStore:
         *,
         task_id: str,
         dataset: str,
-        judge_identity: str,
+        grader_identity: str,
     ) -> bytes:
         """Return the saved grading input after checking whose it is and that it is intact.
 
         Raises ``EvalResumeIdentityError`` when the checkpoint belongs to another
-        tenant, task, dataset, or judge, and ``EvalResumeIntegrityError`` when the stored
+        tenant, task, dataset, or grader, and ``EvalResumeIntegrityError`` when the stored
         bytes differ from what was saved.
         """
         checkpoint = self.parse(state)
@@ -290,9 +297,9 @@ class EvalResumeStore:
                 f"checkpoint is for task {checkpoint.task_id} in dataset {checkpoint.dataset}, "
                 f"not task {task_id} in dataset {dataset}"
             )
-        if checkpoint.judge_identity != judge_identity:
+        if checkpoint.grader_identity != grader_identity:
             raise EvalResumeIdentityError(
-                f"checkpoint for task {task_id} was saved under a different judge; "
+                f"checkpoint for task {task_id} was saved under a different grader; "
                 "re-grade it with the service version that produced it, or retry the task from scratch"
             )
         content = await self._get(checkpoint.s3_key, checkpoint.size_bytes)
@@ -321,7 +328,7 @@ class EvalResumeStore:
             benchmark_id=checkpoint.benchmark_id,
             task_id=checkpoint.task_id,
             dataset=checkpoint.dataset,
-            judge_identity=checkpoint.judge_identity,
+            grader_identity=checkpoint.grader_identity,
             sha256=checkpoint.sha256,
         )
         if checkpoint.s3_key != expected:
@@ -377,5 +384,5 @@ __all__ = [
     "EvalResumeStore",
     "S3Client",
     "benchmark_id_from_sandbox",
-    "judge_identity",
+    "grader_identity",
 ]

@@ -4927,13 +4927,17 @@ class LocalShellCgroupProcess(CgroupProcess):
         _assert_pty_create_config(envs, pty_size)
         self.sessions.add(id)
         self.pty_marker = envs[_PTY_CREATE_MARKER_ENV]
-        return LocalShellCgroupPtyHandle(on_data, self)
+        return LocalShellCgroupPtyHandle(on_data, self, envs)
 
 
 class LocalShellCgroupPtyHandle(CgroupPtyHandle):
-    def __init__(self, on_data: Callable[[bytes], None | Awaitable[None]], process: LocalShellCgroupProcess) -> None:
+    def __init__(
+        self, on_data: Callable[[bytes], None | Awaitable[None]],
+        process: LocalShellCgroupProcess, envs: dict[str, str],
+    ) -> None:
         super().__init__(on_data, process)
         self.process = process
+        self.envs = envs
 
     async def send_input(self, data: str) -> None:
         if data.startswith("stty"):
@@ -4950,6 +4954,7 @@ class LocalShellCgroupPtyHandle(CgroupPtyHandle):
             "/bin/sh", "-c", local_command,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
             start_new_session=True,
+            env={"PATH": os.environ["PATH"], **self.envs},
         )
         self.process.workers.append(self.worker)
         self.process.command_admitted.set()
@@ -4973,13 +4978,17 @@ async def test_daytona_controlled_nonnull_cwd_runs_real_shell_and_preserves_exit
 ) -> None:
     cwd = tmp_path / "working directory with spaces"
     cwd.mkdir()
+    env_name = "CBS_DAYTONA_CHILD_ENV_R141"
+    env_value = "r141-pty-env-from-created-session"
+    assert env_name not in os.environ
     process = LocalShellCgroupProcess(tmp_path)
     try:
         workload = _cgroup_sandbox(process).controlled_workload(
-            'printf "%s\n" "$PWD"; printf full-tail; exit 17', cwd=str(cwd)
+            f'printf "%s\n" "$PWD" "${env_name}"; printf full-tail; exit 17',
+            cwd=str(cwd), env_vars={env_name: env_value},
         )
         completed = await asyncio.wait_for(workload.wait(), 5)
-        assert completed.result.output == f"{cwd}\nfull-tail"
+        assert completed.result.output == f"{cwd}\n{env_value}\nfull-tail"
         assert completed.result.exit_code == 17
         assert not process.group_exists
         assert process.sessions == set()

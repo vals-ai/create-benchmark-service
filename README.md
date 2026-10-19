@@ -381,6 +381,8 @@ or local Docker task container. For ordinary controlled commands, confirmation c
 members of the marked process group in the same PID namespace, not independently detached
 processes. For supervised process-group episodes, the subreaper also drains adopted
 descendants before confirmation; Docker-daemon-owned descendants remain outside that boundary.
+The FIFO listener ignores TERM/INT/HUP to accept stop requests while the owner and workload
+remain active; normal foreground completion still triggers group cleanup.
 
 Consume `workload.output()` for streamed text. `await workload.wait()` returns
 `ControlledWorkloadResult(result=ExecResult(exit_code, output), absence_confirmed_at=...)`

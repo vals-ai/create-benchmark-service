@@ -20,8 +20,12 @@ def owner_command(command: str, control_dir: str, shell: str) -> str:
         f"umask 077; mkdir {directory} || exit 1\n"
         f"mkfifo {directory}/stop || exit 1\n"
         f"exec 3<>{directory}/stop || exit 1\n"
+        # The listener inherits ignored signals; the owner then catches them
+        # so foreground workloads retain their native signal dispositions.
+        "trap '' TERM INT HUP\n"
         f"printf '%s\n' $$ > {directory}/pgid || exit 1\n"
         "( IFS= read -r request <&3; kill -KILL 0 ) >/dev/null 2>&1 &\n"
+        "trap ':' TERM INT HUP\n"
         f"{shell} {shlex.quote(command)} 3>&-; status=$?\n"
         f"printf '%s\n' \"$status\" > {directory}/status\n"
         "kill -KILL 0"

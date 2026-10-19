@@ -113,6 +113,47 @@ async def test_probe_and_stop_negative_process_group(tmp_path: Path, session_lea
         assert not control.exists()
 
 
+async def test_workload_group_term_leaves_fifo_listener_to_stop_ignoring_helper(tmp_path: Path) -> None:
+    control = tmp_path / "owner"
+    helper = "trap '' TERM; printf 'helper:%s\n' $$; exec sleep 30"
+    command = (
+        "trap ':' TERM; printf 'workload:%s\n' $$; "
+        f"/bin/sh -c {shlex.quote(helper)} & "
+        "IFS= read -r start; kill -TERM 0; printf 'signaled\n'; IFS= read -r finish"
+    )
+    process = await asyncio.create_subprocess_exec(
+        "/bin/sh", "-c", owner_command(command, str(control), "/bin/sh -c"),
+        stdin=asyncio.subprocess.PIPE,
+        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+    )
+    try:
+        assert process.stdout is not None and process.stdin is not None
+        announced = [await asyncio.wait_for(process.stdout.readline(), 5) for _ in range(2)]
+        pids = dict(line.decode().strip().split(":") for line in announced)
+        member_pids = (int(pids["workload"]), int(pids["helper"]))
+        group_id = int((control / "pgid").read_text())
+        process.stdin.write(b"start\n")
+        await asyncio.wait_for(process.stdin.drain(), 5)
+        assert await asyncio.wait_for(process.stdout.readline(), 5) == b"signaled\n"
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(process.wait(), 0.05)
+        for pid in member_pids:
+            state, _, member_group = Path(f"/proc/{pid}/stat").read_text().split(") ", 1)[1].split()[:3]
+            assert state not in ("Z", "X") and int(member_group) == group_id
+        assert process.returncode is None
+        assert not (control / "status").exists()
+        stop = await asyncio.create_subprocess_exec(
+            "/bin/sh", "-c", stop_command(str(control)),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+        output, _ = await asyncio.wait_for(stop.communicate(), 5)
+        assert stop.returncode == 0, output
+        assert not _group_live(group_id)
+        assert await asyncio.wait_for(process.wait(), 5) != 0
+    finally:
+        await _finish_owned_process(process, control)
+        assert not control.exists()
+
 @pytest.mark.parametrize("session_leader", [False, True])
 async def test_natural_owner_preserves_foreground_stdin_status_and_output(
     tmp_path: Path, session_leader: bool,

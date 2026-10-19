@@ -222,8 +222,7 @@ Tracker reads the counter during generation and, unless exhaustion has frozen th
 In Tracker task results, null base/effective
 allowances mean no generation deadline; `generation_elapsed_seconds` is still measured at terminal
 finalization. A null elapsed value instead means no generation-time measurement was recorded.
-The independent 166-hour whole-task wall applies to every selected task, including those without
-a generation deadline. Modal separately limits each sandbox to a 24-hour provider lifetime.
+The independent 166-hour whole-task wall applies to every selected task, including those without a generation deadline. Daytona requests a 167-hour sandbox TTL, local Docker uses a 167-hour keepalive, and Modal caps sandbox lifetime at 24 hours.
 Accounting credit is optional and independent of whether `credited_generation` is present; eligibility needs
 configured proxy access, a resolved native Gateway URL and key, and an attested model. Missing
 eligibility uses the base clock; failure of an eligible counter read does not silently fall back.
@@ -308,6 +307,8 @@ targets the workload group, not the reusable Modal sandbox (including the select
 or local Docker task container. For ordinary controlled commands, confirmation covers live
 members of the marked process group in the same PID namespace, not independently detached
 processes. Docker-daemon-owned descendants remain outside that boundary.
+The FIFO listener ignores TERM/INT/HUP to accept stop requests while the owner and workload
+remain active; normal foreground completion still triggers group cleanup.
 
 Consume `workload.output()` for streamed text. `await workload.wait()` returns
 `ControlledWorkloadResult(result=ExecResult(exit_code, output), absence_confirmed_at=...)`

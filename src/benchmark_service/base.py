@@ -7,7 +7,7 @@ a FastAPI app with your implementation.
 
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, Mapping
-from contextlib import AbstractAsyncContextManager
+from contextlib import AbstractAsyncContextManager, aclosing
 from functools import cached_property
 from pathlib import Path
 from typing import Any, ClassVar, Self
@@ -79,7 +79,8 @@ class BenchmarkService(ABC):
 
     def __new__(cls, *args: Any, **kwargs: Any) -> Self:
         # Checked here rather than in __init_subclass__ so an intermediate base class may
-        # leave both evaluate_instance and all three hooks unimplemented, as abstract methods allow.
+        # leave evaluate_instance and any of the three hooks to a subclass, as abstract methods allow.
+        # A service that overrides evaluate_instance may define any of the hooks for its own use.
         if cls.evaluate_instance is BenchmarkService.evaluate_instance and not cls._grades_input():
             raise TypeError(
                 f"{cls.__name__} must implement evaluate_instance, or collect_grading_input, "
@@ -97,12 +98,6 @@ class BenchmarkService(ABC):
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
-        implemented = cls._implemented_grading_hooks()
-        if implemented and len(implemented) != len(_GRADING_HOOKS):
-            raise TypeError(
-                f"{cls.__name__} implements {', '.join(implemented)}; the framework's checkpointed grading "
-                "needs all of collect_grading_input, grader_identity and grade_input"
-            )
         if (
             cls.eval_mode == EvalMode.SANDBOX
             and cls.prepare_grading_sandbox is BenchmarkService.prepare_grading_sandbox
@@ -373,8 +368,9 @@ class BenchmarkService(ABC):
             content = await self.eval_resume_store.load(
                 request.eval_resume_state, task_id=request.task_id, **self._checkpoint_binding(request.task_id, dataset)
             )
-            async for chunk in self.grade_input(request.task_id, content, dataset=dataset):
-                yield chunk
+            async with aclosing(self.grade_input(request.task_id, content, dataset=dataset)) as chunks:
+                async for chunk in chunks:
+                    yield chunk
             return
         result = await self.evaluate_response(request, dataset=dataset)
         yield StreamResultChunk(type="result", data=jsonable_encoder(result))
@@ -488,8 +484,11 @@ class BenchmarkService(ABC):
             **self._checkpoint_binding(task_id, dataset),
         )
         yield StreamEvalResumeStateChunk(type="eval_resume_state", data=checkpoint.model_dump(mode="json"))
-        async for chunk in self.grade_input(task_id, content, dataset=dataset):
-            yield chunk
+        # aclosing: a consumer that stops at the result closes this stream, and the grader's
+        # cleanup must finish before that close returns, not later on the event loop.
+        async with aclosing(self.grade_input(task_id, content, dataset=dataset)) as chunks:
+            async for chunk in chunks:
+                yield chunk
 
     async def prepare_grading_sandbox(
         self,

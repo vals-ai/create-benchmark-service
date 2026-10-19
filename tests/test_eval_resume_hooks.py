@@ -1,5 +1,6 @@
 """The framework-owned eval-resume path: collect, save, checkpoint, grade; and load, grade on retry."""
 
+import asyncio
 import json
 from collections.abc import AsyncGenerator, Iterator, Mapping
 from typing import Any, cast
@@ -143,12 +144,95 @@ async def test_a_response_is_still_graded_by_evaluate_response(s3: _FakeS3) -> N
     assert service.graded == []
 
 
-def test_the_grading_hooks_come_as_a_set() -> None:
-    with pytest.raises(TypeError, match="collect_grading_input, grader_identity and grade_input"):
+async def test_the_default_evaluate_instance_needs_all_three_hooks() -> None:
+    class _Partial(StubBenchmark):
+        evaluate_instance = BenchmarkService.evaluate_instance
 
-        class _Partial(StubBenchmark):  # pyright: ignore[reportUnusedClass]
-            def grader_identity(self, task_id: str, dataset: str | None = None) -> Mapping[str, Any]:
-                return {"rubric": "1"}
+        def grader_identity(self, task_id: str, dataset: str | None = None) -> Mapping[str, Any]:
+            return {"rubric": "1"}
+
+    with pytest.raises(TypeError, match="collect_grading_input, grader_identity and grade_input"):
+        await _Partial.create()
+
+
+async def test_a_service_with_its_own_evaluate_instance_may_define_one_hook() -> None:
+    class _OwnGrader(StubBenchmark):
+        def grader_identity(self, task_id: str, dataset: str | None = None) -> Mapping[str, Any]:
+            return {"rubric": "1"}
+
+    service = await _OwnGrader.create()
+
+    chunks = await _drain(service.stream_evaluate_response(EvaluateResponseRequest(task_id="task-1", response="2")))
+    assert chunks[0].data == {"resolved": True}
+
+
+async def test_an_intermediate_base_may_supply_one_hook_for_its_subclass(s3: _FakeS3) -> None:
+    class _Base(StubBenchmark):
+        evaluate_instance = BenchmarkService.evaluate_instance
+
+        def grader_identity(self, task_id: str, dataset: str | None = None) -> Mapping[str, Any]:
+            return {"rubric": "1"}
+
+    class _Concrete(_Base):
+        collect_grading_input = HookBenchmark.collect_grading_input
+        grade_input = HookBenchmark.grade_input
+
+    service = await _Concrete.create()
+    service.graded = []  # pyright: ignore[reportAttributeAccessIssue]
+    service.eval_resume_store = EvalResumeStore(s3_client=s3)
+
+    chunks = await _drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox())))
+    assert [chunk.type for chunk in chunks] == ["eval_resume_state", "result"]
+
+
+class _CleanupBenchmark(HookBenchmark):
+    """Releases a grading resource after its result, the way a grader closes a session."""
+
+    cleaned: list[str]
+
+    async def grade_input(
+        self, task_id: str, content: bytes, dataset: str | None = None
+    ) -> AsyncGenerator[StreamChunk, None]:
+        try:
+            yield StreamResultChunk(type="result", data={"resolved": True})
+            yield StreamResultChunk(type="result", data={"unreachable": True})
+        finally:
+            await asyncio.sleep(0)
+            self.cleaned.append(task_id)
+
+
+async def _cleanup_service(s3: _FakeS3) -> _CleanupBenchmark:
+    service = await _CleanupBenchmark.create()
+    service.graded = []
+    service.cleaned = []
+    service.eval_resume_store = EvalResumeStore(s3_client=s3)
+    return service
+
+
+async def _close_after_result(stream: AsyncGenerator[StreamChunk, None]) -> None:
+    async for chunk in stream:
+        if chunk.type == "result":
+            break
+    await stream.aclose()
+
+
+async def test_closing_evaluate_instance_after_the_result_finishes_the_graders_cleanup(s3: _FakeS3) -> None:
+    service = await _cleanup_service(s3)
+
+    await _close_after_result(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox())))
+
+    assert service.cleaned == ["task-1"]
+
+
+async def test_closing_the_retry_stream_after_the_result_finishes_the_graders_cleanup(s3: _FakeS3) -> None:
+    first = await _service(s3)
+    checkpoint = (await _drain(first.evaluate_instance("task-1", cast(Sandbox, _Sandbox()))))[0].data
+    retry = await _cleanup_service(s3)
+    request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=cast(dict[str, Any], checkpoint))
+
+    await _close_after_result(retry.stream_evaluate_response(request))
+
+    assert retry.cleaned == ["task-1"]
 
 
 async def test_a_service_without_evaluate_instance_or_hooks_cannot_be_created() -> None:

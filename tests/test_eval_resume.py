@@ -1,4 +1,6 @@
+import asyncio
 import hashlib
+import threading
 from typing import Any
 
 import pytest
@@ -100,6 +102,27 @@ async def test_load_returns_saved_bytes_from_the_json_state(store: EvalResumeSto
     assert s3.bodies[0].closed
 
 
+async def test_load_closes_the_body_when_the_caller_is_cancelled_mid_get(store: EvalResumeStore, s3: _FakeS3) -> None:
+    checkpoint = await _save(store, b"grading input")
+    started, release = threading.Event(), threading.Event()
+    get_object = s3.get_object
+
+    def slow_get_object(*, Bucket: str, Key: str) -> Any:
+        started.set()
+        release.wait(5)
+        return get_object(Bucket=Bucket, Key=Key)
+
+    s3.get_object = slow_get_object  # type: ignore[method-assign]
+    load = asyncio.create_task(store.load(checkpoint, task_id="both__t1", dataset="test", judge_identity=JUDGE))
+    await asyncio.to_thread(started.wait, 5)
+    load.cancel()
+    release.set()
+
+    with pytest.raises(asyncio.CancelledError):
+        await load
+    assert s3.bodies[0].closed
+
+
 async def test_load_refuses_a_checkpoint_saved_under_another_judge(store: EvalResumeStore, s3: _FakeS3) -> None:
     checkpoint = await _save(store)
     new_judge = judge_identity({"model": "openai/gpt-6", "test_revision": "rev-1"})
@@ -175,7 +198,6 @@ async def test_save_fails_loudly_without_a_bucket(monkeypatch: pytest.MonkeyPatc
     monkeypatch.delenv(BUCKET_ENV)
     store = EvalResumeStore(bucket_env=BUCKET_ENV, object_prefix="snap/eval-resume", s3_client=s3)
 
-    assert not store.is_configured()
     with pytest.raises(RuntimeError, match=BUCKET_ENV):
         await _save(store)
 

@@ -169,9 +169,6 @@ class EvalResumeStore:
         self.content_type = content_type
         self._s3_client = s3_client
 
-    def is_configured(self) -> bool:
-        return bool(os.environ.get(self.bucket_env))
-
     def key(self, benchmark_id: str, task_id: str, sha256: str) -> str:
         """The only key a checkpoint with these fields may point at."""
         return f"{self.object_prefix}/{benchmark_id}/{task_id}/{sha256}"
@@ -265,17 +262,23 @@ class EvalResumeStore:
     async def _get(self, key: str, expected_size: int) -> bytes:
         bucket = self._bucket()
         client = self._client()
-        response = await run_blocking(partial(client.get_object, Bucket=bucket, Key=key))
-        body = response["Body"]
-        try:
-            declared = response.get("ContentLength")
-            if declared is not None and declared > expected_size:
-                raise EvalResumeIntegrityError(f"stored object {key} is larger than its checkpoint records")
-            # One byte past the expected size is enough to detect a longer object
-            # without reading an unbounded body.
-            return await run_blocking(partial(body.read, expected_size + 1))
-        finally:
-            await run_blocking(body.close)
+
+        # Get, read and close run in one blocking call, so a cancelled caller cannot
+        # drop the response before its body is closed.
+        def get() -> bytes:
+            response = client.get_object(Bucket=bucket, Key=key)
+            body = response["Body"]
+            try:
+                declared = response.get("ContentLength")
+                if declared is not None and declared > expected_size:
+                    raise EvalResumeIntegrityError(f"stored object {key} is larger than its checkpoint records")
+                # One byte past the expected size is enough to detect a longer object
+                # without reading an unbounded body.
+                return body.read(expected_size + 1)
+            finally:
+                body.close()
+
+        return await run_blocking(get)
 
     def _bucket(self) -> str:
         bucket = os.environ.get(self.bucket_env)

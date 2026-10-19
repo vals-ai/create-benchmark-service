@@ -23,7 +23,7 @@ hooks never calls the store itself; the usage below is for one that overrides
 
 Usage::
 
-    STORE = EvalResumeStore(bucket_env="MY_EVAL_STATE_BUCKET", object_prefix="my-bench/eval-resume")
+    STORE = EvalResumeStore()  # or EvalResumeStore(bucket_env=..., object_prefix=...)
 
     # evaluate_instance, before grading
     checkpoint = await STORE.save(
@@ -228,7 +228,7 @@ class EvalResumeStore:
                     "(benchmark-services-registry EvalResumeStorageConfig)"
                 )
         # The registry form (`snap/eval-resume/*`) names the same prefix as `snap/eval-resume`.
-        prefix = object_prefix.removesuffix("*").strip("/")
+        prefix = object_prefix.removesuffix("/*").strip("/")
         if max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
         self.bucket_env = bucket_env

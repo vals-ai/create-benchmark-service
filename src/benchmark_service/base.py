@@ -78,8 +78,8 @@ class BenchmarkService(ABC):
     priority_dataset: ClassVar[str | None] = None
 
     def __new__(cls, *args: Any, **kwargs: Any) -> Self:
-        # Checked here rather than in __init_subclass__ so intermediate base classes may
-        # leave grading open, as abstract methods allow.
+        # Checked here rather than in __init_subclass__ so an intermediate base class may
+        # leave both evaluate_instance and all three hooks unimplemented, as abstract methods allow.
         if cls.evaluate_instance is BenchmarkService.evaluate_instance and not cls._grades_input():
             raise TypeError(
                 f"{cls.__name__} must implement evaluate_instance, or collect_grading_input, "
@@ -88,12 +88,16 @@ class BenchmarkService(ABC):
         return super().__new__(cls)
 
     @classmethod
+    def _implemented_grading_hooks(cls) -> list[str]:
+        return [hook for hook in _GRADING_HOOKS if getattr(cls, hook) is not getattr(BenchmarkService, hook)]
+
+    @classmethod
     def _grades_input(cls) -> bool:
-        return all(getattr(cls, hook) is not getattr(BenchmarkService, hook) for hook in _GRADING_HOOKS)
+        return len(cls._implemented_grading_hooks()) == len(_GRADING_HOOKS)
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
-        implemented = [hook for hook in _GRADING_HOOKS if getattr(cls, hook) is not getattr(BenchmarkService, hook)]
+        implemented = cls._implemented_grading_hooks()
         if implemented and len(implemented) != len(_GRADING_HOOKS):
             raise TypeError(
                 f"{cls.__name__} implements {', '.join(implemented)}; the framework's checkpointed grading "
@@ -367,10 +371,7 @@ class BenchmarkService(ABC):
         if request.eval_resume_state is not None and self._grades_input():
             await self.validate_task_ids([request.task_id], dataset=dataset)
             content = await self.eval_resume_store.load(
-                request.eval_resume_state,
-                task_id=request.task_id,
-                dataset=dataset or "default",
-                grader_identity=eval_resume.grader_identity(self.grader_identity(request.task_id, dataset=dataset)),
+                request.eval_resume_state, task_id=request.task_id, **self._checkpoint_binding(request.task_id, dataset)
             )
             async for chunk in self.grade_input(request.task_id, content, dataset=dataset):
                 yield chunk
@@ -434,6 +435,13 @@ class BenchmarkService(ABC):
         """Grade the bytes ``collect_grading_input`` returned, on the first attempt and on retry."""
         raise NotImplementedError(f"{type(self).__name__}.grade_input is not implemented")
 
+    def _checkpoint_binding(self, task_id: str, dataset: str | None) -> dict[str, str]:
+        """The dataset and grader digest a checkpoint is saved under; save and load must agree on both."""
+        return {
+            "dataset": dataset or "default",
+            "grader_identity": eval_resume.grader_identity(self.grader_identity(task_id, dataset=dataset)),
+        }
+
     @cached_property
     def eval_resume_store(self) -> eval_resume.EvalResumeStore:
         """Where the default ``evaluate_instance`` saves grading input.
@@ -476,9 +484,8 @@ class BenchmarkService(ABC):
         checkpoint = await self.eval_resume_store.save(
             benchmark_id=eval_resume.benchmark_id_from_sandbox(sandbox),
             task_id=task_id,
-            dataset=dataset or "default",
             content=content,
-            grader_identity=eval_resume.grader_identity(self.grader_identity(task_id, dataset=dataset)),
+            **self._checkpoint_binding(task_id, dataset),
         )
         yield StreamEvalResumeStateChunk(type="eval_resume_state", data=checkpoint.model_dump(mode="json"))
         async for chunk in self.grade_input(task_id, content, dataset=dataset):

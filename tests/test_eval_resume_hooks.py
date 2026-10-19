@@ -123,6 +123,17 @@ async def test_retry_refuses_a_checkpoint_saved_under_another_grader(s3: _FakeS3
     assert retry.graded == []
 
 
+async def test_retry_refuses_a_task_the_dataset_does_not_have(s3: _FakeS3) -> None:
+    first = await _service(s3)
+    checkpoint = (await _drain(first.evaluate_instance("task-1", cast(Sandbox, _Sandbox()))))[0].data
+
+    retry = await _service(s3)
+    request = EvaluateResponseRequest(task_id="task-404", eval_resume_state=cast(dict[str, Any], checkpoint))
+    with pytest.raises(ValueError, match="task-404"):
+        await _drain(retry.stream_evaluate_response(request))
+    assert retry.graded == []
+
+
 async def test_a_response_is_still_graded_by_evaluate_response(s3: _FakeS3) -> None:
     service = await _service(s3)
 
@@ -144,7 +155,7 @@ async def test_a_service_without_evaluate_instance_or_hooks_cannot_be_created() 
     class _NoGrading(StubBenchmark):
         evaluate_instance = BenchmarkService.evaluate_instance
 
-    with pytest.raises(TypeError, match="evaluate_instance"):
+    with pytest.raises(TypeError, match="or collect_grading_input"):
         await _NoGrading.create()
 
 

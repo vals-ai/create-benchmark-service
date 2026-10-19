@@ -8,6 +8,13 @@ bytes back, checks their size and SHA-256 against the pointer, and refuses the
 retry when the judge it would use now is not the judge the pointer was saved
 under, so a retry grades what the first attempt would have graded.
 
+Every object key names the authenticated tenant that saved it and a digest of
+the checkpoint's dataset and judge, so a checkpoint replayed by another tenant,
+or edited to claim the current judge, never resolves to the saved bytes. The
+store reads the tenant the framework binds for each request
+(``benchmark_service.context.current_tenant``); call ``save`` and ``load`` from
+inside ``evaluate_instance`` or ``stream_evaluate_response``.
+
 The bucket comes from the environment variable that the registry's
 ``EvalResumeStorageConfig.bucket_env`` names for the service; the store's
 ``object_prefix`` matches that config's ``object_prefix`` without the ``/*``.
@@ -44,6 +51,7 @@ from typing import Any, Literal, NotRequired, Protocol, TypedDict, cast
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 from benchmark_service.blocking import run_blocking
+from benchmark_service.context import current_tenant
 from benchmark_service.sandbox import Sandbox
 
 REGION_ENV = "AWS_REGION"
@@ -120,6 +128,21 @@ def _key_component(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()[:32]
 
 
+def _caller_tenant() -> str:
+    tenant = current_tenant()
+    if tenant is None:
+        raise RuntimeError(
+            "no authenticated tenant is bound; call eval-resume save and load from inside a service request"
+        )
+    return _key_component(tenant)
+
+
+def _binding(dataset: str, judge_identity: str) -> str:
+    """Digest of the fields ``load`` checks but the content hash does not cover."""
+    encoded = json.dumps({"dataset": dataset, "judge_identity": judge_identity}, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()[:32]
+
+
 def benchmark_id_from_sandbox(sandbox: Sandbox) -> str:
     """The Valkyrie run id the sandbox is labelled with, else the sandbox's own id.
 
@@ -183,10 +206,16 @@ class EvalResumeStore:
         self.content_type = content_type
         self._s3_client = s3_client
 
-    def key(self, benchmark_id: str, task_id: str, sha256: str) -> str:
-        """The only key a checkpoint with these fields may point at. A task id that is not a
-        safe path segment (``org/name``) is stored under a digest of it; the checkpoint keeps it as is."""
-        return f"{self.object_prefix}/{benchmark_id}/{_key_component(task_id)}/{sha256}"
+    def key(self, *, benchmark_id: str, task_id: str, dataset: str, judge_identity: str, sha256: str) -> str:
+        """The only key a checkpoint with these fields may point at, for the current tenant.
+
+        Layout: ``<prefix>/<tenant>/<benchmark_id>/<task_id>/<digest of dataset and judge>/<sha256>``.
+        A tenant or task id that is not a safe path segment (``org/name``) is stored under a
+        digest of it; the checkpoint keeps the task id as is.
+        """
+        tenant = _caller_tenant()
+        binding = _binding(dataset, judge_identity)
+        return f"{self.object_prefix}/{tenant}/{benchmark_id}/{_key_component(task_id)}/{binding}/{sha256}"
 
     async def save(
         self,
@@ -205,7 +234,13 @@ class EvalResumeStore:
             benchmark_id=benchmark_id,
             task_id=task_id,
             dataset=dataset,
-            s3_key=self.key(benchmark_id, task_id, sha256),
+            s3_key=self.key(
+                benchmark_id=benchmark_id,
+                task_id=task_id,
+                dataset=dataset,
+                judge_identity=judge_identity,
+                sha256=sha256,
+            ),
             sha256=sha256,
             size_bytes=len(content),
             judge_identity=judge_identity,
@@ -236,7 +271,7 @@ class EvalResumeStore:
         """Return the saved grading input after checking whose it is and that it is intact.
 
         Raises ``EvalResumeIdentityError`` when the checkpoint belongs to another
-        task, dataset, or judge, and ``EvalResumeIntegrityError`` when the stored
+        tenant, task, dataset, or judge, and ``EvalResumeIntegrityError`` when the stored
         bytes differ from what was saved.
         """
         checkpoint = self.parse(state)
@@ -261,15 +296,26 @@ class EvalResumeStore:
         return content
 
     def parse(self, state: Mapping[str, Any] | EvalResumeCheckpoint) -> EvalResumeCheckpoint:
-        """Validate ``eval_resume_state`` as a checkpoint this store wrote."""
+        """Validate ``eval_resume_state`` as a checkpoint this store wrote for the current tenant."""
         try:
             checkpoint = (
                 state if isinstance(state, EvalResumeCheckpoint) else EvalResumeCheckpoint.model_validate(dict(state))
             )
         except ValidationError as exc:
             raise EvalResumeError(f"eval_resume_state is not a checkpoint: {exc}") from exc
-        if checkpoint.s3_key != self.key(checkpoint.benchmark_id, checkpoint.task_id, checkpoint.sha256):
-            raise EvalResumeError("checkpoint s3_key is outside this benchmark's eval-resume prefix")
+        # Mirrors submission_artifacts._require_tenant_key: the tenant segment is the caller's own.
+        tenant = _caller_tenant()
+        if not checkpoint.s3_key.startswith(f"{self.object_prefix}/{tenant}/"):
+            raise EvalResumeIdentityError("checkpoint was saved by another tenant or outside this benchmark's prefix")
+        expected = self.key(
+            benchmark_id=checkpoint.benchmark_id,
+            task_id=checkpoint.task_id,
+            dataset=checkpoint.dataset,
+            judge_identity=checkpoint.judge_identity,
+            sha256=checkpoint.sha256,
+        )
+        if checkpoint.s3_key != expected:
+            raise EvalResumeError("checkpoint s3_key does not match the key its fields derive")
         if checkpoint.size_bytes > self.max_bytes:
             raise EvalResumeError(
                 f"checkpoint records {checkpoint.size_bytes} bytes, over the {self.max_bytes}-byte limit"

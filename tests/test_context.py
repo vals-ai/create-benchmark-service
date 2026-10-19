@@ -2,7 +2,7 @@
 
 import asyncio
 
-from benchmark_service.context import current_sandbox_provider, sandbox_provider_scope
+from benchmark_service.context import current_sandbox_provider, current_tenant, sandbox_provider_scope, tenant_scope
 
 
 class _Provider:
@@ -103,3 +103,10 @@ def test_binding_survives_a_stream_closed_through_a_task() -> None:
 
     asyncio.run(main())
     assert seen == ["a"]
+
+
+def test_tenant_is_bound_only_inside_its_scope() -> None:
+    assert current_tenant() is None
+    with tenant_scope("tenant-a"):
+        assert current_tenant() == "tenant-a"
+    assert current_tenant() is None

@@ -1,10 +1,12 @@
 import asyncio
 import hashlib
 import threading
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
 
+from benchmark_service.context import tenant_scope
 from benchmark_service.eval_resume import (
     EvalResumeCheckpoint,
     EvalResumeError,
@@ -18,6 +20,7 @@ from benchmark_service.eval_resume import (
 BUCKET_ENV = "TEST_EVAL_STATE_BUCKET"
 RUN_ID = "2ecbe3f6-e545-475f-81e1-00408dc02c6f"
 JUDGE = judge_identity({"model": "anthropic/claude-opus-4-7", "test_revision": "rev-1"})
+TENANT = "tenant-a"
 
 
 class _Body:
@@ -52,6 +55,16 @@ class _FakeS3:
         return {"Body": body, "ContentLength": len(content)}
 
 
+@pytest.fixture(autouse=True)
+def caller_tenant() -> Iterator[None]:
+    with tenant_scope(TENANT):
+        yield
+
+
+def _binding(dataset: str = "test", judge: str = JUDGE) -> str:
+    return hashlib.sha256(f'{{"dataset":"{dataset}","judge_identity":"{judge}"}}'.encode()).hexdigest()[:32]
+
+
 @pytest.fixture
 def s3(monkeypatch: pytest.MonkeyPatch) -> _FakeS3:
     monkeypatch.setenv(BUCKET_ENV, "agentic-harness-dev")
@@ -81,7 +94,7 @@ async def test_save_writes_bytes_under_the_prefix_and_returns_their_pointer(
         "benchmark_id": RUN_ID,
         "task_id": "both__t1",
         "dataset": "test",
-        "s3_key": f"snap/eval-resume/{RUN_ID}/both__t1/{sha256}",
+        "s3_key": f"snap/eval-resume/{TENANT}/{RUN_ID}/both__t1/{_binding()}/{sha256}",
         "sha256": sha256,
         "size_bytes": len(content),
         "judge_identity": JUDGE,
@@ -153,6 +166,57 @@ async def test_load_refuses_a_checkpoint_saved_under_another_judge(store: EvalRe
     assert s3.bodies == []
 
 
+@pytest.mark.parametrize(
+    "fields",
+    [
+        {"dataset": "test", "judge_identity": judge_identity({"model": "openai/gpt-6", "test_revision": "rev-2"})},
+        {"dataset": "val", "judge_identity": JUDGE},
+    ],
+)
+async def test_load_refuses_a_checkpoint_whose_judge_or_dataset_was_edited(
+    store: EvalResumeStore, s3: _FakeS3, fields: dict[str, str]
+) -> None:
+    """An edited judge or dataset no longer derives the saved key, so the old bytes never load under it."""
+    checkpoint = await _save(store)
+    state = checkpoint.model_dump(mode="json") | fields
+
+    with pytest.raises(EvalResumeError, match="does not match"):
+        await store.load(state, task_id="both__t1", **fields)
+    rekeyed = state | {"s3_key": store.key(benchmark_id=RUN_ID, task_id="both__t1", sha256=checkpoint.sha256, **fields)}
+    assert rekeyed["s3_key"] != checkpoint.s3_key
+    with pytest.raises(KeyError):  # the fake's NoSuchKey: nothing was ever saved under the edited fields
+        await store.load(rekeyed, task_id="both__t1", **fields)
+    assert s3.bodies == []
+
+
+async def test_load_refuses_a_checkpoint_saved_by_another_tenant(store: EvalResumeStore, s3: _FakeS3) -> None:
+    checkpoint = await _save(store)
+
+    with tenant_scope("tenant-b"):
+        with pytest.raises(EvalResumeIdentityError, match="another tenant"):
+            await store.load(checkpoint, task_id="both__t1", dataset="test", judge_identity=JUDGE)
+        own_key = checkpoint.s3_key.replace(f"/{TENANT}/", "/tenant-b/", 1)
+        with pytest.raises(KeyError):  # rewriting the tenant segment points at tenant-b's own, empty namespace
+            await store.load(
+                checkpoint.model_dump(mode="json") | {"s3_key": own_key},
+                task_id="both__t1",
+                dataset="test",
+                judge_identity=JUDGE,
+            )
+    assert s3.bodies == []
+
+
+async def test_save_and_load_require_an_authenticated_tenant(store: EvalResumeStore, s3: _FakeS3) -> None:
+    checkpoint = await _save(store)
+
+    with tenant_scope(None):
+        with pytest.raises(RuntimeError, match="no authenticated tenant"):
+            await _save(store)
+        with pytest.raises(RuntimeError, match="no authenticated tenant"):
+            await store.load(checkpoint, task_id="both__t1", dataset="test", judge_identity=JUDGE)
+    assert len(s3.puts) == 1 and s3.bodies == []
+
+
 @pytest.mark.parametrize(("task_id", "dataset"), [("both__t2", "test"), ("both__t1", "val")])
 async def test_load_refuses_a_checkpoint_for_another_task_or_dataset(
     store: EvalResumeStore, task_id: str, dataset: str
@@ -188,10 +252,10 @@ async def test_org_style_ids_round_trip_under_a_digest_key(store: EvalResumeStor
 
     digest = hashlib.sha256(task_id.encode()).hexdigest()[:32]
     assert checkpoint.task_id == task_id and checkpoint.dataset == dataset
-    assert checkpoint.s3_key == f"snap/eval-resume/{RUN_ID}/{digest}/{checkpoint.sha256}"
+    assert checkpoint.s3_key == f"snap/eval-resume/{TENANT}/{RUN_ID}/{digest}/{_binding(dataset)}/{checkpoint.sha256}"
     state = checkpoint.model_dump(mode="json")
     assert await store.load(state, task_id=task_id, dataset=dataset, judge_identity=JUDGE) == b"archive"
-    with pytest.raises(EvalResumeError, match="outside"):
+    with pytest.raises(EvalResumeError, match="does not match"):
         store.parse(state | {"task_id": "../escape"})
 
 
@@ -199,7 +263,7 @@ async def test_parse_rejects_a_pointer_outside_the_prefix(store: EvalResumeStore
     checkpoint = await _save(store)
     state = checkpoint.model_dump(mode="json") | {"s3_key": "other-bench/secret"}
 
-    with pytest.raises(EvalResumeError, match="outside"):
+    with pytest.raises(EvalResumeError, match="another tenant"):
         store.parse(state)
 
 

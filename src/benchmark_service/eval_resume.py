@@ -9,7 +9,7 @@ retry when the judge it would use now is not the judge the pointer was saved
 under, so a retry grades what the first attempt would have graded.
 
 Every object key names the authenticated tenant that saved it and a digest of
-the checkpoint's dataset and judge, so a checkpoint replayed by another tenant,
+the checkpoint's task, dataset and judge, so a checkpoint replayed by another tenant,
 or edited to claim the current judge, never resolves to the saved bytes. The
 store reads the tenant the framework binds for each request
 (``benchmark_service.context.current_tenant``); call ``save`` and ``load`` from
@@ -53,12 +53,14 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 from benchmark_service.blocking import run_blocking
 from benchmark_service.context import current_tenant
 from benchmark_service.sandbox import Sandbox
+from benchmark_service.v1_schemas import KEY_SEGMENT_PATTERN
 
 REGION_ENV = "AWS_REGION"
 DEFAULT_MAX_BYTES = 256 * 1024**2
 RUN_ID_LABEL = "Id"
 
 _SAFE_COMPONENT = re.compile(r"^(?!\.{1,2}$)[A-Za-z0-9_.-]+$")
+_TENANT_SEGMENT = re.compile(KEY_SEGMENT_PATTERN)
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -134,16 +136,20 @@ def _caller_tenant() -> str:
         raise RuntimeError(
             "no authenticated tenant is bound; call eval-resume save and load from inside a service request"
         )
-    # Rejected rather than digested, as submission_artifacts._require_tenant_key does: a digested
-    # tenant could share a namespace with a tenant whose id is that digest.
-    if not _SAFE_COMPONENT.fullmatch(tenant):
+    # The rule submission_artifacts._require_tenant_key applies. Rejected rather than digested:
+    # a digested tenant could share a namespace with a tenant whose id is that digest.
+    if not _TENANT_SEGMENT.fullmatch(tenant):
         raise EvalResumeError("tenant is not a valid object-key segment")
     return tenant
 
 
-def _binding(dataset: str, judge_identity: str) -> str:
-    """Digest of the fields ``load`` checks but the content hash does not cover."""
-    encoded = json.dumps({"dataset": dataset, "judge_identity": judge_identity}, sort_keys=True, separators=(",", ":"))
+def _binding(task_id: str, dataset: str, judge_identity: str) -> str:
+    """Digest of the fields ``load`` checks but the key's readable segments do not pin.
+
+    The task id is included because its key segment may be a digest of it, which a task
+    literally named that digest would share."""
+    fields = {"task_id": task_id, "dataset": dataset, "judge_identity": judge_identity}
+    encoded = json.dumps(fields, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode()).hexdigest()[:32]
 
 
@@ -213,12 +219,12 @@ class EvalResumeStore:
     def key(self, *, benchmark_id: str, task_id: str, dataset: str, judge_identity: str, sha256: str) -> str:
         """The only key a checkpoint with these fields may point at, for the current tenant.
 
-        Layout: ``<prefix>/<tenant>/<benchmark_id>/<task_id>/<digest of dataset and judge>/<sha256>``.
+        Layout: ``<prefix>/<tenant>/<benchmark_id>/<task_id>/<digest of task, dataset and judge>/<sha256>``.
         A task id that is not a safe path segment (``org/name``) is stored under a digest of it;
         the checkpoint keeps it as is. A tenant that is not a safe path segment is refused.
         """
         tenant = _caller_tenant()
-        binding = _binding(dataset, judge_identity)
+        binding = _binding(task_id, dataset, judge_identity)
         return f"{self.object_prefix}/{tenant}/{benchmark_id}/{_key_component(task_id)}/{binding}/{sha256}"
 
     async def save(

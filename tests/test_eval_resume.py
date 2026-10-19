@@ -61,8 +61,9 @@ def caller_tenant() -> Iterator[None]:
         yield
 
 
-def _binding(dataset: str = "test", judge: str = JUDGE) -> str:
-    return hashlib.sha256(f'{{"dataset":"{dataset}","judge_identity":"{judge}"}}'.encode()).hexdigest()[:32]
+def _binding(task_id: str = "both__t1", dataset: str = "test", judge: str = JUDGE) -> str:
+    fields = f'{{"dataset":"{dataset}","judge_identity":"{judge}","task_id":"{task_id}"}}'
+    return hashlib.sha256(fields.encode()).hexdigest()[:32]
 
 
 @pytest.fixture
@@ -206,6 +207,32 @@ async def test_load_refuses_a_checkpoint_saved_by_another_tenant(store: EvalResu
     assert s3.bodies == []
 
 
+async def test_a_task_id_edited_to_its_key_digest_is_refused(store: EvalResumeStore, s3: _FakeS3) -> None:
+    """``org/name`` is stored under its digest; a task literally named that digest must not reach it."""
+    task_id = "terminal-bench-science/tb-1"
+    checkpoint = await store.save(
+        benchmark_id=RUN_ID, task_id=task_id, dataset="test", content=b"archive", judge_identity=JUDGE
+    )
+    alias = hashlib.sha256(task_id.encode()).hexdigest()[:32]
+
+    with pytest.raises(EvalResumeError, match="does not match"):
+        await store.load(
+            checkpoint.model_dump(mode="json") | {"task_id": alias}, task_id=alias, dataset="test", judge_identity=JUDGE
+        )
+    assert s3.bodies == []
+
+
+async def test_tenant_segments_follow_the_submission_artifact_rule(store: EvalResumeStore, s3: _FakeS3) -> None:
+    """The same tenants are valid here as in ``submission_artifacts``: ``KEY_SEGMENT_PATTERN``."""
+    with tenant_scope("acme+team"):
+        checkpoint = await _save(store)
+        assert checkpoint.s3_key.startswith("snap/eval-resume/acme+team/")
+    for tenant in (".hidden", "x" * 129):
+        with tenant_scope(tenant), pytest.raises(EvalResumeError, match="tenant is not a valid"):
+            await _save(store)
+    assert len(s3.puts) == 1
+
+
 async def test_an_unsafe_tenant_is_refused_rather_than_aliased(store: EvalResumeStore, s3: _FakeS3) -> None:
     """Digesting ``org/name`` would share a namespace with a tenant whose id is that digest."""
     with tenant_scope("org/name"):
@@ -260,7 +287,7 @@ async def test_org_style_ids_round_trip_under_a_digest_key(store: EvalResumeStor
 
     digest = hashlib.sha256(task_id.encode()).hexdigest()[:32]
     assert checkpoint.task_id == task_id and checkpoint.dataset == dataset
-    assert checkpoint.s3_key == f"snap/eval-resume/{TENANT}/{RUN_ID}/{digest}/{_binding(dataset)}/{checkpoint.sha256}"
+    assert checkpoint.s3_key == f"snap/eval-resume/{TENANT}/{RUN_ID}/{digest}/{_binding(task_id, dataset)}/{checkpoint.sha256}"
     state = checkpoint.model_dump(mode="json")
     assert await store.load(state, task_id=task_id, dataset=dataset, judge_identity=JUDGE) == b"archive"
     with pytest.raises(EvalResumeError, match="does not match"):

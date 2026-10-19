@@ -5186,6 +5186,42 @@ async def test_daytona_kill_rejects_unconfirmed_pty_absence(failure: str) -> Non
     assert not process.group_exists
 
 
+async def test_daytona_kill_accepts_failed_pty_cleanup_after_fresh_absence() -> None:
+    class AlreadyAbsentProcess(ListedCgroupProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_events: list[str] = []
+
+        async def kill_pty_session(self, session_id: str) -> None:
+            assert session_id not in self.sessions
+            self.user_finished.set()
+            self.release_seen.set()
+            self.close_events.append("kill failed")
+            raise DaytonaError("PTY session not found")
+
+        async def list_pty_sessions(self) -> list[SimpleNamespace]:
+            sessions = await super().list_pty_sessions()
+            if self.close_events:
+                self.close_events.append("listed")
+            return sessions
+
+    process = AlreadyAbsentProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    process.allow_final_frame.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    assert process.group_exists
+    assert len(process.sessions) == 1
+    process.sessions.remove(next(iter(process.sessions)))
+
+    await asyncio.wait_for(workload.kill(), 2)
+    assert process.close_events == ["kill failed", "listed"]
+    assert process.sessions == set()
+    assert not process.group_exists
+    await asyncio.wait_for(workload.wait(), 2)
+
+
 async def test_daytona_cleanup_retries_failed_close_after_provider_recovers() -> None:
     process = ListedCgroupProcess()
     process.allow_creation.set()

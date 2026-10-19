@@ -19,7 +19,7 @@ from websockets.exceptions import ConnectionClosed
 from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_required
 from benchmark_service.base import BenchmarkService
-from benchmark_service.context import sandbox_provider_scope
+from benchmark_service.context import sandbox_provider_scope, tenant_scope
 from benchmark_service.schemas import (
     DATASET_VERSION_HEADER,
     DatasetVersion,
@@ -277,7 +277,8 @@ class BenchmarkServiceApp(FastAPI):
                     else:
                         connection.state.dataset_version = resolved
                 entered = True
-                yield
+                with tenant_scope(tenant):
+                    yield
         except HTTPException as exc:
             if isinstance(connection, WebSocket) and exc.status_code == 403:
                 await connection.close(code=1008, reason="Dataset not allowed")

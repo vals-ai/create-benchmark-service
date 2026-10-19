@@ -13,6 +13,7 @@ from starlette.websockets import WebSocketDisconnect
 from benchmark_service.vals import auth as auth_module
 from benchmark_service.vals.app import ValsBenchmarkServiceApp
 from benchmark_service.app import BenchmarkServiceApp, send_json_if_connected
+from benchmark_service.context import current_tenant
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
 from benchmark_service.sandbox.types import (
@@ -537,6 +538,32 @@ def test_local_http_and_websocket_bypass_custom_auth(
         with client.websocket_connect("/ws/evaluate-response") as ws:
             ws.send_json({"task_id": "task-1", "response": "2"})
             assert ws.receive_json() == {"type": "result", "data": {"resolved": True}}
+
+
+@pytest.mark.parametrize("app_cls", [BenchmarkServiceApp, ValsBenchmarkServiceApp])
+def test_websocket_evaluation_binds_the_authenticated_tenant(
+    monkeypatch: pytest.MonkeyPatch, app_cls: type[BenchmarkServiceApp]
+) -> None:
+    """A benchmark's eval-resume store reads the caller's tenant from the request scope."""
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
+
+    class TenantBenchmark(ValsStubBenchmark):
+        async def resolve_tenant(self, headers: dict[str, str]) -> str | None:
+            return headers.get("x-tenant")
+
+        async def check_dataset_access(self, tenant: str, dataset: str | None) -> bool:
+            return True
+
+        async def stream_evaluate_response(  # type: ignore[override]
+            self, request: Any, dataset: str | None = None
+        ) -> AsyncGenerator[Any, None]:
+            yield StreamResultChunk(type="result", data={"tenant": current_tenant()})
+
+    with TestClient(app_cls(TenantBenchmark)) as client:
+        with client.websocket_connect("/ws/evaluate-response", headers={"x-tenant": "tenant-a"}) as ws:
+            ws.send_json({"task_id": "task-1", "eval_resume_state": {}})
+            assert ws.receive_json() == {"type": "result", "data": {"tenant": "tenant-a"}}
+    assert current_tenant() is None
 
 
 class TestDescopeAuth:

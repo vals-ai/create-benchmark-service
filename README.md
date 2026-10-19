@@ -222,8 +222,7 @@ Tracker reads the counter during generation and, unless exhaustion has frozen th
 In Tracker task results, null base/effective
 allowances mean no generation deadline; `generation_elapsed_seconds` is still measured at terminal
 finalization. A null elapsed value instead means no generation-time measurement was recorded.
-The independent 166-hour whole-task wall applies to every selected task, including those without
-a generation deadline. Modal separately limits each sandbox to a 24-hour provider lifetime.
+The independent 166-hour whole-task wall applies to every selected task, including those without a generation deadline. Daytona requests a 167-hour sandbox TTL, local Docker uses a 167-hour keepalive, and Modal caps sandbox lifetime at 24 hours.
 Accounting credit is optional and independent of whether `credited_generation` is present; eligibility needs
 configured proxy access, a resolved native Gateway URL and key, and an attested model. Missing
 eligibility uses the base clock; failure of an eligible counter read does not silently fall back.
@@ -295,7 +294,9 @@ bundle to
 and starts each selected-agent turn in a new process group. The bundle renders `{problem_statement_path}` to that turn's
 observation file and `{slot_dir}` to `<slots_root>/<slot>/agent`. A configured `container_name` requires
 `parallel_agents=1`; `{container_name}` is bound to that template with `{slot}` filled first. Otherwise
-it remains literal in the command. Other unbound tokens also remain literal. Bound token
+it remains literal in the command. Other unbound tokens also remain literal.
+The episode orchestrator must be able to write under `slots_root`; when `container_name` is configured, its environment must also provide the `docker` CLI on `PATH` for named-container cleanup.
+Bound token
 replacements insert values opaquely, including any braces they contain. In `final_output`,
 `{slot_dir}` is replaced for each
 configured path. The orchestrator names slots and shares one workspace and budget across
@@ -315,6 +316,9 @@ A file keeps its basename; `n` starts at 1 per slot. `final_output` may contain 
 launch. Tracker requires that placeholder when `parallel_agents > 1` and `final_output` is set, so parallel slots
 do not snapshot the same path. The agent workspace and turn snapshots are sibling directories; snapshots
 are stored outside the agent workspace. Tracker archives `slots_root` as the episode output.
+Directory snapshots follow symlinks and copy their targets. The copied tree must not contain cyclic links
+or include its own snapshot destination. Copy errors propagate without returning a `SlotResult` and may
+leave partial files.
 
 Upload `valkyrie_stage_source()` as `valkyrie_stage.py` during setup and import `Agents` there with Python 3.8+:
 
@@ -337,6 +341,12 @@ SIGKILL. Overlapping slots count as one union interval. `stop` returns `stopped`
 returns `exited` or `exhausted` as appropriate. Tracker writes `$VALKYRIE_STAGE_DIR/exhausted` before its ACK when the shared
 budget expires. The library stops all active turns, completes their cleanup and END, and later `start` raises
 `Exhausted`. If the notice arrives with BEGIN ACK, no child starts and no END is sent.
+For a known no-process launch failure after an ordinary BEGIN, `Agents` closes that attempt's pipes,
+reports the matching END, and raises the original launch error. A later `start` is explicit;
+time already charged between BEGIN and END is not refunded. Unknown owner readiness is not
+proof of child absence and does not trigger END. If named-container absence cannot be confirmed
+after an owner exits, the slot retains its initial completion reason and pending result; a later
+public call resumes Docker cleanup before END, output snapshot, and the completed result.
 
 For every task, check `sandbox.generation_containment` and run
 `await sandbox.probe_generation_containment()` before starting a controlled workload. An advertised

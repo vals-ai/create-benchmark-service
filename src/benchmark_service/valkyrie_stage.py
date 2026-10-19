@@ -77,6 +77,7 @@ class _RunningSlot:
     container: str | None
     final_output: Path | None
     kill_requested: bool = False
+    completion_reason: Literal["exited", "stopped", "exhausted"] | None = None
 
 
 class Agents:
@@ -134,7 +135,8 @@ class Agents:
             if self._final_output_template is not None
             else None
         )
-        if not self._active:
+        opened_interval = not self._active
+        if opened_interval:
             self._reporter.begin(container)
             if (self._stage_dir / "exhausted").exists():
                 raise Exhausted
@@ -143,8 +145,20 @@ class Agents:
         if generation_gateway_url is not None:
             child_env = os.environ.copy()
             child_env["MODEL_GATEWAY_URL"] = generation_gateway_url
-        control_read, control_write = os.pipe()
-        result_read, result_write = os.pipe()
+        try:
+            control_read, control_write = os.pipe()
+        except OSError:
+            if opened_interval:
+                self._reporter.end()
+            raise
+        try:
+            result_read, result_write = os.pipe()
+        except OSError:
+            os.close(control_read)
+            os.close(control_write)
+            if opened_interval:
+                self._reporter.end()
+            raise
         try:
             process = subprocess.Popen(
                 [sys.executable, __file__, "--turn-owner", str(control_read), str(result_write), command],
@@ -154,6 +168,8 @@ class Agents:
         except OSError:
             os.close(control_write)
             os.close(result_read)
+            if opened_interval:
+                self._reporter.end()
             raise
         finally:
             os.close(control_read)
@@ -165,6 +181,8 @@ class Agents:
                 failure = json.load(stream) if ready == b"F" else None
             os.close(control_write)
             if failure is not None:
+                if opened_interval:
+                    self._reporter.end()
                 raise OSError(failure["errno"], failure["strerror"], failure["filename"])
             raise RuntimeError("turn owner exited before root launch")
         self._active[slot] = _RunningSlot(process, control_write, result_read, container, final_output)
@@ -207,6 +225,9 @@ class Agents:
         if (self._stage_dir / "exhausted").exists():
             self._exhaust_all()
         for slot, running in list(self._active.items()):
+            if running.completion_reason is not None:
+                self._complete(slot, running.completion_reason)
+                continue
             if self._turn_status(running) != b"A":
                 self._complete(slot, "exited")
 
@@ -225,19 +246,18 @@ class Agents:
 
     def _exhaust_all(self) -> None:
         for running in self._active.values():
-            self._request_kill(running)
+            if not running.kill_requested:
+                self._request_kill(running)
         for slot in list(self._active):
             self._complete(slot, "exhausted")
 
     def _complete(self, slot: str, reason: Literal["exited", "stopped", "exhausted"]) -> None:
         running = self._active[slot]
+        if running.completion_reason is None:
+            running.completion_reason = reason
         if not running.kill_requested:
             self._request_kill(running)
         running.process.wait()
-        with os.fdopen(running.result_fd) as stream:
-            result = json.load(stream)
-        os.close(running.control_fd)
-        exit_code = result["exit_code"]
 
         if running.container is not None:
             subprocess.run(["docker", "rm", "-f", running.container], capture_output=True, check=False)
@@ -250,6 +270,10 @@ class Agents:
             if running.container in listed.stdout.splitlines():
                 raise RuntimeError(f"container {running.container!r} is still present")
 
+        with os.fdopen(running.result_fd) as stream:
+            result = json.load(stream)
+        os.close(running.control_fd)
+        exit_code = result["exit_code"]
         del self._active[slot]
         if not self._active:
             self._reporter.end()
@@ -262,7 +286,7 @@ class Agents:
             else:
                 turn_dir.mkdir()
                 shutil.copy2(running.final_output, turn_dir / running.final_output.name)
-        self._finished.append(SlotResult(slot, reason, exit_code))
+        self._finished.append(SlotResult(slot, running.completion_reason, exit_code))
 
     def _take(self, slot: str, newest: bool) -> SlotResult:
         indices = range(len(self._finished) - 1, -1, -1) if newest else range(len(self._finished))

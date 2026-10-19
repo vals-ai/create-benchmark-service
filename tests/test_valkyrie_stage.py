@@ -170,6 +170,149 @@ def test_configured_container_binding_keeps_inserted_braces_opaque(
     assert reporter.events == [("begin", "box-one-{slot_dir}"), ("end", None)]
 
 
+@pytest.mark.parametrize("failure", ["first_pipe", "second_pipe", "owner", "child"])
+def test_failed_no_process_start_balances_interval_and_later_explicit_start(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    worker, reporter = agents(tmp_path, monkeypatch, run_cmd="exit 17")
+    owned_fds: tuple[int, int] | None = None
+    with monkeypatch.context() as fault:
+        if failure in ("first_pipe", "second_pipe"):
+            original_pipe = os.pipe
+            calls = 0
+
+            def fail_pipe() -> tuple[int, int]:
+                nonlocal calls, owned_fds
+                calls += 1
+                if calls == (1 if failure == "first_pipe" else 2):
+                    raise OSError(errno.EMFILE, "pipe unavailable")
+                owned_fds = original_pipe()
+                return owned_fds
+
+            fault.setattr(valkyrie_stage.os, "pipe", fail_pipe)
+        elif failure == "owner":
+            def fail_owner(*args: object, **kwargs: object) -> None:
+                raise OSError(errno.ENOENT, "owner unavailable", sys.executable)
+
+            fault.setattr(valkyrie_stage.subprocess, "Popen", fail_owner)
+        else:
+            fault.setenv("PATH", "")  # The actual owner can start, but its 'sh' child cannot.
+
+        with pytest.raises(OSError) as raised:
+            worker.start("one", "observation")
+
+    assert raised.value.errno == (errno.EMFILE if "pipe" in failure else errno.ENOENT)
+    if owned_fds is not None:
+        for fd in owned_fds:
+            with pytest.raises(OSError) as closed:
+                os.fstat(fd)
+            assert closed.value.errno == errno.EBADF
+    assert reporter.events == [("begin", None), ("end", None)]
+    worker.start("one", "observation")
+    assert worker.wait_any() == valkyrie_stage.SlotResult("one", "exited", 17)
+    assert reporter.events == [("begin", None), ("end", None)] * 2
+
+
+def test_uncertain_owner_readiness_does_not_close_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker, reporter = agents(tmp_path, monkeypatch)
+    original_popen = subprocess.Popen
+
+    def ambiguous_owner(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        result_fd = int(args[4])
+        return original_popen(
+            [sys.executable, "-c", "import os,sys; os.write(int(sys.argv[1]), b'?')", str(result_fd)],
+            pass_fds=(result_fd,),
+        )
+
+    with monkeypatch.context() as fault:
+        fault.setattr(valkyrie_stage.subprocess, "Popen", ambiguous_owner)
+        with pytest.raises(RuntimeError, match="before root launch"):
+            worker.start("one", "observation")
+    assert reporter.events == [("begin", None)]
+    assert not worker._active
+
+
+
+def test_failed_parallel_start_does_not_end_other_slots_interval(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    worker, reporter = agents(tmp_path, monkeypatch, run_cmd="sleep 30")
+    worker.start("one", "observation")
+    try:
+        with monkeypatch.context() as fault:
+            def fail_owner(*args: object, **kwargs: object) -> None:
+                raise OSError(errno.ENOENT, "owner unavailable", sys.executable)
+
+            fault.setattr(valkyrie_stage.subprocess, "Popen", fail_owner)
+            with pytest.raises(OSError, match="owner unavailable"):
+                worker.start("two", "observation")
+        assert reporter.events == [("begin", None)]
+        assert worker.stop("one").reason == "stopped"
+        assert reporter.events == [("begin", None), ("end", None)]
+    finally:
+        if "one" in worker._active:
+            worker.stop("one")
+
+
+@pytest.mark.parametrize("mode", ["natural", "stop", "exhausted"])
+def test_named_container_cleanup_resumes_only_on_later_call(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
+) -> None:
+    docker = tmp_path / "docker"
+    listed = tmp_path / "first-list"
+    docker.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1\" = container ]; then\n"
+        f"  if [ ! -e '{listed}' ]; then touch '{listed}'; printf 'box-one\\n'; fi\n"
+        "fi\n"
+    )
+    docker.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
+    output = tmp_path / "slots" / "one" / "agent" / "result"
+    command = "printf 'owned-result' > '{slot_dir}/result'; " + (
+        "exit 23" if mode == "natural" else "exec sleep 30"
+    )
+    worker, reporter = agents(
+        tmp_path, monkeypatch, run_cmd=command, container_name="box-{slot}",
+        parallel_agents=1, final_output="{slot_dir}/result",
+    )
+    worker.start("one", "observation")
+    owner = worker._active["one"].process
+    try:
+        if mode != "natural":
+            deadline = time.monotonic() + 5
+            while not output.exists():
+                assert time.monotonic() < deadline
+                time.sleep(0.01)
+        if mode == "exhausted":
+            (tmp_path / "stage" / "exhausted").touch()
+        with pytest.raises(RuntimeError, match="still present"):
+            if mode == "stop":
+                worker.stop("one")
+            else:
+                worker.wait_any()
+        assert reporter.events == [("begin", "box-one")]
+        assert not (tmp_path / "slots" / "one" / "turns" / "1").exists()
+        if mode != "exhausted":
+            (tmp_path / "stage" / "exhausted").touch()
+        assert worker.wait_any() == valkyrie_stage.SlotResult(
+            "one", {"natural": "exited", "stop": "stopped", "exhausted": "exhausted"}[mode],
+            23 if mode == "natural" else -signal.SIGKILL,
+        )
+        assert reporter.events == [("begin", "box-one"), ("end", None)]
+        assert (tmp_path / "slots" / "one" / "turns" / "1" / "result").read_text() == "owned-result"
+    finally:
+        try:
+            if "one" in worker._active:
+                worker.stop("one")
+        finally:
+            if owner.poll() is None:
+                owner.kill()
+            owner.wait(timeout=5)
+
+
 def test_natural_exit_retains_code_until_group_cleanup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     gate = tmp_path / "slots" / "one" / "agent" / "go"
     gate.parent.mkdir(parents=True)

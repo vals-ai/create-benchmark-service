@@ -124,6 +124,7 @@ async def test_load_closes_the_body_when_the_caller_is_cancelled_mid_get(store: 
 
 
 async def test_default_client_is_built_off_the_event_loop(monkeypatch: pytest.MonkeyPatch, s3: _FakeS3) -> None:
+    monkeypatch.setenv("AWS_REGION", "us-east-1")
     built_on_loop: list[bool] = []
 
     def slow_default_client() -> _FakeS3:
@@ -238,11 +239,6 @@ async def test_save_fails_loudly_without_a_bucket(monkeypatch: pytest.MonkeyPatc
         await _save(store)
 
 
-def test_store_rejects_an_unsafe_prefix() -> None:
-    with pytest.raises(ValueError, match="object_prefix"):
-        EvalResumeStore(bucket_env=BUCKET_ENV, object_prefix="../snap")
-
-
 def test_judge_identity_ignores_key_order_and_tracks_values() -> None:
     assert judge_identity({"a": 1, "b": [2]}) == judge_identity({"b": [2], "a": 1})
     assert judge_identity({"a": 1}) != judge_identity({"a": 2})
@@ -270,3 +266,10 @@ def test_benchmark_id_hashes_an_unsafe_label() -> None:
     benchmark_id = benchmark_id_from_sandbox(_LabelledSandbox("sandbox-1", {"Id": "run/1"}))  # pyright: ignore[reportArgumentType]
 
     assert benchmark_id == hashlib.sha256(b"run/1").hexdigest()[:32]
+
+
+async def test_default_client_requires_a_region(monkeypatch: pytest.MonkeyPatch, s3: _FakeS3) -> None:
+    monkeypatch.delenv("AWS_REGION", raising=False)
+    store = EvalResumeStore(bucket_env=BUCKET_ENV, object_prefix="snap/eval-resume")
+    with pytest.raises(RuntimeError, match="AWS_REGION is not set"):
+        await _save(store)

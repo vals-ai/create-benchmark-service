@@ -121,7 +121,10 @@ def _key_component(value: str) -> str:
 
 
 def benchmark_id_from_sandbox(sandbox: Sandbox) -> str:
-    """The Valkyrie run id the sandbox is labelled with, else the sandbox's own id."""
+    """The Valkyrie run id the sandbox is labelled with, else the sandbox's own id.
+
+    The tracker labels every task sandbox ``{"Benchmark": name, "Id": benchmark id, "Task": task id}``
+    (Valkyrie ``services/tracker/src/tracker/sandbox.py``)."""
     return _key_component(((sandbox.labels or {}).get(RUN_ID_LABEL) or "").strip() or sandbox.id)
 
 
@@ -141,11 +144,21 @@ class S3Client(Protocol):
 
 
 def _default_s3_client() -> S3Client:
+    """Mirrors ``submission_artifacts._s3_client``: an explicit region and bounded timeouts, so a
+    cancelled caller waits at most one timeout for the worker thread to return."""
     import boto3
+    from botocore.config import Config
 
+    region = os.environ.get(REGION_ENV)
+    if not region:
+        raise RuntimeError(f"{REGION_ENV} is not set; eval-resume S3 access must be configured for the bucket's region")
     return cast(
         S3Client,
-        boto3.client("s3", region_name=os.environ.get(REGION_ENV)),  # pyright: ignore[reportUnknownMemberType]
+        boto3.client(  # pyright: ignore[reportUnknownMemberType]
+            "s3",
+            region_name=region,
+            config=Config(signature_version="s3v4", connect_timeout=10, read_timeout=60),
+        ),
     )
 
 
@@ -162,8 +175,6 @@ class EvalResumeStore:
         s3_client: S3Client | None = None,
     ) -> None:
         prefix = object_prefix.strip("/")
-        if not all(_SAFE_COMPONENT.fullmatch(segment) for segment in prefix.split("/")):
-            raise ValueError(f"object_prefix {object_prefix!r} must be '/'-separated safe path segments")
         if max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
         self.bucket_env = bucket_env

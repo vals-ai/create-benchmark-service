@@ -219,7 +219,7 @@ class EvalResumeStore:
         content_type: str = "application/octet-stream",
         s3_client: S3Client | None = None,
     ) -> None:
-        """``object_prefix`` defaults to ``$EVAL_RESUME_PREFIX``, the registry's prefix without ``/*``."""
+        """``object_prefix`` defaults to ``$EVAL_RESUME_PREFIX``; a trailing ``/*`` is dropped."""
         if object_prefix is None:
             object_prefix = os.environ.get(PREFIX_ENV)
             if not object_prefix:
@@ -227,7 +227,8 @@ class EvalResumeStore:
                     f"{PREFIX_ENV} is not set; the deployment must configure eval-resume storage "
                     "(benchmark-services-registry EvalResumeStorageConfig)"
                 )
-        prefix = object_prefix.strip("/")
+        # The registry form (`snap/eval-resume/*`) names the same prefix as `snap/eval-resume`.
+        prefix = object_prefix.removesuffix("*").strip("/")
         if max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
         self.bucket_env = bucket_env

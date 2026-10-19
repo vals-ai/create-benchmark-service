@@ -161,3 +161,16 @@ def test_the_store_requires_a_prefix(monkeypatch: pytest.MonkeyPatch) -> None:
 
     with pytest.raises(RuntimeError, match="EVAL_RESUME_PREFIX"):
         EvalResumeStore()
+
+
+def test_the_store_accepts_the_registry_form_of_the_prefix() -> None:
+    store = EvalResumeStore(object_prefix="snap/eval-resume/*")
+
+    assert store.object_prefix == "snap/eval-resume"
+
+
+def test_adopters_can_bind_a_tenant_from_the_package_root() -> None:
+    import benchmark_service
+
+    with benchmark_service.tenant_scope("tenant-b"):
+        assert benchmark_service.current_tenant() == "tenant-b"

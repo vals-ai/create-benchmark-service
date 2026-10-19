@@ -15,9 +15,11 @@ store reads the tenant the framework binds for each request
 (``benchmark_service.context.current_tenant``); call ``save`` and ``load`` from
 inside ``evaluate_instance`` or ``stream_evaluate_response``.
 
-The bucket comes from the environment variable that the registry's
-``EvalResumeStorageConfig.bucket_env`` names for the service; the store's
-``object_prefix`` matches that config's ``object_prefix`` without the ``/*``.
+By default the bucket comes from ``$EVAL_RESUME_BUCKET`` and the prefix from
+``$EVAL_RESUME_PREFIX``, which benchmark-services-registry sets for a service with
+``EvalResumeStorageConfig``. A service that implements ``BenchmarkService``'s grading
+hooks never calls the store itself; the usage below is for one that overrides
+``evaluate_instance`` because it grades in the live sandbox.
 
 Usage::
 
@@ -56,6 +58,9 @@ from benchmark_service.sandbox import Sandbox
 from benchmark_service.v1_schemas import KEY_SEGMENT_PATTERN
 
 REGION_ENV = "AWS_REGION"
+# Set by benchmark-services-registry's infra_stack for every service with EvalResumeStorageConfig.
+BUCKET_ENV = "EVAL_RESUME_BUCKET"
+PREFIX_ENV = "EVAL_RESUME_PREFIX"
 DEFAULT_MAX_BYTES = 256 * 1024**2
 RUN_ID_LABEL = "Id"
 
@@ -208,12 +213,20 @@ class EvalResumeStore:
     def __init__(
         self,
         *,
-        bucket_env: str,
-        object_prefix: str,
+        bucket_env: str = BUCKET_ENV,
+        object_prefix: str | None = None,
         max_bytes: int = DEFAULT_MAX_BYTES,
         content_type: str = "application/octet-stream",
         s3_client: S3Client | None = None,
     ) -> None:
+        """``object_prefix`` defaults to ``$EVAL_RESUME_PREFIX``, the registry's prefix without ``/*``."""
+        if object_prefix is None:
+            object_prefix = os.environ.get(PREFIX_ENV)
+            if not object_prefix:
+                raise RuntimeError(
+                    f"{PREFIX_ENV} is not set; the deployment must configure eval-resume storage "
+                    "(benchmark-services-registry EvalResumeStorageConfig)"
+                )
         prefix = object_prefix.strip("/")
         if max_bytes <= 0:
             raise ValueError("max_bytes must be positive")
@@ -376,12 +389,14 @@ class EvalResumeStore:
 
 
 __all__ = [
+    "BUCKET_ENV",
     "DEFAULT_MAX_BYTES",
     "EvalResumeCheckpoint",
     "EvalResumeError",
     "EvalResumeIdentityError",
     "EvalResumeIntegrityError",
     "EvalResumeStore",
+    "PREFIX_ENV",
     "S3Client",
     "benchmark_id_from_sandbox",
     "grader_identity",

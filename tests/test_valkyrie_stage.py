@@ -17,6 +17,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from typing import Literal
 
 import pytest
 
@@ -297,8 +298,11 @@ def test_named_container_cleanup_resumes_only_on_later_call(
         assert not (tmp_path / "slots" / "one" / "turns" / "1").exists()
         if mode != "exhausted":
             (tmp_path / "stage" / "exhausted").touch()
+        reason: Literal["exited", "stopped", "exhausted"] = (
+            "exited" if mode == "natural" else "stopped" if mode == "stop" else "exhausted"
+        )
         assert worker.wait_any() == valkyrie_stage.SlotResult(
-            "one", {"natural": "exited", "stop": "stopped", "exhausted": "exhausted"}[mode],
+            "one", reason,
             23 if mode == "natural" else -signal.SIGKILL,
         )
         assert reporter.events == [("begin", "box-one"), ("end", None)]

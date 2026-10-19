@@ -143,7 +143,7 @@ async def test_workload_group_term_leaves_fifo_listener_to_stop_ignoring_helper(
         assert process.returncode is None
         assert not (control / "status").exists()
         stop = await asyncio.create_subprocess_exec(
-            "/bin/sh", "-c", stop_command(str(control)),
+            "/bin/sh", "-c", stop_command(str(control), episode_owner=False),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         )
         output, _ = await asyncio.wait_for(stop.communicate(), 5)

@@ -159,6 +159,21 @@ async def test_load_detects_a_size_mismatch(store: EvalResumeStore, s3: _FakeS3,
         await store.load(checkpoint, task_id="both__t1", dataset="test", judge_identity=JUDGE)
 
 
+async def test_org_style_ids_round_trip_under_a_digest_key(store: EvalResumeStore, s3: _FakeS3) -> None:
+    task_id, dataset = "terminal-bench-science/tb-1", "terminal-bench-science/tb@sha256:abc"
+    checkpoint = await store.save(
+        benchmark_id=RUN_ID, task_id=task_id, dataset=dataset, content=b"archive", judge_identity=JUDGE
+    )
+
+    digest = hashlib.sha256(task_id.encode()).hexdigest()[:32]
+    assert checkpoint.task_id == task_id and checkpoint.dataset == dataset
+    assert checkpoint.s3_key == f"snap/eval-resume/{RUN_ID}/{digest}/{checkpoint.sha256}"
+    state = checkpoint.model_dump(mode="json")
+    assert await store.load(state, task_id=task_id, dataset=dataset, judge_identity=JUDGE) == b"archive"
+    with pytest.raises(EvalResumeError, match="outside"):
+        store.parse(state | {"task_id": "../escape"})
+
+
 async def test_parse_rejects_a_pointer_outside_the_prefix(store: EvalResumeStore) -> None:
     checkpoint = await _save(store)
     state = checkpoint.model_dump(mode="json") | {"s3_key": "other-bench/secret"}
@@ -170,8 +185,9 @@ async def test_parse_rejects_a_pointer_outside_the_prefix(store: EvalResumeStore
 @pytest.mark.parametrize(
     "change",
     [
-        {"task_id": "../escape"},
-        {"task_id": ".."},
+        {"benchmark_id": "../escape"},
+        {"task_id": ""},
+        {"dataset": ""},
         {"sha256": "ABC"},
         {"judge_identity": "not-a-digest"},
         {"size_bytes": 1.0},

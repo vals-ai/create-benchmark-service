@@ -74,8 +74,8 @@ class EvalResumeCheckpoint(BaseModel):
 
     version: Literal[1] = 1
     benchmark_id: str
-    task_id: str
-    dataset: str
+    task_id: str = Field(min_length=1)
+    dataset: str = Field(min_length=1)
     s3_key: str
     sha256: str
     size_bytes: int = Field(ge=0)
@@ -88,11 +88,11 @@ class EvalResumeCheckpoint(BaseModel):
             raise ValueError("checkpoint integer fields must be exact JSON integers")
         return value
 
-    @field_validator("benchmark_id", "task_id", "dataset")
+    @field_validator("benchmark_id")
     @classmethod
     def _safe_component(cls, value: str) -> str:
         if not _SAFE_COMPONENT.fullmatch(value):
-            raise ValueError("checkpoint identifiers may contain only letters, numbers, '.', '_', and '-'")
+            raise ValueError("benchmark_id may contain only letters, numbers, '.', '_', and '-'")
         return value
 
     @field_validator("sha256", "judge_identity")
@@ -114,12 +114,16 @@ def judge_identity(parts: Mapping[str, Any]) -> str:
     return hashlib.sha256(encoded.encode()).hexdigest()
 
 
+def _key_component(value: str) -> str:
+    """``value`` when it is a safe S3 path segment, else a digest of it (an org-style ``org/name`` id)."""
+    if _SAFE_COMPONENT.fullmatch(value):
+        return value
+    return hashlib.sha256(value.encode()).hexdigest()[:32]
+
+
 def benchmark_id_from_sandbox(sandbox: Sandbox) -> str:
     """The Valkyrie run id the sandbox is labelled with, else the sandbox's own id."""
-    candidate = ((sandbox.labels or {}).get(RUN_ID_LABEL) or "").strip() or sandbox.id
-    if not _SAFE_COMPONENT.fullmatch(candidate):
-        candidate = hashlib.sha256(candidate.encode()).hexdigest()[:32]
-    return candidate
+    return _key_component(((sandbox.labels or {}).get(RUN_ID_LABEL) or "").strip() or sandbox.id)
 
 
 class _StreamingBody(Protocol):
@@ -170,8 +174,9 @@ class EvalResumeStore:
         self._s3_client = s3_client
 
     def key(self, benchmark_id: str, task_id: str, sha256: str) -> str:
-        """The only key a checkpoint with these fields may point at."""
-        return f"{self.object_prefix}/{benchmark_id}/{task_id}/{sha256}"
+        """The only key a checkpoint with these fields may point at. A task id that is not a
+        safe path segment (``org/name``) is stored under a digest of it; the checkpoint keeps it as is."""
+        return f"{self.object_prefix}/{benchmark_id}/{_key_component(task_id)}/{sha256}"
 
     async def save(
         self,

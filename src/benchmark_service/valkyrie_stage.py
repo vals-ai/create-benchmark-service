@@ -88,6 +88,7 @@ class Agents:
         config = json.loads((self._stage_dir / "agent.json").read_text())
         self._run_cmd: str = config["run_cmd"]
         self._continue_cmd: str | None = config["continue_cmd"]
+        self._command_bindings: dict[str, str] = config["command_bindings"]
         self._interrupt_grace_seconds: float | None = config["interrupt_grace_seconds"]
         self._container_template: str | None = config["container_name"]
         self._final_output_template: str | None = config["final_output"]
@@ -122,7 +123,7 @@ class Agents:
             template = self._continue_cmd
         else:
             template = self._run_cmd
-        bindings = {"problem_statement_path": observation_path, "slot_dir": str(slot_dir)}
+        bindings = {**self._command_bindings, "problem_statement_path": observation_path, "slot_dir": str(slot_dir)}
         if container is not None:
             bindings["container_name"] = container
         command = re.sub(

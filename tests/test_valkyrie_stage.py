@@ -104,6 +104,7 @@ def agents(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, **config: object) ->
             {
                 "run_cmd": "exit 0",
                 "continue_cmd": None,
+                "command_bindings": {"task_id": "benchmark-task-123"},
                 "interrupt_grace_seconds": None,
                 "container_name": None,
                 "final_output": None,
@@ -120,8 +121,8 @@ def test_commands_render_only_bound_tokens_once(tmp_path: Path, monkeypatch: pyt
     slot_root = tmp_path / "{container_name}" / "{slot_dir}"
     observation = tmp_path / "observation-{slot_dir}"
     observation.write_text("observed")
-    first = "printf '%s\\n' '{\"json\": {\"ok\": true}}' '{problem_statement_path}' > '{slot_dir}/first'"
-    continuation = "printf '%s\\n' '{\"json\": {\"ok\": true}}' '{problem_statement_path}' > '{slot_dir}/next'"
+    first = "printf '%s\\n' '{\"json\": {\"ok\": true}}' '{problem_statement_path}' '{task_id}' > '{slot_dir}/first'"
+    continuation = "printf '%s\\n' '{\"json\": {\"ok\": true}}' '{problem_statement_path}' '{task_id}' > '{slot_dir}/next'"
     worker, reporter = agents(
         tmp_path,
         monkeypatch,
@@ -133,11 +134,11 @@ def test_commands_render_only_bound_tokens_once(tmp_path: Path, monkeypatch: pyt
     slot_dir = slot_root / "one" / "agent"
     worker.start("one", str(observation))
     assert worker.wait_any() == valkyrie_stage.SlotResult("one", "exited", 0)
-    assert (slot_dir / "first").read_text().splitlines() == ['{"json": {"ok": true}}', str(observation)]
+    assert (slot_dir / "first").read_text().splitlines() == ['{"json": {"ok": true}}', str(observation), "benchmark-task-123"]
     assert (slot_root / "one" / "turns" / "1" / "first").read_text() == (slot_dir / "first").read_text()
     worker.start("one", str(observation))
     assert worker.wait_any() == valkyrie_stage.SlotResult("one", "exited", 0)
-    assert (slot_dir / "next").read_text().splitlines() == ['{"json": {"ok": true}}', str(observation)]
+    assert (slot_dir / "next").read_text().splitlines() == ['{"json": {"ok": true}}', str(observation), "benchmark-task-123"]
     assert reporter.events == [("begin", None), ("end", None)] * 2
 
 

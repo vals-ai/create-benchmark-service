@@ -288,17 +288,22 @@ itself with the Python subreaper. An episode stop waits for that owner to drain 
 descendants and publish a numeric status; a missing status after launch is not confirmation.
 Native Daytona cgroup episodes run inside a dedicated cgroup v2 subgroup. Tracker runs the
 benchmark-owned `episode.command` in place of the agent command and writes the selected agent
-bundle to
-`$VALKYRIE_STAGE_DIR/agent.json` after setup: `run_cmd`, `continue_cmd`, `interrupt_grace_seconds`,
-`container_name`, `final_output`, `parallel_agents`, and `slots_root`. The library owns a single `StageReporter`
-and starts each selected-agent turn in a new process group. The bundle renders `{problem_statement_path}` to that turn's
-observation file and `{slot_dir}` to `<slots_root>/<slot>/agent`. A configured `container_name` requires
-`parallel_agents=1`; `{container_name}` is bound to that template with `{slot}` filled first. Otherwise
-it remains literal in the command. Other unbound tokens also remain literal.
+bundle to `$VALKYRIE_STAGE_DIR/agent.json` after setup. Its required keys are `run_cmd`,
+`continue_cmd`, `command_bindings`, `interrupt_grace_seconds`, `container_name`,
+`final_output`, `parallel_agents`, and `slots_root`. Tracker owns the raw run and
+continue command templates and the `command_bindings` map of validated contract kwargs
+plus the actual task ID. The standalone CBS stage owns turn rendering: it merges the current
+`problem_statement_path` and `slot_dir` (and configured `container_name`) over that
+map, then substitutes matching tokens in the original command template once per turn.
+The library owns a single `StageReporter` and starts each selected-agent turn in a new
+process group. `{problem_statement_path}` is that turn's observation file and `{slot_dir}`
+is `<slots_root>/<slot>/agent`. A configured `container_name` requires
+`parallel_agents=1`; `{container_name}` is bound to that template with `{slot}` filled
+first. Without a configured container, a contract kwarg can still bind that token; otherwise it
+remains literal, as do other unbound tokens.
 The episode orchestrator must be able to write under `slots_root`; when `container_name` is configured, its environment must also provide the `docker` CLI on `PATH` for named-container cleanup.
-Bound token
-replacements insert values opaquely, including any braces they contain. In `final_output`,
-`{slot_dir}` is replaced for each
+Command token replacements insert values opaquely, including any braces they contain; they do
+not shell-escape inserted text. In `final_output`, `{slot_dir}` is replaced for each
 configured path. The orchestrator names slots and shares one workspace and budget across
 multiple slots; each slot has separate
 runtime/session/output state. More than `parallel_agents` live turns are refused. A second turn on a slot requires

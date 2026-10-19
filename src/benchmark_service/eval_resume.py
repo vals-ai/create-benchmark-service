@@ -39,7 +39,6 @@ import json
 import os
 import re
 from collections.abc import Mapping
-from functools import partial
 from typing import Any, Literal, NotRequired, Protocol, TypedDict, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -201,16 +200,18 @@ class EvalResumeStore:
             judge_identity=judge_identity,
         )
         bucket = self._bucket()
-        client = self._client()
-        await run_blocking(
-            partial(
-                client.put_object,
+
+        # The client is built inside the blocking call: its first creation can fetch
+        # role credentials synchronously, which must not stall the event loop.
+        def put() -> None:
+            self._client().put_object(
                 Bucket=bucket,
                 Key=checkpoint.s3_key,
                 Body=content,
                 ContentType=self.content_type,
             )
-        )
+
+        await run_blocking(put)
         return checkpoint
 
     async def load(
@@ -266,12 +267,12 @@ class EvalResumeStore:
 
     async def _get(self, key: str, expected_size: int) -> bytes:
         bucket = self._bucket()
-        client = self._client()
 
-        # Get, read and close run in one blocking call, so a cancelled caller cannot
-        # drop the response before its body is closed.
+        # Client creation, get, read and close run in one blocking call: creating the
+        # client can fetch credentials synchronously, and a cancelled caller cannot drop
+        # the response before its body is closed.
         def get() -> bytes:
-            response = client.get_object(Bucket=bucket, Key=key)
+            response = self._client().get_object(Bucket=bucket, Key=key)
             body = response["Body"]
             try:
                 declared = response.get("ContentLength")

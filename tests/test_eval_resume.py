@@ -287,7 +287,10 @@ async def test_org_style_ids_round_trip_under_a_digest_key(store: EvalResumeStor
 
     digest = hashlib.sha256(task_id.encode()).hexdigest()[:32]
     assert checkpoint.task_id == task_id and checkpoint.dataset == dataset
-    assert checkpoint.s3_key == f"snap/eval-resume/{TENANT}/{RUN_ID}/{digest}/{_binding(task_id, dataset)}/{checkpoint.sha256}"
+    assert (
+        checkpoint.s3_key
+        == f"snap/eval-resume/{TENANT}/{RUN_ID}/{digest}/{_binding(task_id, dataset)}/{checkpoint.sha256}"
+    )
     state = checkpoint.model_dump(mode="json")
     assert await store.load(state, task_id=task_id, dataset=dataset, judge_identity=JUDGE) == b"archive"
     with pytest.raises(EvalResumeError, match="does not match"):

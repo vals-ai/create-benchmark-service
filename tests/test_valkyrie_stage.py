@@ -655,10 +655,10 @@ def test_stop_returns_current_turn_without_consuming_older_completion(
         continue_cmd=command,
         interrupt_grace_seconds=1.0 if mode == "grace_exhausted" else None,
     )
-    worker.start("one", "observation")
-    _wait_for_root_exit(worker)
-    worker.start("one", "observation")
     try:
+        worker.start("one", "observation")
+        _wait_for_root_exit(worker)
+        worker.start("one", "observation")
         if mode != "exited":
             deadline = time.monotonic() + 5
             while not ready.exists():
@@ -687,26 +687,34 @@ def test_stop_returns_current_turn_without_consuming_older_completion(
 
 def test_stop_selects_current_turn_when_outcomes_are_equal(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     worker, _ = agents(tmp_path, monkeypatch, run_cmd="exit 11", continue_cmd="exit 11")
-    worker.start("one", "observation")
-    _wait_for_root_exit(worker)
-    worker.start("one", "observation")
-    older = worker._finished[0]
-    _wait_for_root_exit(worker)
-    current = worker.stop("one")
-    assert current == older
-    assert current is not older
-    assert worker.wait_any() is older
+    try:
+        worker.start("one", "observation")
+        _wait_for_root_exit(worker)
+        worker.start("one", "observation")
+        older = worker._finished[0]
+        _wait_for_root_exit(worker)
+        current = worker.stop("one")
+        assert current == older
+        assert current is not older
+        assert worker.wait_any() is older
+    finally:
+        if "one" in worker._active:
+            worker.stop("one")
 
 
 def test_stop_of_inactive_slot_preserves_fifo(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     worker, _ = agents(tmp_path, monkeypatch, run_cmd="exit 11", continue_cmd="exit 22")
-    worker.start("one", "observation")
-    _wait_for_root_exit(worker)
-    worker.start("one", "observation")
-    _wait_for_root_exit(worker)
-    worker._collect()
-    assert worker.stop("one") == valkyrie_stage.SlotResult("one", "exited", 11)
-    assert worker.wait_any() == valkyrie_stage.SlotResult("one", "exited", 22)
+    try:
+        worker.start("one", "observation")
+        _wait_for_root_exit(worker)
+        worker.start("one", "observation")
+        _wait_for_root_exit(worker)
+        worker._collect()
+        assert worker.stop("one") == valkyrie_stage.SlotResult("one", "exited", 11)
+        assert worker.wait_any() == valkyrie_stage.SlotResult("one", "exited", 22)
+    finally:
+        if "one" in worker._active:
+            worker.stop("one")
 
 
 def test_start_exhausts_active_group_when_marker_arrives_after_collection(

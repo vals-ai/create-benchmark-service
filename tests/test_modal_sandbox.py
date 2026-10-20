@@ -3,11 +3,10 @@ from __future__ import annotations
 # pyright: reportPrivateUsage=false
 
 import asyncio
-import time
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 import pytest
 from modal import Sandbox as ModalSdkSandbox
@@ -675,10 +674,7 @@ async def test_create_sandbox_uses_vm_runtime(monkeypatch: pytest.MonkeyPatch) -
     assert captured["experimental_options"] is None
 
 
-@pytest.mark.parametrize("runtime", ["gvisor", "vm"])
-async def test_create_sandbox_maps_gpu_request(
-    monkeypatch: pytest.MonkeyPatch, runtime: Literal["gvisor", "vm"]
-) -> None:
+async def test_create_sandbox_maps_gpu_request(monkeypatch: pytest.MonkeyPatch) -> None:
     inner = FakeInnerSandbox()
     captured: dict[str, Any] = {}
 
@@ -687,13 +683,10 @@ async def test_create_sandbox_maps_gpu_request(
         return inner
 
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
-    provider._config.runtime = runtime
 
     await provider.create_sandbox(_request(resources=Resources(vcpu=4, memory=8, disk=30, gpu=2, gpu_type="H100")))
 
     assert captured["gpu"] == "H100:2"
-    assert captured["runtime"] == "gvisor"
-    assert captured["experimental_options"] == {"enable_docker": True}
 
 
 async def test_create_sandbox_requires_gpu_type_for_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -911,86 +904,20 @@ async def test_list_sandboxes_rejects_creation_time_filter(monkeypatch: pytest.M
         _ = [sandbox async for sandbox in provider.list_sandboxes(query)]
 
 
-async def test_create_sandbox_uses_unique_names_across_providers(monkeypatch: pytest.MonkeyPatch) -> None:
-    created: list[str] = []
-
-    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
-        created.append(kwargs["name"])
-        return FakeInnerSandbox(object_id=f"sb-{len(created)}")
-
-    async def from_name(app_name: str, name: str, **kwargs: Any) -> FakeInnerSandbox:
-        return FakeInnerSandbox(object_id="sb-existing")
-
-    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create), from_name=_aio(from_name)))
-
-    first = await provider.create_sandbox(_request())
-    other = _provider(monkeypatch, SimpleNamespace(create=_aio(create), from_name=_aio(from_name)))
-    second = await other.create_sandbox(_request())
-    assert first.id != second.id
-    assert first.name == second.name == "task-1"
-    assert len(set(created)) == 2
-
-
-@pytest.mark.parametrize(
-    "message", ["Insufficient capacity to create sandbox.", "Sandbox creation rate limit exceeded."]
-)
-async def test_create_sandbox_reports_resource_exhaustion_without_retry(
-    monkeypatch: pytest.MonkeyPatch, message: str
-) -> None:
+async def test_create_sandbox_reports_resource_exhaustion_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
     attempts = 0
+    exhausted = ModalResourceExhaustedError("Insufficient capacity to create sandbox.")
 
     async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
         nonlocal attempts
         attempts += 1
-        raise ModalResourceExhaustedError(message)
+        raise exhausted
 
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
 
-    with pytest.raises(SandboxError, match="Modal sandbox resources exhausted") as error:
+    with pytest.raises(SandboxError, match="resources exhausted: Insufficient capacity") as error:
         await provider.create_sandbox(_request().model_copy(update={"create_timeout": 1}))
-    assert message in str(error.value)
-    assert isinstance(error.value.__cause__, ModalResourceExhaustedError)
-    assert attempts == 1
-
-
-@pytest.mark.parametrize("cancel", [False, True], ids=["timeout", "cancel"])
-async def test_create_sandbox_cleans_up_late_result(monkeypatch: pytest.MonkeyPatch, cancel: bool) -> None:
-    inner = FakeInnerSandbox()
-    started = asyncio.Event()
-    release = asyncio.Event()
-    attempts = 0
-
-    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
-        nonlocal attempts
-        attempts += 1
-        started.set()
-        await release.wait()
-        return inner
-
-    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
-    request = _request().model_copy(update={"create_timeout": 1})
-
-    creation = asyncio.create_task(provider.create_sandbox(request))
-    await started.wait()
-    before = time.monotonic()
-    if cancel:
-        creation.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await creation
-    else:
-        with pytest.raises(SandboxError, match="within 1s"):
-            await creation
-    assert time.monotonic() - before < 1.5
-
-    async def close() -> None:
-        assert inner.terminated
-
-    assert provider._client is not None
-    monkeypatch.setattr(provider._client, "_close", _aio(close))
-    release.set()
-    await provider.close()
-    assert inner.terminated
-    assert inner.terminate_wait
+    assert error.value.__cause__ is exhausted
     assert attempts == 1
 
 

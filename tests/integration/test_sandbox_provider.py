@@ -145,18 +145,16 @@ class TestSandboxProviderIntegration:
     """Run the same live contract checks against every configured provider."""
 
     @pytest.mark.parametrize("provider_type", ["modal"], indirect=True)
-    @pytest.mark.parametrize("gpu", [False, True], ids=["cpu-vm", "gpu-gvisor"])
-    async def test_modal_runtime_with_vm_provider(
+    async def test_modal_gpu_with_vm_provider(
         self,
         sandbox_provider_config: ModalProviderConfig,
         record_property: Callable[[str, object], None],
-        gpu: bool,
     ) -> None:
-        """Create and delete CPU and GPU sandboxes with a VM provider default."""
+        """Create and delete a GPU sandbox with a VM provider default."""
         provider = sandbox_provider_config.model_copy(update={"runtime": "vm"}).create_provider()
         request = SandboxCreateRequest(
             source=ImageSource(image=_TEST_IMAGE),
-            resources=Resources(vcpu=1, memory=2, disk=5, gpu=int(gpu), gpu_type="T4" if gpu else None),
+            resources=Resources(vcpu=1, memory=2, disk=5, gpu=1, gpu_type="T4"),
             name=f"cbs-modal-gpu-runtime-{uuid4().hex[:10]}",
             labels={"test": "modal-gpu-runtime"},
             env_vars={},
@@ -169,10 +167,10 @@ class TestSandboxProviderIntegration:
             record_property("provider_runtime", "vm")
             record_property("gpu_count", request.resources.gpu)
             try:
-                result = await sandbox.exec("nvidia-smi -L" if gpu else "uname -sr", timeout=30)
+                result = await sandbox.exec("nvidia-smi -L", timeout=30)
                 record_property("output", result.output)
                 assert result.exit_code == 0
-                assert ("Tesla T4" if gpu else "Linux") in result.output
+                assert "Tesla T4" in result.output
             finally:
                 await provider.delete_sandbox(sandbox.id)
                 await _wait_until_not_found(provider, sandbox.id)

@@ -5929,7 +5929,21 @@ async def test_daytona_unconfirmed_group_removal_reports_error() -> None:
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
 async def test_daytona_output_consumer_waits_for_confirmed_group_stop() -> None:
-    process = CgroupProcess()
+    class OpenReaderProcess(CgroupProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.allow_follow_close = asyncio.Event()
+
+        async def get_session_command_logs_async(
+            self, session_id: str, command_id: str,
+            on_stdout: Callable[[str], Awaitable[None]],
+            on_stderr: Callable[[str], Awaitable[None]],
+        ) -> None:
+            await on_stdout(self.stdout)
+            await on_stderr(self.stderr)
+            await self.allow_follow_close.wait()
+
+    process = OpenReaderProcess()
     process.allow_creation.set()
     workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
     stream = workload.output()
@@ -5942,6 +5956,7 @@ async def test_daytona_output_consumer_waits_for_confirmed_group_stop() -> None:
 
     process.allow_removal.set()
     await asyncio.wait_for(killing, 2)
+    process.allow_follow_close.set()
     with pytest.raises(StopAsyncIteration):
         await asyncio.wait_for(pending_output, 2)
     await stream.aclose()

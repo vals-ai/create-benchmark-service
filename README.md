@@ -355,17 +355,18 @@ The caller still owns the deadline and explicit stop. The probe
 requires writable cgroup v2 delegation with `cgroup.kill`; other sandbox services
 remain outside the subgroup.
 
-Launch setup is a one-shot phase, separate from repeated observation. Completion
-and stop handling run independently of the log watcher. `wait()` and `kill()` share
-session cleanup, which waits for the launch attempt to settle before deleting the
-session and confirming absence. A prompt watcher failure does not cancel cleanup;
+Launch setup is a one-shot phase, separate from repeated observation. Creation
+of the UUID-owned cgroup tolerates a lost toolbox reply on retry without
+replaying the native workload. Completion and stop handling run independently
+of the log watcher. `wait()` and `kill()` share session cleanup, which waits
+for the launch attempt to settle before deleting the session and confirming
+absence. A prompt watcher failure does not cancel cleanup;
 `kill()` still waits for stop and absence confirmation.
 A completed failed session close may be retried by `kill()` but still requires fresh
 absence confirmation, without replaying the command, recovering its result, or
 extending the caller's deadline.
 
-See the [Daytona reconnect diagram](docs/diagrams/daytona-reconnect.png)
-([editable Excalidraw source](docs/diagrams/daytona-reconnect.excalidraw)).
+See the [Daytona reconnect diagram](docs/diagrams/daytona-reconnect.png).
 
 `ComposeSandbox` supports `linux_process_group` v1 (`LINUX_PROCESS_GROUP_V1`).
 It pins the running service container, starts the command in a new process group inside

@@ -1488,7 +1488,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
 
     async def _launch(self) -> str:
         try:
-            created = await self._control_exec(f"mkdir {shlex.quote(self._group)}")
+            created = await self._control_exec(f"mkdir -p {shlex.quote(self._group)}")
             if created.exit_code != 0:
                 raise SandboxError(f"Daytona controlled cgroup creation failed: {self._group}: {created.output}")
             self._group_created = True

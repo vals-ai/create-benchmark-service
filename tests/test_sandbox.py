@@ -4904,7 +4904,7 @@ class CgroupProcess(Process):
 
     async def exec(self, command: str) -> SimpleNamespace:
         command = _unwrap_shell_command(command)
-        if command.startswith("mkdir /sys/fs/cgroup/cbs-"):
+        if command.startswith("mkdir -p /sys/fs/cgroup/cbs-"):
             await self.allow_creation.wait()
             self.group_exists = True
             return SimpleNamespace(exit_code=0, result="")
@@ -5391,8 +5391,8 @@ class LocalNativeShellCgroupProcess(CgroupProcess):
         if plain == f"mkdir -p {daytona_module._STATUS_DIR}":  # pyright: ignore[reportPrivateUsage]
             self.status.mkdir()
             return SimpleNamespace(exit_code=0, result="")
-        if plain.startswith("mkdir /sys/fs/cgroup/cbs-"):
-            self.remote_group = plain.removeprefix("mkdir ")
+        if plain.startswith("mkdir -p /sys/fs/cgroup/cbs-"):
+            self.remote_group = plain.removeprefix("mkdir -p ")
             self.group.mkdir()
             (self.group / "cgroup.procs").touch()
             self.group_exists = True
@@ -6163,6 +6163,49 @@ async def test_daytona_lost_launch_reply_does_not_resend() -> None:
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
+async def test_daytona_lost_cgroup_mkdir_reply_replays_owned_creation(tmp_path: Path) -> None:
+    class LostMkdirReplyProcess(CgroupProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.mkdir_calls = 0
+            self.local_group = tmp_path / "owned-group"
+            self.allow_creation.set()
+            self.allow_removal.set()
+
+        async def exec(self, command: str) -> SimpleNamespace:
+            plain = _unwrap_shell_command(command)
+            if plain.startswith("mkdir ") and "/sys/fs/cgroup/cbs-" in plain:
+                self.mkdir_calls += 1
+                remote_group = shlex.split(plain)[-1]
+                local_command = plain.replace(remote_group, shlex.quote(str(self.local_group)))
+                mkdir = await asyncio.create_subprocess_exec(
+                    "/bin/sh", "-c", local_command,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                )
+                output, _ = await mkdir.communicate()
+                self.group_exists = self.local_group.exists()
+                if self.mkdir_calls == 1:
+                    assert mkdir.returncode == 0
+                    raise DaytonaConnectionError("mkdir reply lost after creation")
+                return SimpleNamespace(exit_code=mkdir.returncode, result=output.decode())
+            return await super().exec(command)
+
+        async def execute_session_command(self, session_id: str, req: Any) -> SimpleNamespace:
+            response = await super().execute_session_command(session_id, req)
+            self.user_finished.set()
+            return response
+
+    process = LostMkdirReplyProcess()
+    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
+    completed = await asyncio.wait_for(workload.wait(), 12)
+    assert completed.result.exit_code == 7
+    assert process.mkdir_calls == 2
+    assert process.execute_calls == 1
+    assert not process.group_exists
+    assert process.sessions == set()
+
+
+@pytest.mark.usefixtures("_fake_cgroup_follow")
 async def test_daytona_confirmed_sandbox_loss_surfaces_not_found() -> None:
     class LostSandboxProcess(CgroupProcess):
         async def get_session_command_logs_async(
@@ -6315,8 +6358,8 @@ class NestedCgroupProcess(CgroupProcess):
 
     async def exec(self, command: str) -> SimpleNamespace:
         plain = _unwrap_shell_command(command)
-        if plain.startswith("mkdir /sys/fs/cgroup/cbs-"):
-            self.group_name = plain.removeprefix("mkdir ")
+        if plain.startswith("mkdir -p /sys/fs/cgroup/cbs-"):
+            self.group_name = plain.removeprefix("mkdir -p ")
             for directory in (self.root, self.root / ".hidden", self.root / ".hidden" / "nested"):
                 directory.mkdir()
                 (directory / "cgroup.events").write_text("populated 0\n")

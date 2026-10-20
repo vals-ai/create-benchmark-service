@@ -191,7 +191,9 @@ Provider compatibility notes:
 - GPUs are requested via `Resources.gpu` (count) and `Resources.gpu_type`. Modal requires `gpu_type` (any Modal GPU name, e.g. `H100`, `A100-80GB`, `T4`) and passes `"<type>:<count>"` to the sandbox. Daytona accepts a count with an optional type restricted to its `GpuType` enum (`H100`, `H200`, `RTX-PRO-6000`, `RTX-4090`, `RTX-5090`); GPU requests are rejected for Daytona snapshot sandboxes because snapshot resources are fixed at snapshot creation.
 - Modal GPU requests always use `gvisor`, because Modal does not support GPUs on `vm`. CPU requests use the configured runtime.
 - Nested Docker (Docker-in-Docker) capability is granted on every sandbox for Daytona and Modal — Daytona supports it natively and the Modal adapter requests it unconditionally — so benchmarks never configure it. The benchmark service owns the Docker-capable image, dockerd startup flags, compose workflow, and cleanup.
-- Transient Modal connection errors are retried up to three attempts, matching the Daytona adapter's provider-level retry shape. Non-transient command failures still surface as `SandboxCommandError` with the command exit code.
+- Transient Modal lookup, execution, and deletion connection errors are retried up to three attempts. Non-transient command failures still surface as `SandboxCommandError` with the command exit code.
+- Modal creation uses one SDK call, with the SDK's transport retries. Resource exhaustion can mean quota, capacity, or placement failure. The adapter reports `SandboxError` without starting another create call. `create_timeout` bounds the wait for that SDK call. If creation returns after timeout or cancellation, the adapter terminates that sandbox. `close()` waits for this cleanup before closing the client and reports cleanup failures.
+- Each Modal create call uses a unique allocation name. The returned wrapper keeps the requested name. Resume with `get_sandbox(id)`; create does not recover a sandbox by name. This prevents late cleanup from deleting another attempt's sandbox.
 
 ### Local Docker sandboxes
 
@@ -336,7 +338,7 @@ and proc visibility before launch.
 
 Native Modal and local Docker also advertise `linux_process_group` v1, probe the same group
 boundary, and run controlled commands through their own provider process transports. Stop
-targets the workload group, not the reusable Modal sandbox (including the selected VM runtime)
+targets the workload group, not the enclosing Modal sandbox (including the selected VM runtime)
 or local Docker task container. For ordinary controlled commands, confirmation covers live
 members of the marked process group in the same PID namespace, not independently detached
 processes. Docker-daemon-owned descendants remain outside that boundary.

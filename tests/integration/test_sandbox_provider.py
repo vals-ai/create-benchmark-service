@@ -10,11 +10,12 @@ import shlex
 import time
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
-from typing import cast
+from typing import Any, cast
 from uuid import uuid4
 
 import pytest
 from daytona import CreateSecretParams
+from modal import Sandbox as ModalSdkSandbox
 
 from benchmark_service import (
     ImageSource,
@@ -22,6 +23,7 @@ from benchmark_service import (
     Sandbox,
     SandboxCommandError,
     SandboxCreateRequest,
+    SandboxError,
     SandboxNotFoundError,
     SandboxProvider,
     SandboxQuery,
@@ -177,6 +179,90 @@ class TestSandboxProviderIntegration:
                 record_property("cleanup", "sandbox not found")
         finally:
             await provider.close()
+
+    @pytest.mark.parametrize("provider_type", ["modal"], indirect=True)
+    @pytest.mark.parametrize("cancel", [False, True], ids=["timeout", "cancel"])
+    async def test_modal_cleans_up_delayed_create(
+        self,
+        sandbox_provider_config: ModalProviderConfig,
+        monkeypatch: pytest.MonkeyPatch,
+        record_property: Callable[[str, object], None],
+        cancel: bool,
+    ) -> None:
+        """Verify late cleanup cannot delete another provider's retry."""
+        provider = sandbox_provider_config.create_provider()
+        retry_provider = sandbox_provider_config.create_provider()
+        retries: list[Sandbox] = []
+        native_create = cast(Callable[..., Awaitable[ModalSdkSandbox]], ModalSdkSandbox.create.aio)  # pyright: ignore[reportUnknownMemberType]
+        started = asyncio.Event()
+        allocated = asyncio.Event()
+        release = asyncio.Event()
+        sandboxes: list[ModalSdkSandbox] = []
+
+        async def delayed_create(**kwargs: Any) -> ModalSdkSandbox:
+            first = not started.is_set()
+            started.set()
+            sandbox = await native_create(**kwargs)
+            if first:
+                sandboxes.append(sandbox)
+                allocated.set()
+                await release.wait()
+            return sandbox
+
+        monkeypatch.setattr(ModalSdkSandbox.create, "aio", delayed_create)
+        request = SandboxCreateRequest(
+            source=ImageSource(image=_TEST_IMAGE),
+            resources=_TEST_RESOURCES,
+            name=f"cbs-modal-create-cleanup-{uuid4().hex[:10]}",
+            labels={"test": "modal-create-cleanup"},
+            env_vars={},
+            auto_stop_interval=5,
+            create_timeout=1,
+        )
+        creation = asyncio.create_task(provider.create_sandbox(request))
+        try:
+            await asyncio.wait_for(started.wait(), timeout=30)
+            before = time.monotonic()
+            if cancel:
+                creation.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await creation
+            else:
+                with pytest.raises(SandboxError, match="within 1s"):
+                    await creation
+            elapsed = time.monotonic() - before
+            record_property("caller_wait_seconds", elapsed)
+            assert elapsed < 2
+            await asyncio.wait_for(allocated.wait(), timeout=120)
+            retry = await retry_provider.create_sandbox(request.model_copy(update={"create_timeout": 120}))
+            retries.append(retry)
+            release.set()
+            await provider.close()
+            assert len(sandboxes) == 1
+            original_id = sandboxes[0].object_id
+            record_property("sandbox_id", original_id)
+            record_property("retry_sandbox_id", retry.id)
+            assert retry.id != original_id
+            await _wait_until_not_found(retry_provider, original_id)
+            result = await retry.exec("echo retry-alive", timeout=30)
+            assert result.exit_code == 0
+            assert result.output.strip() == "retry-alive"
+            record_property("cleanup", "original absent; retry still running")
+        finally:
+            release.set()
+            if not creation.done():
+                creation.cancel()
+                await asyncio.gather(creation, return_exceptions=True)
+            try:
+                await provider.close()
+            finally:
+                try:
+                    for retry in retries:
+                        await retry_provider.delete_sandbox(retry.id)
+                        await _wait_until_not_found(retry_provider, retry.id)
+                        record_property("retry_cleanup", "sandbox not found")
+                finally:
+                    await retry_provider.close()
 
     @pytest.mark.parametrize("provider_type", ["daytona"], indirect=True)
     async def test_daytona_inventory_metadata_and_filtering(

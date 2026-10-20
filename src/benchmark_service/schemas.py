@@ -49,6 +49,12 @@ class ResolveDatasetResponse(BaseModel):
     version: DatasetVersion
 
 
+class ListDatasetsResponse(BaseModel):
+    """Dataset names visible to the caller, without task content."""
+
+    datasets: list[str]
+
+
 class StreamDatasetVersionChunk(BaseModel):
     """Framework acknowledgement sent before a pinned operation starts."""
 
@@ -248,6 +254,14 @@ class RetrieveTaskResponse(BaseModel):
     eval_sandbox: EvalSandboxSpec | None = Field(
         default=None, description="Grading-sandbox overrides for eval_mode == SANDBOX; None uses generation values"
     )
+    resume_sandbox: EvalSandboxSpec | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description=(
+            "Opt in to a caller-owned sandbox for durable evaluation resume; "
+            "the caller admits, provisions, and cleans up the sandbox"
+        ),
+    )
 
     @computed_field(description="Legacy sandbox image field for older Valkyrie clients")
     @property
@@ -286,7 +300,7 @@ class SetupTaskResponse(BaseModel):
 
 class EvaluateResponseRequest(BaseModel):
     """
-    Request to evaluate without a live sandbox.
+    Evaluate a response or resume state, optionally in a caller-owned sandbox.
 
     Use this for benchmarks where evaluation can run from a text response or
     benchmark-owned durable resume state.
@@ -299,7 +313,13 @@ class EvaluateResponseRequest(BaseModel):
     )
     sandbox_provider: SandboxProviderConfig | None = Field(
         default=None,
-        description="Request-scoped sandbox provider config for evaluation work that creates a sandbox",
+        description="Request-scoped provider config for evaluation work that uses a sandbox",
+    )
+    instance_id: str | None = Field(
+        default=None,
+        min_length=1,
+        exclude_if=lambda value: value is None,
+        description="Caller-owned sandbox for eval_resume_state; the service must not delete it",
     )
     dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
 
@@ -307,6 +327,10 @@ class EvaluateResponseRequest(BaseModel):
     def require_one_eval_input(self) -> "EvaluateResponseRequest":
         if (self.response is None) == (self.eval_resume_state is None):
             raise ValueError("Exactly one of response or eval_resume_state is required")
+
+        if self.instance_id is not None and self.eval_resume_state is None:
+            raise ValueError("A caller-owned sandbox requires eval_resume_state")
+
         return self
 
 

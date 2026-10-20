@@ -55,15 +55,15 @@ def test_presigned_put_url_uses_configured_bucket_and_key(monkeypatch: pytest.Mo
     monkeypatch.setenv("AWS_REGION", "us-east-1")
     captured: dict[str, object] = {}
 
-    class _FakeS3:
+    class _PresignedPutS3:
         def generate_presigned_url(self, op: str, *, Params: dict[str, str], ExpiresIn: int) -> str:
             captured.update(op=op, Params=Params, ExpiresIn=ExpiresIn)
             return "https://signed.example/put"
 
-    def fake_client(service: str, **kwargs: object) -> _FakeS3:
+    def fake_client(service: str, **kwargs: object) -> _PresignedPutS3:
         assert service == "s3"
         captured.update(client_kwargs=kwargs)
-        return _FakeS3()
+        return _PresignedPutS3()
 
     monkeypatch.setattr(boto3, "client", fake_client)
     url = submission_artifacts.presigned_put_url("submission-artifacts/run-1/task-9/submission.xlsx")

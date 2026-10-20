@@ -93,6 +93,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 **Built-in methods:**
 
 - `get_dataset(dataset)` — return the task dictionary for a given dataset name (defaults to `"default"`)
+- `list_datasets()` — return available dataset names; defaults to the keys of `self.datasets`. Override for dynamically discovered datasets. The HTTP endpoint applies `check_dataset_access` to each name.
 - `filter_tasks(task_filter, dataset)` — return task IDs matching a list or Python slice notation (e.g. `"0:10:2"`)
 - `validate_task_ids(task_ids, dataset)` — raise `ValueError` if any ID is not in the dataset
 - `list_tasks(dataset)` — return `list[V1Task]` (id, question, timeout) for the Vals app's `GET /v1/datasets/{dataset}/tasks` endpoint. Must be overridden before exposing task listing; the base implementation fails closed to avoid leaking evaluator-only data.
@@ -115,11 +116,21 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 |--------|------|-------------|
 | `GET` | `/health` | Returns `{"status": "ok"}` |
 | `GET` | `/version` | Returns framework, service, and dataset versions plus the benchmark's `eval_mode` |
+| `GET` | `/v1/datasets` | Returns `{"datasets": ["default", "validation"]}` with the caller's accessible dataset names |
 | `POST` | `/resolve-dataset` | Resolves a dataset default or fixed release to an immutable version ID |
 | `GET` | `/verify-task-ids` | Return task IDs filtered by `?task_ids=…` or `?slice=start:stop:step` (optional `?dataset=…`) |
 | `GET` | `/retrieve-task/?task_id=…` | Return task metadata for a given task ID (optional `?dataset=…`) |
 | `POST` | `/evaluate-response/` | Evaluate without a sandbox and return one final response |
 | `POST` | `/final-score/` | Aggregate results: `{"evaluation_results": {task_id: result, …}, "dataset": "…"}` |
+
+Dataset discovery returns sorted, unique names without task IDs, task content, or evaluation calls. It uses the service's normal authentication and dataset access hooks; Vals trial tenants may list their permitted datasets too. An authenticated tenant with no matching datasets receives an empty list. Discovery is service-wide metadata, so it does not select or acknowledge a dataset version, even on a version-pinned client.
+
+```python
+async with BenchmarkServiceClient(service_url, headers=auth_headers) as client:
+    names = (await client.list_datasets()).datasets
+```
+
+Services must upgrade to a framework release containing `/v1/datasets` before clients can discover their names. Older services return 404, which the client exposes as `BenchmarkServiceError` rather than an empty inventory.
 
 **WebSocket endpoints** (stream `StreamChunk` JSON objects):
 
@@ -129,7 +140,22 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | `/ws/evaluate-response` | Evaluate without a sandbox; streams progress, checkpoint state, errors, and a final result |
 | `/ws/evaluate-instance` | Evaluate a live sandbox solution; streams progress, errors, and a final result |
 
-Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` config so one hosted service can use different sandbox providers per request. Eval-only retry uses `/ws/evaluate-response` with `{"task_id": "…", "eval_resume_state": {...}, "sandbox_provider": {...}, "dataset": "…"}`. The provider config is optional because many benchmarks resume without a sandbox; include it when the benchmark must create one for evaluation. It is request-only and must not be embedded in persisted `eval_resume_state`.
+Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` config so one hosted service can use different sandbox providers per request. Eval-only retry uses `/ws/evaluate-response` with `{"task_id": "…", "eval_resume_state": {...}, "sandbox_provider": {...}, "dataset": "…"}`. The provider config is optional because many benchmarks resume without a sandbox. It is request-only and must not be embedded in persisted `eval_resume_state`.
+
+A benchmark can set `RetrieveTaskResponse.resume_sandbox` to an `EvalSandboxSpec`
+when resumed grading needs a caller-owned sandbox. The caller uses its existing
+capacity controls to provision the declared source and resources, then passes
+`instance_id` to `BenchmarkServiceClient.resume_evaluation`. Unset source and
+resource fields use the task's values. The caller owns cleanup. The service
+borrows the supplied sandbox and must not create a replacement or delete it.
+Services that require this mode must reject a resume without an instance ID.
+
+`instance_id` is accepted only with `eval_resume_state`, over both HTTP and
+WebSocket evaluation-response routes. Keep it outside saved checkpoint state:
+a later retry can use the same checkpoint in a different sandbox. The optional
+fields are omitted from serialized requests and metadata when unset, preserving
+the existing sandbox-free resume path. This framework contract does not itself
+allocate capacity or enforce a caller's scheduling policy.
 
 #### Sandbox providers
 
@@ -146,17 +172,21 @@ When a setup or evaluate-instance request omits `sandbox_provider`, the Daytona 
 Providing the organization ID enables organization-scoped capacity admission; omitting it preserves direct creation.
 `SandboxProvider.get_capacity_domains()` reports Daytona CPU, memory, disk, and aggregate GPU usage plus allowed GPU
 types separately for every canonical target and sandbox class; `get_capacity()` retains its configured-target container
-view. Capacity is observational and is not reserved. The API key must be able to read organization usage. Targeted snapshot admission also requires
-snapshot-read access.
-When the target is a region name instead of its ID, the key must be able to list regions so admission can resolve
-the canonical ID.
+view. Capacity is observational and is not reserved. Daytona's `reservable_demand()` returns a frozen
+`SandboxReservationDemand` containing the canonical `target_id`, `sandbox_class`, and CPU, memory, disk, and GPU quota
+charges. Image demand comes from the creation request; snapshot demand uses its own metadata, including fractional
+amounts. GPU builds charge GPU quota without charging attached CPU, memory, or disk against ordinary compute quota;
+shared GPU targets use `earth`, while dedicated and custom targets retain their region ID. Unreadable metadata raises
+an error rather than substituting requested resources. Providers without this capability raise `NotImplementedError`.
+The API key must be able to read organization usage and list regions to resolve canonical quota domains. Targeted
+snapshot admission and snapshot demand also require snapshot-read access.
 
 Provider compatibility notes:
 
 - `Sandbox.modify_egress_rules(addresses)` applies a non-empty allowlist, `Sandbox.block_all_egress()` denies all outbound access, and `Sandbox.clear_egress_rules()` restores unrestricted access. Deny-all is a separate provider-native operation; do not represent it as `modify_egress_rules([])`. `ComposeSandbox` forwards all three operations to its outer sandbox.
 - `Sandbox.labels` and `Sandbox.created_at` expose provider inventory metadata when available; unsupported metadata is `None`, and creation times are timezone-aware UTC. `SandboxQuery.created_at_lte` is an inclusive creation-time bound. Daytona supports it and always limits listing to the provider's configured target, which may be a Daytona region name or ID. Modal rejects creation-time-bounded listing.
 - Modal supports both `ImageSource` (registry pull) and `SnapshotSource` (a Modal filesystem snapshot created via `Sandbox.snapshot_filesystem()`, restored by image id). `TargetedSnapshotSource` is Daytona-only.
-- Daytona uses `TargetedSnapshotSource(snapshot=..., target=...)` to select the target for admission and creation. Admission uses the snapshot's CPU, memory, disk, and sandbox class with the exact target's organization-usage row; GPU snapshots retain unmetered GPU admission. `docker_image` is invalid on targeted snapshots because that field cannot preserve the target.
+- Daytona uses `TargetedSnapshotSource(snapshot=..., target=...)` to select the target for admission and creation. CPU snapshot admission uses the snapshot's CPU, memory, disk, and sandbox class with the exact target's organization-usage row. GPU snapshot prechecks validate target availability; `reservable_demand()` reports their GPU quota charge. `docker_image` is invalid on targeted snapshots because that field cannot preserve the target.
 - Modal sandboxes do not expose a disk-size parameter; `Resources.disk` is accepted for schema compatibility but not enforced.
 - GPUs are requested via `Resources.gpu` (count) and `Resources.gpu_type`. Modal requires `gpu_type` (any Modal GPU name, e.g. `H100`, `A100-80GB`, `T4`) and passes `"<type>:<count>"` to the sandbox. Daytona accepts a count with an optional type restricted to its `GpuType` enum (`H100`, `H200`, `RTX-PRO-6000`, `RTX-4090`, `RTX-5090`); GPU requests are rejected for Daytona snapshot sandboxes because snapshot resources are fixed at snapshot creation.
 - Nested Docker (Docker-in-Docker) capability is granted on every sandbox for Daytona and Modal — Daytona supports it natively and the Modal adapter requests it unconditionally — so benchmarks never configure it. The benchmark service owns the Docker-capable image, dockerd startup flags, compose workflow, and cleanup.
@@ -340,6 +370,8 @@ Eval-only retry flow:
 3. If evaluation fails after that point, retry calls `/ws/evaluate-response` with the saved state and, when needed, the request-scoped sandbox provider config.
 4. The benchmark service decides what the state means and streams a new result, plus any newer checkpoint state.
 
+When the grading input is the agent's output (a result file, a patch, an archive), `benchmark_service.eval_resume` saves it for you. `EvalResumeStore(bucket_env=..., object_prefix=...)` takes the service's `EvalResumeStorageConfig` from benchmark-services-registry: its `bucket_env`, and its `object_prefix` without the trailing `/*` (`snap/eval-resume/*` becomes `snap/eval-resume`). `save()` writes the bytes to S3 and returns an `EvalResumeCheckpoint` to yield as the state: `{version, benchmark_id, task_id, dataset, s3_key, sha256, size_bytes, grader_identity}`. `load()` returns the bytes on retry after checking size and SHA-256. It raises `EvalResumeIdentityError` when the checkpoint was saved by another tenant or names another task, dataset, or grader than the caller's, and `EvalResumeError` when its `s3_key` is not the key its own fields derive. The object key is `<object_prefix>/<tenant>/<benchmark_id>/<task_id>/<digest of task_id, dataset and grader_identity>/<sha256>`, so a checkpoint edited to claim a different grader or dataset never resolves to the saved bytes. Tenants must match `KEY_SEGMENT_PATTERN`, the rule submission artifacts use. The store reads the caller's authenticated tenant from the request scope (`benchmark_service.context.current_tenant()`, bound by the framework on every evaluation route), so call `save()` and `load()` from inside `evaluate_instance` or `stream_evaluate_response`; outside a request they raise `RuntimeError`. Task and dataset ids may be org-style (`org/name`); a task id that is not a safe path segment is stored under a digest of it in the key. Build `grader_identity` with `grader_identity({...})` from whatever decides the grade: the judge model and rubric revision for a judge, or the test revision, grader image digest and grading-code hash for a deterministic grader, so a retry never grades under a different grader. An empty mapping raises `ValueError`.
+
 ### Streaming protocol
 
 The WebSocket endpoints and generators communicate via four chunk types:
@@ -475,7 +507,7 @@ The service role needs `s3:PutObject` and `s3:GetObject` on `arn:aws:s3:::BUCKET
 
 Status codes: 403 when authentication is required but the caller lacks an allowed tenant identity for the dataset; 404 if access is allowed but the service's `load_datasets()` doesn't load the dataset; 501 if the benchmark has not implemented `list_tasks`. The base `BenchmarkService.list_tasks` does not infer a public task shape from internal task objects because those objects often include evaluator-only data (`answer`, `checks`, rubrics, grader config). Benchmarks must explicitly map their loaded tasks to `V1Task(id, question, timeout, ...)`. `V1Task` allows benchmark-specific extras, so benchmarks that need to surface additional per-task fields (e.g. SWE-bench's `repo`/`base_commit`) can include them when constructing the `V1Task` — document them in your benchmark's README and validate on the runner side with a typed `Task` subclass.
 
-**Trial mode (Vals template only).** A tenant with `trial_mode: true` in its allowlist entry receives score-only responses on `/v1/evaluate` and `/v1/score`. Benchmarks enabling trial mode must implement `project_trial_result(result)` to return the audited per-task fields trial callers may see and resubmit to `/v1/score`; include any field `calculate_final_score` needs for aggregation. The Vals layer removes `evaluator_version` and error text from `/v1/evaluate` (the error *count* survives as generic `"error"` entries), and `/v1/score` `metadata` is emptied while `final_score` and `tasks_evaluated` remain. The sanitizer builds fresh response objects from allowlisted fields, so fields added later do not leak to trial callers by default. Unhandled server errors return a generic `{"detail": "Internal server error"}` 500 (no traceback) for every caller, not just trial tenants. Trial tenants may access only `/resolve-dataset`, `/v1/evaluate`, `/v1/score`, and `GET /v1/datasets/{dataset}/tasks`; other `/v1/*`, internal `/evaluate-response/`, `/final-score/`, and `/ws/*` endpoints are denied (403). For trial tenants, the dataset task list is projected to `id`, `question`, and `timeout` even if the benchmark's normal `V1Task` includes extras.
+**Trial mode (Vals template only).** A tenant with `trial_mode: true` in its allowlist entry receives score-only responses on `/v1/evaluate` and `/v1/score`. Benchmarks enabling trial mode must implement `project_trial_result(result)` to return the audited per-task fields trial callers may see and resubmit to `/v1/score`; include any field `calculate_final_score` needs for aggregation. The Vals layer removes `evaluator_version` and error text from `/v1/evaluate` (the error *count* survives as generic `"error"` entries), and `/v1/score` `metadata` is emptied while `final_score` and `tasks_evaluated` remain. The sanitizer builds fresh response objects from allowlisted fields, so fields added later do not leak to trial callers by default. Unhandled server errors return a generic `{"detail": "Internal server error"}` 500 (no traceback) for every caller, not just trial tenants. Trial tenants may access only `/v1/datasets`, `/resolve-dataset`, `/v1/evaluate`, `/v1/score`, and `GET /v1/datasets/{dataset}/tasks`; other `/v1/*`, internal `/evaluate-response/`, `/final-score/`, and `/ws/*` endpoints are denied (403). For trial tenants, the dataset task list is projected to `id`, `question`, and `timeout` even if the benchmark's normal `V1Task` includes extras.
 
 **Deferred to follow-on plans.** `GET /v1/schema`, `GET /v1/tasks/{task_id}` (single-task lookup), `/ws/v1/evaluate` (streamed judges), async/`poll_url` response shape, idempotency on `(run_id, task_id)`.
 
@@ -510,7 +542,7 @@ result = await client.run_with_sandbox_recovery(
 
 Pydantic models used across requests and responses:
 
-- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, optional `CreditedGeneration(allowance_seconds, stage_protocol)`, `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox`
+- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, optional `CreditedGeneration(allowance_seconds, stage_protocol)`, `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox` and `resume_sandbox`
 - **`GenerationContainment`** — effective-sandbox capability: `linux_cgroup_v2` v1 for direct Daytona or `linux_process_group` v1 for Compose service, native Modal, and local Docker workloads. Tracker probes the effective sandbox for every task before its `ControlledWorkload` and does not fall back to `Sandbox.command()` on unsupported providers.
 - **`agent_install_order`** — `"before_setup"` installs agent dependencies before benchmark setup; `"after_setup"` lets setup prepare the environment first. The default is `"before_setup"`; lifecycle execution is the caller's responsibility.
 - **`BenchmarkEgressPlan`** — declarative `setup_task`, agent `run`, and `evaluation` policies. `"*"` is unrestricted, `[]` is deny-all, and a non-empty list is an allowlist. Setup and evaluation default to `"*"`; `run=None` leaves the benchmark without a run-policy opinion. Applying and composing the plan is the caller's responsibility.
@@ -522,7 +554,7 @@ Pydantic models used across requests and responses:
 - **`Resources`** — `vcpu`, `memory`, `disk`, optional `gpu` (count, default 0) and `gpu_type` (requires `gpu >= 1`)
 - **`VolumeMount`** — named persistent volume, absolute `mount_path`, optional `read_only`, `create_if_missing`, and relative `subpath`; `{run_id}` in a subpath resolves from the sandbox's `run-id` or `run_id` label and fails when that label is absent
 - **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, optional `sandbox_provider` with Daytona header fallback, `dataset`
-- **`EvaluateResponseRequest`** — `task_id`, `response` or `eval_resume_state`, optional `sandbox_provider`, `dataset`
+- **`EvaluateResponseRequest`** — `task_id`, `response` or `eval_resume_state`, optional `sandbox_provider`, optional caller-owned `instance_id` for resume, `dataset`
 - **`FinalScoreResult`** / **`FinalScoreResponse`** — `score` (float), `metadata`, `tasks_evaluated`
 - **`TaskFilter`** — `task_ids` list or `slice_str`; `parse_slice()` converts `"start:stop:step"` to a Python `slice`
 

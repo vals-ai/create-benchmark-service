@@ -561,6 +561,42 @@ async def test_stream_download_yields_chunks() -> None:
     assert chunks == [b"hello", b" world"]
 
 
+class ConnectionLostThenApplyPolicySandbox(FakeInnerSandbox):
+    def __init__(self) -> None:
+        super().__init__()
+        self.policy_attempts = 0
+
+    async def _set_outbound_network_policy(
+        self,
+        *,
+        outbound_cidr_allowlist: list[str] | None = None,
+        outbound_domain_allowlist: list[str] | None = None,
+    ) -> None:
+        self.policy_attempts += 1
+        if self.policy_attempts == 1:
+            raise ModalConnectionError("outbound policy update disconnected")
+        await super()._set_outbound_network_policy(
+            outbound_cidr_allowlist=outbound_cidr_allowlist,
+            outbound_domain_allowlist=outbound_domain_allowlist,
+        )
+
+
+async def test_egress_rule_updates_retry_connection_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A transport failure while setting the outbound policy is retried by the provider."""
+
+    async def _noop(_seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr(cast(Any, modal_module.ModalSandbox._set_outbound_network_policy).retry, "sleep", _noop)
+    inner = ConnectionLostThenApplyPolicySandbox()
+    sandbox = _sandbox(inner)
+
+    await sandbox.block_all_egress()
+
+    assert inner.policy_attempts == 2
+    assert inner.outbound_policies == [{"outbound_cidr_allowlist": [], "outbound_domain_allowlist": []}]
+
+
 async def test_egress_rule_updates_replace_outbound_policy() -> None:
     """Verify Modal egress updates call the SDK outbound policy API.
 
@@ -1015,9 +1051,7 @@ async def test_create_sandbox_mounts_named_volumes(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(modal_module, "Volume", SimpleNamespace(from_name=from_name))
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
 
-    await provider.create_sandbox(
-        _request(volumes=[VolumeMount(name="kspbench-steam", mount_path="/vol")])
-    )
+    await provider.create_sandbox(_request(volumes=[VolumeMount(name="kspbench-steam", mount_path="/vol")]))
 
     assert captured["volumes"] == {"/vol": "vol::kspbench-steam"}
     assert looked_up == [("kspbench-steam", False)]

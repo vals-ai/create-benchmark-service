@@ -19,7 +19,7 @@ from websockets.exceptions import ConnectionClosed
 from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_required
 from benchmark_service.base import BenchmarkService
-from benchmark_service.context import sandbox_provider_scope
+from benchmark_service.context import sandbox_provider_scope, tenant_scope
 from benchmark_service.schemas import (
     DATASET_VERSION_HEADER,
     DatasetVersion,
@@ -29,6 +29,7 @@ from benchmark_service.schemas import (
     FinalScoreRequest,
     FinalScoreResponse,
     HealthCheckResponse,
+    ListDatasetsResponse,
     RetrieveTaskResponse,
     ResolveDatasetRequest,
     ResolveDatasetResponse,
@@ -195,6 +196,7 @@ class BenchmarkServiceApp(FastAPI):
         self.add_exception_handler(Exception, self._exception_handler)
         self.add_api_route("/health", self._health_check, methods=["GET"])
         self.add_api_route("/version", self._version, methods=["GET"])
+        self.add_api_route("/v1/datasets", self._list_datasets, methods=["GET"], response_model=ListDatasetsResponse)
         self.add_api_route("/resolve-dataset", self._resolve_dataset, methods=["POST"])
         self.add_api_route("/verify-task-ids", self._verify_task_ids, methods=["GET"])
         self.add_api_route("/retrieve-task/", self._retrieve_task, methods=["GET"])
@@ -229,6 +231,12 @@ class BenchmarkServiceApp(FastAPI):
             dataset_version=self.service.get_dataset_version(dataset),
             dataset_version_selection=self.service.supports_dataset_version_selection(dataset or "default"),
             eval_mode=self.service.eval_mode,
+        )
+
+    async def _list_datasets(self, request: Request) -> ListDatasetsResponse:
+        names = sorted(set(await self.service.list_datasets()))
+        return ListDatasetsResponse(
+            datasets=[name for name in names if await self.service.check_dataset_access(request.state.tenant, name)]
         )
 
     @asynccontextmanager
@@ -269,7 +277,8 @@ class BenchmarkServiceApp(FastAPI):
                     else:
                         connection.state.dataset_version = resolved
                 entered = True
-                yield
+                with tenant_scope(tenant):
+                    yield
         except HTTPException as exc:
             if isinstance(connection, WebSocket) and exc.status_code == 403:
                 await connection.close(code=1008, reason="Dataset not allowed")

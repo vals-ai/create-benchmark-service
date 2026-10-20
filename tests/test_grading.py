@@ -30,6 +30,7 @@ from benchmark_service import (
 )
 from benchmark_service.vals import auth as auth_module
 from benchmark_service import grading, submission_artifacts
+from benchmark_service.context import current_tenant
 from benchmark_service.vals.app import (
     ValsBenchmarkServiceApp,
     _DuplicateGradingRequest,
@@ -248,6 +249,19 @@ async def test_grade_instance_returns_evaluated_with_passthrough_result() -> Non
     assert resp.task_id == "task-1"
     assert resp.evaluator_version == "stub-1.0"
     assert resp.result == {"resolved": True, "weighted_pass_percentage": 100.0}
+
+
+class TenantStub(SandboxStub):
+    async def evaluate_instance(  # type: ignore[override]
+        self, task_id: str, sandbox: Sandbox, dataset: str | None = None
+    ) -> AsyncGenerator[StreamChunk, None]:
+        yield StreamResultChunk(type="result", data={"tenant": current_tenant()})
+
+
+async def test_grade_instance_binds_the_callers_tenant_for_the_benchmark() -> None:
+    service = await TenantStub.create()
+    resp = await _grade(service, FakeProvider(FakeSandbox()))
+    assert resp.result == {"tenant": "acme"}
 
 
 async def test_grade_instance_creates_isolated_sandbox_from_task_source_and_deletes_it() -> None:

@@ -30,7 +30,7 @@ from typing import Any
 from fastapi.encoders import jsonable_encoder
 
 from benchmark_service.base import BenchmarkService
-from benchmark_service.context import sandbox_provider_scope
+from benchmark_service.context import sandbox_provider_scope, tenant_scope
 from benchmark_service.sandbox import (
     ComposeSource,
     Resources,
@@ -496,7 +496,7 @@ async def evaluate_submission(
     """Evaluate one typed submission per the benchmark's eval mode."""
     # Bound here rather than inside the stream: the stream is finalized through
     # a task, which copies the context, and a token cannot be reset in a copy.
-    with sandbox_provider_scope(provider):
+    with sandbox_provider_scope(provider), tenant_scope(tenant):
         return await _evaluate_submission(
             service=service,
             run_id=run_id,

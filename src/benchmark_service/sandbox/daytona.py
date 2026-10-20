@@ -1026,11 +1026,13 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         self._sandbox_ref = sandbox._sandbox_ref  # pyright: ignore[reportPrivateUsage]
         self._sandbox_error = sandbox._sandbox_error  # pyright: ignore[reportPrivateUsage]
         self._control_exec = sandbox._control_exec  # pyright: ignore[reportPrivateUsage]
+        self._upload_file = sandbox.upload_file
         self._open_pty_session = sandbox._open_pty_session  # pyright: ignore[reportPrivateUsage]
         self._reconnect_pty = sandbox._reconnect_pty  # pyright: ignore[reportPrivateUsage]
         self._session_id = session_id
         ident = session_id.rsplit("-", 1)[-1]
         self._group = f"/sys/fs/cgroup/cbs-{ident}"
+        self._launch_path = f"/tmp/cbs-controlled-{ident}.sh"
         self._complete = f"{_STATUS_DIR}/{ident}.complete"
         self._release = f"{_STATUS_DIR}/{ident}.release"
         # The PTY shell stays outside the child cgroup to report the foreground exit after cleanup.
@@ -1271,6 +1273,15 @@ class _DaytonaControlledWorkload(ControlledWorkload):
             self._append_output(self._decoder.decode(data))
 
         try:
+            launch_command = (
+                f"rm -f {shlex.quote(self._launch_path)} || exit $?; "
+                f"mkdir -p {shlex.quote(_STATUS_DIR)}; {self._command}"
+            )
+            await _bounded(
+                "sandbox.upload_file",
+                self._upload_file(self._launch_path, launch_command.encode()),
+                _TOOLBOX_CALL_TIMEOUT_SECONDS,
+            )
             created = await self._control_exec(f"mkdir {shlex.quote(self._group)}")
             if created.exit_code != 0:
                 raise SandboxError(f"Daytona controlled cgroup creation failed: {self._group}: {created.output}")
@@ -1337,11 +1348,10 @@ class _DaytonaControlledWorkload(ControlledWorkload):
                 break
             if self._close_requested:
                 raise SandboxError("Controlled workload closed before command admission")
-            launch_command = f"mkdir -p {shlex.quote(_STATUS_DIR)}; {self._command}"
             await _bounded(
                 "handle.send_input",
                 handle.send_input(
-                    f"unset {_PTY_CREATE_MARKER_ENV}; exec sh -c {shlex.quote(launch_command)}\n"
+                    f"unset {_PTY_CREATE_MARKER_ENV}; exec sh -c \"$(cat {shlex.quote(self._launch_path)})\"\n"
                 ),
                 _TOOLBOX_CALL_TIMEOUT_SECONDS,
             )

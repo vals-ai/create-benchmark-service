@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import pty
 import shlex
 import signal
 import subprocess
@@ -714,9 +715,15 @@ class StalledDisconnectProcess(BlockingProcess):
 
 
 class Files:
+    def __init__(self) -> None:
+        self.staged: dict[str, bytes] = {}
+
     async def upload_file(self, content: bytes, remote_path: str) -> None:
-        assert content == b"hello world"
-        assert remote_path == "/tmp/result.txt"
+        if remote_path.startswith("/tmp/cbs-controlled-"):
+            self.staged[remote_path] = content
+        else:
+            assert content == b"hello world"
+            assert remote_path == "/tmp/result.txt"
 
     async def download_file_stream(self, remote_path: str) -> Any:
         assert remote_path == "/tmp/result.txt"
@@ -4848,6 +4855,7 @@ class CgroupProcess(Process):
     def __init__(self) -> None:
         super().__init__()
         self.handle: CgroupPtyHandle
+        self.files: Files
         self.group_created = asyncio.Event()
         self.allow_creation = asyncio.Event()
         self.command_admitted = asyncio.Event()
@@ -4933,6 +4941,7 @@ class CgroupPtyHandle(PtyHandle):
 def _cgroup_sandbox(process: CgroupProcess) -> DaytonaSandbox:
     inner = InnerSandbox()
     inner.process = process
+    process.files = inner.fs
     return DaytonaSandbox(cast(Any, inner))
 
 
@@ -5242,6 +5251,7 @@ async def test_daytona_output_consumer_waits_for_confirmed_group_stop() -> None:
 class LocalShellCgroupProcess(CgroupProcess):
     def __init__(self, root: Path) -> None:
         super().__init__()
+        self.root = root
         self.status = root / "status"
         self.workers: list[asyncio.subprocess.Process] = []
         self.group = root / "group"
@@ -5287,7 +5297,15 @@ class LocalShellCgroupPtyHandle(CgroupPtyHandle):
         if data.startswith("stty"):
             await self.emit(self.process.pty_marker.encode() + b"\r\n")
             return
-        local_command = shlex.split(data.removeprefix(f"unset {_PTY_CREATE_MARKER_ENV}; "))[3]
+        local_command = data
+        for remote_path, content in self.process.files.staged.items():
+            local_path = self.process.root / Path(remote_path).name
+            local_path.write_bytes(
+                content.replace(remote_path.encode(), str(local_path).encode())
+                .replace(f"{self.process.group_name}/cgroup.procs".encode(), str(self.process.group / "cgroup.procs").encode())
+                .replace(daytona_module._STATUS_DIR.encode(), str(self.process.status).encode())  # pyright: ignore[reportPrivateUsage]
+            )
+            local_command = local_command.replace(remote_path, str(local_path))
         local_command = local_command.replace(
             f"{self.process.group_name}/cgroup.procs", str(self.process.group / "cgroup.procs")
         )
@@ -5339,7 +5357,9 @@ async def test_daytona_controlled_nonnull_cwd_runs_real_shell_and_preserves_exit
     finally:
         await _finish_local_workers(process)
 
-async def _generated_daytona_command_in_host_pty(command: str, tmp_path: Path) -> tuple[int, str]:
+async def _generated_daytona_command_in_host_pty(
+    command: str, tmp_path: Path, *, canonical_input: bool
+) -> tuple[int, str]:
     process = CgroupProcess()
     process.allow_creation.set()
     process.allow_removal.set()
@@ -5363,14 +5383,38 @@ async def _generated_daytona_command_in_host_pty(command: str, tmp_path: Path) -
     paths[workload._release].touch()  # pyright: ignore[reportPrivateUsage]
     for original, local in paths.items():
         generated = generated.replace(original, str(local))
-    prelude = f"stty -echo; {generated}"
-    shell = f"/bin/bash --noprofile --norc -ic {shlex.quote(prelude)}"
-    child = subprocess.Popen(
-        ["script", "-q", "-e", "-c", shell, "/dev/null"],
-        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
-        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "TERM": "dumb"},
-    )
+    for remote_path, content in process.files.staged.items():
+        local_path = tmp_path / Path(remote_path).name
+        for original, local in paths.items():
+            content = content.replace(original.encode(), str(local).encode())
+        local_path.write_bytes(content.replace(remote_path.encode(), str(local_path).encode()).replace(
+            daytona_module._STATUS_DIR.encode(), str(tmp_path).encode()  # pyright: ignore[reportPrivateUsage]
+        ))
+        generated = generated.replace(remote_path, str(local_path))
+    if canonical_input:
+        master, slave = pty.openpty()
+        ready = tmp_path / "ready"
+        child = subprocess.Popen(
+            ["/bin/sh", "-c", f"stty -echo icanon; touch {shlex.quote(str(ready))}; IFS= read -r line; eval \"$line\""],
+            stdin=slave, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, start_new_session=True,
+            env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "TERM": "dumb"},
+        )
+        os.close(slave)
+    else:
+        prelude = f"stty -echo; {generated}"
+        shell = f"/bin/bash --noprofile --norc -ic {shlex.quote(prelude)}"
+        child = subprocess.Popen(
+            ["script", "-q", "-e", "-c", shell, "/dev/null"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+            env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "TERM": "dumb"},
+        )
     try:
+        if canonical_input:
+            async with asyncio.timeout(2):
+                while not ready.exists():
+                    await asyncio.sleep(0.01)
+            os.write(master, generated.encode())
         output, _ = child.communicate(timeout=5)
     except subprocess.TimeoutExpired:
         # The generated child can be in a different PTY process group from `script`.
@@ -5383,22 +5427,33 @@ async def _generated_daytona_command_in_host_pty(command: str, tmp_path: Path) -
         raise
     finally:
         child.wait(timeout=5)
+        if canonical_input:
+            os.close(master)
+    assert paths[status].exists(), output
     assert child.returncode == int(paths[status].read_text())
     return child.returncode, output
 
 
 async def test_daytona_controlled_pty_command_can_use_terminal_modes(tmp_path: Path) -> None:
-    exit_code, _ = await _generated_daytona_command_in_host_pty("stty sane", tmp_path)
+    exit_code, _ = await _generated_daytona_command_in_host_pty("stty sane", tmp_path, canonical_input=False)
     assert exit_code == 0
 
 
 async def test_daytona_controlled_pty_output_has_no_shell_job_notice(tmp_path: Path) -> None:
     exit_code, output = await _generated_daytona_command_in_host_pty(
-        "printf agent-output; printf agent-error >&2", tmp_path
+        "printf agent-output; printf agent-error >&2", tmp_path, canonical_input=False
     )
     assert exit_code == 0
     assert output.strip() == "agent-outputagent-error"
 
+
+async def test_daytona_controlled_long_compose_launch_survives_canonical_pty(tmp_path: Path) -> None:
+    command = "printf compose-launched; : '" + "x" * 5000 + "'; exit 17"
+    exit_code, output = await _generated_daytona_command_in_host_pty(
+        command, tmp_path, canonical_input=True
+    )
+    assert exit_code == 17
+    assert "compose-launched" in output
 
 
 class UnwritableStatusLocalShellProcess(LocalShellCgroupProcess):

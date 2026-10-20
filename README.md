@@ -190,6 +190,7 @@ Provider compatibility notes:
 - Modal sandboxes do not expose a disk-size parameter; `Resources.disk` is accepted for schema compatibility but not enforced.
 - GPUs are requested via `Resources.gpu` (count) and `Resources.gpu_type`. Modal requires `gpu_type` (any Modal GPU name, e.g. `H100`, `A100-80GB`, `T4`) and passes `"<type>:<count>"` to the sandbox. Daytona accepts a count with an optional type restricted to its `GpuType` enum (`H100`, `H200`, `RTX-PRO-6000`, `RTX-4090`, `RTX-5090`); GPU requests are rejected for Daytona snapshot sandboxes because snapshot resources are fixed at snapshot creation.
 - Nested Docker (Docker-in-Docker) capability is granted on every sandbox for Daytona and Modal — Daytona supports it natively and the Modal adapter requests it unconditionally — so benchmarks never configure it. The benchmark service owns the Docker-capable image, dockerd startup flags, compose workflow, and cleanup.
+- Daytona controlled workloads upload their generated launch command before PTY creation and execute it through a short shell bootstrap, so long Compose episode commands are not truncated by the PTY's canonical input limit. The launch file removes itself before the workload starts.
 - Transient Modal connection errors are retried up to three attempts, matching the Daytona adapter's provider-level retry shape. Non-transient command failures still surface as `SandboxCommandError` with the command exit code.
 
 ### Local Docker sandboxes

@@ -80,8 +80,13 @@ class BenchmarkService(ABC):
     def __new__(cls, *args: Any, **kwargs: Any) -> Self:
         # Checked here rather than in __init_subclass__ so an intermediate base class may
         # leave evaluate_instance and any of the three hooks to a subclass, as abstract methods allow.
-        # A service that overrides evaluate_instance may define any of the hooks for its own use.
-        if cls.evaluate_instance is BenchmarkService.evaluate_instance and not cls._grades_input():
+        implemented = cls._implemented_grading_hooks()
+        if implemented and len(implemented) != len(_GRADING_HOOKS):
+            raise TypeError(
+                f"{cls.__name__} implements {', '.join(implemented)}; the framework's checkpointed grading "
+                "needs all of collect_grading_input, grader_identity and grade_input"
+            )
+        if cls.evaluate_instance is BenchmarkService.evaluate_instance and not implemented:
             raise TypeError(
                 f"{cls.__name__} must implement evaluate_instance, or collect_grading_input, "
                 "grader_identity and grade_input"
@@ -89,8 +94,12 @@ class BenchmarkService(ABC):
         return super().__new__(cls)
 
     @classmethod
+    def _implemented_grading_hooks(cls) -> list[str]:
+        return [hook for hook in _GRADING_HOOKS if getattr(cls, hook) is not getattr(BenchmarkService, hook)]
+
+    @classmethod
     def _grades_input(cls) -> bool:
-        return all(getattr(cls, hook) is not getattr(BenchmarkService, hook) for hook in _GRADING_HOOKS)
+        return len(cls._implemented_grading_hooks()) == len(_GRADING_HOOKS)
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)

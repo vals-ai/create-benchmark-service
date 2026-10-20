@@ -151,16 +151,21 @@ async def test_the_default_evaluate_instance_needs_all_three_hooks() -> None:
         def grader_identity(self, task_id: str, dataset: str | None = None) -> Mapping[str, Any]:
             return {"rubric": "1"}
 
-    with pytest.raises(TypeError, match="collect_grading_input, grader_identity and grade_input"):
+    with pytest.raises(TypeError, match="_Partial implements grader_identity; .*collect_grading_input"):
         await _Partial.create()
 
 
-async def test_a_service_with_its_own_evaluate_instance_may_define_one_hook() -> None:
+async def test_a_partial_hook_set_is_refused_beside_a_custom_evaluate_instance() -> None:
     class _OwnGrader(StubBenchmark):
         def grader_identity(self, task_id: str, dataset: str | None = None) -> Mapping[str, Any]:
             return {"rubric": "1"}
 
-    service = await _OwnGrader.create()
+    with pytest.raises(TypeError, match="_OwnGrader implements grader_identity; .*collect_grading_input"):
+        await _OwnGrader.create()
+
+
+async def test_a_service_with_its_own_evaluate_instance_and_no_hooks_is_created() -> None:
+    service = await StubBenchmark.create()
 
     chunks = await _drain(service.stream_evaluate_response(EvaluateResponseRequest(task_id="task-1", response="2")))
     assert chunks[0].data == {"resolved": True}

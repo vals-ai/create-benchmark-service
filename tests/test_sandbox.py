@@ -4447,7 +4447,7 @@ async def test_daytona_egress_updates_retry_concurrent_operation_conflicts(
 ) -> None:
     """A 409 raised while Daytona still holds the sandbox lock is retried on the provider ladder."""
     inner = ConflictThenApplyNetworkSettingsSandbox()
-    sandbox = DaytonaSandbox(cast(Any, inner))
+    sandbox = _daytona_sandbox(inner)
     for method in (sandbox.modify_egress_rules, sandbox.block_all_egress, sandbox.clear_egress_rules):
         _skip_retry_sleep(monkeypatch, method)
 
@@ -5927,14 +5927,14 @@ async def test_daytona_unconfirmed_group_removal_reports_error() -> None:
     assert process.sessions
 
 
+@pytest.mark.usefixtures("_fake_cgroup_follow")
 async def test_daytona_output_consumer_waits_for_confirmed_group_stop() -> None:
     process = CgroupProcess()
     process.allow_creation.set()
     workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
     stream = workload.output()
     await asyncio.wait_for(process.command_admitted.wait(), 2)
-    await process.handle.emit(b"initial")
-    assert await asyncio.wait_for(anext(stream), 2) == "initial"
+    assert await asyncio.wait_for(anext(stream), 2) == "hello"
     pending_output = asyncio.create_task(anext(stream))
     killing = asyncio.create_task(workload.kill())
     await asyncio.wait_for(process.removal_started.wait(), 2)

@@ -5401,23 +5401,34 @@ async def _generated_daytona_command_in_host_pty(
             env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "TERM": "dumb"},
         )
         os.close(slave)
-    else:
-        prelude = f"stty -echo; {generated}"
-        shell = f"/bin/bash --noprofile --norc -ic {shlex.quote(prelude)}"
-        child = subprocess.Popen(
-            ["script", "-q", "-e", "-c", shell, "/dev/null"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
-            env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "TERM": "dumb"},
-        )
-    try:
-        if canonical_input:
+        try:
             async with asyncio.timeout(2):
                 while not ready.exists():
                     await asyncio.sleep(0.01)
             os.write(master, generated.encode())
+            output, _ = child.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            with suppress(ProcessLookupError):
+                os.killpg(child.pid, signal.SIGKILL)
+            raise
+        finally:
+            child.wait(timeout=5)
+            os.close(master)
+        assert paths[status].exists(), output
+        assert child.returncode == int(paths[status].read_text())
+        return child.returncode, output
+
+    prelude = f"stty -echo; {generated}"
+    shell = f"/bin/bash --noprofile --norc -ic {shlex.quote(prelude)}"
+    child = subprocess.Popen(
+        ["script", "-q", "-e", "-c", shell, "/dev/null"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "TERM": "dumb"},
+    )
+    try:
         output, _ = child.communicate(timeout=5)
     except subprocess.TimeoutExpired:
-        # The generated child can be in a different PTY process group from `script`.
+        # The generated child can be in a different PTY process group from script.
         group_pid_file = paths[group] / "cgroup.procs"
         if group_pid_file.exists():
             with suppress(ProcessLookupError):
@@ -5427,8 +5438,6 @@ async def _generated_daytona_command_in_host_pty(
         raise
     finally:
         child.wait(timeout=5)
-        if canonical_input:
-            os.close(master)
     assert paths[status].exists(), output
     assert child.returncode == int(paths[status].read_text())
     return child.returncode, output

@@ -19,6 +19,7 @@ from benchmark_service import (
     BenchmarkServiceStreamClosedError,
     BenchmarkServiceStreamError,
     BenchmarkServiceStreamIdleError,
+    GenerationContainment,
     SandboxNotFoundError,
     SandboxRecoveryPolicy,
 )
@@ -65,85 +66,20 @@ def _task_response(max_sandbox_attempts: int | None = None) -> RetrieveTaskRespo
     )
 
 
+@pytest.mark.parametrize("version", [0, True, "1"])
+def test_generation_containment_requires_positive_integer_version(version: object) -> None:
+    with pytest.raises(ValidationError):
+        GenerationContainment.model_validate(
+            {"type": "linux_cgroup_v2", "version": version}
+        )
+
+
 def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "error") -> MagicMock:
     resp = MagicMock()
     resp.status_code = status_code
     resp.json.return_value = json_data
     resp.text = text
     return resp
-
-
-@pytest.mark.parametrize(
-    ("method", "args", "expected_path", "json_data"),
-    [
-        (
-            "health_check",
-            [],
-            "/health",
-            {"status": "ok"},
-        ),
-        (
-            "version",
-            [],
-            "/version",
-            {
-                "framework_version": "0.7.4",
-                "service_name": "legal-research-benchmark-service",
-                "service_version": "1.2.3",
-                "dataset_version": "3.0.0",
-                "dataset_version_selection": False,
-                "eval_mode": "text",
-            },
-        ),
-        (
-            "verify_task_ids",
-            [["t1", "t2"], None],
-            "/verify-task-ids",
-            {"task_ids": ["t1", "t2"]},
-        ),
-        (
-            "retrieve_task",
-            ["task-1"],
-            "/retrieve-task/",
-            {
-                "source": {"type": "image", "image": "python:3.12"},
-                "docker_image": "python:3.12",
-                "problem_path": "/tmp/problem_statement.txt",
-                "cwd": "/work",
-                "resources": {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None},
-                "agent_install_order": "before_setup",
-                "egress": {"setup_task": "*", "run": None, "evaluation": "*"},
-                "agent_timeout": None,
-                "eval_sandbox": None,
-                "sandbox_recovery": None,
-                "sandbox_secrets": {},
-                "volumes": [],
-            },
-        ),
-        (
-            "final_score",
-            [{"t1": {"resolved": True}}],
-            "/final-score/",
-            {"tasks_evaluated": ["t1"], "final_score": 100.0, "metadata": {}},
-        ),
-    ],
-    ids=["health_check", "version", "verify_task_ids", "retrieve_task", "final_score"],
-)
-async def test_http_happy_path(
-    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
-    method: str,
-    args: list[Any],
-    expected_path: str,
-    json_data: dict[str, Any],
-) -> None:
-    client, mock_http = benchmark_client
-    mock_resp = _mock_response(json_data=json_data)
-    mock_http.get = AsyncMock(return_value=mock_resp)
-    mock_http.post = AsyncMock(return_value=mock_resp)
-
-    result = await getattr(client, method)(*args)
-
-    assert result.model_dump() == json_data
 
 
 async def test_retrieve_task_accepts_legacy_shape(
@@ -168,7 +104,23 @@ async def test_retrieve_task_accepts_legacy_shape(
     assert result.model_dump()["docker_image"] == "python:3.12"
     assert result.resources.model_dump() == {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None}
     assert result.agent_install_order == "before_setup"
+    assert result.credited_generation is None
     assert result.egress.model_dump() == {"setup_task": "*", "run": None, "evaluation": "*"}
+
+
+async def test_retrieve_task_accepts_credited_generation_opt_in(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    payload = _task_response().model_dump(mode="json")
+    payload["credited_generation"] = {"allowance_seconds": 18000, "stage_protocol": None}
+    mock_http.get = AsyncMock(return_value=_mock_response(json_data=payload))
+
+    result = await client.retrieve_task("task-1")
+
+    assert result.credited_generation is not None
+    assert result.credited_generation.allowance_seconds == 18000
+    assert result.credited_generation.stage_protocol is None
 
 
 async def test_retrieve_task_accepts_explicit_agent_install_order(

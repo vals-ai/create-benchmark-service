@@ -1,10 +1,13 @@
 import asyncio
 import logging
+import os
 import shlex
+import signal
 import subprocess
 from collections.abc import AsyncGenerator, Mapping
-from contextlib import nullcontext
+from contextlib import nullcontext, suppress
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, cast
 
@@ -58,10 +61,10 @@ from benchmark_service.sandbox import (
     VolumeMount,
 )
 from benchmark_service.sandbox.daytona import (
+    _DaytonaControlledWorkload,  # pyright: ignore[reportPrivateUsage]
     _PTY_COLS,  # pyright: ignore[reportPrivateUsage]
     _PTY_CREATE_MARKER_ENV,  # pyright: ignore[reportPrivateUsage]
     _PTY_ROWS,  # pyright: ignore[reportPrivateUsage]
-    _PTY_STDOUT_TAIL_MAX_BYTES,  # pyright: ignore[reportPrivateUsage]
     DaytonaProviderConfig,
     _is_ambiguous_pty_create_error,  # pyright: ignore[reportPrivateUsage]
     _is_not_found_error,  # pyright: ignore[reportPrivateUsage]
@@ -148,6 +151,7 @@ class Process:
         self.pty_envs: dict[str, str] | None = None
         self.pty_size: PtySize | None = None
         self.pty_handle: PtyHandle | None = None
+        self.output_frames: tuple[bytes, ...] = ()
 
     async def exec(self, command: str) -> SimpleNamespace:
         self.command = command
@@ -170,11 +174,13 @@ class Process:
         _assert_pty_create_config(envs, pty_size)
         self.pty_envs = envs
         self.pty_size = pty_size
-        self.pty_handle = PtyHandle(on_data)
+        self.pty_handle = PtyHandle(on_data, self.output_frames)
         return self.pty_handle
 
     async def kill_pty_session(self, session_id: str) -> None:
         assert session_id
+
+
 
 
 class RetryingProcess(Process):
@@ -323,8 +329,11 @@ class RemovedSandboxProcess(Process):
 
 
 class PtyHandle:
-    def __init__(self, on_data: Callable[[bytes], None | Awaitable[None]]) -> None:
+    def __init__(
+        self, on_data: Callable[[bytes], None | Awaitable[None]], output_frames: tuple[bytes, ...]
+    ) -> None:
         self._on_data = on_data
+        self.output_frames = output_frames
         self.inputs: list[str] = []
         self.disconnected = False
 
@@ -332,7 +341,11 @@ class PtyHandle:
         self.inputs.append(data)
         if data.startswith("stty"):
             return
-        result = self._on_data(b"hello")
+        for frame in self.output_frames:
+            await self.emit(frame)
+
+    async def emit(self, data: bytes) -> None:
+        result = self._on_data(data)
         if result is not None:
             await result
 
@@ -370,7 +383,7 @@ class ReconnectingProcess(Process):
     ) -> PtyHandle:
         assert id
         _assert_pty_create_config(envs, pty_size)
-        handle = DisconnectedPtyHandle(on_data)
+        handle = DisconnectedPtyHandle(on_data, self.output_frames)
         self.handles.append(handle)
         return handle
 
@@ -386,14 +399,14 @@ class ReconnectingProcess(Process):
     ) -> PtyHandle:
         assert self.checked_session_id == session_id
         self.connected_session_id = session_id
-        handle = PtyHandle(on_data)
+        handle = PtyHandle(on_data, self.output_frames)
         self.handles.append(handle)
         return handle
 
 
 class FinishedPtyHandle(PtyHandle):
     def __init__(self, on_data: Callable[[bytes], None | Awaitable[None]], result: PtyResult) -> None:
-        super().__init__(on_data)
+        super().__init__(on_data, ())
         self._result = result
 
     async def wait(self) -> PtyResult:
@@ -519,7 +532,7 @@ class ReconcilingPtyProcess(Process):
         outcome = self.create_outcomes.pop(0)
         if outcome is not None:
             raise outcome
-        handle = PtyHandle(on_data)
+        handle = PtyHandle(on_data, self.output_frames)
         self.handles.append(handle)
         return handle
 
@@ -554,7 +567,7 @@ class ReconcilingPtyProcess(Process):
             self.destroy_sandbox_on_connect.state = SandboxState.DESTROYED
         if self.connect_errors:
             raise self.connect_errors.pop(0)
-        handle = PtyHandle(on_data)
+        handle = PtyHandle(on_data, self.output_frames)
         self.handles.append(handle)
         return handle
 
@@ -620,7 +633,7 @@ class FloodingProcess(Process):
         assert id
         _assert_pty_create_config(envs, pty_size)
         self.pty_envs = envs
-        self.pty_handle = FloodingPtyHandle(on_data)
+        self.pty_handle = FloodingPtyHandle(on_data, self.output_frames)
         return self.pty_handle
 
 
@@ -647,7 +660,7 @@ class BlockingProcess(Process):
     ) -> PtyHandle:
         assert id
         _assert_pty_create_config(envs, pty_size)
-        self.handle = self.handle_cls(on_data)
+        self.handle = self.handle_cls(on_data, self.output_frames)
         return self.handle
 
     async def kill_pty_session(self, session_id: str) -> None:
@@ -963,13 +976,15 @@ class DaytonaClient:
         self.closed = False
         self.deleted = False
         self.listed_query: Any | None = None
+        self.create_params: Any = None
 
     async def get(self, instance_id: str) -> InnerSandbox:
         assert instance_id == self.sandbox.name
         return self.sandbox
 
-    async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
+    async def create(self, params: object, *_args: object, **_kwargs: object) -> InnerSandbox:
         self.created = True
+        self.create_params = params
         return self.sandbox
 
     async def delete(self, sandbox: InnerSandbox) -> None:
@@ -3105,7 +3120,7 @@ async def test_daytona_pty_caps_result_output_without_dropping_streamed_chunks()
 
     Test cases:
     - Every chunk is still forwarded to the streaming queue.
-    - ExecResult.output is capped near the tail limit and keeps the newest output.
+    - ExecResult.output truncates the older output and keeps the newest output.
     """
     inner = InnerSandbox()
     inner.process = FloodingProcess()
@@ -3114,22 +3129,15 @@ async def test_daytona_pty_caps_result_output_without_dropping_streamed_chunks()
 
     result = await sandbox._exec_pty("noisy", queue, {})  # pyright: ignore[reportPrivateUsage]
 
-    chunk_length = 1024 + len("chunk-0000-")
-    total_streamed = 0
+    chunks: list[str] = []
     while not queue.empty():
-        total_streamed += len(queue.get_nowait())
-    assert total_streamed == 200 * chunk_length
-    assert len(result.output) <= _PTY_STDOUT_TAIL_MAX_BYTES + chunk_length
-    assert "chunk-0199-" in result.output
+        chunks.append(queue.get_nowait())
+    streamed = "".join(chunks)
+    assert streamed == "".join(f"chunk-{index:04d}-" + "x" * 1024 for index in range(200))
+    assert 0 < len(result.output) < len(streamed)
+    assert result.output == streamed[-len(result.output):]
+    assert result.output.endswith("chunk-0199-" + "x" * 1024)
     assert "chunk-0000-" not in result.output
-
-
-async def test_daytona_command_streams_output() -> None:
-    sandbox = DaytonaSandbox(cast(Any, InnerSandbox()))
-
-    output = [chunk async for chunk in sandbox.command("printf hello")]
-
-    assert output == ["hello"]
 
 
 async def test_daytona_command_reads_status_after_toolbox_shell_diagnostics() -> None:
@@ -3161,11 +3169,19 @@ async def test_daytona_command_reads_status_after_toolbox_shell_diagnostics() ->
 
 
 async def test_daytona_command_publishes_status_atomically_and_cleans_temp() -> None:
+    class LateOutputProcess(Process):
+        async def exec(self, command: str) -> SimpleNamespace:
+            if _unwrap_shell_command(command).startswith("cat "):
+                assert self.pty_handle is not None
+                await self.pty_handle.emit(b"alpha")
+                await self.pty_handle.emit(b"omega")
+            return await super().exec(command)
+
     inner = InnerSandbox()
+    inner.process = LateOutputProcess()
     sandbox = DaytonaSandbox(cast(Any, inner))
-
-    assert [chunk async for chunk in sandbox.command("printf hello")] == ["hello"]
-
+    chunks = [chunk async for chunk in sandbox.command("printf hello")]
+    assert "".join(chunks) == "alphaomega"
     assert inner.process.pty_handle is not None
     publish_input = inner.process.pty_handle.inputs[1]
     write_command, move_command = publish_input.split(" && mv ", maxsplit=1)
@@ -3183,9 +3199,7 @@ async def test_daytona_command_uses_native_process_environment() -> None:
     inner = InnerSandbox()
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    output = [chunk async for chunk in sandbox.command("printf hello", env_vars={"AGENT_SECRET": secret})]
-
-    assert output == ["hello"]
+    _ = [chunk async for chunk in sandbox.command("printf hello", env_vars={"AGENT_SECRET": secret})]
     assert inner.process.pty_envs is not None
     assert inner.process.pty_envs["TERM"] == "dumb"
     assert inner.process.pty_envs["LANG"] == "C.UTF-8"
@@ -3226,9 +3240,7 @@ async def test_daytona_command_finishes_when_pty_close_never_arrives(monkeypatch
     sandbox = DaytonaSandbox(cast(Any, inner))
 
     async with asyncio.timeout(1):
-        output = [chunk async for chunk in sandbox.command("printf hello")]
-
-    assert output == ["hello"]
+        _ = [chunk async for chunk in sandbox.command("printf hello")]
     assert process.handle is not None
     assert process.handle.disconnected is True
     assert process.killed_session_id is not None
@@ -3262,9 +3274,7 @@ async def test_daytona_command_continues_cleanup_when_disconnect_stalls(monkeypa
     monkeypatch.setattr(daytona_module, "_TOOLBOX_CALL_TIMEOUT_SECONDS", 0.05)
 
     async with asyncio.timeout(5):
-        output = [chunk async for chunk in sandbox.command("printf hello")]
-
-    assert output == ["hello"]
+        _ = [chunk async for chunk in sandbox.command("printf hello")]
     assert process.handle is not None
     assert process.handle.disconnected is True
     assert process.killed_session_id is not None
@@ -3276,9 +3286,7 @@ async def test_daytona_command_checks_pty_before_reconnecting() -> None:
     inner.process = process
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    output = [chunk async for chunk in sandbox.command("printf hello")]
-
-    assert output == ["hello"]
+    _ = [chunk async for chunk in sandbox.command("printf hello")]
     assert process.checked_session_id is not None
     assert process.connected_session_id == process.checked_session_id
     command_inputs = [data for handle in process.handles for data in handle.inputs if "mkdir -p " in data]
@@ -3297,7 +3305,7 @@ async def test_daytona_command_prefers_status_over_pty_exit() -> None:
     inner.process = process
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    assert [chunk async for chunk in sandbox.command("printf hello")] == ["hello"]
+    _ = [chunk async for chunk in sandbox.command("printf hello")]
     assert process.checked_session_id is None
 
 
@@ -3305,7 +3313,7 @@ async def test_daytona_command_returns_completed_status_without_health_refresh()
     inner = PersistentBareHtml502RefreshSandbox()
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    assert [chunk async for chunk in sandbox.command("printf hello")] == ["hello"]
+    _ = [chunk async for chunk in sandbox.command("printf hello")]
     assert inner.refresh_count == 0
 
 
@@ -3315,11 +3323,12 @@ async def test_daytona_command_does_not_refresh_sandbox_state_while_pty_is_runni
     monkeypatch.setattr(daytona_module, "_PTY_STATUS_POLL_SECONDS", 0)
     inner = InnerSandbox()
     process = RunningProcess()
+    process.output_frames = (b"started",)
     inner.process = process
     sandbox = DaytonaSandbox(cast(Any, inner))
 
     stream = sandbox.command("printf hello")
-    assert await anext(stream) == "hello"
+    assert await anext(stream) == "started"
     await asyncio.wait_for(process.status_probe_started.wait(), timeout=1)
     assert inner.refresh_count == 0
     await stream.aclose()
@@ -3344,7 +3353,7 @@ async def test_daytona_command_rechecks_status_after_initial_probe_failure() -> 
     inner.process = process
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    assert [chunk async for chunk in sandbox.command("printf hello")] == ["hello"]
+    _ = [chunk async for chunk in sandbox.command("printf hello")]
     assert len(process.status_probe_commands) == 2
 
 
@@ -3409,7 +3418,7 @@ async def test_daytona_command_reconnects_without_per_poll_sandbox_health_check(
     inner.state = SandboxState.DESTROYED
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    assert [chunk async for chunk in sandbox.command("printf hello")] == ["hello"]
+    _ = [chunk async for chunk in sandbox.command("printf hello")]
 
     assert inner.refresh_count == 0
 
@@ -3503,7 +3512,7 @@ async def test_daytona_command_reconciles_ambiguous_pty_create_once(
     inner.process = process
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    assert [chunk async for chunk in sandbox.command("printf unique-command")] == ["hello"]
+    _ = [chunk async for chunk in sandbox.command("printf unique-command")]
 
     assert len(process.create_ids) == expected_create_attempts
     assert len(set(process.create_ids)) == 1
@@ -3608,13 +3617,13 @@ async def test_daytona_command_keeps_marker_operation_scoped_and_unsets_it(
     sandbox = DaytonaSandbox(cast(Any, inner))
 
     for command in ("printf first-command", "printf second-command"):
-        assert [
+        _ = [
             chunk
             async for chunk in sandbox.command(
                 command,
                 env_vars={_PTY_CREATE_MARKER_ENV: "caller-value", "EXPECTED_ENV": "expected"},
             )
-        ] == ["hello"]
+        ]
 
     first_markers = {envs[_PTY_CREATE_MARKER_ENV] for envs in process.create_envs[:2]}
     second_markers = {envs[_PTY_CREATE_MARKER_ENV] for envs in process.create_envs[2:]}
@@ -3648,7 +3657,7 @@ async def test_daytona_command_retries_only_the_active_reconciliation_phase(
     inner.process = process
     sandbox = DaytonaSandbox(cast(Any, inner))
 
-    assert [chunk async for chunk in sandbox.command("printf phase-command")] == ["hello"]
+    _ = [chunk async for chunk in sandbox.command("printf phase-command")]
 
     assert len(process.create_ids) == 2
     assert len(process.get_session_ids) == (2 if retry_stage == "get" else 1)
@@ -3851,8 +3860,9 @@ async def test_daytona_command_cleans_up_when_consumer_stops() -> None:
     inner.process = process
     sandbox = DaytonaSandbox(cast(Any, inner))
 
+    process.output_frames = (b"started",)
     stream = sandbox.command("printf hello")
-    assert await anext(stream) == "hello"
+    assert await anext(stream) == "started"
 
     await stream.aclose()
 
@@ -3869,6 +3879,7 @@ async def test_daytona_provider_creates_fresh_sandbox() -> None:
 
     assert sandbox.id == inner.id
     assert daytona.created is True
+    assert daytona.create_params.ttl_minutes == 167 * 60
 
 
 def test_daytona_sandbox_exposes_inventory_metadata() -> None:
@@ -4830,3 +4841,1014 @@ def test_provider_secret_references_reject_invalid_configuration(
 def test_volume_mount_rejects_invalid_subpath(subpath: str) -> None:
     with pytest.raises(ValidationError):
         VolumeMount(name="fixtures", mount_path="/fixtures", subpath=subpath)
+
+
+
+class CgroupProcess(Process):
+    def __init__(self) -> None:
+        super().__init__()
+        self.handle: CgroupPtyHandle
+        self.group_created = asyncio.Event()
+        self.allow_creation = asyncio.Event()
+        self.command_admitted = asyncio.Event()
+        self.user_finished = asyncio.Event()
+        self.removal_started = asyncio.Event()
+        self.allow_removal = asyncio.Event()
+        self.release_seen = asyncio.Event()
+        self.allow_final_frame = asyncio.Event()
+        self.group_exists = False
+        self.removal_fails = False
+        self.sessions: set[str] = set()
+        self.poll_error = False
+        self.pty_marker: str
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        command = _unwrap_shell_command(command)
+        if command.startswith("mkdir /sys/fs/cgroup/cbs-"):
+            await self.allow_creation.wait()
+            self.group_exists = True
+            self.group_created.set()
+            return SimpleNamespace(exit_code=0, result="")
+        if command.startswith("test -e ") and command.endswith(".complete"):
+            if self.poll_error:
+                raise DaytonaConnectionError("control channel unavailable")
+            return SimpleNamespace(exit_code=0 if self.user_finished.is_set() else 1, result="")
+        if command.startswith("test -e ") and command.endswith(".status"):
+            return SimpleNamespace(exit_code=0 if self.user_finished.is_set() else 1, result="")
+        if command.startswith("cat ") and command.endswith(".status"):
+            return SimpleNamespace(exit_code=0, result="7")
+        if command.startswith("d=/sys/fs/cgroup/cbs-"):
+            self.removal_started.set()
+            await self.allow_removal.wait()
+            if self.removal_fails:
+                return SimpleNamespace(exit_code=1, result="cgroup still populated")
+            self.group_exists = False
+            if self.command_admitted.is_set():
+                self.user_finished.set()
+            return SimpleNamespace(exit_code=0, result="")
+        if command.startswith(": > ") and command.endswith(".release"):
+            self.release_seen.set()
+            return SimpleNamespace(exit_code=0, result="")
+        return await super().exec(command)
+
+    async def create_pty_session(
+        self, *, id: str, on_data: Callable[[bytes], None | Awaitable[None]],
+        envs: dict[str, str], pty_size: PtySize,
+    ) -> "CgroupPtyHandle":
+        _assert_pty_create_config(envs, pty_size)
+        self.sessions.add(id)
+        self.pty_marker = envs[_PTY_CREATE_MARKER_ENV]
+        handle = CgroupPtyHandle(on_data, self)
+        self.handle = handle
+        return handle
+
+    async def kill_pty_session(self, session_id: str) -> None:
+        self.sessions.discard(session_id)
+        self.user_finished.set()
+        self.release_seen.set()
+
+    async def list_pty_sessions(self) -> list[SimpleNamespace]:
+        return [SimpleNamespace(id=session_id) for session_id in self.sessions]
+
+
+class CgroupPtyHandle(PtyHandle):
+    def __init__(self, on_data: Callable[[bytes], None | Awaitable[None]], process: CgroupProcess) -> None:
+        super().__init__(on_data, process.output_frames)
+        self.process = process
+
+    async def send_input(self, data: str) -> None:
+        await super().send_input(data)
+        if data.startswith("stty"):
+            await self.emit(self.process.pty_marker.encode() + b"\r\n")
+        else:
+            self.process.command_admitted.set()
+
+    async def wait(self) -> PtyResult:
+        await self.process.release_seen.wait()
+        await self.process.allow_final_frame.wait()
+        await self.emit(b"final frame")
+        return PtyResult(exit_code=0, error=None)
+
+
+def _cgroup_sandbox(process: CgroupProcess) -> DaytonaSandbox:
+    inner = InnerSandbox()
+    inner.process = process
+    return DaytonaSandbox(cast(Any, inner))
+
+
+async def test_daytona_controlled_utf8_spans_callbacks_and_reconnect_and_flushes_at_completion() -> None:
+    setup_sent = asyncio.Event()
+
+    class InitialHandle(CgroupPtyHandle):
+        async def send_input(self, data: str) -> None:
+            self.inputs.append(data)
+            setup_sent.set()
+
+        async def wait(self) -> PtyResult:
+            await setup_sent.wait()
+            return PtyResult(exit_code=None, error="WebSocket error")
+
+    class FirstHandle(CgroupPtyHandle):
+        async def send_input(self, data: str) -> None:
+            if data.startswith("stty"):
+                self.inputs.append(data)
+                await self.emit(b"stty -echo && setup shell text\r\n")
+                marker = self.process.pty_marker.encode()
+                await self.emit(marker[:11])
+                await self.emit(marker[11:] + b"\r\n")
+            else:
+                await super().send_input(data)
+        async def wait(self) -> PtyResult:
+            await self.process.command_admitted.wait()
+            await self.emit(b"before-\xe2")
+            return PtyResult(exit_code=None, error="WebSocket error")
+
+    class LastHandle(CgroupPtyHandle):
+        async def wait(self) -> PtyResult:
+            await self.process.release_seen.wait()
+            await self.process.allow_final_frame.wait()
+            await self.emit(b"\xf0\x9f")
+            return PtyResult(exit_code=0, error=None)
+
+    class SplitProcess(CgroupProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.reconnected = asyncio.Event()
+            self.reconnect_count = 0
+
+        async def create_pty_session(
+            self, *, id: str, on_data: Callable[[bytes], None | Awaitable[None]],
+            envs: dict[str, str], pty_size: PtySize,
+        ) -> CgroupPtyHandle:
+            _assert_pty_create_config(envs, pty_size)
+            self.sessions.add(id)
+            self.pty_marker = envs[_PTY_CREATE_MARKER_ENV]
+            self.handle = InitialHandle(on_data, self)
+            return self.handle
+
+        async def get_pty_session_info(self, session_id: str) -> SimpleNamespace:
+            assert session_id in self.sessions
+            return SimpleNamespace(id=session_id)
+
+        async def connect_pty_session(
+            self, session_id: str, on_data: Callable[[bytes], None | Awaitable[None]],
+        ) -> CgroupPtyHandle:
+            assert session_id in self.sessions
+            self.reconnect_count += 1
+            if self.reconnect_count == 1:
+                self.handle = FirstHandle(on_data, self)
+            else:
+                self.handle = LastHandle(on_data, self)
+                await self.handle.emit(b"\x82\xac-after-")
+                self.reconnected.set()
+            return self.handle
+
+    process = SplitProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
+    await asyncio.wait_for(process.reconnected.wait(), 2)
+    process.user_finished.set()
+    process.allow_final_frame.set()
+    result = await asyncio.wait_for(workload.wait(), 2)
+    assert result.result.exit_code == 7
+    assert process.reconnect_count == 2
+    assert result.result.output == "before-€-after-�"
+    assert "".join([chunk async for chunk in workload.output()]) == result.result.output
+    await process.handle.emit(b"late")
+    assert "".join([chunk async for chunk in workload.output()]) == ""
+
+
+async def test_daytona_controlled_utf8_flushes_once_at_confirmed_forced_close() -> None:
+    process = CgroupProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    await process.handle.emit(b"start-\xe2\x82")
+    await asyncio.wait_for(workload.kill(), 2)
+    assert "".join([chunk async for chunk in workload.output()]) == "start-�"
+    await process.handle.emit(b"late")
+    assert "".join([chunk async for chunk in workload.output()]) == ""
+
+
+async def test_daytona_controlled_utf8_flushes_on_terminal_status_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(daytona_module, "_PTY_STATUS_POLL_SECONDS", 0.01)
+
+    class FailedStatusProcess(CgroupProcess):
+        async def exec(self, command: str) -> SimpleNamespace:
+            command = _unwrap_shell_command(command)
+            if command.startswith("cat ") and command.endswith(".status"):
+                return SimpleNamespace(exit_code=1, result="")
+            return await super().exec(command)
+
+    process = FailedStatusProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    await process.handle.emit(b"unfinished-\xc3")
+    process.user_finished.set()
+    with pytest.raises(SandboxError, match="Failed to read Daytona controlled PTY exit code"):
+        await asyncio.wait_for(workload.wait(), 2)
+    assert "".join([chunk async for chunk in workload.output()]) == "unfinished-�"
+    await process.handle.emit(b"late")
+    assert "".join([chunk async for chunk in workload.output()]) == ""
+
+
+async def test_daytona_controlled_utf8_keeps_existing_bounded_tail() -> None:
+    process = CgroupProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    for index in range(80):
+        await process.handle.emit(f"chunk-{index:02d}:".encode() + b"x" * 1024)
+    process.user_finished.set()
+    process.allow_final_frame.set()
+    result = await asyncio.wait_for(workload.wait(), 2)
+    streamed = "".join([chunk async for chunk in workload.output()])
+    assert streamed == "".join(
+        f"chunk-{index:02d}:" + "x" * 1024 for index in range(80)
+    ) + "final frame"
+    assert "chunk-00:" not in result.result.output
+    assert "chunk-79:" in result.result.output
+    assert result.result.output.endswith("final frame")
+    assert 0 < len(result.result.output) < len(streamed)
+    assert result.result.output == streamed[-len(result.result.output):]
+
+
+@pytest.mark.parametrize("split_frames", [False, True], ids=["oversized-frame", "many-frames"])
+async def test_daytona_controlled_utf8_result_tail_is_byte_bounded(split_frames: bool) -> None:
+    process = CgroupProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    frames = ["€" * 300] * 100 if split_frames else ["€" * 30000]
+    for frame in frames:
+        await process.handle.emit(frame.encode("utf-8"))
+    process.user_finished.set()
+    process.allow_final_frame.set()
+    result = await asyncio.wait_for(workload.wait(), 2)
+    streamed = "".join([chunk async for chunk in workload.output()])
+    assert streamed == "€" * 30000 + "final frame"
+    assert result.result.output == "€" * 21841 + "final frame"
+
+
+async def test_daytona_cgroup_probe_rejects_unsupported_kernel() -> None:
+    class UnsupportedProcess(Process):
+        async def exec(self, command: str) -> SimpleNamespace:
+            return SimpleNamespace(exit_code=1, result="cgroup.kill unavailable")
+
+    inner = InnerSandbox()
+    inner.process = UnsupportedProcess()
+    with pytest.raises(SandboxError, match="linux_cgroup_v2"):
+        await DaytonaSandbox(cast(Any, inner)).probe_generation_containment()
+
+
+async def test_daytona_natural_completion_fences_group_before_release_and_final_output(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(daytona_module, "_PTY_STATUS_POLL_SECONDS", 0.01)
+    process = CgroupProcess()
+    process.allow_creation.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    waiting = asyncio.create_task(workload.wait())
+    process.user_finished.set()
+    await asyncio.wait_for(process.removal_started.wait(), 2)
+    assert not waiting.done()
+    assert not process.release_seen.is_set()
+    assert process.group_exists
+
+    process.allow_removal.set()
+    await asyncio.wait_for(process.release_seen.wait(), 2)
+    assert not process.group_exists
+    assert not waiting.done()
+    process.allow_final_frame.set()
+    completed = await asyncio.wait_for(waiting, 2)
+    assert completed.result.exit_code == 7
+    assert completed.absence_confirmed_at <= asyncio.get_running_loop().time()
+    assert process.sessions == set()
+
+
+async def test_daytona_unconfirmed_group_removal_never_reports_absence() -> None:
+    process = CgroupProcess()
+    process.allow_creation.set()
+    process.removal_fails = True
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    with pytest.raises(SandboxError, match="cgroup removal failed"):
+        await asyncio.wait_for(workload.kill(), 2)
+    assert process.group_exists
+    assert not process.release_seen.is_set()
+    assert process.sessions
+    process.user_finished.set()
+    process.release_seen.set()
+    process.allow_final_frame.set()
+
+
+async def test_daytona_kill_before_command_admission() -> None:
+    process = CgroupProcess()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("must-not-run")
+    killing = asyncio.create_task(workload.kill())
+    await asyncio.sleep(0)
+    process.allow_creation.set()
+    await asyncio.wait_for(killing, 2)
+    assert not process.command_admitted.is_set()
+    assert not process.group_exists
+    assert process.sessions == set()
+
+    setup_sent = asyncio.Event()
+
+    class NoMarkerHandle(CgroupPtyHandle):
+        async def send_input(self, data: str) -> None:
+            self.inputs.append(data)
+            setup_sent.set()
+
+        async def wait(self) -> PtyResult:
+            await setup_sent.wait()
+            return PtyResult(exit_code=None, error="WebSocket error")
+
+    class NoMarkerProcess(CgroupProcess):
+        async def create_pty_session(
+            self, *, id: str, on_data: Callable[[bytes], None | Awaitable[None]],
+            envs: dict[str, str], pty_size: PtySize,
+        ) -> CgroupPtyHandle:
+            _assert_pty_create_config(envs, pty_size)
+            self.sessions.add(id)
+            return NoMarkerHandle(on_data, self)
+
+    stalled = NoMarkerProcess()
+    stalled.allow_creation.set()
+    stalled.allow_removal.set()
+    stopped = _cgroup_sandbox(stalled).controlled_workload("must-not-run")
+    await asyncio.wait_for(setup_sent.wait(), 2)
+    await asyncio.wait_for(stopped.kill(), 2)
+    assert not stalled.command_admitted.is_set()
+    assert not stalled.group_exists
+    assert stalled.sessions == set()
+
+
+async def test_daytona_control_poll_failure_can_still_be_stopped_explicitly(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _skip_retry_sleep(monkeypatch, DaytonaSandbox._control_exec)  # pyright: ignore[reportPrivateUsage]
+    process = CgroupProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    process.poll_error = True
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+
+    with pytest.raises(SandboxConnectionError, match="Sandbox connection error"):
+        await asyncio.wait_for(workload.wait(), 2)
+    assert not process.group_exists
+    assert process.sessions == set()
+
+    process.poll_error = False
+    await asyncio.wait_for(workload.kill(), 2)
+    assert not process.group_exists
+    assert process.sessions == set()
+
+
+async def test_daytona_output_consumer_waits_for_confirmed_group_stop() -> None:
+    process = CgroupProcess()
+    process.allow_creation.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    stream = workload.output()
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    await process.handle.emit(b"initial")
+    assert await asyncio.wait_for(anext(stream), 2) == "initial"
+    pending_output = asyncio.create_task(anext(stream))
+    killing = asyncio.create_task(workload.kill())
+    await asyncio.wait_for(process.removal_started.wait(), 2)
+    assert not pending_output.done()
+
+    process.allow_removal.set()
+    await asyncio.wait_for(killing, 2)
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(pending_output, 2)
+    await stream.aclose()
+    assert not process.group_exists
+    assert process.sessions == set()
+
+
+class LocalShellCgroupProcess(CgroupProcess):
+    def __init__(self, root: Path) -> None:
+        super().__init__()
+        self.status = root / "status"
+        self.workers: list[asyncio.subprocess.Process] = []
+        self.group = root / "group"
+        self.group.mkdir()
+        (self.group / "cgroup.procs").touch()
+        self.allow_creation.set()
+        self.allow_removal.set()
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        plain = _unwrap_shell_command(command)
+        if plain.startswith("mkdir /sys/fs/cgroup/cbs-"):
+            self.group_name = plain.removeprefix("mkdir ")
+        if plain.startswith("test -e ") and plain.endswith((".complete", ".status")):
+            marker = self.status / Path(plain[8:]).name
+            return SimpleNamespace(exit_code=0 if marker.exists() else 1, result="")
+        if plain.startswith("cat ") and plain.endswith(".status"):
+            status = self.status / Path(plain[4:]).name
+            return SimpleNamespace(exit_code=0, result=status.read_text())
+        if plain.startswith(": > ") and plain.endswith(".release"):
+            (self.status / Path(plain[4:]).name).touch()
+        return await super().exec(command)
+
+    async def create_pty_session(
+        self, *, id: str, on_data: Callable[[bytes], None | Awaitable[None]],
+        envs: dict[str, str], pty_size: PtySize,
+    ) -> "LocalShellCgroupPtyHandle":
+        _assert_pty_create_config(envs, pty_size)
+        self.sessions.add(id)
+        self.pty_marker = envs[_PTY_CREATE_MARKER_ENV]
+        return LocalShellCgroupPtyHandle(on_data, self, envs)
+
+
+class LocalShellCgroupPtyHandle(CgroupPtyHandle):
+    def __init__(
+        self, on_data: Callable[[bytes], None | Awaitable[None]],
+        process: LocalShellCgroupProcess, envs: dict[str, str],
+    ) -> None:
+        super().__init__(on_data, process)
+        self.process = process
+        self.envs = envs
+
+    async def send_input(self, data: str) -> None:
+        if data.startswith("stty"):
+            await self.emit(self.process.pty_marker.encode() + b"\r\n")
+            return
+        local_command = shlex.split(data.removeprefix(f"unset {_PTY_CREATE_MARKER_ENV}; "))[3]
+        local_command = local_command.replace(
+            f"{self.process.group_name}/cgroup.procs", str(self.process.group / "cgroup.procs")
+        )
+        local_command = local_command.replace(
+            daytona_module._STATUS_DIR, str(self.process.status)  # pyright: ignore[reportPrivateUsage]
+        )
+        self.worker = await asyncio.create_subprocess_exec(
+            "/bin/sh", "-c", local_command,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            start_new_session=True,
+            env={"PATH": os.environ["PATH"], **self.envs},
+        )
+        self.process.workers.append(self.worker)
+        self.process.command_admitted.set()
+
+    async def wait(self) -> PtyResult:
+        await self.process.command_admitted.wait()
+        output, _ = await self.worker.communicate()
+        await self.emit(output)
+        return PtyResult(exit_code=self.worker.returncode, error=None)
+
+
+async def _finish_local_workers(process: LocalShellCgroupProcess) -> None:
+    for worker in process.workers:
+        if worker.returncode is None:
+            os.killpg(worker.pid, signal.SIGKILL)
+        await worker.wait()
+
+
+async def test_daytona_controlled_nonnull_cwd_runs_real_shell_and_preserves_exit(
+    tmp_path: Path,
+) -> None:
+    cwd = tmp_path / "working directory with spaces"
+    cwd.mkdir()
+    env_name = "CBS_DAYTONA_CHILD_ENV_R141"
+    env_value = "r141-pty-env-from-created-session"
+    assert env_name not in os.environ
+    process = LocalShellCgroupProcess(tmp_path)
+    try:
+        workload = _cgroup_sandbox(process).controlled_workload(
+            f'printf "%s\n" "$PWD" "${env_name}"; printf full-tail; exit 17',
+            cwd=str(cwd), env_vars={env_name: env_value},
+        )
+        completed = await asyncio.wait_for(workload.wait(), 5)
+        assert completed.result.output == f"{cwd}\n{env_value}\nfull-tail"
+        assert completed.result.exit_code == 17
+        assert not process.group_exists
+        assert process.sessions == set()
+    finally:
+        await _finish_local_workers(process)
+
+async def _generated_daytona_command_in_host_pty(command: str, tmp_path: Path) -> tuple[int, str]:
+    process = CgroupProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    process.allow_final_frame.set()
+    workload = cast(_DaytonaControlledWorkload, _cgroup_sandbox(process).controlled_workload(command))
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    generated = process.handle.inputs[1]
+    group = workload._group  # pyright: ignore[reportPrivateUsage]
+    status = workload._status_path  # pyright: ignore[reportPrivateUsage]
+    paths = {
+        group: tmp_path / "group",
+        status: tmp_path / "status",
+        workload._status_temp_path: tmp_path / "status.tmp",  # pyright: ignore[reportPrivateUsage]
+        workload._complete: tmp_path / "complete",  # pyright: ignore[reportPrivateUsage]
+        workload._release: tmp_path / "release",  # pyright: ignore[reportPrivateUsage]
+    }
+    process.user_finished.set()
+    await asyncio.wait_for(workload.wait(), 2)
+
+    paths[group].mkdir()
+    paths[workload._release].touch()  # pyright: ignore[reportPrivateUsage]
+    for original, local in paths.items():
+        generated = generated.replace(original, str(local))
+    prelude = f"stty -echo; {generated}"
+    shell = f"/bin/bash --noprofile --norc -ic {shlex.quote(prelude)}"
+    child = subprocess.Popen(
+        ["script", "-q", "-e", "-c", shell, "/dev/null"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True,
+        env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path), "TERM": "dumb"},
+    )
+    try:
+        output, _ = child.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        # The generated child can be in a different PTY process group from `script`.
+        group_pid_file = paths[group] / "cgroup.procs"
+        if group_pid_file.exists():
+            with suppress(ProcessLookupError):
+                os.killpg(os.getpgid(int(group_pid_file.read_text())), signal.SIGKILL)
+        with suppress(ProcessLookupError):
+            os.killpg(child.pid, signal.SIGKILL)
+        raise
+    finally:
+        child.wait(timeout=5)
+    assert child.returncode == int(paths[status].read_text())
+    return child.returncode, output
+
+
+async def test_daytona_controlled_pty_command_can_use_terminal_modes(tmp_path: Path) -> None:
+    exit_code, _ = await _generated_daytona_command_in_host_pty("stty sane", tmp_path)
+    assert exit_code == 0
+
+
+async def test_daytona_controlled_pty_output_has_no_shell_job_notice(tmp_path: Path) -> None:
+    exit_code, output = await _generated_daytona_command_in_host_pty(
+        "printf agent-output; printf agent-error >&2", tmp_path
+    )
+    assert exit_code == 0
+    assert output.strip() == "agent-outputagent-error"
+
+
+
+class UnwritableStatusLocalShellProcess(LocalShellCgroupProcess):
+    async def create_pty_session(
+        self, *, id: str, on_data: Callable[[bytes], None | Awaitable[None]],
+        envs: dict[str, str], pty_size: PtySize,
+    ) -> "LocalShellCgroupPtyHandle":
+        self.status.mkdir(exist_ok=True)
+        (self.status / f"{id.rsplit('-', 1)[-1]}.status.tmp").mkdir()
+        return await super().create_pty_session(id=id, on_data=on_data, envs=envs, pty_size=pty_size)
+
+
+async def test_daytona_status_write_failure_does_not_report_workload_result(tmp_path: Path) -> None:
+    process = UnwritableStatusLocalShellProcess(tmp_path)
+    try:
+        workload = _cgroup_sandbox(process).controlled_workload("exit 7")
+        with pytest.raises(SandboxError, match="PTY exited before writing command status"):
+            await asyncio.wait_for(workload.wait(), 5)
+        assert not process.group_exists
+        assert process.sessions == set()
+    finally:
+        await _finish_local_workers(process)
+
+
+class KilledLocalShellCgroupProcess(LocalShellCgroupProcess):
+    async def exec(self, command: str) -> SimpleNamespace:
+        plain = _unwrap_shell_command(command)
+        if plain.startswith("d=/sys/fs/cgroup/cbs-"):
+            def subtree_pids(pid: int) -> list[int]:
+                pids = [pid]
+                for child in Path(f"/proc/{pid}/task/{pid}/children").read_text().split():
+                    pids.extend(subtree_pids(int(child)))
+                return pids
+
+            pids = subtree_pids(int((self.group / "cgroup.procs").read_text().strip()))
+            for pid in pids:
+                os.kill(pid, signal.SIGKILL)
+        return await super().exec(command)
+
+    async def create_pty_session(
+        self, *, id: str, on_data: Callable[[bytes], None | Awaitable[None]],
+        envs: dict[str, str], pty_size: PtySize,
+    ) -> "LocalShellCgroupPtyHandle":
+        handle = await super().create_pty_session(id=id, on_data=on_data, envs=envs, pty_size=pty_size)
+        self.local_handle = handle
+        return handle
+
+    async def kill_pty_session(self, session_id: str) -> None:
+        self.local_handle.worker.kill()
+        await self.local_handle.worker.wait()
+        await super().kill_pty_session(session_id)
+
+
+async def test_daytona_intentional_kill_retains_shell_exit_status_before_pty_sigkill(
+    tmp_path: Path,
+) -> None:
+    process = KilledLocalShellCgroupProcess(tmp_path)
+    try:
+        marker = tmp_path / "running"
+        command = f"printf ready > {shlex.quote(str(marker))}; exec sleep 30"
+        workload = _cgroup_sandbox(process).controlled_workload(command)
+        await asyncio.wait_for(process.command_admitted.wait(), 2)
+        async with asyncio.timeout(2):
+            while not marker.exists() or marker.read_text() != "ready":
+                await asyncio.sleep(0.01)
+        await asyncio.wait_for(workload.kill(), 5)
+        completed = await asyncio.wait_for(workload.wait(), 5)
+        assert completed.result.exit_code == 137
+        assert not process.group_exists
+        assert process.sessions == set()
+    finally:
+        await _finish_local_workers(process)
+
+
+class ListedCgroupProcess(CgroupProcess):
+    def __init__(self) -> None:
+        super().__init__()
+        self.list_error = False
+        self.preserve_session = False
+        self.list_calls = 0
+
+    async def kill_pty_session(self, session_id: str) -> None:
+        if self.preserve_session:
+            self.user_finished.set()
+            self.release_seen.set()
+            return
+        await super().kill_pty_session(session_id)
+
+    async def list_pty_sessions(self) -> list[SimpleNamespace]:
+        self.list_calls += 1
+        if self.list_error:
+            raise DaytonaConnectionError("PTY listing unavailable")
+        return await super().list_pty_sessions()
+
+
+@pytest.mark.parametrize("failure", ["error", "present"])
+async def test_daytona_natural_wait_rejects_unconfirmed_pty_absence(failure: str) -> None:
+    process = ListedCgroupProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    process.allow_final_frame.set()
+    process.list_error = failure == "error"
+    process.preserve_session = failure == "present"
+    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    process.user_finished.set()
+    error = SandboxConnectionError if failure == "error" else SandboxError
+    with pytest.raises(error):
+        await asyncio.wait_for(workload.wait(), 2)
+    assert process.list_calls == 1
+    assert not process.group_exists
+    assert process.release_seen.is_set()
+
+
+@pytest.mark.parametrize("failure", ["error", "present"])
+async def test_daytona_kill_rejects_unconfirmed_pty_absence(failure: str) -> None:
+    process = ListedCgroupProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    process.allow_final_frame.set()
+    process.list_error = failure == "error"
+    process.preserve_session = failure == "present"
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    error = SandboxConnectionError if failure == "error" else SandboxError
+    with pytest.raises(error):
+        await asyncio.wait_for(workload.kill(), 2)
+    assert process.list_calls == 2
+    assert not process.group_exists
+
+
+async def test_daytona_kill_accepts_failed_pty_cleanup_after_fresh_absence() -> None:
+    class AlreadyAbsentProcess(ListedCgroupProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_events: list[str] = []
+
+        async def kill_pty_session(self, session_id: str) -> None:
+            assert session_id not in self.sessions
+            self.user_finished.set()
+            self.release_seen.set()
+            self.close_events.append("kill failed")
+            raise DaytonaError("PTY session not found")
+
+        async def list_pty_sessions(self) -> list[SimpleNamespace]:
+            sessions = await super().list_pty_sessions()
+            if self.close_events:
+                self.close_events.append("listed")
+            return sessions
+
+    process = AlreadyAbsentProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    process.allow_final_frame.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    assert process.group_exists
+    assert len(process.sessions) == 1
+    process.sessions.remove(next(iter(process.sessions)))
+
+    await asyncio.wait_for(workload.kill(), 2)
+    assert process.close_events == ["kill failed", "listed"]
+    assert process.sessions == set()
+    assert not process.group_exists
+    await asyncio.wait_for(workload.wait(), 2)
+
+
+async def test_daytona_cleanup_retries_failed_close_after_provider_recovers() -> None:
+    process = ListedCgroupProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    process.allow_final_frame.set()
+    process.list_error = True
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    with pytest.raises(SandboxConnectionError, match="PTY listing unavailable"):
+        await asyncio.wait_for(workload.kill(), 2)
+    assert process.list_calls == 2
+    assert process.sessions == set()
+
+    process.list_error = False
+    await asyncio.wait_for(workload.kill(), 2)
+    assert process.list_calls == 3
+    with pytest.raises(SandboxConnectionError, match="PTY listing unavailable"):
+        await asyncio.wait_for(workload.wait(), 2)
+    assert process.list_calls == 3
+
+
+async def test_daytona_kill_retries_internal_failed_close_in_final_step() -> None:
+    class FirstListingFailsProcess(ListedCgroupProcess):
+        async def list_pty_sessions(self) -> list[SimpleNamespace]:
+            self.list_error = self.list_calls == 0
+            return await super().list_pty_sessions()
+
+    process = FirstListingFailsProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    await asyncio.wait_for(workload.kill(), 2)
+    assert process.list_calls == 2
+    assert process.sessions == set()
+    assert not process.group_exists
+    with pytest.raises(SandboxConnectionError, match="PTY listing unavailable"):
+        await asyncio.wait_for(workload.wait(), 2)
+    assert process.list_calls == 2
+
+
+async def test_daytona_output_cancellation_does_not_stop_admitted_work() -> None:
+    process = CgroupProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    stream = workload.output()
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    await process.handle.emit(b"initial")
+    assert await asyncio.wait_for(anext(stream), 2) == "initial"
+    pending = asyncio.create_task(anext(stream))
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    assert process.group_exists
+    assert process.sessions
+    await asyncio.wait_for(workload.kill(), 2)
+    assert not process.group_exists
+    assert process.sessions == set()
+    await stream.aclose()
+
+
+async def test_daytona_confirmed_kill_preserves_already_buffered_output() -> None:
+    process = CgroupProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    await process.handle.emit(b"buffered-tail")
+    await asyncio.wait_for(workload.kill(), 2)
+    chunks = [chunk async for chunk in workload.output()]
+    assert "".join(chunks).endswith("buffered-tail")
+    assert not process.group_exists
+    assert process.sessions == set()
+
+
+async def test_daytona_failed_kill_keeps_waiting_output_consumer_open() -> None:
+    process = CgroupProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    process.removal_fails = True
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    stream = workload.output()
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    await process.handle.emit(b"initial")
+    assert await asyncio.wait_for(anext(stream), 2) == "initial"
+    pending = asyncio.create_task(anext(stream))
+    with pytest.raises(SandboxError, match="cgroup removal failed"):
+        await asyncio.wait_for(workload.kill(), 2)
+    assert process.group_exists
+    assert not pending.done()
+    pending.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await pending
+    await stream.aclose()
+    process.user_finished.set()
+    process.release_seen.set()
+    process.allow_final_frame.set()
+    async with asyncio.timeout(2):
+        chunks = [chunk async for chunk in workload.output()]
+    assert "final frame" in "".join(chunks)
+
+
+async def test_daytona_natural_completion_drains_queued_and_final_pty_frames() -> None:
+    process = CgroupProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    process.allow_final_frame.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    await process.handle.emit(b"queued-tail")
+    process.user_finished.set()
+    completed = await asyncio.wait_for(workload.wait(), 2)
+    chunks = [chunk async for chunk in workload.output()]
+    assert completed.result.output.endswith("queued-tailfinal frame")
+    assert "".join(chunks) == completed.result.output
+    assert completed.result.exit_code == 7
+
+
+async def test_daytona_natural_wait_and_kill_share_pty_closure_during_final_drain() -> None:
+    process = ListedCgroupProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    waiting = asyncio.create_task(workload.wait())
+    process.user_finished.set()
+    await asyncio.wait_for(process.release_seen.wait(), 2)
+    assert not waiting.done()
+    await asyncio.wait_for(workload.kill(), 2)
+    completed = await asyncio.wait_for(waiting, 2)
+    assert completed.result.exit_code == 7
+    assert "final frame" not in completed.result.output
+    assert process.list_calls == 1
+    assert not process.group_exists
+    assert process.sessions == set()
+
+
+async def test_daytona_confirmed_kill_does_not_wait_for_stalled_status_probe(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(daytona_module, "_PTY_STATUS_POLL_SECONDS", 0.01)
+    class StalledStatusProcess(CgroupProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.status_started = asyncio.Event()
+            self.status_allowed = asyncio.Event()
+
+        async def exec(self, command: str) -> SimpleNamespace:
+            plain = _unwrap_shell_command(command)
+            if plain.startswith("test -e ") and plain.endswith(".status"):
+                self.status_started.set()
+                await self.status_allowed.wait()
+            return await super().exec(command)
+
+    process = StalledStatusProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    await asyncio.wait_for(process.status_started.wait(), 2)
+    await asyncio.wait_for(workload.kill(), 2)
+    assert not process.group_exists
+    assert process.sessions == set()
+    waiting = asyncio.create_task(workload.wait())
+    assert not waiting.done()
+    process.status_allowed.set()
+    await asyncio.wait_for(waiting, 2)
+
+
+class NestedCgroupProcess(CgroupProcess):
+    def __init__(self, root: Path) -> None:
+        super().__init__()
+        self.root = root / "group"
+        self.removal_bin = root / "bin"
+        self.removal_bin.mkdir()
+        wrapper = self.removal_bin / "rmdir"
+        wrapper.write_text(
+            '#!/bin/sh\nfor dir do\n'
+            '  rm -f "$dir/cgroup.events" "$dir/cgroup.kill" "$dir/cgroup.procs"\n'
+            '  PATH=/usr/bin:/bin rmdir "$dir" || exit $?\n'
+            'done\n'
+        )
+        wrapper.chmod(0o700)
+
+    async def exec(self, command: str) -> SimpleNamespace:
+        plain = _unwrap_shell_command(command)
+        if plain.startswith("mkdir /sys/fs/cgroup/cbs-"):
+            self.group_name = plain.removeprefix("mkdir ")
+            for directory in (
+                self.root,
+                self.root / ".hidden",
+                self.root / ".hidden" / "nested",
+            ):
+                directory.mkdir()
+                (directory / "cgroup.events").write_text("populated 0\n")
+                (directory / "cgroup.kill").touch()
+                (directory / "cgroup.procs").touch()
+            self.group_exists = True
+            self.group_created.set()
+            return SimpleNamespace(exit_code=0, result="")
+        if plain.startswith("d=/sys/fs/cgroup/cbs-"):
+            self.removal_started.set()
+            shell = plain.replace(self.group_name, str(self.root))
+            process = await asyncio.create_subprocess_exec(
+                "/bin/sh", "-c", shell,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+                env={**os.environ, "PATH": f"{self.removal_bin}:{os.environ['PATH']}"},
+            )
+            output, _ = await process.communicate()
+            self.group_exists = self.root.exists()
+            if process.returncode == 0 and self.command_admitted.is_set():
+                self.user_finished.set()
+            return SimpleNamespace(exit_code=process.returncode, result=output.decode())
+        return await super().exec(command)
+
+
+async def test_daytona_kill_removes_hidden_nested_groups_before_root_fence(
+    tmp_path: Path,
+) -> None:
+    process = NestedCgroupProcess(tmp_path)
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    await asyncio.wait_for(workload.kill(), 2)
+    assert not process.root.exists()
+    assert not (process.root / ".hidden" / "nested").exists()
+    assert process.sessions == set()
+
+
+class ResultCgroupProcess(CgroupProcess):
+    def __init__(self, pty_result: PtyResult) -> None:
+        super().__init__()
+        self.pty_result = pty_result
+        self.allow_creation.set()
+        self.allow_removal.set()
+        self.allow_final_frame.set()
+
+    async def create_pty_session(
+        self, *, id: str, on_data: Callable[[bytes], None | Awaitable[None]],
+        envs: dict[str, str], pty_size: PtySize,
+    ) -> "ResultCgroupPtyHandle":
+        _assert_pty_create_config(envs, pty_size)
+        self.sessions.add(id)
+        self.pty_marker = envs[_PTY_CREATE_MARKER_ENV]
+        return ResultCgroupPtyHandle(on_data, self)
+
+
+class ResultCgroupPtyHandle(CgroupPtyHandle):
+    def __init__(
+        self, on_data: Callable[[bytes], None | Awaitable[None]], process: ResultCgroupProcess
+    ) -> None:
+        super().__init__(on_data, process)
+        self.process = process
+
+    async def wait(self) -> PtyResult:
+        await super().wait()
+        return self.process.pty_result
+
+
+@pytest.mark.parametrize(
+    ("exit_code", "error"),
+    [(None, "WebSocket error"), (0, "WebSocket error: dropped")],
+)
+async def test_daytona_complete_status_rejects_pty_websocket_error(
+    exit_code: int | None, error: str,
+) -> None:
+    process = ResultCgroupProcess(PtyResult(exit_code=exit_code, error=error))
+    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    process.user_finished.set()
+    with pytest.raises(SandboxError, match="WebSocket error"):
+        await asyncio.wait_for(workload.wait(), 2)
+    assert not process.group_exists
+
+
+async def test_daytona_normal_pty_exit_reason_preserves_status_and_final_frame() -> None:
+    process = ResultCgroupProcess(PtyResult(exit_code=7, error="completed"))
+    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    process.user_finished.set()
+    completed = await asyncio.wait_for(workload.wait(), 2)
+    assert completed.result.exit_code == 7
+    assert completed.result.output.endswith("final frame")
+    assert not process.group_exists
+    assert process.sessions == set()

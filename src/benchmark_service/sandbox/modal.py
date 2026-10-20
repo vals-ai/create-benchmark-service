@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
+import logging
 import os
 import re
 import shlex
@@ -57,11 +57,32 @@ _ALLOW_ALL_CIDRS = ("0.0.0.0/0",)
 _ALLOW_ALL_DOMAINS = ("*",)
 _COMMAND_STATUS_POLL_SECONDS = 10
 _CONTROLLED_OUTPUT_TAIL_BYTES = 64 * 1024
-_MAX_NAME_LENGTH = 64
 _INVALID_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_.-]")
-_APP_ID_PATTERN = re.compile(r"^ap-[a-zA-Z0-9]{22}$")
-_RATE_LIMIT_RETRY_BASE_SECONDS = 1.0
-_RATE_LIMIT_RETRY_MAX_SECONDS = 10.0
+logger = logging.getLogger(__name__)
+# Late allocations outlive request-scoped providers.
+_BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
+
+
+def _background_finished(task: asyncio.Task[None]) -> None:
+    _BACKGROUND_TASKS.discard(task)
+    try:
+        task.result()
+    except BaseException:
+        logger.exception("Modal background task failed: %s", task.get_name())
+
+
+def _start_background(action: Coroutine[Any, Any, None], name: str) -> asyncio.Task[None]:
+    task = asyncio.create_task(action, name=name)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_background_finished)
+    return task
+
+
+async def _close_client(client: Client, cleanup: tuple[asyncio.Task[None], ...]) -> None:
+    try:
+        await asyncio.gather(*cleanup, return_exceptions=True)
+    finally:
+        await client._close.aio()  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType]
 
 
 _PROVIDER_RETRY = retry(
@@ -126,24 +147,6 @@ def _command(command: str, cwd: str | None, timeout: float | None) -> str:
     if cwd:
         command = f"cd {shlex.quote(cwd)} && {command}"
     return f"{{ {command} ; }} 2>&1"
-
-
-def _modal_sandbox_name(name: str) -> str:
-    """Return the deterministic Modal SDK name for a requested sandbox name.
-
-    Arguments
-    - name: Requested sandbox name from the benchmark task.
-
-    Returns
-    A Modal-safe name for SDK lookup/create calls; callers should keep the original name on Sandbox.
-    """
-    modal_name = _INVALID_NAME_CHARS.sub("_", name) or "sandbox"
-    if _APP_ID_PATTERN.fullmatch(modal_name):
-        modal_name = f"sandbox-{modal_name}"
-    if len(modal_name) <= _MAX_NAME_LENGTH:
-        return modal_name
-    digest = hashlib.sha1(name.encode()).hexdigest()[:8]
-    return f"{modal_name[:55]}-{digest}"
 
 
 class ModalSandbox(Sandbox):
@@ -580,6 +583,7 @@ class ModalSandboxProvider(SandboxProvider):
         self._config = config
         self._client: Client | None = None
         self._app: App | None = None
+        self._cleanup_tasks: set[asyncio.Task[None]] = set()
 
     async def _connect(self) -> tuple[Client, App]:
         if self._client is None or self._app is None:
@@ -649,35 +653,14 @@ class ModalSandboxProvider(SandboxProvider):
         except ModalError as exc:
             raise _sandbox_error(exc) from exc
 
-    async def _find_reusable_sandbox(self, name: str, client: Client) -> ModalSdkSandbox | None:
-        # Match Daytona: task retry/resume reuses a still-running sandbox by
-        # name (Modal names are unique per app, so a blind create would raise).
-        try:
-            inner = await ModalSdkSandbox.from_name.aio(
-                _APP_NAME,
-                name,
-                client=client,
-            )
-        except ModalNotFoundError:
-            return None
-        except ModalError as exc:
-            raise _sandbox_error(exc) from exc
-        try:
-            still_running = await inner.poll.aio() is None
-        except ModalError as exc:
-            raise _sandbox_error(exc) from exc
-        return inner if still_running else None
-
-    @_PROVIDER_RETRY
     async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
         if request.sandbox_secrets:
             raise SandboxError("Modal sandbox provider does not support sandbox_secrets")
 
         client, app = await self._connect()
-        modal_name = _modal_sandbox_name(request.name)
-        existing = await self._find_reusable_sandbox(modal_name, client)
-        if existing is not None:
-            return ModalSandbox(existing, name=request.name, labels=request.labels)
+        # Keep the full UUID within Modal's 64-character name limit.
+        prefix = _INVALID_NAME_CHARS.sub("_", request.name)[:31] or "sandbox"
+        modal_name = f"{prefix}-{uuid.uuid4().hex}"
         image = self._resolve_image(request.source, client)
         allow_all_egress = not request.network_block_all
         gpu: str | None = None
@@ -685,6 +668,7 @@ class ModalSandboxProvider(SandboxProvider):
             if not request.resources.gpu_type:
                 raise SandboxError("Modal sandbox provider requires gpu_type when gpu is requested")
             gpu = f"{request.resources.gpu_type}:{request.resources.gpu}"
+        runtime = "gvisor" if gpu else self._config.runtime
         create_kwargs: dict[str, Any] = {
             "app": app,
             "name": modal_name,
@@ -700,38 +684,42 @@ class ModalSandboxProvider(SandboxProvider):
             "outbound_cidr_allowlist": list(_ALLOW_ALL_CIDRS) if allow_all_egress else None,
             "outbound_domain_allowlist": list(_ALLOW_ALL_DOMAINS) if allow_all_egress else None,
             "client": client,
-            "runtime": self._config.runtime,
-            "experimental_options": {"enable_docker": True} if self._config.runtime == "gvisor" else None,
+            "runtime": runtime,
+            # Keep this flag: nested Docker's overlay2 failed without it on T4.
+            "experimental_options": {"enable_docker": True} if runtime == "gvisor" else None,
         }
         if request.volumes:
             create_kwargs["volumes"] = self._resolve_volumes(request.volumes, client, request.labels)
 
-        loop = asyncio.get_running_loop()
-        deadline = loop.time() + request.create_timeout
-        retry_delay = _RATE_LIMIT_RETRY_BASE_SECONDS
+        # One SDK call preserves Modal's transport idempotency key.
+        creation = asyncio.create_task(ModalSdkSandbox.create.aio(**create_kwargs))  # pyright: ignore[reportUnknownMemberType]
         try:
-            async with asyncio.timeout_at(deadline):
-                while True:
-                    try:
-                        # No entrypoint args: an argless Modal sandbox idles until timeout.
-                        inner = await ModalSdkSandbox.create.aio(**create_kwargs)  # pyright: ignore[reportUnknownMemberType]
-                    except ModalResourceExhaustedError as exc:
-                        if loop.time() + retry_delay >= deadline:
-                            raise SandboxError(
-                                f"Modal sandbox creation rate limit still exceeded after {request.create_timeout}s: {exc}"
-                            ) from exc
-                        await asyncio.sleep(retry_delay)
-                        retry_delay = min(retry_delay * 2, _RATE_LIMIT_RETRY_MAX_SECONDS)
-                    except ModalNotFoundError as exc:
-                        if request.volumes and _is_missing_volume_error(exc):
-                            raise SandboxError(f"Modal volume mount failed: {exc}") from exc
-                        raise _sandbox_error(exc) from exc
-                    except ModalError as exc:
-                        raise _sandbox_error(exc) from exc
-                    else:
-                        return ModalSandbox(inner, name=request.name, labels=request.labels)
-        except TimeoutError as exc:
+            async with asyncio.timeout(request.create_timeout):
+                inner = await asyncio.shield(creation)
+        except (TimeoutError, asyncio.CancelledError) as exc:
+            # Retain ownership until the late allocation can be terminated.
+            cleanup = _start_background(self._cleanup_create(creation), f"Modal cleanup {request.name}")
+            self._cleanup_tasks.add(cleanup)
+            cleanup.add_done_callback(self._cleanup_tasks.discard)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
             raise SandboxError(f"Failed to create Modal sandbox within {request.create_timeout}s") from exc
+        except ModalResourceExhaustedError as exc:
+            raise SandboxError(f"Modal sandbox resources exhausted: {exc}") from exc
+        except ModalNotFoundError as exc:
+            if request.volumes and _is_missing_volume_error(exc):
+                raise SandboxError(f"Modal volume mount failed: {exc}") from exc
+            raise _sandbox_error(exc) from exc
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
+        return ModalSandbox(inner, name=request.name, labels=request.labels)
+
+    async def _cleanup_create(self, creation: asyncio.Task[ModalSdkSandbox]) -> None:
+        try:
+            inner = await creation
+            await inner.terminate.aio(wait=True)
+        except ModalError as exc:
+            raise _sandbox_error(exc) from exc
 
     @_PROVIDER_RETRY
     async def get_sandbox(self, instance_id: str) -> Sandbox:
@@ -777,7 +765,13 @@ class ModalSandboxProvider(SandboxProvider):
             raise _sandbox_error(exc) from exc
 
     async def close(self) -> None:
-        if self._client is not None:
-            await self._client._close.aio()  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType]
-            self._client = None
-            self._app = None
+        if self._client is None:
+            return
+        client = self._client
+        self._client = None
+        self._app = None
+        cleanup = tuple(self._cleanup_tasks)
+        self._cleanup_tasks.clear()
+        closing = _start_background(_close_client(client, cleanup), "Modal client close")
+        if not cleanup:
+            await asyncio.shield(closing)

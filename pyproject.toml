@@ -32,6 +32,11 @@ vals-ai = [
     "descope>=1.13.0",
     "sentry-sdk[fastapi]>=2.58.0,<3.0",
 ]
+vals-judge = [
+    "create-benchmark-service[vals-ai]",
+    "model-library>=0.1.28",
+    "valsai",
+]
 
 [dependency-groups]
 dev = [
@@ -41,9 +46,9 @@ dev = [
     "pytest-asyncio>=1.3.0",
     "httpx>=0.28.1",
     "opentelemetry-sdk>=1.20.0",
-    "opentelemetry-instrumentation-httpx>=0.61b0,<0.62",
+    "opentelemetry-instrumentation-httpx>=0.60b1,<0.62",
     "types-pyyaml>=6.0.12",
-    "create-benchmark-service[vals-ai]",
+    "create-benchmark-service[vals-judge]",
 ]
 
 [build-system]
@@ -85,6 +90,12 @@ reportAny = false
 reportMissingTypeStubs = false
 enableTypeIgnoreComments = true
 exclude = [".*", "**/*-service/"]
+
+[tool.uv]
+# The vals-judge extra leaves valsai unbounded: services install it from a platform
+# submodule that builds as 0.3.1.devN. This keeps CBS's own lock on a release with
+# CheckResult.eval_error and the model-library version those services run.
+constraint-dependencies = ["valsai>=0.3.12"]
 
 [tool.uv.sources]
 create-benchmark-service = { workspace = true }

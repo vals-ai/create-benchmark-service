@@ -78,7 +78,7 @@ _TRIAL_ALLOWED_PATH = re.compile(r"/v1/(?:evaluate|score|datasets/[^/]+/tasks)")
 
 
 def _trial_tenant_may_access_path(path: str) -> bool:
-    return path == "/resolve-dataset" or _TRIAL_ALLOWED_PATH.fullmatch(path) is not None
+    return path in {"/resolve-dataset", "/v1/datasets"} or _TRIAL_ALLOWED_PATH.fullmatch(path) is not None
 
 
 GRADING_SANDBOX_PROVIDER_ENV = "GRADING_SANDBOX_PROVIDER"

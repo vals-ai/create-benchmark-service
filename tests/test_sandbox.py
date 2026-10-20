@@ -27,7 +27,7 @@ from daytona.common.errors import (
 from daytona.common.pty import PtyResult, PtySize
 from daytona_api_client import VolumeState
 from daytona_api_client_async import GpuType as ApiGpuType
-from daytona_api_client_async import SandboxClass
+from daytona_api_client_async import Region, RegionType, SandboxClass
 from daytona_api_client_async.exceptions import ApiException, NotFoundException
 from daytona_toolbox_api_client_async.models.pty_session_info import PtySessionInfo
 from multidict import CIMultiDict, CIMultiDictProxy
@@ -51,7 +51,9 @@ from benchmark_service.sandbox import (
     SandboxCreateRequest,
     SandboxError,
     SandboxNotFoundError,
+    SandboxProvider,
     SandboxQuery,
+    SandboxReservationDemand,
     SandboxSource,
     SnapshotSource,
     TargetedSnapshotSource,
@@ -1669,6 +1671,7 @@ async def test_daytona_targeted_snapshot_admission_propagates_cancellation(
     [
         ("west", None, True, True),
         ("us-west-3", ["us-west-3"], True, False),
+        ("west", ["earth"], False, True),
         ("west", [], False, True),
         ("west", ["other-region"], False, True),
     ],
@@ -1685,7 +1688,7 @@ async def test_daytona_targeted_gpu_snapshot_checks_target_scope_before_unmetere
         monkeypatch,
         AssertionError("GPU admission should not fetch organization usage"),
         snapshot=_snapshot_metadata(gpu=1, region_ids=region_ids),
-        regions=[SimpleNamespace(id="us-west-3", name="west")],
+        regions=[SimpleNamespace(id="us-west-3", name="west", region_type=RegionType.DEDICATED)],
         region_requests=region_requests,
     )
     decision = provider.check_admission(
@@ -1700,6 +1703,248 @@ async def test_daytona_targeted_gpu_snapshot_checks_target_scope_before_unmetere
             await decision
     assert requested == []
     assert region_requests == (["list_available_regions"] if resolves_target else [])
+
+
+def _demand_provider(
+    monkeypatch: pytest.MonkeyPatch,
+    snapshot: Exception | SimpleNamespace,
+    *,
+    regions: Exception | list[Region] | None = None,
+    **config: object,
+) -> tuple[DaytonaSandboxProvider, list[str], list[str]]:
+    provider = _configured_daytona_provider(**config)
+    target_requests, snapshot_requests = _targeted_snapshot_result(monkeypatch, provider, snapshot)
+
+    async def list_available_regions() -> list[Region]:
+        if isinstance(regions, Exception):
+            raise regions
+        if regions is not None:
+            return regions
+        return [
+            Region(
+                id=region_id,
+                name=name,
+                region_type=region_type,
+                created_at="2026-01-01T00:00:00Z",
+                updated_at="2026-01-01T00:00:00Z",
+            )
+            for region_id, name, region_type in [
+                ("us-id", "us", RegionType.SHARED),
+                ("eu-id", "eu", RegionType.DEDICATED),
+                ("custom-id", "custom", RegionType.CUSTOM),
+            ]
+        ]
+
+    def api_client(_value: object) -> nullcontext[None]:
+        return nullcontext()
+
+    def organizations_api(_value: object) -> SimpleNamespace:
+        return SimpleNamespace(list_available_regions=list_available_regions)
+
+    monkeypatch.setattr("benchmark_service.sandbox.daytona.DaytonaApiClient", api_client)
+    monkeypatch.setattr("benchmark_service.sandbox.daytona.OrganizationsApi", organizations_api)
+    return provider, target_requests, snapshot_requests
+
+
+async def test_default_provider_does_not_support_reservation_demand() -> None:
+    class Provider(SandboxProvider):
+        async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
+            raise NotImplementedError
+
+        async def get_sandbox(self, instance_id: str) -> Sandbox:
+            raise NotImplementedError
+
+        async def delete_sandbox(self, instance_id: str) -> None:
+            raise NotImplementedError
+
+        def list_sandboxes(self, query: SandboxQuery) -> AsyncGenerator[Sandbox, None]:
+            raise NotImplementedError
+
+    with pytest.raises(NotImplementedError):
+        await Provider().reservable_demand(_ADMISSION_IMAGE, _ADMISSION_RESOURCES)
+
+
+@pytest.mark.parametrize("sandbox_class", [SandboxClass.CONTAINER, SandboxClass.LINUX_VM])
+@pytest.mark.parametrize(
+    "source",
+    [
+        SnapshotSource(snapshot="snap"),
+        TargetedSnapshotSource(snapshot="snap", target="us"),
+        TargetedSnapshotSource(snapshot="snap", target="us-id"),
+        ComposeSource(outer=SnapshotSource(snapshot="snap")),
+        TargetedSnapshotSource(snapshot="snap", target="eu"),
+        TargetedSnapshotSource(snapshot="snap", target="eu-id"),
+    ],
+    ids=["snapshot", "targeted", "targeted_id", "compose", "foreign_target", "foreign_target_id"],
+)
+async def test_daytona_reservable_demand_reads_exact_snapshot_size_and_class(
+    monkeypatch: pytest.MonkeyPatch,
+    source: SandboxSource,
+    sandbox_class: SandboxClass,
+) -> None:
+    target = source.target if isinstance(source, TargetedSnapshotSource) else "us"
+    target_id = "eu-id" if target in ("eu", "eu-id") else "us-id"
+    provider, target_requests, snapshot_requests = _demand_provider(
+        monkeypatch,
+        _snapshot_metadata(
+            cpu=4.5,
+            mem=8.5,
+            disk=20.5,
+            sandbox_class=sandbox_class.value,
+            region_ids=[target_id],
+        ),
+    )
+    original_source = source.model_dump()
+    original_resources = _ADMISSION_RESOURCES.model_dump()
+
+    assert await provider.reservable_demand(source, _ADMISSION_RESOURCES) == SandboxReservationDemand(
+        target_id=target_id,
+        sandbox_class=sandbox_class.value,
+        vcpu=4.5,
+        memory=8.5,
+        disk=20.5,
+        gpu=0,
+    )
+    assert target_requests == [target]
+    assert snapshot_requests == ["snap"]
+    assert source.model_dump() == original_source
+    assert _ADMISSION_RESOURCES.model_dump() == original_resources
+
+
+@pytest.mark.parametrize(
+    ("target", "target_id"),
+    [
+        ("us", "us-id"),
+        ("us-id", "us-id"),
+        ("eu", "eu-id"),
+        ("eu-id", "eu-id"),
+        ("custom", "custom-id"),
+        ("custom-id", "custom-id"),
+    ],
+)
+@pytest.mark.parametrize("gpu", [0, 2])
+@pytest.mark.parametrize("compose", [False, True], ids=["image", "compose_image"])
+async def test_daytona_reservable_image_demand_resolves_quota_domain_without_snapshot_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+    target: str,
+    target_id: str,
+    gpu: int,
+    compose: bool,
+) -> None:
+    provider, targets, snapshots = _demand_provider(
+        monkeypatch,
+        AssertionError("images carry demand"),
+        DAYTONA_TARGET=target,
+    )
+    resources = Resources(vcpu=2, memory=4, disk=10, gpu=gpu)
+    original_resources = resources.model_dump()
+    source = ComposeSource(outer=_ADMISSION_IMAGE) if compose else _ADMISSION_IMAGE
+
+    assert await provider.reservable_demand(source, resources) == SandboxReservationDemand(
+        target_id="earth" if gpu and target_id == "us-id" else target_id,
+        sandbox_class=SandboxClass.CONTAINER.value,
+        vcpu=0 if gpu else 2,
+        memory=0 if gpu else 4,
+        disk=0 if gpu else 10,
+        gpu=gpu,
+    )
+    assert targets == []
+    assert snapshots == []
+    assert resources.model_dump() == original_resources
+
+
+@pytest.mark.parametrize("sandbox_class", [SandboxClass.CONTAINER, SandboxClass.LINUX_VM])
+@pytest.mark.parametrize(
+    ("target", "region_ids", "target_id"),
+    [
+        ("us", ["earth"], "earth"),
+        ("us-id", None, "earth"),
+        ("eu", ["eu-id"], "eu-id"),
+        ("eu-id", None, "eu-id"),
+        ("custom", ["custom-id"], "custom-id"),
+        ("custom-id", None, "custom-id"),
+    ],
+)
+async def test_daytona_reservable_gpu_snapshot_charges_actual_gpus_in_its_domain(
+    monkeypatch: pytest.MonkeyPatch,
+    sandbox_class: SandboxClass,
+    target: str,
+    region_ids: list[str] | None,
+    target_id: str,
+) -> None:
+    provider, targets, snapshots = _demand_provider(
+        monkeypatch,
+        _snapshot_metadata(gpu=2, sandbox_class=sandbox_class.value, region_ids=region_ids),
+    )
+
+    assert await provider.reservable_demand(
+        TargetedSnapshotSource(snapshot="snap", target=target),
+        _ADMISSION_RESOURCES,
+    ) == SandboxReservationDemand(
+        target_id=target_id,
+        sandbox_class=sandbox_class.value,
+        vcpu=0,
+        memory=0,
+        disk=0,
+        gpu=2,
+    )
+    assert targets == [target]
+    assert snapshots == ["snap"]
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [_snapshot_metadata(cpu=0), _snapshot_metadata(sandbox_class=None)],
+    ids=["zero_cpu", "no_class"],
+)
+async def test_daytona_reservable_demand_preserves_snapshot_metadata_validation(
+    monkeypatch: pytest.MonkeyPatch,
+    snapshot: SimpleNamespace,
+) -> None:
+    provider, _targets, _snapshots = _demand_provider(monkeypatch, snapshot)
+
+    with pytest.raises(SandboxError, match="capacity metadata is invalid"):
+        await provider.reservable_demand(SnapshotSource(snapshot="snap"), _ADMISSION_RESOURCES)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [TimeoutError(), DaytonaError("temporary", status_code=503), DaytonaError("not found", status_code=404)],
+    ids=["timeout", "transient", "not_found"],
+)
+async def test_daytona_reservable_demand_preserves_snapshot_error_classification(
+    monkeypatch: pytest.MonkeyPatch,
+    error: Exception,
+) -> None:
+    provider, _targets, _snapshots = _demand_provider(monkeypatch, error)
+
+    with pytest.raises(SandboxError):
+        await provider.reservable_demand(SnapshotSource(snapshot="snap"), _ADMISSION_RESOURCES)
+
+
+async def test_daytona_reservable_demand_preserves_region_error_classification(monkeypatch: pytest.MonkeyPatch) -> None:
+    error = ApiException(status=403, reason="denied")
+    provider, _targets, _snapshots = _demand_provider(monkeypatch, AssertionError("image"), regions=error)
+
+    with pytest.raises(SandboxError, match="rejected the target metadata request") as caught:
+        await provider.reservable_demand(_ADMISSION_IMAGE, _ADMISSION_RESOURCES)
+    assert caught.value.__cause__ is error
+
+
+async def test_daytona_reservable_demand_rejects_unavailable_target(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider, _targets, _snapshots = _demand_provider(monkeypatch, AssertionError("image"), DAYTONA_TARGET="mars")
+
+    with pytest.raises(SandboxError, match="Daytona target is not available: 'mars'"):
+        await provider.reservable_demand(_ADMISSION_IMAGE, _ADMISSION_RESOURCES)
+
+
+async def test_daytona_reservable_demand_rejects_snapshot_unavailable_in_target(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider, _targets, _snapshots = _demand_provider(monkeypatch, _snapshot_metadata(region_ids=["eu-id"]))
+
+    with pytest.raises(SandboxError, match="not available in the requested target"):
+        await provider.reservable_demand(SnapshotSource(snapshot="snap"), _ADMISSION_RESOURCES)
 
 
 async def test_daytona_capacity_preserves_provider_values_and_clamps_oversubscription(
@@ -2439,6 +2684,35 @@ def test_daytona_permanent_http_statuses_are_not_transient(status_code: int) -> 
     assert not _is_transient_daytona_error(DaytonaError("provider request failed", status_code=status_code))
 
 
+@pytest.mark.parametrize(
+    "exc",
+    [
+        DaytonaConflictError(
+            "Failed to update network settings: An operation is already in progress for this resource"
+        ),
+        DaytonaConflictError("Sandbox was modified by another operation, please try again"),
+        DaytonaConflictError("Failed to remove sandbox: State change in progress"),
+        DaytonaError("Failed to update network settings: An operation is already in progress", status_code=409),
+        _client_response_error(409, "Sandbox was modified by another operation"),
+    ],
+)
+def test_daytona_concurrent_operation_conflicts_are_transient(exc: DaytonaError | ClientResponseError) -> None:
+    assert _is_transient_daytona_error(exc)
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        DaytonaConflictError("Sandbox with name both__task_1 already exists"),
+        DaytonaConflictError("PTY session already exists"),
+        DaytonaError("Failed to execute command: an operation is already in progress", status_code=400),
+        DaytonaError("Setup script failed: migration already in progress"),
+    ],
+)
+def test_daytona_other_conflicts_and_unrelated_in_progress_errors_are_not_transient(exc: DaytonaError) -> None:
+    assert not _is_transient_daytona_error(exc)
+
+
 def test_daytona_not_found_classification_uses_structured_code_and_status_fallback() -> None:
     assert _is_not_found_error(DaytonaError("sandbox missing", code="NOT_FOUND"))
     assert _is_not_found_error(DaytonaError("sandbox missing", status_code=404))
@@ -2906,11 +3180,19 @@ async def test_daytona_command_reads_status_after_toolbox_shell_diagnostics() ->
 
 
 async def test_daytona_command_publishes_status_atomically_and_cleans_temp() -> None:
+    class LateOutputProcess(Process):
+        async def exec(self, command: str) -> SimpleNamespace:
+            if _unwrap_shell_command(command).startswith("cat "):
+                assert self.pty_handle is not None
+                await self.pty_handle.emit(b"alpha")
+                await self.pty_handle.emit(b"omega")
+            return await super().exec(command)
+
     inner = InnerSandbox()
+    inner.process = LateOutputProcess()
     sandbox = _daytona_sandbox(cast(Any, inner))
-
-    _ = [chunk async for chunk in sandbox.command("printf hello")]
-
+    chunks = [chunk async for chunk in sandbox.command("printf hello")]
+    assert "".join(chunks) == "alphaomega"
     assert inner.process.pty_handle is not None
     publish_input = inner.process.pty_handle.inputs[1]
     write_command, move_command = publish_input.split(" && mv ", maxsplit=1)
@@ -4111,6 +4393,68 @@ def test_daytona_provider_rejects_blank_target() -> None:
                 DAYTONA_TARGET="   ",
             )
         )
+
+
+class ConflictThenApplyNetworkSettingsSandbox(InnerSandbox):
+    def __init__(self) -> None:
+        super().__init__()
+        self.update_attempts = 0
+
+    async def update_network_settings(
+        self,
+        *,
+        network_block_all: bool | None = None,
+        network_allow_list: str | None = None,
+        domain_allow_list: str | None = None,
+    ) -> None:
+        self.update_attempts += 1
+        if self.update_attempts == 1:
+            raise DaytonaConflictError(
+                "Failed to update network settings: An operation is already in progress for this resource"
+            )
+        await super().update_network_settings(
+            network_block_all=network_block_all,
+            network_allow_list=network_allow_list,
+            domain_allow_list=domain_allow_list,
+        )
+
+
+async def _modify_egress(sandbox: DaytonaSandbox) -> None:
+    await sandbox.modify_egress_rules(["github.com"])
+
+
+async def _block_egress(sandbox: DaytonaSandbox) -> None:
+    await sandbox.block_all_egress()
+
+
+async def _clear_egress(sandbox: DaytonaSandbox) -> None:
+    await sandbox.clear_egress_rules()
+
+
+@pytest.mark.parametrize(
+    ("operation", "expected_settings"),
+    [
+        (_modify_egress, {"network_block_all": False, "network_allow_list": "", "domain_allow_list": "github.com"}),
+        (_block_egress, {"network_block_all": True, "network_allow_list": None, "domain_allow_list": None}),
+        (_clear_egress, {"network_block_all": False, "network_allow_list": "", "domain_allow_list": ""}),
+    ],
+    ids=["modify", "block", "clear"],
+)
+async def test_daytona_egress_updates_retry_concurrent_operation_conflicts(
+    monkeypatch: pytest.MonkeyPatch,
+    operation: Callable[[DaytonaSandbox], Awaitable[None]],
+    expected_settings: dict[str, str | bool | None],
+) -> None:
+    """A 409 raised while Daytona still holds the sandbox lock is retried on the provider ladder."""
+    inner = ConflictThenApplyNetworkSettingsSandbox()
+    sandbox = DaytonaSandbox(cast(Any, inner))
+    for method in (sandbox.modify_egress_rules, sandbox.block_all_egress, sandbox.clear_egress_rules):
+        _skip_retry_sleep(monkeypatch, method)
+
+    await operation(sandbox)
+
+    assert inner.update_attempts == 2
+    assert inner.network_settings == [expected_settings]
 
 
 async def test_daytona_updates_egress_rules() -> None:
@@ -5581,6 +5925,29 @@ async def test_daytona_unconfirmed_group_removal_reports_error() -> None:
         await asyncio.wait_for(workload.kill(), 2)
     assert process.group_exists
     assert process.sessions
+
+
+async def test_daytona_output_consumer_waits_for_confirmed_group_stop() -> None:
+    process = CgroupProcess()
+    process.allow_creation.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
+    stream = workload.output()
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    await process.handle.emit(b"initial")
+    assert await asyncio.wait_for(anext(stream), 2) == "initial"
+    pending_output = asyncio.create_task(anext(stream))
+    killing = asyncio.create_task(workload.kill())
+    await asyncio.wait_for(process.removal_started.wait(), 2)
+    assert not pending_output.done()
+
+    process.allow_removal.set()
+    await asyncio.wait_for(killing, 2)
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(pending_output, 2)
+    await stream.aclose()
+    assert not process.group_exists
+    assert process.sessions == set()
+
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")

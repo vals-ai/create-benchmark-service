@@ -5,6 +5,7 @@ from typing import Any
 
 from benchmark_service import {% if template == "default" %}BenchmarkService, {% endif %}ImageSource, Resources, Sandbox
 from benchmark_service.schemas import (
+    BenchmarkEgressPlan,
     EvaluateResponseRequest,
     FinalScoreResult,
     RetrieveTaskResponse,
@@ -56,6 +57,7 @@ class ExampleBenchmark({% if template == "vals-ai" %}ValsBenchmarkService{% else
             cwd="/workspace",
             agent_timeout=60.0,
             resources=Resources(vcpu=2, memory=4, disk=10),
+            egress=BenchmarkEgressPlan(setup_task=[], run=[], evaluation=[]),
         )
 
     async def setup_task(

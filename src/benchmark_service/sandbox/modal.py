@@ -389,6 +389,7 @@ class ModalSandbox(Sandbox):
         except ModalError as exc:
             raise _sandbox_error(exc) from exc
 
+    @_PROVIDER_RETRY
     async def _set_outbound_network_policy(
         self,
         cidrs: list[str] | None,

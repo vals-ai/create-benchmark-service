@@ -141,6 +141,9 @@ async def test_pin_survives_default_switch_on_http_and_websocket(
         async def use_version(version: str) -> None:
             async with BenchmarkServiceClient(url, headers, dataset_version=version) as client:
                 assert (await client.verify_task_ids(None, None)).task_ids == ["task-1", f"only-{version}"]
+                task = await client.retrieve_task(f"only-{version}")
+                assert task.problem_path == "/tmp/problem_statement.txt"
+                assert task.cwd == "/workspace"
                 assert (await client.evaluate_response("task-1", version))["resolved"] is True
                 assert await client.resume_evaluation("task-1", {"overlap": True}) == {"version": version}
                 assert (await client.final_score({f"only-{version}": {"resolved": True}})).final_score == 100

@@ -1,9 +1,11 @@
 """Tests for project generator."""
 
 import ast
+import runpy
 import tempfile
 import tomllib
 from pathlib import Path
+from typing import cast
 
 import pytest
 from click.testing import CliRunner
@@ -192,6 +194,19 @@ def test_unknown_template_does_not_create_project(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="Unknown template"):
         generate_project("demo", output_dir, template="missing")
     assert not output_dir.exists()
+
+
+@pytest.mark.parametrize("template", ["default", "vals-ai"])
+async def test_generated_service_declares_empty_stage_egress(tmp_path: Path, template: str) -> None:
+    output_dir = tmp_path / "demo-benchmark-service"
+    generate_project("demo", output_dir, template=template)
+    namespace = runpy.run_path(str(output_dir / "src" / "demo_benchmark_service" / "benchmark_service.py"))
+    service_class = cast(type[benchmark_service.BenchmarkService], namespace["ExampleBenchmark"])
+    service = await service_class.create()
+
+    task = await service.retrieve_task("example-task-1")
+
+    assert task.egress.model_dump() == {"setup_task": [], "run": [], "evaluation": []}
 
 
 def test_generated_benchmark_service_implements_task_listing(tmp_path: Path) -> None:

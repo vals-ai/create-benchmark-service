@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 import re
 import shlex
@@ -57,6 +58,31 @@ _ALLOW_ALL_DOMAINS = ("*",)
 _COMMAND_STATUS_POLL_SECONDS = 10
 _CONTROLLED_OUTPUT_TAIL_BYTES = 64 * 1024
 _INVALID_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_.-]")
+logger = logging.getLogger(__name__)
+# Late allocations outlive request-scoped providers.
+_BACKGROUND_TASKS: set[asyncio.Task[None]] = set()
+
+
+def _background_finished(task: asyncio.Task[None]) -> None:
+    _BACKGROUND_TASKS.discard(task)
+    try:
+        task.result()
+    except BaseException:
+        logger.exception("Modal background task failed: %s", task.get_name())
+
+
+def _start_background(action: Coroutine[Any, Any, None], name: str) -> asyncio.Task[None]:
+    task = asyncio.create_task(action, name=name)
+    _BACKGROUND_TASKS.add(task)
+    task.add_done_callback(_background_finished)
+    return task
+
+
+async def _close_client(client: Client, cleanup: tuple[asyncio.Task[None], ...]) -> None:
+    try:
+        await asyncio.gather(*cleanup, return_exceptions=True)
+    finally:
+        await client._close.aio()  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType]
 
 
 _PROVIDER_RETRY = retry(
@@ -557,7 +583,7 @@ class ModalSandboxProvider(SandboxProvider):
         self._config = config
         self._client: Client | None = None
         self._app: App | None = None
-        self._cleanup_tasks: list[asyncio.Task[None]] = []
+        self._cleanup_tasks: set[asyncio.Task[None]] = set()
 
     async def _connect(self) -> tuple[Client, App]:
         if self._client is None or self._app is None:
@@ -671,8 +697,10 @@ class ModalSandboxProvider(SandboxProvider):
             async with asyncio.timeout(request.create_timeout):
                 inner = await asyncio.shield(creation)
         except (TimeoutError, asyncio.CancelledError) as exc:
-            # Keep the exact handle so a late allocation cannot outlive its caller.
-            self._cleanup_tasks.append(asyncio.create_task(self._cleanup_create(creation)))
+            # Retain ownership until the late allocation can be terminated.
+            cleanup = _start_background(self._cleanup_create(creation), f"Modal cleanup {request.name}")
+            self._cleanup_tasks.add(cleanup)
+            cleanup.add_done_callback(self._cleanup_tasks.discard)
             if isinstance(exc, asyncio.CancelledError):
                 raise
             raise SandboxError(f"Failed to create Modal sandbox within {request.create_timeout}s") from exc
@@ -737,12 +765,13 @@ class ModalSandboxProvider(SandboxProvider):
             raise _sandbox_error(exc) from exc
 
     async def close(self) -> None:
-        results = await asyncio.shield(asyncio.gather(*self._cleanup_tasks, return_exceptions=True))
+        if self._client is None:
+            return
+        client = self._client
+        self._client = None
+        self._app = None
+        cleanup = tuple(self._cleanup_tasks)
         self._cleanup_tasks.clear()
-        if self._client is not None:
-            await self._client._close.aio()  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType]
-            self._client = None
-            self._app = None
-        for result in results:
-            if isinstance(result, BaseException):
-                raise result
+        closing = _start_background(_close_client(client, cleanup), "Modal client close")
+        if not cleanup:
+            await asyncio.shield(closing)

@@ -3169,11 +3169,19 @@ async def test_daytona_command_reads_status_after_toolbox_shell_diagnostics() ->
 
 
 async def test_daytona_command_publishes_status_atomically_and_cleans_temp() -> None:
+    class LateOutputProcess(Process):
+        async def exec(self, command: str) -> SimpleNamespace:
+            if _unwrap_shell_command(command).startswith("cat "):
+                assert self.pty_handle is not None
+                await self.pty_handle.emit(b"alpha")
+                await self.pty_handle.emit(b"omega")
+            return await super().exec(command)
+
     inner = InnerSandbox()
+    inner.process = LateOutputProcess()
     sandbox = DaytonaSandbox(cast(Any, inner))
-
-    _ = [chunk async for chunk in sandbox.command("printf hello")]
-
+    chunks = [chunk async for chunk in sandbox.command("printf hello")]
+    assert "".join(chunks) == "alphaomega"
     assert inner.process.pty_handle is not None
     publish_input = inner.process.pty_handle.inputs[1]
     write_command, move_command = publish_input.split(" && mv ", maxsplit=1)

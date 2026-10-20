@@ -249,9 +249,11 @@ that finite credited allowance. Tracker charges a finite base `B` plus capped op
 credit `C` across intervals; setup, evaluation, and gaps between intervals do not debit the
 clock. A configured accounting proxy counts neutral overhead for the native Gateway bearer.
 Tracker reads the counter during generation and, unless exhaustion has frozen the accepted credit, after confirmed stop.
-In Tracker task results, null base/effective
-allowances mean no generation deadline; `generation_elapsed_seconds` is still measured at terminal
-finalization. A null elapsed value instead means no generation-time measurement was recorded.
+In Tracker task results, `base_generation_allowance_seconds` is null when there is no
+generation deadline; effective allowance is derived from that base plus applied accounting credit,
+not stored separately. `external_service_credit_applied_seconds` is null without an accounting
+snapshot. `generation_elapsed_seconds` is measured at terminal finalization even without a deadline;
+a null elapsed value instead means no generation-time measurement was recorded.
 The independent 166-hour whole-task wall applies to every selected task, including those without a generation deadline. Daytona requests a 167-hour sandbox TTL, local Docker uses a 167-hour keepalive, and Modal caps sandbox lifetime at 24 hours.
 Accounting credit is optional and independent of whether `credited_generation` is present; eligibility needs
 configured proxy access, a resolved native Gateway URL and key, and an attested model. Missing
@@ -550,7 +552,7 @@ Pydantic models used across requests and responses:
 - **`SandboxSource`** — `ImageSource`, `SnapshotSource`, top-level Daytona-only `TargetedSnapshotSource`, or `ComposeSource` with an outer image/snapshot
 - **`EvalSandboxSpec`** — grading overrides whose optional `source` is an image or snapshot, never `ComposeSource`
 - **`GradingSubmission`** — typed `TextGradingSubmission` or `ArtifactGradingSubmission` passed only to the sandbox-grading hook
-- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`; currently `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET, DAYTONA_ORGANIZATION_ID=None)` or `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)`
+- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`: `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET, DAYTONA_ORGANIZATION_ID=None)`, `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)`, or `DockerProviderConfig(type="docker")`. Docker requests require `CBS_DOCKER_ENABLED=true` on the benchmark service.
 - **`Resources`** — `vcpu`, `memory`, `disk`, optional `gpu` (count, default 0) and `gpu_type` (requires `gpu >= 1`)
 - **`VolumeMount`** — named persistent volume, absolute `mount_path`, optional `read_only`, `create_if_missing`, and relative `subpath`; `{run_id}` in a subpath resolves from the sandbox's `run-id` or `run_id` label and fails when that label is absent
 - **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, optional `sandbox_provider` with Daytona header fallback, `dataset`

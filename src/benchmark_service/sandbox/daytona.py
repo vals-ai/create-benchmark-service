@@ -77,6 +77,7 @@ from benchmark_service.sandbox.types import (
     ResourceCapacity,
     Resources,
     Sandbox,
+    SandboxCapabilities,
     SandboxCapacity,
     SandboxCapacityDomain,
     SandboxCommandError,
@@ -164,6 +165,7 @@ _TOOLBOX_CALL_TIMEOUT_SECONDS = 120.0
 # create budget in this service (grading's _GRADING_CREATE_TIMEOUT_S), so a start that a concurrent
 # create is still legitimately waiting on is never aborted early.
 _SANDBOX_START_TIMEOUT_SECONDS = 600.0
+_SNAPSHOT_TIMEOUT_SECONDS = 600.0
 
 _T = TypeVar("_T")
 
@@ -721,6 +723,15 @@ class DaytonaSandbox(Sandbox):
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
 
+    async def snapshot(self, name: str) -> SnapshotSource:
+        # Daytona snapshots a started container in place; never stop() it first, since CBS sandboxes are
+        # created with auto_delete_interval=0 and stopping one deletes it.
+        try:
+            await self._sandbox.create_snapshot(name, timeout=_SNAPSHOT_TIMEOUT_SECONDS)
+        except _SANDBOX_OPERATION_ERRORS as exc:
+            raise self._sandbox_error(exc) from exc
+        return SnapshotSource(snapshot=name)
+
     async def _exec_pty(self, command: str, output: asyncio.Queue[str], env_vars: dict[str, str]) -> ExecResult:
         session_id = f"{self.id}:exec-{uuid.uuid4().hex}"
         status_path = f"{_STATUS_DIR}/{uuid.uuid4().hex}.status"
@@ -984,6 +995,20 @@ class DaytonaSandboxProvider(SandboxProvider):
         if target not in self._daytona_by_target:
             self._daytona_by_target[target] = _daytona_client(self._config, target)
         return self._daytona_by_target[target]
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities(snapshot=True)
+
+    @_PROVIDER_RETRY
+    async def delete_snapshot(self, snapshot: SnapshotSource) -> None:
+        try:
+            existing = await self._daytona.snapshot.get(snapshot.snapshot)
+            await self._daytona.snapshot.delete(existing)
+        except DaytonaNotFoundError:
+            return
+        except DaytonaError as exc:
+            raise self._sandbox_error(exc) from exc
 
     @property
     def admission_pool_id(self) -> str | None:

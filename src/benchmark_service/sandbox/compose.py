@@ -9,6 +9,7 @@ from benchmark_service.sandbox.types import (
     ExecResult,
     Sandbox,
     SandboxError,
+    SnapshotSource,
     validate_command_env,
 )
 
@@ -164,3 +165,6 @@ class ComposeSandbox(Sandbox):
 
     async def clear_egress_rules(self) -> None:
         await self._outer.clear_egress_rules()
+
+    async def snapshot(self, name: str) -> SnapshotSource:
+        return await self._outer.snapshot(name)

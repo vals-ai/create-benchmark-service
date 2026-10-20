@@ -136,6 +136,14 @@ class SandboxReservationDemand(BaseModel):
     gpu: FiniteFloat = Field(ge=0)
 
 
+class SandboxCapabilities(BaseModel):
+    """Optional operations a provider supports, so callers can plan without probing for errors."""
+
+    model_config = ConfigDict(frozen=True)
+
+    snapshot: bool = Field(default=False, description="Sandbox.snapshot() and SandboxProvider.delete_snapshot() work")
+
+
 class VolumeMount(BaseModel):
     """A named, persistent volume attached to a sandbox at a fixed path.
 
@@ -345,11 +353,29 @@ class Sandbox(ABC):
     async def clear_egress_rules(self) -> None:
         raise SandboxError("Sandbox provider does not support modifying egress rules")
 
+    async def snapshot(self, name: str) -> SnapshotSource:
+        """Capture the root filesystem as a source new sandboxes can be created from.
+
+        Only files survive: processes, memory, and mounted volumes are not captured, so a
+        restored sandbox must restart any services it needs. The sandbox itself keeps running.
+        `name` is a unique label for providers that name snapshots and is ignored by those
+        that assign IDs.
+        """
+        raise SandboxError("Sandbox provider does not support snapshots")
+
 
 class SandboxProvider(ABC):
     @property
     def admission_pool_id(self) -> str | None:
         return None
+
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities()
+
+    async def delete_snapshot(self, snapshot: SnapshotSource) -> None:
+        """Delete a snapshot created by Sandbox.snapshot(); deleting a missing snapshot is a no-op."""
+        raise SandboxError("Sandbox provider does not support snapshots")
 
     async def check_admission(
         self,

@@ -6,8 +6,9 @@ a FastAPI app with your implementation.
 """
 
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator
-from contextlib import AbstractAsyncContextManager
+from collections.abc import AsyncGenerator, Mapping
+from contextlib import AbstractAsyncContextManager, aclosing
+from functools import cached_property
 from pathlib import Path
 from typing import Any, ClassVar, Self
 
@@ -18,6 +19,7 @@ from benchmark_service.auth import (
     check_benchmark_service_auth,
     resolve_caller_tenant,
 )
+from benchmark_service import eval_resume
 from benchmark_service.dataset_versioning import DatasetVersionEntry, load_dataset_versions
 from benchmark_service.sandbox import Sandbox
 from benchmark_service.schemas import (
@@ -29,6 +31,7 @@ from benchmark_service.schemas import (
     MaterializedSubmissionArtifact,
     RetrieveTaskResponse,
     StreamChunk,
+    StreamEvalResumeStateChunk,
     StreamResultChunk,
     TaskFilter,
 )
@@ -43,6 +46,9 @@ def _prioritize_dataset(datasets: dict[str, dict[str, Any]], priority_dataset: s
         name: dict(sorted(tasks.items(), key=lambda item: item[0] not in priority_ids))
         for name, tasks in datasets.items()
     }
+
+
+_GRADING_HOOKS = ("collect_grading_input", "grader_identity", "grade_input")
 
 
 class BenchmarkService(ABC):
@@ -70,6 +76,30 @@ class BenchmarkService(ABC):
     # come first, e.g. so a run of the full split finishes the index subset
     # before the long tail.
     priority_dataset: ClassVar[str | None] = None
+
+    def __new__(cls, *args: Any, **kwargs: Any) -> Self:
+        # Checked here rather than in __init_subclass__ so an intermediate base class may
+        # leave evaluate_instance and any of the three hooks to a subclass, as abstract methods allow.
+        implemented = cls._implemented_grading_hooks()
+        if implemented and len(implemented) != len(_GRADING_HOOKS):
+            raise TypeError(
+                f"{cls.__name__} implements {', '.join(implemented)}; the framework's checkpointed grading "
+                "needs all of collect_grading_input, grader_identity and grade_input"
+            )
+        if cls.evaluate_instance is BenchmarkService.evaluate_instance and not implemented:
+            raise TypeError(
+                f"{cls.__name__} must implement evaluate_instance, or collect_grading_input, "
+                "grader_identity and grade_input"
+            )
+        return super().__new__(cls)
+
+    @classmethod
+    def _implemented_grading_hooks(cls) -> list[str]:
+        return [hook for hook in _GRADING_HOOKS if getattr(cls, hook) is not getattr(BenchmarkService, hook)]
+
+    @classmethod
+    def _grades_input(cls) -> bool:
+        return len(cls._implemented_grading_hooks()) == len(_GRADING_HOOKS)
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -334,8 +364,19 @@ class BenchmarkService(ABC):
         """Evaluate without a sandbox and stream the result.
 
         evaluate_response may return any JSON-encodable object; the chunk
-        carries its JSON form.
+        carries its JSON form. A retry carrying ``eval_resume_state`` to a service
+        that implements the grading hooks loads the saved grading input, checks it
+        was saved under the current ``grader_identity``, and streams ``grade_input``.
         """
+        if request.eval_resume_state is not None and self._grades_input():
+            await self.validate_task_ids([request.task_id], dataset=dataset)
+            content = await self.eval_resume_store.load(
+                request.eval_resume_state, task_id=request.task_id, **self._checkpoint_binding(request.task_id, dataset)
+            )
+            async with aclosing(self.grade_input(request.task_id, content, dataset=dataset)) as chunks:
+                async for chunk in chunks:
+                    yield chunk
+            return
         result = await self.evaluate_response(request, dataset=dataset)
         yield StreamResultChunk(type="result", data=jsonable_encoder(result))
 
@@ -368,8 +409,50 @@ class BenchmarkService(ABC):
             "eval_mode == EvalMode.IN_PROCESS_MATERIALIZED_ARTIFACT"
         )
 
-    @abstractmethod
-    def evaluate_instance(
+    async def collect_grading_input(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> bytes:
+        """Read the bytes ``grade_input`` grades from the finished sandbox, e.g. a result file.
+
+        One of three grading hooks. A service that implements ``collect_grading_input``,
+        ``grader_identity`` and ``grade_input`` leaves ``evaluate_instance`` to the
+        framework, which saves these bytes as an eval-resume checkpoint before grading
+        them, so a grading failure is retried without rerunning the agent.
+        """
+        raise NotImplementedError(f"{type(self).__name__}.collect_grading_input is not implemented")
+
+    def grader_identity(self, task_id: str, dataset: str | None = None) -> Mapping[str, Any]:
+        """Everything besides the grading input that decides this task's grade.
+
+        A judge model, a test or rubric revision, a grader image digest, a hash of the
+        grading code. A retry refuses a checkpoint saved under any other value.
+        """
+        raise NotImplementedError(f"{type(self).__name__}.grader_identity is not implemented")
+
+    def grade_input(
+        self,
+        task_id: str,
+        content: bytes,
+        dataset: str | None = None,
+    ) -> AsyncGenerator[StreamChunk, None]:
+        """Grade the bytes ``collect_grading_input`` returned, on the first attempt and on retry."""
+        raise NotImplementedError(f"{type(self).__name__}.grade_input is not implemented")
+
+    def _checkpoint_binding(self, task_id: str, dataset: str | None) -> dict[str, str]:
+        """The dataset and grader digest a checkpoint is saved under; save and load must agree on both."""
+        return {
+            "dataset": dataset or "default",
+            "grader_identity": eval_resume.grader_identity(self.grader_identity(task_id, dataset=dataset)),
+        }
+
+    @cached_property
+    def eval_resume_store(self) -> eval_resume.EvalResumeStore:
+        """Where the default ``evaluate_instance`` saves grading input.
+
+        Defaults to ``$EVAL_RESUME_BUCKET`` and ``$EVAL_RESUME_PREFIX``, which
+        benchmark-services-registry sets for every service with eval-resume storage.
+        """
+        return eval_resume.EvalResumeStore()
+
+    async def evaluate_instance(
         self, task_id: str, sandbox: Sandbox, dataset: str | None = None
     ) -> AsyncGenerator[StreamChunk, None]:
         """Evaluate a solution in a sandbox environment.
@@ -377,7 +460,10 @@ class BenchmarkService(ABC):
         The sandbox is already connected and ready to use. Interact with it to
         execute tests, run evaluation scripts, etc. Yield StreamChunk objects to stream progress.
 
-        Implement evaluation logic:
+        A service that implements ``collect_grading_input``, ``grader_identity`` and
+        ``grade_input`` can keep this default: it collects the grading input, saves it,
+        yields the checkpoint as ``eval_resume_state``, and then grades it. Override it
+        when grading needs the live sandbox, following these steps:
         1. Execute tests or evaluation scripts using sandbox.exec
         2. Parse test output and grade results
         3. Yield progress logs: yield StreamMessageChunk(type="message", data="log line")
@@ -395,7 +481,17 @@ class BenchmarkService(ABC):
         Yields:
             StreamChunk - one of StreamMessageChunk, StreamResultChunk, or StreamErrorChunk
         """
-        ...
+        content = await self.collect_grading_input(task_id, sandbox, dataset=dataset)
+        checkpoint = await self.eval_resume_store.save(
+            benchmark_id=eval_resume.benchmark_id_from_sandbox(sandbox),
+            task_id=task_id,
+            content=content,
+            **self._checkpoint_binding(task_id, dataset),
+        )
+        yield StreamEvalResumeStateChunk(type="eval_resume_state", data=checkpoint.model_dump(mode="json"))
+        async with aclosing(self.grade_input(task_id, content, dataset=dataset)) as chunks:
+            async for chunk in chunks:
+                yield chunk
 
     async def prepare_grading_sandbox(
         self,

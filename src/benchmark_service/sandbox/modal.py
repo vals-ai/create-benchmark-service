@@ -659,6 +659,7 @@ class ModalSandboxProvider(SandboxProvider):
             "outbound_domain_allowlist": list(_ALLOW_ALL_DOMAINS) if allow_all_egress else None,
             "client": client,
             "runtime": runtime,
+            # Keep this flag: nested Docker's overlay2 failed without it on T4.
             "experimental_options": {"enable_docker": True} if runtime == "gvisor" else None,
         }
         if request.volumes:

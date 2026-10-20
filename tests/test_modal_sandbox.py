@@ -7,7 +7,7 @@ import time
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 from types import SimpleNamespace
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 import pytest
 from modal import Sandbox as ModalSdkSandbox
@@ -681,7 +681,10 @@ async def test_create_sandbox_uses_vm_runtime(monkeypatch: pytest.MonkeyPatch) -
     assert captured["experimental_options"] is None
 
 
-async def test_create_sandbox_maps_gpu_request(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("runtime", ["gvisor", "vm"])
+async def test_create_sandbox_maps_gpu_request(
+    monkeypatch: pytest.MonkeyPatch, runtime: Literal["gvisor", "vm"]
+) -> None:
     inner = FakeInnerSandbox()
     captured: dict[str, Any] = {}
 
@@ -690,10 +693,13 @@ async def test_create_sandbox_maps_gpu_request(monkeypatch: pytest.MonkeyPatch) 
         return inner
 
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    provider._config.runtime = runtime
 
     await provider.create_sandbox(_request(resources=Resources(vcpu=4, memory=8, disk=30, gpu=2, gpu_type="H100")))
 
     assert captured["gpu"] == "H100:2"
+    assert captured["runtime"] == "gvisor"
+    assert captured["experimental_options"] == {"enable_docker": True}
 
 
 async def test_create_sandbox_requires_gpu_type_for_gpu(monkeypatch: pytest.MonkeyPatch) -> None:

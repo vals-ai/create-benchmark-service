@@ -28,6 +28,7 @@ from benchmark_service import (
     VolumeMount,
 )
 from benchmark_service.sandbox.daytona import DaytonaSandboxProvider
+from benchmark_service.sandbox.modal import ModalProviderConfig
 
 _POLL_INTERVAL_SECONDS = 2
 _POLL_TIMEOUT_SECONDS = 120
@@ -140,6 +141,42 @@ async def _read_stream_until_ready(sandbox: Sandbox, ready: asyncio.Event) -> No
 
 class TestSandboxProviderIntegration:
     """Run the same live contract checks against every configured provider."""
+
+    @pytest.mark.parametrize("provider_type", ["modal"], indirect=True)
+    @pytest.mark.parametrize("gpu", [False, True], ids=["cpu-vm", "gpu-gvisor"])
+    async def test_modal_runtime_with_vm_provider(
+        self,
+        sandbox_provider_config: ModalProviderConfig,
+        record_property: Callable[[str, object], None],
+        gpu: bool,
+    ) -> None:
+        """Create and delete CPU and GPU sandboxes with a VM provider default."""
+        provider = sandbox_provider_config.model_copy(update={"runtime": "vm"}).create_provider()
+        request = SandboxCreateRequest(
+            source=ImageSource(image=_TEST_IMAGE),
+            resources=Resources(vcpu=1, memory=2, disk=5, gpu=int(gpu), gpu_type="T4" if gpu else None),
+            name=f"cbs-modal-gpu-runtime-{uuid4().hex[:10]}",
+            labels={"test": "modal-gpu-runtime"},
+            env_vars={},
+            auto_stop_interval=5,
+            create_timeout=120,
+        )
+        try:
+            sandbox = await provider.create_sandbox(request)
+            record_property("sandbox_id", sandbox.id)
+            record_property("provider_runtime", "vm")
+            record_property("gpu_count", request.resources.gpu)
+            try:
+                result = await sandbox.exec("nvidia-smi -L" if gpu else "uname -sr", timeout=30)
+                record_property("output", result.output)
+                assert result.exit_code == 0
+                assert ("Tesla T4" if gpu else "Linux") in result.output
+            finally:
+                await provider.delete_sandbox(sandbox.id)
+                await _wait_until_not_found(provider, sandbox.id)
+                record_property("cleanup", "sandbox not found")
+        finally:
+            await provider.close()
 
     @pytest.mark.parametrize("provider_type", ["daytona"], indirect=True)
     async def test_daytona_inventory_metadata_and_filtering(

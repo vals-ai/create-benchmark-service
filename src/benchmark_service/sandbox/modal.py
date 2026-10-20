@@ -685,6 +685,7 @@ class ModalSandboxProvider(SandboxProvider):
             if not request.resources.gpu_type:
                 raise SandboxError("Modal sandbox provider requires gpu_type when gpu is requested")
             gpu = f"{request.resources.gpu_type}:{request.resources.gpu}"
+        runtime = "gvisor" if gpu else self._config.runtime
         create_kwargs: dict[str, Any] = {
             "app": app,
             "name": modal_name,
@@ -700,8 +701,8 @@ class ModalSandboxProvider(SandboxProvider):
             "outbound_cidr_allowlist": list(_ALLOW_ALL_CIDRS) if allow_all_egress else None,
             "outbound_domain_allowlist": list(_ALLOW_ALL_DOMAINS) if allow_all_egress else None,
             "client": client,
-            "runtime": self._config.runtime,
-            "experimental_options": {"enable_docker": True} if self._config.runtime == "gvisor" else None,
+            "runtime": runtime,
+            "experimental_options": {"enable_docker": True} if runtime == "gvisor" else None,
         }
         if request.volumes:
             create_kwargs["volumes"] = self._resolve_volumes(request.volumes, client, request.labels)

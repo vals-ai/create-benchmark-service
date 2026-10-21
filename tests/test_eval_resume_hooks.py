@@ -493,9 +493,11 @@ async def test_grade_in_sandbox_retries_in_a_fresh_sandbox_and_deletes_it(s3: _F
     assert chunks[-1].data == {"resolved": True}
     assert retry.graded_in == ["fresh-1"]
     created = provider.created[0]
-    assert (created.source, created.resources) == (
+    assert (created.source, created.resources, created.auto_stop_interval, created.create_timeout) == (
         ImageSource(image="python:3.12-slim"),
         Resources(vcpu=2, memory=4, disk=10),
+        30,
+        600,
     )
     assert (created.labels["Benchmark"], created.labels["Id"], created.labels["Task"]) == (
         "_SandboxGrader",

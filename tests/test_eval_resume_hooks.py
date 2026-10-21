@@ -988,3 +988,27 @@ async def test_a_cancelled_create_slower_than_the_teardown_bound_is_still_delete
             await task
 
     assert provider.deleted == ["fresh-1"]
+
+
+async def test_a_grading_input_saved_that_holds_its_cancellation_is_still_left_behind_at_the_bound(
+    s3: _FakeS3, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    release = asyncio.Event()
+
+    class _StubbornRelease(_SavedHookBenchmark):
+        async def grading_input_saved(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await release.wait()
+
+    monkeypatch.setattr(base, "TEARDOWN_TIMEOUT_S", 0.01)
+    service = await _saved_service(s3, _StubbornRelease)
+
+    grading = asyncio.create_task(_drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox()))))
+    done, _ = await asyncio.wait({grading}, timeout=5)
+    release.set()
+
+    assert done == {grading}
+    assert [chunk.type for chunk in grading.result()] == ["eval_resume_state", "result"]
+    assert "grading_input_saved failed for task-1" in caplog.text

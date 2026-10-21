@@ -70,23 +70,24 @@ logger = logging.getLogger(__name__)
 
 
 async def _finish_quietly(work: Awaitable[None], failure: str, *args: object, timeout_s: float | None = None) -> None:
-    """Await ``work`` for up to ``TEARDOWN_TIMEOUT_S`` even if the caller is cancelled; log, never raise, a failure."""
-
-    async def run() -> None:
-        try:
-            async with asyncio.timeout(TEARDOWN_TIMEOUT_S if timeout_s is None else timeout_s):
-                await work
-        except Exception:
-            logger.exception(failure, *args)
-
-    task = asyncio.create_task(run())
+    """Wait up to ``TEARDOWN_TIMEOUT_S`` for ``work`` even if the caller is cancelled; log, never raise, a failure."""
+    bound = TEARDOWN_TIMEOUT_S if timeout_s is None else timeout_s
+    task = asyncio.ensure_future(work)
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + bound
     cancellation: asyncio.CancelledError | None = None
-    while not task.done():
+    while not task.done() and (remaining := deadline - loop.time()) > 0:
         try:
-            await asyncio.shield(task)
+            await asyncio.wait({task}, timeout=remaining)
         except asyncio.CancelledError as exc:
             if cancellation is None:
                 cancellation = exc
+    if not task.done():
+        task.cancel()
+        task.add_done_callback(lambda done: done.cancelled() or done.exception())
+        logger.error(failure, *args, exc_info=TimeoutError(f"exceeded {bound:g}s"))
+    elif not task.cancelled() and (error := task.exception()) is not None:
+        logger.error(failure, *args, exc_info=error)
     if cancellation is not None:
         raise cancellation
 
@@ -99,15 +100,12 @@ async def _create_owned_sandbox(provider: SandboxProvider, request: SandboxCreat
     except asyncio.CancelledError:
 
         async def delete_when_created() -> None:
-            try:
-                sandbox = await creation
-            except Exception:
-                return
+            sandbox = await creation
             await provider.delete_sandbox(sandbox.id)
 
         await _finish_quietly(
             delete_when_created(),
-            "Failed to delete eval-resume sandbox after a cancelled create",
+            "Eval-resume sandbox cleanup after a cancelled create failed",
             timeout_s=_EVAL_RESUME_CREATE_TIMEOUT_S + TEARDOWN_TIMEOUT_S,
         )
         raise

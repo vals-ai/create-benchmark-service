@@ -424,10 +424,17 @@ Eval-only retry flow:
 **Making a benchmark retryable from evaluation.** If your grader reads the agent's output (a result file, a patch, an archive), implement three hooks instead of `evaluate_instance`:
 
 - `collect_grading_input(task_id, sandbox, dataset) -> bytes`: what to save from the finished sandbox.
-- `grader_identity(task_id, dataset)`: what decides the grade (judge model and rubric revision, or test revision and grader image). A retry refuses to grade if this changed.
+- `grader_identity(task_id, dataset)`: what decides the grade (judge model and rubric revision, or test revision and grader image). A retry refuses to grade if this changed. It may be `async`.
 - `grade_input(task_id, content, dataset)`: how to grade those bytes.
 
-The framework saves the bytes to S3 before grading and, on a retry, grades the saved copy instead of rerunning the agent. Storage comes from `EVAL_RESUME_BUCKET` and `EVAL_RESUME_PREFIX`, which benchmark-services-registry sets when a service opts in. Implement all three hooks or none; a service that grades inside the live sandbox keeps its own `evaluate_instance` and uses `self.eval_resume_store` directly. Details are in `benchmark_service/eval_resume.py`.
+The framework saves the bytes to S3 before grading and, on a retry, grades the saved copy instead of rerunning the agent. Storage comes from `EVAL_RESUME_BUCKET` and `EVAL_RESUME_PREFIX`, which benchmark-services-registry sets when a service opts in. Implement all three hooks or none. Details are in `benchmark_service/eval_resume.py`.
+
+Graders that need more can use these optional extras:
+
+- A grader that should resume part-way, such as after each judge call, yields `GradingInput(new_bytes)` from `grade_input`. The framework saves it before the grader continues.
+- A grader that runs inside a sandbox implements `grade_in_sandbox(task_id, content, sandbox, dataset)` instead of `grade_input`. A retry grades in the caller's sandbox when the request names one, or else in a fresh sandbox built from the task's source through the request's `sandbox_provider`, deleted afterwards.
+- `grading_input_saved(task_id, sandbox, dataset)` runs once the first save lands, to release anything kept only for collecting.
+- `load_grading_input(request, dataset)` returns the checked bytes, for a custom `evaluate_response`.
 
 ### Streaming protocol
 

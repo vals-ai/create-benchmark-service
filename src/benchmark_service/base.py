@@ -5,12 +5,16 @@ all the abstract methods. Then use the factory function in benchmark_service.app
 a FastAPI app with your implementation.
 """
 
+import asyncio
+import hashlib
+import logging
 from abc import ABC, abstractmethod
-from collections.abc import AsyncGenerator, Mapping
-from contextlib import AbstractAsyncContextManager, aclosing
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Mapping
+from contextlib import AbstractAsyncContextManager, aclosing, asynccontextmanager
 from functools import cached_property
 from pathlib import Path
 from typing import Any, ClassVar, Self
+from uuid import uuid4
 
 from fastapi.encoders import jsonable_encoder
 
@@ -20,8 +24,9 @@ from benchmark_service.auth import (
     resolve_caller_tenant,
 )
 from benchmark_service import eval_resume
+from benchmark_service.context import current_sandbox_provider
 from benchmark_service.dataset_versioning import DatasetVersionEntry, load_dataset_versions
-from benchmark_service.sandbox import Sandbox
+from benchmark_service.sandbox import Sandbox, SandboxCreateRequest, SandboxProvider
 from benchmark_service.schemas import (
     DatasetVersion,
     EvalMode,
@@ -48,7 +53,49 @@ def _prioritize_dataset(datasets: dict[str, dict[str, Any]], priority_dataset: s
     }
 
 
-_GRADING_HOOKS = ("collect_grading_input", "grader_identity", "grade_input")
+_GRADERS = ("grade_input", "grade_in_sandbox")
+_GRADING_HOOKS = ("collect_grading_input", "grader_identity", *_GRADERS)
+
+# A retry sandbox the framework creates is deleted when grading ends; auto-stop is the backstop
+# for a delete that never ran. The values are the SWE-bench and SRE-bench services' own.
+EVAL_RESUME_SANDBOX_AUTO_STOP_MINUTES = 30
+EVAL_RESUME_SANDBOX_CREATE_TIMEOUT_SECONDS = 600
+
+logger = logging.getLogger(__name__)
+
+
+async def _delete_owned_sandbox(provider: SandboxProvider, sandbox_id: str) -> None:
+    """Delete a retry sandbox even when the stream that owns it is being cancelled."""
+    cleanup = asyncio.create_task(provider.delete_sandbox(sandbox_id))
+    try:
+        await asyncio.shield(cleanup)
+    except asyncio.CancelledError:
+        await asyncio.shield(cleanup)
+        raise
+    except Exception:
+        logger.exception("Failed to delete eval-resume sandbox %s", sandbox_id)
+
+
+async def _create_owned_sandbox(provider: SandboxProvider, request: SandboxCreateRequest) -> Sandbox:
+    """Create a retry sandbox; a cancellation mid-create still deletes what was created."""
+    creation = asyncio.create_task(provider.create_sandbox(request))
+    try:
+        return await asyncio.shield(creation)
+    except asyncio.CancelledError:
+
+        async def delete_when_created() -> None:
+            try:
+                sandbox = await creation
+            except Exception:
+                return
+            await _delete_owned_sandbox(provider, sandbox.id)
+
+        cleanup = asyncio.create_task(delete_when_created())
+        try:
+            await asyncio.shield(cleanup)
+        except asyncio.CancelledError:
+            pass
+        raise
 
 
 class BenchmarkService(ABC):
@@ -81,15 +128,17 @@ class BenchmarkService(ABC):
         # Checked here rather than in __init_subclass__ so an intermediate base class may
         # leave evaluate_instance and any of the three hooks to a subclass, as abstract methods allow.
         implemented = cls._implemented_grading_hooks()
-        if implemented and len(implemented) != len(_GRADING_HOOKS):
+        if all(grader in implemented for grader in _GRADERS):
+            raise TypeError(f"{cls.__name__} must implement either grade_input or grade_in_sandbox, not both")
+        if implemented and not cls._grades_input():
             raise TypeError(
                 f"{cls.__name__} implements {', '.join(implemented)}; the framework's checkpointed grading "
-                "needs all of collect_grading_input, grader_identity and grade_input"
+                "needs collect_grading_input, grader_identity, and grade_input or grade_in_sandbox"
             )
         if cls.evaluate_instance is BenchmarkService.evaluate_instance and not implemented:
             raise TypeError(
                 f"{cls.__name__} must implement evaluate_instance, or collect_grading_input, "
-                "grader_identity and grade_input"
+                "grader_identity, and grade_input or grade_in_sandbox"
             )
         return super().__new__(cls)
 
@@ -99,7 +148,12 @@ class BenchmarkService(ABC):
 
     @classmethod
     def _grades_input(cls) -> bool:
-        return len(cls._implemented_grading_hooks()) == len(_GRADING_HOOKS)
+        implemented = set(cls._implemented_grading_hooks())
+        return {"collect_grading_input", "grader_identity"} <= implemented and len(implemented & set(_GRADERS)) == 1
+
+    @classmethod
+    def _grades_in_sandbox(cls) -> bool:
+        return cls.grade_in_sandbox is not BenchmarkService.grade_in_sandbox
 
     def __init_subclass__(cls, **kwargs: Any) -> None:
         super().__init_subclass__(**kwargs)
@@ -369,13 +423,12 @@ class BenchmarkService(ABC):
         was saved under the current ``grader_identity``, and streams ``grade_input``.
         """
         if request.eval_resume_state is not None and self._grades_input():
-            await self.validate_task_ids([request.task_id], dataset=dataset)
-            content = await self.eval_resume_store.load(
-                request.eval_resume_state, task_id=request.task_id, **self._checkpoint_binding(request.task_id, dataset)
-            )
-            async with aclosing(self.grade_input(request.task_id, content, dataset=dataset)) as chunks:
-                async for chunk in chunks:
-                    yield chunk
+            checkpoint, content, binding = await self._load_checkpoint(request, dataset)
+            async with self._retry_sandbox(request, checkpoint, dataset) as sandbox:
+                grading = self._grade(request.task_id, content, sandbox, dataset)
+                async with aclosing(self._saving(grading, checkpoint.benchmark_id, request.task_id, binding)) as chunks:
+                    async for chunk in chunks:
+                        yield chunk
             return
         result = await self.evaluate_response(request, dataset=dataset)
         yield StreamResultChunk(type="result", data=jsonable_encoder(result))
@@ -412,18 +465,21 @@ class BenchmarkService(ABC):
     async def collect_grading_input(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> bytes:
         """Read the bytes ``grade_input`` grades from the finished sandbox, e.g. a result file.
 
-        One of three grading hooks. A service that implements ``collect_grading_input``,
-        ``grader_identity`` and ``grade_input`` leaves ``evaluate_instance`` to the
-        framework, which saves these bytes as an eval-resume checkpoint before grading
-        them, so a grading failure is retried without rerunning the agent.
+        A grading hook. A service that implements ``collect_grading_input``,
+        ``grader_identity``, and ``grade_input`` or ``grade_in_sandbox`` leaves
+        ``evaluate_instance`` to the framework, which saves these bytes as an eval-resume
+        checkpoint before grading them, so a grading failure is retried without rerunning the agent.
         """
         raise NotImplementedError(f"{type(self).__name__}.collect_grading_input is not implemented")
 
-    def grader_identity(self, task_id: str, dataset: str | None = None) -> Mapping[str, Any]:
+    def grader_identity(
+        self, task_id: str, dataset: str | None = None
+    ) -> Mapping[str, Any] | Awaitable[Mapping[str, Any]]:
         """Everything besides the grading input that decides this task's grade.
 
         A judge model, a test or rubric revision, a grader image digest, a hash of the
-        grading code. A retry refuses a checkpoint saved under any other value.
+        grading code. A retry refuses a checkpoint saved under any other value. May be
+        ``async`` when naming the grader needs I/O, such as resolving an image digest.
         """
         raise NotImplementedError(f"{type(self).__name__}.grader_identity is not implemented")
 
@@ -432,16 +488,129 @@ class BenchmarkService(ABC):
         task_id: str,
         content: bytes,
         dataset: str | None = None,
-    ) -> AsyncGenerator[StreamChunk, None]:
-        """Grade the bytes ``collect_grading_input`` returned, on the first attempt and on retry."""
+    ) -> AsyncGenerator[StreamChunk | eval_resume.GradingInput, None]:
+        """Grade the bytes ``collect_grading_input`` returned, on the first attempt and on retry.
+
+        Yield ``GradingInput(new_bytes)`` to save progress: the framework saves it under
+        the same run and streams the checkpoint before this generator resumes.
+        """
         raise NotImplementedError(f"{type(self).__name__}.grade_input is not implemented")
 
-    def _checkpoint_binding(self, task_id: str, dataset: str | None) -> dict[str, str]:
+    def grade_in_sandbox(
+        self,
+        task_id: str,
+        content: bytes,
+        sandbox: Sandbox,
+        dataset: str | None = None,
+    ) -> AsyncGenerator[StreamChunk | eval_resume.GradingInput, None]:
+        """Grade the saved bytes inside ``sandbox``; implement this instead of ``grade_input``.
+
+        The first attempt passes the agent's sandbox. A retry passes the caller-owned sandbox
+        the request names, or a fresh one the framework creates from the task's
+        ``resume_sandbox`` (else generation) source and resources and deletes afterwards. Put
+        ``content`` back where the grader reads it, so both attempts run the same code.
+        """
+        raise NotImplementedError(f"{type(self).__name__}.grade_in_sandbox is not implemented")
+
+    async def grading_input_saved(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> None:
+        """Called once the first checkpoint is saved, before grading; does nothing by default.
+
+        Release state that was kept only so the grading input could be collected again,
+        such as an in-process session: a failed save never reaches this hook.
+        """
+
+    async def load_grading_input(self, request: EvaluateResponseRequest, dataset: str | None = None) -> bytes:
+        """The grading input ``request.eval_resume_state`` points at, after the retry checks.
+
+        Refuses a task the dataset does not have, a checkpoint from another tenant, task,
+        dataset or grader, and bytes that fail their size or SHA-256 check.
+        """
+        _, content, _ = await self._load_checkpoint(request, dataset)
+        return content
+
+    async def _load_checkpoint(
+        self, request: EvaluateResponseRequest, dataset: str | None
+    ) -> tuple[eval_resume.EvalResumeCheckpoint, bytes, dict[str, str]]:
+        if request.eval_resume_state is None:
+            raise ValueError(f"task {request.task_id} has no eval_resume_state to load")
+        await self.validate_task_ids([request.task_id], dataset=dataset)
+        binding = await self._checkpoint_binding(request.task_id, dataset)
+        checkpoint = self.eval_resume_store.parse(request.eval_resume_state)
+        content = await self.eval_resume_store.load(checkpoint, task_id=request.task_id, **binding)
+        return checkpoint, content, binding
+
+    async def _checkpoint_binding(self, task_id: str, dataset: str | None) -> dict[str, str]:
         """The dataset and grader digest a checkpoint is saved under; save and load must agree on both."""
-        return {
-            "dataset": dataset or "default",
-            "grader_identity": eval_resume.grader_identity(self.grader_identity(task_id, dataset=dataset)),
-        }
+        parts = self.grader_identity(task_id, dataset=dataset)
+        if isinstance(parts, Awaitable):
+            parts = await parts
+        return {"dataset": dataset or "default", "grader_identity": eval_resume.grader_identity(parts)}
+
+    async def _save(
+        self, benchmark_id: str, task_id: str, content: bytes, binding: dict[str, str]
+    ) -> StreamEvalResumeStateChunk:
+        checkpoint = await self.eval_resume_store.save(
+            benchmark_id=benchmark_id, task_id=task_id, content=content, **binding
+        )
+        return StreamEvalResumeStateChunk(type="eval_resume_state", data=checkpoint.model_dump(mode="json"))
+
+    def _grade(
+        self, task_id: str, content: bytes, sandbox: Sandbox | None, dataset: str | None
+    ) -> AsyncGenerator[StreamChunk | eval_resume.GradingInput, None]:
+        if sandbox is not None and self._grades_in_sandbox():
+            return self.grade_in_sandbox(task_id, content, sandbox, dataset=dataset)
+        return self.grade_input(task_id, content, dataset=dataset)
+
+    async def _saving(
+        self,
+        grading: AsyncGenerator[StreamChunk | eval_resume.GradingInput, None],
+        benchmark_id: str,
+        task_id: str,
+        binding: dict[str, str],
+    ) -> AsyncGenerator[StreamChunk, None]:
+        """Stream ``grading``, saving each ``GradingInput`` it yields before asking it for more."""
+        async with aclosing(grading) as items:
+            async for item in items:
+                if isinstance(item, eval_resume.GradingInput):
+                    yield await self._save(benchmark_id, task_id, item.content, binding)
+                else:
+                    yield item
+
+    @asynccontextmanager
+    async def _retry_sandbox(
+        self, request: EvaluateResponseRequest, checkpoint: eval_resume.EvalResumeCheckpoint, dataset: str | None
+    ) -> AsyncIterator[Sandbox | None]:
+        """The sandbox a ``grade_in_sandbox`` retry grades in; None for ``grade_input``."""
+        if not self._grades_in_sandbox():
+            yield None
+            return
+        provider = current_sandbox_provider()
+        if provider is None:
+            raise ValueError(f"{type(self).__name__} grades in a sandbox; a retry needs the request's sandbox_provider")
+        if request.instance_id is not None:
+            # Caller-owned (RetrieveTaskResponse.resume_sandbox): borrowed, never deleted here.
+            yield await provider.get_sandbox(request.instance_id)
+            return
+        task = await self.retrieve_task(request.task_id, skip_validation=True, dataset=dataset)
+        spec = task.resume_sandbox
+        digest = hashlib.sha256(f"{checkpoint.benchmark_id}:{checkpoint.task_id}:{checkpoint.sha256}".encode())
+        sandbox = await _create_owned_sandbox(
+            provider,
+            SandboxCreateRequest(
+                source=(spec.source if spec is not None and spec.source is not None else task.source),
+                resources=(spec.resources if spec is not None and spec.resources is not None else task.resources),
+                name=f"eval-resume-{digest.hexdigest()[:8]}-{uuid4().hex[:8]}",
+                labels={"Id": checkpoint.benchmark_id, "Task": checkpoint.task_id, "EvalResume": "true"},
+                env_vars={},
+                auto_stop_interval=EVAL_RESUME_SANDBOX_AUTO_STOP_MINUTES,
+                create_timeout=EVAL_RESUME_SANDBOX_CREATE_TIMEOUT_SECONDS,
+                network_block_all=spec.network_block_all if spec is not None else False,
+            ),
+        )
+        try:
+            yield sandbox
+        finally:
+            await _delete_owned_sandbox(provider, sandbox.id)
 
     @cached_property
     def eval_resume_store(self) -> eval_resume.EvalResumeStore:
@@ -460,10 +629,9 @@ class BenchmarkService(ABC):
         The sandbox is already connected and ready to use. Interact with it to
         execute tests, run evaluation scripts, etc. Yield StreamChunk objects to stream progress.
 
-        A service that implements ``collect_grading_input``, ``grader_identity`` and
-        ``grade_input`` can keep this default: it collects the grading input, saves it,
-        yields the checkpoint as ``eval_resume_state``, and then grades it. Override it
-        when grading needs the live sandbox, following these steps:
+        A service that implements the grading hooks can keep this default: it collects the
+        grading input, saves it, yields the checkpoint as ``eval_resume_state``, calls
+        ``grading_input_saved``, and then grades it. Otherwise override it:
         1. Execute tests or evaluation scripts using sandbox.exec
         2. Parse test output and grade results
         3. Yield progress logs: yield StreamMessageChunk(type="message", data="log line")
@@ -482,14 +650,13 @@ class BenchmarkService(ABC):
             StreamChunk - one of StreamMessageChunk, StreamResultChunk, or StreamErrorChunk
         """
         content = await self.collect_grading_input(task_id, sandbox, dataset=dataset)
-        checkpoint = await self.eval_resume_store.save(
-            benchmark_id=eval_resume.benchmark_id_from_sandbox(sandbox),
-            task_id=task_id,
-            content=content,
-            **self._checkpoint_binding(task_id, dataset),
-        )
-        yield StreamEvalResumeStateChunk(type="eval_resume_state", data=checkpoint.model_dump(mode="json"))
-        async with aclosing(self.grade_input(task_id, content, dataset=dataset)) as chunks:
+        benchmark_id = eval_resume.benchmark_id_from_sandbox(sandbox)
+        binding = await self._checkpoint_binding(task_id, dataset)
+        saved = await self._save(benchmark_id, task_id, content, binding)
+        await self.grading_input_saved(task_id, sandbox, dataset=dataset)
+        yield saved
+        grading = self._grade(task_id, content, sandbox, dataset)
+        async with aclosing(self._saving(grading, benchmark_id, task_id, binding)) as chunks:
             async for chunk in chunks:
                 yield chunk
 

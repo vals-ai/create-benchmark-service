@@ -18,8 +18,8 @@ inside ``evaluate_instance`` or ``stream_evaluate_response``.
 By default the bucket comes from ``$EVAL_RESUME_BUCKET`` and the prefix from
 ``$EVAL_RESUME_PREFIX``, which benchmark-services-registry sets for a service with
 ``EvalResumeStorageConfig``. A service that implements ``BenchmarkService``'s grading
-hooks never calls the store itself; the usage below is for one that overrides
-``evaluate_instance`` because it grades in the live sandbox.
+hooks never calls the store itself; the usage below is for one that keeps its own
+``evaluate_instance``.
 
 Usage::
 
@@ -48,6 +48,7 @@ import json
 import os
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any, Literal, NotRequired, Protocol, TypedDict, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -79,6 +80,18 @@ class EvalResumeIdentityError(EvalResumeError):
 
 class EvalResumeIntegrityError(EvalResumeError):
     """The stored bytes do not match the size or SHA-256 the checkpoint recorded."""
+
+
+@dataclass(frozen=True)
+class GradingInput:
+    """Yielded by ``grade_input`` or ``grade_in_sandbox`` to replace the saved grading input mid-grading.
+
+    The framework saves ``content`` under the same run, streams the new checkpoint, and only
+    then resumes the grader, so a retry continues from this point rather than from the start.
+    A judge-graded benchmark yields one after each judge call, carrying the calls made so far.
+    """
+
+    content: bytes
 
 
 class EvalResumeCheckpoint(BaseModel):
@@ -397,6 +410,7 @@ __all__ = [
     "EvalResumeIdentityError",
     "EvalResumeIntegrityError",
     "EvalResumeStore",
+    "GradingInput",
     "PREFIX_ENV",
     "S3Client",
     "benchmark_id_from_sandbox",

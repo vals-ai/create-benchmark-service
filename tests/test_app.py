@@ -13,7 +13,7 @@ from starlette.websockets import WebSocketDisconnect
 from benchmark_service.vals import auth as auth_module
 from benchmark_service.vals.app import ValsBenchmarkServiceApp
 from benchmark_service.app import BenchmarkServiceApp, send_json_if_connected
-from benchmark_service.context import current_tenant
+from benchmark_service.context import current_sandbox_provider, current_tenant
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
 from benchmark_service.sandbox.types import (
@@ -425,6 +425,32 @@ def test_websocket_setup_task_resolves_sandbox_provider(
                 "type": "result",
                 "data": {"task_id": "task-1", "sandbox_name": "selected-sandbox-name"},
             }
+
+
+@pytest.mark.parametrize("sandbox_provider", [None, {"type": "modal", "MODAL_TOKEN_ID": "id", "MODAL_TOKEN_SECRET": "secret"}])
+def test_websocket_evaluate_response_binds_the_requests_sandbox_provider(
+    monkeypatch: pytest.MonkeyPatch, sandbox_provider: dict[str, str] | None
+) -> None:
+    """A retry sees the request's sandbox provider in the request scope, as evaluate-instance does."""
+    created = ProviderSelectionProvider()
+
+    class ProviderReadingBenchmark(StubBenchmark):
+        async def stream_evaluate_response(self, request: EvaluateResponseRequest, dataset: str | None = None):
+            yield StreamResultChunk(type="result", data={"bound": current_sandbox_provider() is created})
+
+    def create_provider(_config: ModalProviderConfig) -> SandboxProvider:
+        return created
+
+    monkeypatch.setattr(ModalProviderConfig, "create_provider", create_provider)
+    monkeypatch.delenv("AUTH_REQUIRED", raising=False)
+    body: dict[str, Any] = {"task_id": "task-1", "eval_resume_state": {"s3_key": "k"}}
+    if sandbox_provider is not None:
+        body["sandbox_provider"] = sandbox_provider
+
+    with TestClient(BenchmarkServiceApp(ProviderReadingBenchmark)) as c:
+        with c.websocket_connect("/ws/evaluate-response") as ws:
+            ws.send_json(body)
+            assert ws.receive_json() == {"type": "result", "data": {"bound": sandbox_provider is not None}}
 
 
 def test_websocket_setup_task_falls_back_to_header_provider_config(

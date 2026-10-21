@@ -8,9 +8,9 @@ from typing import Any, cast
 import pytest
 
 from benchmark_service.base import BenchmarkService
-from benchmark_service.context import tenant_scope
-from benchmark_service.eval_resume import EvalResumeIdentityError, EvalResumeStore
-from benchmark_service.sandbox import Sandbox
+from benchmark_service.context import sandbox_provider_scope, tenant_scope
+from benchmark_service.eval_resume import EvalResumeIdentityError, EvalResumeStore, GradingInput
+from benchmark_service.sandbox import ImageSource, Resources, Sandbox, SandboxCreateRequest, SandboxProvider
 from benchmark_service.schemas import (
     EvaluateResponseRequest,
     StreamChunk,
@@ -30,6 +30,9 @@ class _Sandbox:
     async def download_file(self, remote_path: str) -> bytes:
         return RESULT
 
+    async def upload_file(self, remote_path: str, content: bytes) -> None:
+        pass
+
 
 class HookBenchmark(StubBenchmark):
     """Grades the bytes its sandbox leaves behind, through the three hooks only."""
@@ -46,7 +49,7 @@ class HookBenchmark(StubBenchmark):
 
     async def grade_input(
         self, task_id: str, content: bytes, dataset: str | None = None
-    ) -> AsyncGenerator[StreamChunk, None]:
+    ) -> AsyncGenerator[StreamChunk | GradingInput, None]:
         self.graded.append(content)
         answer = json.loads(content)["answer"]
         yield StreamResultChunk(
@@ -274,3 +277,247 @@ def test_adopters_can_bind_a_tenant_from_the_package_root() -> None:
 
     with benchmark_service.tenant_scope("tenant-b"):
         assert benchmark_service.current_tenant() == "tenant-b"
+
+
+# Hooks v2: progress saves, sandbox grading, the post-save hook, the public load, an async identity.
+
+
+class _ProgressBenchmark(HookBenchmark):
+    """Saves its progress after each judge call, the way a judge-graded benchmark resumes mid-rubric."""
+
+    saved_before_resume: list[int]
+    store_objects: dict[tuple[str, str], bytes]
+
+    async def grade_input(
+        self, task_id: str, content: bytes, dataset: str | None = None
+    ) -> AsyncGenerator[StreamChunk | GradingInput, None]:
+        self.graded.append(content)
+        progress = json.loads(content)
+        for call in range(progress.get("calls", 0), 2):
+            progress["calls"] = call + 1
+            yield GradingInput(json.dumps(progress).encode())
+            self.saved_before_resume.append(len(self.store_objects))
+        yield StreamResultChunk(type="result", data={"calls": progress["calls"]})
+
+
+async def _progress_service(s3: _FakeS3) -> _ProgressBenchmark:
+    service = await _ProgressBenchmark.create()
+    service.graded = []
+    service.saved_before_resume = []
+    service.store_objects = s3.objects
+    service.eval_resume_store = EvalResumeStore(s3_client=s3)
+    return service
+
+
+async def test_grading_input_is_saved_and_streamed_before_grading_resumes(s3: _FakeS3) -> None:
+    service = await _progress_service(s3)
+
+    chunks = await _drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox())))
+
+    assert [chunk.type for chunk in chunks] == ["eval_resume_state", "eval_resume_state", "eval_resume_state", "result"]
+    assert service.saved_before_resume == [2, 3]
+    keys = [cast(StreamEvalResumeStateChunk, chunk).data["s3_key"] for chunk in chunks[:3]]
+    assert all(key.startswith("stub/eval-resume/tenant-a/run-1/task-1/") for key in keys)
+
+
+async def test_a_retry_resumes_from_the_latest_progress_and_saves_under_the_same_run(s3: _FakeS3) -> None:
+    first = await _progress_service(s3)
+    chunks = await _drain(first.evaluate_instance("task-1", cast(Sandbox, _Sandbox())))
+    after_one_call = chunks[1].data
+
+    retry = await _progress_service(s3)
+    request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=cast(dict[str, Any], after_one_call))
+    resumed = await _drain(retry.stream_evaluate_response(request))
+
+    assert json.loads(retry.graded[0]) == {"answer": "2", "calls": 1}
+    assert [chunk.type for chunk in resumed] == ["eval_resume_state", "result"]
+    assert cast(StreamEvalResumeStateChunk, resumed[0]).data["benchmark_id"] == "run-1"
+    assert resumed[-1].data == {"calls": 2}
+
+
+class _SavedHookBenchmark(HookBenchmark):
+    released: list[str]
+
+    async def grading_input_saved(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> None:
+        self.released.append(sandbox.id)
+
+
+async def test_grading_input_saved_runs_after_the_save(s3: _FakeS3) -> None:
+    service = await _SavedHookBenchmark.create()
+    service.graded, service.released = [], []
+    service.eval_resume_store = EvalResumeStore(s3_client=s3)
+
+    await _drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox())))
+
+    assert service.released == ["sandbox-1"]
+
+
+async def test_grading_input_saved_does_not_run_when_the_save_fails(
+    s3: _FakeS3, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service = await _SavedHookBenchmark.create()
+    service.graded, service.released = [], []
+    service.eval_resume_store = EvalResumeStore(s3_client=s3)
+    monkeypatch.delenv("EVAL_RESUME_BUCKET")
+
+    with pytest.raises(RuntimeError, match="EVAL_RESUME_BUCKET"):
+        await _drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox())))
+    assert service.released == []
+
+
+async def test_load_grading_input_returns_the_checked_bytes(s3: _FakeS3) -> None:
+    first = await _service(s3)
+    checkpoint = (await _drain(first.evaluate_instance("task-1", cast(Sandbox, _Sandbox()))))[0].data
+    request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=cast(dict[str, Any], checkpoint))
+
+    retry = await _service(s3)
+    assert await retry.load_grading_input(request) == RESULT
+
+    retry.grader_version = "rubric-2"
+    with pytest.raises(EvalResumeIdentityError):
+        await retry.load_grading_input(request)
+
+
+async def test_an_async_grader_identity_is_awaited(s3: _FakeS3) -> None:
+    class _AsyncIdentity(StubBenchmark):
+        evaluate_instance = BenchmarkService.evaluate_instance
+        collect_grading_input = HookBenchmark.collect_grading_input
+        grade_input = HookBenchmark.grade_input
+        graded: list[bytes]
+
+        async def grader_identity(self, task_id: str, dataset: str | None = None) -> Mapping[str, Any]:
+            await asyncio.sleep(0)
+            return {"verifier_image": "sha256:abc"}
+
+    service = await _AsyncIdentity.create()
+    service.graded = []
+    service.eval_resume_store = EvalResumeStore(s3_client=s3)
+    checkpoint = (await _drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox()))))[0].data
+
+    request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=cast(dict[str, Any], checkpoint))
+    assert [chunk.type for chunk in await _drain(service.stream_evaluate_response(request))] == ["result"]
+
+
+class _GradingSandbox:
+    def __init__(self, sandbox_id: str) -> None:
+        self.id = sandbox_id
+        self.labels: dict[str, str] = {}
+        self.files: dict[str, bytes] = {}
+
+    async def upload_file(self, remote_path: str, content: bytes) -> None:
+        self.files[remote_path] = content
+
+
+class _Provider:
+    def __init__(self) -> None:
+        self.created: list[SandboxCreateRequest] = []
+        self.deleted: list[str] = []
+        self.borrowed = _GradingSandbox("caller-owned")
+
+    async def create_sandbox(self, request: SandboxCreateRequest) -> _GradingSandbox:
+        self.created.append(request)
+        return _GradingSandbox(f"fresh-{len(self.created)}")
+
+    async def get_sandbox(self, instance_id: str) -> _GradingSandbox:
+        assert instance_id == self.borrowed.id
+        return self.borrowed
+
+    async def delete_sandbox(self, instance_id: str) -> None:
+        self.deleted.append(instance_id)
+
+
+class _SandboxGrader(StubBenchmark):
+    """Restores the saved bytes into whichever sandbox it is handed, then grades there."""
+
+    evaluate_instance = BenchmarkService.evaluate_instance
+    graded_in: list[str]
+    fail = False
+
+    async def collect_grading_input(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> bytes:
+        return await sandbox.download_file("/result.json")
+
+    def grader_identity(self, task_id: str, dataset: str | None = None) -> Mapping[str, Any]:
+        return {"grader_image": "sha256:def"}
+
+    async def grade_in_sandbox(
+        self, task_id: str, content: bytes, sandbox: Sandbox, dataset: str | None = None
+    ) -> AsyncGenerator[StreamChunk | GradingInput, None]:
+        await sandbox.upload_file("/submission", content)
+        self.graded_in.append(sandbox.id)
+        if self.fail:
+            raise RuntimeError("grader crashed")
+        yield StreamResultChunk(type="result", data={"resolved": True})
+
+
+async def _sandbox_service(s3: _FakeS3) -> _SandboxGrader:
+    service = await _SandboxGrader.create()
+    service.graded_in = []
+    service.eval_resume_store = EvalResumeStore(s3_client=s3)
+    return service
+
+
+async def _sandbox_checkpoint(s3: _FakeS3) -> dict[str, Any]:
+    first = await _sandbox_service(s3)
+    chunks = await _drain(first.evaluate_instance("task-1", cast(Sandbox, _Sandbox())))
+    assert first.graded_in == ["sandbox-1"]
+    return cast(dict[str, Any], chunks[0].data)
+
+
+async def test_grade_in_sandbox_retries_in_a_fresh_sandbox_and_deletes_it(s3: _FakeS3) -> None:
+    checkpoint = await _sandbox_checkpoint(s3)
+    retry, provider = await _sandbox_service(s3), _Provider()
+    request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=checkpoint)
+
+    with sandbox_provider_scope(cast(SandboxProvider, provider)):
+        chunks = await _drain(retry.stream_evaluate_response(request))
+
+    assert chunks[-1].data == {"resolved": True}
+    assert retry.graded_in == ["fresh-1"]
+    created = provider.created[0]
+    assert (created.source, created.resources) == (
+        ImageSource(image="python:3.12-slim"),
+        Resources(vcpu=2, memory=4, disk=10),
+    )
+    assert (created.labels["Id"], created.labels["Task"]) == ("run-1", "task-1")
+    assert provider.deleted == ["fresh-1"]
+
+
+async def test_the_fresh_sandbox_is_deleted_when_grading_fails(s3: _FakeS3) -> None:
+    checkpoint = await _sandbox_checkpoint(s3)
+    retry, provider = await _sandbox_service(s3), _Provider()
+    retry.fail = True
+    request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=checkpoint)
+
+    with sandbox_provider_scope(cast(SandboxProvider, provider)), pytest.raises(RuntimeError, match="grader crashed"):
+        await _drain(retry.stream_evaluate_response(request))
+    assert provider.deleted == ["fresh-1"]
+
+
+async def test_a_caller_owned_sandbox_is_borrowed_not_deleted(s3: _FakeS3) -> None:
+    checkpoint = await _sandbox_checkpoint(s3)
+    retry, provider = await _sandbox_service(s3), _Provider()
+    request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=checkpoint, instance_id="caller-owned")
+
+    with sandbox_provider_scope(cast(SandboxProvider, provider)):
+        await _drain(retry.stream_evaluate_response(request))
+
+    assert retry.graded_in == ["caller-owned"]
+    assert (provider.created, provider.deleted) == ([], [])
+
+
+async def test_grade_in_sandbox_retry_needs_a_sandbox_provider(s3: _FakeS3) -> None:
+    checkpoint = await _sandbox_checkpoint(s3)
+    retry = await _sandbox_service(s3)
+    request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=checkpoint)
+
+    with pytest.raises(ValueError, match="sandbox_provider"):
+        await _drain(retry.stream_evaluate_response(request))
+    assert retry.graded_in == []
+
+
+async def test_a_service_may_not_implement_both_graders() -> None:
+    class _Both(_SandboxGrader):
+        grade_input = HookBenchmark.grade_input
+
+    with pytest.raises(TypeError, match="either grade_input or grade_in_sandbox"):
+        await _Both.create()

@@ -316,8 +316,8 @@ An opt-in episode declares
 `RetrieveTaskResponse.episode = Episode(command="exec python /opt/bench/orchestrator.py", parallel_agents=5)`.
 It requires `credited_generation` with `stage_protocol="valkyrie-stage/1"`; without an episode,
 Tracker runs the agent command directly. Every episode sandbox must expose readable
-`/proc/$$/task/$$/children` to its command shell; CBS checks this before any episode
-preparation or launch. Ordinary controlled commands are unchanged.
+`/proc/$$/task/$$/children` to its command shell; CBS checks this before preparing the
+episode supervisor or launching the workload. Ordinary controlled commands are unchanged.
 In a `linux_process_group` sandbox, the image must provide Python 3.8+ as `python3`
 on `PATH` for the CBS-owned episode supervisor; the benchmark orchestrator owns its
 command and interpreter. CBS uploads the supervisor before constructing

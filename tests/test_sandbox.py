@@ -5459,6 +5459,20 @@ async def test_daytona_native_shell_preserves_cwd_env_and_exit(tmp_path: Path) -
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
+async def test_daytona_native_long_episode_command_preserves_payload(tmp_path: Path) -> None:
+    process = LocalNativeShellCgroupProcess(tmp_path)
+    payload = "x" * 5000
+    workload = _cgroup_sandbox(process).controlled_workload(f"printf '%s' '{payload}'; exit 17")
+    completed = await asyncio.wait_for(workload.wait(), 5)
+    assert completed.result.exit_code == 17
+    assert completed.result.output == payload
+    assert "".join([chunk async for chunk in workload.output()]) == payload
+    assert process.execute_calls == 1
+    assert not process.group_exists
+    assert process.sessions == set()
+
+
+@pytest.mark.usefixtures("_fake_cgroup_follow")
 async def test_daytona_native_command_gets_stdin_eof_with_parent_pipe_open(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

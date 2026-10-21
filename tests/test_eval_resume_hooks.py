@@ -8,6 +8,7 @@ from typing import Any, cast
 
 import pytest
 
+from benchmark_service import base
 from benchmark_service.base import BenchmarkService
 from benchmark_service.context import sandbox_provider_scope, tenant_scope
 from benchmark_service.eval_resume import EvalResumeIdentityError, EvalResumeStore, GradingInput, NotGradeable
@@ -804,11 +805,15 @@ async def test_a_failed_grading_input_saved_is_logged_and_grading_continues(
 
 
 class _VerifierGrader(_SandboxGrader):
-    async def grading_sandbox_spec(self, task_id: str, dataset: str | None = None) -> EvalSandboxSpec | None:
-        return EvalSandboxSpec(source=ImageSource(image="verifier:sha256-abc"), timeout_s=3600)
+    async def retrieve_task(
+        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+    ) -> RetrieveTaskResponse:
+        task = await super().retrieve_task(task_id, skip_validation, dataset)
+        spec = EvalSandboxSpec(source=ImageSource(image="verifier:sha256-abc"), timeout_s=3600)
+        return task.model_copy(update={"eval_sandbox": spec})
 
 
-async def test_a_grading_sandbox_spec_grades_the_first_attempt_in_its_own_sandbox(s3: _FakeS3) -> None:
+async def test_a_tasks_eval_sandbox_grades_the_first_attempt_in_its_own_sandbox(s3: _FakeS3) -> None:
     service, provider = await _sandbox_service(s3, _VerifierGrader), _Provider()
 
     with sandbox_provider_scope(cast(SandboxProvider, provider)):
@@ -826,7 +831,7 @@ async def test_a_grading_sandbox_spec_grades_the_first_attempt_in_its_own_sandbo
     assert provider.deleted == ["fresh-1"]
 
 
-async def test_a_grading_sandbox_spec_grades_the_retry_in_the_same_kind_of_sandbox(s3: _FakeS3) -> None:
+async def test_a_tasks_eval_sandbox_grades_the_retry_in_the_same_kind_of_sandbox(s3: _FakeS3) -> None:
     checkpoint = await _sandbox_checkpoint(s3)
     retry, provider = await _sandbox_service(s3, _VerifierGrader), _Provider()
     request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=checkpoint)
@@ -842,9 +847,25 @@ async def test_a_grading_sandbox_spec_grades_the_retry_in_the_same_kind_of_sandb
     assert provider.deleted == ["fresh-1"]
 
 
-async def test_a_grading_sandbox_spec_needs_a_sandbox_provider_on_the_first_attempt(s3: _FakeS3) -> None:
+async def test_a_tasks_eval_sandbox_needs_a_sandbox_provider_on_the_first_attempt(s3: _FakeS3) -> None:
     service = await _sandbox_service(s3, _VerifierGrader)
 
     with pytest.raises(ValueError, match="sandbox_provider"):
         await _drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox())))
     assert service.graded_in == []
+
+
+async def test_a_hung_grading_input_saved_is_abandoned_after_the_teardown_bound(
+    s3: _FakeS3, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _HungRelease(_SavedHookBenchmark):
+        async def grading_input_saved(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> None:
+            await asyncio.Event().wait()
+
+    monkeypatch.setattr(base, "TEARDOWN_TIMEOUT_S", 0.01)
+    service = await _saved_service(s3, _HungRelease)
+
+    chunks = await _drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox())))
+
+    assert [chunk.type for chunk in chunks] == ["eval_resume_state", "result"]
+    assert "grading_input_saved failed for task-1" in caplog.text

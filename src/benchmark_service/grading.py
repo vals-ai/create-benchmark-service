@@ -19,7 +19,6 @@ semantics. An async-job wrapper can later reuse all of these.
 
 import asyncio
 import logging
-import math
 import re
 import time
 import uuid
@@ -31,23 +30,22 @@ from fastapi.encoders import jsonable_encoder
 
 from benchmark_service.base import BenchmarkService
 from benchmark_service.context import sandbox_provider_scope, tenant_scope
+from benchmark_service.grading_spec import (
+    TEARDOWN_TIMEOUT_S,
+    ResolvedSpec,
+    auto_stop_minutes,
+    resolve_grading_spec,
+)
 from benchmark_service.sandbox import (
-    ComposeSource,
-    Resources,
     Sandbox,
     SandboxCreateRequest,
     SandboxProvider,
-    SnapshotSource,
-    TargetedSnapshotSource,
-    VolumeMount,
 )
-from benchmark_service.sandbox.types import BaseSandboxSource
 from benchmark_service.schemas import (
     ArtifactGradingSubmission,
     EvalMode,
     EvaluateResponseRequest,
     GradingSubmission,
-    RetrieveTaskResponse,
     StreamChunk,
     StreamErrorChunk,
     StreamMessageChunk,
@@ -58,13 +56,11 @@ from benchmark_service.v1_schemas import V1EvalResponse, V1EvalStatus
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_GRADE_TIMEOUT_S = 1800.0
 # Where the framework materializes an artifact-reference submission inside the
 # grading sandbox before the benchmark's prepare_grading_sandbox hook runs.
 SUBMISSION_ARTIFACT_SANDBOX_PATH = "/tmp/submission-artifact"
 _GRADING_CREATE_TIMEOUT_S = 600
 _PREPARATION_TIMEOUT_S = 600.0
-_TEARDOWN_TIMEOUT_S = 120.0
 _STREAM_CLOSE_TIMEOUT_S = 10.0
 _COLLAPSE_CLOSE_TIMEOUT_S = _STREAM_CLOSE_TIMEOUT_S
 
@@ -155,13 +151,6 @@ async def _next_stream_chunk(stream: AsyncGenerator[StreamChunk, None]) -> Strea
     return await anext(stream)
 
 
-def _auto_stop_minutes(budget_s: float) -> int:
-    """Backstop derived from the grading deadline so it never stops a sandbox
-    mid-grade; the explicit delete in grade_instance_stream is the real
-    teardown, and stopped sandboxes auto-delete (auto_delete_interval=0)."""
-    return math.ceil(budget_s / 60) + 10
-
-
 def _sandbox_name(run_id: str, task_id: str) -> str:
     """Unique logical grading name for operator attribution; Modal allocates its
     physical sandbox name independently. run_id/task_id appear only as a
@@ -169,52 +158,6 @@ def _sandbox_name(run_id: str, task_id: str) -> str:
     slug = re.sub(r"[^A-Za-z0-9-]+", "-", f"{run_id}-{task_id}").strip("-").lower()[:40]
     suffix = uuid.uuid4().hex[:10]
     return f"grade-{slug}-{suffix}" if slug else f"grade-{suffix}"
-
-
-@dataclass(frozen=True)
-class _ResolvedSpec:
-    """The task's eval-sandbox spec with generation-value fallbacks applied."""
-
-    source: BaseSandboxSource | TargetedSnapshotSource
-    resources: Resources
-    volumes: list[VolumeMount]
-    network_block_all: bool
-    grade_timeout: float
-
-
-def _resolve_grading_spec(task: RetrieveTaskResponse) -> _ResolvedSpec:
-    spec = task.eval_sandbox
-    source = spec.source if spec is not None and spec.source is not None else task.source
-    if isinstance(source, ComposeSource):
-        raise ValueError(
-            "sandbox grading does not support ComposeSource; set eval_sandbox.source to an image or snapshot"
-        )
-    if spec is not None and spec.resources is not None and isinstance(
-        source, (SnapshotSource, TargetedSnapshotSource)
-    ):
-        raise ValueError(
-            "eval_sandbox.resources cannot override a snapshot-backed sandbox; use an image source with explicit resources"
-        )
-    resources = spec.resources if spec is not None and spec.resources is not None else task.resources
-    if isinstance(source, (SnapshotSource, TargetedSnapshotSource)):
-        # The snapshot owns its resources; generation GPU settings cannot be
-        # forwarded through the required create-request resources field.
-        resources = resources.model_copy(update={"gpu": 0, "gpu_type": None})
-    if spec is None:
-        return _ResolvedSpec(
-            source=source,
-            resources=resources,
-            volumes=task.volumes,
-            network_block_all=True,
-            grade_timeout=DEFAULT_GRADE_TIMEOUT_S,
-        )
-    return _ResolvedSpec(
-        source=source,
-        resources=resources,
-        volumes=task.volumes,
-        network_block_all=spec.network_block_all,
-        grade_timeout=spec.timeout_s if spec.timeout_s is not None else DEFAULT_GRADE_TIMEOUT_S,
-    )
 
 
 async def _materialize_artifact(
@@ -246,7 +189,7 @@ class _GradeRun:
     def task_id(self) -> str:
         return self.submission.task_id
 
-    def create_request(self, spec: _ResolvedSpec, budget_s: float) -> SandboxCreateRequest:
+    def create_request(self, spec: ResolvedSpec, budget_s: float) -> SandboxCreateRequest:
         return SandboxCreateRequest(
             source=spec.source,
             resources=spec.resources,
@@ -260,13 +203,13 @@ class _GradeRun:
                 **(self.labels or {}),
             },
             env_vars={},
-            auto_stop_interval=_auto_stop_minutes(budget_s),
+            auto_stop_interval=auto_stop_minutes(budget_s),
             create_timeout=_GRADING_CREATE_TIMEOUT_S,
             network_block_all=spec.network_block_all,
             volumes=spec.volumes,
         )
 
-    async def create_sandbox(self, spec: _ResolvedSpec, budget_s: float) -> Sandbox:
+    async def create_sandbox(self, spec: ResolvedSpec, budget_s: float) -> Sandbox:
         return await self.provider.create_sandbox(self.create_request(spec, budget_s))
 
     async def prepare_sandbox(self, sandbox: Sandbox) -> None:
@@ -279,7 +222,7 @@ class _GradeRun:
         this misses."""
         await _run_bounded_cleanup(
             self.provider.delete_sandbox(sandbox.id),
-            timeout_s=_TEARDOWN_TIMEOUT_S,
+            timeout_s=TEARDOWN_TIMEOUT_S,
             action_name="grading sandbox deletion",
             run_id=self.run_id,
             task_id=self.task_id,
@@ -375,7 +318,7 @@ async def grade_instance_stream(
         try:
             async with asyncio.timeout(_PREPARATION_TIMEOUT_S):
                 task = await run.service.retrieve_task(run.task_id, dataset=run.dataset)
-                spec = _resolve_grading_spec(task)
+                spec = resolve_grading_spec(task)
                 budget_s = _PREPARATION_TIMEOUT_S + spec.grade_timeout
                 sandbox = await run.create_sandbox(spec, budget_s)
                 await run.prepare_sandbox(sandbox)

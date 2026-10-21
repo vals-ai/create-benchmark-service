@@ -801,3 +801,50 @@ async def test_a_failed_grading_input_saved_is_logged_and_grading_continues(
 
     assert [chunk.type for chunk in chunks] == ["eval_resume_state", "result"]
     assert "grading_input_saved failed for task-1" in caplog.text
+
+
+class _VerifierGrader(_SandboxGrader):
+    async def grading_sandbox_spec(self, task_id: str, dataset: str | None = None) -> EvalSandboxSpec | None:
+        return EvalSandboxSpec(source=ImageSource(image="verifier:sha256-abc"), timeout_s=3600)
+
+
+async def test_a_grading_sandbox_spec_grades_the_first_attempt_in_its_own_sandbox(s3: _FakeS3) -> None:
+    service, provider = await _sandbox_service(s3, _VerifierGrader), _Provider()
+
+    with sandbox_provider_scope(cast(SandboxProvider, provider)):
+        chunks = await _drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox())))
+
+    assert [chunk.type for chunk in chunks] == ["eval_resume_state", "result"]
+    assert service.graded_in == ["fresh-1"]
+    created = provider.created[0]
+    assert (created.source, created.resources, created.network_block_all, created.auto_stop_interval) == (
+        ImageSource(image="verifier:sha256-abc"),
+        Resources(vcpu=2, memory=4, disk=10),
+        True,
+        70,
+    )
+    assert provider.deleted == ["fresh-1"]
+
+
+async def test_a_grading_sandbox_spec_grades_the_retry_in_the_same_kind_of_sandbox(s3: _FakeS3) -> None:
+    checkpoint = await _sandbox_checkpoint(s3)
+    retry, provider = await _sandbox_service(s3, _VerifierGrader), _Provider()
+    request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=checkpoint)
+
+    with sandbox_provider_scope(cast(SandboxProvider, provider)):
+        await _drain(retry.stream_evaluate_response(request))
+
+    assert retry.graded_in == ["fresh-1"]
+    assert (provider.created[0].source, provider.created[0].network_block_all) == (
+        ImageSource(image="verifier:sha256-abc"),
+        True,
+    )
+    assert provider.deleted == ["fresh-1"]
+
+
+async def test_a_grading_sandbox_spec_needs_a_sandbox_provider_on_the_first_attempt(s3: _FakeS3) -> None:
+    service = await _sandbox_service(s3, _VerifierGrader)
+
+    with pytest.raises(ValueError, match="sandbox_provider"):
+        await _drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox())))
+    assert service.graded_in == []

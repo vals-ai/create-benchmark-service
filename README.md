@@ -506,12 +506,12 @@ Eval-only retry flow:
 **Making a benchmark retryable from evaluation.** If your grader reads the agent's output (a result file, a patch, an archive), implement three hooks instead of `evaluate_instance`:
 
 - `collect_grading_input(task_id, sandbox, dataset) -> bytes`: what to save from the finished sandbox.
-- `grader_identity(task_id, dataset)`: what decides the grade (judge model and rubric revision, or test revision and grader image). A retry refuses to grade if this changed. It may be `async`.
+- `grader_identity(task_id, dataset)`: what decides the grade (judge model and rubric revision, or test revision and grader image). A retry refuses to grade if this changed.
 - `grade_input(task_id, content, dataset)`: how to grade those bytes.
 
 The framework saves the bytes to S3 before grading and, on a retry, grades the saved copy instead of rerunning the agent. Storage comes from `EVAL_RESUME_BUCKET` and `EVAL_RESUME_PREFIX`, which benchmark-services-registry sets when a service opts in. Implement all three hooks or none. Details are in `benchmark_service/eval_resume.py`.
 
-If your grader runs inside a sandbox, implement `grade_in_sandbox` instead of `grade_input`; a retry then grades in a fresh sandbox, or in the caller's when the task declares `resume_sandbox`. A grader with no bounded input to save keeps its own `evaluate_instance`. If it should resume part-way, for example after each judge call, yield `GradingInput` from it.
+If your grader runs in a sandbox, implement `grade_in_sandbox` instead of `grade_input`; a retry grades in a fresh sandbox, or in the caller's sandbox when the request names one. To save progress part-way, for example after each judge call, yield `GradingInput`. A grader with no bounded input to save keeps its own `evaluate_instance`.
 
 ### Streaming protocol
 

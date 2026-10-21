@@ -73,11 +73,15 @@ async def _finish_quietly(work: Awaitable[None], failure: str, *args: object) ->
             logger.exception(failure, *args)
 
     task = asyncio.create_task(run())
-    try:
-        await asyncio.shield(task)
-    except asyncio.CancelledError:
-        await asyncio.shield(task)
-        raise
+    cancellation: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            if cancellation is None:
+                cancellation = exc
+    if cancellation is not None:
+        raise cancellation
 
 
 async def _delete_owned_sandbox(provider: SandboxProvider, sandbox_id: str) -> None:
@@ -96,13 +100,9 @@ async def _create_owned_sandbox(provider: SandboxProvider, request: SandboxCreat
                 sandbox = await creation
             except Exception:
                 return
-            await _delete_owned_sandbox(provider, sandbox.id)
+            await provider.delete_sandbox(sandbox.id)
 
-        cleanup = asyncio.create_task(delete_when_created())
-        try:
-            await asyncio.shield(cleanup)
-        except asyncio.CancelledError:
-            pass
+        await _finish_quietly(delete_when_created(), "Failed to delete eval-resume sandbox after a cancelled create")
         raise
 
 

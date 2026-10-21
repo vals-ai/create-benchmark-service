@@ -627,7 +627,8 @@ async def test_a_task_that_declares_a_caller_owned_resume_sandbox_needs_its_inst
     assert (provider.created, retry.graded_in) == ([], [])
 
 
-async def test_cancelling_a_retry_while_its_sandbox_is_created_still_deletes_it(s3: _FakeS3) -> None:
+@pytest.mark.parametrize("cancels", [1, 2])
+async def test_cancelling_a_retry_while_its_sandbox_is_created_still_deletes_it(s3: _FakeS3, cancels: int) -> None:
     class _SlowProvider(_Provider):
         def __init__(self) -> None:
             super().__init__()
@@ -646,8 +647,9 @@ async def test_cancelling_a_retry_while_its_sandbox_is_created_still_deletes_it(
     with sandbox_provider_scope(cast(SandboxProvider, provider)):
         task = asyncio.create_task(_drain(retry.stream_evaluate_response(request)))
         await provider.creating.wait()
-        task.cancel()
-        await asyncio.sleep(0)
+        for _ in range(cancels):
+            task.cancel()
+            await asyncio.sleep(0)
         provider.release.set()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -686,9 +688,12 @@ async def _cancel_while_deleting(s3: _FakeS3, provider: _BlockingDeleteProvider,
             await task
 
 
-async def test_cancelling_a_retry_while_its_sandbox_is_deleted_lets_the_delete_finish(s3: _FakeS3) -> None:
+@pytest.mark.parametrize("cancels", [1, 2])
+async def test_cancelling_a_retry_while_its_sandbox_is_deleted_lets_the_delete_finish(
+    s3: _FakeS3, cancels: int
+) -> None:
     provider = _BlockingDeleteProvider()
-    await _cancel_while_deleting(s3, provider)
+    await _cancel_while_deleting(s3, provider, cancels)
     assert provider.deleted == ["fresh-1"]
 
 
@@ -697,7 +702,6 @@ async def test_a_failed_delete_during_cancellation_is_logged_and_the_cancellatio
     s3: _FakeS3, caplog: pytest.LogCaptureFixture, cancels: int
 ) -> None:
     await _cancel_while_deleting(s3, _BlockingDeleteProvider(fail=True), cancels)
-    await asyncio.sleep(0)
     assert "Failed to delete eval-resume sandbox fresh-1" in caplog.text
 
 
@@ -756,22 +760,24 @@ class _BlockingRelease(_SavedHookBenchmark):
         self.released.append(sandbox.id)
 
 
-async def _cancel_while_releasing(s3: _FakeS3, fail: bool = False) -> _BlockingRelease:
+async def _cancel_while_releasing(s3: _FakeS3, fail: bool = False, cancels: int = 1) -> _BlockingRelease:
     service = cast(_BlockingRelease, await _saved_service(s3, _BlockingRelease))
     service.releasing, service.finish, service.fail = asyncio.Event(), asyncio.Event(), fail
 
     task = asyncio.create_task(_drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox()))))
     await service.releasing.wait()
-    task.cancel()
-    await asyncio.sleep(0)
+    for _ in range(cancels):
+        task.cancel()
+        await asyncio.sleep(0)
     service.finish.set()
     with pytest.raises(asyncio.CancelledError):
         await task
     return service
 
 
-async def test_grading_input_saved_finishes_when_the_stream_is_cancelled_during_it(s3: _FakeS3) -> None:
-    service = await _cancel_while_releasing(s3)
+@pytest.mark.parametrize("cancels", [1, 2])
+async def test_grading_input_saved_finishes_when_the_stream_is_cancelled_during_it(s3: _FakeS3, cancels: int) -> None:
+    service = await _cancel_while_releasing(s3, cancels=cancels)
     assert (service.released, service.graded) == (["sandbox-1"], [])
 
 

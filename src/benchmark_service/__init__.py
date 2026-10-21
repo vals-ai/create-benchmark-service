@@ -52,6 +52,7 @@ from benchmark_service.schemas import (
     ArtifactGradingSubmission,
     CreditedGeneration,
     DatasetVersion,
+    Episode,
     ListDatasetsResponse,
     ResolveDatasetRequest,
     ResolveDatasetResponse,
@@ -62,11 +63,15 @@ from benchmark_service.schemas import (
     SubmissionArtifactReference,
     TextGradingSubmission,
 )
-from benchmark_service.valkyrie_stage import StageReporter, valkyrie_stage_source
+from benchmark_service.valkyrie_stage import Agents, Exhausted, SlotResult, StageReporter, valkyrie_stage_source
 
 __all__ = [
     "DATASET_VERSION_HEADER",
     "CreditedGeneration",
+    "Episode",
+    "Agents",
+    "Exhausted",
+    "SlotResult",
     "DatasetVersion",
     "ListDatasetsResponse",
     "ResolveDatasetRequest",

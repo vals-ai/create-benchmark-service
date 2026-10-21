@@ -1,4 +1,4 @@
-"""How a grading sandbox is resolved from a task, shared by ``/v1`` grading and eval-resume."""
+"""Grading-sandbox resolution and teardown bounds, shared by ``/v1`` grading and eval-resume."""
 
 import math
 from dataclasses import dataclass
@@ -18,9 +18,7 @@ TEARDOWN_TIMEOUT_S = 120.0
 
 
 def auto_stop_minutes(budget_s: float) -> int:
-    """Backstop derived from the grading deadline so it never stops a sandbox
-    mid-grade; the explicit delete in grade_instance_stream is the real
-    teardown, and stopped sandboxes auto-delete (auto_delete_interval=0)."""
+    """Auto-stop backstop that outlasts the grading budget; the caller's explicit delete is the real teardown."""
     return math.ceil(budget_s / 60) + 10
 
 

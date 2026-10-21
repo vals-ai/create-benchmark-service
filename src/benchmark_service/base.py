@@ -65,7 +65,7 @@ logger = logging.getLogger(__name__)
 
 
 async def _finish_quietly(work: Awaitable[None], failure: str, *args: object) -> None:
-    """Await ``work`` for up to two minutes even if the caller is cancelled meanwhile; log its failure rather than raise it."""
+    """Await ``work`` for up to ``TEARDOWN_TIMEOUT_S`` even if the caller is cancelled; log, never raise, a failure."""
 
     async def run() -> None:
         try:

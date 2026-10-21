@@ -867,7 +867,8 @@ async def test_a_hung_grading_input_saved_is_abandoned_after_the_teardown_bound(
     monkeypatch.setattr(base, "TEARDOWN_TIMEOUT_S", 0.01)
     service = await _saved_service(s3, _HungRelease)
 
-    chunks = await _drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox())))
+    async with asyncio.timeout(5):
+        chunks = await _drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox())))
 
     assert [chunk.type for chunk in chunks] == ["eval_resume_state", "result"]
     assert "grading_input_saved failed for task-1" in caplog.text

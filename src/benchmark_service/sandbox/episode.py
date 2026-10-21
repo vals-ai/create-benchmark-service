@@ -24,10 +24,14 @@ async def controlled_episode_workload(
     env_vars: Mapping[str, str] | None = None,
 ) -> ControlledWorkload:
     """Prepare the uploaded owner before constructing the auto-starting native workload."""
-    if sandbox.generation_containment == LINUX_CGROUP_V2_V1:
-        return sandbox.controlled_workload(command, cwd=cwd, env_vars=env_vars)
-    if sandbox.generation_containment != LINUX_PROCESS_GROUP_V1:
+    containment = sandbox.generation_containment
+    if containment not in (LINUX_CGROUP_V2_V1, LINUX_PROCESS_GROUP_V1):
         raise SandboxError("Episode requires supported generation containment")
+    result = await sandbox.exec("cat /proc/$$/task/$$/children >/dev/null")
+    if result.exit_code:
+        raise SandboxError(f"Episode requires readable /proc task children: {result.output}")
+    if containment == LINUX_CGROUP_V2_V1:
+        return sandbox.controlled_workload(command, cwd=cwd, env_vars=env_vars)
     directory = f"/tmp/cbs-episode-{uuid.uuid4().hex}"
     result = await sandbox.exec(f"mkdir {shlex.quote(directory)}")
     if result.exit_code:

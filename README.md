@@ -315,9 +315,12 @@ code may assert a generation credit.
 An opt-in episode declares
 `RetrieveTaskResponse.episode = Episode(command="exec python /opt/bench/orchestrator.py", parallel_agents=5)`.
 It requires `credited_generation` with `stage_protocol="valkyrie-stage/1"`; without an episode,
-Tracker runs the agent command directly. In a `linux_process_group` sandbox, the image must
-provide Python 3.8+ as `python3` on `PATH` for the CBS-owned episode supervisor; the benchmark
-orchestrator owns its command and interpreter. CBS uploads the supervisor before constructing
+Tracker runs the agent command directly. Every episode sandbox must expose readable
+`/proc/$$/task/$$/children` to its command shell; CBS checks this before any episode
+preparation or launch. Ordinary controlled commands are unchanged.
+In a `linux_process_group` sandbox, the image must provide Python 3.8+ as `python3`
+on `PATH` for the CBS-owned episode supervisor; the benchmark orchestrator owns its
+command and interpreter. CBS uploads the supervisor before constructing
 the native workload. A single process-group leader publishes a FIFO and PGID, then replaces
 itself with the Python subreaper. An episode stop waits for that owner to drain its adopted
 descendants and publish a numeric status; a missing status after launch is not confirmation.

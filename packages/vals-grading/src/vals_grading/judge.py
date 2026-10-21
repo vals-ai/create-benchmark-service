@@ -54,11 +54,27 @@ class CheckJudge:
     def __init__(self, model: JudgeModel) -> None:
         self._model = model
 
-    async def require_gradeable(self, test: GradingCase) -> None:
-        """Refuse unsupported prompts before any grading query."""
-        if any("{{files}}" in check.prompt for check in test.checks):
-            raise UnsupportedCheckError(f"Test {test.id} requires file grading, which is not supported.")
-        if any("{{context.input}}" in check.prompt for check in test.checks):
+    async def require_gradeable(
+        self, test: GradingCase, llm_output: str = "", output_context: dict[str, JsonValue] | None = None
+    ) -> None:
+        """Refuse unsupported expansions before any grading query."""
+        expanded: set[str] = set()
+        for check in test.checks:
+            try:
+                _format_prompt(
+                    check.prompt,
+                    test=test,
+                    criteria=check.criteria,
+                    llm_output=llm_output,
+                    output_context=output_context or {},
+                    expanded=expanded,
+                )
+            except UnsupportedCheckError:
+                raise
+            except ValueError:
+                # Missing context remains a per-check error during grading.
+                continue
+        if "{{context.input}}" in expanded:
             if await self._model.count_tokens(str(test.context)) > CHUNK_TOKENS:
                 raise UnsupportedCheckError(
                     f"Test {test.id} has context over {CHUNK_TOKENS} tokens, which requires chunked grading."
@@ -72,7 +88,7 @@ class CheckJudge:
         test = test.model_copy(deep=True)
         evaluation_context = json.loads(json.dumps(output_context))
         evaluation_context.pop(TRAJECTORY_OUTPUT_CONTEXT_KEY, None)
-        await self.require_gradeable(test)
+        await self.require_gradeable(test, llm_output, evaluation_context)
         semaphore = asyncio.Semaphore(CHECK_CONCURRENCY)
 
         async def grade(check: Check) -> CheckResult:
@@ -103,6 +119,7 @@ class CheckJudge:
         pass_percentage, weighted, low_confidence = _compute_pass_percentages(test.checks, outcomes)
         return GradingResult(
             test_id=test.id,
+            grading_case=test,
             check_results=tuple(outcomes),
             pass_percentage=pass_percentage,
             pass_percentage_with_weight=weighted,
@@ -171,14 +188,20 @@ class CheckJudge:
         reprompt = REQUERY_PROMPT.format(initial_output=initial_output, initial_prompt=initial_prompt)
         output = await self._model.generate(reprompt)
         raw_output = output.strip()[0]
-        if raw_output.isdigit():
+        if raw_output in ("0", "1"):
             return int(raw_output)
         logger.warning("Judge gave no 0 or 1 after a requery; scoring the check 0")
         return 0
 
 
 def _format_prompt(
-    template: str, *, test: GradingCase, criteria: str, llm_output: str, output_context: dict[str, JsonValue]
+    template: str,
+    *,
+    test: GradingCase,
+    criteria: str,
+    llm_output: str,
+    output_context: dict[str, JsonValue],
+    expanded: set[str] | None = None,
 ) -> str:
     """Render a binary check prompt.
 
@@ -202,6 +225,11 @@ def _format_prompt(
     }
     prompt += DEFAULT_FORMATTING_PROMPT
     for placeholder, value in matching_placeholders.items():
+        if placeholder in prompt:
+            if placeholder == "{{files}}":
+                raise UnsupportedCheckError(f"Test {test.id} requires file grading, which is not supported.")
+            if expanded is not None:
+                expanded.add(placeholder)
         prompt = prompt.replace(placeholder, value)
     return prompt
 
@@ -232,7 +260,8 @@ def _parse_json(llm_output: str) -> Any:
     try:
         parsed_output = json.loads(llm_output)
         if "explanation" in parsed_output and "result" in parsed_output:
-            return parsed_output
+            if parsed_output["result"] in (0, 1, "0", "1"):
+                return parsed_output
     except json.JSONDecodeError:
         pass
     return 0

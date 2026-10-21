@@ -157,3 +157,42 @@ async def test_runnable_example_inputs() -> None:
         saved, response["llm_output"], response["output_context"]
     )
     assert result.pass_percentage_with_weight == 1
+
+
+@pytest.mark.parametrize("source", ["criteria", "input", "output", "nested", "output_context"])
+@pytest.mark.parametrize("placeholder", ["{{files}}", "{{context.input}}"])
+async def test_inserted_unsupported_placeholders_fail_before_queries(source: str, placeholder: str) -> None:
+    if source == "output_context" and placeholder == "{{context.input}}":
+        return  # This replacement is earlier in the documented order and stays literal.
+    test = case().model_copy(update={"context": {"large": "x" * CHUNK_TOKENS, "nested": placeholder}})
+    prompt = {
+        "criteria": "{{criteria}}",
+        "input": "{{input}}",
+        "output": "{{output}}",
+        "nested": "{{context.input.nested}}",
+        "output_context": "{{context.output}}",
+    }[source]
+    test = test.model_copy(
+        update={
+            "input_under_test": placeholder,
+            "checks": (test.checks[0].model_copy(update={"prompt": prompt, "criteria": placeholder}),),
+        }
+    )
+    model = RecordedModel([PASS])
+    with pytest.raises(UnsupportedCheckError):
+        await CheckJudge(model).grade_test(test, placeholder, {"value": placeholder})
+    assert not model.prompts
+
+
+@pytest.mark.parametrize("invalid", [2, -1, 0.5, "2"])
+async def test_nonbinary_json_uses_fallback(invalid: object) -> None:
+    model = RecordedModel([json.dumps({"result": invalid, "explanation": "invalid"}), "0"])
+    result = await CheckJudge(model).grade_test(case(weights=(-1,)), "A", {})
+    assert result.check_results[0].auto_eval == 0
+    assert len(model.prompts) == 2
+
+
+async def test_nonbinary_requery_cannot_escape_negative_penalty() -> None:
+    model = RecordedModel([PASS, "no json", "2", "2"])
+    result = await CheckJudge(model).grade_test(case(weights=(2, -1)), "A", {})
+    assert result.pass_percentage_with_weight == 0.5

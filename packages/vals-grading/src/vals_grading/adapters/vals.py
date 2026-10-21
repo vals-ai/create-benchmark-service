@@ -68,9 +68,12 @@ def to_test_result(
     metadata: Metadata | None = None,
 ) -> TestResult:
     """Build an SDK result for existing scoring or upload code."""
-    expected = [(check.operator, check.criteria) for check in test.checks]
+    original = result.grading_case
+    operators = {check.operator: CustomOperatorPrompt(prompt=check.prompt, rubric=None) for check in original.checks}
+    exported = export_suite(Suite(title="Result conversion", tests=[test]), operators)
+    expected = exported.get(result.test_id)
     actual = [(check.operator, check.criteria) for check in result.check_results]
-    if result.test_id != test.id or expected != actual:
+    if expected != original or actual != [(check.operator, check.criteria) for check in original.checks]:
         raise ValueError(
             "The grading result belongs to a different test or check list. Use the original exported test."
         )

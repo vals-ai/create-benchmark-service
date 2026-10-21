@@ -95,7 +95,9 @@ For service deployment and dataset setup, use the existing
 ## Grading behavior
 
 The first version implements binary custom checks from platform revision `d63fdbd` and CBS PR #213 at `27ffd6e6`.
-It preserves prompt replacement order, JSON parsing, two fallback requests, per-test concurrency of ten, and severity-weighted scoring.
+It preserves prompt replacement order, two fallback requests, per-test concurrency of ten, and severity-weighted scoring.
+Unlike the platform parser, it rejects nonbinary JSON scores and limits final requery scores to zero or one.
+Results carry their saved grading case. SDK conversion rejects changes to the test inputs, context, checks, or weights.
 Nested context substitutions retain the platform's outer braces.
 Negative severity weights penalize failing checks.
 Model exceptions become failed checks with `eval_error=true`.

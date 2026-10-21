@@ -56,3 +56,23 @@ def test_rejects_unsupported_suite(kind: str) -> None:
     operators = {"custom": CustomOperatorPrompt(prompt="P", rubric=[{"score": 1}] if kind == "rubric" else None)}
     with pytest.raises(UnsupportedCheckError):
         export_suite(suite, operators)
+
+
+async def test_conversion_rejects_changed_weights() -> None:
+    test = Test(
+        id="saved",
+        input_under_test="Q",
+        checks=[
+            SDKCheck(operator="custom", criteria="first", modifiers=CheckModifiers(severity=2)),
+            SDKCheck(operator="custom", criteria="second", modifiers=CheckModifiers(severity=1)),
+        ],
+    )
+    saved = export_suite(Suite(title="suite", tests=[test]), OPERATORS)["saved"]
+    result = await CheckJudge(
+        RecordedModel(['{"result":1,"explanation":"yes"}', '{"result":0,"explanation":"no"}'])
+    ).grade_test(saved, "A", {})
+    assert to_test_result(result, test, "A", {}).pass_percentage_with_weight == 2 / 3
+    test.checks[0].modifiers.severity = 1
+    test.checks[1].modifiers.severity = 2
+    with pytest.raises(ValueError, match="different test"):
+        to_test_result(result, test, "A", {})

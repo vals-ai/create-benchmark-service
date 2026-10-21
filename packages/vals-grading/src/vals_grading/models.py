@@ -40,6 +40,7 @@ class CheckResult(GradingModel):
 
 class GradingResult(GradingModel):
     test_id: str
+    grading_case: GradingCase
     check_results: tuple[CheckResult, ...]
     pass_percentage: float
     pass_percentage_with_weight: float

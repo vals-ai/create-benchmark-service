@@ -36,6 +36,7 @@ from benchmark_service.schemas import (
     MaterializedSubmissionArtifact,
     RetrieveTaskResponse,
     StreamChunk,
+    StreamErrorChunk,
     StreamEvalResumeStateChunk,
     StreamResultChunk,
     TaskFilter,
@@ -62,21 +63,25 @@ _EVAL_RESUME_CREATE_TIMEOUT_S = 600
 logger = logging.getLogger(__name__)
 
 
-async def _delete_owned_sandbox(provider: SandboxProvider, sandbox_id: str) -> None:
-    """Delete a retry sandbox even when the stream that owns it is being cancelled."""
+async def _finish_quietly(work: Awaitable[None], failure: str, *args: object) -> None:
+    """Await ``work`` to the end even if the caller is cancelled meanwhile; log its failure rather than raise it."""
 
-    async def delete() -> None:
+    async def run() -> None:
         try:
-            await provider.delete_sandbox(sandbox_id)
+            await work
         except Exception:
-            logger.exception("Failed to delete eval-resume sandbox %s", sandbox_id)
+            logger.exception(failure, *args)
 
-    cleanup = asyncio.create_task(delete())
+    task = asyncio.create_task(run())
     try:
-        await asyncio.shield(cleanup)
+        await asyncio.shield(task)
     except asyncio.CancelledError:
-        await asyncio.shield(cleanup)
+        await asyncio.shield(task)
         raise
+
+
+async def _delete_owned_sandbox(provider: SandboxProvider, sandbox_id: str) -> None:
+    await _finish_quietly(provider.delete_sandbox(sandbox_id), "Failed to delete eval-resume sandbox %s", sandbox_id)
 
 
 async def _create_owned_sandbox(provider: SandboxProvider, request: SandboxCreateRequest) -> Sandbox:
@@ -641,11 +646,22 @@ class BenchmarkService(ABC):
         Yields:
             StreamChunk - one of StreamMessageChunk, StreamResultChunk, or StreamErrorChunk
         """
-        content = await self.collect_grading_input(task_id, sandbox, dataset=dataset)
+        try:
+            content = await self.collect_grading_input(task_id, sandbox, dataset=dataset)
+        except eval_resume.NotGradeable as exc:
+            yield StreamErrorChunk(type="error", data=str(exc))
+            return
         benchmark_id = eval_resume.benchmark_id_from_sandbox(sandbox)
         binding = await self._checkpoint_binding(task_id, dataset)
-        yield await self._eval_resume_save(benchmark_id, task_id, content, binding)
-        await self.grading_input_saved(task_id, sandbox, dataset=dataset)
+        checkpoint = await self._eval_resume_save(benchmark_id, task_id, content, binding)
+        try:
+            yield checkpoint
+        finally:
+            await _finish_quietly(
+                self.grading_input_saved(task_id, sandbox, dataset=dataset),
+                "grading_input_saved failed for %s",
+                task_id,
+            )
         grading = self._eval_resume_grade(task_id, content, sandbox, dataset)
         async with aclosing(self._eval_resume_stream(grading, benchmark_id, task_id, binding)) as chunks:
             async for chunk in chunks:

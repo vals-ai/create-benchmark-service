@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+from contextlib import aclosing
 from collections.abc import AsyncGenerator, Iterator, Mapping
 from typing import Any, cast
 
@@ -9,7 +10,7 @@ import pytest
 
 from benchmark_service.base import BenchmarkService
 from benchmark_service.context import sandbox_provider_scope, tenant_scope
-from benchmark_service.eval_resume import EvalResumeIdentityError, EvalResumeStore, GradingInput
+from benchmark_service.eval_resume import EvalResumeIdentityError, EvalResumeStore, GradingInput, NotGradeable
 from benchmark_service.sandbox import (
     ImageSource,
     Resources,
@@ -23,6 +24,7 @@ from benchmark_service.schemas import (
     EvaluateResponseRequest,
     RetrieveTaskResponse,
     StreamChunk,
+    StreamErrorChunk,
     StreamEvalResumeStateChunk,
     StreamResultChunk,
 )
@@ -707,3 +709,102 @@ async def test_a_failed_delete_is_logged_and_the_grade_still_streams(
 
     assert chunks[-1].data == {"resolved": True}
     assert "Failed to delete eval-resume sandbox fresh-1" in caplog.text
+
+
+async def test_an_ungradeable_input_streams_its_error_and_saves_nothing(s3: _FakeS3) -> None:
+    class _Ungradeable(HookBenchmark):
+        async def collect_grading_input(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> bytes:
+            raise NotGradeable("generation did not finish")
+
+    service = await _Ungradeable.create()
+    service.graded = []
+    service.eval_resume_store = EvalResumeStore(s3_client=s3)
+
+    chunks = await _drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox())))
+
+    assert chunks == [StreamErrorChunk(type="error", data="generation did not finish")]
+    assert (s3.objects, service.graded) == ({}, [])
+
+
+async def test_grading_input_saved_runs_when_the_caller_hangs_up_at_the_checkpoint(s3: _FakeS3) -> None:
+    service = await _SavedHookBenchmark.create()
+    service.graded, service.released = [], []
+    service.eval_resume_store = EvalResumeStore(s3_client=s3)
+
+    async with aclosing(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox()))) as chunks:
+        assert (await anext(chunks)).type == "eval_resume_state"
+
+    assert (service.released, service.graded) == (["sandbox-1"], [])
+
+
+async def test_grading_input_saved_runs_when_the_stream_is_cancelled_at_the_checkpoint(s3: _FakeS3) -> None:
+    hang_up = asyncio.Event()
+
+    class _SlowRelease(_SavedHookBenchmark):
+        async def grading_input_saved(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> None:
+            await asyncio.sleep(0)
+            self.released.append(sandbox.id)
+
+    service = await _SlowRelease.create()
+    service.graded, service.released = [], []
+    service.eval_resume_store = EvalResumeStore(s3_client=s3)
+
+    async def consume() -> None:
+        async with aclosing(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox()))) as chunks:
+            await anext(chunks)
+            hang_up.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(consume())
+    await hang_up.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert (service.released, service.graded) == (["sandbox-1"], [])
+
+
+async def test_a_failed_grading_input_saved_during_cancellation_is_logged_and_the_cancellation_kept(
+    s3: _FakeS3, caplog: pytest.LogCaptureFixture
+) -> None:
+    hang_up = asyncio.Event()
+
+    class _FailingRelease(_SavedHookBenchmark):
+        async def grading_input_saved(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> None:
+            await asyncio.sleep(0)
+            raise RuntimeError("release failed")
+
+    service = await _FailingRelease.create()
+    service.graded, service.released = [], []
+    service.eval_resume_store = EvalResumeStore(s3_client=s3)
+
+    async def consume() -> None:
+        async with aclosing(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox()))) as chunks:
+            await anext(chunks)
+            hang_up.set()
+            await asyncio.Event().wait()
+
+    task = asyncio.create_task(consume())
+    await hang_up.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    assert "grading_input_saved failed for task-1" in caplog.text
+
+
+async def test_a_failed_grading_input_saved_is_logged_and_grading_continues(
+    s3: _FakeS3, caplog: pytest.LogCaptureFixture
+) -> None:
+    class _FailingRelease(_SavedHookBenchmark):
+        async def grading_input_saved(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> None:
+            raise RuntimeError("release failed")
+
+    service = await _FailingRelease.create()
+    service.graded, service.released = [], []
+    service.eval_resume_store = EvalResumeStore(s3_client=s3)
+
+    chunks = await _drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox())))
+
+    assert [chunk.type for chunk in chunks] == ["eval_resume_state", "result"]
+    assert "grading_input_saved failed for task-1" in caplog.text

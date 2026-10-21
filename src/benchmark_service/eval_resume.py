@@ -82,6 +82,10 @@ class EvalResumeIntegrityError(EvalResumeError):
     """The stored bytes do not match the size or SHA-256 the checkpoint recorded."""
 
 
+class NotGradeable(Exception):
+    """Raised by ``collect_grading_input`` when the agent's output cannot be graded; the message is streamed."""
+
+
 @dataclass(frozen=True)
 class GradingInput:
     """Yielded by a grader to save ``content`` under the same run before it continues."""
@@ -406,6 +410,7 @@ __all__ = [
     "EvalResumeIntegrityError",
     "EvalResumeStore",
     "GradingInput",
+    "NotGradeable",
     "PREFIX_ENV",
     "S3Client",
     "benchmark_id_from_sandbox",

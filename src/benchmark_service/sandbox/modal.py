@@ -601,14 +601,16 @@ class ModalSandboxProvider(SandboxProvider):
                     raise _sandbox_error(exc) from exc
             return self._client
 
+    @_PROVIDER_RETRY
     async def _get_app(self, client: Client, labels: Mapping[str, str]) -> App:
-        run_id = labels["run-id"]
-        name = f"benchmark-service-{run_id}"
+        run_id = labels.get("run-id")
+        name = f"benchmark-service-{run_id}" if run_id is not None else "benchmark-service"
         async with self._connect_lock:
             if name not in self._apps:
                 try:
                     app = await App.lookup.aio(name, client=client, create_if_missing=True)
-                    await app.set_tags.aio({"run-id": run_id, "benchmark": labels.get("Benchmark", "")})
+                    if run_id is not None:
+                        await app.set_tags.aio({"run-id": run_id, "benchmark": labels.get("Benchmark", "")})
                     self._apps[name] = app
                 except ModalError as exc:
                     raise _sandbox_error(exc) from exc
@@ -771,9 +773,10 @@ class ModalSandboxProvider(SandboxProvider):
             raise SandboxError("Modal sandbox provider does not support filtering by creation time")
 
         client = await self._connect()
+        app = await self._get_app(client, query.labels)
         try:
             sandboxes: list[ModalSdkSandbox] = []
-            async for inner in ModalSdkSandbox.list.aio(tags=query.labels or None, client=client):
+            async for inner in ModalSdkSandbox.list.aio(app_id=app.app_id, tags=query.labels or None, client=client):
                 if await inner.poll.aio() is None:
                     sandboxes.append(inner)
             return sandboxes

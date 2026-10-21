@@ -793,6 +793,69 @@ async def test_create_sandbox_uses_tagged_app_per_run(
     }
 
 
+@pytest.mark.parametrize("labels", [{}, {"Benchmark": "vcb"}])
+async def test_create_sandbox_without_run_id_uses_shared_app(
+    monkeypatch: pytest.MonkeyPatch, labels: dict[str, str]
+) -> None:
+    captured: dict[str, Any] = {}
+    lookups: list[str] = []
+    app = SimpleNamespace(app_id="ap-shared")
+
+    async def create(**kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return FakeInnerSandbox()
+
+    async def lookup(name: str, **kwargs: Any) -> SimpleNamespace:
+        lookups.append(name)
+        return app
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    monkeypatch.setattr(modal_module, "App", SimpleNamespace(lookup=_aio(lookup)))
+
+    await provider.create_sandbox(_request(labels=labels))
+
+    assert lookups == ["benchmark-service"]
+    assert captured["app"] is app
+
+
+@pytest.mark.parametrize("failure", ["lookup", "set_tags"])
+async def test_get_app_retries_connection_errors_before_caching(
+    monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    lookups = 0
+    tag_attempts = 0
+    provider = _provider(monkeypatch, SimpleNamespace())
+
+    async def set_tags(tags: dict[str, str]) -> None:
+        nonlocal tag_attempts
+        tag_attempts += 1
+        assert provider._apps == {}
+        assert tags == {"run-id": "r1", "benchmark": "vcb"}
+        if failure == "set_tags" and tag_attempts == 1:
+            raise ModalConnectionError("tags temporarily unavailable")
+
+    app = SimpleNamespace(app_id="ap-r1", set_tags=_aio(set_tags))
+
+    async def lookup(name: str, **kwargs: Any) -> SimpleNamespace:
+        nonlocal lookups
+        lookups += 1
+        assert name == "benchmark-service-r1"
+        if failure == "lookup" and lookups == 1:
+            raise ModalConnectionError("app temporarily unavailable")
+        return app
+
+    monkeypatch.setattr(modal_module, "App", SimpleNamespace(lookup=_aio(lookup)))
+    monkeypatch.setattr(cast(Any, ModalSandboxProvider._get_app).retry, "sleep", _noop)
+    client = await provider._connect()
+    labels = {"run-id": "r1", "Benchmark": "vcb"}
+
+    assert await provider._get_app(client, labels) is app
+    assert await provider._get_app(client, labels) is app
+    assert lookups == 2
+    assert tag_attempts == (2 if failure == "set_tags" else 1)
+    assert provider._apps == {"benchmark-service-r1": app}
+
+
 async def test_create_sandbox_does_not_retry_ambiguous_connection_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     attempts = 0
 
@@ -935,8 +998,34 @@ async def test_list_sandboxes_filters_by_labels(monkeypatch: pytest.MonkeyPatch)
 
     assert [sandbox.id for sandbox in sandboxes] == ["sb-123"]
     assert sandboxes[0].labels == {"run_id": "r1", "Task": "task-1"}
-    assert "app_id" not in captured
+    assert captured["app_id"] == "ap-1"
     assert captured["tags"] == {"run_id": "r1"}
+
+
+@pytest.mark.parametrize("labels", [{}, {"run-id": "r1"}])
+async def test_list_sandboxes_scopes_to_app(
+    monkeypatch: pytest.MonkeyPatch, labels: dict[str, str]
+) -> None:
+    captured: dict[str, Any] = {}
+    lookups: list[str] = []
+
+    async def list_sandboxes(**kwargs: Any) -> AsyncGenerator[FakeInnerSandbox, None]:
+        captured.update(kwargs)
+        yield FakeInnerSandbox()
+
+    async def lookup(name: str, **kwargs: Any) -> SimpleNamespace:
+        lookups.append(name)
+        return SimpleNamespace(app_id=f"ap-{name}", set_tags=_aio(_noop))
+
+    provider = _provider(monkeypatch, SimpleNamespace(list=_aio(list_sandboxes)))
+    monkeypatch.setattr(modal_module, "App", SimpleNamespace(lookup=_aio(lookup)))
+
+    sandboxes = [sandbox async for sandbox in provider.list_sandboxes(SandboxQuery(labels=labels))]
+
+    name = "benchmark-service-r1" if "run-id" in labels else "benchmark-service"
+    assert lookups == [name]
+    assert captured == {"app_id": f"ap-{name}", "tags": labels or None, "client": provider._client}
+    assert [sandbox.id for sandbox in sandboxes] == ["sb-123"]
 
 
 async def test_list_sandboxes_rejects_creation_time_filter(monkeypatch: pytest.MonkeyPatch) -> None:

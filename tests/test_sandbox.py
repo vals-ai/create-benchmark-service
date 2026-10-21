@@ -5965,7 +5965,6 @@ async def test_daytona_output_consumer_waits_for_confirmed_group_stop() -> None:
 
 
 
-
 @pytest.mark.usefixtures("_fake_cgroup_follow")
 async def test_daytona_output_cancellation_does_not_stop_admitted_work() -> None:
     process = CgroupProcess()

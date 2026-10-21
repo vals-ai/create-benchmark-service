@@ -86,7 +86,9 @@ async def _finish_quietly(work: Awaitable[None], failure: str, *args: object, ti
         task.cancel()
         task.add_done_callback(lambda done: done.cancelled() or done.exception())
         logger.error(failure, *args, exc_info=TimeoutError(f"exceeded {bound:g}s"))
-    elif not task.cancelled() and (error := task.exception()) is not None:
+    elif task.cancelled():
+        cancellation = cancellation or asyncio.CancelledError()
+    elif (error := task.exception()) is not None:
         logger.error(failure, *args, exc_info=error)
     if cancellation is not None:
         raise cancellation

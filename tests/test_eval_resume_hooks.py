@@ -1012,3 +1012,45 @@ async def test_a_grading_input_saved_that_holds_its_cancellation_is_still_left_b
     assert done == {grading}
     assert [chunk.type for chunk in grading.result()] == ["eval_resume_state", "result"]
     assert "grading_input_saved failed for task-1" in caplog.text
+
+
+async def test_a_grading_input_saved_that_cancels_itself_ends_the_stream_before_grading(s3: _FakeS3) -> None:
+    class _SelfCancelling(_SavedHookBenchmark):
+        async def grading_input_saved(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> None:
+            raise asyncio.CancelledError
+
+    service = await _saved_service(s3, _SelfCancelling)
+
+    with pytest.raises(asyncio.CancelledError):
+        await _drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox())))
+    assert service.graded == []
+
+
+async def test_a_create_that_fails_after_a_cancel_is_logged_and_the_cancellation_kept(
+    s3: _FakeS3, caplog: pytest.LogCaptureFixture
+) -> None:
+    class _FailingSlowCreate(_Provider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.creating, self.fail = asyncio.Event(), asyncio.Event()
+
+        async def create_sandbox(self, request: SandboxCreateRequest) -> _GradingSandbox:
+            self.creating.set()
+            await self.fail.wait()
+            raise RuntimeError("create failed")
+
+    checkpoint = await _sandbox_checkpoint(s3)
+    retry, provider = await _sandbox_service(s3), _FailingSlowCreate()
+    request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=checkpoint)
+
+    with sandbox_provider_scope(cast(SandboxProvider, provider)):
+        task = asyncio.create_task(_drain(retry.stream_evaluate_response(request)))
+        await provider.creating.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        provider.fail.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert "Eval-resume sandbox cleanup after a cancelled create failed" in caplog.text
+    assert provider.deleted == []

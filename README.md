@@ -26,7 +26,10 @@ create-benchmark-service <benchmark-name> --template vals-ai
 
 The base install includes Daytona, Modal, and the OpenTelemetry API for both templates.
 
-`create-benchmark-service[vals-ai]` bundles the Vals dependencies: S3/AWS clients, Sentry, Descope, and caching. The Vals template selects this extra automatically. Services that grade Vals suite checks in-process with `benchmark_service.vals.check_judge` install `create-benchmark-service[vals-judge]` instead, which adds the Vals SDK and model-library to the Vals dependencies.
+For local custom-check grading, use the separate [vals-grading package](packages/vals-grading/README.md).
+It has its own version and dependencies and can run without CBS or the Vals platform.
+
+`create-benchmark-service[vals-ai]` bundles the Vals dependencies: S3/AWS clients, Sentry, Descope, and caching. The Vals template selects this extra automatically.
 
 ## What Gets Generated
 

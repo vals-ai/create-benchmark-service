@@ -268,6 +268,8 @@ class _ComposeControlledWorkload(ControlledWorkload):
     async def kill(self) -> None:
         workload, _ = await asyncio.shield(self._launch_task)
         await asyncio.shield(self._ensure_stopped())
+        assert self._result_task is not None
+        await asyncio.shield(self._result_task)
         await workload.kill()
 
     async def _ensure_stopped(self) -> tuple[float, int | None]:

@@ -602,21 +602,25 @@ class BenchmarkService(ABC):
             raise ValueError(f"{type(self).__name__} grades in a sandbox; it needs the request's sandbox_provider")
         if agent_sandbox is None and task.eval_sandbox is None and task.resume_sandbox is not None:
             raise ValueError(f"task {task_id} declares a caller-owned resume_sandbox; the retry needs its instance_id")
+        spec = resolve_grading_spec(task)
         if task.eval_sandbox is None:
-            source, resources, network_block_all = task.source, task.resources, False
-            auto_stop = _EVAL_RESUME_AUTO_STOP_MINUTES
+            network_block_all, auto_stop = False, _EVAL_RESUME_AUTO_STOP_MINUTES
         else:
-            spec = resolve_grading_spec(task)
-            source, resources, network_block_all = spec.source, spec.resources, spec.network_block_all
-            auto_stop = auto_stop_minutes(spec.grade_timeout)
+            network_block_all, auto_stop = spec.network_block_all, auto_stop_minutes(spec.grade_timeout)
         sandbox = await _create_owned_sandbox(
             provider,
             SandboxCreateRequest(
-                source=source,
-                resources=resources,
-                volumes=task.volumes,
+                source=spec.source,
+                resources=spec.resources,
+                volumes=spec.volumes,
                 name=f"eval-resume-{uuid4().hex[:12]}",
-                labels={"Benchmark": type(self).__name__, "Id": benchmark_id, "Task": task_id, "EvalResume": "true"},
+                labels={
+                    "Benchmark": type(self).__name__,
+                    "Id": benchmark_id,
+                    "run-id": benchmark_id,
+                    "Task": task_id,
+                    "EvalResume": "true",
+                },
                 env_vars={},
                 auto_stop_interval=auto_stop,
                 create_timeout=_EVAL_RESUME_CREATE_TIMEOUT_S,

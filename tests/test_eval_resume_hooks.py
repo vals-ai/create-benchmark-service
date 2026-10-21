@@ -13,11 +13,13 @@ from benchmark_service.base import BenchmarkService
 from benchmark_service.context import sandbox_provider_scope, tenant_scope
 from benchmark_service.eval_resume import EvalResumeIdentityError, EvalResumeStore, GradingInput, NotGradeable
 from benchmark_service.sandbox import (
+    ComposeSource,
     ImageSource,
     Resources,
     Sandbox,
     SandboxCreateRequest,
     SandboxProvider,
+    SnapshotSource,
     VolumeMount,
 )
 from benchmark_service.schemas import (
@@ -1054,3 +1056,40 @@ async def test_a_create_that_fails_after_a_cancel_is_logged_and_the_cancellation
 
     assert "Eval-resume sandbox cleanup after a cancelled create failed" in caplog.text
     assert provider.deleted == []
+
+
+class _TaskSourceGrader(_SandboxGrader):
+    task_update: dict[str, Any] = {}
+
+    async def retrieve_task(
+        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+    ) -> RetrieveTaskResponse:
+        task = await super().retrieve_task(task_id, skip_validation, dataset)
+        return task.model_copy(update=self.task_update)
+
+
+async def _retry_with_task(s3: _FakeS3, **task_update: Any) -> _Provider:
+    checkpoint = await _sandbox_checkpoint(s3)
+    retry, provider = await _sandbox_service(s3, _TaskSourceGrader), _Provider()
+    cast(_TaskSourceGrader, retry).task_update = task_update
+    request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=checkpoint)
+    with sandbox_provider_scope(cast(SandboxProvider, provider)):
+        await _drain(retry.stream_evaluate_response(request))
+    return provider
+
+
+async def test_a_fresh_retry_sandbox_carries_the_run_id_label_volume_subpaths_resolve_from(s3: _FakeS3) -> None:
+    provider = await _retry_with_task(s3)
+    assert (provider.created[0].labels["run-id"], provider.created[0].labels["Id"]) == ("run-1", "run-1")
+
+
+async def test_a_snapshot_task_retry_drops_the_generation_gpu(s3: _FakeS3) -> None:
+    provider = await _retry_with_task(
+        s3, source=SnapshotSource(snapshot="grader-snap"), resources=Resources(vcpu=2, memory=4, disk=10, gpu=1)
+    )
+    assert (provider.created[0].resources.gpu, provider.created[0].resources.gpu_type) == (0, None)
+
+
+async def test_a_compose_task_retry_without_eval_sandbox_is_refused_before_create(s3: _FakeS3) -> None:
+    with pytest.raises(ValueError, match="ComposeSource"):
+        await _retry_with_task(s3, source=ComposeSource(outer=ImageSource(image="docker:28-dind")))

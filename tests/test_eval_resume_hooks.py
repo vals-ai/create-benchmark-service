@@ -351,7 +351,7 @@ class _SavedHookBenchmark(HookBenchmark):
 async def test_grading_input_saved_runs_once_after_the_first_save_and_before_grading(s3: _FakeS3) -> None:
     events: list[str] = []
 
-    class _Ordered(_SavedHookBenchmark):
+    class _Ordered(HookBenchmark):
         async def grading_input_saved(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> None:
             events.append(f"released {sandbox.id}")
 
@@ -468,8 +468,8 @@ class _SandboxGrader(StubBenchmark):
         yield StreamResultChunk(type="result", data={"resolved": True})
 
 
-async def _sandbox_service(s3: _FakeS3) -> _SandboxGrader:
-    service = await _SandboxGrader.create()
+async def _sandbox_service(s3: _FakeS3, cls: type[_SandboxGrader] = _SandboxGrader) -> _SandboxGrader:
+    service = await cls.create()
     service.graded_in = []
     service.eval_resume_store = EvalResumeStore(s3_client=s3)
     return service
@@ -516,9 +516,7 @@ async def test_the_fresh_sandbox_mounts_the_tasks_volumes(s3: _FakeS3) -> None:
             return task.model_copy(update={"volumes": [fixture]})
 
     checkpoint = await _sandbox_checkpoint(s3)
-    retry, provider = await _WithVolume.create(), _Provider()
-    retry.graded_in = []
-    retry.eval_resume_store = EvalResumeStore(s3_client=s3)
+    retry, provider = await _sandbox_service(s3, _WithVolume), _Provider()
     request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=checkpoint)
 
     with sandbox_provider_scope(cast(SandboxProvider, provider)):
@@ -613,9 +611,7 @@ async def test_a_task_that_declares_a_caller_owned_resume_sandbox_needs_its_inst
             return task.model_copy(update={"resume_sandbox": EvalSandboxSpec()})
 
     checkpoint = await _sandbox_checkpoint(s3)
-    retry, provider = await _CallerOwned.create(), _Provider()
-    retry.graded_in = []
-    retry.eval_resume_store = EvalResumeStore(s3_client=s3)
+    retry, provider = await _sandbox_service(s3, _CallerOwned), _Provider()
     request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=checkpoint)
 
     with sandbox_provider_scope(cast(SandboxProvider, provider)), pytest.raises(ValueError, match="instance_id"):

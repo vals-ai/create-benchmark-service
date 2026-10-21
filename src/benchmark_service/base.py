@@ -6,6 +6,7 @@ a FastAPI app with your implementation.
 """
 
 import asyncio
+import inspect
 import logging
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Mapping
@@ -63,17 +64,19 @@ logger = logging.getLogger(__name__)
 
 async def _delete_owned_sandbox(provider: SandboxProvider, sandbox_id: str) -> None:
     """Delete a retry sandbox even when the stream that owns it is being cancelled."""
-    cleanup = asyncio.create_task(provider.delete_sandbox(sandbox_id))
+
+    async def delete() -> None:
+        try:
+            await provider.delete_sandbox(sandbox_id)
+        except Exception:
+            logger.exception("Failed to delete eval-resume sandbox %s", sandbox_id)
+
+    cleanup = asyncio.create_task(delete())
     try:
         await asyncio.shield(cleanup)
     except asyncio.CancelledError:
-        try:
-            await asyncio.shield(cleanup)
-        except Exception:
-            logger.exception("Failed to delete eval-resume sandbox %s", sandbox_id)
+        await asyncio.shield(cleanup)
         raise
-    except Exception:
-        logger.exception("Failed to delete eval-resume sandbox %s", sandbox_id)
 
 
 async def _create_owned_sandbox(provider: SandboxProvider, request: SandboxCreateRequest) -> Sandbox:
@@ -525,7 +528,7 @@ class BenchmarkService(ABC):
     async def _checkpoint_binding(self, task_id: str, dataset: str | None) -> dict[str, str]:
         """The dataset and grader digest a checkpoint is saved under; save and load must agree on both."""
         parts = self.grader_identity(task_id, dataset=dataset)
-        if isinstance(parts, Awaitable):
+        if inspect.isawaitable(parts):
             parts = await parts
         return {"dataset": dataset or "default", "grader_identity": eval_resume.grader_identity(parts)}
 

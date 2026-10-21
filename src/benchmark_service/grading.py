@@ -31,6 +31,7 @@ from fastapi.encoders import jsonable_encoder
 from benchmark_service.base import BenchmarkService
 from benchmark_service.context import sandbox_provider_scope, tenant_scope
 from benchmark_service.grading_spec import (
+    GRADING_SANDBOX_LABELS,
     TEARDOWN_TIMEOUT_S,
     ResolvedSpec,
     auto_stop_minutes,
@@ -197,7 +198,7 @@ class _GradeRun:
             labels={
                 "Benchmark": type(self.service).__name__,
                 "Task": self.task_id,
-                "vals-eval": "grade-instance",
+                **GRADING_SANDBOX_LABELS,
                 "tenant": self.tenant,
                 "run-id": self.run_id,
                 **(self.labels or {}),

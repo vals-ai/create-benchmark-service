@@ -931,3 +931,57 @@ async def test_a_first_attempt_with_eval_sandbox_ignores_the_caller_owned_resume
         await _drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox())))
 
     assert service.graded_in == ["fresh-1"]
+
+
+async def test_a_v1_grading_sandbox_is_graded_in_rather_than_replaced(s3: _FakeS3) -> None:
+    class _V1GradingSandbox(_Sandbox):
+        labels = {"Id": "run-1", "vals-eval": "grade-instance"}
+
+    service, provider = await _sandbox_service(s3, _VerifierGrader), _Provider()
+
+    with sandbox_provider_scope(cast(SandboxProvider, provider)):
+        await _drain(service.evaluate_instance("task-1", cast(Sandbox, _V1GradingSandbox())))
+
+    assert (service.graded_in, provider.created) == (["sandbox-1"], [])
+
+
+async def test_a_retry_with_eval_sandbox_grades_fresh_even_when_the_task_declares_resume_sandbox(
+    s3: _FakeS3,
+) -> None:
+    checkpoint = await _sandbox_checkpoint(s3)
+    retry, provider = await _sandbox_service(s3, _VerifierGrader), _Provider()
+    cast(_VerifierGrader, retry).resume_sandbox = EvalSandboxSpec()
+    request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=checkpoint)
+
+    with sandbox_provider_scope(cast(SandboxProvider, provider)):
+        await _drain(retry.stream_evaluate_response(request))
+
+    assert (retry.graded_in, provider.deleted) == (["fresh-1"], ["fresh-1"])
+
+
+async def test_a_cancelled_create_slower_than_the_teardown_bound_is_still_deleted(
+    s3: _FakeS3, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class _SlowCreate(_Provider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.creating = asyncio.Event()
+
+        async def create_sandbox(self, request: SandboxCreateRequest) -> _GradingSandbox:
+            self.creating.set()
+            await asyncio.sleep(0.05)
+            return await super().create_sandbox(request)
+
+    monkeypatch.setattr(base, "TEARDOWN_TIMEOUT_S", 0.01)
+    checkpoint = await _sandbox_checkpoint(s3)
+    retry, provider = await _sandbox_service(s3), _SlowCreate()
+    request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=checkpoint)
+
+    with sandbox_provider_scope(cast(SandboxProvider, provider)):
+        task = asyncio.create_task(_drain(retry.stream_evaluate_response(request)))
+        await provider.creating.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert provider.deleted == ["fresh-1"]

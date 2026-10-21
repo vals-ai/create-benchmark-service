@@ -25,7 +25,12 @@ from benchmark_service.auth import (
 )
 from benchmark_service import eval_resume
 from benchmark_service.context import current_sandbox_provider
-from benchmark_service.grading_spec import TEARDOWN_TIMEOUT_S, auto_stop_minutes, resolve_grading_spec
+from benchmark_service.grading_spec import (
+    TEARDOWN_TIMEOUT_S,
+    auto_stop_minutes,
+    is_grading_sandbox,
+    resolve_grading_spec,
+)
 from benchmark_service.dataset_versioning import DatasetVersionEntry, load_dataset_versions
 from benchmark_service.sandbox import Sandbox, SandboxCreateRequest, SandboxProvider
 from benchmark_service.schemas import (
@@ -64,12 +69,12 @@ _EVAL_RESUME_CREATE_TIMEOUT_S = 600
 logger = logging.getLogger(__name__)
 
 
-async def _finish_quietly(work: Awaitable[None], failure: str, *args: object) -> None:
+async def _finish_quietly(work: Awaitable[None], failure: str, *args: object, timeout_s: float | None = None) -> None:
     """Await ``work`` for up to ``TEARDOWN_TIMEOUT_S`` even if the caller is cancelled; log, never raise, a failure."""
 
     async def run() -> None:
         try:
-            async with asyncio.timeout(TEARDOWN_TIMEOUT_S):
+            async with asyncio.timeout(TEARDOWN_TIMEOUT_S if timeout_s is None else timeout_s):
                 await work
         except Exception:
             logger.exception(failure, *args)
@@ -100,7 +105,11 @@ async def _create_owned_sandbox(provider: SandboxProvider, request: SandboxCreat
                 return
             await provider.delete_sandbox(sandbox.id)
 
-        await _finish_quietly(delete_when_created(), "Failed to delete eval-resume sandbox after a cancelled create")
+        await _finish_quietly(
+            delete_when_created(),
+            "Failed to delete eval-resume sandbox after a cancelled create",
+            timeout_s=_EVAL_RESUME_CREATE_TIMEOUT_S + TEARDOWN_TIMEOUT_S,
+        )
         raise
 
 
@@ -586,12 +595,12 @@ class BenchmarkService(ABC):
             yield await provider.get_sandbox(instance_id)
             return
         task = await self.retrieve_task(task_id, skip_validation=True, dataset=dataset)
-        if task.eval_sandbox is None and agent_sandbox is not None:
+        if agent_sandbox is not None and (task.eval_sandbox is None or is_grading_sandbox(agent_sandbox.labels)):
             yield agent_sandbox
             return
         if provider is None:
             raise ValueError(f"{type(self).__name__} grades in a sandbox; it needs the request's sandbox_provider")
-        if agent_sandbox is None and task.resume_sandbox is not None:
+        if agent_sandbox is None and task.eval_sandbox is None and task.resume_sandbox is not None:
             raise ValueError(f"task {task_id} declares a caller-owned resume_sandbox; the retry needs its instance_id")
         if task.eval_sandbox is None:
             source, resources, network_block_all = task.source, task.resources, False

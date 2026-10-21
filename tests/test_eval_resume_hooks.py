@@ -585,7 +585,7 @@ async def test_an_adopter_may_define_its_own_private_grade_helper(s3: _FakeS3) -
 async def test_each_checkpoint_reaches_the_caller_before_the_grader_resumes(s3: _FakeS3) -> None:
     events: list[str] = []
 
-    class _Ordered(_ProgressBenchmark):
+    class _Ordered(HookBenchmark):
         async def grade_input(
             self, task_id: str, content: bytes, dataset: str | None = None
         ) -> AsyncGenerator[StreamChunk | GradingInput, None]:
@@ -595,7 +595,6 @@ async def test_each_checkpoint_reaches_the_caller_before_the_grader_resumes(s3: 
             yield StreamResultChunk(type="result", data={})
 
     service = await _Ordered.create()
-    service.graded, service.saved_before_resume, service.store_objects = [], [], s3.objects
     service.eval_resume_store = EvalResumeStore(s3_client=s3)
 
     async for chunk in service.evaluate_instance("task-1", cast(Sandbox, _Sandbox())):
@@ -626,10 +625,11 @@ async def test_cancelling_a_retry_while_its_sandbox_is_created_still_deletes_it(
         def __init__(self) -> None:
             super().__init__()
             self.creating = asyncio.Event()
+            self.release = asyncio.Event()
 
         async def create_sandbox(self, request: SandboxCreateRequest) -> _GradingSandbox:
             self.creating.set()
-            await asyncio.sleep(0.05)
+            await self.release.wait()
             return await super().create_sandbox(request)
 
     checkpoint = await _sandbox_checkpoint(s3)
@@ -640,6 +640,8 @@ async def test_cancelling_a_retry_while_its_sandbox_is_created_still_deletes_it(
         task = asyncio.create_task(_drain(retry.stream_evaluate_response(request)))
         await provider.creating.wait()
         task.cancel()
+        await asyncio.sleep(0)
+        provider.release.set()
         with pytest.raises(asyncio.CancelledError):
             await task
 

@@ -56,8 +56,6 @@ def _prioritize_dataset(datasets: dict[str, dict[str, Any]], priority_dataset: s
 _GRADERS = ("grade_input", "grade_in_sandbox")
 _GRADING_HOOKS = ("collect_grading_input", "grader_identity", *_GRADERS)
 
-# A retry sandbox the framework creates is deleted when grading ends; auto-stop is the backstop
-# for a delete that never ran. The values are the SWE-bench and SRE-bench services' own.
 EVAL_RESUME_SANDBOX_AUTO_STOP_MINUTES = 30
 EVAL_RESUME_SANDBOX_CREATE_TIMEOUT_SECONDS = 600
 
@@ -489,11 +487,7 @@ class BenchmarkService(ABC):
         content: bytes,
         dataset: str | None = None,
     ) -> AsyncGenerator[StreamChunk | eval_resume.GradingInput, None]:
-        """Grade the bytes ``collect_grading_input`` returned, on the first attempt and on retry.
-
-        Yield ``GradingInput(new_bytes)`` to save progress: the framework saves it under
-        the same run and streams the checkpoint before this generator resumes.
-        """
+        """Grade the saved bytes, on the first attempt and on retry; yield ``GradingInput`` to save progress."""
         raise NotImplementedError(f"{type(self).__name__}.grade_input is not implemented")
 
     def grade_in_sandbox(
@@ -503,28 +497,14 @@ class BenchmarkService(ABC):
         sandbox: Sandbox,
         dataset: str | None = None,
     ) -> AsyncGenerator[StreamChunk | eval_resume.GradingInput, None]:
-        """Grade the saved bytes inside ``sandbox``; implement this instead of ``grade_input``.
-
-        The first attempt passes the agent's sandbox. A retry passes the caller-owned sandbox
-        the request names, or a fresh one the framework creates from the task's
-        ``resume_sandbox`` (else generation) source and resources and deletes afterwards. Put
-        ``content`` back where the grader reads it, so both attempts run the same code.
-        """
+        """Like ``grade_input``, inside the agent's sandbox or, on retry, a borrowed or fresh one."""
         raise NotImplementedError(f"{type(self).__name__}.grade_in_sandbox is not implemented")
 
     async def grading_input_saved(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> None:
-        """Called once the first checkpoint is saved, before grading; does nothing by default.
-
-        Release state that was kept only so the grading input could be collected again,
-        such as an in-process session: a failed save never reaches this hook.
-        """
+        """Release state kept only for collecting, once the first checkpoint is saved."""
 
     async def load_grading_input(self, request: EvaluateResponseRequest, dataset: str | None = None) -> bytes:
-        """The grading input ``request.eval_resume_state`` points at, after the retry checks.
-
-        Refuses a task the dataset does not have, a checkpoint from another tenant, task,
-        dataset or grader, and bytes that fail their size or SHA-256 check.
-        """
+        """The grading input ``request.eval_resume_state`` points at, after the checks a retry makes."""
         _, content, _ = await self._load_checkpoint(request, dataset)
         return content
 
@@ -588,7 +568,6 @@ class BenchmarkService(ABC):
         if provider is None:
             raise ValueError(f"{type(self).__name__} grades in a sandbox; a retry needs the request's sandbox_provider")
         if request.instance_id is not None:
-            # Caller-owned (RetrieveTaskResponse.resume_sandbox): borrowed, never deleted here.
             yield await provider.get_sandbox(request.instance_id)
             return
         task = await self.retrieve_task(request.task_id, skip_validation=True, dataset=dataset)

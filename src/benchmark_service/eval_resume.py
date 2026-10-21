@@ -84,12 +84,7 @@ class EvalResumeIntegrityError(EvalResumeError):
 
 @dataclass(frozen=True)
 class GradingInput:
-    """Yielded by ``grade_input`` or ``grade_in_sandbox`` to replace the saved grading input mid-grading.
-
-    The framework saves ``content`` under the same run, streams the new checkpoint, and only
-    then resumes the grader, so a retry continues from this point rather than from the start.
-    A judge-graded benchmark yields one after each judge call, carrying the calls made so far.
-    """
+    """Yielded by a grader to save ``content`` under the same run before it continues."""
 
     content: bytes
 

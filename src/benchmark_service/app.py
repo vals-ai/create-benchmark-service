@@ -465,8 +465,6 @@ class BenchmarkServiceApp(FastAPI):
                 if not await self._admit_websocket_evaluation(websocket, tenant):
                     return
 
-                # A retry that grades in a sandbox reads the provider from the request
-                # scope, as evaluate-instance does; see benchmark_service.context.
                 async with _optional_provider(request.sandbox_provider) as provider:
                     with sandbox_provider_scope(provider):
                         await _forward_stream(

@@ -279,9 +279,6 @@ def test_adopters_can_bind_a_tenant_from_the_package_root() -> None:
         assert benchmark_service.current_tenant() == "tenant-b"
 
 
-# Hooks v2: progress saves, sandbox grading, the post-save hook, the public load, an async identity.
-
-
 class _ProgressBenchmark(HookBenchmark):
     """Saves its progress after each judge call, the way a judge-graded benchmark resumes mid-rubric."""
 

@@ -670,7 +670,7 @@ class _BlockingDeleteProvider(_Provider):
         await super().delete_sandbox(instance_id)
 
 
-async def _cancel_while_deleting(s3: _FakeS3, provider: _BlockingDeleteProvider) -> None:
+async def _cancel_while_deleting(s3: _FakeS3, provider: _BlockingDeleteProvider, cancels: int = 1) -> None:
     checkpoint = await _sandbox_checkpoint(s3)
     retry = await _sandbox_service(s3)
     request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=checkpoint)
@@ -678,8 +678,9 @@ async def _cancel_while_deleting(s3: _FakeS3, provider: _BlockingDeleteProvider)
     with sandbox_provider_scope(cast(SandboxProvider, provider)):
         task = asyncio.create_task(_drain(retry.stream_evaluate_response(request)))
         await provider.deleting.wait()
-        task.cancel()
-        await asyncio.sleep(0)
+        for _ in range(cancels):
+            task.cancel()
+            await asyncio.sleep(0)
         provider.release.set()
         with pytest.raises(asyncio.CancelledError):
             await task
@@ -691,10 +692,12 @@ async def test_cancelling_a_retry_while_its_sandbox_is_deleted_lets_the_delete_f
     assert provider.deleted == ["fresh-1"]
 
 
+@pytest.mark.parametrize("cancels", [1, 2])
 async def test_a_failed_delete_during_cancellation_is_logged_and_the_cancellation_kept(
-    s3: _FakeS3, caplog: pytest.LogCaptureFixture
+    s3: _FakeS3, caplog: pytest.LogCaptureFixture, cancels: int
 ) -> None:
-    await _cancel_while_deleting(s3, _BlockingDeleteProvider(fail=True))
+    await _cancel_while_deleting(s3, _BlockingDeleteProvider(fail=True), cancels)
+    await asyncio.sleep(0)
     assert "Failed to delete eval-resume sandbox fresh-1" in caplog.text
 
 

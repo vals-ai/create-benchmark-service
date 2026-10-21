@@ -275,7 +275,7 @@ async def test_retrieve_task_accepts_sandbox_recovery_policy(
     assert result.sandbox_recovery.max_sandbox_attempts == 10
 
 
-@pytest.mark.parametrize("max_sandbox_attempts", [1, 21])
+@pytest.mark.parametrize("max_sandbox_attempts", [0, 21])
 def test_sandbox_recovery_policy_rejects_out_of_range_attempts(max_sandbox_attempts: int) -> None:
     with pytest.raises(ValidationError):
         SandboxRecoveryPolicy(max_sandbox_attempts=max_sandbox_attempts)

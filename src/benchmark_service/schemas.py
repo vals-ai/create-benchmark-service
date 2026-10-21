@@ -126,18 +126,19 @@ class EvalSandboxSpec(BaseModel):
 
 
 class SandboxRecoveryPolicy(BaseModel):
-    """Opt-in policy for recreating a generation sandbox after provider loss.
+    """Bound generation-sandbox attempts, including caller-requested retries.
 
-    Recovery reruns task setup and the agent command with the same run identity,
-    environment, and persistent volumes. Benchmarks enabling it must therefore
-    make those operations idempotent and keep all continuation state outside the
-    sandbox's ephemeral filesystem.
+    One attempt disables retries after the task policy loads. Larger limits
+    permit recovery after provider loss. Recovery reruns setup and the agent
+    command with the same run identity, environment, and persistent volumes.
+    Benchmarks enabling recovery must make those operations idempotent and keep
+    continuation state outside the sandbox's ephemeral filesystem.
     """
 
     model_config = ConfigDict(extra="forbid")
 
     max_sandbox_attempts: int = Field(
-        ge=2,
+        ge=1,
         le=20,
         description="Maximum generation-sandbox attempts, including the initial sandbox",
     )
@@ -234,7 +235,7 @@ class RetrieveTaskResponse(BaseModel):
     sandbox_recovery: SandboxRecoveryPolicy | None = Field(
         default=None,
         description=(
-            "Opt in to bounded recreation when the generation sandbox disappears; None preserves fail-fast behavior"
+            "Bound sandbox attempts; one disables retries after task retrieval; None uses the caller's setup retry cap"
         ),
     )
     eval_sandbox: EvalSandboxSpec | None = Field(

@@ -202,7 +202,7 @@ def _request(
         source=source or ImageSource(image="python:3.12"),
         resources=resources or Resources(vcpu=4, memory=8, disk=30),
         name="task-1",
-        labels={"run_id": "r1"} if labels is None else labels,
+        labels={"run-id": "r1"} if labels is None else labels,
         env_vars={"FOO": "bar"},
         auto_stop_interval=30,
         create_timeout=120,
@@ -212,7 +212,7 @@ def _request(
 
 def _provider(monkeypatch: pytest.MonkeyPatch, sdk_sandbox: Any) -> ModalSandboxProvider:
     client = SimpleNamespace(_close=_aio(_noop))
-    app = SimpleNamespace(app_id="ap-1")
+    app = SimpleNamespace(app_id="ap-1", set_tags=_aio(_noop))
 
     async def from_credentials(token_id: str, token_secret: str) -> Any:
         return client
@@ -645,7 +645,7 @@ async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> N
     assert captured["entrypoint"] == ()
     assert captured["image"] == ("image", "python:3.12")
     assert captured["env"] == {"FOO": "bar"}
-    assert captured["tags"] == {"run_id": "r1"}
+    assert captured["tags"] == {"run-id": "r1"}
     assert captured["cpu"] == 4.0
     assert captured["memory"] == 8192
     assert captured["idle_timeout"] == 1800
@@ -732,7 +732,7 @@ async def test_create_sandbox_uses_modal_safe_name(monkeypatch: pytest.MonkeyPat
         source=ImageSource(image="python:3.12"),
         resources=Resources(vcpu=4, memory=8, disk=30),
         name=f"dataset/task:with/slashes-{'x' * 80}",
-        labels={"run_id": "r1"},
+        labels={"run-id": "r1"},
         env_vars={"FOO": "bar"},
         auto_stop_interval=30,
         create_timeout=120,
@@ -745,6 +745,52 @@ async def test_create_sandbox_uses_modal_safe_name(monkeypatch: pytest.MonkeyPat
     assert "/" not in captured["name"]
     assert ":" not in captured["name"]
     assert len(captured["name"]) <= 64
+
+
+@pytest.mark.parametrize("run_ids", [("r1", "r2"), ("r1", "r1")])
+async def test_create_sandbox_uses_tagged_app_per_run(
+    monkeypatch: pytest.MonkeyPatch, run_ids: tuple[str, str]
+) -> None:
+    apps: dict[str, SimpleNamespace] = {}
+    tags: dict[str, list[dict[str, str]]] = {}
+    created_apps: list[SimpleNamespace] = []
+
+    async def create(**kwargs: Any) -> FakeInnerSandbox:
+        created_apps.append(kwargs["app"])
+        return FakeInnerSandbox()
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    async def lookup(name: str, **kwargs: Any) -> SimpleNamespace:
+        assert kwargs == {"client": provider._client, "create_if_missing": True}
+        assert name not in apps
+        await asyncio.sleep(0)
+        tags[name] = []
+
+        async def set_tags(app_tags: dict[str, str]) -> None:
+            await asyncio.sleep(0)
+            tags[name].append(app_tags)
+
+        app = SimpleNamespace(app_id=f"ap-{name}", set_tags=_aio(set_tags))
+        apps[name] = app
+        return app
+
+    monkeypatch.setattr(modal_module, "App", SimpleNamespace(lookup=_aio(lookup)))
+    await asyncio.gather(
+        *(
+            provider.create_sandbox(
+                _request(labels={"Benchmark": "vcb", "Id": run_id, "run-id": run_id, "Task": f"task-{index}"})
+            )
+            for index, run_id in enumerate(run_ids)
+        )
+    )
+
+    assert set(apps) == {f"benchmark-service-{run_id}" for run_id in run_ids}
+    assert created_apps == [apps[f"benchmark-service-{run_id}"] for run_id in run_ids]
+    assert tags == {
+        f"benchmark-service-{run_id}": [{"run-id": run_id, "benchmark": "vcb"}]
+        for run_id in run_ids
+    }
 
 
 async def test_create_sandbox_does_not_retry_ambiguous_connection_errors(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -889,7 +935,7 @@ async def test_list_sandboxes_filters_by_labels(monkeypatch: pytest.MonkeyPatch)
 
     assert [sandbox.id for sandbox in sandboxes] == ["sb-123"]
     assert sandboxes[0].labels == {"run_id": "r1", "Task": "task-1"}
-    assert captured["app_id"] == "ap-1"
+    assert "app_id" not in captured
     assert captured["tags"] == {"run_id": "r1"}
 
 

@@ -49,8 +49,6 @@ from benchmark_service.sandbox.types import (
     validate_command_env,
 )
 
-# Modal sandboxes must belong to an app; all benchmark sandboxes share one.
-_APP_NAME = "benchmark-service"
 # Modal's default sandbox timeout is 5 minutes; benchmark tasks run for hours.
 _MAX_LIFETIME_SECONDS = min(MAX_SANDBOX_LIFETIME_SECONDS, 24 * 60 * 60)
 _ALLOW_ALL_CIDRS = ("0.0.0.0/0",)
@@ -588,22 +586,33 @@ class ModalSandboxProvider(SandboxProvider):
     def __init__(self, config: ModalProviderConfig) -> None:
         self._config = config
         self._client: Client | None = None
-        self._app: App | None = None
+        self._apps: dict[str, App] = {}
+        self._connect_lock = asyncio.Lock()
         self._cleanup_tasks: set[asyncio.Task[None]] = set()
 
-    async def _connect(self) -> tuple[Client, App]:
-        if self._client is None or self._app is None:
-            try:
-                client = await Client.from_credentials.aio(self._config.MODAL_TOKEN_ID, self._config.MODAL_TOKEN_SECRET)
-                self._app = await App.lookup.aio(
-                    _APP_NAME,
-                    client=client,
-                    create_if_missing=True,
-                )
-                self._client = client
-            except ModalError as exc:
-                raise _sandbox_error(exc) from exc
-        return self._client, self._app
+    async def _connect(self) -> Client:
+        async with self._connect_lock:
+            if self._client is None:
+                try:
+                    self._client = await Client.from_credentials.aio(
+                        self._config.MODAL_TOKEN_ID, self._config.MODAL_TOKEN_SECRET
+                    )
+                except ModalError as exc:
+                    raise _sandbox_error(exc) from exc
+            return self._client
+
+    async def _get_app(self, client: Client, labels: Mapping[str, str]) -> App:
+        run_id = labels["run-id"]
+        name = f"benchmark-service-{run_id}"
+        async with self._connect_lock:
+            if name not in self._apps:
+                try:
+                    app = await App.lookup.aio(name, client=client, create_if_missing=True)
+                    await app.set_tags.aio({"run-id": run_id, "benchmark": labels.get("Benchmark", "")})
+                    self._apps[name] = app
+                except ModalError as exc:
+                    raise _sandbox_error(exc) from exc
+            return self._apps[name]
 
     def _resolve_volumes(
         self,
@@ -663,7 +672,8 @@ class ModalSandboxProvider(SandboxProvider):
         if request.sandbox_secrets:
             raise SandboxError("Modal sandbox provider does not support sandbox_secrets")
 
-        client, app = await self._connect()
+        client = await self._connect()
+        app = await self._get_app(client, request.labels)
         # Keep the full UUID within Modal's 64-character name limit.
         prefix = _INVALID_NAME_CHARS.sub("_", request.name)[:31] or "sandbox"
         modal_name = f"{prefix}-{uuid.uuid4().hex}"
@@ -729,7 +739,7 @@ class ModalSandboxProvider(SandboxProvider):
 
     @_PROVIDER_RETRY
     async def get_sandbox(self, instance_id: str) -> Sandbox:
-        client, _ = await self._connect()
+        client = await self._connect()
         try:
             inner = await ModalSdkSandbox.from_id.aio(instance_id, client=client)
             if await inner.poll.aio() is not None:
@@ -742,7 +752,7 @@ class ModalSandboxProvider(SandboxProvider):
 
     @_PROVIDER_RETRY
     async def delete_sandbox(self, instance_id: str) -> None:
-        client, _ = await self._connect()
+        client = await self._connect()
         try:
             inner = await ModalSdkSandbox.from_id.aio(instance_id, client=client)
             await inner.terminate.aio(wait=True)
@@ -760,10 +770,10 @@ class ModalSandboxProvider(SandboxProvider):
         if query.created_at_lte is not None:
             raise SandboxError("Modal sandbox provider does not support filtering by creation time")
 
-        client, app = await self._connect()
+        client = await self._connect()
         try:
             sandboxes: list[ModalSdkSandbox] = []
-            async for inner in ModalSdkSandbox.list.aio(app_id=app.app_id, tags=query.labels or None, client=client):
+            async for inner in ModalSdkSandbox.list.aio(tags=query.labels or None, client=client):
                 if await inner.poll.aio() is None:
                     sandboxes.append(inner)
             return sandboxes
@@ -775,7 +785,7 @@ class ModalSandboxProvider(SandboxProvider):
             return
         client = self._client
         self._client = None
-        self._app = None
+        self._apps.clear()
         cleanup = tuple(self._cleanup_tasks)
         self._cleanup_tasks.clear()
         closing = _start_background(_close_client(client, cleanup), "Modal client close")

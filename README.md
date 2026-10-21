@@ -509,9 +509,22 @@ Eval-only retry flow:
 - `grader_identity(task_id, dataset)`: what decides the grade (judge model and rubric revision, or test revision and grader image). A retry refuses to grade if this changed.
 - `grade_input(task_id, content, dataset)`: how to grade those bytes.
 
-The framework saves the bytes to S3 before grading and, on a retry, grades the saved copy instead of rerunning the agent. Storage comes from `EVAL_RESUME_BUCKET` and `EVAL_RESUME_PREFIX`, which benchmark-services-registry sets when a service opts in. Implement `collect_grading_input`, `grader_identity` and one grader, or none. Details are in `benchmark_service/eval_resume.py`.
+The framework saves the bytes to S3 before grading and, on a retry, grades the saved copy instead of rerunning the agent. Storage comes from `EVAL_RESUME_BUCKET` and `EVAL_RESUME_PREFIX`, which benchmark-services-registry sets when a service opts in.
+Implement `collect_grading_input`, `grader_identity` and one grader, or none.
+Details are in `benchmark_service/eval_resume.py`.
 
-If your grader runs in a sandbox, implement `grade_in_sandbox` instead of `grade_input`; a retry grades in a fresh sandbox, or in the caller's sandbox when the request names one. If it needs its own image or no network, set the task's `eval_sandbox`, the same spec `/v1` grading reads: every attempt then grades in a fresh sandbox built from it, with the network blocked unless it sets `network_block_all=False`. Its `timeout_s` sizes that sandbox's auto-stop but does not bound `grade_in_sandbox`. To save progress part-way, for example after each judge call, yield `GradingInput`. If the agent's output cannot be graded, raise `NotGradeable(message)` from `collect_grading_input`: the task ends with that error and nothing is saved. A grader with no bounded input to save keeps its own `evaluate_instance`.
+Optional, as your grader needs:
+
+- **Grades inside a sandbox:** implement `grade_in_sandbox` instead of `grade_input`.
+  A retry grades in a fresh sandbox with the network blocked,
+  or in the caller's sandbox when the request names one.
+- **Needs its own image, or the network:** set the task's `eval_sandbox`, the spec `/v1` grading reads.
+  Every attempt then grades in a fresh sandbox built from it.
+  Its `timeout_s` sizes that sandbox's auto-stop; it does not bound grading.
+- **Saves progress part-way**, for example after each judge call: yield `GradingInput`.
+- **Output that cannot be graded:** raise `NotGradeable(message)` from `collect_grading_input`.
+  The task ends with that error, and nothing is saved.
+- **No bounded input to save:** keep your own `evaluate_instance`.
 
 ### Streaming protocol
 

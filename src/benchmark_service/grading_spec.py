@@ -1,7 +1,6 @@
 """Grading-sandbox resolution and teardown bounds, shared by ``/v1`` grading and eval-resume."""
 
 import math
-from collections.abc import Mapping
 from dataclasses import dataclass
 
 from benchmark_service.sandbox import (
@@ -16,14 +15,6 @@ from benchmark_service.schemas import RetrieveTaskResponse
 
 DEFAULT_GRADE_TIMEOUT_S = 1800.0
 TEARDOWN_TIMEOUT_S = 120.0
-GRADING_SANDBOX_LABELS = {"vals-eval": "grade-instance"}
-
-
-def is_grading_sandbox(labels: Mapping[str, str] | None) -> bool:
-    """Whether a sandbox was created by ``/v1`` grading from the task's ``eval_sandbox``."""
-    return labels is not None and labels.get("vals-eval") == GRADING_SANDBOX_LABELS["vals-eval"]
-
-
 def auto_stop_minutes(budget_s: float) -> int:
     """Auto-stop backstop that outlasts the grading budget; the caller's explicit delete is the real teardown."""
     return math.ceil(budget_s / 60) + 10

@@ -24,11 +24,10 @@ from benchmark_service.auth import (
     resolve_caller_tenant,
 )
 from benchmark_service import eval_resume
-from benchmark_service.context import current_sandbox_provider
+from benchmark_service.context import current_grading_sandbox_id, current_sandbox_provider
 from benchmark_service.grading_spec import (
     TEARDOWN_TIMEOUT_S,
     auto_stop_minutes,
-    is_grading_sandbox,
     resolve_grading_spec,
 )
 from benchmark_service.dataset_versioning import DatasetVersionEntry, load_dataset_versions
@@ -595,7 +594,9 @@ class BenchmarkService(ABC):
             yield await provider.get_sandbox(instance_id)
             return
         task = await self.retrieve_task(task_id, skip_validation=True, dataset=dataset)
-        if agent_sandbox is not None and (task.eval_sandbox is None or is_grading_sandbox(agent_sandbox.labels)):
+        if agent_sandbox is not None and (
+            task.eval_sandbox is None or current_grading_sandbox_id() == agent_sandbox.id
+        ):
             yield agent_sandbox
             return
         if provider is None:
@@ -603,10 +604,9 @@ class BenchmarkService(ABC):
         if agent_sandbox is None and task.eval_sandbox is None and task.resume_sandbox is not None:
             raise ValueError(f"task {task_id} declares a caller-owned resume_sandbox; the retry needs its instance_id")
         spec = resolve_grading_spec(task)
-        if task.eval_sandbox is None:
-            network_block_all, auto_stop = False, _EVAL_RESUME_AUTO_STOP_MINUTES
-        else:
-            network_block_all, auto_stop = spec.network_block_all, auto_stop_minutes(spec.grade_timeout)
+        auto_stop = (
+            _EVAL_RESUME_AUTO_STOP_MINUTES if task.eval_sandbox is None else auto_stop_minutes(spec.grade_timeout)
+        )
         sandbox = await _create_owned_sandbox(
             provider,
             SandboxCreateRequest(
@@ -624,7 +624,7 @@ class BenchmarkService(ABC):
                 env_vars={},
                 auto_stop_interval=auto_stop,
                 create_timeout=_EVAL_RESUME_CREATE_TIMEOUT_S,
-                network_block_all=network_block_all,
+                network_block_all=spec.network_block_all,
             ),
         )
         try:

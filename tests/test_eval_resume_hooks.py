@@ -906,7 +906,7 @@ async def test_an_eval_sandbox_falls_back_to_the_task_and_follows_its_own_fields
     assert (created.source, created.resources, created.network_block_all, created.auto_stop_interval) == expected
 
 
-async def test_a_retry_without_eval_sandbox_sets_no_network_policy(s3: _FakeS3) -> None:
+async def test_a_retry_without_eval_sandbox_blocks_the_network_as_grading_sandboxes_do(s3: _FakeS3) -> None:
     checkpoint = await _sandbox_checkpoint(s3)
     retry, provider = await _sandbox_service(s3), _Provider()
     request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=checkpoint)
@@ -914,7 +914,7 @@ async def test_a_retry_without_eval_sandbox_sets_no_network_policy(s3: _FakeS3) 
     with sandbox_provider_scope(cast(SandboxProvider, provider)):
         await _drain(retry.stream_evaluate_response(request))
 
-    assert provider.created[0].network_block_all is False
+    assert provider.created[0].network_block_all is True
 
 
 async def test_a_retry_naming_a_caller_owned_sandbox_borrows_it_even_with_eval_sandbox(s3: _FakeS3) -> None:
@@ -938,16 +938,16 @@ async def test_a_first_attempt_with_eval_sandbox_ignores_the_caller_owned_resume
     assert service.graded_in == ["fresh-1"]
 
 
-async def test_a_v1_grading_sandbox_is_graded_in_rather_than_replaced(s3: _FakeS3) -> None:
-    class _V1GradingSandbox(_Sandbox):
+async def test_a_caller_labelled_sandbox_does_not_pass_for_the_v1_grading_sandbox(s3: _FakeS3) -> None:
+    class _LabelledAgentSandbox(_Sandbox):
         labels = {"Id": "run-1", "vals-eval": "grade-instance"}
 
     service, provider = await _sandbox_service(s3, _VerifierGrader), _Provider()
 
     with sandbox_provider_scope(cast(SandboxProvider, provider)):
-        await _drain(service.evaluate_instance("task-1", cast(Sandbox, _V1GradingSandbox())))
+        await _drain(service.evaluate_instance("task-1", cast(Sandbox, _LabelledAgentSandbox())))
 
-    assert (service.graded_in, provider.created) == (["sandbox-1"], [])
+    assert (service.graded_in, provider.deleted) == (["fresh-1"], ["fresh-1"])
 
 
 async def test_a_retry_with_eval_sandbox_grades_fresh_even_when_the_task_declares_resume_sandbox(

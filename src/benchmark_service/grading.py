@@ -29,9 +29,8 @@ from typing import Any
 from fastapi.encoders import jsonable_encoder
 
 from benchmark_service.base import BenchmarkService
-from benchmark_service.context import sandbox_provider_scope, tenant_scope
+from benchmark_service.context import grading_sandbox_context, sandbox_provider_scope, tenant_scope
 from benchmark_service.grading_spec import (
-    GRADING_SANDBOX_LABELS,
     TEARDOWN_TIMEOUT_S,
     ResolvedSpec,
     auto_stop_minutes,
@@ -198,7 +197,7 @@ class _GradeRun:
             labels={
                 "Benchmark": type(self.service).__name__,
                 "Task": self.task_id,
-                **GRADING_SANDBOX_LABELS,
+                "vals-eval": "grade-instance",
                 "tenant": self.tenant,
                 "run-id": self.run_id,
                 **(self.labels or {}),
@@ -334,6 +333,7 @@ async def grade_instance_stream(
             terminal = StreamErrorChunk(type="error", data=str(exc))
         else:
             evaluation = run.service.evaluate_instance(run.task_id, sandbox, dataset=run.dataset)
+            evaluation_context = grading_sandbox_context(sandbox.id)
             deadline = time.monotonic() + spec.grade_timeout
             timeout_message = f"grading exceeded the {spec.grade_timeout:g}s grade timeout"
             while terminal is None:
@@ -342,7 +342,7 @@ async def grade_instance_stream(
                     logger.warning("grading timed out run_id=%s task_id=%s", run_id, run.task_id)
                     terminal = StreamErrorChunk(type="error", data=timeout_message)
                     break
-                evaluation_task = asyncio.create_task(_next_stream_chunk(evaluation))
+                evaluation_task = asyncio.create_task(_next_stream_chunk(evaluation), context=evaluation_context)
                 try:
                     if not await _future_finished(evaluation_task, remaining):
                         logger.warning("grading timed out run_id=%s task_id=%s", run_id, run.task_id)

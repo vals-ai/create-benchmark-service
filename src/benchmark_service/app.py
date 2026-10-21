@@ -4,7 +4,7 @@ import importlib.metadata
 import logging
 import os
 import traceback
-from collections.abc import AsyncGenerator, AsyncIterator
+from collections.abc import AsyncGenerator
 from contextlib import aclosing, asynccontextmanager, nullcontext, suppress
 from typing import Any, cast
 
@@ -44,7 +44,6 @@ from benchmark_service.schemas import (
 from benchmark_service.sandbox import (
     DaytonaProviderConfig,
     DockerProviderConfig,
-    SandboxProvider,
     SandboxProviderConfig,
 )
 
@@ -91,15 +90,6 @@ def _request_sandbox_provider_config(
     websocket: WebSocket,
 ) -> SandboxProviderConfig:
     return request.sandbox_provider or DaytonaProviderConfig.from_headers(websocket.headers)
-
-
-@asynccontextmanager
-async def _optional_provider(config: SandboxProviderConfig | None) -> AsyncIterator[SandboxProvider | None]:
-    if config is None:
-        yield None
-        return
-    async with config.create_provider() as provider:
-        yield provider
 
 
 DOCKER_ENABLED_ENV = "CBS_DOCKER_ENABLED"
@@ -465,7 +455,7 @@ class BenchmarkServiceApp(FastAPI):
                 if not await self._admit_websocket_evaluation(websocket, tenant):
                     return
 
-                async with _optional_provider(request.sandbox_provider) as provider:
+                async with request.sandbox_provider.create_provider() if request.sandbox_provider else nullcontext() as provider:
                     with sandbox_provider_scope(provider):
                         await _forward_stream(
                             websocket,

@@ -12,7 +12,9 @@ from benchmark_service.context import sandbox_provider_scope, tenant_scope
 from benchmark_service.eval_resume import EvalResumeIdentityError, EvalResumeStore, GradingInput
 from benchmark_service.sandbox import ImageSource, Resources, Sandbox, SandboxCreateRequest, SandboxProvider
 from benchmark_service.schemas import (
+    EvalSandboxSpec,
     EvaluateResponseRequest,
+    RetrieveTaskResponse,
     StreamChunk,
     StreamEvalResumeStateChunk,
     StreamResultChunk,
@@ -518,3 +520,83 @@ async def test_a_service_may_not_implement_both_graders() -> None:
 
     with pytest.raises(TypeError, match="either grade_input or grade_in_sandbox"):
         await _Both.create()
+
+
+async def test_an_adopter_may_define_its_own_private_grade_helper(s3: _FakeS3) -> None:
+    class _OwnHelper(HookBenchmark):
+        async def _grade(self, conductor_result: dict[str, Any], test: object, condition: str) -> None:
+            raise AssertionError("the framework must not call an adopter's own _grade")
+
+    service = await _OwnHelper.create()
+    service.graded = []
+    service.eval_resume_store = EvalResumeStore(s3_client=s3)
+
+    chunks = await _drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox())))
+    request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=cast(dict[str, Any], chunks[0].data))
+    assert [chunk.type for chunk in await _drain(service.stream_evaluate_response(request))] == ["result"]
+
+
+async def test_each_checkpoint_reaches_the_caller_before_the_grader_resumes(s3: _FakeS3) -> None:
+    events: list[str] = []
+
+    class _Ordered(_ProgressBenchmark):
+        async def grade_input(
+            self, task_id: str, content: bytes, dataset: str | None = None
+        ) -> AsyncGenerator[StreamChunk | GradingInput, None]:
+            for call in range(2):
+                yield GradingInput(json.dumps({"calls": call + 1}).encode())
+                events.append("resumed")
+            yield StreamResultChunk(type="result", data={})
+
+    service = await _Ordered.create()
+    service.graded, service.saved_before_resume, service.store_objects = [], [], s3.objects
+    service.eval_resume_store = EvalResumeStore(s3_client=s3)
+
+    async for chunk in service.evaluate_instance("task-1", cast(Sandbox, _Sandbox())):
+        events.append(chunk.type)
+
+    assert events == ["eval_resume_state", "eval_resume_state", "resumed", "eval_resume_state", "resumed", "result"]
+
+
+async def test_a_task_that_declares_a_caller_owned_resume_sandbox_needs_its_instance_id(s3: _FakeS3) -> None:
+    class _CallerOwned(_SandboxGrader):
+        async def retrieve_task(
+            self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+        ) -> RetrieveTaskResponse:
+            task = await super().retrieve_task(task_id, skip_validation, dataset)
+            return task.model_copy(update={"resume_sandbox": EvalSandboxSpec()})
+
+    checkpoint = await _sandbox_checkpoint(s3)
+    retry, provider = await _CallerOwned.create(), _Provider()
+    retry.graded_in = []
+    retry.eval_resume_store = EvalResumeStore(s3_client=s3)
+    request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=checkpoint)
+
+    with sandbox_provider_scope(cast(SandboxProvider, provider)), pytest.raises(ValueError, match="instance_id"):
+        await _drain(retry.stream_evaluate_response(request))
+    assert (provider.created, retry.graded_in) == ([], [])
+
+
+async def test_cancelling_a_retry_while_its_sandbox_is_created_still_deletes_it(s3: _FakeS3) -> None:
+    class _SlowProvider(_Provider):
+        def __init__(self) -> None:
+            super().__init__()
+            self.creating = asyncio.Event()
+
+        async def create_sandbox(self, request: SandboxCreateRequest) -> _GradingSandbox:
+            self.creating.set()
+            await asyncio.sleep(0.05)
+            return await super().create_sandbox(request)
+
+    checkpoint = await _sandbox_checkpoint(s3)
+    retry, provider = await _sandbox_service(s3), _SlowProvider()
+    request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=checkpoint)
+
+    with sandbox_provider_scope(cast(SandboxProvider, provider)):
+        task = asyncio.create_task(_drain(retry.stream_evaluate_response(request)))
+        await provider.creating.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    assert (retry.graded_in, provider.deleted) == ([], ["fresh-1"])

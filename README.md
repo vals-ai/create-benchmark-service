@@ -429,7 +429,7 @@ Eval-only retry flow:
 
 The framework saves the bytes to S3 before grading and, on a retry, grades the saved copy instead of rerunning the agent. Storage comes from `EVAL_RESUME_BUCKET` and `EVAL_RESUME_PREFIX`, which benchmark-services-registry sets when a service opts in. Implement all three hooks or none. Details are in `benchmark_service/eval_resume.py`.
 
-If your grader runs inside a sandbox, implement `grade_in_sandbox` instead of `grade_input`; a retry then grades in a fresh sandbox. If it should resume part-way, for example after each judge call, yield `GradingInput` from it.
+If your grader runs inside a sandbox, implement `grade_in_sandbox` instead of `grade_input`; a retry then grades in a fresh sandbox, or in the caller's when the task declares `resume_sandbox`. A grader with no bounded input to save keeps its own `evaluate_instance`. If it should resume part-way, for example after each judge call, yield `GradingInput` from it.
 
 ### Streaming protocol
 

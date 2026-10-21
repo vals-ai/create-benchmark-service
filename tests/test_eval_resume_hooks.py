@@ -805,12 +805,14 @@ async def test_a_failed_grading_input_saved_is_logged_and_grading_continues(
 
 
 class _VerifierGrader(_SandboxGrader):
+    spec = EvalSandboxSpec(source=ImageSource(image="verifier:sha256-abc"), timeout_s=3600)
+    resume_sandbox: EvalSandboxSpec | None = None
+
     async def retrieve_task(
         self, task_id: str, skip_validation: bool = False, dataset: str | None = None
     ) -> RetrieveTaskResponse:
         task = await super().retrieve_task(task_id, skip_validation, dataset)
-        spec = EvalSandboxSpec(source=ImageSource(image="verifier:sha256-abc"), timeout_s=3600)
-        return task.model_copy(update={"eval_sandbox": spec})
+        return task.model_copy(update={"eval_sandbox": self.spec, "resume_sandbox": self.resume_sandbox})
 
 
 async def test_a_tasks_eval_sandbox_grades_the_first_attempt_in_its_own_sandbox(s3: _FakeS3) -> None:
@@ -869,3 +871,63 @@ async def test_a_hung_grading_input_saved_is_abandoned_after_the_teardown_bound(
 
     assert [chunk.type for chunk in chunks] == ["eval_resume_state", "result"]
     assert "grading_input_saved failed for task-1" in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("spec", "expected"),
+    [
+        (
+            EvalSandboxSpec(timeout_s=3601),
+            (ImageSource(image="python:3.12-slim"), Resources(vcpu=2, memory=4, disk=10), True, 71),
+        ),
+        (
+            EvalSandboxSpec(resources=Resources(vcpu=8, memory=16, disk=20), network_block_all=False),
+            (ImageSource(image="python:3.12-slim"), Resources(vcpu=8, memory=16, disk=20), False, 40),
+        ),
+    ],
+)
+async def test_an_eval_sandbox_falls_back_to_the_task_and_follows_its_own_fields(
+    s3: _FakeS3, spec: EvalSandboxSpec, expected: tuple[object, ...]
+) -> None:
+    checkpoint = await _sandbox_checkpoint(s3)
+    retry, provider = await _sandbox_service(s3, _VerifierGrader), _Provider()
+    cast(_VerifierGrader, retry).spec = spec
+    request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=checkpoint)
+
+    with sandbox_provider_scope(cast(SandboxProvider, provider)):
+        await _drain(retry.stream_evaluate_response(request))
+
+    created = provider.created[0]
+    assert (created.source, created.resources, created.network_block_all, created.auto_stop_interval) == expected
+
+
+async def test_a_retry_without_eval_sandbox_sets_no_network_policy(s3: _FakeS3) -> None:
+    checkpoint = await _sandbox_checkpoint(s3)
+    retry, provider = await _sandbox_service(s3), _Provider()
+    request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=checkpoint)
+
+    with sandbox_provider_scope(cast(SandboxProvider, provider)):
+        await _drain(retry.stream_evaluate_response(request))
+
+    assert provider.created[0].network_block_all is False
+
+
+async def test_a_retry_naming_a_caller_owned_sandbox_borrows_it_even_with_eval_sandbox(s3: _FakeS3) -> None:
+    checkpoint = await _sandbox_checkpoint(s3)
+    retry, provider = await _sandbox_service(s3, _VerifierGrader), _Provider()
+    request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=checkpoint, instance_id="caller-owned")
+
+    with sandbox_provider_scope(cast(SandboxProvider, provider)):
+        await _drain(retry.stream_evaluate_response(request))
+
+    assert (retry.graded_in, provider.created, provider.deleted) == (["caller-owned"], [], [])
+
+
+async def test_a_first_attempt_with_eval_sandbox_ignores_the_caller_owned_resume_sandbox(s3: _FakeS3) -> None:
+    service, provider = await _sandbox_service(s3, _VerifierGrader), _Provider()
+    cast(_VerifierGrader, service).resume_sandbox = EvalSandboxSpec()
+
+    with sandbox_provider_scope(cast(SandboxProvider, provider)):
+        await _drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox())))
+
+    assert service.graded_in == ["fresh-1"]

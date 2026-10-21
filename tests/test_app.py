@@ -427,7 +427,9 @@ def test_websocket_setup_task_resolves_sandbox_provider(
             }
 
 
-@pytest.mark.parametrize("sandbox_provider", [None, {"type": "modal", "MODAL_TOKEN_ID": "id", "MODAL_TOKEN_SECRET": "secret"}])
+@pytest.mark.parametrize(
+    "sandbox_provider", [None, {"type": "modal", "MODAL_TOKEN_ID": "id", "MODAL_TOKEN_SECRET": "secret"}]
+)
 def test_websocket_evaluate_response_binds_the_requests_sandbox_provider(
     monkeypatch: pytest.MonkeyPatch, sandbox_provider: dict[str, str] | None
 ) -> None:

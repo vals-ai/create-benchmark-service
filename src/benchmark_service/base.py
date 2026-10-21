@@ -55,8 +55,8 @@ def _prioritize_dataset(datasets: dict[str, dict[str, Any]], priority_dataset: s
 _GRADERS = ("grade_input", "grade_in_sandbox")
 _GRADING_HOOKS = ("collect_grading_input", "grader_identity", *_GRADERS)
 
-EVAL_RESUME_SANDBOX_AUTO_STOP_MINUTES = 30
-EVAL_RESUME_SANDBOX_CREATE_TIMEOUT_SECONDS = 600
+_EVAL_RESUME_AUTO_STOP_MINUTES = 30
+_EVAL_RESUME_CREATE_TIMEOUT_S = 600
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +67,10 @@ async def _delete_owned_sandbox(provider: SandboxProvider, sandbox_id: str) -> N
     try:
         await asyncio.shield(cleanup)
     except asyncio.CancelledError:
-        await asyncio.shield(cleanup)
+        try:
+            await asyncio.shield(cleanup)
+        except Exception:
+            logger.exception("Failed to delete eval-resume sandbox %s", sandbox_id)
         raise
     except Exception:
         logger.exception("Failed to delete eval-resume sandbox %s", sandbox_id)
@@ -122,8 +125,6 @@ class BenchmarkService(ABC):
     priority_dataset: ClassVar[str | None] = None
 
     def __new__(cls, *args: Any, **kwargs: Any) -> Self:
-        # Checked here rather than in __init_subclass__ so an intermediate base class may
-        # leave evaluate_instance and any of the three hooks to a subclass, as abstract methods allow.
         implemented = cls._implemented_grading_hooks()
         if all(grader in implemented for grader in _GRADERS):
             raise TypeError(f"{cls.__name__} must implement either grade_input or grade_in_sandbox, not both")
@@ -582,6 +583,7 @@ class BenchmarkService(ABC):
             SandboxCreateRequest(
                 source=task.source,
                 resources=task.resources,
+                volumes=task.volumes,
                 name=f"eval-resume-{uuid4().hex[:12]}",
                 labels={
                     "Benchmark": type(self).__name__,
@@ -590,8 +592,8 @@ class BenchmarkService(ABC):
                     "EvalResume": "true",
                 },
                 env_vars={},
-                auto_stop_interval=EVAL_RESUME_SANDBOX_AUTO_STOP_MINUTES,
-                create_timeout=EVAL_RESUME_SANDBOX_CREATE_TIMEOUT_SECONDS,
+                auto_stop_interval=_EVAL_RESUME_AUTO_STOP_MINUTES,
+                create_timeout=_EVAL_RESUME_CREATE_TIMEOUT_S,
             ),
         )
         try:

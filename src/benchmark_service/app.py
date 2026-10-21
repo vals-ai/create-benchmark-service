@@ -455,7 +455,9 @@ class BenchmarkServiceApp(FastAPI):
                 if not await self._admit_websocket_evaluation(websocket, tenant):
                     return
 
-                async with request.sandbox_provider.create_provider() if request.sandbox_provider else nullcontext() as provider:
+                async with (
+                    request.sandbox_provider.create_provider() if request.sandbox_provider else nullcontext()
+                ) as provider:
                     with sandbox_provider_scope(provider):
                         await _forward_stream(
                             websocket,

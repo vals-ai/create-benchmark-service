@@ -10,7 +10,14 @@ import pytest
 from benchmark_service.base import BenchmarkService
 from benchmark_service.context import sandbox_provider_scope, tenant_scope
 from benchmark_service.eval_resume import EvalResumeIdentityError, EvalResumeStore, GradingInput
-from benchmark_service.sandbox import ImageSource, Resources, Sandbox, SandboxCreateRequest, SandboxProvider
+from benchmark_service.sandbox import (
+    ImageSource,
+    Resources,
+    Sandbox,
+    SandboxCreateRequest,
+    SandboxProvider,
+    VolumeMount,
+)
 from benchmark_service.schemas import (
     EvalSandboxSpec,
     EvaluateResponseRequest,
@@ -341,14 +348,27 @@ class _SavedHookBenchmark(HookBenchmark):
         self.released.append(sandbox.id)
 
 
-async def test_grading_input_saved_runs_after_the_save(s3: _FakeS3) -> None:
-    service = await _SavedHookBenchmark.create()
-    service.graded, service.released = [], []
+async def test_grading_input_saved_runs_once_after_the_first_save_and_before_grading(s3: _FakeS3) -> None:
+    events: list[str] = []
+
+    class _Ordered(_SavedHookBenchmark):
+        async def grading_input_saved(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> None:
+            events.append(f"released {sandbox.id}")
+
+        async def grade_input(
+            self, task_id: str, content: bytes, dataset: str | None = None
+        ) -> AsyncGenerator[StreamChunk | GradingInput, None]:
+            events.append("grading")
+            yield GradingInput(b"{}")
+            yield StreamResultChunk(type="result", data={})
+
+    service = await _Ordered.create()
     service.eval_resume_store = EvalResumeStore(s3_client=s3)
 
-    await _drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox())))
+    async for chunk in service.evaluate_instance("task-1", cast(Sandbox, _Sandbox())):
+        events.append(chunk.type)
 
-    assert service.released == ["sandbox-1"]
+    assert events == ["eval_resume_state", "released sandbox-1", "grading", "eval_resume_state", "result"]
 
 
 async def test_grading_input_saved_does_not_run_when_the_save_fails(
@@ -477,8 +497,34 @@ async def test_grade_in_sandbox_retries_in_a_fresh_sandbox_and_deletes_it(s3: _F
         ImageSource(image="python:3.12-slim"),
         Resources(vcpu=2, memory=4, disk=10),
     )
-    assert (created.labels["Id"], created.labels["Task"]) == ("run-1", "task-1")
+    assert (created.labels["Benchmark"], created.labels["Id"], created.labels["Task"]) == (
+        "_SandboxGrader",
+        "run-1",
+        "task-1",
+    )
     assert provider.deleted == ["fresh-1"]
+
+
+async def test_the_fresh_sandbox_mounts_the_tasks_volumes(s3: _FakeS3) -> None:
+    fixture = VolumeMount(name="fixtures", mount_path="/fixtures", read_only=True)
+
+    class _WithVolume(_SandboxGrader):
+        async def retrieve_task(
+            self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+        ) -> RetrieveTaskResponse:
+            task = await super().retrieve_task(task_id, skip_validation, dataset)
+            return task.model_copy(update={"volumes": [fixture]})
+
+    checkpoint = await _sandbox_checkpoint(s3)
+    retry, provider = await _WithVolume.create(), _Provider()
+    retry.graded_in = []
+    retry.eval_resume_store = EvalResumeStore(s3_client=s3)
+    request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=checkpoint)
+
+    with sandbox_provider_scope(cast(SandboxProvider, provider)):
+        await _drain(retry.stream_evaluate_response(request))
+
+    assert provider.created[0].volumes == [fixture]
 
 
 async def test_the_fresh_sandbox_is_deleted_when_grading_fails(s3: _FakeS3) -> None:
@@ -600,3 +646,64 @@ async def test_cancelling_a_retry_while_its_sandbox_is_created_still_deletes_it(
             await task
 
     assert (retry.graded_in, provider.deleted) == ([], ["fresh-1"])
+
+
+class _BlockingDeleteProvider(_Provider):
+    def __init__(self, fail: bool = False) -> None:
+        super().__init__()
+        self.fail = fail
+        self.deleting = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def delete_sandbox(self, instance_id: str) -> None:
+        self.deleting.set()
+        await self.release.wait()
+        if self.fail:
+            raise RuntimeError("delete failed")
+        await super().delete_sandbox(instance_id)
+
+
+async def _cancel_while_deleting(s3: _FakeS3, provider: _BlockingDeleteProvider) -> None:
+    checkpoint = await _sandbox_checkpoint(s3)
+    retry = await _sandbox_service(s3)
+    request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=checkpoint)
+
+    with sandbox_provider_scope(cast(SandboxProvider, provider)):
+        task = asyncio.create_task(_drain(retry.stream_evaluate_response(request)))
+        await provider.deleting.wait()
+        task.cancel()
+        await asyncio.sleep(0)
+        provider.release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_cancelling_a_retry_while_its_sandbox_is_deleted_lets_the_delete_finish(s3: _FakeS3) -> None:
+    provider = _BlockingDeleteProvider()
+    await _cancel_while_deleting(s3, provider)
+    assert provider.deleted == ["fresh-1"]
+
+
+async def test_a_failed_delete_during_cancellation_is_logged_and_the_cancellation_kept(
+    s3: _FakeS3, caplog: pytest.LogCaptureFixture
+) -> None:
+    await _cancel_while_deleting(s3, _BlockingDeleteProvider(fail=True))
+    assert "Failed to delete eval-resume sandbox fresh-1" in caplog.text
+
+
+async def test_a_failed_delete_is_logged_and_the_grade_still_streams(
+    s3: _FakeS3, caplog: pytest.LogCaptureFixture
+) -> None:
+    class _FailingDelete(_Provider):
+        async def delete_sandbox(self, instance_id: str) -> None:
+            raise RuntimeError("delete failed")
+
+    checkpoint = await _sandbox_checkpoint(s3)
+    retry = await _sandbox_service(s3)
+    request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=checkpoint)
+
+    with sandbox_provider_scope(cast(SandboxProvider, _FailingDelete())):
+        chunks = await _drain(retry.stream_evaluate_response(request))
+
+    assert chunks[-1].data == {"resolved": True}
+    assert "Failed to delete eval-resume sandbox fresh-1" in caplog.text

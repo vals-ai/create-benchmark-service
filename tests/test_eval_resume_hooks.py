@@ -386,9 +386,11 @@ class _GradingSandbox:
         self.labels: dict[str, str] = {}
         self.files: dict[str, bytes] = {}
         self.allowlists: list[list[str]] = []
+        self.allowlists_when_graded: list[list[str]] | None = None
 
     async def upload_file(self, remote_path: str, content: bytes) -> None:
         self.files[remote_path] = content
+        self.allowlists_when_graded = list(self.allowlists)
 
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
         self.allowlists.append(allowed_addresses)
@@ -942,7 +944,8 @@ async def test_a_retry_without_eval_sandbox_grades_under_the_tasks_evaluation_eg
     s3: _FakeS3, evaluation: EgressPolicy, network_block_all: bool, allowlists: list[list[str]]
 ) -> None:
     provider = await _retry_with_task(s3, egress=BenchmarkEgressPlan(evaluation=evaluation))
-    assert (provider.created[0].network_block_all, provider.sandboxes[0].allowlists) == (network_block_all, allowlists)
+    created, sandbox = provider.created[0], provider.sandboxes[0]
+    assert (created.network_block_all, sandbox.allowlists_when_graded) == (network_block_all, allowlists)
 
 
 async def test_an_eval_sandbox_network_wins_over_the_tasks_evaluation_egress(s3: _FakeS3) -> None:
@@ -958,9 +961,10 @@ async def test_a_retry_sandbox_whose_egress_cannot_be_applied_is_deleted_before_
     class _RefusingProvider(_Provider):
         async def create_sandbox(self, request: SandboxCreateRequest) -> _GradingSandbox:
             self.created.append(request)
-            return _RefusingSandbox("fresh-1")
+            self.sandboxes.append(_RefusingSandbox("fresh-1"))
+            return self.sandboxes[-1]
 
     provider = _RefusingProvider()
     with pytest.raises(RuntimeError, match="allowlist refused"):
         await _retry_with_task(s3, provider, egress=BenchmarkEgressPlan(evaluation=["pypi.org"]))
-    assert provider.deleted == ["fresh-1"]
+    assert (provider.sandboxes[0].files, provider.deleted) == ({}, ["fresh-1"])

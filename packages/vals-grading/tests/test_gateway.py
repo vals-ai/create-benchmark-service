@@ -50,6 +50,7 @@ async def test_real_gateway_client_with_platform_access_blocked(monkeypatch: pyt
         assert body["config"]["temperature"] == 0
         assert body["config"]["top_p"] == 1
         assert body["config"]["max_tokens"] == 10000
+        assert body["inputs"][0] == {"kind": "system", "text": "<PROMPT>A\n"}
         return httpx.Response(200, request=request, json={"output_text": '{"result":1,"explanation":"ok"}'})
 
     monkeypatch.setattr(httpx.Client, "send", registry_send)
@@ -60,11 +61,14 @@ async def test_real_gateway_client_with_platform_access_blocked(monkeypatch: pyt
         id="test",
         input_under_test="Q",
         context={},
-        checks=(Check(operator="custom", prompt="{{output}}", criteria="C", severity=1),),
+        checks=tuple(
+            Check(operator="custom", prompt="{{output}}\n{{criteria}}", criteria=criteria, severity=1)
+            for criteria in ("C", "D")
+        ),
     )
     result = await CheckJudge(model).grade_test(saved, "A", {})
     assert result.pass_percentage_with_weight == 1
-    assert [request.url.path for request in requests] == ["/registry", "/query"]
+    assert [request.url.path for request in requests] == ["/registry", "/query", "/query"]
 
 
 @pytest.mark.parametrize("identity", ["plain-service-name", '"service"', "[]"])

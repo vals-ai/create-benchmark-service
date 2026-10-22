@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import re
 from typing import Any
 
@@ -89,13 +90,25 @@ class CheckJudge:
         evaluation_context = json.loads(json.dumps(output_context))
         evaluation_context.pop(TRAJECTORY_OUTPUT_CONTEXT_KEY, None)
         await self.require_gradeable(test, llm_output, evaluation_context)
+        queries: list[str] = []
+        for check in test.checks:
+            try:
+                queries.append(_query(check, test, llm_output, evaluation_context))
+            except ValueError:
+                continue
+        # The text every check repeats (e.g. the transcript) goes in its own cached block.
+        shared = os.path.commonprefix(queries) if len(queries) > 1 else ""
+        system = shared[: shared.rfind("\n") + 1]
         semaphore = asyncio.Semaphore(CHECK_CONCURRENCY)
 
         async def grade(check: Check) -> CheckResult:
             async with semaphore:
-                return await self._grade_check(test, check, llm_output, evaluation_context)
+                return await self._grade_check(test, check, llm_output, evaluation_context, system)
 
-        results = await asyncio.gather(*(grade(check) for check in test.checks), return_exceptions=True)
+        # Concurrent calls can't read a prompt cache that's still being written, so the first check runs alone.
+        first = await asyncio.gather(*(grade(check) for check in test.checks[:1]), return_exceptions=True)
+        rest = await asyncio.gather(*(grade(check) for check in test.checks[1:]), return_exceptions=True)
+        results = [*first, *rest]
         outcomes: list[CheckResult] = []
         for check, result in zip(test.checks, results, strict=True):
             if isinstance(result, CheckResult):
@@ -127,18 +140,11 @@ class CheckJudge:
         )
 
     async def _grade_check(
-        self, test: GradingCase, check: Check, llm_output: str, output_context: dict[str, JsonValue]
+        self, test: GradingCase, check: Check, llm_output: str, output_context: dict[str, JsonValue], system: str
     ) -> CheckResult:
         """Render one check and parse its judge response."""
-        prompt = _format_prompt(
-            check.prompt,
-            test=test,
-            criteria=check.criteria,
-            llm_output=llm_output,
-            output_context=output_context,
-        )
-        query_to_llm = f"<PROMPT>{prompt}</PROMPT>"
-        output = await self._model.generate(query_to_llm)
+        query_to_llm = _query(check, test, llm_output, output_context)
+        output = await self._model.generate(query_to_llm.removeprefix(system), system)
 
         start_token = "```json"
         start = output.find(start_token)
@@ -192,6 +198,17 @@ class CheckJudge:
             return int(raw_output)
         logger.warning("Judge gave no 0 or 1 after a requery; scoring the check 0")
         return 0
+
+
+def _query(check: Check, test: GradingCase, llm_output: str, output_context: dict[str, JsonValue]) -> str:
+    prompt = _format_prompt(
+        check.prompt,
+        test=test,
+        criteria=check.criteria,
+        llm_output=llm_output,
+        output_context=output_context,
+    )
+    return f"<PROMPT>{prompt}</PROMPT>"
 
 
 def _format_prompt(

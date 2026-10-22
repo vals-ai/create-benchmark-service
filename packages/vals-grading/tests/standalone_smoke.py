@@ -8,7 +8,7 @@ from vals_grading import CheckJudge, GradingCase
 
 
 class RecordedModel:
-    async def generate(self, prompt: str) -> str:
+    async def generate(self, prompt: str, system: str = "") -> str:
         return '{"result":1,"explanation":"recorded response"}'
 
     async def count_tokens(self, text: str) -> int:

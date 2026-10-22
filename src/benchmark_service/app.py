@@ -459,11 +459,15 @@ class BenchmarkServiceApp(FastAPI):
                     return
 
                 with request_attribution_scope(attribution_from_request(websocket.headers, task_id=request.task_id)):
-                    await _forward_stream(
-                        websocket,
-                        self.service.stream_evaluate_response(request, dataset=request.dataset),
-                        endpoint="evaluate-response",
-                    )
+                    async with (
+                        request.sandbox_provider.create_provider() if request.sandbox_provider else nullcontext()
+                    ) as provider:
+                        with sandbox_provider_scope(provider):
+                            await _forward_stream(
+                                websocket,
+                                self.service.stream_evaluate_response(request, dataset=request.dataset),
+                                endpoint="evaluate-response",
+                            )
 
     async def _evaluate_instance(self, websocket: WebSocket) -> None:
         await websocket.accept()

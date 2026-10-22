@@ -522,7 +522,9 @@ Optional, as your grader needs:
   It grades under the task's `egress.evaluation`, the policy the first attempt grades under.
   A task that declares no `egress.evaluation` grades its retry with the network blocked.
 - **Needs its own image or network:** set the task's `eval_sandbox`, the spec `/v1` grading reads.
-  Every attempt then grades in a fresh sandbox built from it, under its `network_block_all`.
+  Each attempt then grades in a fresh sandbox built from it, under its `network_block_all`,
+  except when a retry names the caller's sandbox (`instance_id`), which is borrowed instead,
+  and under `/v1` grading, which grades in the sandbox `/v1` already built from it.
   Its `timeout_s` sizes that sandbox's auto-stop; it does not bound grading.
 - **Saves progress part-way**, for example after each judge call: yield `GradingInput`.
 - **Output that cannot be graded:** raise `NotGradeable(message)` from `collect_grading_input`.

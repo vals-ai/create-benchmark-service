@@ -1309,6 +1309,7 @@ async def test_client_v1_evaluate_posts_payload_and_returns_v1_eval_response(
         payload_type=V1PayloadType.ARTIFACT,
         dataset="validation",
         versions=V1Versions(runner="benchmark-orchestrator-1.2.3"),
+        attempt_id="attempt-1",
     )
 
     assert isinstance(result, V1EvalResponse)
@@ -1316,6 +1317,7 @@ async def test_client_v1_evaluate_posts_payload_and_returns_v1_eval_response(
     assert result.result == {"resolved": True}
     called_url, called_kwargs = mock_http.post.call_args
     assert called_url[0] == f"{BASE_URL}/v1/evaluate"
+    assert called_kwargs["json"]["attempt_id"] == "attempt-1"
     assert called_kwargs["json"]["payload"] == {
         "type": "artifact",
         "schema": "code-migration.workspace-tar.v1",

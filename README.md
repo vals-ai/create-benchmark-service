@@ -143,6 +143,8 @@ Services must upgrade to a framework release containing `/v1/datasets` before cl
 | `/ws/evaluate-response` | Evaluate without a sandbox; streams progress, checkpoint state, errors, and a final result |
 | `/ws/evaluate-instance` | Evaluate a live sandbox solution; streams progress, errors, and a final result |
 
+**Request attribution.** `BenchmarkServiceClient` sends the caller's `X-Vals-Run-ID`, `X-Vals-Task-ID` and `X-Vals-Attempt-ID` headers from `correlation_scope(run_id=…, task_id=…, attempt_id=…)` (`run_with_sandbox_recovery` and `v1_evaluate` take `attempt_id`; `/v1/evaluate` also carries it in the body). The server binds them for the duration of each `/evaluate-response/`, `/ws/evaluate-response`, `/ws/evaluate-instance` and `/v1/evaluate` request as `benchmark_service.attribution.current_request_attribution()` — a `RequestAttribution(run_id, task_id, attempt_id)` whose unknown fields stay `None`. When the service grades through model-library, the same scope opens `model_library.attribution.attribution_scope(..., agent_name="grader")`, so every judge call made while grading is charged to the caller's run, task and attempt as the grader without touching the benchmark's grading code; framework-created grading sandboxes receive the IDs as `RUN_ID`, `TASK_ID` and `ATTEMPT_ID`. The attempt ID is the caller's opaque identity for one execution of the task (Valkyrie issues a new one on every retry), so repeated grading and repeated generation of one task stay distinguishable in the Gateway ledger.
+
 Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` config so one hosted service can use different sandbox providers per request. Eval-only retry uses `/ws/evaluate-response` with `{"task_id": "…", "eval_resume_state": {...}, "sandbox_provider": {...}, "dataset": "…"}`. The provider config is optional because many benchmarks resume without a sandbox. It is request-only and must not be embedded in persisted `eval_resume_state`.
 
 A benchmark can set `RetrieveTaskResponse.resume_sandbox` to an `EvalSandboxSpec`
@@ -677,6 +679,7 @@ result = await client.run_with_sandbox_recovery(
     run_attempt,
     retryable_attempt_errors=(TransientSandboxSetupError,),
     default_max_attempts=2,
+    attempt_id=attempt_id,  # the caller's identity for this execution of the task
 )
 ```
 

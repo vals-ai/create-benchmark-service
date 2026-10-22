@@ -30,6 +30,7 @@ from typing import Any
 from fastapi.encoders import jsonable_encoder
 
 from benchmark_service.base import BenchmarkService
+from benchmark_service.attribution import RequestAttribution, current_request_attribution, request_attribution_scope
 from benchmark_service.context import sandbox_provider_scope, tenant_scope
 from benchmark_service.sandbox import (
     ComposeSource,
@@ -246,6 +247,12 @@ class _GradeRun:
     def task_id(self) -> str:
         return self.submission.task_id
 
+    @property
+    def attribution(self) -> RequestAttribution:
+        request = current_request_attribution()
+        attempt_id = request.attempt_id if request is not None else None
+        return RequestAttribution(run_id=self.run_id, task_id=self.task_id, attempt_id=attempt_id)
+
     def create_request(self, spec: _ResolvedSpec, budget_s: float) -> SandboxCreateRequest:
         return SandboxCreateRequest(
             source=spec.source,
@@ -259,7 +266,9 @@ class _GradeRun:
                 "run-id": self.run_id,
                 **(self.labels or {}),
             },
-            env_vars={},
+            # Model-library settings a grader process inside the sandbox reads, so
+            # its Gateway calls land on the same run, task and attempt.
+            env_vars=self.attribution.as_environment(),
             auto_stop_interval=_auto_stop_minutes(budget_s),
             create_timeout=_GRADING_CREATE_TIMEOUT_S,
             network_block_all=spec.network_block_all,
@@ -491,11 +500,13 @@ async def evaluate_submission(
     evaluator_version: str | None,
     dataset: str | None,
     labels: dict[str, str] | None = None,
+    attempt_id: str | None = None,
 ) -> V1EvalResponse:
     """Evaluate one typed submission per the benchmark's eval mode."""
     # Bound here rather than inside the stream: the stream is finalized through
     # a task, which copies the context, and a token cannot be reset in a copy.
-    with sandbox_provider_scope(provider), tenant_scope(tenant):
+    attribution = RequestAttribution(run_id=run_id, task_id=submission.task_id, attempt_id=attempt_id)
+    with sandbox_provider_scope(provider), tenant_scope(tenant), request_attribution_scope(attribution):
         return await _evaluate_submission(
             service=service,
             run_id=run_id,

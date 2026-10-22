@@ -592,8 +592,12 @@ class BenchmarkServiceClient:
         default_max_attempts: int = 1,
         retry_delay_s: float = 2.0,
         on_retry: Callable[[SandboxRecoveryAttempt, Exception], Awaitable[None] | None] | None = None,
+        attempt_id: str | None = None,
     ) -> _RecoveryResult:
         """Run a task attempt with benchmark-declared sandbox-loss recovery.
+
+        ``attempt_id`` is the caller's identity for this execution of the task; every
+        nested request carries it so the service can attribute grading to it.
 
         ``SandboxRecoveryAttempt.retrieve_task`` lazily loads and caches the
         task payload so successful durable evaluation resumes need no task
@@ -620,7 +624,7 @@ class BenchmarkServiceClient:
         if any(issubclass(error_type, SandboxNotFoundError) for error_type in retryable_attempt_errors):
             raise ValueError("SandboxNotFoundError is controlled only by SandboxRecoveryPolicy")
 
-        with correlation_scope(run_id=run_id, task_id=task_id):
+        with correlation_scope(run_id=run_id, task_id=task_id, attempt_id=attempt_id):
             state = _SandboxRecoveryState(
                 run_id=run_id,
                 task_id=task_id,
@@ -837,21 +841,24 @@ class BenchmarkServiceClient:
         payload_type: V1PayloadType,
         dataset: str | None = None,
         versions: V1Versions | None = None,
+        attempt_id: str | None = None,
     ) -> V1EvalResponse:
         """Evaluate via the /v1/evaluate surface with caller-supplied authentication.
 
         payload_data is either inline text or an uploaded artifact key, as
         selected by payload_type. Transport failures are not retried because
-        grading may already have started.
+        grading may already have started. attempt_id names the caller's
+        execution attempt of the task for cost attribution.
         """
         request = V1EvalRequest(
             run_id=run_id,
             task_id=task_id,
+            attempt_id=attempt_id,
             dataset=dataset,
             payload=V1Payload(type=payload_type, schema=payload_schema, data=payload_data),
             versions=versions or V1Versions(),
         )
-        with correlation_scope(run_id=run_id, task_id=task_id):
+        with correlation_scope(run_id=run_id, task_id=task_id, attempt_id=attempt_id):
             response = await self._http_client.post(
                 f"{self._url}/v1/evaluate",
                 json=request.model_dump(mode="json", by_alias=True, exclude_none=True),

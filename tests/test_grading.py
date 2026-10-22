@@ -273,7 +273,8 @@ async def test_grade_instance_creates_isolated_sandbox_from_task_source_and_dele
     assert create.source == ImageSource(image="python:3.12-slim")
     assert create.resources == Resources(vcpu=2, memory=4, disk=10)
     assert create.network_block_all is True
-    assert create.env_vars == {}
+    # The grader process inside reads these as model-library settings; no attempt was named.
+    assert create.env_vars == {"RUN_ID": "run-1", "TASK_ID": "task-1"}
     # run_id is caller-supplied: the sandbox name must be a sanitized slug plus
     # a unique suffix, and the labels must carry the tracker vocabulary plus
     # lab attribution so leaked sandboxes are findable.
@@ -283,6 +284,13 @@ async def test_grade_instance_creates_isolated_sandbox_from_task_source_and_dele
     assert create.labels["tenant"] == "acme"
     assert create.labels["run-id"] == "run-1"
     assert provider.deleted == ["fake-sandbox"]
+
+
+async def test_grade_instance_hands_the_callers_attempt_to_the_grading_sandbox() -> None:
+    service = await SandboxStub.create()
+    provider = FakeProvider(FakeSandbox())
+    await _grade(service, provider, attempt_id="attempt-7")
+    assert provider.created[0].env_vars == {"RUN_ID": "run-1", "TASK_ID": "task-1", "ATTEMPT_ID": "attempt-7"}
 
 
 class VolumeStub(SandboxStub):
@@ -346,7 +354,7 @@ async def test_grade_instance_applies_benchmark_declared_eval_sandbox_spec() -> 
     assert create.source == ImageSource(image="grader:1.0")
     assert create.resources == Resources(vcpu=8, memory=16, disk=50)
     assert create.network_block_all is False
-    assert create.env_vars == {}
+    assert create.env_vars == {"RUN_ID": "run-1", "TASK_ID": "task-1"}
 
 
 class ComposeGenerationSourceStub(SandboxStub):

@@ -19,6 +19,7 @@ from websockets.exceptions import ConnectionClosed
 from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_required
 from benchmark_service.base import BenchmarkService
+from benchmark_service.attribution import attribution_from_request, request_attribution_scope
 from benchmark_service.context import sandbox_provider_scope, tenant_scope
 from benchmark_service.schemas import (
     DATASET_VERSION_HEADER,
@@ -434,7 +435,8 @@ class BenchmarkServiceApp(FastAPI):
             raise HTTPException(status_code=403, detail=_DOCKER_DISABLED_REASON)
         async with self._dataset_scope(request, request.state.tenant, body.dataset):
             await self.consume_evaluation_request(cast(str, request.state.tenant))
-            return await self.service.evaluate_response(body, dataset=body.dataset)
+            with request_attribution_scope(attribution_from_request(request.headers, task_id=body.task_id)):
+                return await self.service.evaluate_response(body, dataset=body.dataset)
 
     async def _evaluate_response_stream(self, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -455,11 +457,12 @@ class BenchmarkServiceApp(FastAPI):
                 if not await self._admit_websocket_evaluation(websocket, tenant):
                     return
 
-                await _forward_stream(
-                    websocket,
-                    self.service.stream_evaluate_response(request, dataset=request.dataset),
-                    endpoint="evaluate-response",
-                )
+                with request_attribution_scope(attribution_from_request(websocket.headers, task_id=request.task_id)):
+                    await _forward_stream(
+                        websocket,
+                        self.service.stream_evaluate_response(request, dataset=request.dataset),
+                        endpoint="evaluate-response",
+                    )
 
     async def _evaluate_instance(self, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -490,7 +493,8 @@ class BenchmarkServiceApp(FastAPI):
 
                     # Benchmarks that grade in a second sandbox read the provider
                     # from the request scope; see benchmark_service.context.
-                    with sandbox_provider_scope(provider):
+                    attribution = attribution_from_request(websocket.headers, task_id=request.task_id)
+                    with sandbox_provider_scope(provider), request_attribution_scope(attribution):
                         await _forward_stream(
                             websocket,
                             self.service.evaluate_instance(request.task_id, sandbox, dataset=request.dataset),

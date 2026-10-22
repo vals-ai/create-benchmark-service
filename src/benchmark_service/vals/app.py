@@ -453,6 +453,7 @@ class ValsBenchmarkServiceApp(BenchmarkServiceApp):
                                 provider=provider,
                                 evaluator_version=self._service_version,
                                 dataset=body.dataset,
+                                attempt_id=body.attempt_id,
                             )
                         elif self.service.eval_mode == EvalMode.IN_PROCESS_ARTIFACT:
                             if artifact_reference is None:
@@ -528,6 +529,7 @@ class ValsBenchmarkServiceApp(BenchmarkServiceApp):
                 provider=None,
                 evaluator_version=self._service_version,
                 dataset=body.dataset,
+                attempt_id=body.attempt_id,
             )
         return self.project_eval_response(tenant, response)
 

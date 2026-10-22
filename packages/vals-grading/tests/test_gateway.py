@@ -31,7 +31,7 @@ REGISTRY = {
 async def test_real_gateway_client_with_platform_access_blocked(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MODEL_GATEWAY_URL", "https://gateway.test")
     monkeypatch.setenv("MODEL_GATEWAY_API_KEY", "test-key")
-    monkeypatch.setenv("IDENTITY", '{"service":"grading-test"}')
+    monkeypatch.setenv("IDENTITY", '{"service":"grading-test","agent_name":"snap-agent"}')
     requests: list[httpx.Request] = []
 
     def registry_send(self: httpx.Client, request: httpx.Request, **kwargs: Any) -> httpx.Response:
@@ -46,7 +46,8 @@ async def test_real_gateway_client_with_platform_access_blocked(monkeypatch: pyt
         assert request.headers["authorization"] == "Bearer test-key"
         body = json.loads(request.content)
         assert body["model"] == MODEL
-        assert body["identity"] == {"service": "grading-test"}
+        # The service identity is kept; the role is always the grader's, never the agent's.
+        assert body["identity"] == {"service": "grading-test", "agent_name": "grader"}
         assert body["config"]["temperature"] == 0
         assert body["config"]["top_p"] == 1
         assert body["config"]["max_tokens"] == 10000

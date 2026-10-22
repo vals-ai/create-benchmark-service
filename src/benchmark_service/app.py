@@ -19,7 +19,7 @@ from websockets.exceptions import ConnectionClosed
 from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_required
 from benchmark_service.base import BenchmarkService
-from benchmark_service.context import sandbox_provider_scope
+from benchmark_service.context import sandbox_provider_scope, tenant_scope
 from benchmark_service.schemas import (
     DATASET_VERSION_HEADER,
     DatasetVersion,
@@ -29,6 +29,7 @@ from benchmark_service.schemas import (
     FinalScoreRequest,
     FinalScoreResponse,
     HealthCheckResponse,
+    ListDatasetsResponse,
     RetrieveTaskResponse,
     ResolveDatasetRequest,
     ResolveDatasetResponse,
@@ -195,6 +196,7 @@ class BenchmarkServiceApp(FastAPI):
         self.add_exception_handler(Exception, self._exception_handler)
         self.add_api_route("/health", self._health_check, methods=["GET"])
         self.add_api_route("/version", self._version, methods=["GET"])
+        self.add_api_route("/v1/datasets", self._list_datasets, methods=["GET"], response_model=ListDatasetsResponse)
         self.add_api_route("/resolve-dataset", self._resolve_dataset, methods=["POST"])
         self.add_api_route("/verify-task-ids", self._verify_task_ids, methods=["GET"])
         self.add_api_route("/retrieve-task/", self._retrieve_task, methods=["GET"])
@@ -229,6 +231,12 @@ class BenchmarkServiceApp(FastAPI):
             dataset_version=self.service.get_dataset_version(dataset),
             dataset_version_selection=self.service.supports_dataset_version_selection(dataset or "default"),
             eval_mode=self.service.eval_mode,
+        )
+
+    async def _list_datasets(self, request: Request) -> ListDatasetsResponse:
+        names = sorted(set(await self.service.list_datasets()))
+        return ListDatasetsResponse(
+            datasets=[name for name in names if await self.service.check_dataset_access(request.state.tenant, name)]
         )
 
     @asynccontextmanager
@@ -269,7 +277,8 @@ class BenchmarkServiceApp(FastAPI):
                     else:
                         connection.state.dataset_version = resolved
                 entered = True
-                yield
+                with tenant_scope(tenant):
+                    yield
         except HTTPException as exc:
             if isinstance(connection, WebSocket) and exc.status_code == 403:
                 await connection.close(code=1008, reason="Dataset not allowed")
@@ -367,10 +376,30 @@ class BenchmarkServiceApp(FastAPI):
         async with self._dataset_scope(request, request.state.tenant, dataset):
             return await self.service.retrieve_task(task_id, skip_validation, dataset=dataset)
 
+    @asynccontextmanager
+    async def _stream_session(self, websocket: WebSocket, endpoint: str) -> AsyncGenerator[None, None]:
+        try:
+            yield
+        except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
+            logger.warning("%s websocket disconnected", endpoint)
+        except _DatasetVersionSelectionError as exc:
+            await _send_dataset_version_error(websocket, exc)
+        except Exception as exc:
+            if self._sentry is not None:
+                self._sentry.capture_exception(exc)
+            error_msg = f"{str(exc)}\n{traceback.format_exc()}"
+            logger.error(f"WebSocket error: {error_msg}")
+            error_chunk = StreamErrorChunk(type="error", data=error_msg)
+            if not await send_json_if_connected(websocket, error_chunk.model_dump()):
+                logger.warning("%s websocket disconnected before error chunk could be sent", endpoint)
+        finally:
+            self.clear_request_context()
+            with suppress(RuntimeError):
+                await websocket.close()
+
     async def _setup_task(self, websocket: WebSocket) -> None:
         await websocket.accept()
-
-        try:
+        async with self._stream_session(websocket, "setup-task"):
             tenant = await self._authorize_websocket(websocket)
             if tenant is None:
                 return
@@ -398,23 +427,6 @@ class BenchmarkServiceApp(FastAPI):
                         endpoint="setup-task",
                     )
 
-        except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
-            logger.warning("setup-task websocket disconnected")
-        except _DatasetVersionSelectionError as exc:
-            await _send_dataset_version_error(websocket, exc)
-        except Exception as e:
-            if self._sentry is not None:
-                self._sentry.capture_exception(e)
-            error_msg = f"{str(e)}\n{traceback.format_exc()}"
-            logger.error(f"WebSocket error: {error_msg}")
-            error_chunk = StreamErrorChunk(type="error", data=error_msg)
-            if not await send_json_if_connected(websocket, error_chunk.model_dump()):
-                logger.warning("setup-task websocket disconnected before error chunk could be sent")
-        finally:
-            self.clear_request_context()
-            with suppress(RuntimeError):
-                await websocket.close()
-
     async def _evaluate_response(self, request: Request, body: EvaluateResponseRequest) -> Any:
         if self._sentry is not None:
             self._sentry.bind_request_context(request.headers, task_id=body.task_id, dataset=body.dataset)
@@ -426,8 +438,7 @@ class BenchmarkServiceApp(FastAPI):
 
     async def _evaluate_response_stream(self, websocket: WebSocket) -> None:
         await websocket.accept()
-
-        try:
+        async with self._stream_session(websocket, "evaluate-response"):
             tenant = await self._authorize_websocket(websocket)
             if tenant is None:
                 return
@@ -450,27 +461,9 @@ class BenchmarkServiceApp(FastAPI):
                     endpoint="evaluate-response",
                 )
 
-        except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
-            logger.warning("evaluate-response websocket disconnected")
-        except _DatasetVersionSelectionError as exc:
-            await _send_dataset_version_error(websocket, exc)
-        except Exception as e:
-            if self._sentry is not None:
-                self._sentry.capture_exception(e)
-            error_msg = f"{str(e)}\n{traceback.format_exc()}"
-            logger.error(f"WebSocket error: {error_msg}")
-            error_chunk = StreamErrorChunk(type="error", data=error_msg)
-            if not await send_json_if_connected(websocket, error_chunk.model_dump()):
-                logger.warning("evaluate-response websocket disconnected before error chunk could be sent")
-        finally:
-            self.clear_request_context()
-            with suppress(RuntimeError):
-                await websocket.close()
-
     async def _evaluate_instance(self, websocket: WebSocket) -> None:
         await websocket.accept()
-
-        try:
+        async with self._stream_session(websocket, "evaluate-instance"):
             tenant = await self._authorize_websocket(websocket)
             if tenant is None:
                 return
@@ -503,23 +496,6 @@ class BenchmarkServiceApp(FastAPI):
                             self.service.evaluate_instance(request.task_id, sandbox, dataset=request.dataset),
                             endpoint="evaluate-instance",
                         )
-
-        except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
-            logger.warning("evaluate-instance websocket disconnected")
-        except _DatasetVersionSelectionError as exc:
-            await _send_dataset_version_error(websocket, exc)
-        except Exception as e:
-            if self._sentry is not None:
-                self._sentry.capture_exception(e)
-            error_msg = f"{str(e)}\n{traceback.format_exc()}"
-            logger.error(f"WebSocket error: {error_msg}")
-            error_chunk = StreamErrorChunk(type="error", data=error_msg)
-            if not await send_json_if_connected(websocket, error_chunk.model_dump()):
-                logger.warning("evaluate-instance websocket disconnected before error chunk could be sent")
-        finally:
-            self.clear_request_context()
-            with suppress(RuntimeError):
-                await websocket.close()
 
     async def _final_score(self, request: Request, body: FinalScoreRequest) -> FinalScoreResponse:
         if self._sentry is not None:

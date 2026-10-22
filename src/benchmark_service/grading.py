@@ -30,7 +30,7 @@ from typing import Any
 from fastapi.encoders import jsonable_encoder
 
 from benchmark_service.base import BenchmarkService
-from benchmark_service.context import sandbox_provider_scope
+from benchmark_service.context import sandbox_provider_scope, tenant_scope
 from benchmark_service.sandbox import (
     ComposeSource,
     Resources,
@@ -163,10 +163,9 @@ def _auto_stop_minutes(budget_s: float) -> int:
 
 
 def _sandbox_name(run_id: str, task_id: str) -> str:
-    """Unique per grading request: the create-conflict recovery adopts by name,
-    so a reused name could hand this request another tenant's live sandbox or
-    a dirty one that survived a failed delete. run_id/task_id appear only as a
-    sanitized slug for operators; attribution lives in the labels."""
+    """Unique logical grading name for operator attribution; Modal allocates its
+    physical sandbox name independently. run_id/task_id appear only as a
+    sanitized slug; attribution lives in the labels."""
     slug = re.sub(r"[^A-Za-z0-9-]+", "-", f"{run_id}-{task_id}").strip("-").lower()[:40]
     suffix = uuid.uuid4().hex[:10]
     return f"grade-{slug}-{suffix}" if slug else f"grade-{suffix}"
@@ -496,7 +495,7 @@ async def evaluate_submission(
     """Evaluate one typed submission per the benchmark's eval mode."""
     # Bound here rather than inside the stream: the stream is finalized through
     # a task, which copies the context, and a token cannot be reset in a copy.
-    with sandbox_provider_scope(provider):
+    with sandbox_provider_scope(provider), tenant_scope(tenant):
         return await _evaluate_submission(
             service=service,
             run_id=run_id,

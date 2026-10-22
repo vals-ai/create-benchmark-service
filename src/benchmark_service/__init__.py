@@ -3,7 +3,7 @@
 from benchmark_service._version import __version__
 from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.base import BenchmarkService
-from benchmark_service.context import current_sandbox_provider, sandbox_provider_scope
+from benchmark_service.context import current_sandbox_provider, current_tenant, sandbox_provider_scope, tenant_scope
 from benchmark_service.client import (
     BenchmarkServiceClient,
     BenchmarkServiceError,
@@ -16,10 +16,15 @@ from benchmark_service.client import (
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.sandbox import (
     ComposeSource,
+    ControlledWorkload,
+    ControlledWorkloadResult,
+    ControlledWorkloadUnsupportedError,
     ComposeSandbox,
     DaytonaProviderConfig,
     DockerProviderConfig,
     ExecResult,
+    GenerationContainment,
+    LINUX_CGROUP_V2_V1,
     ImageSource,
     ModalProviderConfig,
     ResourceCapacity,
@@ -35,6 +40,7 @@ from benchmark_service.sandbox import (
     SandboxProvider,
     SandboxProviderConfig,
     SandboxQuery,
+    SandboxReservationDemand,
     SandboxSource,
     SnapshotSource,
     TargetedSnapshotSource,
@@ -44,7 +50,10 @@ from benchmark_service.sandbox import (
 from benchmark_service.schemas import (
     DATASET_VERSION_HEADER,
     ArtifactGradingSubmission,
+    CreditedGeneration,
     DatasetVersion,
+    Episode,
+    ListDatasetsResponse,
     ResolveDatasetRequest,
     ResolveDatasetResponse,
     EvalMode,
@@ -54,15 +63,23 @@ from benchmark_service.schemas import (
     SubmissionArtifactReference,
     TextGradingSubmission,
 )
+from benchmark_service.valkyrie_stage import Agents, Exhausted, SlotResult, StageReporter, valkyrie_stage_source
 
 __all__ = [
     "DATASET_VERSION_HEADER",
+    "CreditedGeneration",
+    "Episode",
+    "Agents",
+    "Exhausted",
+    "SlotResult",
     "DatasetVersion",
+    "ListDatasetsResponse",
     "ResolveDatasetRequest",
     "ResolveDatasetResponse",
     "BenchmarkServiceApp",
     "BenchmarkService",
     "current_sandbox_provider",
+    "current_tenant",
     "BenchmarkServiceUnauthenticatedError",
     "BenchmarkServiceClient",
     "BenchmarkServiceError",
@@ -72,12 +89,17 @@ __all__ = [
     "SandboxRecoveryAttempt",
     "ArtifactGradingSubmission",
     "ComposeSource",
+    "ControlledWorkload",
+    "ControlledWorkloadResult",
+    "ControlledWorkloadUnsupportedError",
     "ComposeSandbox",
     "DaytonaProviderConfig",
     "DockerProviderConfig",
     "EvalMode",
     "GradingSubmission",
     "ExecResult",
+    "GenerationContainment",
+    "LINUX_CGROUP_V2_V1",
     "ImageSource",
     "InflightMiddleware",
     "ModalProviderConfig",
@@ -95,10 +117,14 @@ __all__ = [
     "SandboxProvider",
     "SandboxProviderConfig",
     "sandbox_provider_scope",
+    "tenant_scope",
     "SandboxQuery",
     "SandboxRecoveryPolicy",
+    "SandboxReservationDemand",
     "SandboxSource",
     "SnapshotSource",
+    "StageReporter",
+    "valkyrie_stage_source",
     "SubmissionArtifactReference",
     "TargetedSnapshotSource",
     "TextGradingSubmission",

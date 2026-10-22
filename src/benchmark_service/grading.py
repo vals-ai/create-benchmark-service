@@ -29,7 +29,7 @@ from typing import Any
 from fastapi.encoders import jsonable_encoder
 
 from benchmark_service.base import BenchmarkService
-from benchmark_service.attribution import RequestAttribution, request_attribution_scope
+from benchmark_service.grading_credentials import RequestAttribution, current_grading_credentials, grading_credentials
 from benchmark_service.context import grading_sandbox_context, sandbox_provider_scope, tenant_scope
 from benchmark_service.grading_spec import (
     TEARDOWN_TIMEOUT_S,
@@ -204,7 +204,7 @@ class _GradeRun:
                 "run-id": self.run_id,
                 **(self.labels or {}),
             },
-            env_vars=RequestAttribution(self.run_id, self.task_id, self.attempt_id).as_environment(),
+            env_vars=credentials.as_environment() if (credentials := current_grading_credentials()) else {},
             auto_stop_interval=auto_stop_minutes(budget_s),
             create_timeout=_GRADING_CREATE_TIMEOUT_S,
             network_block_all=spec.network_block_all,
@@ -445,18 +445,19 @@ async def evaluate_submission(
     # Bound here rather than inside the stream: the stream is finalized through
     # a task, which copies the context, and a token cannot be reset in a copy.
     attribution = RequestAttribution(run_id=run_id, task_id=submission.task_id, attempt_id=attempt_id)
-    with sandbox_provider_scope(provider), tenant_scope(tenant), request_attribution_scope(attribution):
-        return await _evaluate_submission(
-            service=service,
-            run_id=run_id,
-            tenant=tenant,
-            submission=submission,
-            provider=provider,
-            evaluator_version=evaluator_version,
-            dataset=dataset,
-            labels=labels,
-            attempt_id=attempt_id,
-        )
+    async with grading_credentials(attribution):
+        with sandbox_provider_scope(provider), tenant_scope(tenant):
+            return await _evaluate_submission(
+                service=service,
+                run_id=run_id,
+                tenant=tenant,
+                submission=submission,
+                provider=provider,
+                evaluator_version=evaluator_version,
+                dataset=dataset,
+                labels=labels,
+                attempt_id=attempt_id,
+            )
 
 
 async def _evaluate_submission(

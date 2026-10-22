@@ -276,7 +276,7 @@ async def test_grade_instance_creates_isolated_sandbox_from_task_source_and_dele
     assert create.source == ImageSource(image="python:3.12-slim")
     assert create.resources == Resources(vcpu=2, memory=4, disk=10)
     assert create.network_block_all is True
-    assert create.env_vars == {"RUN_ID": "run-1", "TASK_ID": "task-1"}
+    assert create.env_vars == {}
     # run_id is caller-supplied: the sandbox name must be a sanitized slug plus
     # a unique suffix, and the labels must carry the tracker vocabulary plus
     # lab attribution so leaked sandboxes are findable.
@@ -288,11 +288,15 @@ async def test_grade_instance_creates_isolated_sandbox_from_task_source_and_dele
     assert provider.deleted == ["fake-sandbox"]
 
 
-async def test_grade_instance_hands_the_callers_attempt_to_the_grading_sandbox() -> None:
+async def test_grade_instance_hands_the_evaluation_gateway_credentials_to_the_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MODEL_GATEWAY_URL", "https://gateway.test")
+    monkeypatch.setenv("MODEL_GATEWAY_API_KEY", "static-key")
     service = await SandboxStub.create()
     provider = FakeProvider(FakeSandbox())
     await _grade(service, provider, attempt_id="attempt-7")
-    assert provider.created[0].env_vars == {"RUN_ID": "run-1", "TASK_ID": "task-1", "ATTEMPT_ID": "attempt-7"}
+    assert provider.created[0].env_vars == {"MODEL_GATEWAY_URL": "https://gateway.test", "MODEL_GATEWAY_API_KEY": "static-key"}
 
 
 class VolumeStub(SandboxStub):
@@ -356,7 +360,7 @@ async def test_grade_instance_applies_benchmark_declared_eval_sandbox_spec() -> 
     assert create.source == ImageSource(image="grader:1.0")
     assert create.resources == Resources(vcpu=8, memory=16, disk=50)
     assert create.network_block_all is False
-    assert create.env_vars == {"RUN_ID": "run-1", "TASK_ID": "task-1"}
+    assert create.env_vars == {}
 
 
 class ComposeGenerationSourceStub(SandboxStub):

@@ -113,7 +113,7 @@ async def test_docker_controlled_natural_status_stream_and_tail(docker_sandbox: 
     assert tail.result.exit_code == 0
     assert streamed == expected
     assert 0 < len(tail.result.output) < len(expected)
-    assert tail.result.output == expected[-len(tail.result.output) :]
+    assert tail.result.output == expected[-len(tail.result.output):]
     assert (await docker_sandbox.exec("printf collection")).output == "collection"
 
 

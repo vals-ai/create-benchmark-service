@@ -144,8 +144,9 @@ async def test_transport_and_decode_failures_are_not_cached() -> None:
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "failure",
-    [_response({}, status_code=status) for status in (408, 429, 500, 502, 503, 504)]
-    + [httpx.ConnectError("unavailable"), httpx.ReadTimeout("timed out"), httpx.RemoteProtocolError("closed")],
+    [
+        _response({}, status_code=status) for status in (408, 429, 500, 502, 503, 504)
+    ] + [httpx.ConnectError("unavailable"), httpx.ReadTimeout("timed out"), httpx.RemoteProtocolError("closed")],
 )
 async def test_transient_failure_is_retried_and_success_cached(failure: httpx.Response | Exception) -> None:
     transport, requests = _transport(

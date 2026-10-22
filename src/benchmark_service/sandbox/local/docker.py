@@ -28,11 +28,7 @@ from aiohttp import ClientError
 from pydantic import AliasPath, BaseModel, Field
 
 from benchmark_service.sandbox._process_group import (
-    cleanup_command,
-    episode_owner_command,
-    owner_command,
-    probe_command,
-    stop_command,
+    cleanup_command, episode_owner_command, owner_command, probe_command, stop_command,
 )
 from benchmark_service.sandbox.types import (
     ControlledWorkload,
@@ -130,10 +126,12 @@ class DockerSandbox(Sandbox):
             raise SandboxError(f"Docker container does not support process groups: {result.output}")
 
     def _process_group_workload(
-        self, command: str, episode_script: str | None, *, cwd: str | None, env_vars: Mapping[str, str] | None
+        self, command: str, episode_script: str | None, *, cwd: str | None,
+        env_vars: Mapping[str, str] | None
     ) -> ControlledWorkload:
         return _DockerControlledWorkload(
-            self._container, self._raise_if_finished, command, cwd, validate_command_env(env_vars), episode_script
+            self._container, self._raise_if_finished, command, cwd,
+            validate_command_env(env_vars), episode_script
         )
 
     async def _raise_if_finished(self) -> None:
@@ -276,6 +274,7 @@ class DockerSandbox(Sandbox):
     def stream_download(self, remote_path: str) -> AsyncGenerator[bytes]:
         path = PurePosixPath(remote_path)
         return self._command_bytes(f"cat -- {shlex.quote(str(path))}")
+
 
 
 class _DockerControlledWorkload(ControlledWorkload):

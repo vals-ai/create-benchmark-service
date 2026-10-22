@@ -6,11 +6,7 @@ import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping
 
 from benchmark_service.sandbox._process_group import (
-    cleanup_command,
-    episode_owner_command,
-    owner_command,
-    probe_command,
-    stop_command,
+    cleanup_command, episode_owner_command, owner_command, probe_command, stop_command,
 )
 from benchmark_service.sandbox.types import (
     ComposeSource,
@@ -43,6 +39,8 @@ _OUTER_SHELL_ENV = (
 _COMPOSE_EXEC_ENV_ARGS = (
     "$(env | sed -En '/^(" + "|".join(_OUTER_SHELL_ENV) + ")=/d; s/^([A-Za-z_][A-Za-z0-9_]*)=.*/-e \\1/p')"
 )
+
+
 
 
 class ComposeSandbox(Sandbox):
@@ -81,7 +79,8 @@ class ComposeSandbox(Sandbox):
             raise SandboxError(f"Compose service does not support process groups: {result.output}")
 
     def _process_group_workload(
-        self, command: str, episode_script: str | None, *, cwd: str | None, env_vars: Mapping[str, str] | None
+        self, command: str, episode_script: str | None, *, cwd: str | None,
+        env_vars: Mapping[str, str] | None
     ) -> ControlledWorkload:
         return _ComposeControlledWorkload(self, command, cwd, validate_command_env(env_vars), episode_script)
 
@@ -139,8 +138,8 @@ class ComposeSandbox(Sandbox):
             result = await self._outer.exec(
                 (
                     f"{self._container_lookup()}; "
-                    f'docker exec "$container_id" sh -lc {make_parent}; '
-                    f'cat {shlex.quote(temp)} | docker exec -i "$container_id" sh -lc {write_file}'
+                    f"docker exec \"$container_id\" sh -lc {make_parent}; "
+                    f"cat {shlex.quote(temp)} | docker exec -i \"$container_id\" sh -lc {write_file}"
                 ),
                 timeout=60,
             )
@@ -154,7 +153,10 @@ class ComposeSandbox(Sandbox):
         try:
             read_file = shlex.quote(f"cat {shlex.quote(remote_path)}")
             result = await self._outer.exec(
-                (f'{self._container_lookup()}; docker exec "$container_id" sh -lc {read_file} > {shlex.quote(temp)}'),
+                (
+                    f"{self._container_lookup()}; "
+                    f"docker exec \"$container_id\" sh -lc {read_file} > {shlex.quote(temp)}"
+                ),
                 timeout=60,
             )
             if result.exit_code != 0:
@@ -168,7 +170,10 @@ class ComposeSandbox(Sandbox):
         try:
             read_file = shlex.quote(f"cat {shlex.quote(remote_path)}")
             result = await self._outer.exec(
-                (f'{self._container_lookup()}; docker exec "$container_id" sh -lc {read_file} > {shlex.quote(temp)}'),
+                (
+                    f"{self._container_lookup()}; "
+                    f"docker exec \"$container_id\" sh -lc {read_file} > {shlex.quote(temp)}"
+                ),
                 timeout=60,
             )
             if result.exit_code != 0:

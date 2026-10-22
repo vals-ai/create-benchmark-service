@@ -86,10 +86,7 @@ class VersionedBenchmark(StubBenchmark, ValsBenchmarkService):
             if self.concurrent_arrivals == 2:
                 self.concurrent_ready.set()
             await asyncio.wait_for(self.concurrent_ready.wait(), timeout=5)
-        if request.eval_resume_state and request.eval_resume_state.get("terminal_type") in {
-            "error",
-            "error_then_result",
-        }:
+        if request.eval_resume_state and request.eval_resume_state.get("terminal_type") in {"error", "error_then_result"}:
             yield StreamErrorChunk(type="error", data="Evaluation failed")
         if not request.eval_resume_state or request.eval_resume_state.get("terminal_type") != "error":
             yield StreamResultChunk(
@@ -293,7 +290,9 @@ def test_legacy_service_requires_opt_in(monkeypatch: pytest.MonkeyPatch) -> None
         with client.websocket_connect("/ws/evaluate-response") as ws:
             ws.send_json({"task_id": "task-1", "response": "2"})
             assert ws.receive_json() == {"type": "result", "data": {"resolved": True}}
-        with client.websocket_connect("/ws/evaluate-response", headers={DATASET_VERSION_HEADER: "v1.0"}) as ws:
+        with client.websocket_connect(
+            "/ws/evaluate-response", headers={DATASET_VERSION_HEADER: "v1.0"}
+        ) as ws:
             ws.send_json({"task_id": "task-1", "response": "2"})
             assert ws.receive_json() == {
                 "type": "error",

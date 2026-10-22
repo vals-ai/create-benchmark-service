@@ -22,11 +22,7 @@ from pydantic import BaseModel
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
 from benchmark_service.sandbox._process_group import (
-    cleanup_command,
-    episode_owner_command,
-    owner_command,
-    probe_command,
-    stop_command,
+    cleanup_command, episode_owner_command, owner_command, probe_command, stop_command,
 )
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
@@ -188,7 +184,8 @@ class ModalSandbox(Sandbox):
             raise SandboxError(f"Modal sandbox does not support process groups: {result.output}")
 
     def _process_group_workload(
-        self, command: str, episode_script: str | None, *, cwd: str | None, env_vars: Mapping[str, str] | None
+        self, command: str, episode_script: str | None, *, cwd: str | None,
+        env_vars: Mapping[str, str] | None
     ) -> ControlledWorkload:
         return _ModalControlledWorkload(
             self, command, cwd, validate_command_env(env_vars), self._start_controlled_process, episode_script
@@ -449,7 +446,6 @@ for domain in {domains_to_resolve!r}:
         # allowlist provides the same access without that unsupported transition.
         await self._set_outbound_network_policy(list(_ALLOW_ALL_CIDRS), list(_ALLOW_ALL_DOMAINS))
 
-
 class _ModalControlledWorkload(ControlledWorkload):
     def __init__(
         self,
@@ -457,7 +453,9 @@ class _ModalControlledWorkload(ControlledWorkload):
         command: str,
         cwd: str | None,
         env_vars: dict[str, str],
-        start_process: Callable[[str, dict[str, str]], Awaitable[tuple[AsyncIterable[str], Coroutine[Any, Any, int]]]],
+        start_process: Callable[
+            [str, dict[str, str]], Awaitable[tuple[AsyncIterable[str], Coroutine[Any, Any, int]]]
+        ],
         episode_script: str | None,
     ) -> None:
         self._sandbox = sandbox
@@ -581,6 +579,9 @@ class _ModalControlledWorkload(ControlledWorkload):
         removed = await self._sandbox.exec(cleanup_command(self._marker))
         if removed.exit_code != 0:
             raise SandboxError(f"Modal process-group control cleanup failed: {removed.output}")
+
+
+
 
 
 class ModalSandboxProvider(SandboxProvider):

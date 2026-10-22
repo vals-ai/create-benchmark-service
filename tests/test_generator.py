@@ -104,7 +104,9 @@ def test_template_rendering(
         assert ".git/" in dockerignore
 
 
-def test_generated_pyproject_pins_to_tag_for_clean_version(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_generated_pyproject_pins_to_tag_for_clean_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     monkeypatch.setattr(benchmark_service, "__version__", "1.0.0")
     output_dir = tmp_path / "demo-benchmark-service"
     generate_project(benchmark_name="demo", output_dir=output_dir)

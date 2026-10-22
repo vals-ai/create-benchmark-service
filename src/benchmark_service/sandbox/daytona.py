@@ -576,6 +576,7 @@ class DaytonaSandbox(Sandbox):
         }
         return {key: str(value) for key, value in metadata.items() if value is not None}
 
+
     @property
     def generation_containment(self) -> GenerationContainment:
         return LINUX_CGROUP_V2_V1
@@ -585,7 +586,7 @@ class DaytonaSandbox(Sandbox):
         quoted = shlex.quote(group)
         result = await self._control_exec(
             f'd={quoted}; mkdir "$d" || exit 1; '
-            'sh -c \'echo $$ > "$1/cgroup.procs"\' sh "$d"; admitted=$?; '
+            "sh -c 'echo $$ > \"$1/cgroup.procs\"' sh \"$d\"; admitted=$?; "
             'echo 1 > "$d/cgroup.kill" || exit 1; '
             "grep -qx 'populated 0' \"$d/cgroup.events\" || exit 1; "
             'rmdir "$d" || exit 1; test "$admitted" -eq 0'
@@ -794,7 +795,9 @@ class DaytonaSandbox(Sandbox):
             output.put_nowait(text)
 
         try:
-            handle = await self._open_pty_session(session_id, on_data, pty_envs, create_state)
+            handle = await self._open_pty_session(
+                session_id, on_data, pty_envs, create_state
+            )
 
             await _bounded(
                 "handle.send_input",
@@ -958,7 +961,9 @@ class DaytonaSandbox(Sandbox):
             return handle
 
         session_info = await self._get_pty_create_session_info(session_id)
-        expected_environment_matches = all(session_info.envs.get(key) == value for key, value in envs.items())
+        expected_environment_matches = all(
+            session_info.envs.get(key) == value for key, value in envs.items()
+        )
         if (
             session_info.id != session_id
             or session_info.rows != _PTY_ROWS
@@ -1148,7 +1153,7 @@ async def _watch_session_command(
     seen_stderr = 0
 
     def consume(text: str, seen: int, forwarded: int) -> tuple[int, int]:
-        forward(text[forwarded - seen :])
+        forward(text[forwarded - seen:])
         return seen + len(text), max(forwarded, seen + len(text))
 
     async def on_stdout(text: str) -> None:
@@ -1263,9 +1268,9 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         payload = f"env {assignments} sh -c {shlex.quote(command)}"
         child = f"echo $$ > {shlex.quote(self._group)}/cgroup.procs || exit 1; {payload}"
         self._command = (
-            f'exec </dev/null; sh -c {shlex.quote(child)} & child=$!; wait "$child"; code=$?; '
+            f"exec </dev/null; sh -c {shlex.quote(child)} & child=$!; wait \"$child\"; code=$?; "
             f": > {shlex.quote(self._complete)} || exit 1; "
-            f'while ! test -e {shlex.quote(self._release)}; do sleep 0.05; done; (exit "$code")'
+            f"while ! test -e {shlex.quote(self._release)}; do sleep 0.05; done; (exit \"$code\")"
         )
         self._session_requested = False
         self._output: asyncio.Queue[str] = asyncio.Queue()
@@ -1425,7 +1430,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
             'while :; do echo 1 > "$d/cgroup.kill" || exit 1; '
             "if grep -qx 'populated 0' \"$d/cgroup.events\" && "
             'find "$d" -depth -type d -exec rmdir {} \\; && test ! -e "$d"; then '
-            "exit 0; fi; sleep 0.05; done"
+            'exit 0; fi; sleep 0.05; done'
         )
         if result.exit_code != 0:
             raise SandboxError(f"Daytona controlled cgroup removal failed: {self._group}: {result.output}")
@@ -1433,8 +1438,13 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         return self._group_stopped_at
 
     async def _ensure_closed(self) -> float:
-        if self._close_task is None or (
-            self._close_task.done() and not self._close_task.cancelled() and self._close_task.exception() is not None
+        if (
+            self._close_task is None
+            or (
+                self._close_task.done()
+                and not self._close_task.cancelled()
+                and self._close_task.exception() is not None
+            )
         ):
             self._close_task = asyncio.create_task(self._close())
         return await self._close_task
@@ -1521,14 +1531,8 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         forwarded_stderr = 0
         while not self._closed.is_set():
             exit_code, forwarded_stdout, forwarded_stderr = await _watch_session_command(
-                self._sandbox._daytona,
-                self._sandbox.id,
-                self._session_id,
-                command_id,  # pyright: ignore[reportPrivateUsage]
-                forwarded_stdout,
-                forwarded_stderr,
-                self._append_output,
-                self._closed,
+                self._sandbox._daytona, self._sandbox.id, self._session_id, command_id,  # pyright: ignore[reportPrivateUsage]
+                forwarded_stdout, forwarded_stderr, self._append_output, self._closed,
             )
             if exit_code is not None:
                 return ExecResult(exit_code=exit_code, output=b"".join(self._stdout).decode("utf-8"))

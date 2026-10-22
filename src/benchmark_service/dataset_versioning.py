@@ -32,6 +32,9 @@ def load_dataset_versions(versions_file: Path) -> dict[str, DatasetVersionEntry]
             f"{versions_file} must be a YAML mapping of dataset name to entry, got {type(data).__name__}"
         )
     try:
-        return {name: DatasetVersionEntry.model_validate(entry) for name, entry in cast("dict[str, Any]", data).items()}
+        return {
+            name: DatasetVersionEntry.model_validate(entry)
+            for name, entry in cast("dict[str, Any]", data).items()
+        }
     except ValidationError as exc:
         raise DatasetVersionError(f"{versions_file}: invalid dataset version entry — {exc}") from exc

@@ -101,7 +101,9 @@ async def _serve_loopback(app: FastAPI) -> AsyncIterator[str]:
     server_socket.listen()
     server_socket.setblocking(False)
     port = server_socket.getsockname()[1]
-    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="critical", access_log=False))
+    server = uvicorn.Server(
+        uvicorn.Config(app, host="127.0.0.1", port=port, log_level="critical", access_log=False)
+    )
     server_task = asyncio.create_task(server.serve(sockets=[server_socket]))
 
     try:
@@ -149,8 +151,12 @@ def configured_sentry(monkeypatch: pytest.MonkeyPatch) -> Iterator[_CaptureTrans
     real_init(dsn=None, disabled_integrations=[StdlibIntegration])
 
 
+
+
 def _composite_propagator() -> CompositePropagator:
-    return CompositePropagator([TraceContextTextMapPropagator(), W3CBaggagePropagator(), SentryPropagator()])
+    return CompositePropagator(
+        [TraceContextTextMapPropagator(), W3CBaggagePropagator(), SentryPropagator()]
+    )
 
 
 @pytest.fixture
@@ -181,6 +187,10 @@ def otel_tracer(monkeypatch: pytest.MonkeyPatch) -> Iterator[tuple[trace.Tracer,
             sentry_sdk.get_client().close()
         finally:
             real_init(dsn=None, disabled_integrations=[StdlibIntegration])
+
+
+
+
 
 
 @pytest.mark.parametrize(
@@ -395,7 +405,6 @@ async def test_concurrent_correlation_scopes_restore_their_caller() -> None:
     assert RUN_ID_HEADER not in uncorrelated
     assert TASK_ID_HEADER not in uncorrelated
 
-
 @pytest.mark.parametrize("error_type", [RuntimeError, _FailedStatusError])
 def test_http_exceptions_are_captured_once_with_request_identity(
     monkeypatch: pytest.MonkeyPatch,
@@ -544,7 +553,6 @@ async def test_http_client_transport_span_injects_trace_and_dynamic_identity(
     async def health(request: Request) -> dict[str, str]:
         observed_headers.update(request.headers)
         return {"status": "ok"}
-
     app.add_api_route("/health", health, methods=["GET"])
 
     instrumentor = HTTPXClientInstrumentor()
@@ -604,7 +612,6 @@ async def test_websocket_handshake_uses_its_client_span_and_dynamic_identity(
             }
         )
         await websocket.close()
-
     app.add_api_websocket_route("/ws/evaluate-response", evaluate_response)
 
     async with _serve_loopback(app) as url:

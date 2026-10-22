@@ -99,10 +99,7 @@ def test_upload_url_returns_namespaced_key_and_signed_url(descope_client: TestCl
     assert resp.status_code == 200
     body = resp.json()
     assert body["key"] == "submission-artifacts/acme/default/run-1/task-1/submission.xlsx"
-    assert (
-        body["url"]
-        == "https://signed.example/submission-artifacts/acme/default/run-1/task-1/submission.xlsx?expires=3600"
-    )
+    assert body["url"] == "https://signed.example/submission-artifacts/acme/default/run-1/task-1/submission.xlsx?expires=3600"
     assert body["expires_in"] == submission_artifacts.DEFAULT_UPLOAD_EXPIRY_S
 
 

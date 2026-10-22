@@ -33,7 +33,10 @@ class DatasetVersionBenchmark(StubBenchmark):
 
 class TaskListingBenchmark(DatasetVersionBenchmark):
     async def list_tasks(self, dataset: str | None = None) -> list[V1Task]:
-        return [V1Task(id=task_id, question=task["problem"]) for task_id, task in self.get_dataset(dataset).items()]
+        return [
+            V1Task(id=task_id, question=task["problem"])
+            for task_id, task in self.get_dataset(dataset).items()
+        ]
 
 
 class CapturingScoreBenchmark(StubBenchmark):
@@ -135,15 +138,13 @@ def test_vals_app_exposes_provider_routes_alongside_standard_routes(descope_clie
 
 
 def test_eval_request_accepts_text_payload() -> None:
-    req = V1EvalRequest.model_validate(
-        {
-            "run_id": "external-run-123",
-            "task_id": "01-011",
-            "dataset": "validation",
-            "payload": {"type": "text", "schema": "fabv2.text.v1", "data": "42"},
-            "versions": {"runner": "0.0.10-a1b2c3d"},
-        }
-    )
+    req = V1EvalRequest.model_validate({
+        "run_id": "external-run-123",
+        "task_id": "01-011",
+        "dataset": "validation",
+        "payload": {"type": "text", "schema": "fabv2.text.v1", "data": "42"},
+        "versions": {"runner": "0.0.10-a1b2c3d"},
+    })
     assert req.payload.type == V1PayloadType.TEXT
     assert req.payload.data == "42"
     assert req.payload.schema_id == "fabv2.text.v1"
@@ -154,13 +155,11 @@ def test_eval_request_accepts_text_payload() -> None:
 
 def test_eval_request_rejects_unknown_payload_type() -> None:
     with pytest.raises(ValidationError):
-        V1EvalRequest.model_validate(
-            {
-                "run_id": "r",
-                "task_id": "t",
-                "payload": {"type": "movie", "schema": "x.v1", "data": ""},
-            }
-        )
+        V1EvalRequest.model_validate({
+            "run_id": "r",
+            "task_id": "t",
+            "payload": {"type": "movie", "schema": "x.v1", "data": ""},
+        })
 
 
 def test_eval_response_round_trips_evaluated_status() -> None:
@@ -179,16 +178,14 @@ def test_eval_response_round_trips_evaluated_status() -> None:
 
 
 def test_score_request_carries_run_id_and_nullable_results() -> None:
-    req = V1ScoreRequest.model_validate(
-        {
-            "run_id": "external-run-123",
-            "dataset": "validation",
-            "evaluation_results": {
-                "01-011": {"status": "evaluated", "result": {"pass_percentage": 0.83}},
-                "01-012": None,
-            },
-        }
-    )
+    req = V1ScoreRequest.model_validate({
+        "run_id": "external-run-123",
+        "dataset": "validation",
+        "evaluation_results": {
+            "01-011": {"status": "evaluated", "result": {"pass_percentage": 0.83}},
+            "01-012": None,
+        },
+    })
     assert req.run_id == "external-run-123"
     assert req.evaluation_results["01-012"] is None
 
@@ -228,12 +225,10 @@ def test_v1_evaluate_returns_evaluated_envelope_for_text_payload(descope_client:
 
 
 def test_v1_evaluate_serializes_pydantic_result(
-    descope_client: TestClient,
-    monkeypatch: pytest.MonkeyPatch,
+    descope_client: TestClient, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """evaluate_response may return a Pydantic BaseModel; v1 must model_dump it
     rather than silently nulling the result field."""
-
     class StubEvalResult(BaseModel):
         pass_percentage: float
         eval_version: str
@@ -441,14 +436,12 @@ def test_v1_task_allows_benchmark_specific_extras() -> None:
     repo/base_commit, an artifact benchmark's docker image hints). Per-benchmark
     fields should be documented in each benchmark's README and validated on the
     runner side with a typed Task subclass."""
-    t = V1Task.model_validate(
-        {
-            "id": "01-011",
-            "question": "What is fair use?",
-            "timeout": 600,
-            "system_prompt": "be helpful",
-        }
-    )
+    t = V1Task.model_validate({
+        "id": "01-011",
+        "question": "What is fair use?",
+        "timeout": 600,
+        "system_prompt": "be helpful",
+    })
     assert t.id == "01-011"
     assert t.timeout == 600
     raw = t.model_dump(mode="json")

@@ -3,6 +3,7 @@
 Run: uv run pytest tests/test_sandbox_contract.py
 """
 
+
 from benchmark_service import SandboxCapacityDomain as RootSandboxCapacityDomain
 from benchmark_service.sandbox import (
     ModalProviderConfig,
@@ -45,6 +46,7 @@ def test_capacity_contract_is_exported_and_backward_compatible() -> None:
 
     assert capacity.gpu is None
     assert capacity.allowed_gpu_types is None
+
 
 
 async def test_provider_capacity_defaults_to_unsupported() -> None:

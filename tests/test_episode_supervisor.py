@@ -54,32 +54,32 @@ def _stop(directory: Path) -> subprocess.CompletedProcess[bytes]:
 
 
 def _finish_owner(process: subprocess.Popen[bytes], directory: Path) -> None:
-    marker = directory / "pgid"
-    child_marker = directory.parent / "child"
+    marker = directory / 'pgid'
+    child_marker = directory.parent / 'child'
     owner_group = None
     stopped = False
     try:
         deadline = time.monotonic() + 5
         while True:
-            published = marker.read_text() if marker.exists() else ""
-            if published.endswith("\n") or process.poll() is not None:
+            published = marker.read_text() if marker.exists() else ''
+            if published.endswith('\n') or process.poll() is not None:
                 break
             assert time.monotonic() < deadline
             time.sleep(0.01)
-        if published.endswith("\n"):
+        if published.endswith('\n'):
             owner_group = int(published)
             stopped = _stop(directory).returncode == 0
     finally:
         if owner_group is None and marker.exists():
             published = marker.read_text()
-            if published.endswith("\n"):
+            if published.endswith('\n'):
                 owner_group = int(published)
         child_group = int(child_marker.read_text()) if child_marker.exists() else None
         groups: set[int] = set()
         if child_group is not None and _live(child_group):
             groups.add(child_group)
         if not stopped and owner_group is not None:
-            children = Path(f"/proc/{owner_group}/task/{owner_group}/children")
+            children = Path(f'/proc/{owner_group}/task/{owner_group}/children')
             if children.exists():
                 for child in children.read_text().split():
                     try:
@@ -102,7 +102,7 @@ def _finish_owner(process: subprocess.Popen[bytes], directory: Path) -> None:
                 time.sleep(0.01)
         if directory.exists():
             cleanup = subprocess.run(
-                ["/bin/sh", "-c", cleanup_command(str(directory))],
+                ['/bin/sh', '-c', cleanup_command(str(directory))],
                 capture_output=True,
                 timeout=5,
             )
@@ -153,7 +153,9 @@ def test_forced_stop_drains_owner_and_not_unrelated_sibling(tmp_path: Path) -> N
 
 
 @pytest.mark.parametrize("stop", [False, True])
-def test_original_child_stays_unreaped_until_adopted_descendants_are_gone(tmp_path: Path, stop: bool) -> None:
+def test_original_child_stays_unreaped_until_adopted_descendants_are_gone(
+    tmp_path: Path, stop: bool
+) -> None:
     directory = tmp_path / "owner"
     child = tmp_path / "child"
     command = f"setsid sh -c 'echo $$ > {child}.tmp; mv {child}.tmp {child}; sleep 30' & "
@@ -172,7 +174,11 @@ def test_original_child_stays_unreaped_until_adopted_descendants_are_gone(tmp_pa
         "sys.exit(owner.main())\n"
     )
     wrapper = tmp_path / "instrumented.py"
-    wrapper.write_text(f"import sys\nsys.argv=[sys.argv[0], {str(SCRIPT)!r}, *sys.argv[1:]]\n" + bootstrap)
+    wrapper.write_text(
+        "import sys\n"
+        f"sys.argv=[sys.argv[0], {str(SCRIPT)!r}, *sys.argv[1:]]\n"
+        + bootstrap
+    )
     process = _start_owner(directory, command, wrapper)
     try:
         _wait_for(child)
@@ -239,6 +245,7 @@ def test_prelaunch_failure_never_claims_postdrain_status(tmp_path: Path) -> None
         assert not (tmp_path / "must-not-run").exists()
     finally:
         _finish_owner(process, directory)
+
 
 
 def test_owner_crash_after_launch_cannot_claim_descendant_drain(tmp_path: Path) -> None:

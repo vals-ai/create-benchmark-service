@@ -21,8 +21,7 @@ def test_lifespan_raises_on_malformed_env_var(monkeypatch: pytest.MonkeyPatch) -
 
 @pytest.mark.parametrize("auth_required", [None, "false"])
 def test_local_lifespan_ignores_hosted_allowlist_and_quota_configuration(
-    monkeypatch: pytest.MonkeyPatch,
-    auth_required: str | None,
+    monkeypatch: pytest.MonkeyPatch, auth_required: str | None,
 ) -> None:
     """Local Vals startup and evaluation do not require hosted tenant configuration.
 

@@ -98,7 +98,9 @@ class CatalogAllowlistClient:
         if not self.service_name:
             raise ValueError("Catalog service name must not be empty")
 
-        client_transport = _NonClosingTransport(transport) if transport is not None else None
+        client_transport = (
+            _NonClosingTransport(transport) if transport is not None else None
+        )
         self._request_timeout = timeout
         self._client = httpx.AsyncClient(
             timeout=min(timeout, CATALOG_ATTEMPT_TIMEOUT_SECONDS), transport=client_transport
@@ -134,9 +136,7 @@ class CatalogAllowlistClient:
 
     @retry(
         retry=(
-            retry_if_exception_type(
-                (TimeoutError, httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError)
-            )
+            retry_if_exception_type((TimeoutError, httpx.TimeoutException, httpx.NetworkError, httpx.RemoteProtocolError))
             | retry_if_result(_transient_catalog_response)
         ),
         stop=stop_after_attempt(3),

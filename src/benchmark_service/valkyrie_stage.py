@@ -359,10 +359,7 @@ def _turn_owner(control_fd: int, result_fd: int, command: str) -> None:
             raise OSError(ctypes.get_errno(), "PR_SET_CHILD_SUBREAPER")
         root = subprocess.Popen(["sh", "-c", command], start_new_session=True)
     except OSError as exc:
-        os.write(
-            result_fd,
-            b"F" + json.dumps({"errno": exc.errno, "strerror": exc.strerror, "filename": exc.filename}).encode(),
-        )
+        os.write(result_fd, b"F" + json.dumps({"errno": exc.errno, "strerror": exc.strerror, "filename": exc.filename}).encode())
         return
     os.write(result_fd, b"B")
 

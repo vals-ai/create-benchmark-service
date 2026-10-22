@@ -20,7 +20,9 @@ from benchmark_service.v1_schemas import (
 )
 
 
-def sanitize_v1_eval_response(resp: V1EvalResponse, project: Callable[[Any], Any]) -> V1EvalResponse:
+def sanitize_v1_eval_response(
+    resp: V1EvalResponse, project: Callable[[Any], Any]
+) -> V1EvalResponse:
     sanitized_result = project(resp.result) if resp.result is not None else None
 
     sanitized_errors: list[str] = []
@@ -51,5 +53,8 @@ def sanitize_v1_dataset_tasks_response(resp: V1DatasetTasksResponse) -> V1Datase
     return V1DatasetTasksResponse(
         dataset=resp.dataset,
         dataset_version=resp.dataset_version,
-        tasks=[V1Task(id=task.id, question=task.question, timeout=task.timeout) for task in resp.tasks],
+        tasks=[
+            V1Task(id=task.id, question=task.question, timeout=task.timeout)
+            for task in resp.tasks
+        ],
     )

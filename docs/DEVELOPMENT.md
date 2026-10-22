@@ -1,5 +1,14 @@
 # Development
 
+## Grading package
+
+`packages/vals-grading` is a separate Python distribution with its own version, lockfile, and CI workflow.
+Run its Makefile targets from that directory.
+Its version comes from its `pyproject.toml`; CBS continues to use Git tags.
+Services can pin the grading subdirectory at a commit without installing or upgrading CBS.
+See the [package guide](../packages/vals-grading/README.md) for installation and grading examples.
+PyPI publication requires separate release setup and approval.
+
 ## Versioning
 
 This repo uses semantic versioning. The framework version is derived from git tags via `hatch-vcs` and exposed at runtime as `benchmark_service.__version__` and via the `GET /version` endpoint on every service.

@@ -1,0 +1,13 @@
+{
+  "id": "sample-1",
+  "input_under_test": "What information do you need to assess eligibility?",
+  "context": {"region": "example region"},
+  "checks": [
+    {
+      "operator": "satisfies_criteria",
+      "prompt": "Evaluate {{output}} against {{criteria}} for the question {{input}}.",
+      "criteria": "Asks about household size and income without promising eligibility.",
+      "severity": 1
+    }
+  ]
+}

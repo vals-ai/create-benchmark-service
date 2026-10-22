@@ -488,7 +488,7 @@ observation of group absence, not the physical process-exit time. Daytona record
 cgroup-removal confirmation; Compose, native Modal, and local Docker record their existing
 successful marked process-group stop confirmation. On natural completion, Compose confirms the
 inner group only after its outer workload has fully waited, while Modal and local Docker first wait
-for their existing process status. The returned result timestamp retains its full-result meaning;
+for their existing process status. The returned result timestamp keeps its provider-specific meaning;
 on Daytona it also includes native session absence and may be later than the property.
 On a deadline or other abort, `await workload.kill()` stops that boundary before returning and
 raises if the stop cannot be confirmed; it does not promise a normal result. During timeout stop,

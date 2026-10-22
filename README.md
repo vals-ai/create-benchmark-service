@@ -246,8 +246,8 @@ credited_generation = CreditedGeneration(allowance_seconds=5 * 60 * 60, stage_pr
 `RetrieveTaskResponse.credited_generation` is `None` by default. Tracker uses one cumulative
 active-generation clock for every task: an explicit credited allowance takes precedence,
 otherwise `agent_timeout` supplies the allowance, otherwise there is no generation deadline.
-The explicit credited allowance is positive and finite; `stage_protocol=None` charges the whole
-command interval, while `"valkyrie-stage/1"` selects benchmark-owned intervals and requires
+The explicit credited allowance is positive and finite; `stage_protocol=None` charges through
+observed agent-group absence, while `"valkyrie-stage/1"` selects benchmark-owned intervals and requires
 that finite credited allowance. Tracker charges a finite base `B` plus capped optional accounting
 credit `C` across intervals; setup, evaluation, and gaps between intervals do not debit the
 clock. A configured accounting proxy counts neutral overhead for the native Gateway bearer.
@@ -255,8 +255,14 @@ Tracker reads the counter during generation and, unless exhaustion has frozen th
 In Tracker task results, `base_generation_allowance_seconds` is null when there is no
 generation deadline; effective allowance is derived from that base plus applied accounting credit,
 not stored separately. `external_service_credit_applied_seconds` is null without an accounting
-snapshot. `generation_elapsed_seconds` is measured at terminal finalization even without a deadline;
-a null elapsed value instead means no generation-time measurement was recorded.
+snapshot. For non-staged generation, `generation_elapsed_seconds` and `agent_run_duration` end at
+the provider-observed agent-group absence, rather than terminal result finalization; each duration
+uses its own start time. Staged generation retains benchmark-owned interval accounting. The elapsed
+field is measured even without a deadline; null means no generation-time measurement was recorded.
+For finite non-staged runs, a group absence confirmed strictly before the effective cutoff permits
+normal result/output/cleanup collection only through that cutoff plus the existing 20-second grace.
+If collection is still unconfirmed, Tracker reports `ERROR` without evaluation; without a timely
+absence receipt, existing deadline stop handling applies.
 The independent 166-hour whole-task wall applies to every selected task, including those without a generation deadline. Daytona requests a 167-hour sandbox TTL, local Docker uses a 167-hour keepalive, and Modal caps sandbox lifetime at 24 hours.
 Accounting credit is optional and independent of whether `credited_generation` is present; eligibility needs
 configured proxy access, a resolved native Gateway URL and key, and an attested model. Missing
@@ -473,14 +479,23 @@ descendants before confirmation; Docker-daemon-owned descendants remain outside 
 For ordinary controlled commands, the shell's FIFO listener ignores TERM/INT/HUP to accept stop
 requests while the owner and workload remain active; normal foreground completion still triggers group cleanup.
 
-Consume `workload.output()` for streamed text. `await workload.wait()` returns
+Consume `workload.output()` for streamed text. A successful `await workload.wait()` returns
 `ControlledWorkloadResult(result=ExecResult(exit_code, output), absence_confirmed_at=...)`
-after its backend-specific stop boundary is confirmed. On a deadline or other abort,
-`await workload.kill()` stops that boundary before returning and raises if the stop
-cannot be confirmed. On Daytona, cleanup may retry a completed failed session close when
-it reaches the close step again, including within the same `kill()` call. A retry
-still requires fresh confirmation of absence and does not turn an earlier workload
-failure into success. The timestamp is event-loop monotonic time, not a wall-clock
+after collecting the exit result, output, and provider cleanup.
+`workload.agent_absence_confirmed_at` is `None` until the provider confirms the agent group absent,
+then remains a sticky monotonic timestamp. It can precede the full `wait()` result and is an
+observation of group absence, not the physical process-exit time. Daytona records its existing
+cgroup-removal confirmation; Compose, native Modal, and local Docker record their existing
+successful marked process-group stop confirmation. On natural completion, Compose confirms the
+inner group only after its outer workload has fully waited, while Modal and local Docker first wait
+for their existing process status. The returned result timestamp retains its full-result meaning;
+on Daytona it also includes native session absence and may be later than the property.
+On a deadline or other abort, `await workload.kill()` stops that boundary before returning and
+raises if the stop cannot be confirmed; it does not promise a normal result. During timeout stop,
+existing process-group control-file cleanup may continue asynchronously. On Daytona, cleanup may
+retry a completed failed session close when it reaches the close step again, including within the
+same `kill()` call. A retry still requires fresh confirmation of absence and does not turn an
+earlier workload failure into success. The returned timestamp is monotonic time, not a wall-clock
 datetime. The caller owns deadline arbitration and must not proceed to independent
 collection on unconfirmed stop. Ordinary `Sandbox.command()` and `Sandbox.exec()`
 do not provide this contract. On Daytona, native Modal, and local Docker, `result.output` is a bounded

@@ -190,7 +190,9 @@ def _resolve_grading_spec(task: RetrieveTaskResponse) -> _ResolvedSpec:
         raise ValueError(
             "sandbox grading does not support ComposeSource; set eval_sandbox.source to an image or snapshot"
         )
-    if spec is not None and spec.resources is not None and isinstance(source, (SnapshotSource, TargetedSnapshotSource)):
+    if spec is not None and spec.resources is not None and isinstance(
+        source, (SnapshotSource, TargetedSnapshotSource)
+    ):
         raise ValueError(
             "eval_sandbox.resources cannot override a snapshot-backed sandbox; use an image source with explicit resources"
         )
@@ -412,7 +414,9 @@ async def grade_instance_stream(
                     evaluation_task = None
                     chunk = completed_task.result()
                 except StopAsyncIteration:
-                    terminal = StreamErrorChunk(type="error", data="evaluate_instance completed without a result chunk")
+                    terminal = StreamErrorChunk(
+                        type="error", data="evaluate_instance completed without a result chunk"
+                    )
                     break
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("grading failed run_id=%s task_id=%s", run_id, run.task_id)

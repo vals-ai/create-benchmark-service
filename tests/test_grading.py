@@ -273,7 +273,6 @@ async def test_grade_instance_creates_isolated_sandbox_from_task_source_and_dele
     assert create.source == ImageSource(image="python:3.12-slim")
     assert create.resources == Resources(vcpu=2, memory=4, disk=10)
     assert create.network_block_all is True
-    # The grader process inside reads these as model-library settings; no attempt was named.
     assert create.env_vars == {"RUN_ID": "run-1", "TASK_ID": "task-1"}
     # run_id is caller-supplied: the sandbox name must be a sanitized slug plus
     # a unique suffix, and the labels must carry the tracker vocabulary plus
@@ -358,7 +357,9 @@ async def test_grade_instance_applies_benchmark_declared_eval_sandbox_spec() -> 
 
 
 class ComposeGenerationSourceStub(SandboxStub):
-    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> Any:
+    async def retrieve_task(
+        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+    ) -> Any:
         task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
         return task.model_copy(
             update={
@@ -371,7 +372,9 @@ class ComposeGenerationSourceStub(SandboxStub):
 
 
 class ComposeGenerationWithEvalOverrideStub(ComposeGenerationSourceStub):
-    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> Any:
+    async def retrieve_task(
+        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+    ) -> Any:
         task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
         return task.model_copy(
             update={
@@ -406,7 +409,9 @@ async def test_grade_instance_rejects_compose_generation_source_without_eval_ove
 
 
 class SnapshotResourceSpecStub(SandboxStub):
-    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> Any:
+    async def retrieve_task(
+        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+    ) -> Any:
         task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
         return task.model_copy(
             update={
@@ -430,7 +435,9 @@ async def test_grade_instance_rejects_snapshot_resource_override_before_create()
 
 
 class SnapshotEvalForGpuTaskStub(SandboxStub):
-    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> Any:
+    async def retrieve_task(
+        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+    ) -> Any:
         task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
         return task.model_copy(
             update={
@@ -453,7 +460,9 @@ async def test_grade_instance_does_not_apply_generation_gpu_to_snapshot_override
 
 
 class SnapshotGenerationGpuTaskStub(SandboxStub):
-    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> Any:
+    async def retrieve_task(
+        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+    ) -> Any:
         task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
         return task.model_copy(
             update={
@@ -476,7 +485,9 @@ async def test_grade_instance_does_not_apply_generation_gpu_to_default_snapshot(
 
 
 class TargetedSnapshotGenerationGpuTaskStub(SandboxStub):
-    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> Any:
+    async def retrieve_task(
+        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+    ) -> Any:
         task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
         return task.model_copy(
             update={
@@ -648,7 +659,9 @@ class BlockingCleanupStub(SandboxStub):
     cleanup_finished: asyncio.Event
     release_cleanup: asyncio.Event
 
-    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> Any:
+    async def retrieve_task(
+        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+    ) -> Any:
         task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
         return task.model_copy(update={"eval_sandbox": EvalSandboxSpec(timeout_s=0.01)})
 
@@ -804,7 +817,9 @@ async def test_request_cancellation_keeps_admission_until_sandbox_deletion() -> 
 
 
 class SlowRetrieveStub(SandboxStub):
-    async def retrieve_task(self, task_id: str, skip_validation: bool = False, dataset: str | None = None) -> Any:
+    async def retrieve_task(
+        self, task_id: str, skip_validation: bool = False, dataset: str | None = None
+    ) -> Any:
         await asyncio.sleep(0.1)
         return await super().retrieve_task(task_id, skip_validation, dataset=dataset)
 
@@ -1076,9 +1091,7 @@ def test_grading_provider_config_does_not_render_present_modal_secret(
     assert "must-not-appear" not in str(exc_info.value)
 
 
-def _sandbox_app(
-    monkeypatch: pytest.MonkeyPatch, service_cls: type[StubBenchmark] = SandboxStub
-) -> ValsBenchmarkServiceApp:
+def _sandbox_app(monkeypatch: pytest.MonkeyPatch, service_cls: type[StubBenchmark] = SandboxStub) -> ValsBenchmarkServiceApp:
     clear_allowlist_cache()
     clear_auth_cache()
     monkeypatch.setenv("AUTH_REQUIRED", "true")

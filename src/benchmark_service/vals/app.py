@@ -46,11 +46,7 @@ from benchmark_service.vals.auth import (
     load_allowlist,
 )
 from benchmark_service.vals.base import ValsBenchmarkService
-from benchmark_service.vals.trial import (
-    sanitize_v1_dataset_tasks_response,
-    sanitize_v1_eval_response,
-    sanitize_v1_score_response,
-)
+from benchmark_service.vals.trial import sanitize_v1_dataset_tasks_response, sanitize_v1_eval_response, sanitize_v1_score_response
 
 logger = logging.getLogger(__name__)
 
@@ -367,9 +363,7 @@ class ValsBenchmarkServiceApp(BenchmarkServiceApp):
 
     async def _v1_evaluate_in_scope(self, request: Request, body: V1EvalRequest) -> V1EvalResponse:
         if self._sentry is not None:
-            self._sentry.bind_request_context(
-                request.headers, run_id=body.run_id, task_id=body.task_id, dataset=body.dataset
-            )
+            self._sentry.bind_request_context(request.headers, run_id=body.run_id, task_id=body.task_id, dataset=body.dataset)
         tenant = cast(str, request.state.tenant)
         try:
             await self.service.validate_task_ids([body.task_id], dataset=body.dataset)
@@ -543,9 +537,7 @@ class ValsBenchmarkServiceApp(BenchmarkServiceApp):
         _require_descope_tenant(request.state.tenant)
         async with self._dataset_scope(request, request.state.tenant, body.dataset):
             if self._sentry is not None:
-                self._sentry.bind_request_context(
-                    request.headers, run_id=body.run_id, task_id=body.task_id, dataset=body.dataset
-                )
+                self._sentry.bind_request_context(request.headers, run_id=body.run_id, task_id=body.task_id, dataset=body.dataset)
             tenant = cast(str, request.state.tenant)
             if not submission_artifacts.is_configured():
                 raise HTTPException(
@@ -577,12 +569,9 @@ class ValsBenchmarkServiceApp(BenchmarkServiceApp):
                 self._sentry.bind_request_context(request.headers, run_id=body.run_id, dataset=body.dataset)
 
             normalized_results = {
-                task_id: _v1_score_item_to_eval_result(task_id, item)
-                for task_id, item in body.evaluation_results.items()
+                task_id: _v1_score_item_to_eval_result(task_id, item) for task_id, item in body.evaluation_results.items()
             }
-            tasks_evaluated = await self.service.validate_task_ids(
-                list(normalized_results.keys()), dataset=body.dataset
-            )
+            tasks_evaluated = await self.service.validate_task_ids(list(normalized_results.keys()), dataset=body.dataset)
             result = await self.service.calculate_final_score(normalized_results, dataset=body.dataset)
             response = V1ScoreResponse(
                 run_id=body.run_id,

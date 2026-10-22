@@ -69,7 +69,9 @@ def _task_response(max_sandbox_attempts: int | None = None) -> RetrieveTaskRespo
 @pytest.mark.parametrize("version", [0, True, "1"])
 def test_generation_containment_requires_positive_integer_version(version: object) -> None:
     with pytest.raises(ValidationError):
-        GenerationContainment.model_validate({"type": "linux_cgroup_v2", "version": version})
+        GenerationContainment.model_validate(
+            {"type": "linux_cgroup_v2", "version": version}
+        )
 
 
 def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "error") -> MagicMock:
@@ -1315,7 +1317,6 @@ async def test_client_v1_evaluate_posts_payload_and_returns_v1_eval_response(
     assert result.result == {"resolved": True}
     called_url, called_kwargs = mock_http.post.call_args
     assert called_url[0] == f"{BASE_URL}/v1/evaluate"
-    assert called_kwargs["json"]["attempt_id"] == "attempt-1"
     assert called_kwargs["json"]["payload"] == {
         "type": "artifact",
         "schema": "code-migration.workspace-tar.v1",
@@ -1323,6 +1324,7 @@ async def test_client_v1_evaluate_posts_payload_and_returns_v1_eval_response(
     }
     assert called_kwargs["json"]["dataset"] == "validation"
     assert called_kwargs["json"]["versions"] == {"runner": "benchmark-orchestrator-1.2.3"}
+    assert called_kwargs["json"]["attempt_id"] == "attempt-1"
 
 
 async def test_client_v1_upload_url_posts_artifact_identity(

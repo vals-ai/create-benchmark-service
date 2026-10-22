@@ -512,7 +512,27 @@ Eval-only retry flow:
 - `grader_identity(task_id, dataset)`: what decides the grade (judge model and rubric revision, or test revision and grader image). A retry refuses to grade if this changed.
 - `grade_input(task_id, content, dataset)`: how to grade those bytes.
 
-The framework saves the bytes to S3 before grading and, on a retry, grades the saved copy instead of rerunning the agent. Storage comes from `EVAL_RESUME_BUCKET` and `EVAL_RESUME_PREFIX`, which benchmark-services-registry sets when a service opts in. Implement all three hooks or none; a service that grades inside the live sandbox keeps its own `evaluate_instance` and uses `self.eval_resume_store` directly. Details are in `benchmark_service/eval_resume.py`.
+The framework saves the bytes to S3 before grading and, on a retry, grades the saved copy instead of rerunning the agent. Storage comes from `EVAL_RESUME_BUCKET` and `EVAL_RESUME_PREFIX`, which benchmark-services-registry sets when a service opts in.
+Implement `collect_grading_input`, `grader_identity` and one grader, or none.
+Details are in `benchmark_service/eval_resume.py`.
+
+Optional, as your grader needs:
+
+- **Grades inside a sandbox:** implement `grade_in_sandbox` instead of `grade_input`.
+  A retry grades in a fresh sandbox, or in the caller's sandbox when the request names one.
+  The fresh sandbox starts from the task's image,
+  so the bytes `collect_grading_input` saves must hold the whole graded workspace.
+  It grades under the task's `egress.evaluation`, the policy the first attempt grades under.
+  A task that declares no `egress.evaluation` grades its retry with the network blocked.
+- **Needs its own image or network:** set the task's `eval_sandbox`, the spec `/v1` grading reads.
+  Each attempt then grades in a fresh sandbox built from it, under its `network_block_all`,
+  except when a retry names the caller's sandbox (`instance_id`), which is borrowed instead,
+  and under `/v1` grading, which grades in the sandbox `/v1` already built from it.
+  Its `timeout_s` sizes that sandbox's auto-stop; it does not bound grading.
+- **Saves progress part-way**, for example after each judge call: yield `GradingInput`.
+- **Output that cannot be graded:** raise `NotGradeable(message)` from `collect_grading_input`.
+  The task ends with that error, and nothing is saved.
+- **No bounded input to save:** keep your own `evaluate_instance`.
 
 ### Streaming protocol
 

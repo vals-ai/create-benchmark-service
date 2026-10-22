@@ -111,7 +111,7 @@ def legacy_docker_image(source: SandboxSource) -> str:
 
 
 class EvalSandboxSpec(BaseModel):
-    """Benchmark-declared grading-sandbox overrides for eval_mode == SANDBOX.
+    """Benchmark-declared grading-sandbox overrides for eval_mode == SANDBOX and for ``grade_in_sandbox``.
 
     Unset fields fall back to the task's generation values; network access is
     blocked unless the benchmark explicitly opens it.
@@ -127,7 +127,11 @@ class EvalSandboxSpec(BaseModel):
         default=None,
         description="Grading sandbox resources; snapshot-backed sandboxes do not support overrides",
     )
-    timeout_s: float | None = Field(default=None, gt=0, description="Wall-clock bound for the grading step in seconds")
+    timeout_s: float | None = Field(
+        default=None,
+        gt=0,
+        description="Wall-clock bound for /v1 grading in seconds; for grade_in_sandbox it sizes only the auto-stop",
+    )
     network_block_all: bool = Field(default=True, description="Block all network egress from the grading sandbox")
 
 
@@ -260,7 +264,8 @@ class RetrieveTaskResponse(BaseModel):
         ),
     )
     eval_sandbox: EvalSandboxSpec | None = Field(
-        default=None, description="Grading-sandbox overrides for eval_mode == SANDBOX; None uses generation values"
+        default=None,
+        description="Grading-sandbox overrides for /v1 SANDBOX grading and grade_in_sandbox; None uses generation values",
     )
     resume_sandbox: EvalSandboxSpec | None = Field(
         default=None,

@@ -17,9 +17,10 @@ class GatewayJudgeModel:
 
     Requests carry the service's ``IDENTITY`` with ``agent_name`` set to
     ``"grader"``, so the Gateway ledger tells judge spend from the agent's. The
-    run, task and attempt a request belongs to come from the caller through
-    ``model_library.attribution.attribution_scope``; outside such a scope the
-    judge is attributed to no run, as before.
+    run, task and attempt a request belongs to come from the grading token the
+    host binds (create-benchmark-service mints one per evaluation; model-library
+    sends it inside ``gateway_token_scope``), whose claims the Gateway stamps on
+    the request. Outside such a scope the judge is attributed to no run, as before.
     """
 
     def __init__(self, model: str) -> None:

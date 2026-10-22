@@ -14,6 +14,8 @@ import pytest
 from fastapi.testclient import TestClient
 
 from benchmark_service.app import BenchmarkServiceApp
+from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL
+from benchmark_service.context import tenant_scope
 from benchmark_service.grading_credentials import (
     GradingCredentials,
     RequestAttribution,
@@ -99,6 +101,25 @@ async def test_run_mints_a_grader_token_and_revokes_it_after(gateway: FakeGatewa
     }
     assert {auth for _, auth, _ in gateway.calls} == {f"Bearer {STATIC_KEY}"}
     assert gateway.calls[1][2] == {"lease_id": "lease-1"}
+
+
+async def test_token_identity_names_an_authenticated_tenant(gateway: FakeGateway) -> None:
+    with tenant_scope("acme"):
+        async with grading_credentials(BOUND):
+            pass
+    assert gateway.mint_body()["identity"] == {
+        "benchmark_name": "snap",
+        "phase": "grading",
+        "tenant": "acme",
+        "agent_name": "grader",
+    }
+
+
+async def test_token_identity_omits_the_unauthenticated_tenant(gateway: FakeGateway) -> None:
+    with tenant_scope(UNAUTHENTICATED_TENANT_SENTINEL):
+        async with grading_credentials(BOUND):
+            pass
+    assert "tenant" not in gateway.mint_body()["identity"]
 
 
 async def test_token_is_revoked_even_when_grading_fails(gateway: FakeGateway) -> None:

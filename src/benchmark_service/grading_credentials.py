@@ -33,6 +33,8 @@ from dataclasses import dataclass
 
 import httpx
 
+from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL
+from benchmark_service.context import current_tenant
 from benchmark_service.observability import ATTEMPT_ID_HEADER, RUN_ID_HEADER
 
 logger = logging.getLogger(__name__)
@@ -87,12 +89,17 @@ def grading_models() -> list[str]:
 
 
 def grading_identity() -> dict[str, object]:
-    """The service ``IDENTITY`` reported as the grader."""
+    """The service ``IDENTITY`` reported as the grader, naming the caller's tenant when one authenticated."""
     try:
         identity = json.loads(os.environ.get("IDENTITY") or "{}")
     except json.JSONDecodeError:
         identity = {}
-    return {**(identity if isinstance(identity, dict) else {}), "agent_name": GRADER_AGENT_NAME}
+    tenant = current_tenant()
+    return {
+        **(identity if isinstance(identity, dict) else {}),
+        **({"tenant": tenant} if tenant not in (None, UNAUTHENTICATED_TENANT_SENTINEL) else {}),
+        "agent_name": GRADER_AGENT_NAME,
+    }
 
 
 async def _mint(url: str, api_key: str, attribution: RequestAttribution, models: list[str]) -> GradingCredentials:

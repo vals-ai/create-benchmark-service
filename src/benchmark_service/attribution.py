@@ -49,14 +49,10 @@ def current_request_attribution() -> RequestAttribution | None:
     return _current_attribution.get()
 
 
-def attribution_from_request(
-    headers: Mapping[str, str], *, task_id: str, attempt_id: str | None = None
-) -> RequestAttribution:
+def attribution_from_request(headers: Mapping[str, str], *, task_id: str) -> RequestAttribution:
     """Read the caller's run and attempt from the correlation headers the client sends."""
     return RequestAttribution(
-        run_id=headers.get(RUN_ID_HEADER) or headers.get(RUN_ID_HEADER.lower()),
-        task_id=task_id,
-        attempt_id=attempt_id or headers.get(ATTEMPT_ID_HEADER) or headers.get(ATTEMPT_ID_HEADER.lower()),
+        run_id=headers.get(RUN_ID_HEADER), task_id=task_id, attempt_id=headers.get(ATTEMPT_ID_HEADER)
     )
 
 

@@ -596,8 +596,8 @@ class BenchmarkServiceClient:
     ) -> _RecoveryResult:
         """Run a task attempt with benchmark-declared sandbox-loss recovery.
 
-        ``attempt_id`` is the caller's identity for this execution of the task; every
-        nested request carries it so the service can attribute grading to it.
+        ``attempt_id`` names this execution of the task on every nested request so
+        the service attributes grading to it.
 
         ``SandboxRecoveryAttempt.retrieve_task`` lazily loads and caches the
         task payload so successful durable evaluation resumes need no task

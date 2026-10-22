@@ -175,7 +175,6 @@ async def test_controlled_stream_arrives_before_status_finishes() -> None:
     assert (await workload.wait()).result.output == "readylater"
 
 
-
 async def test_controlled_read_failure_stops_running_group(monkeypatch: pytest.MonkeyPatch) -> None:
     read_out = _LocalStream.read_out
 
@@ -322,7 +321,7 @@ async def test_controlled_wait_cancellation_does_not_cancel_command(tmp_path: Pa
     release = tmp_path / "release"
     os.mkfifo(release)
     workload = sandbox.controlled_workload(
-        f"exec 5<> {shlex.quote(str(release))}; printf ready; read line <&5; exec 5>&-; printf %s \"$CUSTOM\"",
+        f'exec 5<> {shlex.quote(str(release))}; printf ready; read line <&5; exec 5>&-; printf %s "$CUSTOM"',
         env_vars={"CUSTOM": "ok"},
     )
     stream = workload.output()
@@ -373,7 +372,7 @@ async def test_controlled_result_tail_is_finite_without_output_consumer() -> Non
     assert result.result.exit_code == 0
     assert streamed == expected
     assert 0 < len(result.result.output) < len(expected)
-    assert result.result.output == expected[-len(result.result.output):]
+    assert result.result.output == expected[-len(result.result.output) :]
 
 
 async def test_controlled_launch_failure_wakes_output_reader(monkeypatch: pytest.MonkeyPatch) -> None:

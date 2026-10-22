@@ -220,6 +220,7 @@ class TestSandboxProviderIntegration:
             auto_stop_interval=5,
             create_timeout=1,
         )
+
         async def create_in_context() -> None:
             async with provider:
                 await provider.create_sandbox(create_request)

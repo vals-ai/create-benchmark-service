@@ -51,6 +51,7 @@ from benchmark_service.sandbox import (
 logger = logging.getLogger(__name__)
 _dataset_version_id: TypeAdapter[str] = TypeAdapter(DatasetVersionId)
 
+
 class _DatasetVersionSelectionError(HTTPException):
     pass
 
@@ -184,7 +185,9 @@ class BenchmarkServiceApp(FastAPI):
                 try:
                     self.authorize_request(tenant, request.url.path)
                 except HTTPException as exc:
-                    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
+                    return JSONResponse(
+                        status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers
+                    )
                 response = await call_next(request)  # type: ignore[reportUnknownVariableType]
                 version = getattr(request.state, "dataset_version", None)
                 if version is not None and 200 <= response.status_code < 300:

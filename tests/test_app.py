@@ -163,7 +163,6 @@ def test_retrieve_task_credited_generation_opt_in(monkeypatch: pytest.MonkeyPatc
     }
 
 
-
 def test_retrieve_task_explicit_agent_install_order(monkeypatch: pytest.MonkeyPatch) -> None:
     class AfterSetupBenchmark(StubBenchmark):
         async def retrieve_task(

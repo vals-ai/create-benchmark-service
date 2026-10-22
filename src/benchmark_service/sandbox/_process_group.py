@@ -55,42 +55,37 @@ def episode_owner_command(command: str, control_dir: str, uploaded_script: str) 
 def stop_command(control_dir: str, *, episode_owner: bool) -> str:
     directory = shlex.quote(control_dir)
     proof = (
-        f'if [ ! -s {directory}/status ]; then exit 76; fi\n'
-        f'IFS= read -r state < {directory}/status || exit 76\n'
+        f"if [ ! -s {directory}/status ]; then exit 76; fi\n"
+        f"IFS= read -r state < {directory}/status || exit 76\n"
         f'if [ "$state" != PRELAUNCH ]; then cat {directory}/status; fi'
-        if episode_owner else
-        f'if [ -s {directory}/status ]; then cat {directory}/status; fi'
+        if episode_owner
+        else f"if [ -s {directory}/status ]; then cat {directory}/status; fi"
     )
-    wait_init = '' if episode_owner else 'n=0\n'
-    wait_limit = '' if episode_owner else '  n=$((n + 1))\n  [ "$n" -lt 20 ] || exit 1\n'
+    wait_init = "" if episode_owner else "n=0\n"
+    wait_limit = "" if episode_owner else '  n=$((n + 1))\n  [ "$n" -lt 20 ] || exit 1\n'
     return (
-        f'if [ ! -s {directory}/pgid ]; then exit 75; fi\n'
-        f'IFS= read -r group_id < {directory}/pgid || exit 1\n'
+        f"if [ ! -s {directory}/pgid ]; then exit 75; fi\n"
+        f"IFS= read -r group_id < {directory}/pgid || exit 1\n"
         "alive() {\n"
         "  for stat in /proc/[0-9]*/stat; do\n"
         '    IFS= read -r line 2>/dev/null < "$stat" || continue\n'
-        '    fields=${line##*) }\n'
-        '    set -- $fields\n'
+        "    fields=${line##*) }\n"
+        "    set -- $fields\n"
         '    if [ "$3" = "$group_id" ]; then\n'
         '      case "$1" in Z|X) ;; *) return 0 ;; esac\n'
-        '    fi\n'
-        '  done\n'
-        '  return 1\n'
-        '}\n'
-        'if alive; then\n'
-        f'  exec 3<>{directory}/stop || exit 1\n'
+        "    fi\n"
+        "  done\n"
+        "  return 1\n"
+        "}\n"
+        "if alive; then\n"
+        f"  exec 3<>{directory}/stop || exit 1\n"
         "  printf 'stop\n' >&3 || exit 1\n"
-        '  exec 3>&-\n'
-        'fi\n'
-        + wait_init
-        + 'while alive; do\n'
-        + wait_limit
-        + '  sleep 0.05\n'
-        'done\n'
-        + proof
+        "  exec 3>&-\n"
+        "fi\n" + wait_init + "while alive; do\n" + wait_limit + "  sleep 0.05\n"
+        "done\n" + proof
     )
 
 
 def cleanup_command(control_dir: str) -> str:
     directory = shlex.quote(control_dir)
-    return f'rm -f {directory}/pgid {directory}/status {directory}/stop && rmdir {directory}'
+    return f"rm -f {directory}/pgid {directory}/status {directory}/stop && rmdir {directory}"

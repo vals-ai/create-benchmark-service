@@ -98,7 +98,6 @@ class _LocalOuter:
     async def probe_generation_containment(self) -> None:
         return None
 
-
     async def exec(self, command: str, *, timeout: float | None = None) -> ExecResult:
         process = await asyncio.create_subprocess_shell(
             command,
@@ -148,11 +147,8 @@ async def test_compose_controlled_natural_exit_preserves_status_and_output(
         await asyncio.wait_for(workload.kill(), 5)
 
 
-
 @pytest.mark.parametrize("code", [0, 7])
-async def test_compose_foreground_exit_stops_child_holding_stdout(
-    compose_sandbox: ComposeSandbox, code: int
-) -> None:
+async def test_compose_foreground_exit_stops_child_holding_stdout(compose_sandbox: ComposeSandbox, code: int) -> None:
     workload = compose_sandbox.controlled_workload(
         f'sleep 30 & child=$!; printf "child:%s\nparentcomplete\n" "$child"; exit {code}'
     )
@@ -165,8 +161,7 @@ async def test_compose_foreground_exit_stops_child_holding_stdout(
         assert "".join([chunk async for chunk in workload.output()]) == completed.result.output
         assert (
             await compose_sandbox.exec(
-                f"test ! -e /proc/{child}/stat || "
-                f"test $(cut -d ' ' -f 3 /proc/{child}/stat) = Z"
+                f"test ! -e /proc/{child}/stat || test $(cut -d ' ' -f 3 /proc/{child}/stat) = Z"
             )
         ).exit_code == 0
         assert (await compose_sandbox.exec("printf service-alive")).output == "service-alive"

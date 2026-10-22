@@ -217,7 +217,10 @@ async def test_a_task_id_edited_to_its_key_digest_is_refused(store: EvalResumeSt
 
     with pytest.raises(EvalResumeError, match="does not match"):
         await store.load(
-            checkpoint.model_dump(mode="json") | {"task_id": alias}, task_id=alias, dataset="test", grader_identity=GRADER
+            checkpoint.model_dump(mode="json") | {"task_id": alias},
+            task_id=alias,
+            dataset="test",
+            grader_identity=GRADER,
         )
     assert s3.bodies == []
 

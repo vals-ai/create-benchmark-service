@@ -30,7 +30,7 @@ from typing import Any
 from fastapi.encoders import jsonable_encoder
 
 from benchmark_service.base import BenchmarkService
-from benchmark_service.attribution import RequestAttribution, current_request_attribution, request_attribution_scope
+from benchmark_service.attribution import RequestAttribution, request_attribution_scope
 from benchmark_service.context import sandbox_provider_scope, tenant_scope
 from benchmark_service.sandbox import (
     ComposeSource,
@@ -190,9 +190,7 @@ def _resolve_grading_spec(task: RetrieveTaskResponse) -> _ResolvedSpec:
         raise ValueError(
             "sandbox grading does not support ComposeSource; set eval_sandbox.source to an image or snapshot"
         )
-    if spec is not None and spec.resources is not None and isinstance(
-        source, (SnapshotSource, TargetedSnapshotSource)
-    ):
+    if spec is not None and spec.resources is not None and isinstance(source, (SnapshotSource, TargetedSnapshotSource)):
         raise ValueError(
             "eval_sandbox.resources cannot override a snapshot-backed sandbox; use an image source with explicit resources"
         )
@@ -242,16 +240,11 @@ class _GradeRun:
     provider: SandboxProvider
     dataset: str | None
     labels: dict[str, str] | None = None
+    attempt_id: str | None = None
 
     @property
     def task_id(self) -> str:
         return self.submission.task_id
-
-    @property
-    def attribution(self) -> RequestAttribution:
-        request = current_request_attribution()
-        attempt_id = request.attempt_id if request is not None else None
-        return RequestAttribution(run_id=self.run_id, task_id=self.task_id, attempt_id=attempt_id)
 
     def create_request(self, spec: _ResolvedSpec, budget_s: float) -> SandboxCreateRequest:
         return SandboxCreateRequest(
@@ -268,7 +261,7 @@ class _GradeRun:
             },
             # Model-library settings a grader process inside the sandbox reads, so
             # its Gateway calls land on the same run, task and attempt.
-            env_vars=self.attribution.as_environment(),
+            env_vars=RequestAttribution(self.run_id, self.task_id, self.attempt_id).as_environment(),
             auto_stop_interval=_auto_stop_minutes(budget_s),
             create_timeout=_GRADING_CREATE_TIMEOUT_S,
             network_block_all=spec.network_block_all,
@@ -359,6 +352,7 @@ async def grade_instance_stream(
     provider: SandboxProvider,
     dataset: str | None,
     labels: dict[str, str] | None = None,
+    attempt_id: str | None = None,
 ) -> AsyncGenerator[StreamChunk, None]:
     """The only sandbox-grading lifecycle. Never raises; yields exactly one
     terminal (result | error) chunk and nothing after it.
@@ -375,6 +369,7 @@ async def grade_instance_stream(
         provider=provider,
         dataset=dataset,
         labels=labels,
+        attempt_id=attempt_id,
     )
     sandbox: Sandbox | None = None
     evaluation: AsyncGenerator[StreamChunk, None] | None = None
@@ -417,9 +412,7 @@ async def grade_instance_stream(
                     evaluation_task = None
                     chunk = completed_task.result()
                 except StopAsyncIteration:
-                    terminal = StreamErrorChunk(
-                        type="error", data="evaluate_instance completed without a result chunk"
-                    )
+                    terminal = StreamErrorChunk(type="error", data="evaluate_instance completed without a result chunk")
                     break
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("grading failed run_id=%s task_id=%s", run_id, run.task_id)
@@ -516,6 +509,7 @@ async def evaluate_submission(
             evaluator_version=evaluator_version,
             dataset=dataset,
             labels=labels,
+            attempt_id=attempt_id,
         )
 
 
@@ -529,6 +523,7 @@ async def _evaluate_submission(
     evaluator_version: str | None,
     dataset: str | None,
     labels: dict[str, str] | None = None,
+    attempt_id: str | None = None,
 ) -> V1EvalResponse:
     if service.eval_mode == EvalMode.SANDBOX:
         if provider is None:
@@ -541,6 +536,7 @@ async def _evaluate_submission(
             provider=provider,
             dataset=dataset,
             labels=labels,
+            attempt_id=attempt_id,
         )
     else:
         if not isinstance(submission, TextGradingSubmission):

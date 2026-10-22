@@ -292,7 +292,6 @@ class ControlledWorkloadResult:
 
 
 class ControlledWorkload(ABC):
-
     @abstractmethod
     def output(self) -> AsyncGenerator[str, None]: ...
 
@@ -363,8 +362,7 @@ class Sandbox(ABC):
         return self._process_group_workload(command, script, cwd=cwd, env_vars=env_vars)
 
     def _process_group_workload(
-        self, command: str, episode_script: str | None, *, cwd: str | None,
-        env_vars: Mapping[str, str] | None
+        self, command: str, episode_script: str | None, *, cwd: str | None, env_vars: Mapping[str, str] | None
     ) -> ControlledWorkload:
         raise ControlledWorkloadUnsupportedError(
             f"{type(self).__name__} does not support controlled generation workloads"

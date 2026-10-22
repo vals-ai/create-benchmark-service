@@ -11,7 +11,15 @@ from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, cast
 
 import pytest
-from aiohttp import ClientConnectionError, ClientPayloadError, ClientResponseError, InvalidURL, RequestInfo, WSMessage, WSMsgType
+from aiohttp import (
+    ClientConnectionError,
+    ClientPayloadError,
+    ClientResponseError,
+    InvalidURL,
+    RequestInfo,
+    WSMessage,
+    WSMsgType,
+)
 from daytona import DaytonaConfig, GpuType, SandboxState
 from daytona.common.errors import (
     SOURCE_API,
@@ -179,8 +187,6 @@ class Process:
         assert session_id
 
 
-
-
 class RetryingProcess(Process):
     def __init__(self, errors: list[BaseException]) -> None:
         super().__init__()
@@ -327,9 +333,7 @@ class RemovedSandboxProcess(Process):
 
 
 class PtyHandle:
-    def __init__(
-        self, on_data: Callable[[bytes], None | Awaitable[None]], output_frames: tuple[bytes, ...]
-    ) -> None:
+    def __init__(self, on_data: Callable[[bytes], None | Awaitable[None]], output_frames: tuple[bytes, ...]) -> None:
         self._on_data = on_data
         self.output_frames = output_frames
         self.inputs: list[str] = []
@@ -3137,7 +3141,7 @@ async def test_daytona_pty_caps_result_output_without_dropping_streamed_chunks()
     streamed = "".join(chunks)
     assert streamed == "".join(f"chunk-{index:04d}-" + "x" * 1024 for index in range(200))
     assert 0 < len(result.output) < len(streamed)
-    assert result.output == streamed[-len(result.output):]
+    assert result.output == streamed[-len(result.output) :]
     assert result.output.endswith("chunk-0199-" + "x" * 1024)
     assert "chunk-0000-" not in result.output
 
@@ -4854,17 +4858,21 @@ def test_volume_mount_rejects_invalid_subpath(subpath: str) -> None:
         VolumeMount(name="fixtures", mount_path="/fixtures", subpath=subpath)
 
 
-
 @pytest.fixture
 def _fake_cgroup_follow(monkeypatch: pytest.MonkeyPatch) -> None:  # pyright: ignore[reportUnusedFunction]
     async def consume(
-        reader: Any, url: str, headers: dict[str, str],
+        reader: Any,
+        url: str,
+        headers: dict[str, str],
         on_stdout: Callable[[str], Awaitable[None]],
         on_stderr: Callable[[str], Awaitable[None]],
     ) -> None:
         process = reader._api_client
         await process.get_session_command_logs_async(
-            process.follow_session_id, process.follow_command_id, on_stdout, on_stderr,
+            process.follow_session_id,
+            process.follow_command_id,
+            on_stdout,
+            on_stderr,
         )
 
     monkeypatch.setattr(daytona_module._NativeSessionLogProcess, "_consume_log_websocket", consume)  # pyright: ignore[reportPrivateUsage]
@@ -4896,7 +4904,10 @@ class CgroupProcess(Process):
         self.exit_code = 7
 
     def _get_session_command_logs_serialize(
-        self, session_id: str, command_id: str, **kwargs: Any,
+        self,
+        session_id: str,
+        command_id: str,
+        **kwargs: Any,
     ) -> tuple[str, str, dict[str, str]]:
         self.follow_session_id = session_id
         self.follow_command_id = command_id
@@ -4939,7 +4950,9 @@ class CgroupProcess(Process):
         return SimpleNamespace(cmd_id="command-1")
 
     async def get_session_command_logs_async(
-        self, session_id: str, command_id: str,
+        self,
+        session_id: str,
+        command_id: str,
         on_stdout: Callable[[str], Awaitable[None]],
         on_stderr: Callable[[str], Awaitable[None]],
     ) -> None:
@@ -4986,6 +4999,7 @@ class CgroupDaytonaClient:
         fresh.process = self.process
         return fresh
 
+
 def _cgroup_sandbox(process: CgroupProcess) -> DaytonaSandbox:
     inner = InnerSandbox()
     inner.process = process
@@ -5029,6 +5043,7 @@ async def test_daytona_native_reopens_same_command_and_forwards_each_stream_once
     assert not process.group_exists
     assert process.sessions == set()
 
+
 @pytest.mark.usefixtures("_fake_cgroup_follow")
 async def test_daytona_native_status_failure_keeps_pending_follow(
     monkeypatch: pytest.MonkeyPatch,
@@ -5046,7 +5061,9 @@ async def test_daytona_native_status_failure_keeps_pending_follow(
             self.status_calls = 0
 
         async def get_session_command_logs_async(
-            self, session_id: str, command_id: str,
+            self,
+            session_id: str,
+            command_id: str,
             on_stdout: Callable[[str], Awaitable[None]],
             on_stderr: Callable[[str], Awaitable[None]],
         ) -> None:
@@ -5110,7 +5127,9 @@ async def test_daytona_reopen_from_ids_survives_discarded_launch_adapter(
             return getattr(process, name)
 
         async def get_session_command_logs_async(
-            self, session_id: str, command_id: str,
+            self,
+            session_id: str,
+            command_id: str,
             on_stdout: Callable[[str], Awaitable[None]],
             on_stderr: Callable[[str], Awaitable[None]],
         ) -> None:
@@ -5182,7 +5201,8 @@ def _unexpected_stderr(text: str) -> None:
     ],
 )
 async def test_native_log_reader_preserves_streams_across_ws_boundaries(
-    monkeypatch: pytest.MonkeyPatch, pieces: list[bytes],
+    monkeypatch: pytest.MonkeyPatch,
+    pieces: list[bytes],
 ) -> None:
     socket = RawLogWebSocket([*map(_raw_log_frame, pieces), _normal_log_close()])
     reader = _raw_log_reader(monkeypatch, socket)
@@ -5197,7 +5217,9 @@ async def test_native_log_reader_preserves_streams_across_ws_boundaries(
 @pytest.mark.parametrize("tail", [b"\x01", b"\xe2\x82"])
 @pytest.mark.parametrize("failure", [ClientConnectionError("receive dropped"), asyncio.CancelledError()])
 async def test_native_log_reader_does_not_flush_incomplete_data_on_failed_receive(
-    monkeypatch: pytest.MonkeyPatch, tail: bytes, failure: BaseException,
+    monkeypatch: pytest.MonkeyPatch,
+    tail: bytes,
+    failure: BaseException,
 ) -> None:
     socket = RawLogWebSocket([_raw_log_frame(b"\x01\x01\x01ok\n" + tail), failure])
     reader = _raw_log_reader(monkeypatch, socket)
@@ -5212,14 +5234,15 @@ async def test_native_log_reader_does_not_flush_incomplete_data_on_failed_receiv
     assert socket.closed
 
 
-
 async def test_native_log_reader_non_normal_close_reports_error_without_partial_flush(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    socket = RawLogWebSocket([
-        _raw_log_frame(b"\x01\x01\x01ok\n\x02"),
-        WSMessage(WSMsgType.CLOSE, 1011, "daemon failed"),
-    ])
+    socket = RawLogWebSocket(
+        [
+            _raw_log_frame(b"\x01\x01\x01ok\n\x02"),
+            WSMessage(WSMsgType.CLOSE, 1011, "daemon failed"),
+        ]
+    )
     reader = _raw_log_reader(monkeypatch, socket)
     stdout: list[str] = []
     with pytest.raises(DaytonaError, match="1011"):
@@ -5256,7 +5279,9 @@ async def test_native_log_reader_callback_failure_does_not_reemit_buffer(
     ids=["utf8-tail", "framing-prefix", "terminal-literal-control"],
 )
 async def test_daytona_native_watcher_normal_follow_close_replays_uncommitted_tail_from_snapshot(
-    monkeypatch: pytest.MonkeyPatch, first_frame: bytes, canonical: str,
+    monkeypatch: pytest.MonkeyPatch,
+    first_frame: bytes,
+    canonical: str,
 ) -> None:
     first = RawLogWebSocket([_raw_log_frame(first_frame), _normal_log_close()])
     second = RawLogWebSocket([_raw_log_frame(b"\x01\x01\x01" + canonical.encode()), _normal_log_close()])
@@ -5274,18 +5299,32 @@ async def test_daytona_native_watcher_normal_follow_close_replays_uncommitted_ta
     forwarded: list[str] = []
     closed = asyncio.Event()
     first_result = await daytona_module._watch_session_command(  # pyright: ignore[reportPrivateUsage]
-        cast(Any, client), inner.id, "session", "command", 0, 0, forwarded.append, closed,
+        cast(Any, client),
+        inner.id,
+        "session",
+        "command",
+        0,
+        0,
+        forwarded.append,
+        closed,
     )
     assert first_result[0] is None
     assert "".join(forwarded) == "ok\n"
     process.release_seen.set()
     second_result = await daytona_module._watch_session_command(  # pyright: ignore[reportPrivateUsage]
-        cast(Any, client), inner.id, "session", "command", first_result[1], first_result[2],
-        forwarded.append, closed,
+        cast(Any, client),
+        inner.id,
+        "session",
+        "command",
+        first_result[1],
+        first_result[2],
+        forwarded.append,
+        closed,
     )
     assert second_result[0] == 7
     assert "".join(forwarded) == canonical
     assert first.closed and second.closed
+
 
 async def test_daytona_native_watcher_malformed_follow_matches_final_snapshot_after_reopen(
     monkeypatch: pytest.MonkeyPatch,
@@ -5294,15 +5333,19 @@ async def test_daytona_native_watcher_malformed_follow_matches_final_snapshot_af
     stderr = "E\ufffd\ufffdZ|ERR-TAIL-9Z\n"
     raw_stdout = b"A\xe2\x82B\xe2\x82C|TAIL-9Z\n"
     raw_stderr = b"E\xf0\x90Z|ERR-TAIL-9Z\n"
-    first = RawLogWebSocket([
-        _raw_log_frame(b"\x01\x01\x01A\xe2"),
-        _raw_log_frame(b"\x82B\xe2\x82C|TAIL-9Z\n\x02\x02\x02" + raw_stderr),
-        _normal_log_close(),
-    ])
-    second = RawLogWebSocket([
-        _raw_log_frame(b"\x01\x01\x01" + raw_stdout + b"\x02\x02\x02" + raw_stderr),
-        _normal_log_close(),
-    ])
+    first = RawLogWebSocket(
+        [
+            _raw_log_frame(b"\x01\x01\x01A\xe2"),
+            _raw_log_frame(b"\x82B\xe2\x82C|TAIL-9Z\n\x02\x02\x02" + raw_stderr),
+            _normal_log_close(),
+        ]
+    )
+    second = RawLogWebSocket(
+        [
+            _raw_log_frame(b"\x01\x01\x01" + raw_stdout + b"\x02\x02\x02" + raw_stderr),
+            _normal_log_close(),
+        ]
+    )
     sockets = iter([first, second])
 
     async def open_ws(self: Any, url: str, headers: dict[str, str]) -> RawLogWebSocket:
@@ -5319,15 +5362,28 @@ async def test_daytona_native_watcher_malformed_follow_matches_final_snapshot_af
     closed = asyncio.Event()
 
     first_result = await daytona_module._watch_session_command(  # pyright: ignore[reportPrivateUsage]
-        cast(Any, client), inner.id, "session", "command", 0, 0, forwarded.append, closed,
+        cast(Any, client),
+        inner.id,
+        "session",
+        "command",
+        0,
+        0,
+        forwarded.append,
+        closed,
     )
     assert first_result == (None, len(stdout), len(stderr))
     assert "".join(forwarded) == stdout + stderr
 
     process.release_seen.set()
     second_result = await daytona_module._watch_session_command(  # pyright: ignore[reportPrivateUsage]
-        cast(Any, client), inner.id, "session", "command", first_result[1], first_result[2],
-        forwarded.append, closed,
+        cast(Any, client),
+        inner.id,
+        "session",
+        "command",
+        first_result[1],
+        first_result[2],
+        forwarded.append,
+        closed,
     )
     assert second_result == (7, len(stdout), len(stderr))
     assert "".join(forwarded) == process.stdout + process.stderr
@@ -5339,13 +5395,19 @@ async def test_daytona_native_watcher_replays_exact_stage_frame_after_raw_receiv
 ) -> None:
     marker = "VALKYRIE-STAGE/1 YWJj " + "a" * 64 + "\n"
     canonical = "hello\n" + marker + "界done\n"
-    first = RawLogWebSocket([
-        _raw_log_frame(b"\x01\x01\x01hello\n\x01"), ClientConnectionError("receive dropped"),
-    ])
-    second = RawLogWebSocket([
-        _raw_log_frame(b"\x01\x01\x01hello\n\x01\x01\x01"),
-        _raw_log_frame((marker + "界done\n").encode()), _normal_log_close(),
-    ])
+    first = RawLogWebSocket(
+        [
+            _raw_log_frame(b"\x01\x01\x01hello\n\x01"),
+            ClientConnectionError("receive dropped"),
+        ]
+    )
+    second = RawLogWebSocket(
+        [
+            _raw_log_frame(b"\x01\x01\x01hello\n\x01\x01\x01"),
+            _raw_log_frame((marker + "界done\n").encode()),
+            _normal_log_close(),
+        ]
+    )
     sockets = iter([first, second])
 
     async def open_ws(self: Any, url: str, headers: dict[str, str]) -> RawLogWebSocket:
@@ -5360,19 +5422,33 @@ async def test_daytona_native_watcher_replays_exact_stage_frame_after_raw_receiv
     forwarded: list[str] = []
     closed = asyncio.Event()
     first_result = await daytona_module._watch_session_command(  # pyright: ignore[reportPrivateUsage]
-        cast(Any, client), inner.id, "session", "command", 0, 0, forwarded.append, closed,
+        cast(Any, client),
+        inner.id,
+        "session",
+        "command",
+        0,
+        0,
+        forwarded.append,
+        closed,
     )
     assert first_result == (None, len("hello\n"), 0)
     assert "".join(forwarded) == "hello\n"
     process.release_seen.set()
     second_result = await daytona_module._watch_session_command(  # pyright: ignore[reportPrivateUsage]
-        cast(Any, client), inner.id, "session", "command", first_result[1], first_result[2],
-        forwarded.append, closed,
+        cast(Any, client),
+        inner.id,
+        "session",
+        "command",
+        first_result[1],
+        first_result[2],
+        forwarded.append,
+        closed,
     )
     assert second_result == (7, len(canonical), 0)
     assert "".join(forwarded) == canonical
     assert "".join(forwarded).count(marker) == 1
     assert first.closed and second.closed
+
 
 class LocalNativeShellCgroupProcess(CgroupProcess):
     def __init__(self, root: Path) -> None:
@@ -5414,16 +5490,22 @@ class LocalNativeShellCgroupProcess(CgroupProcess):
     async def execute_session_command(self, session_id: str, req: Any) -> SimpleNamespace:
         result = await super().execute_session_command(session_id, req)
         local_command = req.command.replace(self.remote_group, str(self.group)).replace(
-            daytona_module._STATUS_DIR, str(self.status)  # pyright: ignore[reportPrivateUsage]
+            daytona_module._STATUS_DIR,
+            str(self.status),  # pyright: ignore[reportPrivateUsage]
         )
         self.worker = await asyncio.create_subprocess_exec(
-            "/bin/sh", "-c", local_command,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+            "/bin/sh",
+            "-c",
+            local_command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
         )
         return result
 
     async def get_session_command_logs_async(
-        self, session_id: str, command_id: str,
+        self,
+        session_id: str,
+        command_id: str,
         on_stdout: Callable[[str], Awaitable[None]],
         on_stderr: Callable[[str], Awaitable[None]],
     ) -> None:
@@ -5444,7 +5526,8 @@ async def test_daytona_native_shell_preserves_cwd_env_and_exit(tmp_path: Path) -
     cwd.mkdir()
     workload = _cgroup_sandbox(process).controlled_workload(
         'printf "cwd:%s|env:%s\n" "$PWD" "$CBS_TOKEN"; exit 17',
-        cwd=str(cwd), env_vars={"CBS_TOKEN": "one two"},
+        cwd=str(cwd),
+        env_vars={"CBS_TOKEN": "one two"},
     )
     completed = await asyncio.wait_for(workload.wait(), 5)
     assert completed.result.exit_code == 17
@@ -5474,7 +5557,8 @@ async def test_daytona_native_long_episode_command_preserves_payload(tmp_path: P
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
 async def test_daytona_native_command_gets_stdin_eof_with_parent_pipe_open(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     process = LocalNativeShellCgroupProcess(tmp_path)
     read_fd, write_fd = os.pipe()
@@ -5537,7 +5621,9 @@ async def test_daytona_native_exit_completes_while_follow_reader_is_open(
             self.status_polled = asyncio.Event()
 
         async def get_session_command_logs_async(
-            self, session_id: str, command_id: str,
+            self,
+            session_id: str,
+            command_id: str,
             on_stdout: Callable[[str], Awaitable[None]],
             on_stderr: Callable[[str], Awaitable[None]],
         ) -> None:
@@ -5621,7 +5707,9 @@ async def test_daytona_stop_wins_during_follow_cancel_join(monkeypatch: pytest.M
             self.allow_follow_close = asyncio.Event()
 
         async def get_session_command_logs_async(
-            self, session_id: str, command_id: str,
+            self,
+            session_id: str,
+            command_id: str,
             on_stdout: Callable[[str], Awaitable[None]],
             on_stderr: Callable[[str], Awaitable[None]],
         ) -> None:
@@ -5833,7 +5921,6 @@ async def test_daytona_concurrent_kills_share_native_close_replacement_after_can
     assert process.sessions == set()
 
 
-
 @pytest.mark.usefixtures("_fake_cgroup_follow")
 async def test_daytona_cleanup_retries_failed_close_after_provider_recovers() -> None:
     class FailedConfirmationProcess(CgroupProcess):
@@ -5949,7 +6036,9 @@ async def test_daytona_output_consumer_waits_for_confirmed_group_stop() -> None:
             self.allow_follow_close = asyncio.Event()
 
         async def get_session_command_logs_async(
-            self, session_id: str, command_id: str,
+            self,
+            session_id: str,
+            command_id: str,
             on_stdout: Callable[[str], Awaitable[None]],
             on_stderr: Callable[[str], Awaitable[None]],
         ) -> None:
@@ -5978,7 +6067,6 @@ async def test_daytona_output_consumer_waits_for_confirmed_group_stop() -> None:
     assert process.sessions == set()
 
 
-
 @pytest.mark.usefixtures("_fake_cgroup_follow")
 async def test_daytona_output_cancellation_does_not_stop_admitted_work() -> None:
     process = CgroupProcess()
@@ -6003,7 +6091,9 @@ async def test_daytona_output_cancellation_does_not_stop_admitted_work() -> None
 async def test_daytona_native_stream_keeps_bounded_result_tail(split_frames: bool) -> None:
     class LargeOutputProcess(CgroupProcess):
         async def get_session_command_logs_async(
-            self, session_id: str, command_id: str,
+            self,
+            session_id: str,
+            command_id: str,
             on_stdout: Callable[[str], Awaitable[None]],
             on_stderr: Callable[[str], Awaitable[None]],
         ) -> None:
@@ -6028,8 +6118,7 @@ async def test_daytona_native_stream_keeps_bounded_result_tail(split_frames: boo
     assert completed.result.output.endswith("final frame")
     assert "chunk-00:" not in completed.result.output
     assert len(completed.result.output.encode("utf-8")) <= 64 * 1024
-    assert completed.result.output == streamed.encode("utf-8")[-64 * 1024:].decode("utf-8", errors="ignore")
-
+    assert completed.result.output == streamed.encode("utf-8")[-64 * 1024 :].decode("utf-8", errors="ignore")
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
@@ -6049,6 +6138,7 @@ async def test_daytona_failed_cgroup_stop_keeps_output_consumer_open() -> None:
     process.release_seen.set()
     assert await asyncio.wait_for(pending, 2) == "final frame"
     await stream.aclose()
+
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
 async def test_daytona_cancelled_wait_does_not_interrupt_shared_kill_cleanup() -> None:
@@ -6093,7 +6183,9 @@ async def test_daytona_queued_output_remains_consumable_after_confirmed_stop() -
             self.output_buffered = asyncio.Event()
 
         async def get_session_command_logs_async(
-            self, session_id: str, command_id: str,
+            self,
+            session_id: str,
+            command_id: str,
             on_stdout: Callable[[str], Awaitable[None]],
             on_stderr: Callable[[str], Awaitable[None]],
         ) -> None:
@@ -6102,7 +6194,10 @@ async def test_daytona_queued_output_remains_consumable_after_confirmed_stop() -
                 self.output_buffered.set()
 
             await super().get_session_command_logs_async(
-                session_id, command_id, buffered_stdout, on_stderr,
+                session_id,
+                command_id,
+                buffered_stdout,
+                on_stderr,
             )
 
     process = BufferedOutputProcess()
@@ -6122,7 +6217,9 @@ async def test_daytona_queued_output_remains_consumable_after_confirmed_stop() -
 async def test_daytona_kill_when_observer_is_disconnected() -> None:
     class DisconnectedProcess(CgroupProcess):
         async def get_session_command_logs_async(
-            self, session_id: str, command_id: str,
+            self,
+            session_id: str,
+            command_id: str,
             on_stdout: Callable[[str], Awaitable[None]],
             on_stderr: Callable[[str], Awaitable[None]],
         ) -> None:
@@ -6193,8 +6290,11 @@ async def test_daytona_lost_cgroup_mkdir_reply_replays_owned_creation(tmp_path: 
                 remote_group = shlex.split(plain)[-1]
                 local_command = plain.replace(remote_group, shlex.quote(str(self.local_group)))
                 mkdir = await asyncio.create_subprocess_exec(
-                    "/bin/sh", "-c", local_command,
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+                    "/bin/sh",
+                    "-c",
+                    local_command,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
                 )
                 output, _ = await mkdir.communicate()
                 self.group_exists = self.local_group.exists()
@@ -6223,7 +6323,9 @@ async def test_daytona_lost_cgroup_mkdir_reply_replays_owned_creation(tmp_path: 
 async def test_daytona_confirmed_sandbox_loss_surfaces_not_found() -> None:
     class LostSandboxProcess(CgroupProcess):
         async def get_session_command_logs_async(
-            self, session_id: str, command_id: str,
+            self,
+            session_id: str,
+            command_id: str,
             on_stdout: Callable[[str], Awaitable[None]],
             on_stderr: Callable[[str], Awaitable[None]],
         ) -> None:
@@ -6248,7 +6350,9 @@ async def test_daytona_sandbox_loss_precedes_distinct_cgroup_cleanup_failure(
 ) -> None:
     class LostSandboxProcess(CgroupProcess):
         async def get_session_command_logs_async(
-            self, session_id: str, command_id: str,
+            self,
+            session_id: str,
+            command_id: str,
             on_stdout: Callable[[str], Awaitable[None]],
             on_stderr: Callable[[str], Awaitable[None]],
         ) -> None:
@@ -6275,7 +6379,8 @@ async def test_daytona_sandbox_loss_precedes_distinct_cgroup_cleanup_failure(
     native_workload = cast(daytona_module._DaytonaControlledWorkload, workload)  # pyright: ignore[reportPrivateUsage]
     assert raised.value is native_workload._run_task.exception()  # pyright: ignore[reportPrivateUsage]
     cleanup_errors = [
-        record for record in caplog.records
+        record
+        for record in caplog.records
         if record.name == daytona_module.__name__ and record.levelno == logging.ERROR
     ]
     assert len(cleanup_errors) == 1
@@ -6287,7 +6392,8 @@ async def test_daytona_sandbox_loss_precedes_distinct_cgroup_cleanup_failure(
 @pytest.mark.usefixtures("_fake_cgroup_follow")
 @pytest.mark.parametrize("state", [SandboxState.STOPPED, SandboxState.ERROR])
 async def test_daytona_native_watcher_terminates_on_existing_dead_sandbox_state(
-    monkeypatch: pytest.MonkeyPatch, state: SandboxState,
+    monkeypatch: pytest.MonkeyPatch,
+    state: SandboxState,
 ) -> None:
     monkeypatch.setattr(daytona_module, "_SESSION_WATCH_REOPEN_SECONDS", 0.01)
 
@@ -6310,6 +6416,7 @@ async def test_daytona_native_watcher_terminates_on_existing_dead_sandbox_state(
             if observed.state == state:
                 self.dead_observed.set()
             return observed
+
     process = UnavailableProcess()
     process.allow_creation.set()
     inner = InnerSandbox()
@@ -6363,10 +6470,10 @@ class NestedCgroupProcess(CgroupProcess):
         self.removal_bin.mkdir()
         wrapper = self.removal_bin / "rmdir"
         wrapper.write_text(
-            '#!/bin/sh\nfor dir do\n'
+            "#!/bin/sh\nfor dir do\n"
             '  rm -f "$dir/cgroup.events" "$dir/cgroup.kill" "$dir/cgroup.procs"\n'
             '  PATH=/usr/bin:/bin rmdir "$dir" || exit $?\n'
-            'done\n'
+            "done\n"
         )
         wrapper.chmod(0o700)
 
@@ -6385,7 +6492,10 @@ class NestedCgroupProcess(CgroupProcess):
             self.removal_started.set()
             shell = plain.replace(self.group_name, str(self.root))
             process = await asyncio.create_subprocess_exec(
-                "/bin/sh", "-c", shell, stdout=asyncio.subprocess.PIPE,
+                "/bin/sh",
+                "-c",
+                shell,
+                stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
                 env={**os.environ, "PATH": f"{self.removal_bin}:{os.environ['PATH']}"},
             )

@@ -80,17 +80,11 @@ def test_scope_binds_and_restores_even_after_an_error() -> None:
     assert current_request_attribution() is None
 
 
-def test_headers_are_read_case_insensitively_and_missing_values_stay_none() -> None:
+def test_missing_headers_stay_none() -> None:
     assert attribution_from_request(HEADERS, task_id="task-1") == BOUND
-    lowered = {name.lower(): value for name, value in HEADERS.items()}
-    assert attribution_from_request(lowered, task_id="task-1") == BOUND
     assert attribution_from_request({}, task_id="task-1") == RequestAttribution(
         run_id=None, task_id="task-1", attempt_id=None
     )
-
-
-def test_explicit_attempt_id_wins_over_the_header() -> None:
-    assert attribution_from_request(HEADERS, task_id="task-1", attempt_id="attempt-2").attempt_id == "attempt-2"
 
 
 def test_environment_carries_only_known_ids() -> None:

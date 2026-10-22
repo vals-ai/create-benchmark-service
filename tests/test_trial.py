@@ -73,8 +73,11 @@ def test_sanitize_v1_eval_preserves_error_status_but_drops_error_text() -> None:
 
 def test_sanitize_v1_eval_handles_null_result() -> None:
     resp = V1EvalResponse(
-        run_id="run-1", task_id="t", status=V1EvalStatus.DID_NOT_COMPLETE,
-        result=None, errors=[],
+        run_id="run-1",
+        task_id="t",
+        status=V1EvalStatus.DID_NOT_COMPLETE,
+        result=None,
+        errors=[],
     )
     out = sanitize_v1_eval_response(resp, _project)
     assert out.result is None
@@ -105,13 +108,15 @@ class _TrialResultBenchmark(StubBenchmark):
 
     async def list_tasks(self, dataset: str | None = None) -> list[V1Task]:
         return [
-            V1Task.model_validate({
-                "id": "task-1",
-                "question": "What is 1+1?",
-                "timeout": 60,
-                "rubric_hint": "answer is 2",
-                "judge_model": "claude-sonnet-4-6",
-            })
+            V1Task.model_validate(
+                {
+                    "id": "task-1",
+                    "question": "What is 1+1?",
+                    "timeout": 60,
+                    "rubric_hint": "answer is 2",
+                    "judge_model": "claude-sonnet-4-6",
+                }
+            )
         ]
 
     def get_dataset_version(self, dataset: str | None = None) -> str | None:
@@ -216,8 +221,12 @@ def all_pass_trial_client(monkeypatch: pytest.MonkeyPatch) -> Generator[TestClie
 def test_v1_evaluate_sanitizes_response_for_trial_tenant(trial_client: TestClient) -> None:
     resp = trial_client.post(
         "/v1/evaluate",
-        json={"run_id": "r1", "task_id": "task-1", "dataset": "default",
-              "payload": {"type": "text", "schema": "stub.text.v1", "data": "2"}},
+        json={
+            "run_id": "r1",
+            "task_id": "task-1",
+            "dataset": "default",
+            "payload": {"type": "text", "schema": "stub.text.v1", "data": "2"},
+        },
         headers={"x-descope-api-key": "trial-key"},
     )
     assert resp.status_code == 200
@@ -229,8 +238,11 @@ def test_v1_evaluate_sanitizes_response_for_trial_tenant(trial_client: TestClien
 def test_v1_score_sanitizes_response_for_trial_tenant(trial_client: TestClient) -> None:
     resp = trial_client.post(
         "/v1/score",
-        json={"run_id": "r1", "dataset": "default",
-              "evaluation_results": {"task-1": {"status": "evaluated", "result": {"resolved": True}}}},
+        json={
+            "run_id": "r1",
+            "dataset": "default",
+            "evaluation_results": {"task-1": {"status": "evaluated", "result": {"resolved": True}}},
+        },
         headers={"x-descope-api-key": "trial-key"},
     )
     assert resp.status_code == 200
@@ -244,8 +256,12 @@ def test_trial_eval_projection_preserves_fields_used_by_final_score(
 ) -> None:
     eval_resp = all_pass_trial_client.post(
         "/v1/evaluate",
-        json={"run_id": "r1", "task_id": "task-1", "dataset": "default",
-              "payload": {"type": "text", "schema": "stub.text.v1", "data": "answer"}},
+        json={
+            "run_id": "r1",
+            "task_id": "task-1",
+            "dataset": "default",
+            "payload": {"type": "text", "schema": "stub.text.v1", "data": "answer"},
+        },
         headers={"x-descope-api-key": "trial-key"},
     )
     assert eval_resp.status_code == 200
@@ -254,8 +270,11 @@ def test_trial_eval_projection_preserves_fields_used_by_final_score(
 
     score_resp = all_pass_trial_client.post(
         "/v1/score",
-        json={"run_id": "r1", "dataset": "default",
-              "evaluation_results": {"task-1": {"status": "evaluated", "result": eval_result}}},
+        json={
+            "run_id": "r1",
+            "dataset": "default",
+            "evaluation_results": {"task-1": {"status": "evaluated", "result": eval_result}},
+        },
         headers={"x-descope-api-key": "trial-key"},
     )
     assert score_resp.status_code == 200
@@ -265,12 +284,16 @@ def test_trial_eval_projection_preserves_fields_used_by_final_score(
 
 
 def test_internal_error_does_not_leak_traceback(trial_client: TestClient) -> None:
-    with patch.object(_TrialResultBenchmark, "calculate_final_score",
-                      side_effect=Exception("boom at /srv/legal/rubric.py:42")):
+    with patch.object(
+        _TrialResultBenchmark, "calculate_final_score", side_effect=Exception("boom at /srv/legal/rubric.py:42")
+    ):
         resp = trial_client.post(
             "/v1/score",
-            json={"run_id": "r1", "dataset": "default",
-                  "evaluation_results": {"task-1": {"status": "evaluated", "result": {"resolved": True}}}},
+            json={
+                "run_id": "r1",
+                "dataset": "default",
+                "evaluation_results": {"task-1": {"status": "evaluated", "result": {"resolved": True}}},
+            },
             headers={"x-descope-api-key": "trial-key"},
         )
     assert resp.status_code == 500

@@ -126,7 +126,8 @@ async def test_resolve_caller_tenant_rejects_static_bearer_key(
 
 @pytest.mark.parametrize("auth_required", [None, "false"])
 async def test_resolve_caller_tenant_returns_sentinel_when_auth_not_required(
-    monkeypatch: pytest.MonkeyPatch, auth_required: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+    auth_required: str | None,
 ) -> None:
     if auth_required is None:
         monkeypatch.delenv("AUTH_REQUIRED", raising=False)

@@ -176,9 +176,7 @@ def _require_size_within_limit(size: object, key: str, limit: int) -> int:
     if not isinstance(size, int) or isinstance(size, bool) or size < 0:
         raise RuntimeError(f"S3 returned an invalid size for artifact {key}")
     if size > limit:
-        raise SubmissionArtifactTooLarge(
-            f"artifact {key} is {size} bytes, over the {limit}-byte download limit"
-        )
+        raise SubmissionArtifactTooLarge(f"artifact {key} is {size} bytes, over the {limit}-byte download limit")
     return size
 
 
@@ -306,9 +304,7 @@ async def materialize(
     """Stream an admitted artifact to a temporary file owned by the framework."""
     temporary_directory = tempfile.TemporaryDirectory(prefix="benchmark-submission-artifact-")
     try:
-        artifact = await run_blocking(
-            partial(_materialize_sync, reference, tenant, Path(temporary_directory.name))
-        )
+        artifact = await run_blocking(partial(_materialize_sync, reference, tenant, Path(temporary_directory.name)))
         yield artifact
     finally:
         await run_blocking(temporary_directory.cleanup)

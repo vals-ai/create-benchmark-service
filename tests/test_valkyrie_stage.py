@@ -1,4 +1,5 @@
 """Exercise stage reporting, agent rendering, and process-group lifecycle."""
+
 # pyright: reportPrivateUsage=false
 import base64
 import ctypes
@@ -81,7 +82,6 @@ def test_stage_reporter_retransmits_identical_signed_frames_until_ack(
         }
 
 
-
 class Reporter:
     def __init__(self) -> None:
         self.events: list[tuple[str, str | None]] = []
@@ -122,7 +122,9 @@ def test_commands_render_only_bound_tokens_once(tmp_path: Path, monkeypatch: pyt
     observation = tmp_path / "observation-{slot_dir}"
     observation.write_text("observed")
     first = "printf '%s\\n' '{\"json\": {\"ok\": true}}' '{problem_statement_path}' '{task_id}' > '{slot_dir}/first'"
-    continuation = "printf '%s\\n' '{\"json\": {\"ok\": true}}' '{problem_statement_path}' '{task_id}' > '{slot_dir}/next'"
+    continuation = (
+        "printf '%s\\n' '{\"json\": {\"ok\": true}}' '{problem_statement_path}' '{task_id}' > '{slot_dir}/next'"
+    )
     worker, reporter = agents(
         tmp_path,
         monkeypatch,
@@ -134,11 +136,19 @@ def test_commands_render_only_bound_tokens_once(tmp_path: Path, monkeypatch: pyt
     slot_dir = slot_root / "one" / "agent"
     worker.start("one", str(observation))
     assert worker.wait_any() == valkyrie_stage.SlotResult("one", "exited", 0)
-    assert (slot_dir / "first").read_text().splitlines() == ['{"json": {"ok": true}}', str(observation), "benchmark-task-123"]
+    assert (slot_dir / "first").read_text().splitlines() == [
+        '{"json": {"ok": true}}',
+        str(observation),
+        "benchmark-task-123",
+    ]
     assert (slot_root / "one" / "turns" / "1" / "first").read_text() == (slot_dir / "first").read_text()
     worker.start("one", str(observation))
     assert worker.wait_any() == valkyrie_stage.SlotResult("one", "exited", 0)
-    assert (slot_dir / "next").read_text().splitlines() == ['{"json": {"ok": true}}', str(observation), "benchmark-task-123"]
+    assert (slot_dir / "next").read_text().splitlines() == [
+        '{"json": {"ok": true}}',
+        str(observation),
+        "benchmark-task-123",
+    ]
     assert reporter.events == [("begin", None), ("end", None)] * 2
 
 
@@ -193,6 +203,7 @@ def test_failed_no_process_start_balances_interval_and_later_explicit_start(
 
             fault.setattr(valkyrie_stage.os, "pipe", fail_pipe)
         elif failure == "owner":
+
             def fail_owner(*args: object, **kwargs: object) -> None:
                 raise OSError(errno.ENOENT, "owner unavailable", sys.executable)
 
@@ -215,9 +226,7 @@ def test_failed_no_process_start_balances_interval_and_later_explicit_start(
     assert reporter.events == [("begin", None), ("end", None)] * 2
 
 
-def test_uncertain_owner_readiness_does_not_close_interval(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_uncertain_owner_readiness_does_not_close_interval(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     worker, reporter = agents(tmp_path, monkeypatch)
     original_popen = subprocess.Popen
 
@@ -236,7 +245,6 @@ def test_uncertain_owner_readiness_does_not_close_interval(
     assert not worker._active
 
 
-
 def test_failed_parallel_start_does_not_end_other_slots_interval(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -244,6 +252,7 @@ def test_failed_parallel_start_does_not_end_other_slots_interval(
     worker.start("one", "observation")
     try:
         with monkeypatch.context() as fault:
+
             def fail_owner(*args: object, **kwargs: object) -> None:
                 raise OSError(errno.ENOENT, "owner unavailable", sys.executable)
 
@@ -266,19 +275,21 @@ def test_named_container_cleanup_resumes_only_on_later_call(
     listed = tmp_path / "first-list"
     docker.write_text(
         "#!/bin/sh\n"
-        "if [ \"$1\" = container ]; then\n"
+        'if [ "$1" = container ]; then\n'
         f"  if [ ! -e '{listed}' ]; then touch '{listed}'; printf 'box-one\\n'; fi\n"
         "fi\n"
     )
     docker.chmod(0o755)
     monkeypatch.setenv("PATH", f"{tmp_path}:{os.environ['PATH']}")
     output = tmp_path / "slots" / "one" / "agent" / "result"
-    command = "printf 'owned-result' > '{slot_dir}/result'; " + (
-        "exit 23" if mode == "natural" else "exec sleep 30"
-    )
+    command = "printf 'owned-result' > '{slot_dir}/result'; " + ("exit 23" if mode == "natural" else "exec sleep 30")
     worker, reporter = agents(
-        tmp_path, monkeypatch, run_cmd=command, container_name="box-{slot}",
-        parallel_agents=1, final_output="{slot_dir}/result",
+        tmp_path,
+        monkeypatch,
+        run_cmd=command,
+        container_name="box-{slot}",
+        parallel_agents=1,
+        final_output="{slot_dir}/result",
     )
     worker.start("one", "observation")
     owner = worker._active["one"].process
@@ -303,7 +314,8 @@ def test_named_container_cleanup_resumes_only_on_later_call(
             "exited" if mode == "natural" else "stopped" if mode == "stop" else "exhausted"
         )
         assert worker.wait_any() == valkyrie_stage.SlotResult(
-            "one", reason,
+            "one",
+            reason,
             23 if mode == "natural" else -signal.SIGKILL,
         )
         assert reporter.events == [("begin", "box-one"), ("end", None)]
@@ -416,11 +428,8 @@ def _wait_for_root_exit(worker: valkyrie_stage.Agents) -> None:
         time.sleep(0.01)
 
 
-
 @pytest.mark.parametrize("mode", ["natural", "stop", "exhausted"])
-def test_detached_child_is_reaped_before_stage_end(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str
-) -> None:
+def test_detached_child_is_reaped_before_stage_end(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
     slot_dir = tmp_path / "slots" / "one" / "agent"
     slot_dir.mkdir(parents=True)
     gate = slot_dir / "go"
@@ -512,11 +521,7 @@ def test_detached_child_is_reaped_before_stage_end(
                 os.close(root_fd)
 
 
-
-
-def test_sigint_grace_waits_for_child_after_root_exit(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_sigint_grace_waits_for_child_after_root_exit(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     slot_dir = tmp_path / "slots" / "one" / "agent"
     slot_dir.mkdir(parents=True)
     gate = slot_dir / "grace-go"
@@ -633,6 +638,7 @@ def test_sigint_grace_waits_for_child_after_root_exit(
                     os.close(child_fd)
                 if root_fd is not None and root_fd >= 0:
                     os.close(root_fd)
+
 
 @pytest.mark.parametrize(
     ("mode", "expected"),

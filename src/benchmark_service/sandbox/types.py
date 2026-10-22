@@ -293,6 +293,10 @@ class ControlledWorkloadResult:
 
 class ControlledWorkload(ABC):
 
+    @property
+    @abstractmethod
+    def agent_absence_confirmed_at(self) -> float | None: ...
+
     @abstractmethod
     def output(self) -> AsyncGenerator[str, None]: ...
 

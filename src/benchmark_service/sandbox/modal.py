@@ -475,6 +475,11 @@ class _ModalControlledWorkload(ControlledWorkload):
         self._cleanup_task: asyncio.Task[None] | None = None
         self._read_task: asyncio.Task[None] | None = None
         self._process_wait_task: asyncio.Task[int] | None = None
+        self._agent_absence_confirmed_at: float | None = None
+
+    @property
+    def agent_absence_confirmed_at(self) -> float | None:
+        return self._agent_absence_confirmed_at
 
     async def _launch(self) -> None:
         command = f"cd {shlex.quote(self._cwd)} && {self._command}" if self._cwd else self._command
@@ -569,8 +574,9 @@ class _ModalControlledWorkload(ControlledWorkload):
                 await self._process_wait_task
                 raise SandboxError("Modal workload finished without a process-group marker")
             await asyncio.sleep(0.05)
+        self._agent_absence_confirmed_at = asyncio.get_running_loop().time()
         self._cleanup_task = asyncio.create_task(self._cleanup())
-        return asyncio.get_running_loop().time(), int(stopped.output.strip()) if stopped.output.strip() else None
+        return self._agent_absence_confirmed_at, int(stopped.output.strip()) if stopped.output.strip() else None
 
     async def _cleanup(self) -> None:
         assert self._process_wait_task is not None

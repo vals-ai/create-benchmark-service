@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-from contextlib import aclosing
 from collections.abc import AsyncGenerator, Iterator, Mapping
 from typing import Any, cast
 
@@ -23,6 +22,8 @@ from benchmark_service.sandbox import (
     VolumeMount,
 )
 from benchmark_service.schemas import (
+    BenchmarkEgressPlan,
+    EgressPolicy,
     EvalSandboxSpec,
     EvaluateResponseRequest,
     RetrieveTaskResponse,
@@ -346,54 +347,6 @@ async def test_a_retry_resumes_from_the_latest_progress_and_saves_under_the_same
     assert resumed[-1].data == {"calls": 2}
 
 
-class _SavedHookBenchmark(HookBenchmark):
-    released: list[str]
-
-    async def grading_input_saved(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> None:
-        self.released.append(sandbox.id)
-
-
-async def _saved_service(s3: _FakeS3, cls: type[_SavedHookBenchmark] = _SavedHookBenchmark) -> _SavedHookBenchmark:
-    service = await cls.create()
-    service.graded, service.released = [], []
-    service.eval_resume_store = EvalResumeStore(s3_client=s3)
-    return service
-
-
-async def test_grading_input_saved_runs_once_after_the_first_save_and_before_grading(s3: _FakeS3) -> None:
-    events: list[str] = []
-
-    class _Ordered(HookBenchmark):
-        async def grading_input_saved(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> None:
-            events.append(f"released {sandbox.id}")
-
-        async def grade_input(
-            self, task_id: str, content: bytes, dataset: str | None = None
-        ) -> AsyncGenerator[StreamChunk | GradingInput, None]:
-            events.append("grading")
-            yield GradingInput(b"{}")
-            yield StreamResultChunk(type="result", data={})
-
-    service = await _Ordered.create()
-    service.eval_resume_store = EvalResumeStore(s3_client=s3)
-
-    async for chunk in service.evaluate_instance("task-1", cast(Sandbox, _Sandbox())):
-        events.append(chunk.type)
-
-    assert events == ["eval_resume_state", "released sandbox-1", "grading", "eval_resume_state", "result"]
-
-
-async def test_grading_input_saved_does_not_run_when_the_save_fails(
-    s3: _FakeS3, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    service = await _saved_service(s3)
-    monkeypatch.delenv("EVAL_RESUME_BUCKET")
-
-    with pytest.raises(RuntimeError, match="EVAL_RESUME_BUCKET"):
-        await _drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox())))
-    assert service.released == []
-
-
 async def test_load_grading_input_returns_the_checked_bytes(s3: _FakeS3) -> None:
     first = await _service(s3)
     checkpoint = (await _drain(first.evaluate_instance("task-1", cast(Sandbox, _Sandbox()))))[0].data
@@ -432,20 +385,26 @@ class _GradingSandbox:
         self.id = sandbox_id
         self.labels: dict[str, str] = {}
         self.files: dict[str, bytes] = {}
+        self.allowlists: list[list[str]] = []
 
     async def upload_file(self, remote_path: str, content: bytes) -> None:
         self.files[remote_path] = content
+
+    async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
+        self.allowlists.append(allowed_addresses)
 
 
 class _Provider:
     def __init__(self) -> None:
         self.created: list[SandboxCreateRequest] = []
+        self.sandboxes: list[_GradingSandbox] = []
         self.deleted: list[str] = []
         self.borrowed = _GradingSandbox("caller-owned")
 
     async def create_sandbox(self, request: SandboxCreateRequest) -> _GradingSandbox:
         self.created.append(request)
-        return _GradingSandbox(f"fresh-{len(self.created)}")
+        self.sandboxes.append(_GradingSandbox(f"fresh-{len(self.created)}"))
+        return self.sandboxes[-1]
 
     async def get_sandbox(self, instance_id: str) -> _GradingSandbox:
         assert instance_id == self.borrowed.id
@@ -506,7 +465,7 @@ async def test_grade_in_sandbox_retries_in_a_fresh_sandbox_and_deletes_it(s3: _F
     assert (created.source, created.resources, created.auto_stop_interval, created.create_timeout) == (
         ImageSource(image="python:3.12-slim"),
         Resources(vcpu=2, memory=4, disk=10),
-        30,
+        40,
         600,
     )
     assert (created.labels["Benchmark"], created.labels["Id"], created.labels["Task"]) == (
@@ -741,71 +700,6 @@ async def test_an_ungradeable_input_streams_its_error_and_saves_nothing(s3: _Fak
     assert (s3.objects, service.graded) == ({}, [])
 
 
-async def test_grading_input_saved_runs_when_the_caller_hangs_up_at_the_checkpoint(s3: _FakeS3) -> None:
-    service = await _saved_service(s3)
-
-    async with aclosing(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox()))) as chunks:
-        assert (await anext(chunks)).type == "eval_resume_state"
-
-    assert (service.released, service.graded) == (["sandbox-1"], [])
-
-
-class _BlockingRelease(_SavedHookBenchmark):
-    releasing: asyncio.Event
-    finish: asyncio.Event
-    fail = False
-
-    async def grading_input_saved(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> None:
-        self.releasing.set()
-        await self.finish.wait()
-        if self.fail:
-            raise RuntimeError("release failed")
-        self.released.append(sandbox.id)
-
-
-async def _cancel_while_releasing(s3: _FakeS3, fail: bool = False, cancels: int = 1) -> _BlockingRelease:
-    service = cast(_BlockingRelease, await _saved_service(s3, _BlockingRelease))
-    service.releasing, service.finish, service.fail = asyncio.Event(), asyncio.Event(), fail
-
-    task = asyncio.create_task(_drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox()))))
-    await service.releasing.wait()
-    for _ in range(cancels):
-        task.cancel()
-        await asyncio.sleep(0)
-    service.finish.set()
-    with pytest.raises(asyncio.CancelledError):
-        await task
-    return service
-
-
-@pytest.mark.parametrize("cancels", [1, 2])
-async def test_grading_input_saved_finishes_when_the_stream_is_cancelled_during_it(s3: _FakeS3, cancels: int) -> None:
-    service = await _cancel_while_releasing(s3, cancels=cancels)
-    assert (service.released, service.graded) == (["sandbox-1"], [])
-
-
-async def test_a_failed_grading_input_saved_during_cancellation_is_logged_and_the_cancellation_kept(
-    s3: _FakeS3, caplog: pytest.LogCaptureFixture
-) -> None:
-    await _cancel_while_releasing(s3, fail=True)
-    assert "grading_input_saved failed for task-1" in caplog.text
-
-
-async def test_a_failed_grading_input_saved_is_logged_and_grading_continues(
-    s3: _FakeS3, caplog: pytest.LogCaptureFixture
-) -> None:
-    class _FailingRelease(_SavedHookBenchmark):
-        async def grading_input_saved(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> None:
-            raise RuntimeError("release failed")
-
-    service = await _saved_service(s3, _FailingRelease)
-
-    chunks = await _drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox())))
-
-    assert [chunk.type for chunk in chunks] == ["eval_resume_state", "result"]
-    assert "grading_input_saved failed for task-1" in caplog.text
-
-
 class _VerifierGrader(_SandboxGrader):
     spec = EvalSandboxSpec(source=ImageSource(image="verifier:sha256-abc"), timeout_s=3600)
     resume_sandbox: EvalSandboxSpec | None = None
@@ -859,25 +753,6 @@ async def test_a_tasks_eval_sandbox_needs_a_sandbox_provider_on_the_first_attemp
     assert service.graded_in == []
 
 
-async def test_a_hung_grading_input_saved_is_abandoned_after_the_teardown_bound(
-    s3: _FakeS3, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    class _HungRelease(_SavedHookBenchmark):
-        async def grading_input_saved(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> None:
-            await asyncio.Event().wait()
-
-    monkeypatch.setattr(base, "TEARDOWN_TIMEOUT_S", 0.01)
-    service = await _saved_service(s3, _HungRelease)
-
-    grading = asyncio.create_task(_drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox()))))
-    done, _ = await asyncio.wait({grading}, timeout=5)
-    assert done == {grading}
-    chunks = grading.result()
-
-    assert [chunk.type for chunk in chunks] == ["eval_resume_state", "result"]
-    assert "grading_input_saved failed for task-1" in caplog.text
-
-
 @pytest.mark.parametrize(
     ("spec", "expected"),
     [
@@ -906,7 +781,7 @@ async def test_an_eval_sandbox_falls_back_to_the_task_and_follows_its_own_fields
     assert (created.source, created.resources, created.network_block_all, created.auto_stop_interval) == expected
 
 
-async def test_a_retry_without_eval_sandbox_blocks_the_network_as_grading_sandboxes_do(s3: _FakeS3) -> None:
+async def test_a_retry_of_a_task_that_declares_no_evaluation_egress_blocks_the_network(s3: _FakeS3) -> None:
     checkpoint = await _sandbox_checkpoint(s3)
     retry, provider = await _sandbox_service(s3), _Provider()
     request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=checkpoint)
@@ -964,68 +839,32 @@ async def test_a_retry_with_eval_sandbox_grades_fresh_even_when_the_task_declare
     assert (retry.graded_in, provider.deleted) == (["fresh-1"], ["fresh-1"])
 
 
-async def test_a_cancelled_create_slower_than_the_teardown_bound_is_still_deleted(
+async def test_a_cancelled_create_is_abandoned_at_the_teardown_bound(
     s3: _FakeS3, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    class _SlowCreate(_Provider):
+    class _HungCreate(_Provider):
         def __init__(self) -> None:
             super().__init__()
             self.creating = asyncio.Event()
 
         async def create_sandbox(self, request: SandboxCreateRequest) -> _GradingSandbox:
             self.creating.set()
-            await asyncio.sleep(0.05)
+            await asyncio.Event().wait()
             return await super().create_sandbox(request)
 
     monkeypatch.setattr(base, "TEARDOWN_TIMEOUT_S", 0.01)
     checkpoint = await _sandbox_checkpoint(s3)
-    retry, provider = await _sandbox_service(s3), _SlowCreate()
+    retry, provider = await _sandbox_service(s3), _HungCreate()
     request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=checkpoint)
 
     with sandbox_provider_scope(cast(SandboxProvider, provider)):
         task = asyncio.create_task(_drain(retry.stream_evaluate_response(request)))
         await provider.creating.wait()
         task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        done, _ = await asyncio.wait({task}, timeout=5)
 
-    assert provider.deleted == ["fresh-1"]
-
-
-async def test_a_grading_input_saved_that_holds_its_cancellation_is_still_left_behind_at_the_bound(
-    s3: _FakeS3, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    release = asyncio.Event()
-
-    class _StubbornRelease(_SavedHookBenchmark):
-        async def grading_input_saved(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> None:
-            try:
-                await asyncio.Event().wait()
-            except asyncio.CancelledError:
-                await release.wait()
-
-    monkeypatch.setattr(base, "TEARDOWN_TIMEOUT_S", 0.01)
-    service = await _saved_service(s3, _StubbornRelease)
-
-    grading = asyncio.create_task(_drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox()))))
-    done, _ = await asyncio.wait({grading}, timeout=5)
-    release.set()
-
-    assert done == {grading}
-    assert [chunk.type for chunk in grading.result()] == ["eval_resume_state", "result"]
-    assert "grading_input_saved failed for task-1" in caplog.text
-
-
-async def test_a_grading_input_saved_that_cancels_itself_ends_the_stream_before_grading(s3: _FakeS3) -> None:
-    class _SelfCancelling(_SavedHookBenchmark):
-        async def grading_input_saved(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> None:
-            raise asyncio.CancelledError
-
-    service = await _saved_service(s3, _SelfCancelling)
-
-    with pytest.raises(asyncio.CancelledError):
-        await _drain(service.evaluate_instance("task-1", cast(Sandbox, _Sandbox())))
-    assert service.graded == []
+    assert done == {task} and task.cancelled()
+    assert provider.deleted == []
 
 
 async def test_a_create_that_fails_after_a_cancel_is_logged_and_the_cancellation_kept(
@@ -1068,9 +907,9 @@ class _TaskSourceGrader(_SandboxGrader):
         return task.model_copy(update=self.task_update)
 
 
-async def _retry_with_task(s3: _FakeS3, **task_update: Any) -> _Provider:
+async def _retry_with_task(s3: _FakeS3, provider: _Provider | None = None, **task_update: Any) -> _Provider:
     checkpoint = await _sandbox_checkpoint(s3)
-    retry, provider = await _sandbox_service(s3, _TaskSourceGrader), _Provider()
+    retry, provider = await _sandbox_service(s3, _TaskSourceGrader), provider or _Provider()
     cast(_TaskSourceGrader, retry).task_update = task_update
     request = EvaluateResponseRequest(task_id="task-1", eval_resume_state=checkpoint)
     with sandbox_provider_scope(cast(SandboxProvider, provider)):
@@ -1093,3 +932,35 @@ async def test_a_snapshot_task_retry_drops_the_generation_gpu(s3: _FakeS3) -> No
 async def test_a_compose_task_retry_without_eval_sandbox_is_refused_before_create(s3: _FakeS3) -> None:
     with pytest.raises(ValueError, match="ComposeSource"):
         await _retry_with_task(s3, source=ComposeSource(outer=ImageSource(image="docker:28-dind")))
+
+
+@pytest.mark.parametrize(
+    ("evaluation", "network_block_all", "allowlists"),
+    [(["pypi.org"], False, [["pypi.org"]]), ("*", False, []), ([], True, [])],
+)
+async def test_a_retry_without_eval_sandbox_grades_under_the_tasks_evaluation_egress(
+    s3: _FakeS3, evaluation: EgressPolicy, network_block_all: bool, allowlists: list[list[str]]
+) -> None:
+    provider = await _retry_with_task(s3, egress=BenchmarkEgressPlan(evaluation=evaluation))
+    assert (provider.created[0].network_block_all, provider.sandboxes[0].allowlists) == (network_block_all, allowlists)
+
+
+async def test_an_eval_sandbox_network_wins_over_the_tasks_evaluation_egress(s3: _FakeS3) -> None:
+    provider = await _retry_with_task(s3, eval_sandbox=EvalSandboxSpec(), egress=BenchmarkEgressPlan(evaluation="*"))
+    assert (provider.created[0].network_block_all, provider.sandboxes[0].allowlists) == (True, [])
+
+
+async def test_a_retry_sandbox_whose_egress_cannot_be_applied_is_deleted_before_grading(s3: _FakeS3) -> None:
+    class _RefusingSandbox(_GradingSandbox):
+        async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
+            raise RuntimeError("allowlist refused")
+
+    class _RefusingProvider(_Provider):
+        async def create_sandbox(self, request: SandboxCreateRequest) -> _GradingSandbox:
+            self.created.append(request)
+            return _RefusingSandbox("fresh-1")
+
+    provider = _RefusingProvider()
+    with pytest.raises(RuntimeError, match="allowlist refused"):
+        await _retry_with_task(s3, provider, egress=BenchmarkEgressPlan(evaluation=["pypi.org"]))
+    assert provider.deleted == ["fresh-1"]

@@ -34,6 +34,7 @@ from benchmark_service.dataset_versioning import DatasetVersionEntry, load_datas
 from benchmark_service.sandbox import Sandbox, SandboxCreateRequest, SandboxProvider
 from benchmark_service.schemas import (
     DatasetVersion,
+    EgressPolicy,
     EvalMode,
     EvaluateResponseRequest,
     FinalScoreResult,
@@ -62,15 +63,14 @@ def _prioritize_dataset(datasets: dict[str, dict[str, Any]], priority_dataset: s
 _GRADERS = ("grade_input", "grade_in_sandbox")
 _GRADING_HOOKS = ("collect_grading_input", "grader_identity", *_GRADERS)
 
-_EVAL_RESUME_AUTO_STOP_MINUTES = 30
 _EVAL_RESUME_CREATE_TIMEOUT_S = 600
 
 logger = logging.getLogger(__name__)
 
 
-async def _finish_quietly(work: Awaitable[None], failure: str, *args: object, timeout_s: float | None = None) -> None:
+async def _finish_quietly(work: Awaitable[None], failure: str, *args: object) -> None:
     """Wait up to ``TEARDOWN_TIMEOUT_S`` for ``work`` even if the caller is cancelled; log, never raise, a failure."""
-    bound = TEARDOWN_TIMEOUT_S if timeout_s is None else timeout_s
+    bound = TEARDOWN_TIMEOUT_S
     task = asyncio.ensure_future(work)
     loop = asyncio.get_running_loop()
     deadline = loop.time() + bound
@@ -94,7 +94,7 @@ async def _finish_quietly(work: Awaitable[None], failure: str, *args: object, ti
 
 
 async def _create_owned_sandbox(provider: SandboxProvider, request: SandboxCreateRequest) -> Sandbox:
-    """Create a retry sandbox; a cancellation mid-create still deletes what was created."""
+    """Create a retry sandbox; a cancellation mid-create waits up to ``TEARDOWN_TIMEOUT_S`` to delete it."""
     creation = asyncio.create_task(provider.create_sandbox(request))
     try:
         return await asyncio.shield(creation)
@@ -104,12 +104,15 @@ async def _create_owned_sandbox(provider: SandboxProvider, request: SandboxCreat
             sandbox = await creation
             await provider.delete_sandbox(sandbox.id)
 
-        await _finish_quietly(
-            delete_when_created(),
-            "Eval-resume sandbox cleanup after a cancelled create failed",
-            timeout_s=_EVAL_RESUME_CREATE_TIMEOUT_S + TEARDOWN_TIMEOUT_S,
-        )
+        await _finish_quietly(delete_when_created(), "Eval-resume sandbox cleanup after a cancelled create failed")
         raise
+
+
+def _declared_evaluation_egress(task: RetrieveTaskResponse) -> EgressPolicy | None:
+    """The ``egress.evaluation`` a task declares, the policy the tracker grades its first attempt under."""
+    if task.eval_sandbox is not None or "evaluation" not in task.egress.model_fields_set:
+        return None
+    return task.egress.evaluation
 
 
 class BenchmarkService(ABC):
@@ -516,11 +519,11 @@ class BenchmarkService(ABC):
         sandbox: Sandbox,
         dataset: str | None = None,
     ) -> AsyncGenerator[StreamChunk | eval_resume.GradingInput, None]:
-        """Like ``grade_input``, inside the agent's sandbox or, on retry, a borrowed or fresh one."""
-        raise NotImplementedError(f"{type(self).__name__}.grade_in_sandbox is not implemented")
+        """Like ``grade_input``, inside the agent's sandbox or, on retry, a borrowed or fresh one.
 
-    async def grading_input_saved(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> None:
-        """Release state kept only for collecting, once the first checkpoint is saved."""
+        A fresh sandbox starts from the task's image, so ``content`` must hold the whole graded workspace.
+        """
+        raise NotImplementedError(f"{type(self).__name__}.grade_in_sandbox is not implemented")
 
     async def load_grading_input(self, request: EvaluateResponseRequest, dataset: str | None = None) -> bytes:
         """The grading input ``request.eval_resume_state`` points at, after the checks a retry makes."""
@@ -604,9 +607,7 @@ class BenchmarkService(ABC):
         if agent_sandbox is None and task.eval_sandbox is None and task.resume_sandbox is not None:
             raise ValueError(f"task {task_id} declares a caller-owned resume_sandbox; the retry needs its instance_id")
         spec = resolve_grading_spec(task)
-        auto_stop = (
-            _EVAL_RESUME_AUTO_STOP_MINUTES if task.eval_sandbox is None else auto_stop_minutes(spec.grade_timeout)
-        )
+        egress = _declared_evaluation_egress(task)
         sandbox = await _create_owned_sandbox(
             provider,
             SandboxCreateRequest(
@@ -622,12 +623,14 @@ class BenchmarkService(ABC):
                     "EvalResume": "true",
                 },
                 env_vars={},
-                auto_stop_interval=auto_stop,
+                auto_stop_interval=auto_stop_minutes(spec.grade_timeout),
                 create_timeout=_EVAL_RESUME_CREATE_TIMEOUT_S,
-                network_block_all=spec.network_block_all,
+                network_block_all=spec.network_block_all if egress is None else egress == [],
             ),
         )
         try:
+            if isinstance(egress, list) and egress:
+                await sandbox.modify_egress_rules(egress)
             yield sandbox
         finally:
             await _finish_quietly(
@@ -652,8 +655,8 @@ class BenchmarkService(ABC):
         execute tests, run evaluation scripts, etc. Yield StreamChunk objects to stream progress.
 
         A service that implements the grading hooks can keep this default: it collects the
-        grading input, saves it, yields the checkpoint as ``eval_resume_state``, calls
-        ``grading_input_saved``, and then grades it. Otherwise override it:
+        grading input, saves it, yields the checkpoint as ``eval_resume_state``, and then
+        grades it. Otherwise override it:
         1. Execute tests or evaluation scripts using sandbox.exec
         2. Parse test output and grade results
         3. Yield progress logs: yield StreamMessageChunk(type="message", data="log line")
@@ -678,15 +681,7 @@ class BenchmarkService(ABC):
             return
         benchmark_id = eval_resume.benchmark_id_from_sandbox(sandbox)
         binding = await self._checkpoint_binding(task_id, dataset)
-        checkpoint = await self._eval_resume_save(benchmark_id, task_id, content, binding)
-        try:
-            yield checkpoint
-        finally:
-            await _finish_quietly(
-                self.grading_input_saved(task_id, sandbox, dataset=dataset),
-                "grading_input_saved failed for %s",
-                task_id,
-            )
+        yield await self._eval_resume_save(benchmark_id, task_id, content, binding)
         async with self._eval_resume_sandbox(task_id, benchmark_id, dataset, agent_sandbox=sandbox) as grading_sandbox:
             grading = self._eval_resume_grade(task_id, content, grading_sandbox, dataset)
             async with aclosing(self._eval_resume_stream(grading, benchmark_id, task_id, binding)) as chunks:

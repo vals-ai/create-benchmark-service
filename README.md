@@ -516,10 +516,13 @@ Details are in `benchmark_service/eval_resume.py`.
 Optional, as your grader needs:
 
 - **Grades inside a sandbox:** implement `grade_in_sandbox` instead of `grade_input`.
-  A retry grades in a fresh sandbox with the network blocked,
-  or in the caller's sandbox when the request names one.
-- **Needs its own image, or the network:** set the task's `eval_sandbox`, the spec `/v1` grading reads.
-  Every attempt then grades in a fresh sandbox built from it.
+  A retry grades in a fresh sandbox, or in the caller's sandbox when the request names one.
+  The fresh sandbox starts from the task's image,
+  so the bytes `collect_grading_input` saves must hold the whole graded workspace.
+  It grades under the task's `egress.evaluation`, the policy the first attempt grades under.
+  A task that declares no `egress.evaluation` grades its retry with the network blocked.
+- **Needs its own image or network:** set the task's `eval_sandbox`, the spec `/v1` grading reads.
+  Every attempt then grades in a fresh sandbox built from it, under its `network_block_all`.
   Its `timeout_s` sizes that sandbox's auto-stop; it does not bound grading.
 - **Saves progress part-way**, for example after each judge call: yield `GradingInput`.
 - **Output that cannot be graded:** raise `NotGradeable(message)` from `collect_grading_input`.

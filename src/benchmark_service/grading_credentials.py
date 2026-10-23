@@ -87,7 +87,7 @@ def _identity() -> dict[str, object]:
 
 
 async def _mint(
-    service: GradingCredentials, *, run_id: str, task_id: str, attempt_id: str | None, models: list[str]
+    service: GradingCredentials, *, run_id: str, task_id: str, attempt_id: str, models: list[str]
 ) -> GradingCredentials:
     body = {
         "run_id": run_id,
@@ -154,11 +154,12 @@ async def grading_credentials(
         return
     models = [model.strip() for model in os.environ.get("GRADING_MODELS", "").split(",") if model.strip()]
     credentials = service
-    if run_id is not None and models:
+    if run_id is not None and attempt_id is not None and models:
         credentials = await _mint(service, run_id=run_id, task_id=task_id, attempt_id=attempt_id, models=models)
     elif run_id is not None:
         logger.warning(
-            "GRADING_MODELS is not configured: grading of run_id=%s task_id=%s is charged to the service key",
+            "%s: grading of run_id=%s task_id=%s is charged to the service key",
+            "GRADING_MODELS is not configured" if not models else "no attempt id",
             run_id,
             task_id,
         )

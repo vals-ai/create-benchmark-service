@@ -125,7 +125,7 @@ async def test_token_is_revoked_even_when_grading_fails(gateway: FakeGateway) ->
 
 async def test_nested_scope_reuses_the_enclosing_token(gateway: FakeGateway) -> None:
     async with bound():
-        async with grading_credentials(run_id="run-1", task_id="task-1"):
+        async with grading_credentials(run_id="run-1", task_id="task-1", attempt_id="attempt-1"):
             assert current_grading_credentials() == TOKEN
         assert current_grading_credentials() == TOKEN
     assert gateway.paths() == ["/service-auth", "/service-auth/revoke"]
@@ -135,6 +135,15 @@ async def test_without_a_run_the_service_key_is_used_and_nothing_is_minted(gatew
     async with grading_credentials(run_id=None, task_id="task-1"):
         assert current_grading_credentials() == STATIC
     assert gateway.calls == []
+
+
+async def test_a_run_without_an_attempt_falls_back_loudly(
+    gateway: FakeGateway, caplog: pytest.LogCaptureFixture
+) -> None:
+    async with grading_credentials(run_id="run-1", task_id="task-1"):
+        assert current_grading_credentials() == STATIC
+    assert gateway.calls == []
+    assert "no attempt id" in caplog.text
 
 
 def test_outside_an_evaluation_the_service_settings_apply(gateway: FakeGateway) -> None:
@@ -153,7 +162,7 @@ async def test_run_without_grading_models_falls_back_loudly(
 
 async def test_concurrent_evaluations_keep_their_own_credentials(gateway: FakeGateway) -> None:
     async def observe(run_id: str) -> str | None:
-        async with grading_credentials(run_id=run_id, task_id="task-1"):
+        async with grading_credentials(run_id=run_id, task_id="task-1", attempt_id="attempt-1"):
             await asyncio.sleep(0)
             credentials = current_grading_credentials()
             return credentials.api_key if credentials else None

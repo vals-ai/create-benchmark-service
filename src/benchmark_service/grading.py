@@ -356,9 +356,7 @@ async def grade_instance_stream(
                     evaluation_task = None
                     chunk = completed_task.result()
                 except StopAsyncIteration:
-                    terminal = StreamErrorChunk(
-                        type="error", data="evaluate_instance completed without a result chunk"
-                    )
+                    terminal = StreamErrorChunk(type="error", data="evaluate_instance completed without a result chunk")
                     break
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("grading failed run_id=%s task_id=%s", run_id, run.task_id)
@@ -445,8 +443,8 @@ async def evaluate_submission(
     # Bound here rather than inside the stream: the stream is finalized through
     # a task, which copies the context, and a token cannot be reset in a copy.
     attribution = RequestAttribution(run_id=run_id, task_id=submission.task_id, attempt_id=attempt_id)
-    async with grading_credentials(attribution):
-        with sandbox_provider_scope(provider), tenant_scope(tenant):
+    with sandbox_provider_scope(provider), tenant_scope(tenant):
+        async with grading_credentials(attribution):
             return await _evaluate_submission(
                 service=service,
                 run_id=run_id,

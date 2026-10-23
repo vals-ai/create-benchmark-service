@@ -24,10 +24,14 @@ _tracer = trace.get_tracer("benchmark_service.client")
 def correlation_scope(
     *, run_id: str | None = None, task_id: str | None = None, attempt_id: str | None = None
 ) -> Iterator[None]:
-    """Bind caller correlation values for nested client requests."""
+    """Bind caller correlation values for nested client requests.
+
+    A scope that names a run also names its attempt (possibly none), so a nested
+    request for another run never inherits the enclosing attempt.
+    """
     run_token = _run_id.set(run_id) if run_id is not None else None
     task_token = _task_id.set(task_id) if task_id is not None else None
-    attempt_token = _attempt_id.set(attempt_id) if attempt_id is not None else None
+    attempt_token = _attempt_id.set(attempt_id) if run_id is not None or attempt_id is not None else None
     try:
         yield
     finally:

@@ -343,6 +343,11 @@ class EvaluateResponseRequest(BaseModel):
         description="Caller-owned sandbox for eval_resume_state; the service must not delete it",
     )
     dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
+    announce_sandboxes: bool = Field(
+        default=False,
+        exclude_if=lambda value: not value,
+        description="Stream a sandbox_created chunk for each sandbox the service creates; older clients omit it",
+    )
 
     @model_validator(mode="after")
     def require_one_eval_input(self) -> "EvaluateResponseRequest":
@@ -362,6 +367,11 @@ class EvaluateInstanceRequest(BaseModel):
     instance_id: str = Field(description="Sandbox instance where the solution was implemented")
     sandbox_provider: SandboxProviderConfig | None = Field(default=None, description="Sandbox provider config")
     dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
+    announce_sandboxes: bool = Field(
+        default=False,
+        exclude_if=lambda value: not value,
+        description="Stream a sandbox_created chunk for each sandbox the service creates; older clients omit it",
+    )
 
 
 class FinalScoreRequest(BaseModel):

@@ -748,8 +748,11 @@ class BenchmarkServiceClient:
             sandbox_provider=sandbox_provider,
             instance_id=instance_id,
             dataset=dataset,
+            announce_sandboxes=on_sandbox_created is not None,
         )
-        return await self._websocket_request("evaluate-response", request, on_message, on_eval_resume_state, on_sandbox_created)
+        return await self._websocket_request(
+            "evaluate-response", request, on_message, on_eval_resume_state, on_sandbox_created
+        )
 
     async def evaluate_instance(
         self,
@@ -774,8 +777,11 @@ class BenchmarkServiceClient:
             instance_id=instance_id,
             sandbox_provider=sandbox_provider,
             dataset=dataset,
+            announce_sandboxes=on_sandbox_created is not None,
         )
-        return await self._websocket_request("evaluate-instance", request, on_message, on_eval_resume_state, on_sandbox_created)
+        return await self._websocket_request(
+            "evaluate-instance", request, on_message, on_eval_resume_state, on_sandbox_created
+        )
 
     @_retry_http
     async def final_score(self, evaluation_results: dict[str, Any], dataset: str | None = None) -> FinalScoreResponse:

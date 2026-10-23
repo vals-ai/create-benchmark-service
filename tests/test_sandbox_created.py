@@ -9,7 +9,7 @@ from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.context import current_sandbox_provider, sandbox_created_scope
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.types import Sandbox, SandboxProvider
-from benchmark_service.schemas import EvaluateResponseRequest, StreamChunk, StreamResultChunk
+from benchmark_service.schemas import EvaluateInstanceRequest, EvaluateResponseRequest, StreamChunk, StreamResultChunk
 from tests.conftest import StubBenchmark
 from tests.test_sandbox import DaytonaClient, InnerSandbox, _provider, _request  # pyright: ignore[reportPrivateUsage]
 
@@ -24,6 +24,11 @@ class NumberedCreateClient(DaytonaClient):
     def __init__(self) -> None:
         super().__init__(InnerSandbox())
         self.created_ids: list[str] = []
+
+
+class GetByIdClient(NumberedCreateClient):
+    async def get(self, instance_id: str) -> InnerSandbox:
+        return InnerSandbox()
 
 
 class Recorder:
@@ -147,7 +152,14 @@ def test_evaluate_response_stream_announces_sandboxes_a_service_creates_from_its
 
     with TestClient(BenchmarkServiceApp(OwnProviderBenchmark)) as client:
         with client.websocket_connect("/ws/evaluate-response") as ws:
-            ws.send_json({"task_id": "task-1", "eval_resume_state": {"k": "v"}, "sandbox_provider": _PROVIDER_BODY})
+            ws.send_json(
+                {
+                    "task_id": "task-1",
+                    "eval_resume_state": {"k": "v"},
+                    "sandbox_provider": _PROVIDER_BODY,
+                    "announce_sandboxes": True,
+                }
+            )
             frames = [ws.receive_json() for _ in range(3)]
 
     assert frames == [
@@ -160,18 +172,70 @@ def test_evaluate_response_stream_announces_sandboxes_a_service_creates_from_its
 def test_evaluate_instance_stream_announces_sandboxes_created_from_the_request_provider(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    class GetByIdClient(NumberedCreateClient):
-        async def get(self, instance_id: str) -> InnerSandbox:
-            return InnerSandbox()
-
     _patch_daytona_provider(monkeypatch, GetByIdClient())
 
     with TestClient(BenchmarkServiceApp(OwnProviderBenchmark)) as client:
         with client.websocket_connect("/ws/evaluate-instance") as ws:
-            ws.send_json({"task_id": "task-1", "instance_id": "i-1", "sandbox_provider": _PROVIDER_BODY})
+            ws.send_json(
+                {
+                    "task_id": "task-1",
+                    "instance_id": "i-1",
+                    "sandbox_provider": _PROVIDER_BODY,
+                    "announce_sandboxes": True,
+                }
+            )
             frames = [ws.receive_json() for _ in range(2)]
 
     assert frames == [
         {"type": "sandbox_created", "data": {"provider": "daytona", "sandbox_id": "sandbox-1"}},
         {"type": "result", "data": {"ok": True}},
     ]
+
+
+_OLD_EVALUATE_RESPONSE: dict[str, Any] = {
+    "task_id": "task-1",
+    "eval_resume_state": {"k": "v"},
+    "sandbox_provider": _PROVIDER_BODY,
+}
+_OLD_EVALUATE_INSTANCE: dict[str, Any] = {"task_id": "task-1", "instance_id": "i-1", "sandbox_provider": _PROVIDER_BODY}
+
+
+@pytest.mark.parametrize(
+    "body", [{}, {"announce_sandboxes": False}], ids=["old-client-no-field", "new-client-no-callback"]
+)
+def test_evaluate_response_without_opt_in_streams_only_the_result_when_a_sandbox_is_created(
+    monkeypatch: pytest.MonkeyPatch, body: dict[str, Any]
+) -> None:
+    _patch_daytona_provider(monkeypatch, NumberedCreateClient())
+
+    with TestClient(BenchmarkServiceApp(OwnProviderBenchmark)) as client:
+        with client.websocket_connect("/ws/evaluate-response") as ws:
+            ws.send_json({**_OLD_EVALUATE_RESPONSE, **body})
+            frames = [ws.receive_json()]
+
+    assert frames == [{"type": "result", "data": {"ok": True}}]
+
+
+@pytest.mark.parametrize(
+    "body", [{}, {"announce_sandboxes": False}], ids=["old-client-no-field", "new-client-no-callback"]
+)
+def test_evaluate_instance_without_opt_in_streams_only_the_result_when_a_sandbox_is_created(
+    monkeypatch: pytest.MonkeyPatch, body: dict[str, Any]
+) -> None:
+    _patch_daytona_provider(monkeypatch, GetByIdClient())
+
+    with TestClient(BenchmarkServiceApp(OwnProviderBenchmark)) as client:
+        with client.websocket_connect("/ws/evaluate-instance") as ws:
+            ws.send_json({**_OLD_EVALUATE_INSTANCE, **body})
+            frames = [ws.receive_json()]
+
+    assert frames == [{"type": "result", "data": {"ok": True}}]
+
+
+def test_evaluate_requests_omit_the_opt_in_from_the_wire_unless_set() -> None:
+    assert "announce_sandboxes" not in EvaluateInstanceRequest(task_id="t", instance_id="i").model_dump_json()
+    assert "announce_sandboxes" not in EvaluateResponseRequest(task_id="t", response="r").model_dump_json()
+    assert (
+        '"announce_sandboxes":true'
+        in EvaluateInstanceRequest(task_id="t", instance_id="i", announce_sandboxes=True).model_dump_json()
+    )

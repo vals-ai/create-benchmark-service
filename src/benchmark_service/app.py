@@ -52,6 +52,7 @@ from benchmark_service.sandbox import (
 logger = logging.getLogger(__name__)
 _dataset_version_id: TypeAdapter[str] = TypeAdapter(DatasetVersionId)
 
+
 class _DatasetVersionSelectionError(HTTPException):
     pass
 
@@ -471,7 +472,10 @@ class BenchmarkServiceApp(FastAPI):
                 async with (
                     request.sandbox_provider.create_provider() if request.sandbox_provider else nullcontext()
                 ) as provider:
-                    with sandbox_provider_scope(provider), sandbox_created_scope(_sandbox_created_hook(websocket)):
+                    with (
+                        sandbox_provider_scope(provider),
+                        sandbox_created_scope(_sandbox_created_hook(websocket) if request.announce_sandboxes else None),
+                    ):
                         await _forward_stream(
                             websocket,
                             self.service.stream_evaluate_response(request, dataset=request.dataset),
@@ -507,7 +511,10 @@ class BenchmarkServiceApp(FastAPI):
 
                     # Benchmarks that grade in a second sandbox read the provider
                     # from the request scope; see benchmark_service.context.
-                    with sandbox_provider_scope(provider), sandbox_created_scope(_sandbox_created_hook(websocket)):
+                    with (
+                        sandbox_provider_scope(provider),
+                        sandbox_created_scope(_sandbox_created_hook(websocket) if request.announce_sandboxes else None),
+                    ):
                         await _forward_stream(
                             websocket,
                             self.service.evaluate_instance(request.task_id, sandbox, dataset=request.dataset),

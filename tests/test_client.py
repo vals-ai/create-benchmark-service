@@ -831,6 +831,42 @@ async def test_sandbox_created_chunk_is_skipped_without_a_callback(
     assert result == {"score": 1.0}
 
 
+@pytest.mark.parametrize("with_callback", [False, True], ids=["no-callback", "with-callback"])
+async def test_evaluate_instance_asks_for_sandbox_announcements_only_with_a_callback(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock], with_callback: bool
+) -> None:
+    client, _mock_http = benchmark_client
+    ws_connect = _ws_mock([json.dumps({"type": "result", "data": {"score": 1.0}})])
+
+    with patch("benchmark_service.client.websockets.connect", return_value=ws_connect):
+        await client.evaluate_instance(
+            "task-1", "i-1", sandbox_provider=DAYTONA_CONFIG, on_sandbox_created=MagicMock() if with_callback else None
+        )
+
+    sent = json.loads((await ws_connect.__aenter__()).send.call_args.args[0])
+    assert ("announce_sandboxes" in sent) is with_callback
+    assert sent.get("announce_sandboxes", True) is True
+
+
+@pytest.mark.parametrize("with_callback", [False, True], ids=["no-callback", "with-callback"])
+async def test_resume_evaluation_asks_for_sandbox_announcements_only_with_a_callback(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock], with_callback: bool
+) -> None:
+    client, _mock_http = benchmark_client
+    ws_connect = _ws_mock([json.dumps({"type": "result", "data": {"score": 1.0}})])
+
+    with patch("benchmark_service.client.websockets.connect", return_value=ws_connect):
+        await client.resume_evaluation(
+            "task-1",
+            {"k": "v"},
+            sandbox_provider=DAYTONA_CONFIG,
+            on_sandbox_created=MagicMock() if with_callback else None,
+        )
+
+    sent = json.loads((await ws_connect.__aenter__()).send.call_args.args[0])
+    assert ("announce_sandboxes" in sent) is with_callback
+
+
 async def test_resume_evaluation_forwards_an_owned_sandbox_without_changing_state(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:

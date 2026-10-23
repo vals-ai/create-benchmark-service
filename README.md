@@ -562,8 +562,8 @@ StreamResultChunk(type="result", data=<any>)                     # final result 
 
 Yield these from your generator methods; the framework serialises and forwards them to the WebSocket client.
 
-The framework also sends `{"type": "sandbox_created", "data": {"provider": "daytona", "sandbox_id": "…"}}` on the evaluate streams whenever the Daytona provider creates a sandbox for the request.
-Pass `on_sandbox_created` to `evaluate_instance` or `resume_evaluation` to receive each one.
+The framework sends `{"type": "sandbox_created", "data": {"provider": "daytona", "sandbox_id": "…"}}` on the evaluate streams whenever the Daytona provider creates a sandbox for the request, and only when the request sets `announce_sandboxes`.
+The client sets it when you pass `on_sandbox_created` to `evaluate_instance` or `resume_evaluation`; without a callback the stream is unchanged, so older clients never see the new chunk.
 
 ### v1 Eval API (lab-facing)
 

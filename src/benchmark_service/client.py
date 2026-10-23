@@ -596,9 +596,6 @@ class BenchmarkServiceClient:
     ) -> _RecoveryResult:
         """Run a task attempt with benchmark-declared sandbox-loss recovery.
 
-        ``attempt_id`` names this execution of the task on every nested request so
-        the service attributes grading to it.
-
         ``SandboxRecoveryAttempt.retrieve_task`` lazily loads and caches the
         task payload so successful durable evaluation resumes need no task
         request. ``SandboxNotFoundError`` is retried only when the benchmark
@@ -847,8 +844,8 @@ class BenchmarkServiceClient:
 
         payload_data is either inline text or an uploaded artifact key, as
         selected by payload_type. Transport failures are not retried because
-        grading may already have started. attempt_id names the caller's
-        execution attempt of the task for cost attribution.
+        grading may already have started. ``attempt_id`` names the caller's
+        execution of the task, so the service attributes grading to it.
         """
         request = V1EvalRequest(
             run_id=run_id,

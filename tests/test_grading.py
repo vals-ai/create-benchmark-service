@@ -295,7 +295,7 @@ async def test_grade_instance_hands_the_evaluation_gateway_credentials_to_the_sa
     monkeypatch.setenv("MODEL_GATEWAY_API_KEY", "static-key")
     service = await SandboxStub.create()
     provider = FakeProvider(FakeSandbox())
-    await _grade(service, provider, attempt_id="attempt-7")
+    await _grade(service, provider)
     assert provider.created[0].env_vars == {"MODEL_GATEWAY_URL": "https://gateway.test", "MODEL_GATEWAY_API_KEY": "static-key"}
 
 

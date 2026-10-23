@@ -24,7 +24,7 @@ uv sync --extra gateway
 
 Set `MODEL_GATEWAY_URL`, `MODEL_GATEWAY_API_KEY`, and `IDENTITY` before starting Python.
 `IDENTITY` is a JSON object that identifies the service in Gateway usage records, such as `{"service":"my-benchmark"}`.
-The judge sends it with `agent_name` set to `"grader"`, so Gateway usage records separate judge spend from the agent's. When the host binds a grading token (create-benchmark-service mints one per evaluation and model-library sends it inside `model_library.gateway_credentials.gateway_token_scope`), the Gateway stamps that token's run, task and attempt on every judge call; outside one they are attributed to no run.
+The judge sends it with `agent_name` set to `"grader"`, so Gateway usage records separate judge spend from the agent's. The run, task and attempt come from the grading token the host binds (create-benchmark-service mints one per evaluation); outside one they are attributed to no run.
 Then run the example against the Gateway:
 
 ```bash

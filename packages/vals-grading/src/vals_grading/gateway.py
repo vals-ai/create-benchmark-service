@@ -15,12 +15,9 @@ GRADER_AGENT_NAME = "grader"
 class GatewayJudgeModel:
     """Send judge requests through model-library's Gateway client.
 
-    Requests carry the service's ``IDENTITY`` with ``agent_name`` set to
-    ``"grader"``, so the Gateway ledger tells judge spend from the agent's. The
-    run, task and attempt a request belongs to come from the grading token the
-    host binds (create-benchmark-service mints one per evaluation; model-library
-    sends it inside ``gateway_token_scope``), whose claims the Gateway stamps on
-    the request. Outside such a scope the judge is attributed to no run, as before.
+    Requests carry the service's ``IDENTITY`` with ``agent_name="grader"`` so the
+    Gateway ledger tells judge spend from the agent's; the run, task and attempt
+    come from the grading token the host binds, if any.
     """
 
     def __init__(self, model: str) -> None:

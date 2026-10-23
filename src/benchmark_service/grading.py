@@ -29,7 +29,7 @@ from typing import Any
 from fastapi.encoders import jsonable_encoder
 
 from benchmark_service.base import BenchmarkService
-from benchmark_service.grading_credentials import current_grading_credentials, grading_credentials
+from benchmark_service.grading_credentials import current_grading_credentials
 from benchmark_service.context import grading_sandbox_context, sandbox_provider_scope, tenant_scope
 from benchmark_service.grading_spec import (
     TEARDOWN_TIMEOUT_S,
@@ -353,9 +353,7 @@ async def grade_instance_stream(
                     evaluation_task = None
                     chunk = completed_task.result()
                 except StopAsyncIteration:
-                    terminal = StreamErrorChunk(
-                        type="error", data="evaluate_instance completed without a result chunk"
-                    )
+                    terminal = StreamErrorChunk(type="error", data="evaluate_instance completed without a result chunk")
                     break
                 except Exception as exc:  # noqa: BLE001
                     logger.exception("grading failed run_id=%s task_id=%s", run_id, run.task_id)
@@ -438,20 +436,17 @@ async def evaluate_submission(
     labels: dict[str, str] | None = None,
 ) -> V1EvalResponse:
     """Evaluate one typed submission per the benchmark's eval mode."""
-    # Bound here rather than inside the stream: the stream is finalized through
-    # a task, which copies the context, and a token cannot be reset in a copy.
     with sandbox_provider_scope(provider), tenant_scope(tenant):
-        async with grading_credentials(run_id=run_id, task_id=submission.task_id):
-            return await _evaluate_submission(
-                service=service,
-                run_id=run_id,
-                tenant=tenant,
-                submission=submission,
-                provider=provider,
-                evaluator_version=evaluator_version,
-                dataset=dataset,
-                labels=labels,
-            )
+        return await _evaluate_submission(
+            service=service,
+            run_id=run_id,
+            tenant=tenant,
+            submission=submission,
+            provider=provider,
+            evaluator_version=evaluator_version,
+            dataset=dataset,
+            labels=labels,
+        )
 
 
 async def _evaluate_submission(

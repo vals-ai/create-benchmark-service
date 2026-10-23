@@ -1,20 +1,9 @@
 """Per-evaluation Model Gateway credentials.
 
-The caller (the Valkyrie tracker, the Vals app) names the run, task and task
-attempt on each evaluation request. For that evaluation the framework mints a
-Gateway run token from the service's own key whose claims are those ids plus the
-service ``IDENTITY`` with ``agent_name="grader"``. The Gateway stamps the claims
-on every request made with the token, so the usage ledger attributes judge spend
-to the run and attempt as the grader without grading code attaching anything.
-
-The token is bound request-locally for the whole evaluation: model-library sends
-it on judge queries (``gateway_token_scope``), framework grading sandboxes receive
-it as ``MODEL_GATEWAY_API_KEY``, and services that grade elsewhere forward
-``current_grading_credentials().as_environment()``. It is revoked afterwards.
-
-Without a run id or Gateway settings nothing is minted and the service's own
-credentials apply; a run id without ``GRADING_MODELS`` falls back the same way
-with a warning. Nothing here invents a run.
+For each evaluation that names a run, task and attempt, mint a Gateway run token
+from the service key (claims: those ids, ``IDENTITY`` with ``agent_name="grader"``,
+``GRADING_MODELS``), bind it request-locally so judge calls carry it, and revoke it
+afterwards. Without those ids or Gateway settings the service's own key applies.
 """
 
 from __future__ import annotations
@@ -74,13 +63,10 @@ def current_grading_credentials() -> GradingCredentials | None:
 
 def _identity() -> dict[str, object]:
     """The service ``IDENTITY`` as the grader, naming the caller's tenant when one authenticated."""
-    try:
-        identity = json.loads(os.environ.get("IDENTITY") or "{}")
-    except json.JSONDecodeError:
-        identity = {}
+    identity: dict[str, object] = json.loads(os.environ.get("IDENTITY") or "{}")
     tenant = current_tenant()
     return {
-        **(identity if isinstance(identity, dict) else {}),
+        **identity,
         **({"tenant": tenant} if tenant not in (None, UNAUTHENTICATED_TENANT_SENTINEL) else {}),
         "agent_name": GRADER_AGENT_NAME,
     }

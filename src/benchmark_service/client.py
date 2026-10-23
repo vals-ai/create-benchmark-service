@@ -395,7 +395,7 @@ class BenchmarkServiceClient:
         path: str,
         request: BaseModel,
         on_message: Callable[[str], None] | None = None,
-        on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
+        on_eval_resume_state: Callable[[dict[str, Any]], None | Awaitable[None]] | None = None,
     ) -> JsonValue:
         """Send a request over WebSocket and stream the response.
 
@@ -403,6 +403,8 @@ class BenchmarkServiceClient:
             path: WebSocket endpoint path (appended to /ws/).
             request: Pydantic model to serialize and send as the initial message.
             on_message: Optional callback invoked for each intermediate "message" chunk.
+            on_eval_resume_state: Checkpoint callback; awaitable results complete before
+                the next stream chunk is received.
 
         Returns:
             The data payload from the final "result" chunk.
@@ -466,7 +468,9 @@ class BenchmarkServiceClient:
                                     on_message(chunk.data)
                             case "eval_resume_state":
                                 if on_eval_resume_state:
-                                    on_eval_resume_state(chunk.data)
+                                    callback_result = on_eval_resume_state(chunk.data)
+                                    if inspect.isawaitable(callback_result):
+                                        await callback_result
                 except ConnectionClosed as exc:
                     close_frame = exc.rcvd or exc.sent
                     raise BenchmarkServiceStreamClosedError(
@@ -725,7 +729,7 @@ class BenchmarkServiceClient:
         eval_resume_state: dict[str, Any],
         on_message: Callable[[str], None] | None = None,
         dataset: str | None = None,
-        on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
+        on_eval_resume_state: Callable[[dict[str, Any]], None | Awaitable[None]] | None = None,
         sandbox_provider: SandboxProviderConfig | None = None,
         instance_id: str | None = None,
     ) -> JsonValue:
@@ -733,7 +737,8 @@ class BenchmarkServiceClient:
 
         ``sandbox_provider`` and ``instance_id`` are request-only. The caller
         owns admission and cleanup of a supplied sandbox; ``eval_resume_state``
-        remains independently persistable.
+        remains independently persistable. Awaitable checkpoint callbacks complete
+        before the next stream chunk is received.
         """
         request = EvaluateResponseRequest(
             task_id=task_id,
@@ -751,7 +756,7 @@ class BenchmarkServiceClient:
         sandbox_provider: SandboxProviderConfig | None = None,
         on_message: Callable[[str], None] | None = None,
         dataset: str | None = None,
-        on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
+        on_eval_resume_state: Callable[[dict[str, Any]], None | Awaitable[None]] | None = None,
     ) -> JsonValue:
         """Evaluate a task instance via WebSocket.
 
@@ -760,6 +765,8 @@ class BenchmarkServiceClient:
             instance_id: The instance to evaluate.
             sandbox_provider: Sandbox provider config for the task sandbox.
             on_message: Optional callback for intermediate progress messages.
+            on_eval_resume_state: Checkpoint callback; awaitable results complete before
+                the next stream chunk is received.
         """
         request = EvaluateInstanceRequest(
             task_id=task_id,

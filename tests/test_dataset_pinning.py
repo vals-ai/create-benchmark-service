@@ -351,3 +351,42 @@ async def test_client_rejects_invalid_stream_before_callbacks(messages: list[dic
             with pytest.raises(BenchmarkServiceError, match="acknowledge"):
                 await client.resume_evaluation("task-1", {}, on_eval_resume_state=checkpoints.append)
             assert not checkpoints
+
+
+@pytest.mark.parametrize("callback_fails", [False, True], ids=["success", "callback-error"])
+async def test_client_awaits_checkpoint_before_terminal_result(callback_fails: bool) -> None:
+    state = {"artifact_prefix": "s3://bucket/run"}
+    checkpoint_started = asyncio.Event()
+    release_checkpoint = asyncio.Event()
+    result_sent = asyncio.Event()
+
+    async def respond(ws: websockets.ServerConnection) -> None:
+        await ws.recv()
+        await ws.send(json.dumps({"type": "eval_resume_state", "data": state}))
+        await asyncio.wait_for(checkpoint_started.wait(), timeout=5)
+        await ws.send(json.dumps({"type": "result", "data": {"score": 1.0}}))
+        result_sent.set()
+
+    async def save_checkpoint(received: dict[str, Any]) -> None:
+        assert received == state
+        checkpoint_started.set()
+        await release_checkpoint.wait()
+        if callback_fails:
+            raise RuntimeError("checkpoint persistence failed")
+
+    async with serve(respond, "127.0.0.1", 0) as server:
+        port = next(iter(server.sockets)).getsockname()[1]
+        async with BenchmarkServiceClient(f"http://127.0.0.1:{port}", {}) as client:
+            evaluation = asyncio.create_task(
+                client.resume_evaluation("task-1", {}, on_eval_resume_state=save_checkpoint)
+            )
+            try:
+                await asyncio.wait_for(result_sent.wait(), timeout=5)
+                assert not evaluation.done()
+            finally:
+                release_checkpoint.set()
+            if callback_fails:
+                with pytest.raises(RuntimeError, match="checkpoint persistence failed"):
+                    await evaluation
+            else:
+                assert await evaluation == {"score": 1.0}

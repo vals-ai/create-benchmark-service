@@ -10,6 +10,7 @@ from typing import Any, cast
 import pytest
 
 from benchmark_service.sandbox.modal import ModalSandbox
+from benchmark_service.sandbox import modal as modal_module
 from benchmark_service.sandbox.types import LINUX_PROCESS_GROUP_V1
 
 
@@ -53,8 +54,18 @@ def sandbox() -> tuple[ModalSandbox, _LocalSdkSandbox]:
 
 @pytest.mark.parametrize("code", [0, 7])
 async def test_natural_exit_preserves_output_exit_status_and_vm(
-    sandbox: tuple[ModalSandbox, _LocalSdkSandbox], tmp_path: Path, code: int
+    sandbox: tuple[ModalSandbox, _LocalSdkSandbox], tmp_path: Path, code: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    cleanup_started = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+    original_cleanup = modal_module._ModalControlledWorkload._cleanup  # pyright: ignore[reportPrivateUsage]
+
+    async def delayed_cleanup(self: modal_module._ModalControlledWorkload) -> None:  # pyright: ignore[reportPrivateUsage]
+        cleanup_started.set()
+        await allow_cleanup.wait()
+        await original_cleanup(self)
+
+    monkeypatch.setattr(modal_module._ModalControlledWorkload, "_cleanup", delayed_cleanup)  # pyright: ignore[reportPrivateUsage]
     vm, _ = sandbox
     assert vm.generation_containment == LINUX_PROCESS_GROUP_V1
     await vm.probe_generation_containment()
@@ -63,12 +74,21 @@ async def test_natural_exit_preserves_output_exit_status_and_vm(
         cwd=str(tmp_path), env_vars={"VALUE": "hello"},
     )
     try:
-        completed = await asyncio.wait_for(workload.wait(), 5)
+        assert workload.agent_absence_confirmed_at is None
+        waiting = asyncio.create_task(workload.wait())
+        await asyncio.wait_for(cleanup_started.wait(), 5)
+        receipt = workload.agent_absence_confirmed_at
+        assert receipt is not None
+        assert not waiting.done()
+        allow_cleanup.set()
+        completed = await asyncio.wait_for(waiting, 5)
+        assert completed.absence_confirmed_at == receipt
         assert completed.result.exit_code == code
         assert completed.result.output == f"hello:{tmp_path}\nagent-stderr\n"
         assert "".join([chunk async for chunk in workload.output()]) == completed.result.output
         assert (await vm.exec("printf vm-alive")).output == "vm-alive"
     finally:
+        allow_cleanup.set()
         await workload.kill()
 
 
@@ -81,8 +101,12 @@ async def test_deadline_kills_group_child_and_reuses_vm(
     try:
         first = await asyncio.wait_for(anext(stream), 5)
         child = int(first.strip().split("child:")[1])
+        assert workload.agent_absence_confirmed_at is None
         await asyncio.wait_for(workload.kill(), 5)
+        receipt = workload.agent_absence_confirmed_at
+        assert receipt is not None
         completed = await asyncio.wait_for(workload.wait(), 5)
+        assert completed.absence_confirmed_at == receipt
         assert completed.result.exit_code != 0
         assert first in completed.result.output
         assert "Killed" not in completed.result.output

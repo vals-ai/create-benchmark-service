@@ -26,6 +26,9 @@ create-benchmark-service <benchmark-name> --template vals-ai
 
 The base install includes Daytona, Modal, and the OpenTelemetry API for both templates.
 
+For local custom-check grading, use the separate [vals-grading package](packages/vals-grading/README.md).
+It has its own version and dependencies and can run without CBS or the Vals platform.
+
 `create-benchmark-service[vals-ai]` bundles the Vals dependencies: S3/AWS clients, Sentry, Descope, and caching. The Vals template selects this extra automatically.
 
 ## What Gets Generated
@@ -246,8 +249,8 @@ credited_generation = CreditedGeneration(allowance_seconds=5 * 60 * 60, stage_pr
 `RetrieveTaskResponse.credited_generation` is `None` by default. Tracker uses one cumulative
 active-generation clock for every task: an explicit credited allowance takes precedence,
 otherwise `agent_timeout` supplies the allowance, otherwise there is no generation deadline.
-The explicit credited allowance is positive and finite; `stage_protocol=None` charges the whole
-command interval, while `"valkyrie-stage/1"` selects benchmark-owned intervals and requires
+The explicit credited allowance is positive and finite; `stage_protocol=None` charges through
+observed agent-group absence, while `"valkyrie-stage/1"` selects benchmark-owned intervals and requires
 that finite credited allowance. Tracker charges a finite base `B` plus capped optional accounting
 credit `C` across intervals; setup, evaluation, and gaps between intervals do not debit the
 clock. A configured accounting proxy counts neutral overhead for the native Gateway bearer.
@@ -255,8 +258,14 @@ Tracker reads the counter during generation and, unless exhaustion has frozen th
 In Tracker task results, `base_generation_allowance_seconds` is null when there is no
 generation deadline; effective allowance is derived from that base plus applied accounting credit,
 not stored separately. `external_service_credit_applied_seconds` is null without an accounting
-snapshot. `generation_elapsed_seconds` is measured at terminal finalization even without a deadline;
-a null elapsed value instead means no generation-time measurement was recorded.
+snapshot. For non-staged generation, `generation_elapsed_seconds` and `agent_run_duration` end at
+the provider-observed agent-group absence, rather than terminal result finalization; each duration
+uses its own start time. Staged generation retains benchmark-owned interval accounting. The elapsed
+field is measured even without a deadline; null means no generation-time measurement was recorded.
+For finite non-staged runs, a group absence confirmed strictly before the effective cutoff permits
+normal result/output/cleanup collection only through that cutoff plus the existing 20-second grace.
+If collection is still unconfirmed, Tracker reports `ERROR` without evaluation; without a timely
+absence receipt, existing deadline stop handling applies.
 The independent 166-hour whole-task wall applies to every selected task, including those without a generation deadline. Daytona requests a 167-hour sandbox TTL, local Docker uses a 167-hour keepalive, and Modal caps sandbox lifetime at 24 hours.
 Accounting credit is optional and independent of whether `credited_generation` is present; eligibility needs
 configured proxy access, a resolved native Gateway URL and key, and an attested model. Missing
@@ -264,12 +273,14 @@ eligibility uses the base clock; failure of an eligible counter read does not si
 Without a base allowance, optional accounting credit does not create a generation deadline.
 
 When an explicit finite credited allowance selects `stage_protocol="valkyrie-stage/1"`, Tracker
-gives the outer controlled agent command `VALKYRIE_STAGE_DIR=/run/valkyrie-stage`. The sandbox-private directory contains a 64-hex-character
+gives the outer controlled workload (agent command or episode orchestrator) `VALKYRIE_STAGE_DIR=/run/valkyrie-stage`. The sandbox-private directory contains a 64-hex-character
 `key` and an initially empty `ack/` directory. During `setup_task`, upload the bytes from
 `benchmark_service.valkyrie_stage_source()` as `valkyrie_stage.py` and import `StageReporter`
-from that standalone file inside the benchmark-owned agent command. The benchmark owns stage
+from that standalone file inside the benchmark-owned supervisor. The supervisor owns stage
 reporting: BEGIN precedes model-capable execution, and END follows confirmed absence. Nested
-Docker workloads should not receive the reporter key or stage directory.
+Docker workloads should not receive the reporter key or stage directory. The `Agents` helper
+copies the orchestrator environment into selected-agent child subprocesses, including
+`VALKYRIE_STAGE_DIR`; it does not isolate those children from the stage files.
 
 `StageReporter().begin(container)` flushes an initial stdout frame and blocks until Tracker ACKs,
 before launching that model-capable container. `end()` reports the same container only
@@ -310,6 +321,85 @@ On failure, do not assert an END without proof of absence. Tracker owns timeout 
 cleanup, including nested container inspection on abort. Neither model output nor benchmark
 code may assert a generation credit.
 
+An opt-in episode declares
+`RetrieveTaskResponse.episode = Episode(command="exec python /opt/bench/orchestrator.py", parallel_agents=5)`.
+It requires `credited_generation` with `stage_protocol="valkyrie-stage/1"`; without an episode,
+Tracker runs the agent command directly. Every episode sandbox must expose readable
+`/proc/$$/task/$$/children` to its command shell; CBS checks this before preparing the
+episode supervisor or launching the workload. Ordinary controlled commands are unchanged.
+In a `linux_process_group` sandbox, the image must provide Python 3.8+ as `python3`
+on `PATH` for the CBS-owned episode supervisor; the benchmark orchestrator owns its
+command and interpreter. CBS uploads the supervisor before constructing
+the native workload. A single process-group leader publishes a FIFO and PGID, then replaces
+itself with the Python subreaper. An episode stop waits for that owner to drain its adopted
+descendants and publish a numeric status; a missing status after launch is not confirmation.
+Native Daytona cgroup episodes run inside a dedicated cgroup v2 subgroup. Tracker runs the
+benchmark-owned `episode.command` in place of the agent command and writes the selected agent
+bundle to `$VALKYRIE_STAGE_DIR/agent.json` after setup. Its required keys are `run_cmd`,
+`continue_cmd`, `command_bindings`, `interrupt_grace_seconds`, `container_name`,
+`final_output`, `parallel_agents`, and `slots_root`. Tracker owns the raw run and
+continue command templates and the `command_bindings` map of validated contract kwargs
+plus the actual task ID. The standalone CBS stage owns turn rendering: it merges the current
+`problem_statement_path` and `slot_dir` (and configured `container_name`) over that
+map, then substitutes matching tokens in the original command template once per turn.
+The library owns a single `StageReporter` and starts each selected-agent turn in a new
+process group. `{problem_statement_path}` is that turn's observation file and `{slot_dir}`
+is `<slots_root>/<slot>/agent`. A configured `container_name` requires
+`parallel_agents=1`; `{container_name}` is bound to that template with `{slot}` filled
+first. Without a configured container, a contract kwarg can still bind that token; otherwise it
+remains literal, as do other unbound tokens.
+The episode orchestrator must be able to write under `slots_root`; when `container_name` is configured, its environment must also provide the `docker` CLI on `PATH` for named-container cleanup.
+Command token replacements insert values opaquely, including any braces they contain; they do
+not shell-escape inserted text. In `final_output`, `{slot_dir}` is replaced for each
+configured path. The orchestrator names slots and shares one workspace and budget across
+multiple slots; each slot has separate
+runtime/session/output state. More than `parallel_agents` live turns are refused. A second turn on a slot requires
+`continue_cmd`. Children inherit the orchestrator's cwd, stdout and stderr. When
+`VALKYRIE_GENERATION_MODEL_GATEWAY_URL` is configured, `Agents` copies the environment for each
+selected-agent child and sets only its `MODEL_GATEWAY_URL` to that generation URL just before launch;
+the orchestrator and evaluation processes retain the native `MODEL_GATEWAY_URL`. Without the explicit
+generation URL, children inherit the native route. Custom staged orchestrators must likewise route
+generation clients and children through the explicit generation URL while preserving the native route
+for evaluation, including when generation and evaluation overlap. If a turn’s configured `final_output` exists,
+it is snapshotted after its descendants and any configured named Docker container are confirmed absent. When
+the last active turn completes, END is sent and ACKed before its snapshot; other turns may be snapshotted
+while generation remains active. The file or directory is copied into `<slots_root>/<slot>/turns/<n>/`.
+A file keeps its basename; `n` starts at 1 per slot. `final_output` may contain `{slot_dir}` and is rendered before
+launch. Tracker requires that placeholder when `parallel_agents > 1` and `final_output` is set, so parallel slots
+do not snapshot the same path. The agent workspace and turn snapshots are sibling directories; snapshots
+are stored outside the agent workspace. Tracker archives `slots_root` as the episode output.
+Directory snapshots follow symlinks and copy their targets. The copied tree must not contain cyclic links
+or include its own snapshot destination. Copy errors propagate without returning a `SlotResult` and may
+leave partial files.
+
+Upload `valkyrie_stage_source()` as `valkyrie_stage.py` during setup and import `Agents` there with Python 3.8+:
+
+```python
+from valkyrie_stage import Agents, Exhausted
+
+agents = Agents()
+agents.start("first", "/workspace/observations/first.txt")
+result = agents.wait_any()  # SlotResult(slot, reason, exit_code)
+agents.start("first", "/workspace/observations/next.txt")  # Requires continue_cmd.
+result = agents.stop("first")  # SIGINT grace (or immediate SIGKILL for null), then confirmed absence.
+```
+
+`start` reports BEGIN and waits for ACK before spawning the first slot. Each selected-agent turn has its own
+process owner, which stops and reaps that turn's descendants, including those that leave its process group, before
+the turn completes or END is sent. The root command's exit status remains `SlotResult.exit_code`. Configured SIGINT
+grace still applies to the group during `stop` even when the root exits mid-stop; null grace means immediate
+SIGKILL. Overlapping slots count as one union interval. `stop` returns `stopped` when it stops an active slot,
+`exited` if collection already found natural completion, or `exhausted` if the shared limit won. `wait_any`
+returns `exited` or `exhausted` as appropriate. Tracker writes `$VALKYRIE_STAGE_DIR/exhausted` before its ACK when the shared
+budget expires. The library stops all active turns, completes their cleanup and END, and later `start` raises
+`Exhausted`. If the notice arrives with BEGIN ACK, no child starts and no END is sent.
+For a known no-process launch failure after an ordinary BEGIN, `Agents` closes that attempt's pipes,
+reports the matching END, and raises the original launch error. A later `start` is explicit;
+time already charged between BEGIN and END is not refunded. Unknown owner readiness is not
+proof of child absence and does not trigger END. If named-container absence cannot be confirmed
+after an owner exits, the slot retains its initial completion reason and pending result; a later
+public call resumes Docker cleanup before END, output snapshot, and the completed result.
+
 For every task, check `sandbox.generation_containment` and run
 `await sandbox.probe_generation_containment()` before starting a controlled workload. An advertised
 capability alone does not prove the effective sandbox can start it. A Compose capability still
@@ -317,13 +407,59 @@ requires a usable outer transport and effective inner service. Unsupported probe
 raise rather than silently falling back to an ordinary command.
 
 A direct Daytona sandbox supports `LINUX_CGROUP_V2_V1` (`linux_cgroup_v2` v1).
-`sandbox.controlled_workload(command, cwd=..., env_vars=...)` starts a PTY command
-whose child enters a dedicated cgroup v2 subgroup. Natural completion and `kill()`
-use `cgroup.kill`, confirm `populated 0` and remove the subgroup; the PTY session
-is also confirmed absent. The probe requires writable cgroup v2 delegation with
-`cgroup.kill`; the sandbox's other services remain outside the workload subgroup.
-The command runs as a foreground PTY job; shell setup and job-control text are not
-part of its streamed output, while workload stdout and stderr remain included.
+`sandbox.controlled_workload(command, cwd=..., env_vars=...)` launches one native
+asynchronous Daytona session command whose child enters a dedicated cgroup v2
+subgroup. Its stdin is `/dev/null`, so noninteractive readers see EOF at launch.
+Stdout and stderr use pipes, not a PTY. Agents must flush output when they need
+logs delivered promptly; output still buffered inside the agent can be lost when
+it is killed. CBS does not force unbuffered mode.
+The shell stays outside the subgroup and publishes completion before
+release, so descendants are fenced before the native exit status and final output
+are returned. Natural completion and `kill()` use `cgroup.kill`, confirm
+`populated 0`, and remove the subgroup; the native session is also confirmed absent.
+The watcher checks command status on a 10-second idle interval while following logs,
+and whenever the follower ends. Network calls can add time; the interval is not a
+latency bound. A known exit does not depend on the log connection closing.
+After exit, the watcher cancels and joins the reader, then makes one final
+log snapshot request. Confirmed sandbox removal raises `SandboxNotFoundError`;
+other handled snapshot failures warn with sandbox, session, and command identifiers
+without retrying or changing the command exit result; any tail not already followed
+can then be lost. Native Daytona follow keeps
+incomplete UTF-8 sequences across chunks and replaces each malformed byte with
+`U+FFFD` before forwarding, consistent with the observed final snapshot text.
+Reopen and final-snapshot suffixes use separate stdout/stderr character offsets;
+this text stream does not preserve the original malformed bytes. While command exit
+is unknown, an observed sandbox `STOPPED` or `ERROR`
+ends the watcher with `SandboxError`; `wait()` reports that observed failure promptly
+even if independent cgroup and session cleanup is still pending. A later cleanup
+failure is logged. If cleanup fails after a separate observed sandbox loss,
+`wait()` raises the original `SandboxNotFoundError` and logs the distinct cleanup
+failure once; a mirrored copy of the same exception is not a second failure.
+Other failures retain cleanup-first ordering. Success still waits for cleanup and
+confirmed absence. After a handled status-query error with a pending log follower,
+if the existing sandbox-state check does not establish confirmed loss or
+`STOPPED`/`ERROR`, the watcher retains that follower and retries status on the
+same idle interval. If the follower ends without a known exit, the watcher reopens
+it for the same command at saved forwarded offsets, without restarting or stopping
+the workload. Its warning identifies sandbox, session, and command, and reports
+the captured watcher error or that the log stream closed.
+Completion-marker observation retries independently.
+The caller still owns the deadline and explicit stop. The probe
+requires writable cgroup v2 delegation with `cgroup.kill`; other sandbox services
+remain outside the subgroup.
+
+Launch setup is a one-shot phase, separate from repeated observation. Creation
+of the UUID-owned cgroup tolerates a lost toolbox reply on retry without
+replaying the native workload. Completion and stop handling run independently
+of the log watcher. `wait()` and `kill()` share session cleanup, which waits
+for the launch attempt to settle before deleting the session and confirming
+absence. A prompt watcher failure does not cancel cleanup;
+`kill()` still waits for stop and absence confirmation.
+A completed failed session close may be retried by `kill()` but still requires fresh
+absence confirmation, without replaying the command, recovering its result, or
+extending the caller's deadline.
+
+See the [Daytona reconnect diagram](docs/diagrams/daytona-reconnect.png).
 
 `ComposeSandbox` supports `linux_process_group` v1 (`LINUX_PROCESS_GROUP_V1`).
 It pins the running service container, starts the command in a new process group inside
@@ -338,21 +474,31 @@ and proc visibility before launch.
 
 Native Modal and local Docker also advertise `linux_process_group` v1, probe the same group
 boundary, and run controlled commands through their own provider process transports. Stop
-targets the workload group, not the enclosing Modal sandbox (including the selected VM runtime)
+targets the workload group, not the enclosing Modal sandbox (regardless of runtime)
 or local Docker task container. For ordinary controlled commands, confirmation covers live
 members of the marked process group in the same PID namespace, not independently detached
-processes. Docker-daemon-owned descendants remain outside that boundary.
-The FIFO listener ignores TERM/INT/HUP to accept stop requests while the owner and workload
-remain active; normal foreground completion still triggers group cleanup.
+processes. For supervised process-group episodes, the subreaper also drains adopted
+descendants before confirmation; Docker-daemon-owned descendants remain outside that boundary.
+For ordinary controlled commands, the shell's FIFO listener ignores TERM/INT/HUP to accept stop
+requests while the owner and workload remain active; normal foreground completion still triggers group cleanup.
 
-Consume `workload.output()` for streamed text. `await workload.wait()` returns
+Consume `workload.output()` for streamed text. A successful `await workload.wait()` returns
 `ControlledWorkloadResult(result=ExecResult(exit_code, output), absence_confirmed_at=...)`
-after its backend-specific stop boundary is confirmed. On a deadline or other abort,
-`await workload.kill()` stops that boundary before returning and raises if the stop
-cannot be confirmed. On Daytona, cleanup may retry a completed failed PTY close when
-it reaches the close step again, including within the same `kill()` call. A retry
-still requires fresh confirmation of absence and does not turn an earlier workload
-failure into success. The timestamp is event-loop monotonic time, not a wall-clock
+after collecting the exit result, output, and provider cleanup.
+`workload.agent_absence_confirmed_at` is `None` until the provider confirms the agent group absent,
+then remains a sticky monotonic timestamp. It can precede the full `wait()` result and is an
+observation of group absence, not the physical process-exit time. Daytona records its existing
+cgroup-removal confirmation; Compose, native Modal, and local Docker record their existing
+successful marked process-group stop confirmation. On natural completion, Compose confirms the
+inner group only after its outer workload has fully waited, while Modal and local Docker first wait
+for their existing process status. The returned result timestamp keeps its provider-specific meaning;
+on Daytona it also includes native session absence and may be later than the property.
+On a deadline or other abort, `await workload.kill()` stops that boundary before returning and
+raises if the stop cannot be confirmed; it does not promise a normal result. During timeout stop,
+existing process-group control-file cleanup may continue asynchronously. On Daytona, cleanup may
+retry a completed failed session close when it reaches the close step again, including within the
+same `kill()` call. A retry still requires fresh confirmation of absence and does not turn an
+earlier workload failure into success. The returned timestamp is monotonic time, not a wall-clock
 datetime. The caller owns deadline arbitration and must not proceed to independent
 collection on unconfirmed stop. Ordinary `Sandbox.command()` and `Sandbox.exec()`
 do not provide this contract. On Daytona, native Modal, and local Docker, `result.output` is a bounded
@@ -381,7 +527,27 @@ Eval-only retry flow:
 - `grader_identity(task_id, dataset)`: what decides the grade (judge model and rubric revision, or test revision and grader image). A retry refuses to grade if this changed.
 - `grade_input(task_id, content, dataset)`: how to grade those bytes.
 
-The framework saves the bytes to S3 before grading and, on a retry, grades the saved copy instead of rerunning the agent. Storage comes from `EVAL_RESUME_BUCKET` and `EVAL_RESUME_PREFIX`, which benchmark-services-registry sets when a service opts in. Implement all three hooks or none; a service that grades inside the live sandbox keeps its own `evaluate_instance` and uses `self.eval_resume_store` directly. Details are in `benchmark_service/eval_resume.py`.
+The framework saves the bytes to S3 before grading and, on a retry, grades the saved copy instead of rerunning the agent. Storage comes from `EVAL_RESUME_BUCKET` and `EVAL_RESUME_PREFIX`, which benchmark-services-registry sets when a service opts in.
+Implement `collect_grading_input`, `grader_identity` and one grader, or none.
+Details are in `benchmark_service/eval_resume.py`.
+
+Optional, as your grader needs:
+
+- **Grades inside a sandbox:** implement `grade_in_sandbox` instead of `grade_input`.
+  A retry grades in a fresh sandbox, or in the caller's sandbox when the request names one.
+  The fresh sandbox starts from the task's image,
+  so the bytes `collect_grading_input` saves must hold the whole graded workspace.
+  It grades under the task's `egress.evaluation`, the policy the first attempt grades under.
+  A task that declares no `egress.evaluation` grades its retry with the network blocked.
+- **Needs its own image or network:** set the task's `eval_sandbox`, the spec `/v1` grading reads.
+  Each attempt then grades in a fresh sandbox built from it, under its `network_block_all`,
+  except when a retry names the caller's sandbox (`instance_id`), which is borrowed instead,
+  and under `/v1` grading, which grades in the sandbox `/v1` already built from it.
+  Its `timeout_s` sizes that sandbox's auto-stop; it does not bound grading.
+- **Saves progress part-way**, for example after each judge call: yield `GradingInput`.
+- **Output that cannot be graded:** raise `NotGradeable(message)` from `collect_grading_input`.
+  The task ends with that error, and nothing is saved.
+- **No bounded input to save:** keep your own `evaluate_instance`.
 
 ### Streaming protocol
 
@@ -553,8 +719,8 @@ result = await client.run_with_sandbox_recovery(
 
 Pydantic models used across requests and responses:
 
-- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, optional `CreditedGeneration(allowance_seconds, stage_protocol)`, `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox` and `resume_sandbox`
-- **`GenerationContainment`** — effective-sandbox capability: `linux_cgroup_v2` v1 for direct Daytona or `linux_process_group` v1 for Compose service, native Modal, and local Docker workloads. Tracker probes the effective sandbox for every task before its `ControlledWorkload` and does not fall back to `Sandbox.command()` on unsupported providers.
+- **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, optional `CreditedGeneration(allowance_seconds, stage_protocol)`, optional `Episode(command, parallel_agents)`, `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox` and `resume_sandbox`
+- **`GenerationContainment`** — effective-sandbox capability: `linux_cgroup_v2` v1 for direct Daytona native-session commands fenced by cgroup v2, or `linux_process_group` v1 for Compose service, native Modal, and local Docker workloads. Tracker probes the effective sandbox for every task before its `ControlledWorkload` and does not fall back to `Sandbox.command()` on unsupported providers.
 - **`agent_install_order`** — `"before_setup"` installs agent dependencies before benchmark setup; `"after_setup"` lets setup prepare the environment first. The default is `"before_setup"`; lifecycle execution is the caller's responsibility.
 - **`BenchmarkEgressPlan`** — declarative `setup_task`, agent `run`, and `evaluation` policies. `"*"` is unrestricted, `[]` is deny-all, and a non-empty list is an allowlist. Setup and evaluation default to `"*"`; `run=None` leaves the benchmark without a run-policy opinion. Applying and composing the plan is the caller's responsibility.
 - **`SandboxRecoveryPolicy`** — explicit opt-in to recreate a lost generation sandbox with the same run identity and volumes; `max_sandbox_attempts` (2–20, inclusive) includes the initial sandbox

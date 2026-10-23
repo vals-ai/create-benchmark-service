@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator
 from contextlib import contextmanager
-from contextvars import ContextVar
+from contextvars import Context, ContextVar, copy_context
 
 from benchmark_service.sandbox import SandboxProvider
 
@@ -27,6 +27,10 @@ _current_sandbox_provider: ContextVar[SandboxProvider | None] = ContextVar(
 )
 
 _current_tenant: ContextVar[str | None] = ContextVar("benchmark_service_tenant", default=None)
+
+_current_grading_sandbox_id: ContextVar[str | None] = ContextVar(
+    "benchmark_service_grading_sandbox_id", default=None
+)
 
 
 def current_sandbox_provider() -> SandboxProvider | None:
@@ -57,3 +61,15 @@ def tenant_scope(tenant: str | None) -> Iterator[None]:
         yield
     finally:
         _current_tenant.reset(token)
+
+
+def current_grading_sandbox_id() -> str | None:
+    """Return the id of the sandbox ``/v1`` grading created for the in-flight evaluation, or None."""
+    return _current_grading_sandbox_id.get()
+
+
+def grading_sandbox_context(sandbox_id: str) -> Context:
+    """Copy the current context with ``sandbox_id`` bound as the ``/v1`` grading sandbox."""
+    context = copy_context()
+    context.run(_current_grading_sandbox_id.set, sandbox_id)
+    return context

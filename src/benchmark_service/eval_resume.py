@@ -18,8 +18,8 @@ inside ``evaluate_instance`` or ``stream_evaluate_response``.
 By default the bucket comes from ``$EVAL_RESUME_BUCKET`` and the prefix from
 ``$EVAL_RESUME_PREFIX``, which benchmark-services-registry sets for a service with
 ``EvalResumeStorageConfig``. A service that implements ``BenchmarkService``'s grading
-hooks never calls the store itself; the usage below is for one that overrides
-``evaluate_instance`` because it grades in the live sandbox.
+hooks never calls the store itself; the usage below is for one that keeps its own
+``evaluate_instance``.
 
 Usage::
 
@@ -48,6 +48,7 @@ import json
 import os
 import re
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any, Literal, NotRequired, Protocol, TypedDict, cast
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
@@ -79,6 +80,17 @@ class EvalResumeIdentityError(EvalResumeError):
 
 class EvalResumeIntegrityError(EvalResumeError):
     """The stored bytes do not match the size or SHA-256 the checkpoint recorded."""
+
+
+class NotGradeable(Exception):
+    """Raised by ``collect_grading_input`` when the agent's output cannot be graded; the message is streamed."""
+
+
+@dataclass(frozen=True)
+class GradingInput:
+    """Yielded by a grader to save ``content`` under the same run before it continues."""
+
+    content: bytes
 
 
 class EvalResumeCheckpoint(BaseModel):
@@ -397,6 +409,8 @@ __all__ = [
     "EvalResumeIdentityError",
     "EvalResumeIntegrityError",
     "EvalResumeStore",
+    "GradingInput",
+    "NotGradeable",
     "PREFIX_ENV",
     "S3Client",
     "benchmark_id_from_sandbox",

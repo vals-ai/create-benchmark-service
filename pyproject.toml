@@ -76,6 +76,7 @@ indent-style = "space"
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+testpaths = ["tests"]
 
 [tool.basedpyright]
 venvPath="."
@@ -85,7 +86,7 @@ reportExplicitAny = false
 reportAny = false
 reportMissingTypeStubs = false
 enableTypeIgnoreComments = true
-exclude = [".*", "**/*-service/"]
+exclude = [".*", "**/*-service/", "packages/"]
 
 [tool.uv.sources]
 create-benchmark-service = { workspace = true }

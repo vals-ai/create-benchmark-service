@@ -11,6 +11,7 @@ from unittest.mock import patch
 import pytest
 
 from benchmark_service.sandbox._process_group import cleanup_command, stop_command
+from benchmark_service.sandbox.local import docker as docker_module
 from benchmark_service.sandbox.local.docker import DockerSandboxProvider
 from benchmark_service.sandbox.types import Sandbox, SandboxConnectionError, SandboxError
 
@@ -127,9 +128,9 @@ def _record_control_dirs(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     observed: list[str] = []
     original = docker.stop_command
 
-    def record(control_dir: str) -> str:
+    def record(control_dir: str, *, episode_owner: bool) -> str:
         observed.append(control_dir)
-        return original(control_dir)
+        return original(control_dir, episode_owner=episode_owner)
 
     monkeypatch.setattr(docker, "stop_command", record)
     return observed
@@ -148,7 +149,17 @@ async def _assert_control_cleaned(container: _LocalContainer, control_dir: str) 
         await asyncio.sleep(0.01)
 
 
-async def test_controlled_status_stream_utf8_and_container_reuse(tmp_path: Path) -> None:
+async def test_controlled_status_stream_utf8_and_container_reuse(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    cleanup_started = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+    original_cleanup = docker_module._DockerControlledWorkload._cleanup  # pyright: ignore[reportPrivateUsage]
+
+    async def delayed_cleanup(self: docker_module._DockerControlledWorkload) -> None:  # pyright: ignore[reportPrivateUsage]
+        cleanup_started.set()
+        await allow_cleanup.wait()
+        await original_cleanup(self)
+
+    monkeypatch.setattr(docker_module._DockerControlledWorkload, "_cleanup", delayed_cleanup)  # pyright: ignore[reportPrivateUsage]
     container = _LocalContainer(chunk_size=1)
     sandbox = await _sandbox(container)
     await sandbox.probe_generation_containment()
@@ -156,8 +167,18 @@ async def test_controlled_status_stream_utf8_and_container_reuse(tmp_path: Path)
         "printf '\\316'; printf ' stderr' >&2; sleep 0.05; printf '\\261'; exit 7",
         cwd=str(tmp_path),
     )
+    assert workload.agent_absence_confirmed_at is None
     output = "".join([chunk async for chunk in workload.output()])
-    result = await workload.wait()
+    waiting = asyncio.create_task(workload.wait())
+    try:
+        await asyncio.wait_for(cleanup_started.wait(), 3)
+        receipt = workload.agent_absence_confirmed_at
+        assert receipt is not None
+        assert not waiting.done()
+    finally:
+        allow_cleanup.set()
+    result = await asyncio.wait_for(waiting, 3)
+    assert result.absence_confirmed_at == receipt
     assert result.result.exit_code == 7
     assert output == result.result.output
     assert output.count("α") == 1
@@ -276,13 +297,19 @@ async def test_controlled_kill_preserves_output_during_delayed_drain(monkeypatch
     workload = sandbox.controlled_workload("printf tail; sleep 30")
     try:
         await asyncio.wait_for(captured.wait(), 3)
+        assert workload.agent_absence_confirmed_at is None
         await asyncio.wait_for(workload.kill(), 3)
+        receipt = workload.agent_absence_confirmed_at
+        assert receipt is not None
+        waiting = asyncio.create_task(workload.wait())
         process = container.executions[0].process
         assert process is not None and process.returncode is not None
         control_dir = control_dirs[-1]
         assert Path(control_dir).is_dir()
+        assert not waiting.done()
         release.set()
-        result = await asyncio.wait_for(workload.wait(), 3)
+        result = await asyncio.wait_for(waiting, 3)
+        assert result.absence_confirmed_at == receipt
         assert result.result.output == "tail"
         await _assert_control_cleaned(container, control_dir)
     finally:
@@ -397,7 +424,7 @@ async def test_controlled_unconfirmed_group_absence_is_error(monkeypatch: pytest
     workload = sandbox.controlled_workload("sleep 2")
     from benchmark_service.sandbox.local import docker
 
-    def fail_confirmation(control_dir: str) -> str:
+    def fail_confirmation(control_dir: str, *, episode_owner: bool) -> str:
         confirmations.append(control_dir)
         return "exit 1"
 
@@ -413,7 +440,7 @@ async def test_controlled_unconfirmed_group_absence_is_error(monkeypatch: pytest
             while not pgid.exists() or pgid.stat().st_size == 0:
                 assert asyncio.get_running_loop().time() < deadline
                 await asyncio.sleep(0.01)
-            confirmed = await sandbox.exec(stop_command(control_dir))
+            confirmed = await sandbox.exec(stop_command(control_dir, episode_owner=False))
             assert confirmed.exit_code == 0
             with pytest.raises(SandboxError, match="process group did not stop"):
                 await asyncio.wait_for(workload.wait(), timeout=3)

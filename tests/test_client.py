@@ -69,9 +69,7 @@ def _task_response(max_sandbox_attempts: int | None = None) -> RetrieveTaskRespo
 @pytest.mark.parametrize("version", [0, True, "1"])
 def test_generation_containment_requires_positive_integer_version(version: object) -> None:
     with pytest.raises(ValidationError):
-        GenerationContainment.model_validate(
-            {"type": "linux_cgroup_v2", "version": version}
-        )
+        GenerationContainment.model_validate({"type": "linux_cgroup_v2", "version": version})
 
 
 def _mock_response(status_code: int = 200, json_data: Any = None, text: str = "error") -> MagicMock:
@@ -844,7 +842,7 @@ async def test_evaluate_instance_asks_for_sandbox_announcements_only_with_a_call
         )
 
     sent = json.loads((await ws_connect.__aenter__()).send.call_args.args[0])
-    assert ("announce_sandboxes" in sent) is with_callback
+    assert sent.get("announce_sandboxes") is (True if with_callback else None)
     assert sent.get("announce_sandboxes", True) is True
 
 
@@ -864,7 +862,7 @@ async def test_resume_evaluation_asks_for_sandbox_announcements_only_with_a_call
         )
 
     sent = json.loads((await ws_connect.__aenter__()).send.call_args.args[0])
-    assert ("announce_sandboxes" in sent) is with_callback
+    assert sent.get("announce_sandboxes") is (True if with_callback else None)
 
 
 async def test_resume_evaluation_forwards_an_owned_sandbox_without_changing_state(

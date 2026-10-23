@@ -4,9 +4,9 @@ import importlib.metadata
 import logging
 import os
 import traceback
-from collections.abc import AsyncGenerator, Awaitable, Callable
+from collections.abc import AsyncGenerator
 from contextlib import aclosing, asynccontextmanager, nullcontext, suppress
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.responses import JSONResponse
@@ -19,7 +19,8 @@ from websockets.exceptions import ConnectionClosed
 from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_required
 from benchmark_service.base import BenchmarkService
-from benchmark_service.context import sandbox_created_scope, sandbox_provider_scope, tenant_scope
+from benchmark_service.context import sandbox_provider_scope, tenant_scope
+from benchmark_service.sandbox.created import SandboxCreatedHook, sandbox_created_scope
 from benchmark_service.schemas import (
     DATASET_VERSION_HEADER,
     DatasetVersion,
@@ -80,11 +81,11 @@ async def _forward_stream(
                 return
 
 
-def _sandbox_created_hook(websocket: WebSocket) -> Callable[[str, str], Awaitable[None]]:
-    async def announce(provider: str, sandbox_id: str) -> None:
+def _sandbox_created_hook(websocket: WebSocket) -> SandboxCreatedHook:
+    async def announce(provider: Literal["daytona"], sandbox_id: str) -> None:
         chunk = StreamSandboxCreatedChunk(
             type="sandbox_created",
-            data=SandboxCreatedData.model_validate({"provider": provider, "sandbox_id": sandbox_id}),
+            data=SandboxCreatedData(provider=provider, sandbox_id=sandbox_id),
         )
         await send_json_if_connected(websocket, chunk.model_dump())
 
@@ -197,7 +198,9 @@ class BenchmarkServiceApp(FastAPI):
                 try:
                     self.authorize_request(tenant, request.url.path)
                 except HTTPException as exc:
-                    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
+                    return JSONResponse(
+                        status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers
+                    )
                 response = await call_next(request)  # type: ignore[reportUnknownVariableType]
                 version = getattr(request.state, "dataset_version", None)
                 if version is not None and 200 <= response.status_code < 300:

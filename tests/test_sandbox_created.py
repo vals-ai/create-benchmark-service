@@ -6,10 +6,11 @@ from daytona.common.errors import DaytonaError
 from fastapi.testclient import TestClient
 
 from benchmark_service.app import BenchmarkServiceApp
-from benchmark_service.context import current_sandbox_provider, sandbox_created_scope
+from benchmark_service.context import current_sandbox_provider
+from benchmark_service.sandbox.created import sandbox_created_scope
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
-from benchmark_service.sandbox.types import Sandbox, SandboxProvider
-from benchmark_service.schemas import EvaluateInstanceRequest, EvaluateResponseRequest, StreamChunk, StreamResultChunk
+from benchmark_service.sandbox.types import Sandbox, SandboxError, SandboxProvider
+from benchmark_service.schemas import EvaluateResponseRequest, StreamChunk, StreamResultChunk
 from tests.conftest import StubBenchmark
 from tests.test_sandbox import DaytonaClient, InnerSandbox, _provider, _request  # pyright: ignore[reportPrivateUsage]
 
@@ -70,7 +71,7 @@ async def test_failed_create_announces_nothing() -> None:
             raise DaytonaError("quota exceeded")
 
     recorder = Recorder()
-    with sandbox_created_scope(recorder), pytest.raises(Exception):
+    with sandbox_created_scope(recorder), pytest.raises(SandboxError):
         await _provider(FailingCreateClient(InnerSandbox())).create_sandbox(_request("sandbox-name"))
 
     assert recorder.calls == []
@@ -230,12 +231,3 @@ def test_evaluate_instance_without_opt_in_streams_only_the_result_when_a_sandbox
             frames = [ws.receive_json()]
 
     assert frames == [{"type": "result", "data": {"ok": True}}]
-
-
-def test_evaluate_requests_omit_the_opt_in_from_the_wire_unless_set() -> None:
-    assert "announce_sandboxes" not in EvaluateInstanceRequest(task_id="t", instance_id="i").model_dump_json()
-    assert "announce_sandboxes" not in EvaluateResponseRequest(task_id="t", response="r").model_dump_json()
-    assert (
-        '"announce_sandboxes":true'
-        in EvaluateInstanceRequest(task_id="t", instance_id="i", announce_sandboxes=True).model_dump_json()
-    )

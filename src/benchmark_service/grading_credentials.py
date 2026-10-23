@@ -132,7 +132,7 @@ def _model_library_scope(credentials: GradingCredentials) -> AbstractContextMana
     if credentials.lease_id is None:
         return nullcontext()
     try:
-        module = importlib.import_module("model_library.gateway_credentials")
+        module = importlib.import_module("model_library.base.gateway")
     except ImportError:
         return nullcontext()
     return module.gateway_token_scope(credentials.api_key)

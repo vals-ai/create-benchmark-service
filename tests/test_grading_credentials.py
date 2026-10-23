@@ -172,9 +172,9 @@ async def test_model_library_sends_the_token_while_grading(
         seen.append(token)
         yield
 
-    module = types.ModuleType("model_library.gateway_credentials")
+    module = types.ModuleType("model_library.base.gateway")
     module.gateway_token_scope = gateway_token_scope  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "model_library.gateway_credentials", module)
+    monkeypatch.setitem(sys.modules, "model_library.base.gateway", module)
     async with bound():
         pass
     assert seen == ["mgwt_run-1"]

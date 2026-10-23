@@ -57,9 +57,18 @@ class GradingCredentials:
 _current: ContextVar[GradingCredentials | None] = ContextVar("benchmark_service_grading_credentials", default=None)
 
 
+def _service_credentials() -> GradingCredentials | None:
+    url, api_key = os.environ.get("MODEL_GATEWAY_URL", "").rstrip("/"), os.environ.get("MODEL_GATEWAY_API_KEY", "")
+    return GradingCredentials(url, api_key) if url and api_key else None
+
+
 def current_grading_credentials() -> GradingCredentials | None:
-    """The credentials of the in-flight evaluation, or None outside one (or without a Gateway)."""
-    return _current.get()
+    """The in-flight evaluation's credentials, else the service's own Gateway settings, else None.
+
+    Graders that call the Gateway themselves (custom HTTP clients, judge sandboxes)
+    read this instead of ``MODEL_GATEWAY_*`` so they use the evaluation's token.
+    """
+    return _current.get() or _service_credentials()
 
 
 def _identity() -> dict[str, object]:
@@ -77,7 +86,7 @@ def _identity() -> dict[str, object]:
 
 
 async def _mint(
-    url: str, api_key: str, *, run_id: str, task_id: str, attempt_id: str | None, models: list[str]
+    service: GradingCredentials, *, run_id: str, task_id: str, attempt_id: str | None, models: list[str]
 ) -> GradingCredentials:
     body = {
         "run_id": run_id,
@@ -89,7 +98,9 @@ async def _mint(
         "ttl_seconds": _TOKEN_TTL_S,
     }
     async with httpx.AsyncClient(timeout=_MINT_TIMEOUT_S) as client:
-        response = await client.post(f"{url}/service-auth", headers={"Authorization": f"Bearer {api_key}"}, json=body)
+        response = await client.post(
+            f"{service.gateway_url}/service-auth", headers={"Authorization": f"Bearer {service.api_key}"}, json=body
+        )
         response.raise_for_status()
     lease = response.json()
     logger.info(
@@ -99,7 +110,7 @@ async def _mint(
         attempt_id,
         lease["lease_id"],
     )
-    return GradingCredentials(url, lease["token"], lease_id=lease["lease_id"])
+    return GradingCredentials(service.gateway_url, lease["token"], lease_id=lease["lease_id"])
 
 
 async def _revoke(credentials: GradingCredentials, api_key: str) -> None:
@@ -136,21 +147,20 @@ async def grading_credentials(
     task that grades (stream finalizers, cleanup) has finished. A scope entered
     inside another reuses the enclosing credentials.
     """
-    url, api_key = os.environ.get("MODEL_GATEWAY_URL", "").rstrip("/"), os.environ.get("MODEL_GATEWAY_API_KEY", "")
-    if _current.get() is not None or not url or not api_key:
+    service = _service_credentials()
+    if _current.get() is not None or service is None:
         yield
         return
     models = [model.strip() for model in os.environ.get("GRADING_MODELS", "").split(",") if model.strip()]
+    credentials = service
     if run_id is not None and models:
-        credentials = await _mint(url, api_key, run_id=run_id, task_id=task_id, attempt_id=attempt_id, models=models)
-    else:
-        if run_id is not None:
-            logger.warning(
-                "GRADING_MODELS is not configured: grading of run_id=%s task_id=%s is charged to the service key",
-                run_id,
-                task_id,
-            )
-        credentials = GradingCredentials(url, api_key)
+        credentials = await _mint(service, run_id=run_id, task_id=task_id, attempt_id=attempt_id, models=models)
+    elif run_id is not None:
+        logger.warning(
+            "GRADING_MODELS is not configured: grading of run_id=%s task_id=%s is charged to the service key",
+            run_id,
+            task_id,
+        )
     token = _current.set(credentials)
     try:
         with _model_library_scope(credentials):
@@ -158,4 +168,4 @@ async def grading_credentials(
     finally:
         _current.reset(token)
         if credentials.lease_id is not None:
-            await _revoke(credentials, api_key)
+            await _revoke(credentials, service.api_key)

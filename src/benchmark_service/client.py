@@ -37,6 +37,7 @@ from benchmark_service.schemas import (
     RetrieveTaskResponse,
     ResolveDatasetRequest,
     ResolveDatasetResponse,
+    SandboxCreatedData,
     SetupTaskRequest,
     SetupTaskResponse,
     StreamChunk,
@@ -396,6 +397,7 @@ class BenchmarkServiceClient:
         request: BaseModel,
         on_message: Callable[[str], None] | None = None,
         on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
+        on_sandbox_created: Callable[[SandboxCreatedData], None] | None = None,
     ) -> JsonValue:
         """Send a request over WebSocket and stream the response.
 
@@ -403,6 +405,7 @@ class BenchmarkServiceClient:
             path: WebSocket endpoint path (appended to /ws/).
             request: Pydantic model to serialize and send as the initial message.
             on_message: Optional callback invoked for each intermediate "message" chunk.
+            on_sandbox_created: Optional callback invoked for each "sandbox_created" chunk.
 
         Returns:
             The data payload from the final "result" chunk.
@@ -467,6 +470,9 @@ class BenchmarkServiceClient:
                             case "eval_resume_state":
                                 if on_eval_resume_state:
                                     on_eval_resume_state(chunk.data)
+                            case "sandbox_created":
+                                if on_sandbox_created:
+                                    on_sandbox_created(chunk.data)
                 except ConnectionClosed as exc:
                     close_frame = exc.rcvd or exc.sent
                     raise BenchmarkServiceStreamClosedError(
@@ -729,6 +735,7 @@ class BenchmarkServiceClient:
         on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
         sandbox_provider: SandboxProviderConfig | None = None,
         instance_id: str | None = None,
+        on_sandbox_created: Callable[[SandboxCreatedData], None] | None = None,
     ) -> JsonValue:
         """Resume evaluation from state previously streamed by the benchmark service.
 
@@ -742,8 +749,11 @@ class BenchmarkServiceClient:
             sandbox_provider=sandbox_provider,
             instance_id=instance_id,
             dataset=dataset,
+            announce_sandboxes=on_sandbox_created is not None,
         )
-        return await self._websocket_request("evaluate-response", request, on_message, on_eval_resume_state)
+        return await self._websocket_request(
+            "evaluate-response", request, on_message, on_eval_resume_state, on_sandbox_created
+        )
 
     async def evaluate_instance(
         self,
@@ -753,6 +763,7 @@ class BenchmarkServiceClient:
         on_message: Callable[[str], None] | None = None,
         dataset: str | None = None,
         on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
+        on_sandbox_created: Callable[[SandboxCreatedData], None] | None = None,
     ) -> JsonValue:
         """Evaluate a task instance via WebSocket.
 
@@ -767,8 +778,11 @@ class BenchmarkServiceClient:
             instance_id=instance_id,
             sandbox_provider=sandbox_provider,
             dataset=dataset,
+            announce_sandboxes=on_sandbox_created is not None,
         )
-        return await self._websocket_request("evaluate-instance", request, on_message, on_eval_resume_state)
+        return await self._websocket_request(
+            "evaluate-instance", request, on_message, on_eval_resume_state, on_sandbox_created
+        )
 
     @_retry_http
     async def final_score(self, evaluation_results: dict[str, Any], dataset: str | None = None) -> FinalScoreResponse:

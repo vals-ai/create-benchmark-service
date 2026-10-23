@@ -553,7 +553,7 @@ Optional, as your grader needs:
 
 ### Streaming protocol
 
-The WebSocket endpoints and generators communicate via four chunk types:
+The WebSocket endpoints and generators communicate via these chunk types:
 
 ```python
 StreamMessageChunk(type="message", data="log line")              # progress / log output
@@ -563,6 +563,9 @@ StreamResultChunk(type="result", data=<any>)                     # final result 
 ```
 
 Yield these from your generator methods; the framework serialises and forwards them to the WebSocket client.
+
+The framework sends `{"type": "sandbox_created", "data": {"provider": "daytona", "sandbox_id": "…"}}` on the evaluate streams whenever the Daytona provider creates a sandbox for the request, and only when the request sets `announce_sandboxes`.
+The client sets it when you pass `on_sandbox_created` to `evaluate_instance` or `resume_evaluation`; without a callback the stream is unchanged, so older clients never see the new chunk.
 
 ### v1 Eval API (lab-facing)
 

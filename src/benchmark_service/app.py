@@ -6,7 +6,7 @@ import os
 import traceback
 from collections.abc import AsyncGenerator, Mapping
 from contextlib import AbstractAsyncContextManager, aclosing, asynccontextmanager, nullcontext, suppress
-from typing import Any, cast
+from typing import Any, Literal, cast
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.responses import JSONResponse
@@ -22,6 +22,7 @@ from benchmark_service.base import BenchmarkService
 from benchmark_service.grading_credentials import grading_credentials
 from benchmark_service.observability import ATTEMPT_ID_HEADER, RUN_ID_HEADER
 from benchmark_service.context import sandbox_provider_scope, tenant_scope
+from benchmark_service.sandbox.created import SandboxCreatedHook, sandbox_created_scope
 from benchmark_service.schemas import (
     DATASET_VERSION_HEADER,
     DatasetVersion,
@@ -38,7 +39,9 @@ from benchmark_service.schemas import (
     SetupTaskRequest,
     StreamChunk,
     StreamDatasetVersionChunk,
+    SandboxCreatedData,
     StreamErrorChunk,
+    StreamSandboxCreatedChunk,
     TaskFilter,
     VerifyTaskIdsResponse,
     VersionResponse,
@@ -78,6 +81,17 @@ async def _forward_stream(
             if not await send_json_if_connected(websocket, chunk.model_dump()):
                 logger.warning("%s websocket disconnected before benchmark service completed", endpoint)
                 return
+
+
+def _sandbox_created_hook(websocket: WebSocket) -> SandboxCreatedHook:
+    async def announce(provider: Literal["daytona"], sandbox_id: str) -> None:
+        chunk = StreamSandboxCreatedChunk(
+            type="sandbox_created",
+            data=SandboxCreatedData(provider=provider, sandbox_id=sandbox_id),
+        )
+        await send_json_if_connected(websocket, chunk.model_dump())
+
+    return announce
 
 
 async def _send_dataset_version_error(websocket: WebSocket, exc: _DatasetVersionSelectionError) -> None:
@@ -193,7 +207,9 @@ class BenchmarkServiceApp(FastAPI):
                 try:
                     self.authorize_request(tenant, request.url.path)
                 except HTTPException as exc:
-                    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
+                    return JSONResponse(
+                        status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers
+                    )
                 response = await call_next(request)  # type: ignore[reportUnknownVariableType]
                 version = getattr(request.state, "dataset_version", None)
                 if version is not None and 200 <= response.status_code < 300:
@@ -470,7 +486,12 @@ class BenchmarkServiceApp(FastAPI):
                     async with (
                         request.sandbox_provider.create_provider() if request.sandbox_provider else nullcontext()
                     ) as provider:
-                        with sandbox_provider_scope(provider):
+                        with (
+                            sandbox_provider_scope(provider),
+                            sandbox_created_scope(
+                                _sandbox_created_hook(websocket) if request.announce_sandboxes else None
+                            ),
+                        ):
                             await _forward_stream(
                                 websocket,
                                 self.service.stream_evaluate_response(request, dataset=request.dataset),
@@ -507,7 +528,12 @@ class BenchmarkServiceApp(FastAPI):
                     # Benchmarks that grade in a second sandbox read the provider
                     # from the request scope; see benchmark_service.context.
                     async with _grading_credentials(websocket.headers, request.task_id):
-                        with sandbox_provider_scope(provider):
+                        with (
+                            sandbox_provider_scope(provider),
+                            sandbox_created_scope(
+                                _sandbox_created_hook(websocket) if request.announce_sandboxes else None
+                            ),
+                        ):
                             await _forward_stream(
                                 websocket,
                                 self.service.evaluate_instance(request.task_id, sandbox, dataset=request.dataset),

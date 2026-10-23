@@ -58,7 +58,8 @@ _current: ContextVar[GradingCredentials | None] = ContextVar("benchmark_service_
 
 
 def _service_credentials() -> GradingCredentials | None:
-    url, api_key = os.environ.get("MODEL_GATEWAY_URL", "").rstrip("/"), os.environ.get("MODEL_GATEWAY_API_KEY", "")
+    url = os.environ.get("MODEL_GATEWAY_URL", "").strip().rstrip("/")
+    api_key = os.environ.get("MODEL_GATEWAY_API_KEY", "").strip()
     return GradingCredentials(url, api_key) if url and api_key else None
 
 

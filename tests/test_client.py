@@ -796,6 +796,41 @@ async def test_resume_evaluation_with_eval_resume_state(
     on_eval_resume_state.assert_called_once_with(state)
 
 
+async def test_evaluate_instance_reports_each_sandbox_created_chunk(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, _mock_http = benchmark_client
+    messages = [
+        json.dumps({"type": "sandbox_created", "data": {"provider": "daytona", "sandbox_id": "sb-1"}}),
+        json.dumps({"type": "sandbox_created", "data": {"provider": "daytona", "sandbox_id": "sb-2"}}),
+        json.dumps({"type": "result", "data": {"score": 1.0}}),
+    ]
+    on_sandbox_created = MagicMock()
+
+    with patch("benchmark_service.client.websockets.connect", return_value=_ws_mock(messages)):
+        result = await client.evaluate_instance(
+            "task-1", "i-1", sandbox_provider=DAYTONA_CONFIG, on_sandbox_created=on_sandbox_created
+        )
+
+    assert result == {"score": 1.0}
+    assert [call.args[0].sandbox_id for call in on_sandbox_created.call_args_list] == ["sb-1", "sb-2"]
+
+
+async def test_sandbox_created_chunk_is_skipped_without_a_callback(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, _mock_http = benchmark_client
+    messages = [
+        json.dumps({"type": "sandbox_created", "data": {"provider": "daytona", "sandbox_id": "sb-1"}}),
+        json.dumps({"type": "result", "data": {"score": 1.0}}),
+    ]
+
+    with patch("benchmark_service.client.websockets.connect", return_value=_ws_mock(messages)):
+        result = await client.evaluate_instance("task-1", "i-1", sandbox_provider=DAYTONA_CONFIG)
+
+    assert result == {"score": 1.0}
+
+
 async def test_resume_evaluation_forwards_an_owned_sandbox_without_changing_state(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:

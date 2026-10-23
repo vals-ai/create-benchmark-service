@@ -4,7 +4,7 @@ import importlib.metadata
 import logging
 import os
 import traceback
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, Awaitable, Callable
 from contextlib import aclosing, asynccontextmanager, nullcontext, suppress
 from typing import Any, cast
 
@@ -19,7 +19,7 @@ from websockets.exceptions import ConnectionClosed
 from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_required
 from benchmark_service.base import BenchmarkService
-from benchmark_service.context import sandbox_provider_scope, tenant_scope
+from benchmark_service.context import sandbox_created_scope, sandbox_provider_scope, tenant_scope
 from benchmark_service.schemas import (
     DATASET_VERSION_HEADER,
     DatasetVersion,
@@ -36,7 +36,9 @@ from benchmark_service.schemas import (
     SetupTaskRequest,
     StreamChunk,
     StreamDatasetVersionChunk,
+    SandboxCreatedData,
     StreamErrorChunk,
+    StreamSandboxCreatedChunk,
     TaskFilter,
     VerifyTaskIdsResponse,
     VersionResponse,
@@ -75,6 +77,17 @@ async def _forward_stream(
             if not await send_json_if_connected(websocket, chunk.model_dump()):
                 logger.warning("%s websocket disconnected before benchmark service completed", endpoint)
                 return
+
+
+def _sandbox_created_hook(websocket: WebSocket) -> Callable[[str, str], Awaitable[None]]:
+    async def announce(provider: str, sandbox_id: str) -> None:
+        chunk = StreamSandboxCreatedChunk(
+            type="sandbox_created",
+            data=SandboxCreatedData.model_validate({"provider": provider, "sandbox_id": sandbox_id}),
+        )
+        await send_json_if_connected(websocket, chunk.model_dump())
+
+    return announce
 
 
 async def _send_dataset_version_error(websocket: WebSocket, exc: _DatasetVersionSelectionError) -> None:
@@ -458,7 +471,7 @@ class BenchmarkServiceApp(FastAPI):
                 async with (
                     request.sandbox_provider.create_provider() if request.sandbox_provider else nullcontext()
                 ) as provider:
-                    with sandbox_provider_scope(provider):
+                    with sandbox_provider_scope(provider), sandbox_created_scope(_sandbox_created_hook(websocket)):
                         await _forward_stream(
                             websocket,
                             self.service.stream_evaluate_response(request, dataset=request.dataset),
@@ -494,7 +507,7 @@ class BenchmarkServiceApp(FastAPI):
 
                     # Benchmarks that grade in a second sandbox read the provider
                     # from the request scope; see benchmark_service.context.
-                    with sandbox_provider_scope(provider):
+                    with sandbox_provider_scope(provider), sandbox_created_scope(_sandbox_created_hook(websocket)):
                         await _forward_stream(
                             websocket,
                             self.service.evaluate_instance(request.task_id, sandbox, dataset=request.dataset),

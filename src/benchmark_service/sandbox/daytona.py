@@ -73,6 +73,7 @@ from tenacity import (
     wait_random,
 )
 
+from benchmark_service.sandbox.created import notify_sandbox_created
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
     ComposeSource,
@@ -1946,11 +1947,13 @@ class DaytonaSandboxProvider(SandboxProvider):
             if _is_name_conflict_error(exc):
                 existing = await self._find_existing_sandbox(request.name, daytona)
                 if existing is not None:
+                    await notify_sandbox_created("daytona", existing.id)
                     return DaytonaSandbox(existing, daytona)
             elif _is_transient_daytona_error(exc):
                 await self._delete_failed_sandbox(request.name, daytona)
             raise self._sandbox_error(exc) from exc
 
+        await notify_sandbox_created("daytona", inner.id)
         return DaytonaSandbox(inner, daytona)
 
     async def _delete_failed_sandbox(self, name: str, daytona: AsyncDaytona) -> None:

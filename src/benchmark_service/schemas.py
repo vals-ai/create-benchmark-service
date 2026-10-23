@@ -463,5 +463,21 @@ class StreamEvalResumeStateChunk(BaseModel):
     data: dict[str, Any] = Field(description="Benchmark-specific evaluation progress state")
 
 
+class SandboxCreatedData(BaseModel):
+    """Identity of a sandbox a provider created while serving the request."""
+
+    provider: Literal["daytona"]
+    sandbox_id: str
+
+
+class StreamSandboxCreatedChunk(BaseModel):
+    """Streaming chunk announcing a sandbox the service created for this request."""
+
+    type: Literal["sandbox_created"]
+    data: SandboxCreatedData
+
+
 # Union type for all streaming chunks
-StreamChunk = StreamMessageChunk | StreamResultChunk | StreamErrorChunk | StreamEvalResumeStateChunk
+StreamChunk = (
+    StreamMessageChunk | StreamResultChunk | StreamErrorChunk | StreamEvalResumeStateChunk | StreamSandboxCreatedChunk
+)

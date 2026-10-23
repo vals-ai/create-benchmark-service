@@ -382,7 +382,8 @@ async def test_client_awaits_checkpoint_before_terminal_result(callback_fails: b
             )
             try:
                 await asyncio.wait_for(result_sent.wait(), timeout=5)
-                assert not evaluation.done()
+                with pytest.raises(TimeoutError):
+                    await asyncio.wait_for(asyncio.shield(evaluation), timeout=0.1)
             finally:
                 release_checkpoint.set()
             if callback_fails:

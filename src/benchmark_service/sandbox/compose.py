@@ -212,6 +212,11 @@ class _ComposeControlledWorkload(ControlledWorkload):
         self._result_task: asyncio.Task[ControlledWorkloadResult] | None = None
         self._stop_task: asyncio.Task[tuple[float, int | None]] | None = None
         self._cleanup_task: asyncio.Task[None] | None = None
+        self._agent_absence_confirmed_at: float | None = None
+
+    @property
+    def agent_absence_confirmed_at(self) -> float | None:
+        return self._agent_absence_confirmed_at
 
     async def _launch(self) -> tuple[ControlledWorkload, str]:
         sandbox = self._sandbox
@@ -295,8 +300,9 @@ class _ComposeControlledWorkload(ControlledWorkload):
                 await self._result_task
                 raise SandboxError("Compose workload finished without a service process-group marker")
             await asyncio.sleep(0.05)
+        self._agent_absence_confirmed_at = asyncio.get_running_loop().time()
         self._cleanup_task = asyncio.create_task(self._cleanup(container_id))
-        return asyncio.get_running_loop().time(), int(stopped.output.strip()) if stopped.output.strip() else None
+        return self._agent_absence_confirmed_at, int(stopped.output.strip()) if stopped.output.strip() else None
 
     async def _cleanup(self, container_id: str) -> None:
         assert self._result_task is not None

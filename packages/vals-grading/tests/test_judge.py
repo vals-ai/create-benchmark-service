@@ -121,8 +121,11 @@ async def test_concurrency_and_parent_cancellation() -> None:
     peak = 0
 
     class BlockedModel(RecordedModel):
-        async def generate(self, prompt: str) -> str:
+        async def generate(self, prompt: str, system: str = "") -> str:
             nonlocal active, peak
+            if not self.prompts:
+                self.prompts.append(prompt)
+                return PASS
             active += 1
             peak = max(peak, active)
             if active == 10:
@@ -135,13 +138,28 @@ async def test_concurrency_and_parent_cancellation() -> None:
                 if active == 0:
                     stopped.set()
 
-    task = asyncio.create_task(CheckJudge(BlockedModel([])).grade_test(case(weights=(1,) * 15), "Answer", {}))
+    task = asyncio.create_task(CheckJudge(BlockedModel([])).grade_test(case(weights=(1,) * 16), "Answer", {}))
     await asyncio.wait_for(started.wait(), 2)
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     await asyncio.wait_for(stopped.wait(), 2)
     assert active == 0 and peak == 10
+
+
+async def test_checks_share_the_rendered_prefix_as_system() -> None:
+    calls: list[tuple[str, str]] = []
+
+    class SystemModel(RecordedModel):
+        async def generate(self, prompt: str, system: str = "") -> str:
+            calls.append((system, prompt))
+            return PASS
+
+    test = case("A={{output}}\nC={{criteria}}", weights=(1, 1))
+    test = test.model_copy(update={"checks": (test.checks[0], test.checks[1].model_copy(update={"criteria": "Other"}))})
+    await CheckJudge(SystemModel([])).grade_test(test, "Answer", {})
+    assert [system for system, _ in calls] == ["<PROMPT>A=Answer\n"] * 2
+    assert [prompt.split("\n")[0] for _, prompt in calls] == ["C=Rule", "C=Other"]
 
 
 async def test_model_cancellation_does_not_become_a_score() -> None:

@@ -304,6 +304,11 @@ class _DockerControlledWorkload(ControlledWorkload):
         self._stop_task: asyncio.Task[tuple[float, int | None]] | None = None
         self._cleanup_task: asyncio.Task[None] | None = None
         self._result_task = asyncio.create_task(self._run())
+        self._agent_absence_confirmed_at: float | None = None
+
+    @property
+    def agent_absence_confirmed_at(self) -> float | None:
+        return self._agent_absence_confirmed_at
 
     def _accept(self, text: str) -> None:
         if not text:
@@ -436,8 +441,9 @@ class _DockerControlledWorkload(ControlledWorkload):
             if self._status_done.is_set():
                 raise SandboxError("Docker workload finished without a process-group marker")
             await asyncio.sleep(0.05)
+        self._agent_absence_confirmed_at = asyncio.get_running_loop().time()
         self._cleanup_task = asyncio.create_task(self._cleanup())
-        return asyncio.get_running_loop().time(), int(stopped.output.strip()) if stopped.output.strip() else None
+        return self._agent_absence_confirmed_at, int(stopped.output.strip()) if stopped.output.strip() else None
 
     async def _cleanup(self) -> None:
         if self._drain_task is None:

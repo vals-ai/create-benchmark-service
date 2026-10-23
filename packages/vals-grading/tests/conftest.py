@@ -18,8 +18,8 @@ class RecordedModel:
         self.replies = iter(replies)
         self.prompts: list[str] = []
 
-    async def generate(self, prompt: str) -> str:
-        self.prompts.append(prompt)
+    async def generate(self, prompt: str, system: str = "") -> str:
+        self.prompts.append(system + prompt)
         reply = next(self.replies)
         if isinstance(reply, BaseException):
             raise reply

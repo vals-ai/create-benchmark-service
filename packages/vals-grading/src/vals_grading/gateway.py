@@ -5,6 +5,7 @@ import os
 
 from model_library.base import LLMConfig
 from model_library.base.gateway import GatewayLLM
+from model_library.base.input import SystemInput, TextInput
 from model_library.registry_utils import get_registry_model
 from model_library.telemetry import IdentityValidationError, normalize_identity
 
@@ -37,8 +38,9 @@ class GatewayJudgeModel:
                 "The judge did not select the Gateway. Set Gateway configuration before importing model-library."
             )
 
-    async def generate(self, prompt: str) -> str:
-        return (await self._model.query(prompt)).output_text_str
+    async def generate(self, prompt: str, system: str = "") -> str:
+        inputs = [SystemInput(text=system)] if system else []
+        return (await self._model.query([*inputs, TextInput(text=prompt)])).output_text_str
 
     async def count_tokens(self, text: str) -> int:
         encoding = await self._model.get_encoding()

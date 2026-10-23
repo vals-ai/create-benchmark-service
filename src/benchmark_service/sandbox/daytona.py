@@ -1289,6 +1289,10 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         self._finish_task = asyncio.create_task(self._finish())
         self._finish_task.add_done_callback(self._consume_finish_exception)
 
+    @property
+    def agent_absence_confirmed_at(self) -> float | None:
+        return self._group_stopped_at
+
     @staticmethod
     def _consume_run_exception(task: asyncio.Task[Any]) -> None:
         if not task.cancelled():

@@ -5504,22 +5504,42 @@ async def test_daytona_native_command_gets_stdin_eof_with_parent_pipe_open(
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
 async def test_daytona_natural_completion_fences_group_before_release_and_final_output() -> None:
-    process = CgroupProcess()
+    class DelayedCloseProcess(CgroupProcess):
+        def __init__(self) -> None:
+            super().__init__()
+            self.close_started = asyncio.Event()
+            self.allow_close = asyncio.Event()
+
+        async def delete_session(self, session_id: str) -> None:
+            self.close_started.set()
+            await self.allow_close.wait()
+            await super().delete_session(session_id)
+
+    process = DelayedCloseProcess()
     process.allow_creation.set()
     workload = _cgroup_sandbox(process).controlled_workload("exit 7")
+    assert workload.agent_absence_confirmed_at is None
     await asyncio.wait_for(process.command_admitted.wait(), 2)
     process.user_finished.set()
     waiting = asyncio.create_task(workload.wait())
     await asyncio.wait_for(process.removal_started.wait(), 2)
     assert not waiting.done()
     assert not process.release_seen.is_set()
-    process.allow_removal.set()
-    await asyncio.wait_for(process.release_seen.wait(), 2)
-    assert not process.group_exists
-    completed = await asyncio.wait_for(waiting, 2)
-    assert completed.result.exit_code == 7
-    assert completed.result.output.endswith("final frame")
-    assert process.sessions == set()
+    try:
+        process.allow_removal.set()
+        await asyncio.wait_for(process.close_started.wait(), 2)
+        receipt = workload.agent_absence_confirmed_at
+        assert receipt is not None
+        assert not waiting.done()
+        process.allow_close.set()
+        completed = await asyncio.wait_for(waiting, 2)
+        assert completed.absence_confirmed_at >= receipt
+        assert workload.agent_absence_confirmed_at == receipt
+        assert completed.result.exit_code == 7
+        assert completed.result.output.endswith("final frame")
+        assert process.sessions == set()
+    finally:
+        process.allow_close.set()
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
@@ -5694,8 +5714,10 @@ async def test_daytona_kill_rejects_session_still_present_after_cgroup_stop() ->
     process.allow_removal.set()
     workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
     await asyncio.wait_for(process.command_admitted.wait(), 2)
+    assert workload.agent_absence_confirmed_at is None
     with pytest.raises(SandboxError, match="session is still present"):
         await asyncio.wait_for(workload.kill(), 2)
+    assert workload.agent_absence_confirmed_at is not None
     assert not process.group_exists
     assert process.sessions
 

@@ -18,6 +18,7 @@ from benchmark_service.sandbox import (
     Sandbox,
     SandboxError,
 )
+from benchmark_service.sandbox import compose as compose_module
 
 
 _DOCKER_SHIM = """#!/bin/sh
@@ -52,6 +53,11 @@ class _LocalWorkload(ControlledWorkload):
         self._started = asyncio.Event()
         self._process: asyncio.subprocess.Process
         self._task = asyncio.create_task(self._run())
+        self._agent_absence_confirmed_at: float | None = None
+
+    @property
+    def agent_absence_confirmed_at(self) -> float | None:
+        return self._agent_absence_confirmed_at
 
     async def _run(self) -> ExecResult:
         self._process = await asyncio.create_subprocess_shell(
@@ -68,6 +74,7 @@ class _LocalWorkload(ControlledWorkload):
             chunks.append(text)
             await self._chunks.put(text)
         code = await self._process.wait()
+        self._agent_absence_confirmed_at = asyncio.get_running_loop().time()
         await self._chunks.put(None)
         return ExecResult(exit_code=code, output="".join(chunks))
 
@@ -77,7 +84,8 @@ class _LocalWorkload(ControlledWorkload):
 
     async def wait(self) -> ControlledWorkloadResult:
         result = await self._task
-        return ControlledWorkloadResult(result, asyncio.get_running_loop().time())
+        assert self._agent_absence_confirmed_at is not None
+        return ControlledWorkloadResult(result, self._agent_absence_confirmed_at)
 
     async def kill(self) -> None:
         await self._started.wait()
@@ -132,19 +140,38 @@ def compose_sandbox(tmp_path: Path) -> ComposeSandbox:
 
 @pytest.mark.parametrize("code", [0, 7])
 async def test_compose_controlled_natural_exit_preserves_status_and_output(
-    compose_sandbox: ComposeSandbox, code: int
+    compose_sandbox: ComposeSandbox, code: int, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    cleanup_started = asyncio.Event()
+    allow_cleanup = asyncio.Event()
+    original_cleanup = compose_module._ComposeControlledWorkload._cleanup  # pyright: ignore[reportPrivateUsage]
+
+    async def delayed_cleanup(self: compose_module._ComposeControlledWorkload, container_id: str) -> None:  # pyright: ignore[reportPrivateUsage]
+        cleanup_started.set()
+        await allow_cleanup.wait()
+        await original_cleanup(self, container_id)
+
+    monkeypatch.setattr(compose_module._ComposeControlledWorkload, "_cleanup", delayed_cleanup)  # pyright: ignore[reportPrivateUsage]
     assert compose_sandbox.generation_containment == LINUX_PROCESS_GROUP_V1
     await compose_sandbox.probe_generation_containment()
     workload = compose_sandbox.controlled_workload(f'printf "agent output\\n"; exit {code}')
     try:
-        completed = await asyncio.wait_for(workload.wait(), 5)
+        assert workload.agent_absence_confirmed_at is None
+        waiting = asyncio.create_task(workload.wait())
+        await asyncio.wait_for(cleanup_started.wait(), 5)
+        receipt = workload.agent_absence_confirmed_at
+        assert receipt is not None
+        assert not waiting.done()
+        allow_cleanup.set()
+        completed = await asyncio.wait_for(waiting, 5)
+        assert completed.absence_confirmed_at == receipt
         output = "".join([chunk async for chunk in workload.output()])
 
         assert completed.result.exit_code == code
         assert completed.result.output == "agent output\n"
         assert output == completed.result.output
     finally:
+        allow_cleanup.set()
         await asyncio.wait_for(workload.kill(), 5)
 
 
@@ -183,10 +210,14 @@ async def test_compose_controlled_deadline_stops_group_and_allows_later_exec(
         try:
             first = await asyncio.wait_for(anext(stream), 5)
             assert "started\n" in first
+            assert workload.agent_absence_confirmed_at is None
             await asyncio.wait_for(workload.kill(), 5)
             await asyncio.wait_for(workload.kill(), 5)
+            receipt = workload.agent_absence_confirmed_at
+            assert receipt is not None
             assert (await compose_sandbox.exec("printf after-stop")).output == "after-stop"
             completed = await asyncio.wait_for(workload.wait(), 5)
+            assert completed.absence_confirmed_at == receipt
             assert completed.result.exit_code != 0
             assert "started\n" in completed.result.output
         finally:

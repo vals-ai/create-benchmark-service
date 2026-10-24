@@ -57,12 +57,12 @@ def _service_credentials() -> GradingCredentials | None:
 
 
 def current_grading_credentials() -> GradingCredentials | None:
-    """The in-flight evaluation's credentials, else the service's own Gateway settings, else None.
+    """The in-flight evaluation's credentials, else None.
 
     Graders that call the Gateway themselves (custom HTTP clients, judge sandboxes)
     read this instead of ``MODEL_GATEWAY_*`` so they use the evaluation's token.
     """
-    return _current.get() or _service_credentials()
+    return _current.get()
 
 
 def _identity() -> dict[str, object]:

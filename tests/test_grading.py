@@ -46,6 +46,7 @@ from benchmark_service.grading import (
 )
 from benchmark_service.base import BenchmarkService
 from benchmark_service.eval_resume import EvalResumeStore, GradingInput
+from benchmark_service.grading_credentials import grading_credentials
 from benchmark_service.sandbox import MissingSandboxConfigError, SandboxCreateRequest, SandboxProvider
 from benchmark_service.sandbox.types import ExecResult
 from benchmark_service.schemas import (
@@ -295,7 +296,8 @@ async def test_grade_instance_hands_the_evaluation_gateway_credentials_to_the_sa
     monkeypatch.setenv("MODEL_GATEWAY_API_KEY", "static-key")
     service = await SandboxStub.create()
     provider = FakeProvider(FakeSandbox())
-    await _grade(service, provider)
+    async with grading_credentials(run_id=None, task_id="task-1"):
+        await _grade(service, provider)
     assert provider.created[0].env_vars == {"MODEL_GATEWAY_URL": "https://gateway.test", "MODEL_GATEWAY_API_KEY": "static-key"}
 
 

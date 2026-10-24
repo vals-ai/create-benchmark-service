@@ -100,7 +100,7 @@ async def test_run_mints_a_grader_token_and_revokes_it_after(gateway: FakeGatewa
     async with bound():
         assert current_grading_credentials() == TOKEN
         assert TOKEN.as_environment() == {"MODEL_GATEWAY_URL": GATEWAY, "MODEL_GATEWAY_API_KEY": "mgwt_run-1"}
-    assert current_grading_credentials() == STATIC
+    assert current_grading_credentials() is None
     assert gateway.paths() == ["/service-auth", "/service-auth/revoke"]
     assert gateway.mint_body() == {
         "run_id": "run-1",
@@ -139,7 +139,7 @@ async def test_token_is_revoked_even_when_grading_fails(gateway: FakeGateway) ->
         async with bound():
             raise RuntimeError("judge exploded")
     assert gateway.paths() == ["/service-auth", "/service-auth/revoke"]
-    assert current_grading_credentials() == STATIC
+    assert current_grading_credentials() is None
 
 
 async def test_nested_scope_reuses_the_enclosing_token(gateway: FakeGateway) -> None:
@@ -163,8 +163,8 @@ async def test_a_run_without_an_attempt_fails_grading(gateway: FakeGateway) -> N
     assert gateway.calls == []
 
 
-def test_outside_an_evaluation_the_service_settings_apply(gateway: FakeGateway) -> None:
-    assert current_grading_credentials() == STATIC
+def test_outside_an_evaluation_nothing_is_bound(gateway: FakeGateway) -> None:
+    assert current_grading_credentials() is None
 
 
 async def test_run_without_grading_models_fails_grading(gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -183,7 +183,7 @@ async def test_concurrent_evaluations_keep_their_own_credentials(gateway: FakeGa
             return credentials.api_key if credentials else None
 
     assert await asyncio.gather(observe("run-a"), observe("run-b")) == ["mgwt_run-a", "mgwt_run-b"]
-    assert current_grading_credentials() == STATIC
+    assert current_grading_credentials() is None
 
 
 async def test_model_library_sends_the_token_while_grading(gateway: FakeGateway, scoped_tokens: list[str]) -> None:

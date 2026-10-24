@@ -56,8 +56,27 @@ class FakeGateway:
         return next(body for url, _, body in self.calls if url.endswith("/service-auth"))
 
 
+def install_model_library(monkeypatch: pytest.MonkeyPatch, **attributes: Any) -> None:
+    module = types.ModuleType("model_library.base.gateway")
+    vars(module).update(attributes)
+    monkeypatch.setitem(sys.modules, "model_library.base.gateway", module)
+
+
 @pytest.fixture
-def gateway(monkeypatch: pytest.MonkeyPatch) -> FakeGateway:
+def scoped_tokens(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    seen: list[str] = []
+
+    @contextmanager
+    def gateway_token_scope(token: str) -> Iterator[None]:
+        seen.append(token)
+        yield
+
+    install_model_library(monkeypatch, gateway_token_scope=gateway_token_scope)
+    return seen
+
+
+@pytest.fixture
+def gateway(monkeypatch: pytest.MonkeyPatch, scoped_tokens: list[str]) -> FakeGateway:
     monkeypatch.setenv("MODEL_GATEWAY_URL", GATEWAY)
     monkeypatch.setenv("MODEL_GATEWAY_API_KEY", STATIC_KEY)
     monkeypatch.setenv("IDENTITY", json.dumps({"benchmark_name": "snap", "phase": "grading"}))
@@ -137,27 +156,23 @@ async def test_without_a_run_the_service_key_is_used_and_nothing_is_minted(gatew
     assert gateway.calls == []
 
 
-async def test_a_run_without_an_attempt_falls_back_loudly(
-    gateway: FakeGateway, caplog: pytest.LogCaptureFixture
-) -> None:
-    async with grading_credentials(run_id="run-1", task_id="task-1"):
-        assert current_grading_credentials() == STATIC
+async def test_a_run_without_an_attempt_fails_grading(gateway: FakeGateway) -> None:
+    with pytest.raises(RuntimeError, match="no attempt id"):
+        async with grading_credentials(run_id="run-1", task_id="task-1"):
+            pytest.fail("graded without a token")
     assert gateway.calls == []
-    assert "no attempt id" in caplog.text
 
 
 def test_outside_an_evaluation_the_service_settings_apply(gateway: FakeGateway) -> None:
     assert current_grading_credentials() == STATIC
 
 
-async def test_run_without_grading_models_falls_back_loudly(
-    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-) -> None:
+async def test_run_without_grading_models_fails_grading(gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("GRADING_MODELS")
-    async with bound():
-        assert current_grading_credentials() == STATIC
+    with pytest.raises(RuntimeError, match="GRADING_MODELS is not configured"):
+        async with bound():
+            pytest.fail("graded without a token")
     assert gateway.calls == []
-    assert "GRADING_MODELS is not configured" in caplog.text
 
 
 async def test_concurrent_evaluations_keep_their_own_credentials(gateway: FakeGateway) -> None:
@@ -171,22 +186,20 @@ async def test_concurrent_evaluations_keep_their_own_credentials(gateway: FakeGa
     assert current_grading_credentials() == STATIC
 
 
-async def test_model_library_sends_the_token_while_grading(
-    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    seen: list[str] = []
-
-    @contextmanager
-    def gateway_token_scope(token: str) -> Iterator[None]:
-        seen.append(token)
-        yield
-
-    module = types.ModuleType("model_library.base.gateway")
-    module.gateway_token_scope = gateway_token_scope  # type: ignore[attr-defined]
-    monkeypatch.setitem(sys.modules, "model_library.base.gateway", module)
+async def test_model_library_sends_the_token_while_grading(gateway: FakeGateway, scoped_tokens: list[str]) -> None:
     async with bound():
         pass
-    assert seen == ["mgwt_run-1"]
+    assert scoped_tokens == ["mgwt_run-1"]
+
+
+async def test_a_model_library_without_token_scopes_fails_grading_before_minting(
+    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    install_model_library(monkeypatch)
+    with pytest.raises(ImportError, match="gateway_token_scope"):
+        async with bound():
+            pytest.fail("graded without the token reaching model-library")
+    assert gateway.calls == []
 
 
 class CredentialReportingBenchmark(StubBenchmark):

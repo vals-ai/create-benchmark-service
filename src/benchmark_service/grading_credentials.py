@@ -3,12 +3,16 @@
 For each evaluation that names a run, task and attempt, mint a Gateway run token
 from the service key (claims: those ids, ``IDENTITY`` with ``agent_name="grader"``,
 ``GRADING_MODELS``), bind it request-locally so judge calls carry it, and revoke it
-afterwards. Without those ids or Gateway settings the service's own key applies.
+afterwards. Without a run id or Gateway settings the service's own key applies; a run
+id without an attempt id or ``GRADING_MODELS`` fails the evaluation.
+
+The binding is a ``ContextVar``: asyncio tasks and ``asyncio.to_thread`` inherit it,
+but plain ``loop.run_in_executor`` and ``ThreadPoolExecutor.submit`` do not, so graders
+that hand work to threads must use ``asyncio.to_thread`` or ``contextvars.copy_context().run``.
 """
 
 from __future__ import annotations
 
-import importlib
 import json
 import logging
 import os
@@ -114,16 +118,6 @@ async def _revoke(credentials: GradingCredentials, api_key: str) -> None:
         logger.warning("could not revoke grading token lease=%s: %s", credentials.lease_id, exc)
 
 
-def _model_library_scope(credentials: GradingCredentials) -> AbstractContextManager[None]:
-    if credentials.lease_id is None:
-        return nullcontext()
-    try:
-        module = importlib.import_module("model_library.base.gateway")
-    except ImportError:
-        return nullcontext()
-    return module.gateway_token_scope(credentials.api_key)
-
-
 @asynccontextmanager
 async def grading_credentials(
     *, run_id: str | None, task_id: str, attempt_id: str | None = None
@@ -138,20 +132,20 @@ async def grading_credentials(
     if _current.get() is not None or service is None:
         yield
         return
-    models = [model.strip() for model in os.environ.get("GRADING_MODELS", "").split(",") if model.strip()]
     credentials = service
-    if run_id is not None and attempt_id is not None and models:
+    scope: AbstractContextManager[None] = nullcontext()
+    if run_id is not None:
+        models = [model.strip() for model in os.environ.get("GRADING_MODELS", "").split(",") if model.strip()]
+        if attempt_id is None or not models:
+            reason = "GRADING_MODELS is not configured" if not models else "no attempt id"
+            raise RuntimeError(f"cannot mint a grading token for run_id={run_id} task_id={task_id}: {reason}")
+        from model_library.base.gateway import gateway_token_scope  # pyright: ignore[reportMissingImports, reportUnknownVariableType]
+
         credentials = await _mint(service, run_id=run_id, task_id=task_id, attempt_id=attempt_id, models=models)
-    elif run_id is not None:
-        logger.warning(
-            "%s: grading of run_id=%s task_id=%s is charged to the service key",
-            "GRADING_MODELS is not configured" if not models else "no attempt id",
-            run_id,
-            task_id,
-        )
+        scope = gateway_token_scope(credentials.api_key)  # pyright: ignore[reportUnknownVariableType]
     token = _current.set(credentials)
     try:
-        with _model_library_scope(credentials):
+        with scope:
             yield
     finally:
         _current.reset(token)

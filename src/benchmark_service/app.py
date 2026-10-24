@@ -4,8 +4,8 @@ import importlib.metadata
 import logging
 import os
 import traceback
-from collections.abc import AsyncGenerator
-from contextlib import aclosing, asynccontextmanager, nullcontext, suppress
+from collections.abc import AsyncGenerator, Mapping
+from contextlib import AbstractAsyncContextManager, aclosing, asynccontextmanager, nullcontext, suppress
 from typing import Any, Literal, cast
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
@@ -19,6 +19,8 @@ from websockets.exceptions import ConnectionClosed
 from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_required
 from benchmark_service.base import BenchmarkService
+from benchmark_service.grading_credentials import grading_credentials
+from benchmark_service.observability import ATTEMPT_ID_HEADER, RUN_ID_HEADER
 from benchmark_service.context import sandbox_provider_scope, tenant_scope
 from benchmark_service.sandbox.created import SandboxCreatedHook, sandbox_created_scope
 from benchmark_service.schemas import (
@@ -114,6 +116,13 @@ _DOCKER_DISABLED_REASON = "Docker sandboxes are disabled on this service"
 def _request_may_use_provider(config: SandboxProviderConfig | None) -> bool:
     """Docker needs no caller credentials and drives this host's daemon, so only an opted-in service accepts it."""
     return not isinstance(config, DockerProviderConfig) or os.environ.get(DOCKER_ENABLED_ENV, "").lower() == "true"
+
+
+def _grading_credentials(headers: Mapping[str, str], task_id: str) -> AbstractAsyncContextManager[None]:
+    """Gateway credentials for the run and attempt the caller names in its correlation headers."""
+    return grading_credentials(
+        run_id=headers.get(RUN_ID_HEADER), task_id=task_id, attempt_id=headers.get(ATTEMPT_ID_HEADER)
+    )
 
 
 def _get_service_metadata(service_cls: type[BenchmarkService]) -> tuple[str | None, str | None]:
@@ -451,7 +460,8 @@ class BenchmarkServiceApp(FastAPI):
             raise HTTPException(status_code=403, detail=_DOCKER_DISABLED_REASON)
         async with self._dataset_scope(request, request.state.tenant, body.dataset):
             await self.consume_evaluation_request(cast(str, request.state.tenant))
-            return await self.service.evaluate_response(body, dataset=body.dataset)
+            async with _grading_credentials(request.headers, body.task_id):
+                return await self.service.evaluate_response(body, dataset=body.dataset)
 
     async def _evaluate_response_stream(self, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -472,18 +482,21 @@ class BenchmarkServiceApp(FastAPI):
                 if not await self._admit_websocket_evaluation(websocket, tenant):
                     return
 
-                async with (
-                    request.sandbox_provider.create_provider() if request.sandbox_provider else nullcontext()
-                ) as provider:
-                    with (
-                        sandbox_provider_scope(provider),
-                        sandbox_created_scope(_sandbox_created_hook(websocket) if request.announce_sandboxes else None),
-                    ):
-                        await _forward_stream(
-                            websocket,
-                            self.service.stream_evaluate_response(request, dataset=request.dataset),
-                            endpoint="evaluate-response",
-                        )
+                async with _grading_credentials(websocket.headers, request.task_id):
+                    async with (
+                        request.sandbox_provider.create_provider() if request.sandbox_provider else nullcontext()
+                    ) as provider:
+                        with (
+                            sandbox_provider_scope(provider),
+                            sandbox_created_scope(
+                                _sandbox_created_hook(websocket) if request.announce_sandboxes else None
+                            ),
+                        ):
+                            await _forward_stream(
+                                websocket,
+                                self.service.stream_evaluate_response(request, dataset=request.dataset),
+                                endpoint="evaluate-response",
+                            )
 
     async def _evaluate_instance(self, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -514,15 +527,18 @@ class BenchmarkServiceApp(FastAPI):
 
                     # Benchmarks that grade in a second sandbox read the provider
                     # from the request scope; see benchmark_service.context.
-                    with (
-                        sandbox_provider_scope(provider),
-                        sandbox_created_scope(_sandbox_created_hook(websocket) if request.announce_sandboxes else None),
-                    ):
-                        await _forward_stream(
-                            websocket,
-                            self.service.evaluate_instance(request.task_id, sandbox, dataset=request.dataset),
-                            endpoint="evaluate-instance",
-                        )
+                    async with _grading_credentials(websocket.headers, request.task_id):
+                        with (
+                            sandbox_provider_scope(provider),
+                            sandbox_created_scope(
+                                _sandbox_created_hook(websocket) if request.announce_sandboxes else None
+                            ),
+                        ):
+                            await _forward_stream(
+                                websocket,
+                                self.service.evaluate_instance(request.task_id, sandbox, dataset=request.dataset),
+                                endpoint="evaluate-instance",
+                            )
 
     async def _final_score(self, request: Request, body: FinalScoreRequest) -> FinalScoreResponse:
         if self._sentry is not None:

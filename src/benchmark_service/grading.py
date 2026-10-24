@@ -29,6 +29,7 @@ from typing import Any
 from fastapi.encoders import jsonable_encoder
 
 from benchmark_service.base import BenchmarkService
+from benchmark_service.grading_credentials import current_grading_credentials
 from benchmark_service.context import grading_sandbox_context, sandbox_provider_scope, tenant_scope
 from benchmark_service.grading_spec import (
     TEARDOWN_TIMEOUT_S,
@@ -202,7 +203,7 @@ class _GradeRun:
                 "run-id": self.run_id,
                 **(self.labels or {}),
             },
-            env_vars={},
+            env_vars=credentials.as_environment() if (credentials := current_grading_credentials()) else {},
             auto_stop_interval=auto_stop_minutes(budget_s),
             create_timeout=_GRADING_CREATE_TIMEOUT_S,
             network_block_all=spec.network_block_all,

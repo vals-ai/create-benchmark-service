@@ -294,6 +294,7 @@ async def test_grade_instance_hands_the_evaluation_gateway_credentials_to_the_sa
 ) -> None:
     monkeypatch.setenv("MODEL_GATEWAY_URL", "https://gateway.test")
     monkeypatch.setenv("MODEL_GATEWAY_API_KEY", "static-key")
+    monkeypatch.setenv("GRADING_MODELS", "anthropic/judge")
     service = await SandboxStub.create()
     provider = FakeProvider(FakeSandbox())
     async with grading_credentials(run_id=None, task_id="task-1"):

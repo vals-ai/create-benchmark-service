@@ -167,11 +167,13 @@ def test_outside_an_evaluation_nothing_is_bound(gateway: FakeGateway) -> None:
     assert current_grading_credentials() is None
 
 
-async def test_run_without_grading_models_fails_grading(gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("run_id", ["run-1", None])
+async def test_without_grading_models_nothing_is_bound(
+    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch, run_id: str | None
+) -> None:
     monkeypatch.delenv("GRADING_MODELS")
-    with pytest.raises(RuntimeError, match="GRADING_MODELS is not configured"):
-        async with bound():
-            pytest.fail("graded without a token")
+    async with grading_credentials(run_id=run_id, task_id="task-1", attempt_id="attempt-1"):
+        assert current_grading_credentials() is None
     assert gateway.calls == []
 
 

@@ -16,6 +16,7 @@ from benchmark_service import submission_artifacts
 from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_required
 from benchmark_service.grading import SUBMISSION_ARTIFACT_SANDBOX_PATH, collapse_stream, evaluate_submission
+from benchmark_service.grading_credentials import grading_credentials
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.sandbox import (
     DaytonaProviderConfig,
@@ -359,7 +360,8 @@ class ValsBenchmarkServiceApp(BenchmarkServiceApp):
     async def _v1_evaluate(self, request: Request, body: V1EvalRequest) -> V1EvalResponse:
         _require_descope_tenant(request.state.tenant)
         async with self._dataset_scope(request, request.state.tenant, body.dataset):
-            return await self._v1_evaluate_in_scope(request, body)
+            async with grading_credentials(run_id=body.run_id, task_id=body.task_id, attempt_id=body.attempt_id):
+                return await self._v1_evaluate_in_scope(request, body)
 
     async def _v1_evaluate_in_scope(self, request: Request, body: V1EvalRequest) -> V1EvalResponse:
         if self._sentry is not None:

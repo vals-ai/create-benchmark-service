@@ -275,11 +275,16 @@ def test_modal_config_reads_secrets_manager_shape() -> None:
 
 def test_command_merges_stderr_and_applies_timeout_inside_cwd() -> None:
     command = modal_module._command("echo hi", "/workspace", 60)
-    assert command == "{ cd /workspace && timeout 60 echo hi ; } 2>&1"
+    assert command == "{ cd /workspace && timeout 60 sh -c 'echo hi' ; } 2>&1"
+
+
+def test_command_keeps_variable_assignments_and_pipelines_under_the_timeout() -> None:
+    command = modal_module._command('id=$(echo 7); echo "$id" | cat', None, 5)
+    assert command == "{ timeout 5 sh -c 'id=$(echo 7); echo \"$id\" | cat' ; } 2>&1"
 
 
 def test_command_preserves_fractional_timeout() -> None:
-    assert "timeout 1.5 " in modal_module._command("true", None, 1.5)
+    assert "timeout 1.5 sh -c true" in modal_module._command("true", None, 1.5)
 
 
 async def test_exec_returns_combined_output() -> None:
@@ -290,7 +295,7 @@ async def test_exec_returns_combined_output() -> None:
 
     assert result.exit_code == 3
     assert result.stdout == "outerr"
-    assert inner.commands == [("/bin/sh", "-lc", "{ timeout 10 boom ; } 2>&1")]
+    assert inner.commands == [("/bin/sh", "-lc", "{ timeout 10 sh -c boom ; } 2>&1")]
 
 
 async def test_exec_wraps_modal_errors() -> None:

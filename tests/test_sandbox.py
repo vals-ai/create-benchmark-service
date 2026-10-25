@@ -3897,10 +3897,11 @@ async def test_daytona_provider_creates_fresh_sandbox() -> None:
     assert daytona.create_params.ttl_minutes == 167 * 60
 
 
-def _dockerfile_request(tmp_path: Path, name: str) -> SandboxCreateRequest:
+def _dockerfile_request(tmp_path: Path, name: str, build_timeout: float | None = None) -> SandboxCreateRequest:
     (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\nCOPY data.txt /data.txt\n")
     (tmp_path / "data.txt").write_text("data")
-    return _request(name).model_copy(update={"source": DockerfileSource(dockerfile=str(tmp_path / "Dockerfile"))})
+    source = DockerfileSource(dockerfile=str(tmp_path / "Dockerfile"), build_timeout=build_timeout)
+    return _request(name).model_copy(update={"source": source})
 
 
 async def test_daytona_provider_builds_a_dockerfile_source_from_its_folder(tmp_path: Path) -> None:
@@ -3915,6 +3916,16 @@ async def test_daytona_provider_builds_a_dockerfile_source_from_its_folder(tmp_p
         (str(tmp_path / "data.txt"), "data.txt")
     ]
     assert callable(daytona.create_kwargs["on_snapshot_create_logs"])
+
+
+async def test_daytona_gives_a_dockerfile_build_its_own_time_on_top_of_the_creation_timeout(tmp_path: Path) -> None:
+    inner = InnerSandbox()
+    daytona = DaytonaClient(inner)
+    request = _dockerfile_request(tmp_path, inner.name, build_timeout=600)
+
+    await _provider(daytona).create_sandbox(request)
+
+    assert daytona.create_kwargs["timeout"] == request.create_timeout + 600
 
 
 async def test_daytona_build_failure_carries_the_build_log(tmp_path: Path) -> None:

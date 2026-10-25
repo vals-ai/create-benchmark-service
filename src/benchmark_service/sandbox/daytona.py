@@ -1951,11 +1951,11 @@ class DaytonaSandboxProvider(SandboxProvider):
             if isinstance(params, CreateSandboxFromImageParams):
                 inner = await daytona.create(
                     params,
-                    timeout=request.create_timeout,
+                    timeout=request.provider_timeout,
                     on_snapshot_create_logs=build_log.append if isinstance(request.source, DockerfileSource) else None,
                 )
             else:
-                inner = await daytona.create(params, timeout=request.create_timeout)
+                inner = await daytona.create(params, timeout=request.provider_timeout)
         except DaytonaError as exc:
             # A name conflict means an earlier attempt of this same request
             # created the sandbox but the response was lost (transport retry).
@@ -1972,7 +1972,7 @@ class DaytonaSandboxProvider(SandboxProvider):
             if isinstance(request.source, DockerfileSource):
                 if isinstance(exc, DaytonaTimeoutError):
                     raise SandboxBuildError(
-                        f"Timed out building {request.source.dockerfile} after {request.create_timeout:g}s",
+                        f"Timed out building {request.source.dockerfile} after {request.provider_timeout:g}s",
                         "\n".join(build_log),
                     ) from exc
                 if build_log and type(error) is SandboxError:

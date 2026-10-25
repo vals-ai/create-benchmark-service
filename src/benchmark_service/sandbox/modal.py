@@ -716,7 +716,7 @@ class ModalSandboxProvider(SandboxProvider):
         # One SDK call preserves Modal's transport idempotency key.
         creation = asyncio.create_task(ModalSdkSandbox.create.aio(**create_kwargs))  # pyright: ignore[reportUnknownMemberType]
         try:
-            async with asyncio.timeout(request.create_timeout):
+            async with asyncio.timeout(request.provider_timeout):
                 inner = await asyncio.shield(creation)
         except (TimeoutError, asyncio.CancelledError) as exc:
             # Retain ownership until the late allocation can be terminated.
@@ -725,7 +725,7 @@ class ModalSandboxProvider(SandboxProvider):
             cleanup.add_done_callback(self._cleanup_tasks.discard)
             if isinstance(exc, asyncio.CancelledError):
                 raise
-            raise SandboxError(f"Failed to create Modal sandbox within {request.create_timeout}s") from exc
+            raise SandboxError(f"Failed to create Modal sandbox within {request.provider_timeout}s") from exc
         except ModalResourceExhaustedError as exc:
             raise SandboxError(f"Modal sandbox resources exhausted: {exc}") from exc
         except ModalNotFoundError as exc:

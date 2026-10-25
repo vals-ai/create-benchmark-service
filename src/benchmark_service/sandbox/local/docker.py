@@ -605,7 +605,7 @@ class DockerSandboxProvider(SandboxProvider):
                 # create_timeout bounds container creation, so a large first pull must not run inside it.
                 await self._ensure_image(image)
             case DockerfileSource():
-                image = await self._build_image(request.source, request.create_timeout)
+                image = await self._build_image(request.source, request.source.build_timeout or request.create_timeout)
             case _:
                 raise SandboxError(
                     "Local Docker supports image and Dockerfile sources only; snapshots and Compose are not supported"

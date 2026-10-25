@@ -541,11 +541,11 @@ class TestSandboxProviderIntegration:
         self, sandbox_provider: SandboxProvider, tmp_path: Path
     ) -> None:
         """Build a Dockerfile whose COPY reads a file beside it, then delete the sandbox and see it gone."""
+        name = f"cbs-dockerfile-test-{uuid4().hex[:10]}"
         (tmp_path / "Dockerfile").write_text(
-            "FROM python:3.12-slim\nCOPY seed.txt /seed.txt\nRUN echo built > /built.txt\n"
+            f"FROM python:3.12-slim\nRUN echo {name}\nCOPY seed.txt /seed.txt\nRUN echo built > /built.txt\n"
         )
         (tmp_path / "seed.txt").write_text("from the build context")
-        name = f"cbs-dockerfile-test-{uuid4().hex[:10]}"
 
         sandbox = await sandbox_provider.create_sandbox(self._dockerfile_request(tmp_path / "Dockerfile", name))
         try:
@@ -560,8 +560,8 @@ class TestSandboxProviderIntegration:
         self, sandbox_provider: SandboxProvider, tmp_path: Path
     ) -> None:
         """Report a failed build with the provider's output, and leave nothing running under the test's label."""
-        (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\nRUN echo broken-step && exit 3\n")
         name = f"cbs-dockerfile-test-{uuid4().hex[:10]}"
+        (tmp_path / "Dockerfile").write_text(f"FROM python:3.12-slim\nRUN echo {name} && exit 3\n")
 
         with pytest.raises(SandboxBuildError) as error:
             await sandbox_provider.create_sandbox(self._dockerfile_request(tmp_path / "Dockerfile", name))
@@ -573,8 +573,8 @@ class TestSandboxProviderIntegration:
         self, sandbox_provider: SandboxProvider, tmp_path: Path
     ) -> None:
         """Stop a build at its own timeout, report it as a build error without retrying it, and leave nothing behind."""
-        (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\nRUN sleep 300\n")
         name = f"cbs-dockerfile-test-{uuid4().hex[:10]}"
+        (tmp_path / "Dockerfile").write_text(f"FROM python:3.12-slim\nRUN echo {name}\nRUN sleep 300\n")
         started = time.monotonic()
 
         with pytest.raises(SandboxBuildError):

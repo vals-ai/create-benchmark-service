@@ -4873,6 +4873,7 @@ def _fake_cgroup_follow(monkeypatch: pytest.MonkeyPatch) -> None:  # pyright: ig
 class CgroupProcess(Process):
     def __init__(self) -> None:
         super().__init__()
+        self.cgroup_parent = "/\n"
         self._language = "python"
         self._api_client = self
         self.allow_creation = asyncio.Event()
@@ -4904,8 +4905,11 @@ class CgroupProcess(Process):
 
     async def exec(self, command: str) -> SimpleNamespace:
         command = _unwrap_shell_command(command)
-        if command.startswith("mkdir -p /sys/fs/cgroup/cbs-"):
+        if command == daytona_module._CGROUP_SELF_COMMAND:  # pyright: ignore[reportPrivateUsage]
+            return SimpleNamespace(exit_code=0, result=self.cgroup_parent)
+        if command.startswith("mkdir -p /sys/fs/cgroup/") and "/cbs-" in command:
             await self.allow_creation.wait()
+            self.created_group = command.removeprefix("mkdir -p ")
             self.group_exists = True
             return SimpleNamespace(exit_code=0, result="")
         if command.startswith("test -e ") and command.endswith(".complete"):
@@ -4913,7 +4917,8 @@ class CgroupProcess(Process):
             if self.poll_error:
                 raise DaytonaConnectionError("control channel unavailable")
             return SimpleNamespace(exit_code=0 if self.user_finished.is_set() else 1, result="")
-        if command.startswith("d=/sys/fs/cgroup/cbs-"):
+        if command.startswith("d=/sys/fs/cgroup/") and "/cbs-" in command.split(";", 1)[0]:
+            self.removed_group = command.split(";", 1)[0].removeprefix("d=")
             self.removal_started.set()
             await self.allow_removal.wait()
             if self.removal_fails:
@@ -4990,6 +4995,42 @@ def _cgroup_sandbox(process: CgroupProcess) -> DaytonaSandbox:
     inner = InnerSandbox()
     inner.process = process
     return DaytonaSandbox(cast(Any, inner), cast(Any, CgroupDaytonaClient(inner, process)))
+
+
+@pytest.mark.usefixtures("_fake_cgroup_follow")
+async def test_daytona_controlled_cgroup_stays_under_toolbox_cgroup() -> None:
+    # Daytona applies egress rules to the toolbox cgroup; a sibling cgroup at the root escapes them.
+    process = CgroupProcess()
+    process.cgroup_parent = "/init.scope\n"
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    process.user_finished.set()
+    completed = await asyncio.wait_for(workload.wait(), 2)
+    assert completed.result.exit_code == 7
+    assert process.created_group.startswith("/sys/fs/cgroup/init.scope/cbs-")
+    assert process.removed_group == process.created_group
+    assert process.command is not None
+    assert f"echo $$ > {process.created_group}/cgroup.procs" in process.command
+
+
+async def test_daytona_cgroup_probe_runs_under_toolbox_cgroup() -> None:
+    class ProbeProcess(Process):
+        probe = ""
+
+        async def exec(self, command: str) -> SimpleNamespace:
+            command = _unwrap_shell_command(command)
+            if command == daytona_module._CGROUP_SELF_COMMAND:  # pyright: ignore[reportPrivateUsage]
+                return SimpleNamespace(exit_code=0, result="/init.scope\n")
+            self.probe = command
+            return SimpleNamespace(exit_code=0, result="")
+
+    inner = InnerSandbox()
+    process = ProbeProcess()
+    inner.process = process
+    await _daytona_sandbox(cast(Any, inner)).probe_generation_containment()
+    assert process.probe.startswith("d=/sys/fs/cgroup/init.scope/cbs-probe-")
 
 
 async def test_daytona_cgroup_probe_rejects_unsupported_kernel() -> None:
@@ -5388,6 +5429,8 @@ class LocalNativeShellCgroupProcess(CgroupProcess):
 
     async def exec(self, command: str) -> SimpleNamespace:
         plain = _unwrap_shell_command(command)
+        if plain == daytona_module._CGROUP_SELF_COMMAND:  # pyright: ignore[reportPrivateUsage]
+            return SimpleNamespace(exit_code=0, result=self.cgroup_parent)
         if plain == f"mkdir -p {daytona_module._STATUS_DIR}":  # pyright: ignore[reportPrivateUsage]
             self.status.mkdir()
             return SimpleNamespace(exit_code=0, result="")
@@ -6394,6 +6437,8 @@ class NestedCgroupProcess(CgroupProcess):
 
     async def exec(self, command: str) -> SimpleNamespace:
         plain = _unwrap_shell_command(command)
+        if plain == daytona_module._CGROUP_SELF_COMMAND:  # pyright: ignore[reportPrivateUsage]
+            return SimpleNamespace(exit_code=0, result=self.cgroup_parent)
         if plain.startswith("mkdir -p /sys/fs/cgroup/cbs-"):
             self.group_name = plain.removeprefix("mkdir -p ")
             for directory in (self.root, self.root / ".hidden", self.root / ".hidden" / "nested"):

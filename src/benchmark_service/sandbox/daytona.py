@@ -121,6 +121,7 @@ _INVALID_UTF8_BYTES = dict.fromkeys(range(0xDC80, 0xDD00), "\ufffd")
 _PTY_CREATE_MARKER_ENV = "_CBS_PTY_CREATE_MARKER"
 _PTY_ROWS = 24
 _PTY_COLS = 80
+_CGROUP_SELF_COMMAND = "sed -n 's/^0:://p' /proc/self/cgroup"
 _STATUS_DIR = "/tmp/.sandbox-provider"
 _REMOVED_SANDBOX_STATES = (SandboxState.DESTROYING, SandboxState.DESTROYED)
 _FAILED_SANDBOX_STATES = (SandboxState.ERROR, SandboxState.BUILD_FAILED)
@@ -582,9 +583,23 @@ class DaytonaSandbox(Sandbox):
     def generation_containment(self) -> GenerationContainment:
         return LINUX_CGROUP_V2_V1
 
+    async def _controlled_cgroup_parent(self) -> str:
+        """Return the toolbox's cgroup directory; Daytona's egress filter covers only its descendants."""
+        result = await self._control_exec(_CGROUP_SELF_COMMAND)
+        path = result.output.strip()
+        if result.exit_code != 0 or not path.startswith("/"):
+            raise SandboxError(f"Could not resolve the Daytona toolbox cgroup for {self._sandbox_ref}: {result.output}")
+        return f"/sys/fs/cgroup{path.rstrip('/')}"
+
     async def probe_generation_containment(self) -> None:
-        group = f"/sys/fs/cgroup/cbs-probe-{uuid.uuid4().hex}"
-        quoted = shlex.quote(group)
+        try:
+            parent = await self._controlled_cgroup_parent()
+        except SandboxError as exc:
+            raise SandboxError(
+                f"Daytona sandbox does not support {LINUX_CGROUP_V2_V1.type} v"
+                f"{LINUX_CGROUP_V2_V1.version}: {self._sandbox_ref}"
+            ) from exc
+        quoted = shlex.quote(f"{parent}/cbs-probe-{uuid.uuid4().hex}")
         result = await self._control_exec(
             f'd={quoted}; mkdir "$d" || exit 1; '
             "sh -c 'echo $$ > \"$1/cgroup.procs\"' sh \"$d\"; admitted=$?; "
@@ -1258,21 +1273,15 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         self._sandbox_error = sandbox._sandbox_error  # pyright: ignore[reportPrivateUsage]
         self._control_exec = sandbox._control_exec  # pyright: ignore[reportPrivateUsage]
         self._check_sandbox_alive_once = sandbox._check_sandbox_alive_once  # pyright: ignore[reportPrivateUsage]
+        self._controlled_cgroup_parent = sandbox._controlled_cgroup_parent  # pyright: ignore[reportPrivateUsage]
         self._session_id = session_id
-        ident = session_id.rsplit("-", 1)[-1]
-        self._group = f"/sys/fs/cgroup/cbs-{ident}"
-        self._complete = f"{_STATUS_DIR}/{ident}.complete"
-        self._release = f"{_STATUS_DIR}/{ident}.release"
-        # The command shell stays outside the child cgroup until descendants are fenced.
+        self._ident = session_id.rsplit("-", 1)[-1]
+        self._group = f"cbs-{self._ident}"
+        self._complete = f"{_STATUS_DIR}/{self._ident}.complete"
+        self._release = f"{_STATUS_DIR}/{self._ident}.release"
         env = {"TERM": "dumb", "LANG": "C.UTF-8", **env_vars}
         assignments = " ".join(f"{key}={shlex.quote(value)}" for key, value in env.items())
-        payload = f"env {assignments} sh -c {shlex.quote(command)}"
-        child = f"echo $$ > {shlex.quote(self._group)}/cgroup.procs || exit 1; {payload}"
-        self._command = (
-            f"exec </dev/null; sh -c {shlex.quote(child)} & child=$!; wait \"$child\"; code=$?; "
-            f": > {shlex.quote(self._complete)} || exit 1; "
-            f"while ! test -e {shlex.quote(self._release)}; do sleep 0.05; done; (exit \"$code\")"
-        )
+        self._payload = f"env {assignments} sh -c {shlex.quote(command)}"
         self._session_requested = False
         self._output: asyncio.Queue[str] = asyncio.Queue()
         self._stdout: deque[bytes] = deque()
@@ -1491,8 +1500,18 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         self._closed.set()
         return asyncio.get_running_loop().time()
 
+    def _session_command(self) -> str:
+        # The command shell stays outside the child cgroup until descendants are fenced.
+        child = f"echo $$ > {shlex.quote(self._group)}/cgroup.procs || exit 1; {self._payload}"
+        return (
+            f"exec </dev/null; sh -c {shlex.quote(child)} & child=$!; wait \"$child\"; code=$?; "
+            f": > {shlex.quote(self._complete)} || exit 1; "
+            f"while ! test -e {shlex.quote(self._release)}; do sleep 0.05; done; (exit \"$code\")"
+        )
+
     async def _launch(self) -> str:
         try:
+            self._group = f"{await self._controlled_cgroup_parent()}/cbs-{self._ident}"
             created = await self._control_exec(f"mkdir -p {shlex.quote(self._group)}")
             if created.exit_code != 0:
                 raise SandboxError(f"Daytona controlled cgroup creation failed: {self._group}: {created.output}")
@@ -1519,7 +1538,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
                     "process.execute_session_command",
                     self._process.execute_session_command(
                         self._session_id,
-                        SessionExecuteRequest(command=self._command, run_async=True),
+                        SessionExecuteRequest(command=self._session_command(), run_async=True),
                     ),
                     _TOOLBOX_CALL_TIMEOUT_SECONDS,
                 )

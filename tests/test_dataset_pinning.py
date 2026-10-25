@@ -360,6 +360,7 @@ async def test_client_awaits_checkpoint_before_terminal_result(
     callback_fails: bool, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     state = {"artifact_prefix": "s3://bucket/run"}
+    announced: list[str] = []
     checkpoint_started = asyncio.Event()
     release_checkpoint = asyncio.Event()
     checkpoint_completed = asyncio.Event()
@@ -375,8 +376,12 @@ async def test_client_awaits_checkpoint_before_terminal_result(
     )
 
     async def respond(ws: websockets.ServerConnection) -> None:
-        await ws.recv()
+        request = json.loads(await ws.recv())
+        assert request["announce_sandboxes"] is True
         await ws.send(json.dumps({"type": "eval_resume_state", "data": state}))
+        await ws.send(
+            json.dumps({"type": "sandbox_created", "data": {"provider": "daytona", "sandbox_id": "sb-1"}})
+        )
         await ws.send(json.dumps({"type": "result", "data": {"score": 1.0}}))
 
     async def save_checkpoint(received: dict[str, Any]) -> None:
@@ -391,7 +396,12 @@ async def test_client_awaits_checkpoint_before_terminal_result(
         port = next(iter(server.sockets)).getsockname()[1]
         async with BenchmarkServiceClient(f"http://127.0.0.1:{port}", {}) as client:
             evaluation = asyncio.create_task(
-                client.resume_evaluation("task-1", {}, on_eval_resume_state=save_checkpoint)
+                client.resume_evaluation(
+                    "task-1",
+                    {},
+                    on_eval_resume_state=save_checkpoint,
+                    on_sandbox_created=lambda data: announced.append(data.sandbox_id),
+                )
             )
             try:
                 await asyncio.wait_for(checkpoint_started.wait(), timeout=5)
@@ -401,5 +411,7 @@ async def test_client_awaits_checkpoint_before_terminal_result(
             if callback_fails:
                 with pytest.raises(RuntimeError, match="checkpoint persistence failed"):
                     await evaluation
+                assert announced == []
             else:
                 assert await evaluation == {"score": 1.0}
+                assert announced == ["sb-1"]

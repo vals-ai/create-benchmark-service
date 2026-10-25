@@ -55,5 +55,5 @@ def daytona_gpu_type(names: Sequence[str]) -> GpuType | list[GpuType] | None:
 
 
 def modal_gpu_type(names: Sequence[str]) -> str | None:
-    candidates = [normalize_gpu_name(name).upper() for name in names]
+    candidates = [key.upper() for name in names if (key := normalize_gpu_name(name))]
     return next((name for name in candidates if name in _MODAL), candidates[0] if candidates else None)

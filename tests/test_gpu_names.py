@@ -95,6 +95,10 @@ class TestModalGpuType:
         assert modal_gpu_type(["rtx-4090", "nvidia-h100-80gb", "a100"]) == "H100"
         assert modal_gpu_type(["rtx-4090", "rtx-5090"]) == "RTX-4090"
 
+    def test_blank_names_are_skipped(self) -> None:
+        assert modal_gpu_type(["", "B900"]) == "B900"
+        assert modal_gpu_type([" "]) is None
+
     def test_no_types_gives_none(self) -> None:
         assert modal_gpu_type([]) is None
 

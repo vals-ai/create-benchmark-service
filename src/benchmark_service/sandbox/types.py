@@ -123,7 +123,7 @@ class Resources(BaseModel):
     gpu_type: str | None = Field(default=None, description="GPU type to allocate, e.g. 'H100' (provider-specific)")
     gpu_types: list[str] = Field(
         default_factory=list,
-        description="Acceptable GPU types in order of preference; each provider uses the first one it offers",
+        description="Acceptable GPU types in order of preference",
     )
 
     @model_validator(mode="after")

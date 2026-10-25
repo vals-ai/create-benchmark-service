@@ -1,12 +1,15 @@
 """Dockerfile sandbox source checks; run pytest tests/test_dockerfile_source.py."""
 
 import asyncio
+from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
 from benchmark_service import (
     DockerfileSource,
+    ImageSource,
     Resources,
     SandboxBuildError,
     SandboxCreateRequest,
@@ -16,6 +19,7 @@ from benchmark_service.sandbox.local.docker import DockerSandboxProvider
 from benchmark_service.schemas import RetrieveTaskResponse
 
 DOCKERFILE = "/tasks/a/environment/Dockerfile"
+IMAGE_ID = "sha256:0123abcd"
 
 
 def test_a_relative_dockerfile_path_is_rejected() -> None:
@@ -79,24 +83,24 @@ def _run_builds(monkeypatch: pytest.MonkeyPatch, build: FakeBuild) -> list[tuple
 
     async def create_subprocess_exec(*args: Any, **kwargs: Any) -> FakeBuild:
         calls.append((args, kwargs))
+        Path(args[args.index("--iidfile") + 1]).write_text(IMAGE_ID + "\n")
         return build
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", create_subprocess_exec)
     return calls
 
 
-async def test_the_dockerfile_is_built_from_its_folder_under_a_tag_that_names_it(
+async def test_the_dockerfile_is_built_from_its_folder_and_the_image_id_is_returned(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     calls = _run_builds(monkeypatch, FakeBuild(b"done\n", 0))
 
-    tag = await _provider()._build_image(DockerfileSource(dockerfile=DOCKERFILE), 60)  # pyright: ignore[reportPrivateUsage]
+    image = await _provider()._build_image(DockerfileSource(dockerfile=DOCKERFILE), 60)  # pyright: ignore[reportPrivateUsage]
 
-    assert tag.startswith("cbs-build:")
+    assert image == IMAGE_ID
     ((args, _),) = calls
-    assert args == ("docker", "build", "--progress=plain", "--tag", tag, "--file", DOCKERFILE, "/tasks/a/environment")
-    _run_builds(monkeypatch, FakeBuild(b"", 0))
-    assert await _provider()._build_image(DockerfileSource(dockerfile=DOCKERFILE), 60) == tag  # pyright: ignore[reportPrivateUsage]
+    assert args[:3] == ("docker", "build", "--progress=plain")
+    assert args[-3:] == ("--file", DOCKERFILE, "/tasks/a/environment")
 
 
 async def test_the_build_uses_the_docker_host_the_provider_was_made_with(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -141,3 +145,27 @@ async def test_a_missing_docker_cli_is_a_sandbox_error(monkeypatch: pytest.Monke
 
     with pytest.raises(SandboxError, match="requires the docker CLI"):
         await _provider()._build_image(DockerfileSource(dockerfile=DOCKERFILE), 60)  # pyright: ignore[reportPrivateUsage]
+
+
+@pytest.mark.parametrize("source", [ImageSource(image="python:3.12-slim"), DockerfileSource(dockerfile=DOCKERFILE)])
+async def test_an_unsupported_request_is_refused_before_any_pull_or_build(source: ImageSource | DockerfileSource) -> None:
+    provider = _provider()
+    pull = AsyncMock()
+    build = AsyncMock()
+    provider._ensure_image = pull  # pyright: ignore[reportPrivateUsage]
+    provider._build_image = build  # pyright: ignore[reportPrivateUsage]
+    request = SandboxCreateRequest(
+        source=source,
+        resources=Resources(vcpu=1, memory=1, disk=1, gpu=1, gpu_type="H100"),
+        name="task",
+        labels={},
+        env_vars={},
+        auto_stop_interval=10,
+        create_timeout=60,
+    )
+
+    with pytest.raises(SandboxError, match="does not support GPUs"):
+        await provider.create_sandbox(request)
+
+    pull.assert_not_awaited()
+    build.assert_not_awaited()

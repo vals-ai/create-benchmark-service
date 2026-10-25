@@ -3928,38 +3928,52 @@ async def test_daytona_gives_a_dockerfile_build_its_own_time_on_top_of_the_creat
     assert daytona.create_kwargs["timeout"] == request.create_timeout + 600
 
 
-async def test_daytona_build_failure_carries_the_build_log(tmp_path: Path) -> None:
+async def test_daytona_build_failure_carries_the_build_log_and_deletes_the_failed_sandbox(tmp_path: Path) -> None:
     inner = InnerSandbox()
+    inner.state = SandboxState.BUILD_FAILED
 
     class FailingBuildClient(DaytonaClient):
+        async def get(self, instance_id: str) -> InnerSandbox:
+            return self.sandbox
+
         async def create(self, params: object, *_args: object, **kwargs: Any) -> InnerSandbox:
             kwargs["on_snapshot_create_logs"]("Step 1/2 : FROM python:3.12-slim")
             kwargs["on_snapshot_create_logs"]("COPY failed: file not found")
             raise DaytonaError("Failed to build snapshot")
 
+    daytona = FailingBuildClient(inner)
+
     with pytest.raises(SandboxBuildError, match="Failed to build snapshot") as error:
-        await _provider(FailingBuildClient(inner)).create_sandbox(_dockerfile_request(tmp_path, inner.name))
+        await _provider(daytona).create_sandbox(_dockerfile_request(tmp_path, inner.name))
 
     assert error.value.build_log == "Step 1/2 : FROM python:3.12-slim\nCOPY failed: file not found"
+    assert daytona.deleted is True
 
 
 async def test_daytona_build_timeout_is_a_build_error_and_is_not_retried(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     inner = InnerSandbox()
+    inner.state = SandboxState.BUILDING_SNAPSHOT
     attempts: list[int] = []
 
     class TimingOutClient(DaytonaClient):
+        async def get(self, instance_id: str) -> InnerSandbox:
+            return self.sandbox
+
         async def create(self, params: object, *_args: object, **kwargs: Any) -> InnerSandbox:
             attempts.append(1)
             kwargs["on_snapshot_create_logs"]("Step 1/2 : RUN sleep 9999")
             raise DaytonaTimeoutError("Sandbox failed to become ready within the timeout period")
 
+    daytona = TimingOutClient(inner)
+
     with pytest.raises(SandboxBuildError, match="Timed out building") as error:
-        await _provider(TimingOutClient(inner)).create_sandbox(_dockerfile_request(tmp_path, inner.name))
+        await _provider(daytona).create_sandbox(_dockerfile_request(tmp_path, inner.name))
 
     assert len(attempts) == 1
     assert error.value.build_log == "Step 1/2 : RUN sleep 9999"
+    assert daytona.deleted is True
 
 
 async def test_daytona_registry_image_creation_never_collects_a_build_log() -> None:

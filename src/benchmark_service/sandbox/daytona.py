@@ -1946,13 +1946,14 @@ class DaytonaSandboxProvider(SandboxProvider):
             case ComposeSource():
                 raise SandboxError("ComposeSource must be unwrapped before provider.create_sandbox")
 
+        builds_dockerfile = isinstance(request.source, DockerfileSource)
         build_log: list[str] = []
         try:
             if isinstance(params, CreateSandboxFromImageParams):
                 inner = await daytona.create(
                     params,
                     timeout=request.provider_timeout,
-                    on_snapshot_create_logs=build_log.append if isinstance(request.source, DockerfileSource) else None,
+                    on_snapshot_create_logs=build_log.append if builds_dockerfile else None,
                 )
             else:
                 inner = await daytona.create(params, timeout=request.provider_timeout)
@@ -1966,8 +1967,10 @@ class DaytonaSandboxProvider(SandboxProvider):
                 if existing is not None:
                     await notify_sandbox_created("daytona", existing.id)
                     return DaytonaSandbox(existing, daytona)
-            elif _is_transient_daytona_error(exc):
-                await self._delete_failed_sandbox(request.name, daytona)
+            elif _is_transient_daytona_error(exc) or builds_dockerfile:
+                await self._delete_failed_sandbox(
+                    request.name, daytona, abandoned_build=builds_dockerfile and isinstance(exc, DaytonaTimeoutError)
+                )
             error = self._sandbox_error(exc)
             if isinstance(request.source, DockerfileSource):
                 if isinstance(exc, DaytonaTimeoutError):
@@ -1982,7 +1985,7 @@ class DaytonaSandboxProvider(SandboxProvider):
         await notify_sandbox_created("daytona", inner.id)
         return DaytonaSandbox(inner, daytona)
 
-    async def _delete_failed_sandbox(self, name: str, daytona: AsyncDaytona) -> None:
+    async def _delete_failed_sandbox(self, name: str, daytona: AsyncDaytona, *, abandoned_build: bool = False) -> None:
         try:
             sandbox = await _bounded("daytona.get", daytona.get(name), _TOOLBOX_CALL_TIMEOUT_SECONDS)
         except DaytonaNotFoundError:
@@ -1990,7 +1993,7 @@ class DaytonaSandboxProvider(SandboxProvider):
         except DaytonaError as exc:
             raise self._sandbox_error(exc) from exc
 
-        if sandbox.state in _FAILED_SANDBOX_STATES:
+        if sandbox.state in _FAILED_SANDBOX_STATES or (abandoned_build and sandbox.state not in _REMOVED_SANDBOX_STATES):
             await self.delete_sandbox(sandbox.id)
 
     async def _find_existing_sandbox(self, name: str, daytona: AsyncDaytona) -> AsyncSandbox | None:

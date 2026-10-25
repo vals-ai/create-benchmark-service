@@ -727,6 +727,35 @@ async def test_create_sandbox_reports_a_failed_build_with_modals_log(
     assert error.value.build_log == "Image build failed\nstep 2 exited with 1"
 
 
+async def test_create_sandbox_reports_a_dockerfile_build_timeout_as_a_build_error_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    inner = FakeInnerSandbox()
+    finish_build = asyncio.Event()
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        await finish_build.wait()
+
+        return inner
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12\n")
+    timeout = asyncio.timeout
+
+    def short_timeout(_delay: float | None) -> asyncio.Timeout:
+        return timeout(0.01)
+
+    monkeypatch.setattr(asyncio, "timeout", short_timeout)
+
+    with pytest.raises(SandboxBuildError, match="Timed out building"):
+        await provider.create_sandbox(_request(DockerfileSource(dockerfile=str(tmp_path / "Dockerfile"))))
+
+    finish_build.set()
+    await asyncio.gather(*provider._cleanup_tasks)
+
+    assert inner.terminated is True
+
+
 async def test_create_sandbox_reports_a_missing_dockerfile_as_a_sandbox_error(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

@@ -227,7 +227,11 @@ def _provider(monkeypatch: pytest.MonkeyPatch, sdk_sandbox: Any) -> ModalSandbox
 
     monkeypatch.setattr(modal_module, "Client", SimpleNamespace(from_credentials=_aio(from_credentials)))
     monkeypatch.setattr(modal_module, "App", SimpleNamespace(lookup=_aio(lookup)))
-    monkeypatch.setattr(modal_module, "Image", SimpleNamespace(from_registry=_from_registry, from_id=_from_id))
+    monkeypatch.setattr(
+        modal_module,
+        "Image",
+        SimpleNamespace(from_registry=_from_registry, from_id=_from_id, from_dockerfile=_from_dockerfile),
+    )
     monkeypatch.setattr(modal_module, "ModalSdkSandbox", sdk_sandbox)
     return ModalSandboxProvider(_config())
 
@@ -242,6 +246,10 @@ def _from_registry(image: str) -> tuple[str, str]:
 
 def _from_id(snapshot: str, **kwargs: Any) -> tuple[str, str]:
     return ("snapshot", snapshot)
+
+
+def _from_dockerfile(path: str, **kwargs: Any) -> tuple[str, str, dict[str, Any]]:
+    return ("dockerfile", path, kwargs)
 
 
 def _config() -> ModalProviderConfig:
@@ -662,37 +670,22 @@ async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> N
     assert captured["gpu"] is None
 
 
-def _with_dockerfile_builds(monkeypatch: pytest.MonkeyPatch, built: list[tuple[str, dict[str, Any]]]) -> None:
-    def from_dockerfile(path: str, **kwargs: Any) -> tuple[str, str]:
-        built.append((path, kwargs))
-        return ("dockerfile", path)
-
-    monkeypatch.setattr(
-        modal_module,
-        "Image",
-        SimpleNamespace(from_registry=_from_registry, from_id=_from_id, from_dockerfile=from_dockerfile),
-    )
-
-
 async def test_create_sandbox_builds_a_dockerfile_source_from_its_folder(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     captured: dict[str, Any] = {}
-    built: list[tuple[str, dict[str, Any]]] = []
 
     async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
         captured.update(kwargs)
         return FakeInnerSandbox()
 
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
-    _with_dockerfile_builds(monkeypatch, built)
     (tmp_path / "Dockerfile").write_text("FROM python:3.12\n")
     dockerfile = str(tmp_path / "Dockerfile")
 
     await provider.create_sandbox(_request(DockerfileSource(dockerfile=dockerfile)))
 
-    assert built == [(dockerfile, {"context_dir": str(tmp_path)})]
-    assert captured["image"] == ("dockerfile", dockerfile)
+    assert captured["image"] == ("dockerfile", dockerfile, {"context_dir": str(tmp_path)})
 
 
 async def test_create_sandbox_reports_a_failed_build_with_modals_log(
@@ -702,7 +695,6 @@ async def test_create_sandbox_reports_a_failed_build_with_modals_log(
         raise ModalImageBuildError("Image build failed\nstep 2 exited with 1", "im-123")
 
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
-    _with_dockerfile_builds(monkeypatch, [])
     (tmp_path / "Dockerfile").write_text("FROM python:3.12\n")
 
     with pytest.raises(SandboxBuildError, match="Modal image build failed") as error:
@@ -718,7 +710,6 @@ async def test_create_sandbox_reports_a_missing_dockerfile_as_a_sandbox_error(
         raise AssertionError("Modal must not be asked to build a Dockerfile that is missing")
 
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
-    _with_dockerfile_builds(monkeypatch, [])
 
     with pytest.raises(SandboxError, match="Cannot read the Dockerfile"):
         await provider.create_sandbox(_request(DockerfileSource(dockerfile=str(tmp_path / "Dockerfile"))))

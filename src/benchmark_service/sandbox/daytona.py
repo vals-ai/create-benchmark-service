@@ -1920,25 +1920,11 @@ class DaytonaSandboxProvider(SandboxProvider):
         )
 
         match request.source:
-            case ImageSource(image=image):
-                params = CreateSandboxFromImageParams(
-                    auto_stop_interval=request.auto_stop_interval,
-                    auto_delete_interval=0,
-                    ttl_minutes=MAX_SANDBOX_LIFETIME_SECONDS // 60,
-                    name=request.name,
-                    labels=request.labels,
-                    image=image,
-                    network_block_all=request.network_block_all,
-                    resources=resources,
-                    env_vars=request.env_vars,
-                    secrets=request.sandbox_secrets or None,
-                    volumes=volume_mounts,
-                )
-            case DockerfileSource(dockerfile=dockerfile):
+            case ImageSource() | DockerfileSource() as source:
                 try:
-                    image = DaytonaImage.from_dockerfile(dockerfile)
+                    image = source.image if isinstance(source, ImageSource) else DaytonaImage.from_dockerfile(source.dockerfile)
                 except (OSError, DaytonaError) as exc:
-                    raise SandboxError(f"Cannot read the Dockerfile {dockerfile}: {exc}") from exc
+                    raise SandboxError(f"Cannot read the Dockerfile: {exc}") from exc
                 params = CreateSandboxFromImageParams(
                     auto_stop_interval=request.auto_stop_interval,
                     auto_delete_interval=0,

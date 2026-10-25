@@ -518,7 +518,7 @@ class DockerSandboxProvider(SandboxProvider):
             container, info = await self._get_container(instance_id)
             return DockerSandbox(container, info)
 
-    def _cli_environment(self) -> tuple[dict[str, str], list[str]]:
+    async def _docker_cli(self, *args: str) -> asyncio.subprocess.Process:
         # The docker CLI applies the host's registry logins and credential helpers, which aiodocker does not read.
         # DOCKER_CONTEXT overrides DOCKER_HOST in the CLI, unlike the explicit URL passed to aiodocker.
         # Pin CLI calls to the same host selected when this provider was created, even if the environment changes.
@@ -527,16 +527,20 @@ class DockerSandboxProvider(SandboxProvider):
         if self._docker_host:
             env.pop("DOCKER_CONTEXT", None)
             host_args = ["--host", self._docker_host]
-        return env, host_args
+        return await asyncio.create_subprocess_exec(
+            "docker",
+            *host_args,
+            *args,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
 
     async def _build_image(self, source: DockerfileSource, timeout: float) -> str:
-        env, host_args = self._cli_environment()
         with tempfile.TemporaryDirectory() as staging:
             image_id_file = Path(staging) / "image-id"
             try:
-                process = await asyncio.create_subprocess_exec(
-                    "docker",
-                    *host_args,
+                process = await self._docker_cli(
                     "build",
                     "--progress=plain",
                     "--iidfile",
@@ -544,25 +548,18 @@ class DockerSandboxProvider(SandboxProvider):
                     "--file",
                     source.dockerfile,
                     str(PurePosixPath(source.dockerfile).parent),
-                    env=env,
-                    stdout=asyncio.subprocess.PIPE,
-                    stderr=asyncio.subprocess.STDOUT,
                 )
             except OSError as error:
                 raise SandboxError("Building a Dockerfile requires the docker CLI on PATH") from error
+            if process.stdout is None:
+                raise SandboxError("The docker build produced no output stream")
             log = bytearray()
-
-            async def collect() -> None:
-                if process.stdout is None:
-                    raise SandboxError("The docker build produced no output stream")
-                while chunk := await process.stdout.read(65536):
-                    log.extend(chunk)
-                    del log[:-_BUILD_LOG_BYTES]
-                await process.wait()
-
             try:
                 async with asyncio.timeout(timeout):
-                    await collect()
+                    while chunk := await process.stdout.read(65536):
+                        log.extend(chunk)
+                        del log[:-_BUILD_LOG_BYTES]
+                    await process.wait()
             except TimeoutError as error:
                 raise SandboxBuildError(
                     f"Timed out building {source.dockerfile} after {timeout:g}s", log.decode(errors="replace")
@@ -584,18 +581,8 @@ class DockerSandboxProvider(SandboxProvider):
                 if error.status != 404:
                     raise
 
-        env, host_args = self._cli_environment()
         try:
-            process = await asyncio.create_subprocess_exec(
-                "docker",
-                *host_args,
-                "pull",
-                "--quiet",
-                image,
-                env=env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
+            process = await self._docker_cli("pull", "--quiet", image)
         except OSError as error:
             raise SandboxError("Pulling a missing Docker image requires the docker CLI on PATH") from error
         try:

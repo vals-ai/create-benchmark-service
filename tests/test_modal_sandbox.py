@@ -816,7 +816,7 @@ async def test_create_sandbox_maps_gpu_request(monkeypatch: pytest.MonkeyPatch) 
     assert captured["gpu"] == "H100:2"
 
 
-async def test_create_sandbox_asks_modal_for_the_first_acceptable_gpu_type_by_its_own_name(
+async def test_create_sandbox_asks_modal_for_the_first_acceptable_gpu_type_it_knows_by_its_own_name(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, Any] = {}
@@ -826,11 +826,21 @@ async def test_create_sandbox_asks_modal_for_the_first_acceptable_gpu_type_by_it
         return FakeInnerSandbox()
 
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
-    resources = Resources(vcpu=4, memory=8, disk=30, gpu=2, gpu_types=["nvidia-h100-80gb", "a100"])
+    resources = Resources(vcpu=4, memory=8, disk=30, gpu=2, gpu_types=["rtx-4090", "nvidia-h100-80gb", "a100"])
 
     await provider.create_sandbox(_request(resources=resources))
 
     assert captured["gpu"] == "H100:2"
+
+
+async def test_create_sandbox_refuses_a_blank_gpu_type(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        raise AssertionError("create should not be called")
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    with pytest.raises(SandboxError, match="requires gpu_type"):
+        await provider.create_sandbox(_request(resources=Resources(vcpu=4, memory=8, disk=30, gpu=1, gpu_type="")))
 
 
 async def test_create_sandbox_requires_gpu_type_for_gpu(monkeypatch: pytest.MonkeyPatch) -> None:

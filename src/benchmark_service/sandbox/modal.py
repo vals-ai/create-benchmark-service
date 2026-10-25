@@ -689,7 +689,7 @@ class ModalSandboxProvider(SandboxProvider):
         gpu: str | None = None
         if request.resources.gpu:
             gpu_type = modal_gpu_type(request.resources.acceptable_gpu_types)
-            if gpu_type is None:
+            if not gpu_type:
                 raise SandboxError("Modal sandbox provider requires gpu_type when gpu is requested")
             gpu = f"{gpu_type}:{request.resources.gpu}"
         runtime = "gvisor" if gpu else self._config.runtime

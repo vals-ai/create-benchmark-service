@@ -688,6 +688,30 @@ async def test_create_sandbox_builds_a_dockerfile_source_from_its_folder(
     assert captured["image"] == ("dockerfile", dockerfile, {"context_dir": str(tmp_path)})
 
 
+async def test_create_sandbox_waits_for_a_dockerfile_build_on_top_of_the_creation_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        return FakeInnerSandbox()
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12\n")
+    delays: list[float | None] = []
+    timeout = asyncio.timeout
+
+    def recording_timeout(delay: float | None) -> asyncio.Timeout:
+        delays.append(delay)
+        return timeout(delay)
+
+    monkeypatch.setattr(asyncio, "timeout", recording_timeout)
+
+    await provider.create_sandbox(
+        _request(DockerfileSource(dockerfile=str(tmp_path / "Dockerfile"), build_timeout=600))
+    )
+
+    assert delays == [120 + 600]
+
+
 async def test_create_sandbox_reports_a_failed_build_with_modals_log(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:

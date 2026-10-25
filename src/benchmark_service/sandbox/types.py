@@ -35,6 +35,12 @@ class DockerfileSource(BaseModel):
         description="Absolute path of the Dockerfile on the machine that creates the sandbox; "
         "the folder that holds it is the build context",
     )
+    build_timeout: float | None = Field(
+        default=None,
+        gt=0,
+        allow_inf_nan=False,
+        description="Seconds the build may take, on top of create_timeout; None builds within create_timeout",
+    )
 
     @model_validator(mode="after")
     def _validate_dockerfile(self) -> Self:
@@ -217,6 +223,12 @@ class SandboxCreateRequest(BaseModel):
         default_factory=list,
         description="Persistent volumes to attach; empty keeps existing behaviour",
     )
+
+    @property
+    def provider_timeout(self) -> float:
+        """Seconds a provider may take to build the image, when the source has a build, and start the sandbox."""
+        build = self.source.build_timeout if isinstance(self.source, DockerfileSource) else None
+        return self.create_timeout + (build or 0)
 
     @model_validator(mode="after")
     def _validate_request(self) -> Self:

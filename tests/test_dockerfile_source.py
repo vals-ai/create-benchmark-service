@@ -169,3 +169,47 @@ async def test_an_unsupported_request_is_refused_before_any_pull_or_build(source
 
     pull.assert_not_awaited()
     build.assert_not_awaited()
+
+
+def test_a_build_timeout_is_added_to_the_creation_timeout_of_a_dockerfile_source_only() -> None:
+    def request(source: ImageSource | DockerfileSource) -> SandboxCreateRequest:
+        return SandboxCreateRequest(
+            source=source,
+            resources=Resources(vcpu=1, memory=1, disk=1),
+            name="task",
+            labels={},
+            env_vars={},
+            auto_stop_interval=10,
+            create_timeout=60,
+        )
+
+    assert request(DockerfileSource(dockerfile=DOCKERFILE, build_timeout=600)).provider_timeout == 660
+    assert request(DockerfileSource(dockerfile=DOCKERFILE)).provider_timeout == 60
+    assert request(ImageSource(image="python:3.12-slim")).provider_timeout == 60
+
+
+@pytest.mark.parametrize("timeout", [0, -1, float("inf"), float("nan")])
+def test_a_build_timeout_must_be_a_positive_number(timeout: float) -> None:
+    with pytest.raises(ValueError, match="build_timeout"):
+        DockerfileSource(dockerfile=DOCKERFILE, build_timeout=timeout)
+
+
+async def test_a_local_build_gets_its_own_timeout_and_the_container_keeps_the_creation_timeout() -> None:
+    provider = _provider()
+    build = AsyncMock(side_effect=SandboxError("stop"))
+    provider._build_image = build  # pyright: ignore[reportPrivateUsage]
+    source = DockerfileSource(dockerfile=DOCKERFILE, build_timeout=900)
+    request = SandboxCreateRequest(
+        source=source,
+        resources=Resources(vcpu=1, memory=1, disk=1),
+        name="task",
+        labels={},
+        env_vars={},
+        auto_stop_interval=10,
+        create_timeout=60,
+    )
+
+    with pytest.raises(SandboxError, match="stop"):
+        await provider.create_sandbox(request)
+
+    build.assert_awaited_once_with(source, 900)

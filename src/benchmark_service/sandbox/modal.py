@@ -725,6 +725,10 @@ class ModalSandboxProvider(SandboxProvider):
             cleanup.add_done_callback(self._cleanup_tasks.discard)
             if isinstance(exc, asyncio.CancelledError):
                 raise
+            if isinstance(request.source, DockerfileSource):
+                raise SandboxBuildError(
+                    f"Timed out building {request.source.dockerfile} after {request.provider_timeout:g}s"
+                ) from exc
             raise SandboxError(f"Failed to create Modal sandbox within {request.provider_timeout}s") from exc
         except ModalResourceExhaustedError as exc:
             raise SandboxError(f"Modal sandbox resources exhausted: {exc}") from exc

@@ -9,7 +9,7 @@ import os
 import shlex
 import uuid
 from collections import deque
-from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -37,9 +37,6 @@ from daytona_api_client_async import (
 )
 from daytona_api_client_async.exceptions import NotFoundException, OpenApiException
 from daytona_api_client_async.models.region_usage_overview import RegionUsageOverview
-from daytona import (
-    GpuType,
-)
 from daytona import (
     Image as DaytonaImage,
 )
@@ -304,11 +301,6 @@ def _daytona_client(config: DaytonaProviderConfig, target: str) -> AsyncDaytona:
             connection_pool_maxsize=None,
         )
     )
-
-
-def _daytona_gpu_type(names: Sequence[str]) -> GpuType | None:
-    native = daytona_gpu_type(names)
-    return None if native is None else GpuType(native)
 
 
 def _get_config_header(headers: Mapping[str, str], *names: str) -> str | None:
@@ -1892,7 +1884,7 @@ class DaytonaSandboxProvider(SandboxProvider):
             memory=request.resources.memory,
             disk=request.resources.disk,
             gpu=request.resources.gpu or None,
-            gpu_type=_daytona_gpu_type(request.resources.acceptable_gpu_types),
+            gpu_type=daytona_gpu_type(request.resources.acceptable_gpu_types),
         )
 
         volume_mounts = (

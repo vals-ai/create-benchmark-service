@@ -7,7 +7,6 @@ requires-python = ">=3.12"
 dependencies = ["pydantic>=2.12,<3"]
 
 [project.optional-dependencies]
-# PLACEHOLDER: 0.1.38 stands for the first model-library release with gateway_token_scope; set the real version and re-lock once it is published.
 gateway = ["model-library>=0.1.38"]
 vals = ["valsai>=0.3.12"]
 

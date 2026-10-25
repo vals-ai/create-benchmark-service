@@ -36,7 +36,7 @@ async def test_real_gateway_client_with_platform_access_blocked(monkeypatch: pyt
 
     def registry_send(self: httpx.Client, request: httpx.Request, **kwargs: Any) -> httpx.Response:
         requests.append(request)
-        assert str(request.url) == "https://gateway.test/registry"
+        assert str(request.url.copy_with(query=None)) == "https://gateway.test/registry"
         assert request.headers["authorization"] == "Bearer test-key"
         return httpx.Response(200, request=request, json=REGISTRY)
 
@@ -56,7 +56,7 @@ async def test_real_gateway_client_with_platform_access_blocked(monkeypatch: pyt
 
     monkeypatch.setattr(httpx.Client, "send", registry_send)
     monkeypatch.setattr(httpx.AsyncClient, "send", query_send)
-    monkeypatch.setattr(register_models, "_model_registry", None)
+    monkeypatch.setattr(register_models, "_registries", None)
     model = GatewayJudgeModel(MODEL)
     saved = GradingCase(
         id="test",

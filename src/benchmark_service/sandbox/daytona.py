@@ -41,6 +41,9 @@ from daytona import (
     GpuType,
 )
 from daytona import (
+    Image as DaytonaImage,
+)
+from daytona import (
     VolumeMount as DaytonaVolumeMount,
 )
 from daytona import (
@@ -79,6 +82,7 @@ from benchmark_service.sandbox.types import (
     ComposeSource,
     ControlledWorkload,
     ControlledWorkloadResult,
+    DockerfileSource,
     ExecResult,
     GenerationContainment,
     LINUX_CGROUP_V2_V1,
@@ -88,6 +92,7 @@ from benchmark_service.sandbox.types import (
     ResourceCapacity,
     Resources,
     Sandbox,
+    SandboxBuildError,
     SandboxCapacity,
     SandboxCapacityDomain,
     SandboxCommandError,
@@ -1701,9 +1706,9 @@ class DaytonaSandboxProvider(SandboxProvider):
             source = source.outer
         if self._organization_id is None:
             return True
-        if isinstance(source, ImageSource) and resources.gpu:
+        if isinstance(source, (ImageSource, DockerfileSource)) and resources.gpu:
             return True
-        if not isinstance(source, (ImageSource, TargetedSnapshotSource)):
+        if not isinstance(source, (ImageSource, DockerfileSource, TargetedSnapshotSource)):
             return True
 
         target = self._target
@@ -1929,6 +1934,24 @@ class DaytonaSandboxProvider(SandboxProvider):
                     secrets=request.sandbox_secrets or None,
                     volumes=volume_mounts,
                 )
+            case DockerfileSource(dockerfile=dockerfile):
+                try:
+                    image = DaytonaImage.from_dockerfile(dockerfile)
+                except (OSError, DaytonaError) as exc:
+                    raise SandboxError(f"Cannot read the Dockerfile {dockerfile}: {exc}") from exc
+                params = CreateSandboxFromImageParams(
+                    auto_stop_interval=request.auto_stop_interval,
+                    auto_delete_interval=0,
+                    ttl_minutes=MAX_SANDBOX_LIFETIME_SECONDS // 60,
+                    name=request.name,
+                    labels=request.labels,
+                    image=image,
+                    network_block_all=request.network_block_all,
+                    resources=resources,
+                    env_vars=request.env_vars,
+                    secrets=request.sandbox_secrets or None,
+                    volumes=volume_mounts,
+                )
             case SnapshotSource(snapshot=snapshot) | TargetedSnapshotSource(snapshot=snapshot):
                 if request.resources.gpu:
                     raise SandboxError(
@@ -1950,8 +1973,14 @@ class DaytonaSandboxProvider(SandboxProvider):
             case ComposeSource():
                 raise SandboxError("ComposeSource must be unwrapped before provider.create_sandbox")
 
+        build_log: list[str] = []
         try:
-            inner = await daytona.create(params, timeout=request.create_timeout)
+            if isinstance(params, CreateSandboxFromImageParams):
+                inner = await daytona.create(
+                    params, timeout=request.create_timeout, on_snapshot_create_logs=build_log.append
+                )
+            else:
+                inner = await daytona.create(params, timeout=request.create_timeout)
         except DaytonaError as exc:
             # A name conflict means an earlier attempt of this same request
             # created the sandbox but the response was lost (transport retry).
@@ -1964,7 +1993,10 @@ class DaytonaSandboxProvider(SandboxProvider):
                     return DaytonaSandbox(existing, daytona)
             elif _is_transient_daytona_error(exc):
                 await self._delete_failed_sandbox(request.name, daytona)
-            raise self._sandbox_error(exc) from exc
+            error = self._sandbox_error(exc)
+            if build_log and type(error) is SandboxError:
+                raise SandboxBuildError(str(error), "".join(build_log)) from exc
+            raise error from exc
 
         await notify_sandbox_created("daytona", inner.id)
         return DaytonaSandbox(inner, daytona)

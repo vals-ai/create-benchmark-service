@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import codecs
+import hashlib
 import io
 import logging
 import math
@@ -33,12 +34,14 @@ from benchmark_service.sandbox._process_group import (
 from benchmark_service.sandbox.types import (
     ControlledWorkload,
     ControlledWorkloadResult,
+    DockerfileSource,
     ExecResult,
     GenerationContainment,
     ImageSource,
     LINUX_PROCESS_GROUP_V1,
     MAX_SANDBOX_LIFETIME_SECONDS,
     Sandbox,
+    SandboxBuildError,
     SandboxCommandError,
     SandboxConnectionError,
     SandboxCreateRequest,
@@ -53,6 +56,7 @@ logger = logging.getLogger(__name__)
 _MANAGED_LABEL = "io.vals.cbs.managed"
 _NAME_LABEL = "io.vals.cbs.name"
 _PULL_TIMEOUT_S = 1800
+_BUILD_LOG_BYTES = 64 * 1024
 _CONTROLLED_TAIL_BYTES = 64 * 1024
 
 
@@ -474,15 +478,13 @@ class _DockerControlledWorkload(ControlledWorkload):
         await self._ensure_stopped()
 
 
-def _build_container_config(request: SandboxCreateRequest) -> JSONObject:
+def _build_container_config(request: SandboxCreateRequest, image: str) -> JSONObject:
     """Validate Docker support and build the container creation settings."""
-    if not isinstance(request.source, ImageSource):
-        raise SandboxError("Local Docker supports image sources only; snapshots and Compose are not supported")
     if request.resources.gpu or request.volumes or request.sandbox_secrets:
         raise SandboxError("Local Docker does not support GPUs, persistent volumes, or provider-managed secrets")
     labels = {**request.labels, _MANAGED_LABEL: "true", _NAME_LABEL: request.name}
     return {
-        "Image": request.source.image,
+        "Image": image,
         "Entrypoint": ["/bin/sh", "-c"],
         "Cmd": [f"trap 'exit 0' TERM INT; sleep {MAX_SANDBOX_LIFETIME_SECONDS} & wait $!"],
         "Env": [f"{key}={value}" for key, value in request.env_vars.items()],
@@ -513,6 +515,63 @@ class DockerSandboxProvider(SandboxProvider):
             container, info = await self._get_container(instance_id)
             return DockerSandbox(container, info)
 
+    def _cli_environment(self) -> tuple[dict[str, str], list[str]]:
+        # The docker CLI applies the host's registry logins and credential helpers, which aiodocker does not read.
+        # DOCKER_CONTEXT overrides DOCKER_HOST in the CLI, unlike the explicit URL passed to aiodocker.
+        # Pin CLI calls to the same host selected when this provider was created, even if the environment changes.
+        env = os.environ.copy()
+        host_args: list[str] = []
+        if self._docker_host:
+            env.pop("DOCKER_CONTEXT", None)
+            host_args = ["--host", self._docker_host]
+        return env, host_args
+
+    async def _build_image(self, source: DockerfileSource, timeout: float) -> str:
+        # The tag only names the build; Docker's layer cache decides what is rebuilt.
+        tag = f"cbs-build:{hashlib.sha256(source.dockerfile.encode()).hexdigest()[:16]}"
+        env, host_args = self._cli_environment()
+        try:
+            process = await asyncio.create_subprocess_exec(
+                "docker",
+                *host_args,
+                "build",
+                "--progress=plain",
+                "--tag",
+                tag,
+                "--file",
+                source.dockerfile,
+                str(PurePosixPath(source.dockerfile).parent),
+                env=env,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.STDOUT,
+            )
+        except OSError as error:
+            raise SandboxError("Building a Dockerfile requires the docker CLI on PATH") from error
+        log = bytearray()
+
+        async def collect() -> None:
+            if process.stdout is None:
+                raise SandboxError("The docker build produced no output stream")
+            while chunk := await process.stdout.read(65536):
+                log.extend(chunk)
+                del log[:-_BUILD_LOG_BYTES]
+            await process.wait()
+
+        try:
+            async with asyncio.timeout(timeout):
+                await collect()
+        except TimeoutError as error:
+            raise SandboxBuildError(
+                f"Timed out building {source.dockerfile} after {timeout:g}s", log.decode(errors="replace")
+            ) from error
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
+        if process.returncode != 0:
+            raise SandboxBuildError(f"Failed to build {source.dockerfile}", log.decode(errors="replace"))
+        return tag
+
     async def _ensure_image(self, image: str) -> None:
         with _docker_errors():
             try:
@@ -522,14 +581,7 @@ class DockerSandboxProvider(SandboxProvider):
                 if error.status != 404:
                     raise
 
-        # The docker CLI applies the host's registry logins and credential helpers, which aiodocker does not read.
-        # DOCKER_CONTEXT overrides DOCKER_HOST in the CLI, unlike the explicit URL passed to aiodocker.
-        # Pin pulls to the same host selected when this provider was created, even if the environment changes.
-        env = os.environ.copy()
-        host_args: list[str] = []
-        if self._docker_host:
-            env.pop("DOCKER_CONTEXT", None)
-            host_args = ["--host", self._docker_host]
+        env, host_args = self._cli_environment()
         try:
             process = await asyncio.create_subprocess_exec(
                 "docker",
@@ -557,9 +609,17 @@ class DockerSandboxProvider(SandboxProvider):
             raise SandboxError(f"Failed to pull Docker image {image}: {output.decode(errors='replace').strip()}")
 
     async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
-        config = _build_container_config(request)
-        # create_timeout bounds container creation, so a large first pull must not run inside it.
-        await self._ensure_image(str(config["Image"]))
+        match request.source:
+            case ImageSource(image=image):
+                # create_timeout bounds container creation, so a large first pull must not run inside it.
+                await self._ensure_image(image)
+            case DockerfileSource():
+                image = await self._build_image(request.source, request.create_timeout)
+            case _:
+                raise SandboxError(
+                    "Local Docker supports image and Dockerfile sources only; snapshots and Compose are not supported"
+                )
+        config = _build_container_config(request, image)
         name = f"cbs-{uuid4().hex}"
         run = asyncio.create_task(self._docker.containers.run(config, name=name))  # pyright: ignore[reportUnknownMemberType]
         with _docker_errors():

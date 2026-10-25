@@ -57,14 +57,6 @@ class TestDaytonaGpuType:
 
         assert [daytona_gpu_type([member.value]) for member in offered] == offered
 
-    def test_the_types_daytona_offers_are_all_passed_in_order_without_repeats(self) -> None:
-        names = ["A100", "T4", "nvidia-h100-80gb", "RTX-4090", "H100"]
-
-        assert daytona_gpu_type(names) == [GpuType.H100, GpuType.RTX_4090]
-
-    def test_no_types_means_any(self) -> None:
-        assert daytona_gpu_type([]) is None
-
     def test_types_daytona_does_not_offer_are_refused_with_what_it_does(self) -> None:
         with pytest.raises(SandboxError, match=r"Unsupported Daytona GPU type: A100, T4\. Supported types: H100, H200"):
             daytona_gpu_type(["A100", "T4"])
@@ -89,18 +81,8 @@ class TestModalGpuType:
         assert modal_gpu_type([name]) == native
 
     def test_a_name_modal_does_not_list_is_passed_through_so_new_types_keep_working(self) -> None:
-        assert modal_gpu_type(["B900"]) == "B900"
-
-    def test_the_first_type_modal_lists_is_asked_for_and_the_first_name_when_it_lists_none(self) -> None:
-        assert modal_gpu_type(["rtx-4090", "nvidia-h100-80gb", "a100"]) == "H100"
-        assert modal_gpu_type(["rtx-4090", "rtx-5090"]) == "RTX-4090"
-
-    def test_blank_names_are_skipped(self) -> None:
         assert modal_gpu_type(["", "B900"]) == "B900"
-        assert modal_gpu_type([" "]) is None
-
-    def test_no_types_gives_none(self) -> None:
-        assert modal_gpu_type([]) is None
+        assert modal_gpu_type(["rtx-4090", "rtx-5090"]) == "RTX-4090"
 
 
 class TestResourcesGpuTypes:

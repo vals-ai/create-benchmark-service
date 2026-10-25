@@ -8,6 +8,7 @@ import shlex
 import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable, Coroutine, Mapping
+from pathlib import PurePosixPath
 from typing import Any, Literal, cast
 
 from modal import App, Client, Image, Volume
@@ -15,6 +16,7 @@ from modal import Sandbox as ModalSdkSandbox
 from modal.exception import ConflictError as ModalConflictError
 from modal.exception import ConnectionError as ModalConnectionError
 from modal.exception import Error as ModalError
+from modal.exception import ImageBuildError as ModalImageBuildError
 from modal.exception import InvalidError as ModalInvalidError
 from modal.exception import NotFoundError as ModalNotFoundError
 from modal.exception import ResourceExhaustedError as ModalResourceExhaustedError
@@ -28,6 +30,7 @@ from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
     ControlledWorkload,
     ControlledWorkloadResult,
+    DockerfileSource,
     ExecResult,
     GenerationContainment,
     ImageSource,
@@ -35,6 +38,7 @@ from benchmark_service.sandbox.types import (
     MAX_SANDBOX_LIFETIME_SECONDS,
     MissingSandboxConfigError,
     Sandbox,
+    SandboxBuildError,
     SandboxCommandError,
     SandboxConnectionError,
     SandboxCreateRequest,
@@ -655,6 +659,8 @@ class ModalSandboxProvider(SandboxProvider):
                 return Image.from_registry(image)  # pyright: ignore[reportUnknownMemberType]
             case SnapshotSource(snapshot=snapshot):
                 return Image.from_id(snapshot, client=client)
+            case DockerfileSource(dockerfile=dockerfile):
+                return Image.from_dockerfile(dockerfile, context_dir=str(PurePosixPath(dockerfile).parent))  # pyright: ignore[reportUnknownMemberType]
             case _:
                 raise SandboxError(f"Modal sandbox provider does not support source type: {source.type}")
 
@@ -718,6 +724,8 @@ class ModalSandboxProvider(SandboxProvider):
             raise SandboxError(f"Failed to create Modal sandbox within {request.create_timeout}s") from exc
         except ModalResourceExhaustedError as exc:
             raise SandboxError(f"Modal sandbox resources exhausted: {exc}") from exc
+        except ModalImageBuildError as exc:
+            raise SandboxBuildError(f"Modal could not build the Dockerfile: {exc}", str(exc)) from exc
         except ModalNotFoundError as exc:
             if request.volumes and _is_missing_volume_error(exc):
                 raise SandboxError(f"Modal volume mount failed: {exc}") from exc

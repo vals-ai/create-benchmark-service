@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -13,6 +14,7 @@ from modal import Sandbox as ModalSdkSandbox
 from modal.exception import ConflictError as ModalConflictError
 from modal.exception import ConnectionError as ModalConnectionError
 from modal.exception import Error as ModalError
+from modal.exception import ImageBuildError as ModalImageBuildError
 from modal.exception import InvalidError as ModalInvalidError
 from modal.exception import NotFoundError as ModalNotFoundError
 from modal.exception import ResourceExhaustedError as ModalResourceExhaustedError
@@ -21,8 +23,10 @@ import benchmark_service.sandbox.modal as modal_module
 from benchmark_service.sandbox import sandbox_provider_config_from_mapping
 from benchmark_service.sandbox.modal import ModalProviderConfig, ModalSandbox, ModalSandboxProvider
 from benchmark_service.sandbox.types import (
+    DockerfileSource,
     ImageSource,
     Resources,
+    SandboxBuildError,
     SandboxCommandError,
     SandboxConnectionError,
     SandboxCreateRequest,
@@ -193,7 +197,7 @@ class FlakyExecSandbox(FakeInnerSandbox):
 
 
 def _request(
-    source: ImageSource | SnapshotSource | TargetedSnapshotSource | None = None,
+    source: ImageSource | SnapshotSource | TargetedSnapshotSource | DockerfileSource | None = None,
     resources: Resources | None = None,
     labels: dict[str, str] | None = None,
     volumes: list[VolumeMount] | None = None,
@@ -656,6 +660,53 @@ async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> N
     assert captured["runtime"] == "gvisor"
     assert captured["experimental_options"] == {"enable_docker": True}
     assert captured["gpu"] is None
+
+
+def _with_dockerfile_builds(monkeypatch: pytest.MonkeyPatch, built: list[tuple[str, dict[str, Any]]]) -> None:
+    def from_dockerfile(path: str, **kwargs: Any) -> tuple[str, str]:
+        built.append((path, kwargs))
+        return ("dockerfile", path)
+
+    monkeypatch.setattr(
+        modal_module,
+        "Image",
+        SimpleNamespace(from_registry=_from_registry, from_id=_from_id, from_dockerfile=from_dockerfile),
+    )
+
+
+async def test_create_sandbox_builds_a_dockerfile_source_from_its_folder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, Any] = {}
+    built: list[tuple[str, dict[str, Any]]] = []
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return FakeInnerSandbox()
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    _with_dockerfile_builds(monkeypatch, built)
+    dockerfile = str(tmp_path / "Dockerfile")
+
+    await provider.create_sandbox(_request(DockerfileSource(dockerfile=dockerfile)))
+
+    assert built == [(dockerfile, {"context_dir": str(tmp_path)})]
+    assert captured["image"] == ("dockerfile", dockerfile)
+
+
+async def test_create_sandbox_reports_a_failed_build_with_modals_log(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        raise ModalImageBuildError("Image build failed\nstep 2 exited with 1", "im-123")
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    _with_dockerfile_builds(monkeypatch, [])
+
+    with pytest.raises(SandboxBuildError, match="Modal could not build the Dockerfile") as error:
+        await provider.create_sandbox(_request(DockerfileSource(dockerfile=str(tmp_path / "Dockerfile"))))
+
+    assert error.value.build_log == "Image build failed\nstep 2 exited with 1"
 
 
 async def test_create_sandbox_uses_vm_runtime(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -28,6 +28,21 @@ class TargetedSnapshotSource(BaseModel):
     target: str = Field(min_length=1)
 
 
+class DockerfileSource(BaseModel):
+    type: Literal["dockerfile"] = "dockerfile"
+    dockerfile: str = Field(
+        min_length=1,
+        description="Absolute path of the Dockerfile on the machine that creates the sandbox; "
+        "the folder that holds it is the build context",
+    )
+
+    @model_validator(mode="after")
+    def _validate_dockerfile(self) -> Self:
+        if not PurePosixPath(self.dockerfile).is_absolute():
+            raise ValueError(f"dockerfile must be an absolute path, got {self.dockerfile!r}")
+        return self
+
+
 BaseSandboxSource = Annotated[ImageSource | SnapshotSource, Field(discriminator="type")]
 
 
@@ -39,7 +54,7 @@ class ComposeSource(BaseModel):
 
 
 SandboxSource = Annotated[
-    ImageSource | SnapshotSource | TargetedSnapshotSource | ComposeSource,
+    ImageSource | SnapshotSource | TargetedSnapshotSource | DockerfileSource | ComposeSource,
     Field(discriminator="type"),
 ]
 
@@ -242,6 +257,12 @@ class SandboxError(Exception):
 
 class ControlledWorkloadUnsupportedError(SandboxError):
     pass
+
+
+class SandboxBuildError(SandboxError):
+    def __init__(self, message: str, build_log: str = "") -> None:
+        self.build_log = build_log
+        super().__init__(message)
 
 
 def resolve_volume_subpath(mount: VolumeMount, labels: Mapping[str, str]) -> str | None:

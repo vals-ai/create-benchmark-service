@@ -39,12 +39,14 @@ from benchmark_service.sandbox.compose import _COMPOSE_EXEC_ENV_ARGS  # pyright:
 from benchmark_service.sandbox import (
     ComposeSource,
     ComposeSandbox,
+    DockerfileSource,
     ExecResult,
     ImageSource,
     MissingSandboxConfigError,
     ResourceCapacity,
     Resources,
     Sandbox,
+    SandboxBuildError,
     SandboxCapacity,
     SandboxCommandError,
     SandboxConnectionError,
@@ -975,14 +977,16 @@ class DaytonaClient:
         self.deleted = False
         self.listed_query: Any | None = None
         self.create_params: Any = None
+        self.create_kwargs: dict[str, object] = {}
 
     async def get(self, instance_id: str) -> InnerSandbox:
         assert instance_id == self.sandbox.name
         return self.sandbox
 
-    async def create(self, params: object, *_args: object, **_kwargs: object) -> InnerSandbox:
+    async def create(self, params: object, *_args: object, **kwargs: object) -> InnerSandbox:
         self.created = True
         self.create_params = params
+        self.create_kwargs = kwargs
         return self.sandbox
 
     async def delete(self, sandbox: InnerSandbox) -> None:
@@ -3891,6 +3895,62 @@ async def test_daytona_provider_creates_fresh_sandbox() -> None:
     assert sandbox.id == inner.id
     assert daytona.created is True
     assert daytona.create_params.ttl_minutes == 167 * 60
+
+
+def _dockerfile_request(tmp_path: Path, name: str) -> SandboxCreateRequest:
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\nCOPY data.txt /data.txt\n")
+    (tmp_path / "data.txt").write_text("data")
+    return _request(name).model_copy(update={"source": DockerfileSource(dockerfile=str(tmp_path / "Dockerfile"))})
+
+
+async def test_daytona_provider_builds_a_dockerfile_source_from_its_folder(tmp_path: Path) -> None:
+    inner = InnerSandbox()
+    daytona = DaytonaClient(inner)
+
+    await _provider(daytona).create_sandbox(_dockerfile_request(tmp_path, inner.name))
+
+    image = daytona.create_params.image
+    assert image.dockerfile() == "FROM python:3.12-slim\nCOPY data.txt /data.txt\n"
+    assert [(context.source_path, context.archive_path) for context in image._context_list] == [  # pyright: ignore[reportPrivateUsage]
+        (str(tmp_path / "data.txt"), "data.txt")
+    ]
+    assert callable(daytona.create_kwargs["on_snapshot_create_logs"])
+
+
+async def test_daytona_build_failure_carries_the_build_log(tmp_path: Path) -> None:
+    inner = InnerSandbox()
+
+    class FailingBuildClient(DaytonaClient):
+        async def create(self, params: object, *_args: object, **kwargs: Any) -> InnerSandbox:
+            kwargs["on_snapshot_create_logs"]("Step 1/2 : FROM python:3.12-slim\n")
+            kwargs["on_snapshot_create_logs"]("COPY failed: file not found\n")
+            raise DaytonaError("Failed to build snapshot")
+
+    with pytest.raises(SandboxBuildError, match="Failed to build snapshot") as error:
+        await _provider(FailingBuildClient(inner)).create_sandbox(_dockerfile_request(tmp_path, inner.name))
+
+    assert error.value.build_log == "Step 1/2 : FROM python:3.12-slim\nCOPY failed: file not found\n"
+
+
+async def test_daytona_failure_before_any_build_output_is_not_a_build_error(tmp_path: Path) -> None:
+    inner = InnerSandbox()
+
+    class RejectingClient(DaytonaClient):
+        async def create(self, params: object, *_args: object, **_kwargs: object) -> InnerSandbox:
+            raise DaytonaError("Quota exceeded")
+
+    with pytest.raises(SandboxError, match="Quota exceeded") as error:
+        await _provider(RejectingClient(inner)).create_sandbox(_dockerfile_request(tmp_path, inner.name))
+
+    assert not isinstance(error.value, SandboxBuildError)
+
+
+async def test_daytona_dockerfile_that_cannot_be_read_is_a_sandbox_error(tmp_path: Path) -> None:
+    inner = InnerSandbox()
+    request = _request(inner.name).model_copy(update={"source": DockerfileSource(dockerfile=str(tmp_path / "Dockerfile"))})
+
+    with pytest.raises(SandboxError, match="Cannot read the Dockerfile"):
+        await _provider(DaytonaClient(inner)).create_sandbox(request)
 
 
 def test_daytona_sandbox_exposes_inventory_metadata() -> None:

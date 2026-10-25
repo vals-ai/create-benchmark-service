@@ -1977,7 +1977,9 @@ class DaytonaSandboxProvider(SandboxProvider):
         try:
             if isinstance(params, CreateSandboxFromImageParams):
                 inner = await daytona.create(
-                    params, timeout=request.create_timeout, on_snapshot_create_logs=build_log.append
+                    params,
+                    timeout=request.create_timeout,
+                    on_snapshot_create_logs=build_log.append if isinstance(request.source, DockerfileSource) else None,
                 )
             else:
                 inner = await daytona.create(params, timeout=request.create_timeout)
@@ -1994,8 +1996,14 @@ class DaytonaSandboxProvider(SandboxProvider):
             elif _is_transient_daytona_error(exc):
                 await self._delete_failed_sandbox(request.name, daytona)
             error = self._sandbox_error(exc)
-            if build_log and type(error) is SandboxError:
-                raise SandboxBuildError(str(error), "".join(build_log)) from exc
+            if isinstance(request.source, DockerfileSource):
+                if isinstance(exc, DaytonaTimeoutError):
+                    raise SandboxBuildError(
+                        f"Timed out building {request.source.dockerfile} after {request.create_timeout:g}s",
+                        "\n".join(build_log),
+                    ) from exc
+                if build_log and type(error) is SandboxError:
+                    raise SandboxBuildError(str(error), "\n".join(build_log)) from exc
             raise error from exc
 
         await notify_sandbox_created("daytona", inner.id)

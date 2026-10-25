@@ -4,18 +4,18 @@ from __future__ import annotations
 
 import asyncio
 import codecs
-import hashlib
 import io
 import logging
 import math
 import os
 import shlex
 import tarfile
+import tempfile
 from collections import deque
 from collections.abc import AsyncGenerator, Generator, Mapping
 from contextlib import aclosing, contextmanager
 from datetime import datetime
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Awaitable, Callable, Literal
 from uuid import uuid4
 
@@ -478,10 +478,13 @@ class _DockerControlledWorkload(ControlledWorkload):
         await self._ensure_stopped()
 
 
-def _build_container_config(request: SandboxCreateRequest, image: str) -> JSONObject:
-    """Validate Docker support and build the container creation settings."""
+def _reject_unsupported(request: SandboxCreateRequest) -> None:
     if request.resources.gpu or request.volumes or request.sandbox_secrets:
         raise SandboxError("Local Docker does not support GPUs, persistent volumes, or provider-managed secrets")
+
+
+def _build_container_config(request: SandboxCreateRequest, image: str) -> JSONObject:
+    """Build the container creation settings."""
     labels = {**request.labels, _MANAGED_LABEL: "true", _NAME_LABEL: request.name}
     return {
         "Image": image,
@@ -527,50 +530,50 @@ class DockerSandboxProvider(SandboxProvider):
         return env, host_args
 
     async def _build_image(self, source: DockerfileSource, timeout: float) -> str:
-        # The tag only names the build; Docker's layer cache decides what is rebuilt.
-        tag = f"cbs-build:{hashlib.sha256(source.dockerfile.encode()).hexdigest()[:16]}"
         env, host_args = self._cli_environment()
-        try:
-            process = await asyncio.create_subprocess_exec(
-                "docker",
-                *host_args,
-                "build",
-                "--progress=plain",
-                "--tag",
-                tag,
-                "--file",
-                source.dockerfile,
-                str(PurePosixPath(source.dockerfile).parent),
-                env=env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-        except OSError as error:
-            raise SandboxError("Building a Dockerfile requires the docker CLI on PATH") from error
-        log = bytearray()
+        with tempfile.TemporaryDirectory() as staging:
+            image_id_file = Path(staging) / "image-id"
+            try:
+                process = await asyncio.create_subprocess_exec(
+                    "docker",
+                    *host_args,
+                    "build",
+                    "--progress=plain",
+                    "--iidfile",
+                    str(image_id_file),
+                    "--file",
+                    source.dockerfile,
+                    str(PurePosixPath(source.dockerfile).parent),
+                    env=env,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.STDOUT,
+                )
+            except OSError as error:
+                raise SandboxError("Building a Dockerfile requires the docker CLI on PATH") from error
+            log = bytearray()
 
-        async def collect() -> None:
-            if process.stdout is None:
-                raise SandboxError("The docker build produced no output stream")
-            while chunk := await process.stdout.read(65536):
-                log.extend(chunk)
-                del log[:-_BUILD_LOG_BYTES]
-            await process.wait()
-
-        try:
-            async with asyncio.timeout(timeout):
-                await collect()
-        except TimeoutError as error:
-            raise SandboxBuildError(
-                f"Timed out building {source.dockerfile} after {timeout:g}s", log.decode(errors="replace")
-            ) from error
-        finally:
-            if process.returncode is None:
-                process.kill()
+            async def collect() -> None:
+                if process.stdout is None:
+                    raise SandboxError("The docker build produced no output stream")
+                while chunk := await process.stdout.read(65536):
+                    log.extend(chunk)
+                    del log[:-_BUILD_LOG_BYTES]
                 await process.wait()
-        if process.returncode != 0:
-            raise SandboxBuildError(f"Failed to build {source.dockerfile}", log.decode(errors="replace"))
-        return tag
+
+            try:
+                async with asyncio.timeout(timeout):
+                    await collect()
+            except TimeoutError as error:
+                raise SandboxBuildError(
+                    f"Timed out building {source.dockerfile} after {timeout:g}s", log.decode(errors="replace")
+                ) from error
+            finally:
+                if process.returncode is None:
+                    process.kill()
+                    await process.wait()
+            if process.returncode != 0:
+                raise SandboxBuildError(f"Failed to build {source.dockerfile}", log.decode(errors="replace"))
+            return image_id_file.read_text().strip()
 
     async def _ensure_image(self, image: str) -> None:
         with _docker_errors():
@@ -609,6 +612,7 @@ class DockerSandboxProvider(SandboxProvider):
             raise SandboxError(f"Failed to pull Docker image {image}: {output.decode(errors='replace').strip()}")
 
     async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
+        _reject_unsupported(request)
         match request.source:
             case ImageSource(image=image):
                 # create_timeout bounds container creation, so a large first pull must not run inside it.

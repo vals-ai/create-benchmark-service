@@ -686,6 +686,7 @@ async def test_create_sandbox_builds_a_dockerfile_source_from_its_folder(
 
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
     _with_dockerfile_builds(monkeypatch, built)
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12\n")
     dockerfile = str(tmp_path / "Dockerfile")
 
     await provider.create_sandbox(_request(DockerfileSource(dockerfile=dockerfile)))
@@ -702,11 +703,37 @@ async def test_create_sandbox_reports_a_failed_build_with_modals_log(
 
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
     _with_dockerfile_builds(monkeypatch, [])
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12\n")
 
-    with pytest.raises(SandboxBuildError, match="Modal could not build the Dockerfile") as error:
+    with pytest.raises(SandboxBuildError, match="Modal image build failed") as error:
         await provider.create_sandbox(_request(DockerfileSource(dockerfile=str(tmp_path / "Dockerfile"))))
 
     assert error.value.build_log == "Image build failed\nstep 2 exited with 1"
+
+
+async def test_create_sandbox_reports_a_missing_dockerfile_as_a_sandbox_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        raise AssertionError("Modal must not be asked to build a Dockerfile that is missing")
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    _with_dockerfile_builds(monkeypatch, [])
+
+    with pytest.raises(SandboxError, match="Cannot read the Dockerfile"):
+        await provider.create_sandbox(_request(DockerfileSource(dockerfile=str(tmp_path / "Dockerfile"))))
+
+
+async def test_create_sandbox_maps_a_failed_registry_image_build_to_a_build_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        raise ModalImageBuildError("Image build for im-123 failed", "im-123")
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    with pytest.raises(SandboxBuildError, match="Modal image build failed: Image build for im-123 failed"):
+        await provider.create_sandbox(_request())
 
 
 async def test_create_sandbox_uses_vm_runtime(monkeypatch: pytest.MonkeyPatch) -> None:

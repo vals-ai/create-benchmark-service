@@ -3922,14 +3922,50 @@ async def test_daytona_build_failure_carries_the_build_log(tmp_path: Path) -> No
 
     class FailingBuildClient(DaytonaClient):
         async def create(self, params: object, *_args: object, **kwargs: Any) -> InnerSandbox:
-            kwargs["on_snapshot_create_logs"]("Step 1/2 : FROM python:3.12-slim\n")
-            kwargs["on_snapshot_create_logs"]("COPY failed: file not found\n")
+            kwargs["on_snapshot_create_logs"]("Step 1/2 : FROM python:3.12-slim")
+            kwargs["on_snapshot_create_logs"]("COPY failed: file not found")
             raise DaytonaError("Failed to build snapshot")
 
     with pytest.raises(SandboxBuildError, match="Failed to build snapshot") as error:
         await _provider(FailingBuildClient(inner)).create_sandbox(_dockerfile_request(tmp_path, inner.name))
 
-    assert error.value.build_log == "Step 1/2 : FROM python:3.12-slim\nCOPY failed: file not found\n"
+    assert error.value.build_log == "Step 1/2 : FROM python:3.12-slim\nCOPY failed: file not found"
+
+
+async def test_daytona_build_timeout_is_a_build_error_and_is_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inner = InnerSandbox()
+    attempts: list[int] = []
+
+    class TimingOutClient(DaytonaClient):
+        async def create(self, params: object, *_args: object, **kwargs: Any) -> InnerSandbox:
+            attempts.append(1)
+            kwargs["on_snapshot_create_logs"]("Step 1/2 : RUN sleep 9999")
+            raise DaytonaTimeoutError("Sandbox failed to become ready within the timeout period")
+
+    with pytest.raises(SandboxBuildError, match="Timed out building") as error:
+        await _provider(TimingOutClient(inner)).create_sandbox(_dockerfile_request(tmp_path, inner.name))
+
+    assert len(attempts) == 1
+    assert error.value.build_log == "Step 1/2 : RUN sleep 9999"
+
+
+async def test_daytona_registry_image_creation_never_collects_a_build_log() -> None:
+    inner = InnerSandbox()
+
+    class FailingImageClient(DaytonaClient):
+        async def create(self, params: object, *_args: object, **kwargs: Any) -> InnerSandbox:
+            self.create_kwargs = kwargs
+            raise DaytonaError("Failed to pull the image")
+
+    daytona = FailingImageClient(inner)
+
+    with pytest.raises(SandboxError, match="Failed to pull the image") as error:
+        await _provider(daytona).create_sandbox(_request(inner.name))
+
+    assert daytona.create_kwargs["on_snapshot_create_logs"] is None
+    assert not isinstance(error.value, SandboxBuildError)
 
 
 async def test_daytona_failure_before_any_build_output_is_not_a_build_error(tmp_path: Path) -> None:

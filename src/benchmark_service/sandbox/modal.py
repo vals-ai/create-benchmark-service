@@ -8,7 +8,7 @@ import shlex
 import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable, Coroutine, Mapping
-from pathlib import PurePosixPath
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
 
 from modal import App, Client, Image, Volume
@@ -130,6 +130,8 @@ class ModalProviderConfig(BaseModel):
 
 
 def _sandbox_error(exc: ModalError) -> SandboxError:
+    if isinstance(exc, ModalImageBuildError):
+        return SandboxBuildError(f"Modal image build failed: {exc}", str(exc))
     if isinstance(exc, ModalNotFoundError):
         return SandboxNotFoundError(str(exc))
     if isinstance(exc, ModalConflictError) and "shutting down" in str(exc).lower():
@@ -660,6 +662,8 @@ class ModalSandboxProvider(SandboxProvider):
             case SnapshotSource(snapshot=snapshot):
                 return Image.from_id(snapshot, client=client)
             case DockerfileSource(dockerfile=dockerfile):
+                if not Path(dockerfile).is_file():
+                    raise SandboxError(f"Cannot read the Dockerfile {dockerfile}")
                 return Image.from_dockerfile(dockerfile, context_dir=str(PurePosixPath(dockerfile).parent))  # pyright: ignore[reportUnknownMemberType]
             case _:
                 raise SandboxError(f"Modal sandbox provider does not support source type: {source.type}")
@@ -724,8 +728,6 @@ class ModalSandboxProvider(SandboxProvider):
             raise SandboxError(f"Failed to create Modal sandbox within {request.create_timeout}s") from exc
         except ModalResourceExhaustedError as exc:
             raise SandboxError(f"Modal sandbox resources exhausted: {exc}") from exc
-        except ModalImageBuildError as exc:
-            raise SandboxBuildError(f"Modal could not build the Dockerfile: {exc}", str(exc)) from exc
         except ModalNotFoundError as exc:
             if request.volumes and _is_missing_volume_error(exc):
                 raise SandboxError(f"Modal volume mount failed: {exc}") from exc

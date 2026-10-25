@@ -437,7 +437,7 @@ class SnapshotEvalForGpuTaskStub(SandboxStub):
         task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
         return task.model_copy(
             update={
-                "resources": Resources(vcpu=8, memory=16, disk=50, gpu=1, gpu_type="H100"),
+                "resources": Resources(vcpu=8, memory=16, disk=50, gpu=1, gpu_types=["H100", "A100"]),
                 "eval_sandbox": EvalSandboxSpec(source=SnapshotSource(snapshot="grader-snapshot")),
             }
         )
@@ -453,6 +453,7 @@ async def test_grade_instance_does_not_apply_generation_gpu_to_snapshot_override
     assert provider.created[0].source == SnapshotSource(snapshot="grader-snapshot")
     assert provider.created[0].resources.gpu == 0
     assert provider.created[0].resources.gpu_type is None
+    assert provider.created[0].resources.gpu_types == []
 
 
 class SnapshotGenerationGpuTaskStub(SandboxStub):

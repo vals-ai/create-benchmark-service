@@ -3,7 +3,6 @@ from __future__ import annotations
 # pyright: reportPrivateUsage=false
 
 import asyncio
-import time
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 from types import SimpleNamespace
@@ -211,12 +210,6 @@ def _request(
     )
 
 
-@pytest.fixture(autouse=True)
-def reset_create_limiter(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(modal_module, "_create_limiter", None)
-    monkeypatch.setenv(modal_module._CREATES_PER_SECOND_ENV, "100000")
-
-
 def _provider(monkeypatch: pytest.MonkeyPatch, sdk_sandbox: Any) -> ModalSandboxProvider:
     client = SimpleNamespace(_close=_aio(_noop))
     app = SimpleNamespace(app_id="ap-1")
@@ -231,12 +224,6 @@ def _provider(monkeypatch: pytest.MonkeyPatch, sdk_sandbox: Any) -> ModalSandbox
     monkeypatch.setattr(modal_module, "Client", SimpleNamespace(from_credentials=_aio(from_credentials)))
     monkeypatch.setattr(modal_module, "App", SimpleNamespace(lookup=_aio(lookup)))
     monkeypatch.setattr(modal_module, "Image", SimpleNamespace(from_registry=_from_registry, from_id=_from_id))
-    if not hasattr(sdk_sandbox, "from_name"):
-        # Default: no existing sandbox holds the requested name.
-        async def _no_named_sandbox(*args: Any, **kwargs: Any) -> Any:
-            raise ModalNotFoundError("no sandbox with that name")
-
-        sdk_sandbox.from_name = _aio(_no_named_sandbox)
     monkeypatch.setattr(modal_module, "ModalSdkSandbox", sdk_sandbox)
     return ModalSandboxProvider(_config())
 
@@ -567,6 +554,42 @@ async def test_stream_download_yields_chunks() -> None:
     assert chunks == [b"hello", b" world"]
 
 
+class ConnectionLostThenApplyPolicySandbox(FakeInnerSandbox):
+    def __init__(self) -> None:
+        super().__init__()
+        self.policy_attempts = 0
+
+    async def _set_outbound_network_policy(
+        self,
+        *,
+        outbound_cidr_allowlist: list[str] | None = None,
+        outbound_domain_allowlist: list[str] | None = None,
+    ) -> None:
+        self.policy_attempts += 1
+        if self.policy_attempts == 1:
+            raise ModalConnectionError("outbound policy update disconnected")
+        await super()._set_outbound_network_policy(
+            outbound_cidr_allowlist=outbound_cidr_allowlist,
+            outbound_domain_allowlist=outbound_domain_allowlist,
+        )
+
+
+async def test_egress_rule_updates_retry_connection_errors(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A transport failure while setting the outbound policy is retried by the provider."""
+
+    async def _noop(_seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr(cast(Any, modal_module.ModalSandbox._set_outbound_network_policy).retry, "sleep", _noop)
+    inner = ConnectionLostThenApplyPolicySandbox()
+    sandbox = _sandbox(inner)
+
+    await sandbox.block_all_egress()
+
+    assert inner.policy_attempts == 2
+    assert inner.outbound_policies == [{"outbound_cidr_allowlist": [], "outbound_domain_allowlist": []}]
+
+
 async def test_egress_rule_updates_replace_outbound_policy() -> None:
     """Verify Modal egress updates call the SDK outbound policy API.
 
@@ -630,6 +653,7 @@ async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> N
     assert captured["block_network"] is False
     assert captured["outbound_cidr_allowlist"] == ["0.0.0.0/0"]
     assert captured["outbound_domain_allowlist"] == ["*"]
+    assert captured["runtime"] == "gvisor"
     assert captured["experimental_options"] == {"enable_docker": True}
     assert captured["gpu"] is None
 
@@ -646,7 +670,8 @@ async def test_create_sandbox_uses_vm_runtime(monkeypatch: pytest.MonkeyPatch) -
 
     await provider.create_sandbox(_request())
 
-    assert captured["experimental_options"] == {"vm_runtime": True}
+    assert captured["runtime"] == "vm"
+    assert captured["experimental_options"] is None
 
 
 async def test_create_sandbox_maps_gpu_request(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -694,24 +719,15 @@ async def test_create_sandbox_blocks_network_without_conflicting_allowlists(
 
 
 async def test_create_sandbox_uses_modal_safe_name(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verify Modal receives a safe name while callers keep the requested sandbox name.
-
-    Test cases:
-    - Unsafe and long task names are normalized before Modal lookup and creation.
-    - The returned sandbox name remains the original benchmark task name.
-    """
+    """Keep the requested name while Modal receives a safe allocation name."""
     inner = FakeInnerSandbox()
-    captured: dict[str, Any] = {"lookups": []}
+    captured: dict[str, Any] = {}
 
     async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
         captured.update(kwargs)
         return inner
 
-    async def from_name(app_name: str, name: str, **kwargs: Any) -> FakeInnerSandbox:
-        captured["lookups"].append(name)
-        raise ModalNotFoundError("no sandbox with that name")
-
-    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create), from_name=_aio(from_name)))
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
     request = SandboxCreateRequest(
         source=ImageSource(image="python:3.12"),
         resources=Resources(vcpu=4, memory=8, disk=30),
@@ -726,42 +742,24 @@ async def test_create_sandbox_uses_modal_safe_name(monkeypatch: pytest.MonkeyPat
 
     assert sandbox.name == request.name
     assert sandbox.labels == request.labels
-    assert captured["lookups"] == [captured["name"]]
     assert "/" not in captured["name"]
     assert ":" not in captured["name"]
     assert len(captured["name"]) <= 64
 
 
-def test_modal_sandbox_name_avoids_app_id_shape() -> None:
-    """Verify names shaped like Modal app IDs are not passed through unchanged.
-
-    Test cases:
-    - A task name matching Modal's app-id shape is prefixed before SDK use.
-    """
-    modal_app_id_name = "ap-" + ("a" * 22)
-
-    assert modal_module._modal_sandbox_name(modal_app_id_name) == f"sandbox-{modal_app_id_name}"
-
-
-async def test_create_sandbox_retries_modal_connection_errors(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(cast(Any, modal_module.ModalSandboxProvider.create_sandbox).retry, "sleep", _noop)
-    inner = FakeInnerSandbox()
+async def test_create_sandbox_does_not_retry_ambiguous_connection_errors(monkeypatch: pytest.MonkeyPatch) -> None:
     attempts = 0
 
     async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
         nonlocal attempts
         attempts += 1
-        if attempts == 1:
-            raise ModalConnectionError("modal create temporarily unavailable")
-        return inner
+        raise ModalConnectionError("modal create outcome unknown")
 
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
 
-    sandbox = await provider.create_sandbox(_request())
-
-    assert sandbox.id == "sb-123"
-    assert sandbox.labels == _request().labels
-    assert attempts == 2
+    with pytest.raises(SandboxConnectionError, match="outcome unknown"):
+        await provider.create_sandbox(_request())
+    assert attempts == 1
 
 
 async def test_create_sandbox_restores_snapshot_source(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -906,213 +904,21 @@ async def test_list_sandboxes_rejects_creation_time_filter(monkeypatch: pytest.M
         _ = [sandbox async for sandbox in provider.list_sandboxes(query)]
 
 
-async def test_create_sandbox_reuses_running_sandbox_with_same_name(monkeypatch: pytest.MonkeyPatch) -> None:
-    running = FakeInnerSandbox(object_id="sb-existing")  # poll_result=None: still running
-    created: list[str] = []
-
-    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
-        created.append(kwargs["name"])
-        return FakeInnerSandbox(object_id="sb-new")
-
-    async def from_name(app_name: str, name: str, **kwargs: Any) -> FakeInnerSandbox:
-        assert (app_name, name) == (modal_module._APP_NAME, "task-1")
-        return running
-
-    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create), from_name=_aio(from_name)))
-
-    sandbox = await provider.create_sandbox(_request())
-
-    assert sandbox.id == "sb-existing"
-    assert sandbox.name == "task-1"
-    assert sandbox.labels == _request().labels
-    assert created == []
-
-
-async def test_create_rate_limiter_spaces_bursts_evenly() -> None:
-    limiter = modal_module._CreateRateLimiter(per_second=50)
-
-    started = time.monotonic()
-    await asyncio.gather(*(limiter.acquire() for _ in range(6)))
-    elapsed = time.monotonic() - started
-
-    # Six creates at 50/s: the last slot is 5 intervals (100ms) after the first.
-    assert 0.09 <= elapsed < 1.0
-
-
-async def test_create_rate_limiter_does_not_bank_idle_time() -> None:
-    limiter = modal_module._CreateRateLimiter(per_second=20)
-
-    await limiter.acquire()
-    await asyncio.sleep(0.2)  # idle for four intervals
-    started = time.monotonic()
-    await asyncio.gather(limiter.acquire(), limiter.acquire())
-    elapsed = time.monotonic() - started
-
-    # First call is immediate; the second still waits one interval (no burst credit).
-    assert 0.04 <= elapsed < 0.5
-
-
-async def test_create_rate_limiter_cancelled_waiters_leave_no_hole() -> None:
-    limiter = modal_module._CreateRateLimiter(per_second=2)
-
-    await limiter.acquire()  # sets the next slot 0.5s out
-    waiters = [asyncio.create_task(limiter.acquire()) for _ in range(5)]
-    await asyncio.sleep(0)  # let them queue up behind the lock
-    for waiter in waiters:
-        waiter.cancel()
-    await asyncio.gather(*waiters, return_exceptions=True)
-
-    started = time.monotonic()
-    await limiter.acquire()
-    elapsed = time.monotonic() - started
-
-    # Only the first release counts: one interval to wait, not six.
-    assert elapsed < 0.6
-
-
-def test_create_rate_limiter_reads_env_once(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(modal_module._CREATES_PER_SECOND_ENV, "4")
-    first = modal_module._create_rate_limiter()
-    monkeypatch.setenv(modal_module._CREATES_PER_SECOND_ENV, "1")
-
-    assert modal_module._create_rate_limiter() is first
-    assert first._interval == 0.25
-
-
-def test_create_rate_limiter_defaults_when_env_unset(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(modal_module._CREATES_PER_SECOND_ENV)
-
-    limiter = modal_module._create_rate_limiter()
-
-    assert limiter._interval == 1 / modal_module._DEFAULT_CREATES_PER_SECOND
-
-
-@pytest.mark.parametrize("value", ["0", "-1"])
-def test_create_rate_limiter_rejects_non_positive_rate(monkeypatch: pytest.MonkeyPatch, value: str) -> None:
-    monkeypatch.setenv(modal_module._CREATES_PER_SECOND_ENV, value)
-
-    with pytest.raises(ValueError, match=modal_module._CREATES_PER_SECOND_ENV):
-        modal_module._create_rate_limiter()
-
-
-async def test_create_sandbox_takes_a_rate_limit_slot_only_for_real_creates(monkeypatch: pytest.MonkeyPatch) -> None:
-    acquired = 0
-
-    async def acquire(self: Any) -> None:
-        nonlocal acquired
-        acquired += 1
-
-    monkeypatch.setattr(modal_module._CreateRateLimiter, "acquire", acquire)
-    running = FakeInnerSandbox(object_id="sb-existing")
-    names = iter(["task-1"])
-
-    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
-        return FakeInnerSandbox(object_id="sb-new")
-
-    async def from_name(app_name: str, name: str, **kwargs: Any) -> FakeInnerSandbox:
-        if next(names, None) is None:
-            raise ModalNotFoundError("no sandbox with that name")
-        return running
-
-    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create), from_name=_aio(from_name)))
-
-    reused = await provider.create_sandbox(_request())
-    created = await provider.create_sandbox(_request())
-
-    assert (reused.id, created.id) == ("sb-existing", "sb-new")
-    assert acquired == 1
-
-
-async def test_create_sandbox_retries_rate_limited_creates_with_backoff(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(modal_module, "_RATE_LIMIT_RETRY_BASE_SECONDS", 0.01)
-    monkeypatch.setattr(modal_module, "_RATE_LIMIT_RETRY_MAX_SECONDS", 0.02)
-    acquired = 0
-
-    async def acquire(self: Any) -> None:
-        nonlocal acquired
-        acquired += 1
-
-    monkeypatch.setattr(modal_module._CreateRateLimiter, "acquire", acquire)
+async def test_create_sandbox_reports_resource_exhaustion_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
     attempts = 0
+    exhausted = ModalResourceExhaustedError("Insufficient capacity to create sandbox.")
 
     async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
         nonlocal attempts
         attempts += 1
-        if attempts < 3:
-            raise ModalResourceExhaustedError("Sandbox creation rate limit (5/s) exceeded.")
-        return FakeInnerSandbox(object_id="sb-new")
+        raise exhausted
 
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
 
-    sandbox = await provider.create_sandbox(_request())
-
-    assert sandbox.id == "sb-new"
-    # Every attempt is a real create RPC, so each one takes a pacer slot.
-    assert (attempts, acquired) == (3, 3)
-
-
-async def test_create_sandbox_gives_up_on_rate_limit_at_create_timeout(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(modal_module, "_RATE_LIMIT_RETRY_BASE_SECONDS", 0.6)
-    attempts = 0
-
-    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
-        nonlocal attempts
-        attempts += 1
-        raise ModalResourceExhaustedError("Sandbox creation rate limit (5/s) exceeded.")
-
-    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
-    request = _request().model_copy(update={"create_timeout": 1})
-
-    started = time.monotonic()
-    with pytest.raises(SandboxError, match="rate limit still exceeded after 1s"):
-        await provider.create_sandbox(request)
-
-    # Attempt at t=0, sleep 0.6, attempt at t=0.6, then 0.6 + 1.2 >= 1 so no third attempt.
-    assert attempts == 2
-    assert time.monotonic() - started < 1.5
-
-
-async def test_create_sandbox_timeout_covers_pacer_wait(monkeypatch: pytest.MonkeyPatch) -> None:
-    async def acquire(self: Any) -> None:
-        await asyncio.sleep(5)
-
-    monkeypatch.setattr(modal_module._CreateRateLimiter, "acquire", acquire)
-    attempts = 0
-
-    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
-        nonlocal attempts
-        attempts += 1
-        return FakeInnerSandbox()
-
-    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
-    request = _request().model_copy(update={"create_timeout": 1})
-
-    started = time.monotonic()
-    with pytest.raises(SandboxError, match="Failed to create Modal sandbox within 1s"):
-        await provider.create_sandbox(request)
-
-    assert attempts == 0
-    assert time.monotonic() - started < 2
-
-
-async def test_create_sandbox_ignores_finished_sandbox_with_same_name(monkeypatch: pytest.MonkeyPatch) -> None:
-    finished = FakeInnerSandbox(object_id="sb-finished", poll_result=0)  # exited
-
-    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
-        return FakeInnerSandbox(object_id="sb-new")
-
-    async def from_name(app_name: str, name: str, **kwargs: Any) -> FakeInnerSandbox:
-        return finished
-
-    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create), from_name=_aio(from_name)))
-
-    sandbox = await provider.create_sandbox(_request())
-
-    assert sandbox.id == "sb-new"
+    with pytest.raises(SandboxError, match="resources exhausted: Insufficient capacity") as error:
+        await provider.create_sandbox(_request().model_copy(update={"create_timeout": 1}))
+    assert error.value.__cause__ is exhausted
+    assert attempts == 1
 
 
 async def test_create_sandbox_without_volumes_passes_none(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1145,9 +951,7 @@ async def test_create_sandbox_mounts_named_volumes(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(modal_module, "Volume", SimpleNamespace(from_name=from_name))
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
 
-    await provider.create_sandbox(
-        _request(volumes=[VolumeMount(name="kspbench-steam", mount_path="/vol")])
-    )
+    await provider.create_sandbox(_request(volumes=[VolumeMount(name="kspbench-steam", mount_path="/vol")]))
 
     assert captured["volumes"] == {"/vol": "vol::kspbench-steam"}
     assert looked_up == [("kspbench-steam", False)]

@@ -33,9 +33,11 @@ from benchmark_service.schemas import (
     FinalScoreResponse,
     HealthCheckResponse,
     JsonValue,
+    ListDatasetsResponse,
     RetrieveTaskResponse,
     ResolveDatasetRequest,
     ResolveDatasetResponse,
+    SandboxCreatedData,
     SetupTaskRequest,
     SetupTaskResponse,
     StreamChunk,
@@ -191,6 +193,16 @@ def _unauthenticated_error(response: httpx.Response) -> "BenchmarkServiceUnauthe
         detail = response.text
 
     return BenchmarkServiceUnauthenticatedError(detail, status_code=response.status_code)
+
+
+def _require_ok(response: httpx.Response, operation: str) -> None:
+    if response.status_code == 401:
+        raise _unauthenticated_error(response)
+    if response.status_code != 200:
+        raise BenchmarkServiceError(
+            f"{operation} failed with status code {response.status_code}, response: {response.text}",
+            status_code=response.status_code,
+        )
 
 
 @dataclass(frozen=True)
@@ -350,7 +362,9 @@ class BenchmarkServiceClient:
     async def _check_dataset_version(self, response: httpx.Response) -> None:
         if self._dataset_version is None or not response.is_success:
             return
-        if response.request.url.path in {httpx.URL(f"{self._url}/{path}").path for path in ("health", "version")}:
+        if response.request.url.path in {
+            httpx.URL(f"{self._url}/{path}").path for path in ("health", "version", "v1/datasets")
+        }:
             return
         if response.headers.get_list(DATASET_VERSION_HEADER) != [self._dataset_version]:
             raise BenchmarkServiceError("The service did not acknowledge the requested dataset version")
@@ -383,6 +397,7 @@ class BenchmarkServiceClient:
         request: BaseModel,
         on_message: Callable[[str], None] | None = None,
         on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
+        on_sandbox_created: Callable[[SandboxCreatedData], None] | None = None,
     ) -> JsonValue:
         """Send a request over WebSocket and stream the response.
 
@@ -390,6 +405,7 @@ class BenchmarkServiceClient:
             path: WebSocket endpoint path (appended to /ws/).
             request: Pydantic model to serialize and send as the initial message.
             on_message: Optional callback invoked for each intermediate "message" chunk.
+            on_sandbox_created: Optional callback invoked for each "sandbox_created" chunk.
 
         Returns:
             The data payload from the final "result" chunk.
@@ -454,6 +470,9 @@ class BenchmarkServiceClient:
                             case "eval_resume_state":
                                 if on_eval_resume_state:
                                     on_eval_resume_state(chunk.data)
+                            case "sandbox_created":
+                                if on_sandbox_created:
+                                    on_sandbox_created(chunk.data)
                 except ConnectionClosed as exc:
                     close_frame = exc.rcvd or exc.sent
                     raise BenchmarkServiceStreamClosedError(
@@ -482,14 +501,7 @@ class BenchmarkServiceClient:
         """Check if the benchmark service is healthy."""
         response = await self._http_client.get(f"{self._url}/health")
 
-        if response.status_code == 401:
-            raise _unauthenticated_error(response)
-
-        if response.status_code != 200:
-            raise BenchmarkServiceError(
-                f"Health check failed with status code {response.status_code}, response: {response.text}",
-                status_code=response.status_code,
-            )
+        _require_ok(response, "Health check")
 
         return HealthCheckResponse.model_validate(response.json())
 
@@ -502,16 +514,22 @@ class BenchmarkServiceClient:
             else await self._http_client.get(f"{self._url}/version")
         )
 
-        if response.status_code == 401:
-            raise _unauthenticated_error(response)
-
-        if response.status_code != 200:
-            raise BenchmarkServiceError(
-                f"Version check failed with status code {response.status_code}, response: {response.text}",
-                status_code=response.status_code,
-            )
+        _require_ok(response, "Version check")
 
         return VersionResponse.model_validate(response.json())
+
+    @_retry_http
+    async def list_datasets(self) -> ListDatasetsResponse:
+        """List dataset names visible to this caller, independently of a version pin."""
+        response = await self._http_client.get(f"{self._url}/v1/datasets")
+        if response.status_code == 401:
+            raise _unauthenticated_error(response)
+        if response.status_code != 200:
+            raise BenchmarkServiceError(
+                f"Dataset listing failed with status code {response.status_code}, response: {response.text}",
+                status_code=response.status_code,
+            )
+        return ListDatasetsResponse.model_validate(response.json())
 
     @_retry_http
     async def resolve_dataset(self, dataset: str, version: str | None = None) -> ResolveDatasetResponse:
@@ -520,13 +538,7 @@ class BenchmarkServiceClient:
             raise ValueError("Resolve a dataset with an unpinned client")
         body = ResolveDatasetRequest(dataset=dataset, version=version)
         response = await self._http_client.post(f"{self._url}/resolve-dataset", json=body.model_dump())
-        if response.status_code == 401:
-            raise _unauthenticated_error(response)
-        if response.status_code != 200:
-            raise BenchmarkServiceError(
-                f"Dataset resolution failed with status code {response.status_code}, response: {response.text}",
-                status_code=response.status_code,
-            )
+        _require_ok(response, "Dataset resolution")
         resolved = ResolveDatasetResponse.model_validate(response.json())
         if resolved.dataset != dataset:
             raise BenchmarkServiceError("The service resolved a different dataset")
@@ -552,14 +564,7 @@ class BenchmarkServiceClient:
 
         response = await self._http_client.get(f"{self._url}/verify-task-ids", params=params)
 
-        if response.status_code == 401:
-            raise _unauthenticated_error(response)
-
-        if response.status_code != 200:
-            raise BenchmarkServiceError(
-                f"Verify task ids failed with status code {response.status_code}, response: {response.text}",
-                status_code=response.status_code,
-            )
+        _require_ok(response, "Verify task ids")
 
         return VerifyTaskIdsResponse.model_validate(response.json())
 
@@ -578,14 +583,7 @@ class BenchmarkServiceClient:
             params["dataset"] = dataset
         response = await self._http_client.get(f"{self._url}/retrieve-task/", params=params)
 
-        if response.status_code == 401:
-            raise _unauthenticated_error(response)
-
-        if response.status_code != 200:
-            raise BenchmarkServiceError(
-                f"Retrieve task failed with status code {response.status_code}, response: {response.text}",
-                status_code=response.status_code,
-            )
+        _require_ok(response, "Retrieve task")
 
         return RetrieveTaskResponse.model_validate(response.json())
 
@@ -600,6 +598,8 @@ class BenchmarkServiceClient:
         default_max_attempts: int = 1,
         retry_delay_s: float = 2.0,
         on_retry: Callable[[SandboxRecoveryAttempt, Exception], Awaitable[None] | None] | None = None,
+        attempt_id: str | None = None,
+        email: str | None = None,
     ) -> _RecoveryResult:
         """Run a task attempt with benchmark-declared sandbox-loss recovery.
 
@@ -628,7 +628,7 @@ class BenchmarkServiceClient:
         if any(issubclass(error_type, SandboxNotFoundError) for error_type in retryable_attempt_errors):
             raise ValueError("SandboxNotFoundError is controlled only by SandboxRecoveryPolicy")
 
-        with correlation_scope(run_id=run_id, task_id=task_id):
+        with correlation_scope(run_id=run_id, task_id=task_id, attempt_id=attempt_id, email=email):
             state = _SandboxRecoveryState(
                 run_id=run_id,
                 task_id=task_id,
@@ -723,14 +723,7 @@ class BenchmarkServiceClient:
             timeout=self._timeout,
         )
 
-        if resp.status_code == 401:
-            raise _unauthenticated_error(resp)
-
-        if resp.status_code != 200:
-            raise BenchmarkServiceError(
-                f"Evaluate response failed with status code {resp.status_code}, response: {resp.text}",
-                status_code=resp.status_code,
-            )
+        _require_ok(resp, "Evaluate response")
 
         return resp.json()
 
@@ -742,19 +735,26 @@ class BenchmarkServiceClient:
         dataset: str | None = None,
         on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
         sandbox_provider: SandboxProviderConfig | None = None,
+        instance_id: str | None = None,
+        on_sandbox_created: Callable[[SandboxCreatedData], None] | None = None,
     ) -> JsonValue:
         """Resume evaluation from state previously streamed by the benchmark service.
 
-        ``sandbox_provider`` is sent only with this request; benchmark-owned
-        ``eval_resume_state`` remains independently persistable.
+        ``sandbox_provider`` and ``instance_id`` are request-only. The caller
+        owns admission and cleanup of a supplied sandbox; ``eval_resume_state``
+        remains independently persistable.
         """
         request = EvaluateResponseRequest(
             task_id=task_id,
             eval_resume_state=eval_resume_state,
             sandbox_provider=sandbox_provider,
+            instance_id=instance_id,
             dataset=dataset,
+            announce_sandboxes=on_sandbox_created is not None,
         )
-        return await self._websocket_request("evaluate-response", request, on_message, on_eval_resume_state)
+        return await self._websocket_request(
+            "evaluate-response", request, on_message, on_eval_resume_state, on_sandbox_created
+        )
 
     async def evaluate_instance(
         self,
@@ -764,6 +764,7 @@ class BenchmarkServiceClient:
         on_message: Callable[[str], None] | None = None,
         dataset: str | None = None,
         on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
+        on_sandbox_created: Callable[[SandboxCreatedData], None] | None = None,
     ) -> JsonValue:
         """Evaluate a task instance via WebSocket.
 
@@ -778,8 +779,11 @@ class BenchmarkServiceClient:
             instance_id=instance_id,
             sandbox_provider=sandbox_provider,
             dataset=dataset,
+            announce_sandboxes=on_sandbox_created is not None,
         )
-        return await self._websocket_request("evaluate-instance", request, on_message, on_eval_resume_state)
+        return await self._websocket_request(
+            "evaluate-instance", request, on_message, on_eval_resume_state, on_sandbox_created
+        )
 
     @_retry_http
     async def final_score(self, evaluation_results: dict[str, Any], dataset: str | None = None) -> FinalScoreResponse:
@@ -797,14 +801,7 @@ class BenchmarkServiceClient:
             json=body,
         )
 
-        if response.status_code == 401:
-            raise _unauthenticated_error(response)
-
-        if response.status_code != 200:
-            raise BenchmarkServiceError(
-                f"Final score failed with status code {response.status_code}, response: {response.text}",
-                status_code=response.status_code,
-            )
+        _require_ok(response, "Final score")
 
         return FinalScoreResponse.model_validate(response.json())
 
@@ -819,14 +816,7 @@ class BenchmarkServiceClient:
         """
         response = await self._http_client.get(f"{self._url}/v1/datasets/{dataset}/tasks")
 
-        if response.status_code == 401:
-            raise _unauthenticated_error(response)
-
-        if response.status_code != 200:
-            raise BenchmarkServiceError(
-                f"List tasks failed with status code {response.status_code}, response: {response.text}",
-                status_code=response.status_code,
-            )
+        _require_ok(response, "List tasks")
 
         return V1DatasetTasksResponse.model_validate(response.json())
 
@@ -850,14 +840,7 @@ class BenchmarkServiceClient:
                 json=request.model_dump(mode="json", exclude_none=True),
             )
 
-        if response.status_code == 401:
-            raise _unauthenticated_error(response)
-
-        if response.status_code != 200:
-            raise BenchmarkServiceError(
-                f"v1 upload URL request failed with status code {response.status_code}, response: {response.text}",
-                status_code=response.status_code,
-            )
+        _require_ok(response, "v1 upload URL request")
 
         return V1UploadUrlResponse.model_validate(response.json())
 
@@ -870,34 +853,30 @@ class BenchmarkServiceClient:
         payload_type: V1PayloadType,
         dataset: str | None = None,
         versions: V1Versions | None = None,
+        attempt_id: str | None = None,
     ) -> V1EvalResponse:
         """Evaluate via the /v1/evaluate surface with caller-supplied authentication.
 
         payload_data is either inline text or an uploaded artifact key, as
         selected by payload_type. Transport failures are not retried because
-        grading may already have started.
+        grading may already have started. ``attempt_id`` names the caller's
+        execution of the task, so the service attributes grading to it.
         """
         request = V1EvalRequest(
             run_id=run_id,
             task_id=task_id,
+            attempt_id=attempt_id,
             dataset=dataset,
             payload=V1Payload(type=payload_type, schema=payload_schema, data=payload_data),
             versions=versions or V1Versions(),
         )
-        with correlation_scope(run_id=run_id, task_id=task_id):
+        with correlation_scope(run_id=run_id, task_id=task_id, attempt_id=attempt_id):
             response = await self._http_client.post(
                 f"{self._url}/v1/evaluate",
                 json=request.model_dump(mode="json", by_alias=True, exclude_none=True),
             )
 
-        if response.status_code == 401:
-            raise _unauthenticated_error(response)
-
-        if response.status_code != 200:
-            raise BenchmarkServiceError(
-                f"v1 evaluate failed with status code {response.status_code}, response: {response.text}",
-                status_code=response.status_code,
-            )
+        _require_ok(response, "v1 evaluate")
 
         return V1EvalResponse.model_validate(response.json())
 
@@ -915,13 +894,6 @@ class BenchmarkServiceClient:
                 json=request.model_dump(mode="json", exclude_none=True),
             )
 
-        if response.status_code == 401:
-            raise _unauthenticated_error(response)
-
-        if response.status_code != 200:
-            raise BenchmarkServiceError(
-                f"v1 score failed with status code {response.status_code}, response: {response.text}",
-                status_code=response.status_code,
-            )
+        _require_ok(response, "v1 score")
 
         return V1ScoreResponse.model_validate(response.json())

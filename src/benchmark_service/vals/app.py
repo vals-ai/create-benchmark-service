@@ -16,6 +16,8 @@ from benchmark_service import submission_artifacts
 from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_required
 from benchmark_service.grading import SUBMISSION_ARTIFACT_SANDBOX_PATH, collapse_stream, evaluate_submission
+from benchmark_service.grading_credentials import grading_credentials
+from benchmark_service.observability import EMAIL_HEADER
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.sandbox import (
     DaytonaProviderConfig,
@@ -78,7 +80,7 @@ _TRIAL_ALLOWED_PATH = re.compile(r"/v1/(?:evaluate|score|datasets/[^/]+/tasks)")
 
 
 def _trial_tenant_may_access_path(path: str) -> bool:
-    return path == "/resolve-dataset" or _TRIAL_ALLOWED_PATH.fullmatch(path) is not None
+    return path in {"/resolve-dataset", "/v1/datasets"} or _TRIAL_ALLOWED_PATH.fullmatch(path) is not None
 
 
 GRADING_SANDBOX_PROVIDER_ENV = "GRADING_SANDBOX_PROVIDER"
@@ -359,7 +361,13 @@ class ValsBenchmarkServiceApp(BenchmarkServiceApp):
     async def _v1_evaluate(self, request: Request, body: V1EvalRequest) -> V1EvalResponse:
         _require_descope_tenant(request.state.tenant)
         async with self._dataset_scope(request, request.state.tenant, body.dataset):
-            return await self._v1_evaluate_in_scope(request, body)
+            async with grading_credentials(
+                run_id=body.run_id,
+                task_id=body.task_id,
+                attempt_id=body.attempt_id,
+                email=request.headers.get(EMAIL_HEADER),
+            ):
+                return await self._v1_evaluate_in_scope(request, body)
 
     async def _v1_evaluate_in_scope(self, request: Request, body: V1EvalRequest) -> V1EvalResponse:
         if self._sentry is not None:

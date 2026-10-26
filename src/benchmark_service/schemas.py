@@ -49,6 +49,12 @@ class ResolveDatasetResponse(BaseModel):
     version: DatasetVersion
 
 
+class ListDatasetsResponse(BaseModel):
+    """Dataset names visible to the caller, without task content."""
+
+    datasets: list[str]
+
+
 class StreamDatasetVersionChunk(BaseModel):
     """Framework acknowledgement sent before a pinned operation starts."""
 
@@ -105,7 +111,7 @@ def legacy_docker_image(source: SandboxSource) -> str:
 
 
 class EvalSandboxSpec(BaseModel):
-    """Benchmark-declared grading-sandbox overrides for eval_mode == SANDBOX.
+    """Benchmark-declared grading-sandbox overrides for eval_mode == SANDBOX and for ``grade_in_sandbox``.
 
     Unset fields fall back to the task's generation values; network access is
     blocked unless the benchmark explicitly opens it.
@@ -121,7 +127,11 @@ class EvalSandboxSpec(BaseModel):
         default=None,
         description="Grading sandbox resources; snapshot-backed sandboxes do not support overrides",
     )
-    timeout_s: float | None = Field(default=None, gt=0, description="Wall-clock bound for the grading step in seconds")
+    timeout_s: float | None = Field(
+        default=None,
+        gt=0,
+        description="Wall-clock bound for /v1 grading in seconds; for grade_in_sandbox it sizes only the auto-stop",
+    )
     network_block_all: bool = Field(default=True, description="Block all network egress from the grading sandbox")
 
 
@@ -196,6 +206,20 @@ class BenchmarkEgressPlan(BaseModel):
     evaluation: EgressPolicy = "*"
 
 
+class CreditedGeneration(BaseModel):
+    """Tracker-owned generation allowance and optional stage reporting protocol."""
+
+    allowance_seconds: float = Field(gt=0, allow_inf_nan=False)
+    stage_protocol: Literal["valkyrie-stage/1"] | None
+
+
+class Episode(BaseModel):
+    """Benchmark-owned orchestration command and concurrent agent-slot limit."""
+
+    command: str
+    parallel_agents: int = Field(ge=1)
+
+
 class RetrieveTaskResponse(BaseModel):
     """
     Response containing task metadata and setup requirements.
@@ -211,6 +235,8 @@ class RetrieveTaskResponse(BaseModel):
     agent_timeout: float | None = Field(
         default=None, description="Agent execution max time in seconds (None for no timeout)"
     )
+    credited_generation: CreditedGeneration | None = None
+    episode: Episode | None = None
     resources: Resources = Field(description="Computational resources needed")
     agent_install_order: AgentInstallOrder = Field(
         default="before_setup",
@@ -238,8 +264,25 @@ class RetrieveTaskResponse(BaseModel):
         ),
     )
     eval_sandbox: EvalSandboxSpec | None = Field(
-        default=None, description="Grading-sandbox overrides for eval_mode == SANDBOX; None uses generation values"
+        default=None,
+        description="Grading-sandbox overrides for /v1 SANDBOX grading and grade_in_sandbox; None uses generation values",
     )
+    resume_sandbox: EvalSandboxSpec | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description=(
+            "Opt in to a caller-owned sandbox for durable evaluation resume; "
+            "the caller admits, provisions, and cleans up the sandbox"
+        ),
+    )
+
+    @model_validator(mode="after")
+    def require_episode_stage_protocol(self) -> "RetrieveTaskResponse":
+        if self.episode is not None and (
+            self.credited_generation is None or self.credited_generation.stage_protocol != "valkyrie-stage/1"
+        ):
+            raise ValueError("episode requires credited_generation with stage_protocol='valkyrie-stage/1'")
+        return self
 
     @computed_field(description="Legacy sandbox image field for older Valkyrie clients")
     @property
@@ -278,7 +321,7 @@ class SetupTaskResponse(BaseModel):
 
 class EvaluateResponseRequest(BaseModel):
     """
-    Request to evaluate without a live sandbox.
+    Evaluate a response or resume state, optionally in a caller-owned sandbox.
 
     Use this for benchmarks where evaluation can run from a text response or
     benchmark-owned durable resume state.
@@ -291,14 +334,29 @@ class EvaluateResponseRequest(BaseModel):
     )
     sandbox_provider: SandboxProviderConfig | None = Field(
         default=None,
-        description="Request-scoped sandbox provider config for evaluation work that creates a sandbox",
+        description="Request-scoped provider config for evaluation work that uses a sandbox",
+    )
+    instance_id: str | None = Field(
+        default=None,
+        min_length=1,
+        exclude_if=lambda value: value is None,
+        description="Caller-owned sandbox for eval_resume_state; the service must not delete it",
     )
     dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
+    announce_sandboxes: bool = Field(
+        default=False,
+        exclude_if=lambda value: not value,
+        description="Stream a sandbox_created chunk for each sandbox the service creates; older clients omit it",
+    )
 
     @model_validator(mode="after")
     def require_one_eval_input(self) -> "EvaluateResponseRequest":
         if (self.response is None) == (self.eval_resume_state is None):
             raise ValueError("Exactly one of response or eval_resume_state is required")
+
+        if self.instance_id is not None and self.eval_resume_state is None:
+            raise ValueError("A caller-owned sandbox requires eval_resume_state")
+
         return self
 
 
@@ -309,6 +367,11 @@ class EvaluateInstanceRequest(BaseModel):
     instance_id: str = Field(description="Sandbox instance where the solution was implemented")
     sandbox_provider: SandboxProviderConfig | None = Field(default=None, description="Sandbox provider config")
     dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
+    announce_sandboxes: bool = Field(
+        default=False,
+        exclude_if=lambda value: not value,
+        description="Stream a sandbox_created chunk for each sandbox the service creates; older clients omit it",
+    )
 
 
 class FinalScoreRequest(BaseModel):
@@ -410,5 +473,21 @@ class StreamEvalResumeStateChunk(BaseModel):
     data: dict[str, Any] = Field(description="Benchmark-specific evaluation progress state")
 
 
+class SandboxCreatedData(BaseModel):
+    """Identity of a sandbox a provider created while serving the request."""
+
+    provider: Literal["daytona"]
+    sandbox_id: str
+
+
+class StreamSandboxCreatedChunk(BaseModel):
+    """Streaming chunk announcing a sandbox the service created for this request."""
+
+    type: Literal["sandbox_created"]
+    data: SandboxCreatedData
+
+
 # Union type for all streaming chunks
-StreamChunk = StreamMessageChunk | StreamResultChunk | StreamErrorChunk | StreamEvalResumeStateChunk
+StreamChunk = (
+    StreamMessageChunk | StreamResultChunk | StreamErrorChunk | StreamEvalResumeStateChunk | StreamSandboxCreatedChunk
+)

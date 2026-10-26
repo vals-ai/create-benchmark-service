@@ -38,6 +38,8 @@ from benchmark_service import app as app_module, observability
 from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.client import BenchmarkServiceClient, SandboxRecoveryAttempt
 from benchmark_service.observability import (
+    ATTEMPT_ID_HEADER,
+    EMAIL_HEADER,
     RUN_ID_HEADER,
     TASK_ID_HEADER,
     correlation_scope,
@@ -646,3 +648,17 @@ async def test_websocket_handshake_uses_its_client_span_and_dynamic_identity(
         f"{caller_context.trace_id:032x}",
         f"{client_span.context.span_id:016x}",
     ]
+
+
+def test_nested_run_scope_does_not_inherit_the_outer_attempt() -> None:
+    with correlation_scope(run_id="outer-run", task_id="outer-task", attempt_id="outer-attempt"):
+        with correlation_scope(run_id="inner-run", task_id="inner-task"):
+            assert ATTEMPT_ID_HEADER not in request_headers({})
+        assert request_headers({})[ATTEMPT_ID_HEADER] == "outer-attempt"
+
+
+def test_nested_run_scope_does_not_inherit_the_outer_email() -> None:
+    with correlation_scope(run_id="outer-run", email="outer@example.com"):
+        with correlation_scope(run_id="inner-run"):
+            assert EMAIL_HEADER not in request_headers({})
+        assert request_headers({})[EMAIL_HEADER] == "outer@example.com"

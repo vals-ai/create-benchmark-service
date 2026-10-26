@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.14'",
@@ -302,11 +302,11 @@ wheels = [
 
 [[package]]
 name = "certifi"
-version = "2026.2.25"
+version = "2026.10.19"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/af/2d/7bf41579a8986e348fa033a31cdd0e4121114f6bce2457e8876010b092dd/certifi-2026.2.25.tar.gz", hash = "sha256:e887ab5cee78ea814d3472169153c2d12cd43b14bd03329a39a9c6e2e80bfba7", size = 155029, upload-time = "2026-02-25T02:54:17.342Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/a6/bd/1436c50cc46699de0230fbaacc1d1de7bfec413176099949e9d5112e88f2/certifi-2026.10.19.tar.gz", hash = "sha256:035c1e85572b141bf1c3a3eff0e33a8eb74917522f2559075ff8d2fea780a1ae", size = 137598, upload-time = "2026-10-20T02:24:16.604Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/9a/3c/c17fb3ca2d9c3acff52e30b309f538586f9f5b9c9cf454f3845fc9af4881/certifi-2026.2.25-py3-none-any.whl", hash = "sha256:027692e4402ad994f1c42e52a4997a9763c646b73e4096e4d5d6db8af1d6f0fa", size = 153684, upload-time = "2026-02-25T02:54:15.766Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/51/29046e48f693c54e5b7412216d447a1d8362c9653148d98c02cdf65fa733/certifi-2026.10.19-py3-none-any.whl", hash = "sha256:42d35340cc5b9ba78e818ddbff0c5b1c2b779de448a340fd1b989f5fa8670e1b", size = 136464, upload-time = "2026-10-20T02:24:15.072Z" },
 ]
 
 [[package]]
@@ -465,6 +465,7 @@ name = "create-benchmark-service"
 source = { editable = "." }
 dependencies = [
     { name = "aiodocker" },
+    { name = "certifi" },
     { name = "click" },
     { name = "daytona" },
     { name = "daytona-api-client-async" },
@@ -506,6 +507,7 @@ requires-dist = [
     { name = "aiodocker", specifier = ">=0.26,<1" },
     { name = "boto3", marker = "extra == 'vals-ai'", specifier = ">=1.34" },
     { name = "cachetools", marker = "extra == 'vals-ai'", specifier = ">=5.5.0" },
+    { name = "certifi", specifier = ">=2026.10.19" },
     { name = "click", specifier = ">=8.1.3" },
     { name = "daytona", specifier = ">=0.203.0,<2" },
     { name = "daytona-api-client-async", specifier = ">=0.203.0,<2" },
@@ -513,7 +515,7 @@ requires-dist = [
     { name = "fastapi", extras = ["standard-no-fastapi-cloud-cli"], specifier = ">=0.135.3" },
     { name = "httpx", specifier = ">=0.28.1" },
     { name = "jinja2", specifier = ">=3.1.6" },
-    { name = "modal", specifier = ">=1.5.2" },
+    { name = "modal", specifier = ">=1.6.0" },
     { name = "opentelemetry-api", specifier = ">=1.20.0" },
     { name = "pydantic", specifier = ">=2.12" },
     { name = "pyyaml", specifier = ">=6.0.2" },
@@ -1190,7 +1192,7 @@ wheels = [
 
 [[package]]
 name = "modal"
-version = "1.5.2"
+version = "1.6.0"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiohttp" },
@@ -1207,9 +1209,9 @@ dependencies = [
     { name = "typing-extensions" },
     { name = "watchfiles" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/b8/e6/44f609084472d16a3acf7748c184e23d3009944eed5860e855aaafc61065/modal-1.5.2.tar.gz", hash = "sha256:ac0d2983ecccacb80c54385906404d75f37a3751f1374c750974cd7853c0008a", size = 818040, upload-time = "2026-07-10T18:12:55.164Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/3a/e5/eb665f233679ed6cde1b24a7daa68b14eec02cb25046983426145fd3d32c/modal-1.6.0.tar.gz", hash = "sha256:c5dd551b5e0a283f3c764476c0a4ebe5bdef1e4a69432fa27e1b1ad8ca5e0817", size = 936653, upload-time = "2026-09-29T01:17:11.866Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e3/fe/7e284d889eb3ea2c307e48828eccdd9a984beb2e096bce5577ef796592e9/modal-1.5.2-py3-none-any.whl", hash = "sha256:7508a44f8742c6f26be4d28da71f46092ef3bcc07d0f27cbd0ea8c9d6d9fc873", size = 932258, upload-time = "2026-07-10T18:12:52.219Z" },
+    { url = "https://files.pythonhosted.org/packages/04/64/7ed6259ab64f18c65fa5136b89054a7ecdfb2fc3ac325e61883af1c16b8f/modal-1.6.0-py3-none-any.whl", hash = "sha256:2f5981ba656570ad96379d29f0ddff876880708c84966024ce130e9e1794fa68", size = 1057597, upload-time = "2026-09-29T01:17:09.043Z" },
 ]
 
 [[package]]

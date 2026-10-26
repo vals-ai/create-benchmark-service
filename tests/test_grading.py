@@ -30,6 +30,7 @@ from benchmark_service import (
 )
 from benchmark_service.vals import auth as auth_module
 from benchmark_service import grading, submission_artifacts
+from benchmark_service.context import current_tenant
 from benchmark_service.vals.app import (
     ValsBenchmarkServiceApp,
     _DuplicateGradingRequest,
@@ -43,6 +44,9 @@ from benchmark_service.grading import (
     collapse_stream,
     evaluate_submission,
 )
+from benchmark_service.base import BenchmarkService
+from benchmark_service.eval_resume import EvalResumeStore, GradingInput
+from benchmark_service.grading_credentials import grading_credentials
 from benchmark_service.sandbox import MissingSandboxConfigError, SandboxCreateRequest, SandboxProvider
 from benchmark_service.sandbox.types import ExecResult
 from benchmark_service.schemas import (
@@ -62,6 +66,7 @@ from benchmark_service.submission_artifacts import (
 )
 from benchmark_service.v1_schemas import V1EvalRequest, V1EvalStatus, V1Payload, V1PayloadType
 from tests.conftest import ValsStubBenchmark as StubBenchmark
+from tests.test_eval_resume import _FakeS3  # pyright: ignore[reportPrivateUsage]
 
 
 class FakeSandbox(Sandbox):
@@ -250,6 +255,19 @@ async def test_grade_instance_returns_evaluated_with_passthrough_result() -> Non
     assert resp.result == {"resolved": True, "weighted_pass_percentage": 100.0}
 
 
+class TenantStub(SandboxStub):
+    async def evaluate_instance(  # type: ignore[override]
+        self, task_id: str, sandbox: Sandbox, dataset: str | None = None
+    ) -> AsyncGenerator[StreamChunk, None]:
+        yield StreamResultChunk(type="result", data={"tenant": current_tenant()})
+
+
+async def test_grade_instance_binds_the_callers_tenant_for_the_benchmark() -> None:
+    service = await TenantStub.create()
+    resp = await _grade(service, FakeProvider(FakeSandbox()))
+    assert resp.result == {"tenant": "acme"}
+
+
 async def test_grade_instance_creates_isolated_sandbox_from_task_source_and_deletes_it() -> None:
     service = await SandboxStub.create()
     provider = FakeProvider(FakeSandbox())
@@ -269,6 +287,19 @@ async def test_grade_instance_creates_isolated_sandbox_from_task_source_and_dele
     assert create.labels["tenant"] == "acme"
     assert create.labels["run-id"] == "run-1"
     assert provider.deleted == ["fake-sandbox"]
+
+
+async def test_grade_instance_hands_the_evaluation_gateway_credentials_to_the_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MODEL_GATEWAY_URL", "https://gateway.test")
+    monkeypatch.setenv("MODEL_GATEWAY_API_KEY", "static-key")
+    monkeypatch.setenv("GRADING_MODELS", "anthropic/judge")
+    service = await SandboxStub.create()
+    provider = FakeProvider(FakeSandbox())
+    async with grading_credentials(run_id=None, task_id="task-1"):
+        await _grade(service, provider)
+    assert provider.created[0].env_vars == {"MODEL_GATEWAY_URL": "https://gateway.test", "MODEL_GATEWAY_API_KEY": "static-key"}
 
 
 class VolumeStub(SandboxStub):
@@ -1753,3 +1784,58 @@ def test_grading_max_concurrency_of_zero_fails_at_boot(monkeypatch: pytest.Monke
     monkeypatch.setenv("GRADING_MAX_CONCURRENCY", "0")
     with pytest.raises(ValueError, match="GRADING_MAX_CONCURRENCY"):
         ValsBenchmarkServiceApp(StubBenchmark)
+
+
+class LabelledSandbox(FakeSandbox):
+    def __init__(self, sandbox_id: str, labels: Mapping[str, str], files: dict[str, bytes]) -> None:
+        super().__init__()
+        self._id, self.labels, self.files = sandbox_id, dict(labels), files
+
+    @property
+    def id(self) -> str:
+        return self._id
+
+
+class LabelledProvider(FakeProvider):
+    def __init__(self) -> None:
+        super().__init__(FakeSandbox())
+        self.files: dict[str, bytes] = {}
+
+    async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
+        self.created.append(request)
+        return LabelledSandbox(f"sandbox-{len(self.created)}", request.labels, self.files)
+
+
+class HooksSpecStub(SpecStub):
+    """A SANDBOX-mode benchmark that grades through the eval-resume hooks and declares eval_sandbox."""
+
+    evaluate_instance = BenchmarkService.evaluate_instance
+    graded_in: list[str]
+
+    async def collect_grading_input(self, task_id: str, sandbox: Sandbox, dataset: str | None = None) -> bytes:
+        return await sandbox.download_file("/workspace/answer.txt")
+
+    def grader_identity(self, task_id: str, dataset: str | None = None) -> Mapping[str, Any]:
+        return {"grader": "stub-1"}
+
+    async def grade_in_sandbox(
+        self, task_id: str, content: bytes, sandbox: Sandbox, dataset: str | None = None
+    ) -> AsyncGenerator[StreamChunk | GradingInput, None]:
+        self.graded_in.append(sandbox.id)
+        yield StreamResultChunk(type="result", data={"resolved": content == b"2"})
+
+
+async def test_v1_grading_of_a_hooks_service_with_eval_sandbox_creates_one_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("EVAL_RESUME_BUCKET", "agentic-harness-dev")
+    monkeypatch.setenv("EVAL_RESUME_PREFIX", "stub/eval-resume")
+    service = await HooksSpecStub.create()
+    service.graded_in = []
+    service.eval_resume_store = EvalResumeStore(s3_client=_FakeS3())
+    provider = LabelledProvider()
+
+    resp = await _grade(service, provider)
+
+    assert resp.status == V1EvalStatus.EVALUATED
+    assert (len(provider.created), service.graded_in, provider.deleted) == (1, ["sandbox-1"], ["sandbox-1"])

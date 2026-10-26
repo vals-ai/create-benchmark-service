@@ -4,9 +4,9 @@ import importlib.metadata
 import logging
 import os
 import traceback
-from collections.abc import AsyncGenerator
-from contextlib import aclosing, asynccontextmanager, nullcontext, suppress
-from typing import Any, cast
+from collections.abc import AsyncGenerator, Mapping
+from contextlib import AbstractAsyncContextManager, aclosing, asynccontextmanager, nullcontext, suppress
+from typing import Any, Literal, cast
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.responses import JSONResponse
@@ -19,7 +19,10 @@ from websockets.exceptions import ConnectionClosed
 from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_required
 from benchmark_service.base import BenchmarkService
-from benchmark_service.context import sandbox_provider_scope
+from benchmark_service.grading_credentials import grading_credentials
+from benchmark_service.observability import ATTEMPT_ID_HEADER, EMAIL_HEADER, RUN_ID_HEADER
+from benchmark_service.context import sandbox_provider_scope, tenant_scope
+from benchmark_service.sandbox.created import SandboxCreatedHook, sandbox_created_scope
 from benchmark_service.schemas import (
     DATASET_VERSION_HEADER,
     DatasetVersion,
@@ -29,13 +32,16 @@ from benchmark_service.schemas import (
     FinalScoreRequest,
     FinalScoreResponse,
     HealthCheckResponse,
+    ListDatasetsResponse,
     RetrieveTaskResponse,
     ResolveDatasetRequest,
     ResolveDatasetResponse,
     SetupTaskRequest,
     StreamChunk,
     StreamDatasetVersionChunk,
+    SandboxCreatedData,
     StreamErrorChunk,
+    StreamSandboxCreatedChunk,
     TaskFilter,
     VerifyTaskIdsResponse,
     VersionResponse,
@@ -48,6 +54,7 @@ from benchmark_service.sandbox import (
 
 logger = logging.getLogger(__name__)
 _dataset_version_id: TypeAdapter[str] = TypeAdapter(DatasetVersionId)
+
 
 class _DatasetVersionSelectionError(HTTPException):
     pass
@@ -76,6 +83,17 @@ async def _forward_stream(
                 return
 
 
+def _sandbox_created_hook(websocket: WebSocket) -> SandboxCreatedHook:
+    async def announce(provider: Literal["daytona"], sandbox_id: str) -> None:
+        chunk = StreamSandboxCreatedChunk(
+            type="sandbox_created",
+            data=SandboxCreatedData(provider=provider, sandbox_id=sandbox_id),
+        )
+        await send_json_if_connected(websocket, chunk.model_dump())
+
+    return announce
+
+
 async def _send_dataset_version_error(websocket: WebSocket, exc: _DatasetVersionSelectionError) -> None:
     chunk = StreamErrorChunk(type="error", data=str(exc.detail), status_code=exc.status_code)
     await send_json_if_connected(websocket, chunk.model_dump())
@@ -98,6 +116,16 @@ _DOCKER_DISABLED_REASON = "Docker sandboxes are disabled on this service"
 def _request_may_use_provider(config: SandboxProviderConfig | None) -> bool:
     """Docker needs no caller credentials and drives this host's daemon, so only an opted-in service accepts it."""
     return not isinstance(config, DockerProviderConfig) or os.environ.get(DOCKER_ENABLED_ENV, "").lower() == "true"
+
+
+def _grading_credentials(headers: Mapping[str, str], task_id: str) -> AbstractAsyncContextManager[None]:
+    """Gateway credentials for the run, attempt and email the caller names in its correlation headers."""
+    return grading_credentials(
+        run_id=headers.get(RUN_ID_HEADER),
+        task_id=task_id,
+        attempt_id=headers.get(ATTEMPT_ID_HEADER),
+        email=headers.get(EMAIL_HEADER),
+    )
 
 
 def _get_service_metadata(service_cls: type[BenchmarkService]) -> tuple[str | None, str | None]:
@@ -182,7 +210,9 @@ class BenchmarkServiceApp(FastAPI):
                 try:
                     self.authorize_request(tenant, request.url.path)
                 except HTTPException as exc:
-                    return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers)
+                    return JSONResponse(
+                        status_code=exc.status_code, content={"detail": exc.detail}, headers=exc.headers
+                    )
                 response = await call_next(request)  # type: ignore[reportUnknownVariableType]
                 version = getattr(request.state, "dataset_version", None)
                 if version is not None and 200 <= response.status_code < 300:
@@ -195,6 +225,7 @@ class BenchmarkServiceApp(FastAPI):
         self.add_exception_handler(Exception, self._exception_handler)
         self.add_api_route("/health", self._health_check, methods=["GET"])
         self.add_api_route("/version", self._version, methods=["GET"])
+        self.add_api_route("/v1/datasets", self._list_datasets, methods=["GET"], response_model=ListDatasetsResponse)
         self.add_api_route("/resolve-dataset", self._resolve_dataset, methods=["POST"])
         self.add_api_route("/verify-task-ids", self._verify_task_ids, methods=["GET"])
         self.add_api_route("/retrieve-task/", self._retrieve_task, methods=["GET"])
@@ -229,6 +260,12 @@ class BenchmarkServiceApp(FastAPI):
             dataset_version=self.service.get_dataset_version(dataset),
             dataset_version_selection=self.service.supports_dataset_version_selection(dataset or "default"),
             eval_mode=self.service.eval_mode,
+        )
+
+    async def _list_datasets(self, request: Request) -> ListDatasetsResponse:
+        names = sorted(set(await self.service.list_datasets()))
+        return ListDatasetsResponse(
+            datasets=[name for name in names if await self.service.check_dataset_access(request.state.tenant, name)]
         )
 
     @asynccontextmanager
@@ -269,7 +306,8 @@ class BenchmarkServiceApp(FastAPI):
                     else:
                         connection.state.dataset_version = resolved
                 entered = True
-                yield
+                with tenant_scope(tenant):
+                    yield
         except HTTPException as exc:
             if isinstance(connection, WebSocket) and exc.status_code == 403:
                 await connection.close(code=1008, reason="Dataset not allowed")
@@ -367,10 +405,30 @@ class BenchmarkServiceApp(FastAPI):
         async with self._dataset_scope(request, request.state.tenant, dataset):
             return await self.service.retrieve_task(task_id, skip_validation, dataset=dataset)
 
+    @asynccontextmanager
+    async def _stream_session(self, websocket: WebSocket, endpoint: str) -> AsyncGenerator[None, None]:
+        try:
+            yield
+        except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
+            logger.warning("%s websocket disconnected", endpoint)
+        except _DatasetVersionSelectionError as exc:
+            await _send_dataset_version_error(websocket, exc)
+        except Exception as exc:
+            if self._sentry is not None:
+                self._sentry.capture_exception(exc)
+            error_msg = f"{str(exc)}\n{traceback.format_exc()}"
+            logger.error(f"WebSocket error: {error_msg}")
+            error_chunk = StreamErrorChunk(type="error", data=error_msg)
+            if not await send_json_if_connected(websocket, error_chunk.model_dump()):
+                logger.warning("%s websocket disconnected before error chunk could be sent", endpoint)
+        finally:
+            self.clear_request_context()
+            with suppress(RuntimeError):
+                await websocket.close()
+
     async def _setup_task(self, websocket: WebSocket) -> None:
         await websocket.accept()
-
-        try:
+        async with self._stream_session(websocket, "setup-task"):
             tenant = await self._authorize_websocket(websocket)
             if tenant is None:
                 return
@@ -398,23 +456,6 @@ class BenchmarkServiceApp(FastAPI):
                         endpoint="setup-task",
                     )
 
-        except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
-            logger.warning("setup-task websocket disconnected")
-        except _DatasetVersionSelectionError as exc:
-            await _send_dataset_version_error(websocket, exc)
-        except Exception as e:
-            if self._sentry is not None:
-                self._sentry.capture_exception(e)
-            error_msg = f"{str(e)}\n{traceback.format_exc()}"
-            logger.error(f"WebSocket error: {error_msg}")
-            error_chunk = StreamErrorChunk(type="error", data=error_msg)
-            if not await send_json_if_connected(websocket, error_chunk.model_dump()):
-                logger.warning("setup-task websocket disconnected before error chunk could be sent")
-        finally:
-            self.clear_request_context()
-            with suppress(RuntimeError):
-                await websocket.close()
-
     async def _evaluate_response(self, request: Request, body: EvaluateResponseRequest) -> Any:
         if self._sentry is not None:
             self._sentry.bind_request_context(request.headers, task_id=body.task_id, dataset=body.dataset)
@@ -422,12 +463,12 @@ class BenchmarkServiceApp(FastAPI):
             raise HTTPException(status_code=403, detail=_DOCKER_DISABLED_REASON)
         async with self._dataset_scope(request, request.state.tenant, body.dataset):
             await self.consume_evaluation_request(cast(str, request.state.tenant))
-            return await self.service.evaluate_response(body, dataset=body.dataset)
+            async with _grading_credentials(request.headers, body.task_id):
+                return await self.service.evaluate_response(body, dataset=body.dataset)
 
     async def _evaluate_response_stream(self, websocket: WebSocket) -> None:
         await websocket.accept()
-
-        try:
+        async with self._stream_session(websocket, "evaluate-response"):
             tenant = await self._authorize_websocket(websocket)
             if tenant is None:
                 return
@@ -444,33 +485,25 @@ class BenchmarkServiceApp(FastAPI):
                 if not await self._admit_websocket_evaluation(websocket, tenant):
                     return
 
-                await _forward_stream(
-                    websocket,
-                    self.service.stream_evaluate_response(request, dataset=request.dataset),
-                    endpoint="evaluate-response",
-                )
-
-        except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
-            logger.warning("evaluate-response websocket disconnected")
-        except _DatasetVersionSelectionError as exc:
-            await _send_dataset_version_error(websocket, exc)
-        except Exception as e:
-            if self._sentry is not None:
-                self._sentry.capture_exception(e)
-            error_msg = f"{str(e)}\n{traceback.format_exc()}"
-            logger.error(f"WebSocket error: {error_msg}")
-            error_chunk = StreamErrorChunk(type="error", data=error_msg)
-            if not await send_json_if_connected(websocket, error_chunk.model_dump()):
-                logger.warning("evaluate-response websocket disconnected before error chunk could be sent")
-        finally:
-            self.clear_request_context()
-            with suppress(RuntimeError):
-                await websocket.close()
+                async with _grading_credentials(websocket.headers, request.task_id):
+                    async with (
+                        request.sandbox_provider.create_provider() if request.sandbox_provider else nullcontext()
+                    ) as provider:
+                        with (
+                            sandbox_provider_scope(provider),
+                            sandbox_created_scope(
+                                _sandbox_created_hook(websocket) if request.announce_sandboxes else None
+                            ),
+                        ):
+                            await _forward_stream(
+                                websocket,
+                                self.service.stream_evaluate_response(request, dataset=request.dataset),
+                                endpoint="evaluate-response",
+                            )
 
     async def _evaluate_instance(self, websocket: WebSocket) -> None:
         await websocket.accept()
-
-        try:
+        async with self._stream_session(websocket, "evaluate-instance"):
             tenant = await self._authorize_websocket(websocket)
             if tenant is None:
                 return
@@ -497,29 +530,18 @@ class BenchmarkServiceApp(FastAPI):
 
                     # Benchmarks that grade in a second sandbox read the provider
                     # from the request scope; see benchmark_service.context.
-                    with sandbox_provider_scope(provider):
-                        await _forward_stream(
-                            websocket,
-                            self.service.evaluate_instance(request.task_id, sandbox, dataset=request.dataset),
-                            endpoint="evaluate-instance",
-                        )
-
-        except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
-            logger.warning("evaluate-instance websocket disconnected")
-        except _DatasetVersionSelectionError as exc:
-            await _send_dataset_version_error(websocket, exc)
-        except Exception as e:
-            if self._sentry is not None:
-                self._sentry.capture_exception(e)
-            error_msg = f"{str(e)}\n{traceback.format_exc()}"
-            logger.error(f"WebSocket error: {error_msg}")
-            error_chunk = StreamErrorChunk(type="error", data=error_msg)
-            if not await send_json_if_connected(websocket, error_chunk.model_dump()):
-                logger.warning("evaluate-instance websocket disconnected before error chunk could be sent")
-        finally:
-            self.clear_request_context()
-            with suppress(RuntimeError):
-                await websocket.close()
+                    async with _grading_credentials(websocket.headers, request.task_id):
+                        with (
+                            sandbox_provider_scope(provider),
+                            sandbox_created_scope(
+                                _sandbox_created_hook(websocket) if request.announce_sandboxes else None
+                            ),
+                        ):
+                            await _forward_stream(
+                                websocket,
+                                self.service.evaluate_instance(request.task_id, sandbox, dataset=request.dataset),
+                                endpoint="evaluate-instance",
+                            )
 
     async def _final_score(self, request: Request, body: FinalScoreRequest) -> FinalScoreResponse:
         if self._sentry is not None:

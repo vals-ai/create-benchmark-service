@@ -10,11 +10,13 @@ import shlex
 import time
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
-from typing import cast
+from types import SimpleNamespace
+from typing import Any, Literal, cast
 from uuid import uuid4
 
 import pytest
 from daytona import CreateSecretParams
+from modal import Sandbox as ModalSdkSandbox
 
 from benchmark_service import (
     ImageSource,
@@ -22,12 +24,14 @@ from benchmark_service import (
     Sandbox,
     SandboxCommandError,
     SandboxCreateRequest,
+    SandboxError,
     SandboxNotFoundError,
     SandboxProvider,
     SandboxQuery,
     VolumeMount,
 )
 from benchmark_service.sandbox.daytona import DaytonaSandboxProvider
+from benchmark_service.sandbox.modal import ModalProviderConfig
 
 _POLL_INTERVAL_SECONDS = 2
 _POLL_TIMEOUT_SECONDS = 120
@@ -140,6 +144,236 @@ async def _read_stream_until_ready(sandbox: Sandbox, ready: asyncio.Event) -> No
 
 class TestSandboxProviderIntegration:
     """Run the same live contract checks against every configured provider."""
+
+    @pytest.mark.parametrize("provider_type", ["modal"], indirect=True)
+    async def test_modal_gpu_with_vm_provider(
+        self,
+        sandbox_provider_config: ModalProviderConfig,
+        record_property: Callable[[str, object], None],
+    ) -> None:
+        """Create and delete a GPU sandbox with a VM provider default."""
+        provider = sandbox_provider_config.model_copy(update={"runtime": "vm"}).create_provider()
+        request = SandboxCreateRequest(
+            source=ImageSource(image=_TEST_IMAGE),
+            resources=Resources(vcpu=1, memory=2, disk=5, gpu=1, gpu_type="T4"),
+            name=f"cbs-modal-gpu-runtime-{uuid4().hex[:10]}",
+            labels={"test": "modal-gpu-runtime"},
+            env_vars={},
+            auto_stop_interval=5,
+            create_timeout=120,
+        )
+        try:
+            sandbox = await provider.create_sandbox(request)
+            record_property("sandbox_id", sandbox.id)
+            record_property("provider_runtime", "vm")
+            record_property("gpu_count", request.resources.gpu)
+            try:
+                result = await sandbox.exec("nvidia-smi -L", timeout=30)
+                record_property("output", result.output)
+                assert result.exit_code == 0
+                assert "Tesla T4" in result.output
+            finally:
+                await provider.delete_sandbox(sandbox.id)
+                await _wait_until_not_found(provider, sandbox.id)
+                record_property("cleanup", "sandbox not found")
+        finally:
+            await provider.close()
+
+    @pytest.mark.parametrize("provider_type", ["modal"], indirect=True)
+    @pytest.mark.parametrize("cancel", [False, True], ids=["timeout", "cancel"])
+    @pytest.mark.usefixtures("provider_type")
+    async def test_modal_cleans_up_delayed_create(
+        self,
+        request: pytest.FixtureRequest,
+        monkeypatch: pytest.MonkeyPatch,
+        record_property: Callable[[str, object], None],
+        cancel: bool,
+    ) -> None:
+        """Verify late cleanup cannot delete another provider's retry."""
+        sandbox_provider_config = cast(ModalProviderConfig, request.getfixturevalue("sandbox_provider_config"))
+        provider = sandbox_provider_config.create_provider()
+        retry_provider = sandbox_provider_config.create_provider()
+        retries: list[Sandbox] = []
+        native_create = cast(Callable[..., Awaitable[ModalSdkSandbox]], ModalSdkSandbox.create.aio)  # pyright: ignore[reportUnknownMemberType]
+        started = asyncio.Event()
+        allocated = asyncio.Event()
+        release = asyncio.Event()
+        sandboxes: list[ModalSdkSandbox] = []
+
+        async def delayed_create(**kwargs: Any) -> ModalSdkSandbox:
+            first = not started.is_set()
+            started.set()
+            sandbox = await native_create(**kwargs)
+            if first:
+                sandboxes.append(sandbox)
+                allocated.set()
+                await release.wait()
+            return sandbox
+
+        monkeypatch.setattr(ModalSdkSandbox.create, "aio", delayed_create)
+        create_request = SandboxCreateRequest(
+            source=ImageSource(image=_TEST_IMAGE),
+            resources=_TEST_RESOURCES,
+            name=f"cbs-modal-create-cleanup-{uuid4().hex[:10]}",
+            labels={"test": "modal-create-cleanup"},
+            env_vars={},
+            auto_stop_interval=5,
+            create_timeout=1,
+        )
+        async def create_in_context() -> None:
+            async with provider:
+                await provider.create_sandbox(create_request)
+
+        creation = asyncio.create_task(create_in_context())
+        try:
+            await asyncio.wait_for(started.wait(), timeout=30)
+            before = time.monotonic()
+            if cancel:
+                creation.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await asyncio.wait_for(asyncio.shield(creation), timeout=3)
+            else:
+                with pytest.raises(SandboxError, match="within 1s"):
+                    await asyncio.wait_for(asyncio.shield(creation), timeout=3)
+            elapsed = time.monotonic() - before
+            record_property("caller_wait_seconds", elapsed)
+            assert elapsed < 2
+            await asyncio.wait_for(allocated.wait(), timeout=120)
+            retry = await retry_provider.create_sandbox(create_request.model_copy(update={"create_timeout": 120}))
+            retries.append(retry)
+            release.set()
+            await provider.close()
+            assert len(sandboxes) == 1
+            original_id = sandboxes[0].object_id
+            record_property("sandbox_id", original_id)
+            record_property("retry_sandbox_id", retry.id)
+            assert retry.id != original_id
+            await _wait_until_not_found(retry_provider, original_id)
+            assert not cast(Any, provider)._cleanup_tasks
+            result = await retry.exec("echo retry-alive", timeout=30)
+            assert result.exit_code == 0
+            assert result.output.strip() == "retry-alive"
+            record_property("cleanup", "original absent; retry still running")
+        finally:
+            release.set()
+            await asyncio.gather(creation, return_exceptions=True)
+            try:
+                await provider.close()
+                for original in sandboxes:
+                    record_property("original_sandbox_id", original.object_id)
+                    await _wait_until_not_found(retry_provider, original.object_id)
+                    record_property("original_cleanup", "sandbox not found")
+            finally:
+                try:
+                    for retry in retries:
+                        await retry_provider.delete_sandbox(retry.id)
+                        await _wait_until_not_found(retry_provider, retry.id)
+                        record_property("retry_cleanup", "sandbox not found")
+                finally:
+                    await retry_provider.close()
+
+    @pytest.mark.parametrize("provider_type", ["modal"], indirect=True)
+    @pytest.mark.parametrize("fault", ["terminate_failure", "pooled_cleanup", "close_cancel"])
+    @pytest.mark.usefixtures("provider_type")
+    async def test_modal_cleanup_faults(
+        self,
+        request: pytest.FixtureRequest,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        record_property: Callable[[str, object], None],
+        fault: Literal["terminate_failure", "pooled_cleanup", "close_cancel"],
+    ) -> None:
+        """Keep client closure alive through cleanup failure and cancellation."""
+        config = cast(ModalProviderConfig, request.getfixturevalue("sandbox_provider_config"))
+        provider = config.create_provider()
+        checker = config.create_provider()
+        create_request = SandboxCreateRequest(
+            source=ImageSource(image=_TEST_IMAGE),
+            resources=_TEST_RESOURCES,
+            name=f"cbs-modal-cleanup-fault-{uuid4().hex[:10]}",
+            labels={"test": "modal-cleanup-fault"},
+            env_vars={},
+            auto_stop_interval=5,
+            create_timeout=120,
+        )
+        sandbox = await provider.create_sandbox(create_request)
+        record_property("sandbox_id", sandbox.id)
+        client = cast(Any, provider)._client
+        native_close = client._close.aio
+        closing = asyncio.Event()
+        closed = asyncio.Event()
+        release = asyncio.Event()
+        native_create = cast(Callable[..., Awaitable[ModalSdkSandbox]], ModalSdkSandbox.create.aio)  # pyright: ignore[reportUnknownMemberType]
+        inner = cast(ModalSdkSandbox, cast(Any, sandbox)._sandbox)
+        native_terminate = inner.terminate
+
+        async def held_close() -> None:
+            closing.set()
+            await release.wait()
+            await native_close()
+            closed.set()
+
+        async def late_create(**_kwargs: Any) -> ModalSdkSandbox:
+            await release.wait()
+            return inner
+
+        async def failed_terminate(*, wait: bool) -> None:
+            raise RuntimeError("injected termination failure")
+
+        close_task: asyncio.Task[None] | None = None
+        cleaned_up = False
+        try:
+            if fault != "close_cancel":
+                monkeypatch.setattr(ModalSdkSandbox.create, "aio", late_create)
+                if fault == "terminate_failure":
+                    monkeypatch.setattr(inner, "terminate", SimpleNamespace(aio=failed_terminate))
+                with pytest.raises(SandboxError, match="within 1s"):
+                    await provider.create_sandbox(create_request.model_copy(update={"create_timeout": 1}))
+                if fault == "pooled_cleanup":
+                    release.set()
+                    await _wait_until_not_found(checker, sandbox.id)
+                    cleaned_up = True
+                    async with asyncio.timeout(30):
+                        while cast(Any, provider)._cleanup_tasks:
+                            await asyncio.sleep(0.05)
+                    assert not cast(Any, provider)._cleanup_tasks
+                    assert not client.is_closed()
+                    record_property("completed_cleanup_pruned", True)
+                await asyncio.wait_for(provider.close(), timeout=2)
+                release.set()
+            else:
+                monkeypatch.setattr(client, "_close", SimpleNamespace(aio=held_close))
+                close_task = asyncio.create_task(provider.close())
+                await asyncio.wait_for(closing.wait(), timeout=10)
+                close_task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await close_task
+                release.set()
+                await asyncio.wait_for(closed.wait(), timeout=30)
+            async with asyncio.timeout(30):
+                while not client.is_closed():
+                    await asyncio.sleep(0.05)
+            record_property("native_client_closed", client.is_closed())
+            if fault == "terminate_failure":
+                assert "injected termination failure" in caplog.text
+                assert not cast(Any, provider)._cleanup_tasks
+                record_property("cleanup_failure_logged", True)
+            elif fault == "close_cancel":
+                record_property("cancelled_close_finished", True)
+        finally:
+            release.set()
+            if close_task is not None:
+                await asyncio.gather(close_task, return_exceptions=True)
+            monkeypatch.setattr(ModalSdkSandbox.create, "aio", native_create)
+            monkeypatch.setattr(inner, "terminate", native_terminate)
+            try:
+                if not cleaned_up:
+                    await checker.delete_sandbox(sandbox.id)
+                await _wait_until_not_found(checker, sandbox.id)
+                record_property("cleanup", "sandbox not found")
+            finally:
+                await provider.close()
+                await checker.close()
 
     @pytest.mark.parametrize("provider_type", ["daytona"], indirect=True)
     async def test_daytona_inventory_metadata_and_filtering(

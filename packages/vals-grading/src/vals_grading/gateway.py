@@ -10,10 +10,16 @@ from model_library.registry_utils import get_registry_model
 from model_library.telemetry import IdentityValidationError, normalize_identity
 
 JUDGE_CONFIG = LLMConfig(temperature=0, top_p=1.0, max_tokens=10_000)
+GRADER_AGENT_NAME = "grader"
 
 
 class GatewayJudgeModel:
-    """Send judge requests through model-library's Gateway client."""
+    """Send judge requests through model-library's Gateway client.
+
+    Requests carry the service's ``IDENTITY`` with ``agent_name="grader"`` so the
+    Gateway ledger tells judge spend from the agent's; the run, task and attempt
+    come from the grading token the host binds, if any.
+    """
 
     def __init__(self, model: str) -> None:
         missing = [
@@ -25,6 +31,7 @@ class GatewayJudgeModel:
             identity = normalize_identity(json.loads(os.environ["IDENTITY"]))
         except (json.JSONDecodeError, IdentityValidationError) as error:
             raise ValueError("Set IDENTITY to a JSON object that identifies the grading service.") from error
+        identity["agent_name"] = GRADER_AGENT_NAME
         self._model = get_registry_model(model, override_config=JUDGE_CONFIG, identity=identity)
         if not isinstance(self._model, GatewayLLM):
             raise RuntimeError(

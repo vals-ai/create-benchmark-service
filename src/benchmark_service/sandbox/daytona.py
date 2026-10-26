@@ -592,13 +592,7 @@ class DaytonaSandbox(Sandbox):
         return f"/sys/fs/cgroup{path.rstrip('/')}"
 
     async def probe_generation_containment(self) -> None:
-        try:
-            parent = await self._controlled_cgroup_parent()
-        except SandboxError as exc:
-            raise SandboxError(
-                f"Daytona sandbox does not support {LINUX_CGROUP_V2_V1.type} v"
-                f"{LINUX_CGROUP_V2_V1.version}: {self._sandbox_ref}"
-            ) from exc
+        parent = await self._controlled_cgroup_parent()
         quoted = shlex.quote(f"{parent}/cbs-probe-{uuid.uuid4().hex}")
         result = await self._control_exec(
             f'd={quoted}; mkdir "$d" || exit 1; '

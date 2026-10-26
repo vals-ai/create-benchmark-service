@@ -5033,9 +5033,29 @@ async def test_daytona_cgroup_probe_runs_under_toolbox_cgroup() -> None:
     assert process.probe.startswith("d=/sys/fs/cgroup/init.scope/cbs-probe-")
 
 
+@pytest.mark.parametrize("error_type", [SandboxNotFoundError, SandboxConnectionError])
+async def test_daytona_cgroup_probe_preserves_parent_lookup_error(
+    monkeypatch: pytest.MonkeyPatch, error_type: type[SandboxError]
+) -> None:
+    error = error_type("parent lookup failed")
+
+    async def fail_control(_command: str) -> ExecResult:
+        raise error
+
+    sandbox = _daytona_sandbox(InnerSandbox())
+    monkeypatch.setattr(sandbox, "_control_exec", fail_control)
+
+    with pytest.raises(error_type) as raised:
+        await sandbox.probe_generation_containment()
+
+    assert raised.value is error
+
+
 async def test_daytona_cgroup_probe_rejects_unsupported_kernel() -> None:
     class UnsupportedProcess(Process):
         async def exec(self, command: str) -> SimpleNamespace:
+            if _unwrap_shell_command(command) == daytona_module._CGROUP_SELF_COMMAND:  # pyright: ignore[reportPrivateUsage]
+                return SimpleNamespace(exit_code=0, result="/init.scope\n")
             return SimpleNamespace(exit_code=1, result="cgroup.kill unavailable")
 
     inner = InnerSandbox()

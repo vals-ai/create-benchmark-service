@@ -120,13 +120,22 @@ class Resources(BaseModel):
     memory: int = Field(gt=0, description="Sandbox memory")
     disk: int = Field(gt=0, description="Sandbox ephemeral disk")
     gpu: int = Field(default=0, ge=0, description="Number of GPUs to allocate")
-    gpu_type: str | None = Field(default=None, description="GPU type to allocate, e.g. 'H100' (provider-specific)")
+    gpu_type: str | list[str] | None = Field(
+        default=None,
+        description="GPU type to allocate, e.g. 'H100' (provider-specific), or acceptable types in order of preference",
+    )
 
     @model_validator(mode="after")
     def _validate_gpu(self) -> Self:
-        if self.gpu_type is not None and self.gpu < 1:
+        if self.acceptable_gpu_types and self.gpu < 1:
             raise ValueError("gpu_type requires gpu >= 1")
         return self
+
+    @property
+    def acceptable_gpu_types(self) -> list[str]:
+        if isinstance(self.gpu_type, list):
+            return self.gpu_type
+        return [self.gpu_type] if self.gpu_type is not None else []
 
 
 class ResourceCapacity(BaseModel):

@@ -27,6 +27,7 @@ from benchmark_service.sandbox._process_group import (
     cleanup_command, episode_owner_command, owner_command, probe_command, stop_command,
 )
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
+from benchmark_service.sandbox.gpu import modal_gpu_type
 from benchmark_service.sandbox.types import (
     ControlledWorkload,
     ControlledWorkloadResult,
@@ -687,9 +688,10 @@ class ModalSandboxProvider(SandboxProvider):
         allow_all_egress = not request.network_block_all
         gpu: str | None = None
         if request.resources.gpu:
-            if not request.resources.gpu_type:
+            gpu_type = modal_gpu_type(request.resources.acceptable_gpu_types)
+            if not gpu_type:
                 raise SandboxError("Modal sandbox provider requires gpu_type when gpu is requested")
-            gpu = f"{request.resources.gpu_type}:{request.resources.gpu}"
+            gpu = f"{gpu_type}:{request.resources.gpu}"
         runtime = "gvisor" if gpu else self._config.runtime
         create_kwargs: dict[str, Any] = {
             "app": app,

@@ -437,7 +437,7 @@ class SnapshotEvalForGpuTaskStub(SandboxStub):
         task = await super().retrieve_task(task_id, skip_validation, dataset=dataset)
         return task.model_copy(
             update={
-                "resources": Resources(vcpu=8, memory=16, disk=50, gpu=1, gpu_type="H100"),
+                "resources": Resources(vcpu=8, memory=16, disk=50, gpu=1, gpu_type=["H100", "A100"]),
                 "eval_sandbox": EvalSandboxSpec(source=SnapshotSource(snapshot="grader-snapshot")),
             }
         )

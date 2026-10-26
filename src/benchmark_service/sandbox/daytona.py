@@ -38,9 +38,6 @@ from daytona_api_client_async import (
 from daytona_api_client_async.exceptions import NotFoundException, OpenApiException
 from daytona_api_client_async.models.region_usage_overview import RegionUsageOverview
 from daytona import (
-    GpuType,
-)
-from daytona import (
     Image as DaytonaImage,
 )
 from daytona import (
@@ -78,6 +75,7 @@ from tenacity import (
 
 from benchmark_service.sandbox.created import notify_sandbox_created
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
+from benchmark_service.sandbox.gpu import daytona_gpu_type
 from benchmark_service.sandbox.types import (
     ComposeSource,
     ControlledWorkload,
@@ -303,19 +301,6 @@ def _daytona_client(config: DaytonaProviderConfig, target: str) -> AsyncDaytona:
             connection_pool_maxsize=None,
         )
     )
-
-
-def _daytona_gpu_type(gpu_type: str | None) -> GpuType | None:
-    if gpu_type is None:
-        return None
-    try:
-        member = GpuType(gpu_type)
-    except ValueError:
-        member = GpuType.UNKNOWN_DEFAULT_OPEN_API
-    if member is GpuType.UNKNOWN_DEFAULT_OPEN_API:
-        supported = ", ".join(t.value for t in GpuType if t is not GpuType.UNKNOWN_DEFAULT_OPEN_API)
-        raise SandboxError(f"Unsupported Daytona GPU type: {gpu_type}. Supported types: {supported}")
-    return member
 
 
 def _get_config_header(headers: Mapping[str, str], *names: str) -> str | None:
@@ -1899,7 +1884,7 @@ class DaytonaSandboxProvider(SandboxProvider):
             memory=request.resources.memory,
             disk=request.resources.disk,
             gpu=request.resources.gpu or None,
-            gpu_type=_daytona_gpu_type(request.resources.gpu_type),
+            gpu_type=daytona_gpu_type(request.resources.acceptable_gpu_types),
         )
 
         volume_mounts = (

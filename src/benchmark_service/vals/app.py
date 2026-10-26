@@ -17,6 +17,7 @@ from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_required
 from benchmark_service.grading import SUBMISSION_ARTIFACT_SANDBOX_PATH, collapse_stream, evaluate_submission
 from benchmark_service.grading_credentials import grading_credentials
+from benchmark_service.observability import EMAIL_HEADER
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.sandbox import (
     DaytonaProviderConfig,
@@ -47,7 +48,11 @@ from benchmark_service.vals.auth import (
     load_allowlist,
 )
 from benchmark_service.vals.base import ValsBenchmarkService
-from benchmark_service.vals.trial import sanitize_v1_dataset_tasks_response, sanitize_v1_eval_response, sanitize_v1_score_response
+from benchmark_service.vals.trial import (
+    sanitize_v1_dataset_tasks_response,
+    sanitize_v1_eval_response,
+    sanitize_v1_score_response,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -360,12 +365,19 @@ class ValsBenchmarkServiceApp(BenchmarkServiceApp):
     async def _v1_evaluate(self, request: Request, body: V1EvalRequest) -> V1EvalResponse:
         _require_descope_tenant(request.state.tenant)
         async with self._dataset_scope(request, request.state.tenant, body.dataset):
-            async with grading_credentials(run_id=body.run_id, task_id=body.task_id, attempt_id=body.attempt_id):
+            async with grading_credentials(
+                run_id=body.run_id,
+                task_id=body.task_id,
+                attempt_id=body.attempt_id,
+                email=request.headers.get(EMAIL_HEADER),
+            ):
                 return await self._v1_evaluate_in_scope(request, body)
 
     async def _v1_evaluate_in_scope(self, request: Request, body: V1EvalRequest) -> V1EvalResponse:
         if self._sentry is not None:
-            self._sentry.bind_request_context(request.headers, run_id=body.run_id, task_id=body.task_id, dataset=body.dataset)
+            self._sentry.bind_request_context(
+                request.headers, run_id=body.run_id, task_id=body.task_id, dataset=body.dataset
+            )
         tenant = cast(str, request.state.tenant)
         try:
             await self.service.validate_task_ids([body.task_id], dataset=body.dataset)
@@ -537,7 +549,9 @@ class ValsBenchmarkServiceApp(BenchmarkServiceApp):
         _require_descope_tenant(request.state.tenant)
         async with self._dataset_scope(request, request.state.tenant, body.dataset):
             if self._sentry is not None:
-                self._sentry.bind_request_context(request.headers, run_id=body.run_id, task_id=body.task_id, dataset=body.dataset)
+                self._sentry.bind_request_context(
+                    request.headers, run_id=body.run_id, task_id=body.task_id, dataset=body.dataset
+                )
             tenant = cast(str, request.state.tenant)
             if not submission_artifacts.is_configured():
                 raise HTTPException(
@@ -569,9 +583,12 @@ class ValsBenchmarkServiceApp(BenchmarkServiceApp):
                 self._sentry.bind_request_context(request.headers, run_id=body.run_id, dataset=body.dataset)
 
             normalized_results = {
-                task_id: _v1_score_item_to_eval_result(task_id, item) for task_id, item in body.evaluation_results.items()
+                task_id: _v1_score_item_to_eval_result(task_id, item)
+                for task_id, item in body.evaluation_results.items()
             }
-            tasks_evaluated = await self.service.validate_task_ids(list(normalized_results.keys()), dataset=body.dataset)
+            tasks_evaluated = await self.service.validate_task_ids(
+                list(normalized_results.keys()), dataset=body.dataset
+            )
             result = await self.service.calculate_final_score(normalized_results, dataset=body.dataset)
             response = V1ScoreResponse(
                 run_id=body.run_id,

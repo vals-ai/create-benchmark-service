@@ -131,7 +131,7 @@ def test_retrieve_task(client: TestClient) -> None:
     assert data["source"] == {"type": "image", "image": "python:3.12-slim"}
     assert data["docker_image"] == "python:3.12-slim"
     assert data["agent_install_order"] == "before_setup"
-    assert data["egress"] == {"setup_task": "*", "run": None, "evaluation": "*"}
+    assert data["egress"] == {"setup_task": "*", "run": None, "evaluation": "*", "run_through_proxy": False}
     assert data["credited_generation"] is None
 
 
@@ -198,6 +198,7 @@ def test_retrieve_task_explicit_egress_policies(monkeypatch: pytest.MonkeyPatch)
                         setup_task=[],
                         run=["api.openai.com"],
                         evaluation=[],
+                        run_through_proxy=True,
                     )
                 }
             )
@@ -211,6 +212,7 @@ def test_retrieve_task_explicit_egress_policies(monkeypatch: pytest.MonkeyPatch)
         "setup_task": [],
         "run": ["api.openai.com"],
         "evaluation": [],
+        "run_through_proxy": True,
     }
 
 

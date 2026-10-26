@@ -204,6 +204,9 @@ class BenchmarkEgressPlan(BaseModel):
     setup_task: EgressPolicy = "*"
     run: EgressPolicy | None = None
     evaluation: EgressPolicy = "*"
+    # Asks the caller to send the run stage through its egress proxy, which then enforces `run` per
+    # request. A caller without one should refuse the task rather than run it unproxied.
+    run_through_proxy: bool = False
 
 
 class CreditedGeneration(BaseModel):

@@ -17,7 +17,13 @@ from fastapi.testclient import TestClient
 from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL
 from benchmark_service.context import tenant_scope
-from benchmark_service.grading_credentials import GradingCredentials, current_grading_credentials, grading_credentials
+from benchmark_service.grading_credentials import (
+    EvaluationCaller,
+    GradingCredentials,
+    current_evaluation_caller,
+    current_grading_credentials,
+    grading_credentials,
+)
 from benchmark_service.observability import ATTEMPT_ID_HEADER, EMAIL_HEADER, RUN_ID_HEADER, TASK_ID_HEADER
 from benchmark_service.schemas import EvaluateResponseRequest
 from tests.conftest import StubBenchmark
@@ -239,3 +245,18 @@ def test_evaluate_response_without_a_run_uses_the_service_key(client: TestClient
     response = client.post("/evaluate-response/", json={"task_id": "task-1", "response": "2"})
     assert response.json() == STATIC_KEY
     assert gateway.calls == []
+
+
+@pytest.mark.parametrize("grading_models", ["openai/gpt-4o", ""])
+async def test_the_callers_run_and_email_are_bound_with_or_without_grading_models(
+    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch, grading_models: str
+) -> None:
+    monkeypatch.setenv("GRADING_MODELS", grading_models)
+    async with grading_credentials(run_id="run-1", task_id="task-1", attempt_id="attempt-1", email="a@example.com"):
+        assert current_evaluation_caller() == EvaluationCaller("run-1", "task-1", "attempt-1", "a@example.com")
+    assert current_evaluation_caller() is None
+
+
+async def test_without_a_run_no_caller_is_bound(gateway: FakeGateway) -> None:
+    async with grading_credentials(run_id=None, task_id="task-1", email="a@example.com"):
+        assert current_evaluation_caller() is None

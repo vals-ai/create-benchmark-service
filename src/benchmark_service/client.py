@@ -599,6 +599,7 @@ class BenchmarkServiceClient:
         retry_delay_s: float = 2.0,
         on_retry: Callable[[SandboxRecoveryAttempt, Exception], Awaitable[None] | None] | None = None,
         attempt_id: str | None = None,
+        email: str | None = None,
     ) -> _RecoveryResult:
         """Run a task attempt with benchmark-declared sandbox-loss recovery.
 
@@ -627,7 +628,7 @@ class BenchmarkServiceClient:
         if any(issubclass(error_type, SandboxNotFoundError) for error_type in retryable_attempt_errors):
             raise ValueError("SandboxNotFoundError is controlled only by SandboxRecoveryPolicy")
 
-        with correlation_scope(run_id=run_id, task_id=task_id, attempt_id=attempt_id):
+        with correlation_scope(run_id=run_id, task_id=task_id, attempt_id=attempt_id, email=email):
             state = _SandboxRecoveryState(
                 run_id=run_id,
                 task_id=task_id,

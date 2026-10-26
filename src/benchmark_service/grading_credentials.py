@@ -1,9 +1,9 @@
 """Per-evaluation Model Gateway credentials.
 
 For each evaluation that names a run, task and attempt, mint a Gateway run token
-from the service key (claims: those ids, ``IDENTITY`` with ``agent_name="grader"``,
-``GRADING_MODELS``), bind it request-locally so judge calls carry it, and revoke it
-afterwards. Without ``GRADING_MODELS`` or Gateway settings nothing is bound; without a
+from the service key (claims: those ids, ``IDENTITY`` with ``agent_name="grader"``
+and the caller's email, ``GRADING_MODELS``), bind it request-locally so judge calls
+carry it, and revoke it afterwards. Without ``GRADING_MODELS`` or Gateway settings nothing is bound; without a
 run id the service's own key applies; a run id without an attempt id fails the evaluation.
 
 The binding is a ``ContextVar``: asyncio tasks and ``asyncio.to_thread`` inherit it,
@@ -65,19 +65,20 @@ def current_grading_credentials() -> GradingCredentials | None:
     return _current.get()
 
 
-def _identity() -> dict[str, object]:
-    """The service ``IDENTITY`` as the grader, naming the caller's tenant when one authenticated."""
+def _identity(email: str | None) -> dict[str, object]:
+    """The service ``IDENTITY`` as the grader, naming the caller's tenant and email when given."""
     identity: dict[str, object] = json.loads(os.environ.get("IDENTITY") or "{}")
     tenant = current_tenant()
     return {
         **identity,
         **({"tenant": tenant} if tenant not in (None, UNAUTHENTICATED_TENANT_SENTINEL) else {}),
+        **({"email": email} if email is not None else {}),
         "agent_name": GRADER_AGENT_NAME,
     }
 
 
 async def _mint(
-    service: GradingCredentials, *, run_id: str, task_id: str, attempt_id: str, models: list[str]
+    service: GradingCredentials, *, run_id: str, task_id: str, attempt_id: str, email: str | None, models: list[str]
 ) -> GradingCredentials:
     body = {
         "run_id": run_id,
@@ -85,7 +86,7 @@ async def _mint(
         "attempt_id": attempt_id,
         "allowed_models": models,
         "allowed_operations": ["query", "tokens_count"],
-        "identity": _identity(),
+        "identity": _identity(email),
         "ttl_seconds": _TOKEN_TTL_S,
     }
     async with httpx.AsyncClient(timeout=_MINT_TIMEOUT_S) as client:
@@ -120,7 +121,7 @@ async def _revoke(credentials: GradingCredentials, api_key: str) -> None:
 
 @asynccontextmanager
 async def grading_credentials(
-    *, run_id: str | None, task_id: str, attempt_id: str | None = None
+    *, run_id: str | None, task_id: str, attempt_id: str | None = None, email: str | None = None
 ) -> AsyncIterator[None]:
     """Mint, bind and finally revoke the Gateway credentials for one evaluation.
 
@@ -140,7 +141,9 @@ async def grading_credentials(
             raise RuntimeError(f"cannot mint a grading token for run_id={run_id} task_id={task_id}: no attempt id")
         from model_library.base.gateway import gateway_token_scope  # pyright: ignore[reportMissingImports, reportUnknownVariableType]
 
-        credentials = await _mint(service, run_id=run_id, task_id=task_id, attempt_id=attempt_id, models=models)
+        credentials = await _mint(
+            service, run_id=run_id, task_id=task_id, attempt_id=attempt_id, email=email, models=models
+        )
         scope = gateway_token_scope(credentials.api_key)  # pyright: ignore[reportUnknownVariableType]
     token = _current.set(credentials)
     try:

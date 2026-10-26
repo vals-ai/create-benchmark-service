@@ -1,5 +1,6 @@
 """Tests for local dataset export."""
 
+import tomllib
 from pathlib import Path
 from stat import S_IMODE
 from typing import Any, ClassVar
@@ -116,13 +117,43 @@ def test_split_rejects_missing_required_file(tmp_path: Path, filename: str) -> N
         write_harbor_split({"task": task}, "test", tmp_path / "out")
 
 
-@pytest.mark.parametrize(
-    "task_id", ["", ".", "..", "../task", "a/b", "/task", "_task", "-task", "a b", "tâsk", "task\n"]
-)
-def test_split_rejects_bad_task_id(tmp_path: Path, task_id: str) -> None:
+@pytest.mark.parametrize("task_id", ["", ".", "..", "/", "-", "â"])
+def test_split_rejects_task_id_without_a_safe_directory(tmp_path: Path, task_id: str) -> None:
     task = harbor_task(tmp_path / "task")
     with pytest.raises(ValueError):
         write_harbor_split({task_id: task}, "test", tmp_path / "out")
+
+
+@pytest.mark.parametrize(
+    ("task_id", "directory"),
+    [("app/task", "app-task"), ("../task", "task"), ("a b", "a-b"), ("tâsk", "t-sk"), ("2024/nile", "2024-nile")],
+)
+def test_split_keeps_native_task_id_in_task_toml(tmp_path: Path, task_id: str, directory: str) -> None:
+    task = harbor_task(tmp_path / "task")
+    out_dir = tmp_path / "out"
+    write_harbor_split({task_id: task}, "test", out_dir)
+    target = out_dir / "splits" / "test" / directory
+    assert sorted(path.name for path in (out_dir / "splits" / "test").iterdir()) == [directory]
+    manifest = tomllib.loads((target / "task.toml").read_text(encoding="utf-8"))
+    assert manifest["metadata"]["vals_datasets"]["id"] == task_id
+
+
+def test_split_rejects_native_ids_that_share_a_directory(tmp_path: Path) -> None:
+    out_dir = tmp_path / "out"
+    with pytest.raises(ValueError, match="Duplicate task directory"):
+        write_harbor_split(
+            {"app/task": harbor_task(tmp_path / "a"), "app task": harbor_task(tmp_path / "b")},
+            "test",
+            out_dir,
+        )
+    assert not out_dir.exists()
+
+
+def test_split_rejects_existing_vals_datasets_metadata_on_renamed_task(tmp_path: Path) -> None:
+    task = harbor_task(tmp_path / "task")
+    (task / "task.toml").write_text('[metadata.vals_datasets]\nid = "other"\n', encoding="utf-8")
+    with pytest.raises(ValueError, match="metadata.vals_datasets"):
+        write_harbor_split({"app/task": task}, "test", tmp_path / "out")
 
 
 @pytest.mark.parametrize("kind", ["root", "file", "directory", "broken", "required"])
@@ -197,7 +228,7 @@ def test_split_rejects_task_id_in_another_split(tmp_path: Path) -> None:
     task = harbor_task(tmp_path / "task")
     out_dir = tmp_path / "out"
     write_harbor_split({"task": task}, "train", out_dir)
-    with pytest.raises(ValueError, match="Duplicate task ID"):
+    with pytest.raises(ValueError, match="Duplicate task"):
         write_harbor_split({"task": task}, "test", out_dir)
     assert not (out_dir / "splits" / "test").exists()
 

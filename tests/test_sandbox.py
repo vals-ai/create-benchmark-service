@@ -4211,7 +4211,7 @@ async def test_daytona_provider_maps_gpu_resources() -> None:
 async def test_daytona_provider_passes_the_acceptable_gpu_types_it_offers_in_order() -> None:
     inner = InnerSandbox()
     daytona = CapturingCreateDaytonaClient(inner)
-    resources = Resources(vcpu=2, memory=4, disk=10, gpu=1, gpu_types=["A100", "nvidia-h100-80gb", "h200", "H100"])
+    resources = Resources(vcpu=2, memory=4, disk=10, gpu=1, gpu_type=["A100", "nvidia-h100-80gb", "h200", "H100"])
 
     await _provider(daytona).create_sandbox(_request(inner.name, resources=resources))
 

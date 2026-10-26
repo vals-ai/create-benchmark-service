@@ -47,7 +47,7 @@ def resolve_grading_spec(task: RetrieveTaskResponse) -> ResolvedSpec:
         )
     resources = spec.resources if spec is not None and spec.resources is not None else task.resources
     if isinstance(source, (SnapshotSource, TargetedSnapshotSource)):
-        resources = resources.model_copy(update={"gpu": 0, "gpu_type": None, "gpu_types": []})
+        resources = resources.model_copy(update={"gpu": 0, "gpu_type": None})
     if spec is None:
         return ResolvedSpec(
             source=source,

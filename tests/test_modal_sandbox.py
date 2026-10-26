@@ -826,14 +826,14 @@ async def test_create_sandbox_asks_modal_for_the_first_acceptable_gpu_type_it_kn
         return FakeInnerSandbox()
 
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
-    resources = Resources(vcpu=4, memory=8, disk=30, gpu=2, gpu_types=["rtx-4090", "nvidia-h100-80gb", "a100"])
+    resources = Resources(vcpu=4, memory=8, disk=30, gpu=2, gpu_type=["rtx-4090", "nvidia-h100-80gb", "a100"])
 
     await provider.create_sandbox(_request(resources=resources))
 
     assert captured["gpu"] == "H100:2"
 
 
-@pytest.mark.parametrize("gpu_type", [{}, {"gpu_type": ""}, {"gpu_type": "  "}, {"gpu_types": [""]}])
+@pytest.mark.parametrize("gpu_type", [{}, {"gpu_type": ""}, {"gpu_type": "  "}, {"gpu_type": [""]}])
 async def test_create_sandbox_requires_gpu_type_for_gpu(
     monkeypatch: pytest.MonkeyPatch, gpu_type: dict[str, Any]
 ) -> None:

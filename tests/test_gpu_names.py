@@ -86,20 +86,22 @@ class TestModalGpuType:
 
 
 class TestResourcesGpuTypes:
-    """A request names its acceptable GPU types one way or the other, and only with GPUs."""
-
     def test_the_acceptable_types_are_the_list_or_the_single_type(self) -> None:
-        assert Resources(vcpu=1, memory=1, disk=1, gpu=1, gpu_types=["H100", "A100"]).acceptable_gpu_types == [
+        assert Resources(vcpu=1, memory=1, disk=1, gpu=1, gpu_type=["H100", "A100"]).acceptable_gpu_types == [
             "H100",
             "A100",
         ]
         assert Resources(vcpu=1, memory=1, disk=1, gpu=1, gpu_type="H100").acceptable_gpu_types == ["H100"]
         assert Resources(vcpu=1, memory=1, disk=1).acceptable_gpu_types == []
+        assert Resources(vcpu=1, memory=1, disk=1, gpu_type=[]).acceptable_gpu_types == []
 
-    def test_a_list_and_a_single_type_together_are_refused(self) -> None:
-        with pytest.raises(ValueError, match="gpu_type or gpu_types, not both"):
-            Resources(vcpu=1, memory=1, disk=1, gpu=1, gpu_type="H100", gpu_types=["A100"])
+    def test_a_string_stays_a_string_and_a_list_stays_a_list_through_json(self) -> None:
+        single = Resources.model_validate_json('{"vcpu": 1, "memory": 1, "disk": 1, "gpu": 1, "gpu_type": "H100"}')
+        several = Resources.model_validate_json('{"vcpu": 1, "memory": 1, "disk": 1, "gpu": 1, "gpu_type": ["A100"]}')
+
+        assert (single.gpu_type, several.gpu_type) == ("H100", ["A100"])
+        assert (single.model_dump()["gpu_type"], several.model_dump()["gpu_type"]) == ("H100", ["A100"])
 
     def test_types_without_a_gpu_count_are_refused(self) -> None:
         with pytest.raises(ValueError, match="gpu_type requires gpu >= 1"):
-            Resources(vcpu=1, memory=1, disk=1, gpu_types=["H100"])
+            Resources(vcpu=1, memory=1, disk=1, gpu_type=["H100"])

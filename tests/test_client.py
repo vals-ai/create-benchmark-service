@@ -100,7 +100,7 @@ async def test_retrieve_task_accepts_legacy_shape(
 
     assert result.source.model_dump() == {"type": "image", "image": "python:3.12"}
     assert result.model_dump()["docker_image"] == "python:3.12"
-    assert result.resources.model_dump() == {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None, "gpu_types": []}
+    assert result.resources.model_dump() == {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None}
     assert result.agent_install_order == "before_setup"
     assert result.credited_generation is None
     assert result.egress.model_dump() == {"setup_task": "*", "run": None, "evaluation": "*"}
@@ -567,7 +567,7 @@ async def test_retrieve_task_tolerates_legacy_enable_docker_field(
 
     result = await client.retrieve_task("task-1")
 
-    assert result.resources.model_dump() == {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None, "gpu_types": []}
+    assert result.resources.model_dump() == {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None}
 
 
 async def test_retrieve_task_serializes_snapshot_source_for_legacy_clients(

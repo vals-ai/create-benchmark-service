@@ -18,7 +18,7 @@ from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL
 from benchmark_service.context import tenant_scope
 from benchmark_service.grading_credentials import GradingCredentials, current_grading_credentials, grading_credentials
-from benchmark_service.observability import ATTEMPT_ID_HEADER, RUN_ID_HEADER, TASK_ID_HEADER
+from benchmark_service.observability import ATTEMPT_ID_HEADER, EMAIL_HEADER, RUN_ID_HEADER, TASK_ID_HEADER
 from benchmark_service.schemas import EvaluateResponseRequest
 from tests.conftest import StubBenchmark
 
@@ -222,6 +222,17 @@ def test_evaluate_response_grades_with_a_token_for_the_callers_run(client: TestC
     assert response.json() == "mgwt_run-1"
     assert gateway.paths() == ["/service-auth", "/service-auth/revoke"]
     assert gateway.mint_body()["attempt_id"] == "attempt-1"
+    assert "email" not in gateway.mint_body()["identity"]
+
+
+def test_evaluate_response_names_the_callers_email_on_the_token(client: TestClient, gateway: FakeGateway) -> None:
+    response = client.post(
+        "/evaluate-response/",
+        json={"task_id": "task-1", "response": "2"},
+        headers={**HEADERS, EMAIL_HEADER: "starter@example.com"},
+    )
+    assert response.status_code == 200, response.text
+    assert gateway.mint_body()["identity"]["email"] == "starter@example.com"
 
 
 def test_evaluate_response_without_a_run_uses_the_service_key(client: TestClient, gateway: FakeGateway) -> None:

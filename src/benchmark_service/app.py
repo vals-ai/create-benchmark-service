@@ -20,7 +20,7 @@ from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_required
 from benchmark_service.base import BenchmarkService
 from benchmark_service.grading_credentials import grading_credentials
-from benchmark_service.observability import ATTEMPT_ID_HEADER, RUN_ID_HEADER
+from benchmark_service.observability import ATTEMPT_ID_HEADER, EMAIL_HEADER, RUN_ID_HEADER
 from benchmark_service.context import sandbox_provider_scope, tenant_scope
 from benchmark_service.sandbox.created import SandboxCreatedHook, sandbox_created_scope
 from benchmark_service.schemas import (
@@ -119,9 +119,12 @@ def _request_may_use_provider(config: SandboxProviderConfig | None) -> bool:
 
 
 def _grading_credentials(headers: Mapping[str, str], task_id: str) -> AbstractAsyncContextManager[None]:
-    """Gateway credentials for the run and attempt the caller names in its correlation headers."""
+    """Gateway credentials for the run, attempt and email the caller names in its correlation headers."""
     return grading_credentials(
-        run_id=headers.get(RUN_ID_HEADER), task_id=task_id, attempt_id=headers.get(ATTEMPT_ID_HEADER)
+        run_id=headers.get(RUN_ID_HEADER),
+        task_id=task_id,
+        attempt_id=headers.get(ATTEMPT_ID_HEADER),
+        email=headers.get(EMAIL_HEADER),
     )
 
 

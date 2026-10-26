@@ -39,6 +39,7 @@ from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.client import BenchmarkServiceClient, SandboxRecoveryAttempt
 from benchmark_service.observability import (
     ATTEMPT_ID_HEADER,
+    EMAIL_HEADER,
     RUN_ID_HEADER,
     TASK_ID_HEADER,
     correlation_scope,
@@ -654,3 +655,10 @@ def test_nested_run_scope_does_not_inherit_the_outer_attempt() -> None:
         with correlation_scope(run_id="inner-run", task_id="inner-task"):
             assert ATTEMPT_ID_HEADER not in request_headers({})
         assert request_headers({})[ATTEMPT_ID_HEADER] == "outer-attempt"
+
+
+def test_nested_run_scope_does_not_inherit_the_outer_email() -> None:
+    with correlation_scope(run_id="outer-run", email="outer@example.com"):
+        with correlation_scope(run_id="inner-run"):
+            assert EMAIL_HEADER not in request_headers({})
+        assert request_headers({})[EMAIL_HEADER] == "outer@example.com"

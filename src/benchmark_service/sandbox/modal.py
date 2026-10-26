@@ -767,9 +767,13 @@ class ModalSandboxProvider(SandboxProvider):
             raise SandboxError("Modal sandbox provider does not support filtering by creation time")
 
         client, app = await self._connect()
+        # A labelled query searches the whole environment: services start their own sandboxes (graders,
+        # evaluation workers) in other apps under the run's labels, and a force stop must find those too.
+        # An unlabelled query stays within this provider's app so it never lists unrelated sandboxes.
+        app_id = None if query.labels else app.app_id
         try:
             sandboxes: list[ModalSdkSandbox] = []
-            async for inner in ModalSdkSandbox.list.aio(app_id=app.app_id, tags=query.labels or None, client=client):
+            async for inner in ModalSdkSandbox.list.aio(app_id=app_id, tags=query.labels or None, client=client):
                 if await inner.poll.aio() is None:
                     sandboxes.append(inner)
             return sandboxes

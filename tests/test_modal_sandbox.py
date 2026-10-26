@@ -889,8 +889,27 @@ async def test_list_sandboxes_filters_by_labels(monkeypatch: pytest.MonkeyPatch)
 
     assert [sandbox.id for sandbox in sandboxes] == ["sb-123"]
     assert sandboxes[0].labels == {"run_id": "r1", "Task": "task-1"}
-    assert captured["app_id"] == "ap-1"
+    assert captured["app_id"] is None
     assert captured["tags"] == {"run_id": "r1"}
+
+
+async def test_list_sandboxes_without_labels_stays_in_the_app(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    def list_sandboxes(**kwargs: Any) -> AsyncGenerator[FakeInnerSandbox, None]:
+        captured.update(kwargs)
+
+        async def iterate() -> AsyncGenerator[FakeInnerSandbox, None]:
+            yield FakeInnerSandbox()
+
+        return iterate()
+
+    provider = _provider(monkeypatch, SimpleNamespace(list=_aio(list_sandboxes)))
+
+    _ = [sandbox async for sandbox in provider.list_sandboxes(SandboxQuery(labels={}))]
+
+    assert captured["app_id"] == "ap-1"
+    assert captured["tags"] is None
 
 
 async def test_list_sandboxes_rejects_creation_time_filter(monkeypatch: pytest.MonkeyPatch) -> None:

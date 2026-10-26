@@ -46,6 +46,7 @@ class V1Versions(BaseModel):
 class V1EvalRequest(BaseModel):
     run_id: str
     task_id: str
+    attempt_id: str | None = None
     dataset: str | None = None
     payload: V1Payload
     versions: V1Versions = Field(default_factory=V1Versions)

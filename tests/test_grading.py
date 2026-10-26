@@ -46,6 +46,7 @@ from benchmark_service.grading import (
 )
 from benchmark_service.base import BenchmarkService
 from benchmark_service.eval_resume import EvalResumeStore, GradingInput
+from benchmark_service.grading_credentials import grading_credentials
 from benchmark_service.sandbox import MissingSandboxConfigError, SandboxCreateRequest, SandboxProvider
 from benchmark_service.sandbox.types import ExecResult
 from benchmark_service.schemas import (
@@ -286,6 +287,19 @@ async def test_grade_instance_creates_isolated_sandbox_from_task_source_and_dele
     assert create.labels["tenant"] == "acme"
     assert create.labels["run-id"] == "run-1"
     assert provider.deleted == ["fake-sandbox"]
+
+
+async def test_grade_instance_hands_the_evaluation_gateway_credentials_to_the_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("MODEL_GATEWAY_URL", "https://gateway.test")
+    monkeypatch.setenv("MODEL_GATEWAY_API_KEY", "static-key")
+    monkeypatch.setenv("GRADING_MODELS", "anthropic/judge")
+    service = await SandboxStub.create()
+    provider = FakeProvider(FakeSandbox())
+    async with grading_credentials(run_id=None, task_id="task-1"):
+        await _grade(service, provider)
+    assert provider.created[0].env_vars == {"MODEL_GATEWAY_URL": "https://gateway.test", "MODEL_GATEWAY_API_KEY": "static-key"}
 
 
 class VolumeStub(SandboxStub):

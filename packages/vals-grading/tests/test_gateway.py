@@ -31,12 +31,12 @@ REGISTRY = {
 async def test_real_gateway_client_with_platform_access_blocked(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("MODEL_GATEWAY_URL", "https://gateway.test")
     monkeypatch.setenv("MODEL_GATEWAY_API_KEY", "test-key")
-    monkeypatch.setenv("IDENTITY", '{"service":"grading-test"}')
+    monkeypatch.setenv("IDENTITY", '{"service":"grading-test","agent_name":"snap-agent"}')
     requests: list[httpx.Request] = []
 
     def registry_send(self: httpx.Client, request: httpx.Request, **kwargs: Any) -> httpx.Response:
         requests.append(request)
-        assert str(request.url) == "https://gateway.test/registry"
+        assert str(request.url.copy_with(query=None)) == "https://gateway.test/registry"
         assert request.headers["authorization"] == "Bearer test-key"
         return httpx.Response(200, request=request, json=REGISTRY)
 
@@ -46,7 +46,8 @@ async def test_real_gateway_client_with_platform_access_blocked(monkeypatch: pyt
         assert request.headers["authorization"] == "Bearer test-key"
         body = json.loads(request.content)
         assert body["model"] == MODEL
-        assert body["identity"] == {"service": "grading-test"}
+        # The service identity is kept; the role is always the grader's, never the agent's.
+        assert body["identity"] == {"service": "grading-test", "agent_name": "grader"}
         assert body["config"]["temperature"] == 0
         assert body["config"]["top_p"] == 1
         assert body["config"]["max_tokens"] == 10000
@@ -55,7 +56,7 @@ async def test_real_gateway_client_with_platform_access_blocked(monkeypatch: pyt
 
     monkeypatch.setattr(httpx.Client, "send", registry_send)
     monkeypatch.setattr(httpx.AsyncClient, "send", query_send)
-    monkeypatch.setattr(register_models, "_model_registry", None)
+    monkeypatch.setattr(register_models, "_registries", None)
     model = GatewayJudgeModel(MODEL)
     saved = GradingCase(
         id="test",

@@ -47,7 +47,18 @@ class GradingCredentials:
         return {"MODEL_GATEWAY_URL": self.gateway_url, "MODEL_GATEWAY_API_KEY": self.api_key}
 
 
+@dataclass(frozen=True)
+class EvaluationCaller:
+    """The run, task, attempt and email the caller names for the in-flight evaluation."""
+
+    run_id: str
+    task_id: str
+    attempt_id: str | None
+    email: str | None
+
+
 _current: ContextVar[GradingCredentials | None] = ContextVar("benchmark_service_grading_credentials", default=None)
+_caller: ContextVar[EvaluationCaller | None] = ContextVar("benchmark_service_evaluation_caller", default=None)
 
 
 def _service_credentials() -> GradingCredentials | None:
@@ -63,6 +74,15 @@ def current_grading_credentials() -> GradingCredentials | None:
     read this instead of ``MODEL_GATEWAY_*`` so they use the evaluation's token.
     """
     return _current.get()
+
+
+def current_evaluation_caller() -> EvaluationCaller | None:
+    """The in-flight evaluation's caller, else None when the request names no run.
+
+    Services whose grader mints its own Gateway credentials (e.g. a remote eval
+    server) forward these so judge spend lands on the caller's run and email.
+    """
+    return _caller.get()
 
 
 def _identity(email: str | None) -> dict[str, object]:
@@ -129,6 +149,19 @@ async def grading_credentials(
     task that grades (stream finalizers, cleanup) has finished. A scope entered
     inside another reuses the enclosing credentials.
     """
+    caller = _caller.set(EvaluationCaller(run_id, task_id, attempt_id, email)) if run_id is not None else None
+    try:
+        async with _bind_credentials(run_id=run_id, task_id=task_id, attempt_id=attempt_id, email=email):
+            yield
+    finally:
+        if caller is not None:
+            _caller.reset(caller)
+
+
+@asynccontextmanager
+async def _bind_credentials(
+    *, run_id: str | None, task_id: str, attempt_id: str | None, email: str | None
+) -> AsyncIterator[None]:
     service = _service_credentials()
     models = [model.strip() for model in os.environ.get("GRADING_MODELS", "").split(",") if model.strip()]
     if _current.get() is not None or service is None or not models:

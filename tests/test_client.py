@@ -115,6 +115,8 @@ async def test_retrieve_task_accepts_legacy_shape(
         "evaluation": "*",
         "run_through_proxy": False,
         "sandbox_local_hosts": [],
+        "run_inspect": [],
+        "children": {},
     }
 
 
@@ -157,6 +159,8 @@ async def test_retrieve_task_accepts_explicit_egress_policies(
         "evaluation": [],
         "run_through_proxy": True,
         "sandbox_local_hosts": ["api", "supabase-kong.local"],
+        "run_inspect": [],
+        "children": {},
     }
     mock_http.get = AsyncMock(return_value=_mock_response(json_data=payload))
 
@@ -195,6 +199,8 @@ def test_benchmark_egress_plan_serializes_explicit_stage_policies(
         "evaluation": evaluation,
         "run_through_proxy": False,
         "sandbox_local_hosts": [],
+        "run_inspect": [],
+        "children": {},
     }
 
 
@@ -1581,9 +1587,9 @@ CHILD_EGRESS = ChildEgress(
 )
 
 
-@pytest.mark.parametrize("child_egress", [None, CHILD_EGRESS], ids=["omitted", "sent"])
+@pytest.mark.parametrize("child_egress", [None, {"gpu": CHILD_EGRESS}], ids=["omitted", "sent"])
 async def test_setup_task_sends_child_egress_only_when_given(
-    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock], child_egress: ChildEgress | None
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock], child_egress: dict[str, ChildEgress] | None
 ) -> None:
     client, _ = benchmark_client
     ws_connect = _ws_mock([json.dumps({"type": "result", "data": {"status": "ok"}})])
@@ -1592,7 +1598,7 @@ async def test_setup_task_sends_child_egress_only_when_given(
         await client.setup_task("task-1", "i-1", sandbox_provider=DAYTONA_CONFIG, child_egress=child_egress)
 
     sent = json.loads((await ws_connect.__aenter__()).send.call_args.args[0])
-    assert sent.get("child_egress") == (None if child_egress is None else child_egress.model_dump())
+    assert sent.get("child_egress") == (None if child_egress is None else {"gpu": CHILD_EGRESS.model_dump()})
 
 
 async def test_evaluate_instance_sends_child_egress(benchmark_client: tuple[BenchmarkServiceClient, AsyncMock]) -> None:
@@ -1600,10 +1606,12 @@ async def test_evaluate_instance_sends_child_egress(benchmark_client: tuple[Benc
     ws_connect = _ws_mock([json.dumps({"type": "result", "data": {"score": 1.0}})])
 
     with patch("benchmark_service.client.websockets.connect", return_value=ws_connect):
-        await client.evaluate_instance("task-1", "i-1", sandbox_provider=DAYTONA_CONFIG, child_egress=CHILD_EGRESS)
+        await client.evaluate_instance(
+            "task-1", "i-1", sandbox_provider=DAYTONA_CONFIG, child_egress={"judge": CHILD_EGRESS}
+        )
 
     sent = json.loads((await ws_connect.__aenter__()).send.call_args.args[0])
-    assert ChildEgress.model_validate(sent["child_egress"]) == CHILD_EGRESS
+    assert ChildEgress.model_validate(sent["child_egress"]["judge"]) == CHILD_EGRESS
 
 
 def test_child_egress_environment_points_clients_at_the_proxy_and_gateway() -> None:
@@ -1618,3 +1626,11 @@ def test_child_egress_environment_points_clients_at_the_proxy_and_gateway() -> N
 
 def test_child_egress_keeps_credentials_out_of_its_repr() -> None:
     assert "token" not in repr(CHILD_EGRESS).replace("gateway_token", "")
+
+
+def test_child_profiles_need_simple_names() -> None:
+    plan = BenchmarkEgressPlan.model_validate({"children": {"gpu-1": {"egress": ["pypi.org"], "models": ["a/b"]}}})
+
+    assert plan.children["gpu-1"].models == ["a/b"]
+    with pytest.raises(ValidationError):
+        BenchmarkEgressPlan.model_validate({"children": {"GPU box": {}}})

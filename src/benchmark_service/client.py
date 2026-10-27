@@ -676,7 +676,7 @@ class BenchmarkServiceClient:
         sandbox_provider: SandboxProviderConfig | None = None,
         on_message: Callable[[str], None] | None = None,
         dataset: str | None = None,
-        child_egress: ChildEgress | None = None,
+        child_egress: dict[str, ChildEgress] | None = None,
     ) -> SetupTaskResponse:
         """Set up a task instance via WebSocket.
 
@@ -691,7 +691,7 @@ class BenchmarkServiceClient:
             instance_id=instance_id,
             sandbox_provider=sandbox_provider,
             dataset=dataset,
-            child_egress=child_egress,
+            child_egress=child_egress or {},
         )
         result = await self._websocket_request("setup-task", request, on_message)
         return SetupTaskResponse.model_validate(result)
@@ -703,7 +703,7 @@ class BenchmarkServiceClient:
         response: str,
         dataset: str | None = None,
         sandbox_provider: SandboxProviderConfig | None = None,
-        child_egress: ChildEgress | None = None,
+        child_egress: dict[str, ChildEgress] | None = None,
     ) -> Any:
         """Evaluate a text response without a live sandbox.
 
@@ -718,7 +718,7 @@ class BenchmarkServiceClient:
             response=response,
             sandbox_provider=sandbox_provider,
             dataset=dataset,
-            child_egress=child_egress,
+            child_egress=child_egress or {},
         )
         body = request.model_dump(exclude_none=True)
 
@@ -742,7 +742,7 @@ class BenchmarkServiceClient:
         sandbox_provider: SandboxProviderConfig | None = None,
         instance_id: str | None = None,
         on_sandbox_created: Callable[[SandboxCreatedData], None] | None = None,
-        child_egress: ChildEgress | None = None,
+        child_egress: dict[str, ChildEgress] | None = None,
     ) -> JsonValue:
         """Resume evaluation from state previously streamed by the benchmark service.
 
@@ -757,7 +757,7 @@ class BenchmarkServiceClient:
             instance_id=instance_id,
             dataset=dataset,
             announce_sandboxes=on_sandbox_created is not None,
-            child_egress=child_egress,
+            child_egress=child_egress or {},
         )
         return await self._websocket_request(
             "evaluate-response", request, on_message, on_eval_resume_state, on_sandbox_created
@@ -772,7 +772,7 @@ class BenchmarkServiceClient:
         dataset: str | None = None,
         on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
         on_sandbox_created: Callable[[SandboxCreatedData], None] | None = None,
-        child_egress: ChildEgress | None = None,
+        child_egress: dict[str, ChildEgress] | None = None,
     ) -> JsonValue:
         """Evaluate a task instance via WebSocket.
 
@@ -788,7 +788,7 @@ class BenchmarkServiceClient:
             sandbox_provider=sandbox_provider,
             dataset=dataset,
             announce_sandboxes=on_sandbox_created is not None,
-            child_egress=child_egress,
+            child_egress=child_egress or {},
         )
         return await self._websocket_request(
             "evaluate-instance", request, on_message, on_eval_resume_state, on_sandbox_created

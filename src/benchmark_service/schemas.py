@@ -203,7 +203,16 @@ SandboxLocalHost = Annotated[
         pattern=r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$",
     ),
 ]
+ChildProfileName = Annotated[str, StringConstraints(pattern=r"^[a-z0-9][a-z0-9-]{0,31}$")]
 AgentInstallOrder = Literal["before_setup", "after_setup"]
+
+
+class ChildPolicy(BaseModel):
+    """Network and model access for one kind of sandbox a benchmark creates for each task attempt."""
+
+    egress: EgressPolicy = []
+    inspect: list[str] = Field(default=[], description="Hosts the proxy decrypts and holds to GET/HEAD")
+    models: list[str] = Field(default=[], description="Gateway models a token for these sandboxes may call")
 
 
 class BenchmarkEgressPlan(BaseModel):
@@ -214,12 +223,14 @@ class BenchmarkEgressPlan(BaseModel):
     evaluation: EgressPolicy = "*"
     run_through_proxy: bool = False
     sandbox_local_hosts: list[SandboxLocalHost] = []
+    run_inspect: list[str] = Field(default=[], description="Hosts the proxy decrypts and holds to GET/HEAD")
+    children: dict[ChildProfileName, ChildPolicy] = {}
 
 
 class ChildEgress(BaseModel):
-    """The caller's egress proxy access for sandboxes a benchmark creates for one task attempt.
+    """The caller's egress proxy access for one child profile of a task attempt.
 
-    The proxy enforces the attempt's run policy, and the caller revokes this access when the attempt ends.
+    The proxy enforces the profile's policy, and the caller revokes this access when the attempt ends.
     """
 
     proxy_url: str = Field(repr=False, description="https://<key>:<token>@<host>:<port>")
@@ -342,10 +353,10 @@ class SetupTaskRequest(BaseModel):
     instance_id: str = Field(description="Unique identifier for the sandbox instance")
     sandbox_provider: SandboxProviderConfig | None = Field(default=None, description="Sandbox provider config")
     dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
-    child_egress: ChildEgress | None = Field(
-        default=None,
-        exclude_if=lambda value: value is None,
-        description="Proxy access for sandboxes the service creates for this attempt; older clients omit it",
+    child_egress: dict[str, ChildEgress] = Field(
+        default={},
+        exclude_if=lambda value: not value,
+        description="Proxy access by child profile for sandboxes the service creates; older clients omit it",
     )
 
 
@@ -384,10 +395,10 @@ class EvaluateResponseRequest(BaseModel):
         exclude_if=lambda value: not value,
         description="Stream a sandbox_created chunk for each sandbox the service creates; older clients omit it",
     )
-    child_egress: ChildEgress | None = Field(
-        default=None,
-        exclude_if=lambda value: value is None,
-        description="Proxy access for sandboxes the service creates for this attempt; older clients omit it",
+    child_egress: dict[str, ChildEgress] = Field(
+        default={},
+        exclude_if=lambda value: not value,
+        description="Proxy access by child profile for sandboxes the service creates; older clients omit it",
     )
 
     @model_validator(mode="after")
@@ -413,10 +424,10 @@ class EvaluateInstanceRequest(BaseModel):
         exclude_if=lambda value: not value,
         description="Stream a sandbox_created chunk for each sandbox the service creates; older clients omit it",
     )
-    child_egress: ChildEgress | None = Field(
-        default=None,
-        exclude_if=lambda value: value is None,
-        description="Proxy access for sandboxes the service creates for this attempt; older clients omit it",
+    child_egress: dict[str, ChildEgress] = Field(
+        default={},
+        exclude_if=lambda value: not value,
+        description="Proxy access by child profile for sandboxes the service creates; older clients omit it",
     )
 
 

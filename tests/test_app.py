@@ -137,6 +137,8 @@ def test_retrieve_task(client: TestClient) -> None:
         "evaluation": "*",
         "run_through_proxy": False,
         "sandbox_local_hosts": [],
+        "run_inspect": [],
+        "children": {},
     }
     assert data["credited_generation"] is None
 
@@ -220,6 +222,8 @@ def test_retrieve_task_explicit_egress_policies(monkeypatch: pytest.MonkeyPatch)
         "evaluation": [],
         "run_through_proxy": True,
         "sandbox_local_hosts": ["api", "db"],
+        "run_inspect": [],
+        "children": {},
     }
 
 
@@ -936,11 +940,11 @@ def test_websocket_binds_the_requests_child_egress(monkeypatch: pytest.MonkeyPat
 
     class ChildEgressBenchmark(StubBenchmark):
         async def setup_task(self, task_id: str, sandbox: Sandbox, dataset: str | None = None):
-            egress = current_child_egress()
+            egress = current_child_egress("gpu")
             yield StreamResultChunk(type="result", data={"proxy_url": egress.proxy_url if egress else None})
 
         async def evaluate_instance(self, task_id: str, sandbox: Sandbox, dataset: str | None = None):
-            egress = current_child_egress()
+            egress = current_child_egress("gpu")
             yield StreamResultChunk(type="result", data={"proxy_url": egress.proxy_url if egress else None})
 
     def create_provider(_config: ModalProviderConfig) -> SandboxProvider:
@@ -956,9 +960,9 @@ def test_websocket_binds_the_requests_child_egress(monkeypatch: pytest.MonkeyPat
                     "task_id": "task-1",
                     "instance_id": "i-1",
                     "sandbox_provider": {"type": "modal", "MODAL_TOKEN_ID": "id", "MODAL_TOKEN_SECRET": "secret"},
-                    "child_egress": child_egress,
+                    "child_egress": {"gpu": child_egress},
                 }
             )
             assert ws.receive_json() == {"type": "result", "data": {"proxy_url": child_egress["proxy_url"]}}
 
-    assert current_child_egress() is None
+    assert current_child_egress("gpu") is None

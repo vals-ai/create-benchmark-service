@@ -16,7 +16,7 @@ as ``benchmark_service.eval_resume`` can keep each tenant's objects apart.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import Context, ContextVar, copy_context
 
@@ -33,11 +33,9 @@ _current_sandbox_provider: ContextVar[SandboxProvider | None] = ContextVar(
 
 _current_tenant: ContextVar[str | None] = ContextVar("benchmark_service_tenant", default=None)
 
-_current_child_egress: ContextVar[ChildEgress | None] = ContextVar("benchmark_service_child_egress", default=None)
+_current_child_egress: ContextVar[Mapping[str, ChildEgress]] = ContextVar("benchmark_service_child_egress", default={})
 
-_current_grading_sandbox_id: ContextVar[str | None] = ContextVar(
-    "benchmark_service_grading_sandbox_id", default=None
-)
+_current_grading_sandbox_id: ContextVar[str | None] = ContextVar("benchmark_service_grading_sandbox_id", default=None)
 
 
 def current_sandbox_provider() -> SandboxProvider | None:
@@ -70,13 +68,13 @@ def tenant_scope(tenant: str | None) -> Iterator[None]:
         _current_tenant.reset(token)
 
 
-def current_child_egress() -> ChildEgress | None:
-    """Return the in-flight request's proxy access for sandboxes the service creates, or None."""
-    return _current_child_egress.get()
+def current_child_egress(profile: str) -> ChildEgress | None:
+    """Return the in-flight request's proxy access for a child profile, or None when the caller sent none."""
+    return _current_child_egress.get().get(profile)
 
 
 @contextmanager
-def child_egress_scope(child_egress: ChildEgress | None) -> Iterator[None]:
+def child_egress_scope(child_egress: Mapping[str, ChildEgress]) -> Iterator[None]:
     """Bind the request's child egress for the duration of one request."""
     token = _current_child_egress.set(child_egress)
     try:

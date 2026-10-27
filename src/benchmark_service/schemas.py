@@ -216,6 +216,27 @@ class BenchmarkEgressPlan(BaseModel):
     sandbox_local_hosts: list[SandboxLocalHost] = []
 
 
+class ChildEgress(BaseModel):
+    """The caller's egress proxy access for sandboxes a benchmark creates for one task attempt.
+
+    The proxy enforces the attempt's run policy, and the caller revokes this access when the attempt ends.
+    """
+
+    proxy_url: str = Field(repr=False, description="https://<key>:<token>@<host>:<port>")
+    proxy_cidrs: list[str] = Field(description="Addresses a sandbox must be allowed to reach to use the proxy")
+    ca_certificate: str = Field(description="PEM CA the proxy signs inspected TLS with")
+    gateway_url: str | None = None
+    gateway_token: str | None = Field(default=None, repr=False)
+
+    def environment(self) -> dict[str, str]:
+        """Proxy and gateway settings for a process; trusting `ca_certificate` is the caller's job."""
+        environment = {name: self.proxy_url for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")}
+        environment |= {name: "localhost,127.0.0.1,::1" for name in ("NO_PROXY", "no_proxy")}
+        if self.gateway_url is not None and self.gateway_token is not None:
+            environment |= {"MODEL_GATEWAY_URL": self.gateway_url, "MODEL_GATEWAY_API_KEY": self.gateway_token}
+        return environment
+
+
 class CreditedGeneration(BaseModel):
     """Tracker-owned generation allowance and optional stage reporting protocol."""
 
@@ -321,6 +342,11 @@ class SetupTaskRequest(BaseModel):
     instance_id: str = Field(description="Unique identifier for the sandbox instance")
     sandbox_provider: SandboxProviderConfig | None = Field(default=None, description="Sandbox provider config")
     dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
+    child_egress: ChildEgress | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="Proxy access for sandboxes the service creates for this attempt; older clients omit it",
+    )
 
 
 class SetupTaskResponse(BaseModel):
@@ -358,6 +384,11 @@ class EvaluateResponseRequest(BaseModel):
         exclude_if=lambda value: not value,
         description="Stream a sandbox_created chunk for each sandbox the service creates; older clients omit it",
     )
+    child_egress: ChildEgress | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="Proxy access for sandboxes the service creates for this attempt; older clients omit it",
+    )
 
     @model_validator(mode="after")
     def require_one_eval_input(self) -> "EvaluateResponseRequest":
@@ -381,6 +412,11 @@ class EvaluateInstanceRequest(BaseModel):
         default=False,
         exclude_if=lambda value: not value,
         description="Stream a sandbox_created chunk for each sandbox the service creates; older clients omit it",
+    )
+    child_egress: ChildEgress | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="Proxy access for sandboxes the service creates for this attempt; older clients omit it",
     )
 
 

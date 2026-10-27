@@ -21,7 +21,7 @@ from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_requ
 from benchmark_service.base import BenchmarkService
 from benchmark_service.grading_credentials import grading_credentials
 from benchmark_service.observability import ATTEMPT_ID_HEADER, EMAIL_HEADER, RUN_ID_HEADER
-from benchmark_service.context import sandbox_provider_scope, tenant_scope
+from benchmark_service.context import child_egress_scope, sandbox_provider_scope, tenant_scope
 from benchmark_service.sandbox.created import SandboxCreatedHook, sandbox_created_scope
 from benchmark_service.schemas import (
     DATASET_VERSION_HEADER,
@@ -450,11 +450,12 @@ class BenchmarkServiceApp(FastAPI):
                 async with sandbox_config.create_provider() as provider:
                     sandbox = await provider.get_sandbox(request.instance_id)
 
-                    await _forward_stream(
-                        websocket,
-                        self.service.setup_task(request.task_id, sandbox, dataset=request.dataset),
-                        endpoint="setup-task",
-                    )
+                    with child_egress_scope(request.child_egress):
+                        await _forward_stream(
+                            websocket,
+                            self.service.setup_task(request.task_id, sandbox, dataset=request.dataset),
+                            endpoint="setup-task",
+                        )
 
     async def _evaluate_response(self, request: Request, body: EvaluateResponseRequest) -> Any:
         if self._sentry is not None:
@@ -464,7 +465,8 @@ class BenchmarkServiceApp(FastAPI):
         async with self._dataset_scope(request, request.state.tenant, body.dataset):
             await self.consume_evaluation_request(cast(str, request.state.tenant))
             async with _grading_credentials(request.headers, body.task_id):
-                return await self.service.evaluate_response(body, dataset=body.dataset)
+                with child_egress_scope(body.child_egress):
+                    return await self.service.evaluate_response(body, dataset=body.dataset)
 
     async def _evaluate_response_stream(self, websocket: WebSocket) -> None:
         await websocket.accept()
@@ -491,6 +493,7 @@ class BenchmarkServiceApp(FastAPI):
                     ) as provider:
                         with (
                             sandbox_provider_scope(provider),
+                            child_egress_scope(request.child_egress),
                             sandbox_created_scope(
                                 _sandbox_created_hook(websocket) if request.announce_sandboxes else None
                             ),
@@ -533,6 +536,7 @@ class BenchmarkServiceApp(FastAPI):
                     async with _grading_credentials(websocket.headers, request.task_id):
                         with (
                             sandbox_provider_scope(provider),
+                            child_egress_scope(request.child_egress),
                             sandbox_created_scope(
                                 _sandbox_created_hook(websocket) if request.announce_sandboxes else None
                             ),

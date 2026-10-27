@@ -736,7 +736,8 @@ Pydantic models used across requests and responses:
 - **`SandboxProviderConfig`** — request-scoped provider config selected by `type`: `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET, DAYTONA_ORGANIZATION_ID=None)`, `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)`, or `DockerProviderConfig(type="docker")`. Docker requests require `CBS_DOCKER_ENABLED=true` on the benchmark service.
 - **`Resources`** — `vcpu`, `memory`, `disk`, optional `gpu` (count, default 0) and `gpu_type` (requires `gpu >= 1`)
 - **`VolumeMount`** — named persistent volume, absolute `mount_path`, optional `read_only`, `create_if_missing`, and relative `subpath`; `{run_id}` in a subpath resolves from the sandbox's `run-id` or `run_id` label and fails when that label is absent
-- **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, optional `sandbox_provider` with Daytona header fallback, `dataset`
+- **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, optional `sandbox_provider` with Daytona header fallback, `dataset`, optional `child_egress`
+- **`ChildEgress`** — the caller's proxy URL with a per-attempt credential, proxy CIDRs, CA certificate, and optional gateway URL and run token for sandboxes the service creates; read it with `current_child_egress()` during setup or evaluation
 - **`EvaluateResponseRequest`** — `task_id`, `response` or `eval_resume_state`, optional `sandbox_provider`, optional caller-owned `instance_id` for resume, `dataset`
 - **`FinalScoreResult`** / **`FinalScoreResponse`** — `score` (float), `metadata`, `tasks_evaluated`
 - **`TaskFilter`** — `task_ids` list or `slice_str`; `parse_slice()` converts `"start:stop:step"` to a Python `slice`

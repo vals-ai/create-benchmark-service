@@ -20,13 +20,20 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import Context, ContextVar, copy_context
 
+from typing import TYPE_CHECKING
+
 from benchmark_service.sandbox import SandboxProvider
+
+if TYPE_CHECKING:
+    from benchmark_service.schemas import ChildEgress
 
 _current_sandbox_provider: ContextVar[SandboxProvider | None] = ContextVar(
     "benchmark_service_sandbox_provider", default=None
 )
 
 _current_tenant: ContextVar[str | None] = ContextVar("benchmark_service_tenant", default=None)
+
+_current_child_egress: ContextVar[ChildEgress | None] = ContextVar("benchmark_service_child_egress", default=None)
 
 _current_grading_sandbox_id: ContextVar[str | None] = ContextVar(
     "benchmark_service_grading_sandbox_id", default=None
@@ -61,6 +68,21 @@ def tenant_scope(tenant: str | None) -> Iterator[None]:
         yield
     finally:
         _current_tenant.reset(token)
+
+
+def current_child_egress() -> ChildEgress | None:
+    """Return the in-flight request's proxy access for sandboxes the service creates, or None."""
+    return _current_child_egress.get()
+
+
+@contextmanager
+def child_egress_scope(child_egress: ChildEgress | None) -> Iterator[None]:
+    """Bind the request's child egress for the duration of one request."""
+    token = _current_child_egress.set(child_egress)
+    try:
+        yield
+    finally:
+        _current_child_egress.reset(token)
 
 
 def current_grading_sandbox_id() -> str | None:

@@ -32,7 +32,13 @@ from benchmark_service.client import (
 )
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
-from benchmark_service.schemas import BenchmarkEgressPlan, EgressPolicy, HealthCheckResponse, RetrieveTaskResponse
+from benchmark_service.schemas import (
+    BenchmarkEgressPlan,
+    ChildEgress,
+    EgressPolicy,
+    HealthCheckResponse,
+    RetrieveTaskResponse,
+)
 from benchmark_service.v1_schemas import (
     V1DatasetTasksResponse,
     V1EvalResponse,
@@ -1564,3 +1570,51 @@ async def test_client_v1_mutations_do_not_retry_after_response_transport_failure
         await getattr(client, method)(**kwargs)
 
     mock_http.post.assert_awaited_once()
+
+
+CHILD_EGRESS = ChildEgress(
+    proxy_url="https://key:token@proxy.example:3128",
+    proxy_cidrs=["192.0.2.1/32"],
+    ca_certificate="certificate",
+    gateway_url="https://gw.example",
+    gateway_token="run-token",
+)
+
+
+@pytest.mark.parametrize("child_egress", [None, CHILD_EGRESS], ids=["omitted", "sent"])
+async def test_setup_task_sends_child_egress_only_when_given(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock], child_egress: ChildEgress | None
+) -> None:
+    client, _ = benchmark_client
+    ws_connect = _ws_mock([json.dumps({"type": "result", "data": {"status": "ok"}})])
+
+    with patch("benchmark_service.client.websockets.connect", return_value=ws_connect):
+        await client.setup_task("task-1", "i-1", sandbox_provider=DAYTONA_CONFIG, child_egress=child_egress)
+
+    sent = json.loads((await ws_connect.__aenter__()).send.call_args.args[0])
+    assert sent.get("child_egress") == (None if child_egress is None else child_egress.model_dump())
+
+
+async def test_evaluate_instance_sends_child_egress(benchmark_client: tuple[BenchmarkServiceClient, AsyncMock]) -> None:
+    client, _ = benchmark_client
+    ws_connect = _ws_mock([json.dumps({"type": "result", "data": {"score": 1.0}})])
+
+    with patch("benchmark_service.client.websockets.connect", return_value=ws_connect):
+        await client.evaluate_instance("task-1", "i-1", sandbox_provider=DAYTONA_CONFIG, child_egress=CHILD_EGRESS)
+
+    sent = json.loads((await ws_connect.__aenter__()).send.call_args.args[0])
+    assert ChildEgress.model_validate(sent["child_egress"]) == CHILD_EGRESS
+
+
+def test_child_egress_environment_points_clients_at_the_proxy_and_gateway() -> None:
+    environment = CHILD_EGRESS.environment()
+
+    assert environment["HTTPS_PROXY"] == environment["http_proxy"] == "https://key:token@proxy.example:3128"
+    assert environment["NO_PROXY"] == "localhost,127.0.0.1,::1"
+    assert environment["MODEL_GATEWAY_URL"] == "https://gw.example"
+    assert environment["MODEL_GATEWAY_API_KEY"] == "run-token"
+    assert "MODEL_GATEWAY_URL" not in CHILD_EGRESS.model_copy(update={"gateway_token": None}).environment()
+
+
+def test_child_egress_keeps_credentials_out_of_its_repr() -> None:
+    assert "token" not in repr(CHILD_EGRESS).replace("gateway_token", "")

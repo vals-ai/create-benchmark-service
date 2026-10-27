@@ -213,7 +213,6 @@ class BenchmarkEgressPlan(BaseModel):
     run: EgressPolicy | None = None
     evaluation: EgressPolicy = "*"
     run_through_proxy: bool = False
-    # Hosts inside the sandbox (compose service names) the run stage reaches directly, not via the proxy.
     sandbox_local_hosts: list[SandboxLocalHost] = []
 
 

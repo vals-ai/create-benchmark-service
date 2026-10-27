@@ -7,9 +7,10 @@ import inspect
 import logging
 import os
 import time
-from collections.abc import Awaitable, Callable, Generator
+from collections.abc import AsyncIterator, Awaitable, Callable, Generator
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass, field
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
 from uuid import uuid4
 
 import httpx
@@ -21,8 +22,10 @@ from tenacity import (
     stop_after_attempt,
     wait_random,
 )
-from websockets.exceptions import ConnectionClosed
+from websockets.asyncio.client import ClientConnection
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
+from benchmark_service.draining import DRAIN_HEADER
 from benchmark_service.observability import correlation_scope, request_headers, websocket_request_span
 from benchmark_service.sandbox import SandboxNotFoundError, SandboxProvider, SandboxProviderConfig
 from benchmark_service.schemas import (
@@ -90,6 +93,8 @@ _DEFAULT_WS_IDLE_TIMEOUT_S = 3600.0
 _HEALTH_PROBE_TIMEOUT_S = 5.0
 # Distinguishes "caller passed None to disable" from "caller said nothing".
 _UNSET_WS_IDLE_TIMEOUT: float = -1.0
+_DRAIN_RETRY_WINDOW_S = 60.0
+_DRAIN_RETRY_DELAY_S = 1.0
 
 
 def _default_ws_idle_timeout_s() -> float | None:
@@ -351,14 +356,42 @@ class BenchmarkServiceClient:
         )
         self._ws_idle_timeout_s = idle_timeout if idle_timeout is None or idle_timeout > 0 else None
         self._sandbox_providers = {}
-        self._http_client = httpx.AsyncClient(
+        self._http_client = self._new_http_client()
+
+    def _new_http_client(self, *, fresh_connections: bool = False) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
             auth=_TelemetryAuth(),
             follow_redirects=True,
-            timeout=timeout,
+            timeout=self._timeout,
             headers=self._headers,
-            limits=httpx.Limits(max_connections=200),
+            limits=httpx.Limits(max_connections=200, max_keepalive_connections=0 if fresh_connections else 20),
             event_hooks={"response": [self._check_dataset_version]},
         )
+
+    async def _http_request(self, method: Literal["GET", "POST"], url: str, **kwargs: Any) -> httpx.Response:
+        async def send(client: httpx.AsyncClient) -> httpx.Response:
+            if method == "GET":
+                return await client.get(url, **kwargs)
+            return await client.post(url, **kwargs)
+
+        response = await send(self._http_client)
+        if response.status_code != 503 or response.headers.get(DRAIN_HEADER) != "1":
+            return response
+        deadline = time.monotonic() + _DRAIN_RETRY_WINDOW_S
+        # This client owns no other requests. Do not close the shared pool,
+        # which may contain an unrelated grading that is still in progress.
+        async with self._new_http_client(fresh_connections=True) as fresh:
+            while response.status_code == 503 and response.headers.get(DRAIN_HEADER) == "1":
+                remaining = deadline - time.monotonic()
+                if remaining <= _DRAIN_RETRY_DELAY_S:
+                    return response
+                await response.aclose()
+                await asyncio.sleep(_DRAIN_RETRY_DELAY_S)
+                # Bound the start of retries, not the duration of accepted work.
+                if time.monotonic() >= deadline:
+                    return response
+                response = await send(fresh)
+        return response
 
     async def _check_dataset_version(self, response: httpx.Response) -> None:
         if self._dataset_version is None or not response.is_success:
@@ -392,6 +425,41 @@ class BenchmarkServiceClient:
     def _ws_url(self) -> str:
         return self._url.replace("http://", "ws://").replace("https://", "wss://")
 
+    @asynccontextmanager
+    async def _connect_websocket(self, path: str, headers: dict[str, str]) -> AsyncIterator[ClientConnection]:
+        deadline = time.monotonic() + _DRAIN_RETRY_WINDOW_S
+        open_timeout = 60.0
+        while True:
+            async with AsyncExitStack() as stack:
+                try:
+                    websocket = await stack.enter_async_context(
+                        websockets.connect(
+                            f"{self._ws_url}/ws/{path}",
+                            additional_headers=headers,
+                            open_timeout=open_timeout,
+                            ping_interval=_WS_PING_INTERVAL_S,
+                            ping_timeout=_WS_PING_TIMEOUT_S,
+                            max_size=10 * 1024 * 1024,
+                        )
+                    )
+                except InvalidStatus as exc:
+                    remaining = deadline - time.monotonic()
+                    if (
+                        exc.response.status_code != 503
+                        or exc.response.headers.get(DRAIN_HEADER) != "1"
+                        or remaining <= _DRAIN_RETRY_DELAY_S
+                    ):
+                        raise
+                    await asyncio.sleep(_DRAIN_RETRY_DELAY_S)
+                    open_timeout = deadline - time.monotonic()
+                    if open_timeout <= 0:
+                        raise
+                    continue
+                # Exceptions after this point cannot restart the request. In
+                # particular, a sent evaluation payload must never be replayed.
+                yield websocket
+                return
+
     async def _websocket_request(
         self,
         path: str,
@@ -421,14 +489,7 @@ class BenchmarkServiceClient:
         """
         operation = f"WEBSOCKET /ws/{path}"
         with websocket_request_span(operation, self._headers) as headers:
-            async with websockets.connect(
-                f"{self._ws_url}/ws/{path}",
-                additional_headers=headers,
-                open_timeout=60,
-                ping_interval=_WS_PING_INTERVAL_S,
-                ping_timeout=_WS_PING_TIMEOUT_S,
-                max_size=10 * 1024 * 1024,  # 10MB
-            ) as websocket:
+            async with self._connect_websocket(path, headers) as websocket:
                 last_message_at = time.monotonic()
                 acknowledged = self._dataset_version is None
 
@@ -500,7 +561,7 @@ class BenchmarkServiceClient:
     @_retry_http
     async def health_check(self) -> HealthCheckResponse:
         """Check if the benchmark service is healthy."""
-        response = await self._http_client.get(f"{self._url}/health")
+        response = await self._http_request("GET", f"{self._url}/health")
 
         _require_ok(response, "Health check")
 
@@ -510,9 +571,9 @@ class BenchmarkServiceClient:
     async def version(self, dataset: str | None = None) -> VersionResponse:
         """Fetch framework and benchmark service version metadata."""
         response = (
-            await self._http_client.get(f"{self._url}/version", params={"dataset": dataset})
+            await self._http_request("GET", f"{self._url}/version", params={"dataset": dataset})
             if dataset is not None
-            else await self._http_client.get(f"{self._url}/version")
+            else await self._http_request("GET", f"{self._url}/version")
         )
 
         _require_ok(response, "Version check")
@@ -522,7 +583,7 @@ class BenchmarkServiceClient:
     @_retry_http
     async def list_datasets(self) -> ListDatasetsResponse:
         """List dataset names visible to this caller, independently of a version pin."""
-        response = await self._http_client.get(f"{self._url}/v1/datasets")
+        response = await self._http_request("GET", f"{self._url}/v1/datasets")
         if response.status_code == 401:
             raise _unauthenticated_error(response)
         if response.status_code != 200:
@@ -538,7 +599,7 @@ class BenchmarkServiceClient:
         if self._dataset_version is not None:
             raise ValueError("Resolve a dataset with an unpinned client")
         body = ResolveDatasetRequest(dataset=dataset, version=version)
-        response = await self._http_client.post(f"{self._url}/resolve-dataset", json=body.model_dump())
+        response = await self._http_request("POST", f"{self._url}/resolve-dataset", json=body.model_dump())
         _require_ok(response, "Dataset resolution")
         resolved = ResolveDatasetResponse.model_validate(response.json())
         if resolved.dataset != dataset:
@@ -563,7 +624,7 @@ class BenchmarkServiceClient:
         if dataset is not None:
             params["dataset"] = dataset
 
-        response = await self._http_client.get(f"{self._url}/verify-task-ids", params=params)
+        response = await self._http_request("GET", f"{self._url}/verify-task-ids", params=params)
 
         _require_ok(response, "Verify task ids")
 
@@ -582,7 +643,7 @@ class BenchmarkServiceClient:
         params: dict[str, Any] = {"task_id": task_id, "skip_validation": skip_validation}
         if dataset is not None:
             params["dataset"] = dataset
-        response = await self._http_client.get(f"{self._url}/retrieve-task/", params=params)
+        response = await self._http_request("GET", f"{self._url}/retrieve-task/", params=params)
 
         _require_ok(response, "Retrieve task")
 
@@ -722,7 +783,8 @@ class BenchmarkServiceClient:
         )
         body = request.model_dump(exclude_none=True)
 
-        resp = await self._http_client.post(
+        resp = await self._http_request(
+            "POST",
             f"{self._url}/evaluate-response/",
             json=body,
             timeout=self._timeout,
@@ -805,7 +867,8 @@ class BenchmarkServiceClient:
         if dataset is not None:
             body["dataset"] = dataset
 
-        response = await self._http_client.post(
+        response = await self._http_request(
+            "POST",
             f"{self._url}/final-score/",
             json=body,
         )
@@ -823,7 +886,7 @@ class BenchmarkServiceClient:
         unknown datasets, and 501 when the benchmark has not implemented task
         listing.
         """
-        response = await self._http_client.get(f"{self._url}/v1/datasets/{dataset}/tasks")
+        response = await self._http_request("GET", f"{self._url}/v1/datasets/{dataset}/tasks")
 
         _require_ok(response, "List tasks")
 
@@ -844,7 +907,8 @@ class BenchmarkServiceClient:
             filename=filename,
         )
         with correlation_scope(run_id=run_id, task_id=task_id):
-            response = await self._http_client.post(
+            response = await self._http_request(
+                "POST",
                 f"{self._url}/v1/submissions/upload-url",
                 json=request.model_dump(mode="json", exclude_none=True),
             )
@@ -880,7 +944,8 @@ class BenchmarkServiceClient:
             versions=versions or V1Versions(),
         )
         with correlation_scope(run_id=run_id, task_id=task_id, attempt_id=attempt_id):
-            response = await self._http_client.post(
+            response = await self._http_request(
+                "POST",
                 f"{self._url}/v1/evaluate",
                 json=request.model_dump(mode="json", by_alias=True, exclude_none=True),
             )
@@ -898,7 +963,8 @@ class BenchmarkServiceClient:
         """Score via the lab-facing /v1/score surface without retrying a submitted request."""
         request = V1ScoreRequest(run_id=run_id, dataset=dataset, evaluation_results=evaluation_results)
         with correlation_scope(run_id=run_id):
-            response = await self._http_client.post(
+            response = await self._http_request(
+                "POST",
                 f"{self._url}/v1/score",
                 json=request.model_dump(mode="json", exclude_none=True),
             )

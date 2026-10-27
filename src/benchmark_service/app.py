@@ -19,6 +19,7 @@ from websockets.exceptions import ConnectionClosed
 from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_required
 from benchmark_service.base import BenchmarkService
+from benchmark_service.draining import DRAIN_STATE_PATH_ENV, DrainMiddleware, DrainState
 from benchmark_service.grading_credentials import grading_credentials
 from benchmark_service.observability import ATTEMPT_ID_HEADER, EMAIL_HEADER, RUN_ID_HEADER
 from benchmark_service.context import child_egress_scope, sandbox_provider_scope, tenant_scope
@@ -176,6 +177,8 @@ class BenchmarkServiceApp(FastAPI):
         super().__init__(title=service_cls.__name__, lifespan=lifespan)
         self._deployment_name = deployment_name
         self._sentry = sentry
+        if drain_path := os.environ.get(DRAIN_STATE_PATH_ENV):
+            self.add_middleware(DrainMiddleware, state=DrainState(drain_path))
         self._register_routes()
 
     def _sentry_enabled(self) -> bool:

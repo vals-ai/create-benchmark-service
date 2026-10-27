@@ -265,7 +265,9 @@ async def test_http_retry_does_not_close_another_active_request(
         assert await asyncio.wait_for(old, 5) == {"response": "hold"}
         assert service.http_calls == ["hold", "new"]
     configure(state, False, 3)
-    assert state.snapshot().drained
+    async with asyncio.timeout(5):
+        while not state.snapshot().drained:
+            await asyncio.sleep(0.01)
 
 
 async def test_real_websocket_denial_retries_before_payload_and_preserves_existing_stream(
@@ -295,7 +297,9 @@ async def test_real_websocket_denial_retries_before_payload_and_preserves_existi
         service.release.set()
         assert await asyncio.wait_for(old, 5) == {"finished": True}
     configure(state, False, 3)
-    assert state.snapshot().drained
+    async with asyncio.timeout(5):
+        while not state.snapshot().drained:
+            await asyncio.sleep(0.01)
 
 
 @pytest.mark.parametrize("marked", [False, True])

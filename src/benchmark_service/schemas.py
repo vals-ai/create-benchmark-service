@@ -197,7 +197,11 @@ GradingSubmission = Annotated[
 EgressPolicy = Literal["*"] | list[str]
 SandboxLocalHost = Annotated[
     str,
-    StringConstraints(pattern=r"^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$"),
+    StringConstraints(
+        max_length=253,
+        to_lower=True,
+        pattern=r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$",
+    ),
 ]
 AgentInstallOrder = Literal["before_setup", "after_setup"]
 

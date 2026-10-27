@@ -192,10 +192,34 @@ def test_benchmark_egress_plan_serializes_explicit_stage_policies(
     }
 
 
-@pytest.mark.parametrize("host", ["*", ".internal", "10.0.0.0/8", "api:8000", "http://api", "-api", ""])
+@pytest.mark.parametrize(
+    "host",
+    [
+        "*",
+        ".internal",
+        "api.",
+        "10.0.0.0/8",
+        "api:8000",
+        "http://api",
+        "api,db",
+        "api db",
+        "-api",
+        "api-",
+        "",
+        "a" * 64,
+        ".".join(["a" * 63] * 4),
+    ],
+)
 def test_benchmark_egress_plan_rejects_non_hostname_local_hosts(host: str) -> None:
     with pytest.raises(ValidationError):
         BenchmarkEgressPlan.model_validate({"sandbox_local_hosts": [host]})
+
+
+def test_benchmark_egress_plan_lowercases_local_hosts() -> None:
+    longest_label = "a" * 63
+    plan = BenchmarkEgressPlan.model_validate({"sandbox_local_hosts": ["Supabase-Kong.local", longest_label]})
+
+    assert plan.sandbox_local_hosts == ["supabase-kong.local", longest_label]
 
 
 @pytest.mark.parametrize("policy", ["api.openai.com", None, ["api.openai.com", 1]])

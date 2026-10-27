@@ -131,7 +131,13 @@ def test_retrieve_task(client: TestClient) -> None:
     assert data["source"] == {"type": "image", "image": "python:3.12-slim"}
     assert data["docker_image"] == "python:3.12-slim"
     assert data["agent_install_order"] == "before_setup"
-    assert data["egress"] == {"setup_task": "*", "run": None, "evaluation": "*", "run_through_proxy": False, "sandbox_local_hosts": []}
+    assert data["egress"] == {
+        "setup_task": "*",
+        "run": None,
+        "evaluation": "*",
+        "run_through_proxy": False,
+        "sandbox_local_hosts": [],
+    }
     assert data["credited_generation"] is None
 
 
@@ -161,7 +167,6 @@ def test_retrieve_task_credited_generation_opt_in(monkeypatch: pytest.MonkeyPatc
         "allowance_seconds": 18000.0,
         "stage_protocol": "valkyrie-stage/1",
     }
-
 
 
 def test_retrieve_task_explicit_agent_install_order(monkeypatch: pytest.MonkeyPatch) -> None:

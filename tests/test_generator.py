@@ -104,9 +104,7 @@ def test_template_rendering(
         assert ".git/" in dockerignore
 
 
-def test_generated_pyproject_pins_to_tag_for_clean_version(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_generated_pyproject_pins_to_tag_for_clean_version(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(benchmark_service, "__version__", "1.0.0")
     output_dir = tmp_path / "demo-benchmark-service"
     generate_project(benchmark_name="demo", output_dir=output_dir)
@@ -207,7 +205,13 @@ async def test_generated_service_declares_empty_stage_egress(tmp_path: Path, tem
 
     task = await service.retrieve_task("example-task-1")
 
-    assert task.egress.model_dump() == {"setup_task": [], "run": [], "evaluation": [], "run_through_proxy": False, "sandbox_local_hosts": []}
+    assert task.egress.model_dump() == {
+        "setup_task": [],
+        "run": [],
+        "evaluation": [],
+        "run_through_proxy": False,
+        "sandbox_local_hosts": [],
+    }
 
 
 def test_generated_benchmark_service_implements_task_listing(tmp_path: Path) -> None:

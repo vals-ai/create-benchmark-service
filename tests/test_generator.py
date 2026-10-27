@@ -211,6 +211,8 @@ async def test_generated_service_declares_empty_stage_egress(tmp_path: Path, tem
         "evaluation": [],
         "run_through_proxy": False,
         "sandbox_local_hosts": [],
+        "run_inspect": [],
+        "children": {},
     }
 
 

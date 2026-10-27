@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Literal, assert_never, cast
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, computed_field, model_validator
 
@@ -203,7 +204,16 @@ SandboxLocalHost = Annotated[
         pattern=r"^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$",
     ),
 ]
+ChildProfileName = Annotated[str, StringConstraints(pattern=r"^[a-z0-9][a-z0-9-]{0,31}$")]
 AgentInstallOrder = Literal["before_setup", "after_setup"]
+
+
+class ChildPolicy(BaseModel):
+    """Network and model access for one kind of sandbox a benchmark creates for each task attempt."""
+
+    egress: EgressPolicy = []
+    inspect: list[str] = Field(default=[], description="Hosts the proxy decrypts and holds to GET/HEAD")
+    models: list[str] = Field(default=[], description="Gateway models a token for these sandboxes may call")
 
 
 class BenchmarkEgressPlan(BaseModel):
@@ -214,6 +224,48 @@ class BenchmarkEgressPlan(BaseModel):
     evaluation: EgressPolicy = "*"
     run_through_proxy: bool = False
     sandbox_local_hosts: list[SandboxLocalHost] = []
+    run_inspect: list[str] = Field(default=[], description="Hosts the proxy decrypts and holds to GET/HEAD")
+    children: dict[ChildProfileName, ChildPolicy] = {}
+
+
+class ChildEgress(BaseModel):
+    """The caller's egress proxy access for one child profile of a task attempt.
+
+    The proxy enforces the profile's policy, and the caller revokes this access when the attempt ends.
+    """
+
+    proxy_url: str = Field(repr=False, description="https://<key>:<token>@<host>:<port>")
+    proxy_cidrs: list[str] = Field(description="Addresses a sandbox must be allowed to reach to use the proxy")
+    ca_certificate: str = Field(description="PEM CA the proxy signs inspected TLS with")
+    gateway_url: str | None = None
+    gateway_token: str | None = Field(default=None, repr=False)
+
+    def environment(self, *, tunnel_port: int | None) -> dict[str, str]:
+        """Proxy and gateway settings for a process; trusting `ca_certificate` is the caller's job.
+
+        With `tunnel_port`, clients use the loopback tunnel `tunnel_command` starts. Without it they
+        speak TLS to the proxy, which Python's urllib, wget and aiohttp can't (urllib sends the
+        credential in plaintext before failing).
+        """
+        proxy_url = self.proxy_url
+        if tunnel_port is not None:
+            credential = urlsplit(self.proxy_url).netloc.rpartition("@")[0]
+            proxy_url = f"http://{credential}@127.0.0.1:{tunnel_port}"
+        environment = {name: proxy_url for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")}
+        environment |= {name: "localhost,127.0.0.1,::1" for name in ("NO_PROXY", "no_proxy")}
+        if self.gateway_url is not None and self.gateway_token is not None:
+            environment |= {"MODEL_GATEWAY_URL": self.gateway_url, "MODEL_GATEWAY_API_KEY": self.gateway_token}
+        return environment
+
+    def tunnel_command(self, script: str, ca_file: str, port: int) -> list[str]:
+        """Starts `egress_tunnel.py` (`files("benchmark_service") / "egress_tunnel.py"`), uploaded to
+        `script`, on the box's loopback `port`.
+
+        The tunnel needs only the standard library and Python 3.8+, and the command returns once it's
+        listening. `ca_file` holds `ca_certificate`.
+        """
+        proxy = urlsplit(self.proxy_url)
+        return ["python3", script, str(proxy.hostname), str(proxy.port), ca_file, str(port), f"{script}.pid"]
 
 
 class CreditedGeneration(BaseModel):
@@ -321,6 +373,11 @@ class SetupTaskRequest(BaseModel):
     instance_id: str = Field(description="Unique identifier for the sandbox instance")
     sandbox_provider: SandboxProviderConfig | None = Field(default=None, description="Sandbox provider config")
     dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
+    child_egress: dict[str, ChildEgress] = Field(
+        default={},
+        exclude_if=lambda value: not value,
+        description="Proxy access by child profile for sandboxes the service creates; older clients omit it",
+    )
 
 
 class SetupTaskResponse(BaseModel):
@@ -358,6 +415,11 @@ class EvaluateResponseRequest(BaseModel):
         exclude_if=lambda value: not value,
         description="Stream a sandbox_created chunk for each sandbox the service creates; older clients omit it",
     )
+    child_egress: dict[str, ChildEgress] = Field(
+        default={},
+        exclude_if=lambda value: not value,
+        description="Proxy access by child profile for sandboxes the service creates; older clients omit it",
+    )
 
     @model_validator(mode="after")
     def require_one_eval_input(self) -> "EvaluateResponseRequest":
@@ -381,6 +443,11 @@ class EvaluateInstanceRequest(BaseModel):
         default=False,
         exclude_if=lambda value: not value,
         description="Stream a sandbox_created chunk for each sandbox the service creates; older clients omit it",
+    )
+    child_egress: dict[str, ChildEgress] = Field(
+        default={},
+        exclude_if=lambda value: not value,
+        description="Proxy access by child profile for sandboxes the service creates; older clients omit it",
     )
 
 

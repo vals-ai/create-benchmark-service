@@ -13,7 +13,7 @@ from starlette.websockets import WebSocketDisconnect
 from benchmark_service.vals import auth as auth_module
 from benchmark_service.vals.app import ValsBenchmarkServiceApp
 from benchmark_service.app import BenchmarkServiceApp, send_json_if_connected
-from benchmark_service.context import current_sandbox_provider, current_tenant
+from benchmark_service.context import current_child_egress, current_sandbox_provider, current_tenant
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
 from benchmark_service.sandbox.types import (
@@ -137,6 +137,8 @@ def test_retrieve_task(client: TestClient) -> None:
         "evaluation": "*",
         "run_through_proxy": False,
         "sandbox_local_hosts": [],
+        "run_inspect": [],
+        "children": {},
     }
     assert data["credited_generation"] is None
 
@@ -220,6 +222,8 @@ def test_retrieve_task_explicit_egress_policies(monkeypatch: pytest.MonkeyPatch)
         "evaluation": [],
         "run_through_proxy": True,
         "sandbox_local_hosts": ["api", "db"],
+        "run_inspect": [],
+        "children": {},
     }
 
 
@@ -923,3 +927,41 @@ def test_core_app_does_not_expose_provider_routes(client: TestClient, method: st
 async def test_core_dataset_access_does_not_depend_on_hosted_allowlist() -> None:
     service = await StubBenchmark.create()
     assert await service.check_dataset_access("custom-tenant", "default") is True
+
+
+@pytest.mark.parametrize("endpoint", ["setup-task", "evaluate-instance"])
+def test_websocket_binds_the_requests_child_egress(monkeypatch: pytest.MonkeyPatch, endpoint: str) -> None:
+    """Setup and grading see the request's child egress, and nothing outside the request."""
+    child_egress = {
+        "proxy_url": "https://key:token@proxy.example:3128",
+        "proxy_cidrs": ["192.0.2.1/32"],
+        "ca_certificate": "certificate",
+    }
+
+    class ChildEgressBenchmark(StubBenchmark):
+        async def setup_task(self, task_id: str, sandbox: Sandbox, dataset: str | None = None):
+            yield StreamResultChunk(type="result", data={"proxy_url": current_child_egress("gpu").proxy_url})
+
+        async def evaluate_instance(self, task_id: str, sandbox: Sandbox, dataset: str | None = None):
+            yield StreamResultChunk(type="result", data={"proxy_url": current_child_egress("gpu").proxy_url})
+
+    def create_provider(_config: ModalProviderConfig) -> SandboxProvider:
+        return ProviderSelectionProvider()
+
+    monkeypatch.setattr(ModalProviderConfig, "create_provider", create_provider)
+    monkeypatch.delenv("AUTH_REQUIRED", raising=False)
+
+    with TestClient(BenchmarkServiceApp(ChildEgressBenchmark)) as c:
+        with c.websocket_connect(f"/ws/{endpoint}") as ws:
+            ws.send_json(
+                {
+                    "task_id": "task-1",
+                    "instance_id": "i-1",
+                    "sandbox_provider": {"type": "modal", "MODAL_TOKEN_ID": "id", "MODAL_TOKEN_SECRET": "secret"},
+                    "child_egress": {"gpu": child_egress},
+                }
+            )
+            assert ws.receive_json() == {"type": "result", "data": {"proxy_url": child_egress["proxy_url"]}}
+
+    with pytest.raises(LookupError):
+        current_child_egress("gpu")

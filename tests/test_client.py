@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import socket
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -32,7 +33,13 @@ from benchmark_service.client import (
 )
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
-from benchmark_service.schemas import BenchmarkEgressPlan, EgressPolicy, HealthCheckResponse, RetrieveTaskResponse
+from benchmark_service.schemas import (
+    BenchmarkEgressPlan,
+    ChildEgress,
+    EgressPolicy,
+    HealthCheckResponse,
+    RetrieveTaskResponse,
+)
 from benchmark_service.v1_schemas import (
     V1DatasetTasksResponse,
     V1EvalResponse,
@@ -109,6 +116,8 @@ async def test_retrieve_task_accepts_legacy_shape(
         "evaluation": "*",
         "run_through_proxy": False,
         "sandbox_local_hosts": [],
+        "run_inspect": [],
+        "children": {},
     }
 
 
@@ -151,6 +160,8 @@ async def test_retrieve_task_accepts_explicit_egress_policies(
         "evaluation": [],
         "run_through_proxy": True,
         "sandbox_local_hosts": ["api", "supabase-kong.local"],
+        "run_inspect": [],
+        "children": {},
     }
     mock_http.get = AsyncMock(return_value=_mock_response(json_data=payload))
 
@@ -189,6 +200,8 @@ def test_benchmark_egress_plan_serializes_explicit_stage_policies(
         "evaluation": evaluation,
         "run_through_proxy": False,
         "sandbox_local_hosts": [],
+        "run_inspect": [],
+        "children": {},
     }
 
 
@@ -1564,3 +1577,84 @@ async def test_client_v1_mutations_do_not_retry_after_response_transport_failure
         await getattr(client, method)(**kwargs)
 
     mock_http.post.assert_awaited_once()
+
+
+CHILD_EGRESS = ChildEgress(
+    proxy_url="https://key:token@proxy.example:3128",
+    proxy_cidrs=["192.0.2.1/32"],
+    ca_certificate="certificate",
+    gateway_url="https://gw.example",
+    gateway_token="run-token",
+)
+
+
+@pytest.mark.parametrize("child_egress", [None, {"gpu": CHILD_EGRESS}], ids=["omitted", "sent"])
+async def test_setup_task_sends_child_egress_only_when_given(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock], child_egress: dict[str, ChildEgress] | None
+) -> None:
+    client, _ = benchmark_client
+    ws_connect = _ws_mock([json.dumps({"type": "result", "data": {"status": "ok"}})])
+
+    with patch("benchmark_service.client.websockets.connect", return_value=ws_connect):
+        await client.setup_task("task-1", "i-1", sandbox_provider=DAYTONA_CONFIG, child_egress=child_egress)
+
+    sent = json.loads((await ws_connect.__aenter__()).send.call_args.args[0])
+    assert sent.get("child_egress") == (None if child_egress is None else {"gpu": CHILD_EGRESS.model_dump()})
+
+
+async def test_evaluate_instance_sends_child_egress(benchmark_client: tuple[BenchmarkServiceClient, AsyncMock]) -> None:
+    client, _ = benchmark_client
+    ws_connect = _ws_mock([json.dumps({"type": "result", "data": {"score": 1.0}})])
+
+    with patch("benchmark_service.client.websockets.connect", return_value=ws_connect):
+        await client.evaluate_instance(
+            "task-1", "i-1", sandbox_provider=DAYTONA_CONFIG, child_egress={"judge": CHILD_EGRESS}
+        )
+
+    sent = json.loads((await ws_connect.__aenter__()).send.call_args.args[0])
+    assert ChildEgress.model_validate(sent["child_egress"]["judge"]) == CHILD_EGRESS
+
+
+@pytest.mark.parametrize(
+    ("tunnel_port", "proxy_url"),
+    [(None, "https://key:token@proxy.example:3128"), (3128, "http://key:token@127.0.0.1:3128")],
+    ids=["direct", "tunnel"],
+)
+def test_child_egress_environment_points_clients_at_the_proxy_and_gateway(
+    tunnel_port: int | None, proxy_url: str
+) -> None:
+    environment = CHILD_EGRESS.environment(tunnel_port=tunnel_port)
+
+    assert environment["HTTPS_PROXY"] == environment["http_proxy"] == proxy_url
+    assert environment["NO_PROXY"] == "localhost,127.0.0.1,::1"
+    assert environment["MODEL_GATEWAY_URL"] == "https://gw.example"
+    assert environment["MODEL_GATEWAY_API_KEY"] == "run-token"
+    without_gateway = CHILD_EGRESS.model_copy(update={"gateway_token": None})
+    assert "MODEL_GATEWAY_URL" not in without_gateway.environment(tunnel_port=tunnel_port)
+
+
+def test_child_egress_tunnel_command_starts_the_packaged_tunnel() -> None:
+    command = CHILD_EGRESS.tunnel_command("/tmp/egress_tunnel.py", "/tmp/egress-ca.pem", 3128)
+
+    assert command == [
+        "python3",
+        "/tmp/egress_tunnel.py",
+        "proxy.example",
+        "3128",
+        "/tmp/egress-ca.pem",
+        "3128",
+        "/tmp/egress_tunnel.py.pid",
+    ]
+    assert b"def main()" in files("benchmark_service").joinpath("egress_tunnel.py").read_bytes()
+
+
+def test_child_egress_keeps_credentials_out_of_its_repr() -> None:
+    assert "token" not in repr(CHILD_EGRESS).replace("gateway_token", "")
+
+
+def test_child_profiles_need_simple_names() -> None:
+    plan = BenchmarkEgressPlan.model_validate({"children": {"gpu-1": {"egress": ["pypi.org"], "models": ["a/b"]}}})
+
+    assert plan.children["gpu-1"].models == ["a/b"]
+    with pytest.raises(ValidationError):
+        BenchmarkEgressPlan.model_validate({"children": {"GPU box": {}}})

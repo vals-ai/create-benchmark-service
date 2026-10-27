@@ -3,7 +3,13 @@
 from benchmark_service._version import __version__
 from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.base import BenchmarkService
-from benchmark_service.context import current_sandbox_provider, current_tenant, sandbox_provider_scope, tenant_scope
+from benchmark_service.context import (
+    current_child_egress,
+    current_sandbox_provider,
+    current_tenant,
+    sandbox_provider_scope,
+    tenant_scope,
+)
 from benchmark_service.client import (
     BenchmarkServiceClient,
     BenchmarkServiceError,
@@ -50,6 +56,8 @@ from benchmark_service.sandbox import (
 from benchmark_service.schemas import (
     DATASET_VERSION_HEADER,
     ArtifactGradingSubmission,
+    ChildEgress,
+    ChildPolicy,
     CreditedGeneration,
     DatasetVersion,
     Episode,
@@ -73,12 +81,15 @@ __all__ = [
     "Agents",
     "Exhausted",
     "SlotResult",
+    "ChildEgress",
+    "ChildPolicy",
     "DatasetVersion",
     "ListDatasetsResponse",
     "ResolveDatasetRequest",
     "ResolveDatasetResponse",
     "BenchmarkServiceApp",
     "BenchmarkService",
+    "current_child_egress",
     "current_sandbox_provider",
     "current_tenant",
     "BenchmarkServiceUnauthenticatedError",

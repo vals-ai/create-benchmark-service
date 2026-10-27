@@ -1357,10 +1357,10 @@ async def test_ws_close_silence_is_measured_from_last_application_message() -> N
         ConnectionClosedError(close_frame, None),
     )
     client = _make_client()
-    # The client stamps time.monotonic() three times on this path: connection establishment,
+    # The client stamps time for the drain retry window, connection establishment,
     # the application message, and the close.
     fake_time = MagicMock()
-    fake_time.monotonic.side_effect = [100.0, 250.0, 251.5]
+    fake_time.monotonic.side_effect = [99.0, 100.0, 250.0, 251.5]
 
     with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
         with patch("benchmark_service.client.time", fake_time):

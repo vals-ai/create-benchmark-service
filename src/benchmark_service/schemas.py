@@ -5,7 +5,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Literal, assert_never, cast
 
-from pydantic import BaseModel, ConfigDict, Field, computed_field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, computed_field, model_validator
 
 from benchmark_service.sandbox import SandboxProviderConfig
 from benchmark_service.sandbox.types import (
@@ -195,6 +195,10 @@ GradingSubmission = Annotated[
 ]
 
 EgressPolicy = Literal["*"] | list[str]
+SandboxLocalHost = Annotated[
+    str,
+    StringConstraints(pattern=r"^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)*$"),
+]
 AgentInstallOrder = Literal["before_setup", "after_setup"]
 
 
@@ -205,6 +209,8 @@ class BenchmarkEgressPlan(BaseModel):
     run: EgressPolicy | None = None
     evaluation: EgressPolicy = "*"
     run_through_proxy: bool = False
+    # Hosts inside the sandbox (compose service names) the run stage reaches directly, not via the proxy.
+    sandbox_local_hosts: list[SandboxLocalHost] = []
 
 
 class CreditedGeneration(BaseModel):

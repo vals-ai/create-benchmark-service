@@ -207,7 +207,7 @@ async def test_generated_service_declares_empty_stage_egress(tmp_path: Path, tem
 
     task = await service.retrieve_task("example-task-1")
 
-    assert task.egress.model_dump() == {"setup_task": [], "run": [], "evaluation": [], "run_through_proxy": False}
+    assert task.egress.model_dump() == {"setup_task": [], "run": [], "evaluation": [], "run_through_proxy": False, "sandbox_local_hosts": []}
 
 
 def test_generated_benchmark_service_implements_task_listing(tmp_path: Path) -> None:

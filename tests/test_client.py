@@ -103,7 +103,13 @@ async def test_retrieve_task_accepts_legacy_shape(
     assert result.resources.model_dump() == {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None}
     assert result.agent_install_order == "before_setup"
     assert result.credited_generation is None
-    assert result.egress.model_dump() == {"setup_task": "*", "run": None, "evaluation": "*", "run_through_proxy": False}
+    assert result.egress.model_dump() == {
+        "setup_task": "*",
+        "run": None,
+        "evaluation": "*",
+        "run_through_proxy": False,
+        "sandbox_local_hosts": [],
+    }
 
 
 async def test_retrieve_task_accepts_credited_generation_opt_in(
@@ -144,6 +150,7 @@ async def test_retrieve_task_accepts_explicit_egress_policies(
         "run": ["api.openai.com"],
         "evaluation": [],
         "run_through_proxy": True,
+        "sandbox_local_hosts": ["api", "supabase-kong.local"],
     }
     mock_http.get = AsyncMock(return_value=_mock_response(json_data=payload))
 
@@ -181,7 +188,14 @@ def test_benchmark_egress_plan_serializes_explicit_stage_policies(
         "run": run,
         "evaluation": evaluation,
         "run_through_proxy": False,
+        "sandbox_local_hosts": [],
     }
+
+
+@pytest.mark.parametrize("host", ["*", ".internal", "10.0.0.0/8", "api:8000", "http://api", "-api", ""])
+def test_benchmark_egress_plan_rejects_non_hostname_local_hosts(host: str) -> None:
+    with pytest.raises(ValidationError):
+        BenchmarkEgressPlan.model_validate({"sandbox_local_hosts": [host]})
 
 
 @pytest.mark.parametrize("policy", ["api.openai.com", None, ["api.openai.com", 1]])

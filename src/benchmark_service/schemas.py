@@ -204,6 +204,7 @@ class BenchmarkEgressPlan(BaseModel):
     setup_task: EgressPolicy = "*"
     run: EgressPolicy | None = None
     evaluation: EgressPolicy = "*"
+    run_through_proxy: bool = False
 
 
 class CreditedGeneration(BaseModel):

@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import socket
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -1614,14 +1615,37 @@ async def test_evaluate_instance_sends_child_egress(benchmark_client: tuple[Benc
     assert ChildEgress.model_validate(sent["child_egress"]["judge"]) == CHILD_EGRESS
 
 
-def test_child_egress_environment_points_clients_at_the_proxy_and_gateway() -> None:
-    environment = CHILD_EGRESS.environment()
+@pytest.mark.parametrize(
+    ("tunnel_port", "proxy_url"),
+    [(None, "https://key:token@proxy.example:3128"), (3128, "http://key:token@127.0.0.1:3128")],
+    ids=["direct", "tunnel"],
+)
+def test_child_egress_environment_points_clients_at_the_proxy_and_gateway(
+    tunnel_port: int | None, proxy_url: str
+) -> None:
+    environment = CHILD_EGRESS.environment(tunnel_port=tunnel_port)
 
-    assert environment["HTTPS_PROXY"] == environment["http_proxy"] == "https://key:token@proxy.example:3128"
+    assert environment["HTTPS_PROXY"] == environment["http_proxy"] == proxy_url
     assert environment["NO_PROXY"] == "localhost,127.0.0.1,::1"
     assert environment["MODEL_GATEWAY_URL"] == "https://gw.example"
     assert environment["MODEL_GATEWAY_API_KEY"] == "run-token"
-    assert "MODEL_GATEWAY_URL" not in CHILD_EGRESS.model_copy(update={"gateway_token": None}).environment()
+    without_gateway = CHILD_EGRESS.model_copy(update={"gateway_token": None})
+    assert "MODEL_GATEWAY_URL" not in without_gateway.environment(tunnel_port=tunnel_port)
+
+
+def test_child_egress_tunnel_command_starts_the_packaged_tunnel() -> None:
+    command = CHILD_EGRESS.tunnel_command("/tmp/egress_tunnel.py", "/tmp/egress-ca.pem", 3128)
+
+    assert command == [
+        "python3",
+        "/tmp/egress_tunnel.py",
+        "proxy.example",
+        "3128",
+        "/tmp/egress-ca.pem",
+        "3128",
+        "/tmp/egress_tunnel.py.pid",
+    ]
+    assert b"def main()" in files("benchmark_service").joinpath("egress_tunnel.py").read_bytes()
 
 
 def test_child_egress_keeps_credentials_out_of_its_repr() -> None:

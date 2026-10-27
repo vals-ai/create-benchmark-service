@@ -68,9 +68,15 @@ def tenant_scope(tenant: str | None) -> Iterator[None]:
         _current_tenant.reset(token)
 
 
-def current_child_egress(profile: str) -> ChildEgress | None:
-    """Return the in-flight request's proxy access for a child profile, or None when the caller sent none."""
-    return _current_child_egress.get().get(profile)
+def current_child_egress(profile: str) -> ChildEgress:
+    """Return the in-flight request's proxy access for a child profile.
+
+    Raises LookupError when the caller sent none, so a box the task declared isn't created unproxied.
+    """
+    try:
+        return _current_child_egress.get()[profile]
+    except KeyError:
+        raise LookupError(f"The caller sent no egress proxy access for child profile {profile!r}") from None
 
 
 @contextmanager

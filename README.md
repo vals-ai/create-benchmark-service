@@ -737,7 +737,7 @@ Pydantic models used across requests and responses:
 - **`Resources`** — `vcpu`, `memory`, `disk`, optional `gpu` (count, default 0) and `gpu_type` (requires `gpu >= 1`)
 - **`VolumeMount`** — named persistent volume, absolute `mount_path`, optional `read_only`, `create_if_missing`, and relative `subpath`; `{run_id}` in a subpath resolves from the sandbox's `run-id` or `run_id` label and fails when that label is absent
 - **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, optional `sandbox_provider` with Daytona header fallback, `dataset`, optional `child_egress` by profile name
-- **`ChildEgress`** — one child profile's proxy URL with its own per-attempt credential, proxy CIDRs, CA certificate, and a gateway URL and token when the profile names `models`; read it with `current_child_egress(profile)` during setup or evaluation
+- **`ChildEgress`** — one child profile's proxy URL with its own per-attempt credential, proxy CIDRs, CA certificate, and a gateway URL and token when the profile names `models`; read it with `current_child_egress(profile)` during setup or evaluation (it raises when the caller sent none). `tunnel_command` starts the packaged `egress_tunnel.py` in the box, so `environment(tunnel_port=...)` also works for clients that can't speak TLS to a proxy
 - **`EvaluateResponseRequest`** — `task_id`, `response` or `eval_resume_state`, optional `sandbox_provider`, optional caller-owned `instance_id` for resume, `dataset`
 - **`FinalScoreResult`** / **`FinalScoreResponse`** — `score` (float), `metadata`, `tasks_evaluated`
 - **`TaskFilter`** — `task_ids` list or `slice_str`; `parse_slice()` converts `"start:stop:step"` to a Python `slice`

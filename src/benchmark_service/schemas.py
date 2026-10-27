@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import Annotated, Any, Literal, assert_never, cast
+from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, computed_field, model_validator
 
@@ -239,13 +240,32 @@ class ChildEgress(BaseModel):
     gateway_url: str | None = None
     gateway_token: str | None = Field(default=None, repr=False)
 
-    def environment(self) -> dict[str, str]:
-        """Proxy and gateway settings for a process; trusting `ca_certificate` is the caller's job."""
-        environment = {name: self.proxy_url for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")}
+    def environment(self, *, tunnel_port: int | None) -> dict[str, str]:
+        """Proxy and gateway settings for a process; trusting `ca_certificate` is the caller's job.
+
+        With `tunnel_port`, clients use the loopback tunnel `tunnel_command` starts. Without it they
+        speak TLS to the proxy, which Python's urllib, wget and aiohttp can't (urllib sends the
+        credential in plaintext before failing).
+        """
+        proxy_url = self.proxy_url
+        if tunnel_port is not None:
+            credential = urlsplit(self.proxy_url).netloc.rpartition("@")[0]
+            proxy_url = f"http://{credential}@127.0.0.1:{tunnel_port}"
+        environment = {name: proxy_url for name in ("HTTP_PROXY", "HTTPS_PROXY", "http_proxy", "https_proxy")}
         environment |= {name: "localhost,127.0.0.1,::1" for name in ("NO_PROXY", "no_proxy")}
         if self.gateway_url is not None and self.gateway_token is not None:
             environment |= {"MODEL_GATEWAY_URL": self.gateway_url, "MODEL_GATEWAY_API_KEY": self.gateway_token}
         return environment
+
+    def tunnel_command(self, script: str, ca_file: str, port: int) -> list[str]:
+        """Starts `egress_tunnel.py` (`files("benchmark_service") / "egress_tunnel.py"`), uploaded to
+        `script`, on the box's loopback `port`.
+
+        The tunnel needs only the standard library and Python 3.8+, and the command returns once it's
+        listening. `ca_file` holds `ca_certificate`.
+        """
+        proxy = urlsplit(self.proxy_url)
+        return ["python3", script, str(proxy.hostname), str(proxy.port), ca_file, str(port), f"{script}.pid"]
 
 
 class CreditedGeneration(BaseModel):

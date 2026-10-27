@@ -940,12 +940,10 @@ def test_websocket_binds_the_requests_child_egress(monkeypatch: pytest.MonkeyPat
 
     class ChildEgressBenchmark(StubBenchmark):
         async def setup_task(self, task_id: str, sandbox: Sandbox, dataset: str | None = None):
-            egress = current_child_egress("gpu")
-            yield StreamResultChunk(type="result", data={"proxy_url": egress.proxy_url if egress else None})
+            yield StreamResultChunk(type="result", data={"proxy_url": current_child_egress("gpu").proxy_url})
 
         async def evaluate_instance(self, task_id: str, sandbox: Sandbox, dataset: str | None = None):
-            egress = current_child_egress("gpu")
-            yield StreamResultChunk(type="result", data={"proxy_url": egress.proxy_url if egress else None})
+            yield StreamResultChunk(type="result", data={"proxy_url": current_child_egress("gpu").proxy_url})
 
     def create_provider(_config: ModalProviderConfig) -> SandboxProvider:
         return ProviderSelectionProvider()
@@ -965,4 +963,5 @@ def test_websocket_binds_the_requests_child_egress(monkeypatch: pytest.MonkeyPat
             )
             assert ws.receive_json() == {"type": "result", "data": {"proxy_url": child_egress["proxy_url"]}}
 
-    assert current_child_egress("gpu") is None
+    with pytest.raises(LookupError):
+        current_child_egress("gpu")

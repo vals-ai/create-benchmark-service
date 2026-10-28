@@ -7,10 +7,9 @@ import inspect
 import logging
 import os
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Generator
-from contextlib import AsyncExitStack, asynccontextmanager
+from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass, field
-from typing import Any, Literal, TypeVar
+from typing import Any, TypeVar
 from uuid import uuid4
 
 import httpx
@@ -25,7 +24,7 @@ from tenacity import (
 from websockets.asyncio.client import ClientConnection
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
-from benchmark_service.draining import DRAIN_HEADER
+from benchmark_service.draining import is_drain_rejection
 from benchmark_service.observability import correlation_scope, request_headers, websocket_request_span
 from benchmark_service.sandbox import SandboxNotFoundError, SandboxProvider, SandboxProviderConfig
 from benchmark_service.schemas import (
@@ -368,29 +367,20 @@ class BenchmarkServiceClient:
             event_hooks={"response": [self._check_dataset_version]},
         )
 
-    async def _http_request(self, method: Literal["GET", "POST"], url: str, **kwargs: Any) -> httpx.Response:
-        async def send(client: httpx.AsyncClient) -> httpx.Response:
-            if method == "GET":
-                return await client.get(url, **kwargs)
-            return await client.post(url, **kwargs)
-
-        response = await send(self._http_client)
-        if response.status_code != 503 or response.headers.get(DRAIN_HEADER) != "1":
+    async def _http_request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        response = await self._http_client.request(method, url, **kwargs)
+        if not is_drain_rejection(response.status_code, response.headers):
             return response
         deadline = time.monotonic() + _DRAIN_RETRY_WINDOW_S
-        # This client owns no other requests. Do not close the shared pool,
-        # which may contain an unrelated grading that is still in progress.
+        # A fresh pool skips other idle sockets to the old task. The shared
+        # pool stays open because unrelated accepted requests may still use it.
         async with self._new_http_client(fresh_connections=True) as fresh:
-            while response.status_code == 503 and response.headers.get(DRAIN_HEADER) == "1":
-                remaining = deadline - time.monotonic()
-                if remaining <= _DRAIN_RETRY_DELAY_S:
-                    return response
-                await response.aclose()
+            while is_drain_rejection(response.status_code, response.headers):
                 await asyncio.sleep(_DRAIN_RETRY_DELAY_S)
                 # Bound the start of retries, not the duration of accepted work.
                 if time.monotonic() >= deadline:
                     return response
-                response = await send(fresh)
+                response = await fresh.request(method, url, **kwargs)
         return response
 
     async def _check_dataset_version(self, response: httpx.Response) -> None:
@@ -425,40 +415,24 @@ class BenchmarkServiceClient:
     def _ws_url(self) -> str:
         return self._url.replace("http://", "ws://").replace("https://", "wss://")
 
-    @asynccontextmanager
-    async def _connect_websocket(self, path: str, headers: dict[str, str]) -> AsyncIterator[ClientConnection]:
+    async def _connect_websocket(self, path: str, headers: dict[str, str]) -> ClientConnection:
         deadline = time.monotonic() + _DRAIN_RETRY_WINDOW_S
-        open_timeout = 60.0
         while True:
-            async with AsyncExitStack() as stack:
-                try:
-                    websocket = await stack.enter_async_context(
-                        websockets.connect(
-                            f"{self._ws_url}/ws/{path}",
-                            additional_headers=headers,
-                            open_timeout=open_timeout,
-                            ping_interval=_WS_PING_INTERVAL_S,
-                            ping_timeout=_WS_PING_TIMEOUT_S,
-                            max_size=10 * 1024 * 1024,
-                        )
-                    )
-                except InvalidStatus as exc:
-                    remaining = deadline - time.monotonic()
-                    if (
-                        exc.response.status_code != 503
-                        or exc.response.headers.get(DRAIN_HEADER) != "1"
-                        or remaining <= _DRAIN_RETRY_DELAY_S
-                    ):
-                        raise
-                    await asyncio.sleep(_DRAIN_RETRY_DELAY_S)
-                    open_timeout = deadline - time.monotonic()
-                    if open_timeout <= 0:
-                        raise
-                    continue
-                # Exceptions after this point cannot restart the request. In
-                # particular, a sent evaluation payload must never be replayed.
-                yield websocket
-                return
+            try:
+                return await websockets.connect(
+                    f"{self._ws_url}/ws/{path}",
+                    additional_headers=headers,
+                    open_timeout=60.0,
+                    ping_interval=_WS_PING_INTERVAL_S,
+                    ping_timeout=_WS_PING_TIMEOUT_S,
+                    max_size=10 * 1024 * 1024,
+                )
+            except InvalidStatus as exc:
+                if not is_drain_rejection(exc.response.status_code, exc.response.headers):
+                    raise
+                await asyncio.sleep(_DRAIN_RETRY_DELAY_S)
+                if time.monotonic() >= deadline:
+                    raise
 
     async def _websocket_request(
         self,
@@ -489,7 +463,7 @@ class BenchmarkServiceClient:
         """
         operation = f"WEBSOCKET /ws/{path}"
         with websocket_request_span(operation, self._headers) as headers:
-            async with self._connect_websocket(path, headers) as websocket:
+            async with await self._connect_websocket(path, headers) as websocket:
                 last_message_at = time.monotonic()
                 acknowledged = self._dataset_version is None
 

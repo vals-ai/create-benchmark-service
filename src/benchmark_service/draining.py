@@ -12,6 +12,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 from uuid import uuid4
 
 from starlette.responses import JSONResponse
@@ -23,16 +24,21 @@ DRAIN_STATE_PATH_ENV = "BENCHMARK_SERVICE_DRAIN_STATE_PATH"
 DRAIN_HEADER = "X-Benchmark-Service-Draining"
 
 
+class _Headers(Protocol):
+    def get(self, key: str, /) -> object: ...
+
+
+def is_drain_rejection(status: int, headers: _Headers) -> bool:
+    """Recognize a rejection that guarantees benchmark work did not start."""
+    return status == 503 and headers.get(DRAIN_HEADER) == "1"
+
+
 @dataclass(frozen=True)
 class DrainSnapshot:
     store_id: str
     revision: int
     accepting: bool
     in_flight: int
-
-    @property
-    def drained(self) -> bool:
-        return self.revision >= 0 and not self.accepting and self.in_flight == 0
 
 
 class DrainState:
@@ -75,57 +81,53 @@ class DrainState:
         return cls(target)
 
     @contextmanager
-    def _transaction(self) -> Iterator[sqlite3.Connection]:
+    def _transaction(self) -> Iterator[tuple[sqlite3.Connection, sqlite3.Row]]:
         connection = sqlite3.connect(self._uri, uri=True, timeout=1)
+        connection.row_factory = sqlite3.Row
         try:
             with connection:
                 connection.execute("BEGIN IMMEDIATE")
-                row = connection.execute("SELECT store_id FROM control WHERE id = 1").fetchone()
-                if row is None or row[0] != self.store_id:
+                row = connection.execute("SELECT store_id, revision, accepting FROM control WHERE id = 1").fetchone()
+                if row is None or row["store_id"] != self.store_id:
                     raise RuntimeError("Drain store identity changed; completion is unknown")
-                yield connection
+                yield connection, row
         finally:
             connection.close()
 
-    def set_admission(self, *, accepting: bool, revision: int, store_id: str) -> DrainSnapshot:
-        """Apply a monotonic control command addressed to this store incarnation."""
+    def set_admission(self, *, accepting: bool, revision: int) -> DrainSnapshot:
+        """Apply a monotonic control command to this store incarnation."""
         if revision < 0:
             raise ValueError("Drain control revision must be nonnegative")
-        if store_id != self.store_id:
-            raise ValueError("Drain control command targets a different store")
-        with self._transaction() as connection:
-            row = connection.execute("SELECT revision, accepting FROM control WHERE id = 1").fetchone()
-            assert row is not None
-            current_revision, current_accepting = int(row[0]), bool(row[1])
+        with self._transaction() as (connection, row):
+            current_revision, current_accepting = int(row["revision"]), bool(row["accepting"])
             if revision == current_revision and accepting != current_accepting:
                 raise ValueError("Conflicting drain commands at the same revision")
             if revision > current_revision:
                 connection.execute("UPDATE control SET revision = ?, accepting = ? WHERE id = 1", (revision, accepting))
-            return self._snapshot(connection)
+                current_revision, current_accepting = revision, accepting
+            return self._snapshot(connection, current_revision, current_accepting)
 
     def admit(self, request_id: str) -> bool:
         """Atomically check admission and take ownership of one request."""
-        with self._transaction() as connection:
-            row = connection.execute("SELECT accepting FROM control WHERE id = 1").fetchone()
-            if row is None or not row[0]:
+        with self._transaction() as (connection, row):
+            if not row["accepting"]:
                 return False
             connection.execute("INSERT INTO requests VALUES (?)", (request_id,))
             return True
 
     def complete(self, request_id: str) -> None:
         """Release an owned request. Repeated completion cannot lower another count."""
-        with self._transaction() as connection:
+        with self._transaction() as (connection, _):
             connection.execute("DELETE FROM requests WHERE id = ?", (request_id,))
 
     def snapshot(self) -> DrainSnapshot:
-        with self._transaction() as connection:
-            return self._snapshot(connection)
+        with self._transaction() as (connection, row):
+            return self._snapshot(connection, int(row["revision"]), bool(row["accepting"]))
 
-    def _snapshot(self, connection: sqlite3.Connection) -> DrainSnapshot:
-        row = connection.execute("SELECT revision, accepting FROM control WHERE id = 1").fetchone()
+    def _snapshot(self, connection: sqlite3.Connection, revision: int, accepting: bool) -> DrainSnapshot:
         count = connection.execute("SELECT COUNT(*) FROM requests").fetchone()
-        assert row is not None and count is not None
-        return DrainSnapshot(self.store_id, int(row[0]), bool(row[1]), int(count[0]))
+        assert count is not None
+        return DrainSnapshot(self.store_id, revision, accepting, int(count[0]))
 
 
 class DrainMiddleware:

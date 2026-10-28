@@ -472,12 +472,21 @@ async def test_websocket_context_closes_after_payload_failure_without_replay(can
     assert close_codes == [1011]
 
 
+@pytest.mark.parametrize("fail", [False, True], ids=["success", "unhandled_error"])
 async def test_request_remains_counted_until_outer_response_send_finishes(
-    state: DrainState, monkeypatch: pytest.MonkeyPatch
+    state: DrainState, monkeypatch: pytest.MonkeyPatch, fail: bool
 ) -> None:
     monkeypatch.setenv(DRAIN_STATE_PATH_ENV, str(state.path))
     monkeypatch.delenv("AUTH_REQUIRED", raising=False)
-    app = BenchmarkServiceApp(StubBenchmark)
+
+    class Benchmark(StubBenchmark):
+        async def evaluate_response(self, request: EvaluateResponseRequest, dataset: str | None = None) -> Any:
+            if fail:
+                raise RuntimeError("benchmark failed")
+            return {"score": 1}
+
+    app = BenchmarkServiceApp(Benchmark)
+    statuses: list[int] = []
     sending = asyncio.Event()
     release = asyncio.Event()
     completed = asyncio.Event()
@@ -491,21 +500,23 @@ async def test_request_remains_counted_until_outer_response_send_finishes(
     monkeypatch.setattr(DrainState, "complete", complete)
 
     async def receive() -> Message:
-        return {"type": "http.request", "body": b"", "more_body": False}
+        return {"type": "http.request", "body": b'{"task_id":"task-1","response":"answer"}', "more_body": False}
 
     async def send(message: Message) -> None:
+        if message["type"] == "http.response.start":
+            statuses.append(message["status"])
         if message["type"] == "http.response.body" and message.get("body"):
             sending.set()
             await release.wait()
 
     scope: Scope = {
         "type": "http",
-        "method": "GET",
-        "path": "/version",
+        "method": "POST",
+        "path": "/evaluate-response/",
         "query_string": b"",
         "scheme": "http",
         "http_version": "1.1",
-        "headers": [],
+        "headers": [(b"content-type", b"application/json")],
         "server": ("test", 80),
         "client": ("caller", 1234),
     }
@@ -521,6 +532,11 @@ async def test_request_remains_counted_until_outer_response_send_finishes(
             assert state.snapshot().in_flight == 1
         finally:
             release.set()
-            await asyncio.wait_for(request, 5)
+            if fail:
+                with pytest.raises(RuntimeError, match="benchmark failed"):
+                    await asyncio.wait_for(request, 5)
+            else:
+                await asyncio.wait_for(request, 5)
+        assert statuses == [500 if fail else 200]
         assert completed.is_set()
         assert state.snapshot().in_flight == 0

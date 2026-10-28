@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.responses import JSONResponse
 from pydantic import TypeAdapter, ValidationError
 from starlette.middleware.base import RequestResponseEndpoint
+from starlette.types import ASGIApp
 from starlette.websockets import WebSocketDisconnect
 from uvicorn.protocols.utils import ClientDisconnected
 from websockets.exceptions import ConnectionClosed
@@ -177,10 +178,16 @@ class BenchmarkServiceApp(FastAPI):
         super().__init__(title=service_cls.__name__, lifespan=lifespan)
         self._deployment_name = deployment_name
         self._sentry = sentry
+        drain_path = os.environ.get(DRAIN_STATE_PATH_ENV)
+        self._drain_state = DrainState(drain_path) if drain_path else None
         self._register_routes()
-        if drain_path := os.environ.get(DRAIN_STATE_PATH_ENV):
-            # Count the outer response send, including the HTTP middleware relay.
-            self.add_middleware(DrainMiddleware, state=DrainState(drain_path))
+
+    def build_middleware_stack(self) -> ASGIApp:
+        app = super().build_middleware_stack()
+        if self._drain_state is not None:
+            # Include response relays and the outer handler for uncaught errors.
+            return DrainMiddleware(app, self._drain_state)
+        return app
 
     def _sentry_enabled(self) -> bool:
         """Let app subclasses opt into the optional Sentry integration."""

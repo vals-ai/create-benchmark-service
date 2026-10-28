@@ -8,6 +8,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, computed_field, model_validator
 
+from benchmark_service import egress_tunnel
 from benchmark_service.sandbox import SandboxProviderConfig
 from benchmark_service.sandbox.types import (
     BaseSandboxSource,
@@ -265,7 +266,11 @@ class ChildEgress(BaseModel):
         listening. `ca_file` holds `ca_certificate`.
         """
         proxy = urlsplit(self.proxy_url)
-        return ["python3", script, str(proxy.hostname), str(proxy.port), ca_file, str(port), f"{script}.pid"]
+        return [
+            "python3",
+            script,
+            *egress_tunnel.arguments([str(proxy.hostname)], proxy.port or 443, ca_file, port, f"{script}.pid"),
+        ]
 
 
 class CreditedGeneration(BaseModel):

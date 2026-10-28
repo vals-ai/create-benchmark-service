@@ -6,7 +6,10 @@ Clients use the plain HTTP proxy this serves on loopback, so those that can't sp
 unencrypted. Runs in the sandbox with only the standard library, on any Python from 3.8. Exits once
 it's listening, leaving a child in its own session to serve, so the exec that starts it returns.
 
-Usage: egress_tunnel.py PROXY_HOST PROXY_PORT CA_FILE LISTEN_PORT PID_FILE
+Usage: egress_tunnel.py PROXY_HOSTS PROXY_PORT CA_FILE LISTEN_PORT PID_FILE, built by `arguments()`.
+
+PROXY_HOSTS lists the proxy's addresses, comma-separated. Each new connection tries them in order,
+starting with the one that last worked, so the sandbox keeps its egress if one address goes down.
 """
 
 from __future__ import annotations
@@ -17,6 +20,15 @@ import resource
 import socket
 import ssl
 import sys
+from collections.abc import Sequence
+
+# How long to wait on one proxy address before trying the next.
+_CONNECT_TIMEOUT_SECONDS = 10
+
+
+def arguments(hosts: Sequence[str], port: int, ca_file: str, listen_port: int, pid_file: str) -> list[str]:
+    """Builds this script's command-line arguments, so callers don't depend on their order or format."""
+    return [",".join(hosts), str(port), ca_file, str(listen_port), pid_file]
 
 
 async def _relay(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -28,16 +40,29 @@ async def _relay(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> 
         await writer.drain()
 
 
-async def serve(listener: socket.socket, host: str, port: int, context: ssl.SSLContext) -> None:
+async def serve(listener: socket.socket, hosts: list[str], port: int, context: ssl.SSLContext) -> None:
+    preferred = 0
+
+    async def connect() -> tuple[asyncio.StreamReader, asyncio.StreamWriter] | None:
+        nonlocal preferred
+        for index in [(preferred + offset) % len(hosts) for offset in range(len(hosts))]:
+            try:
+                connection = await asyncio.wait_for(
+                    asyncio.open_connection(hosts[index], port, ssl=context), timeout=_CONNECT_TIMEOUT_SECONDS
+                )
+            except (OSError, asyncio.TimeoutError) as error:
+                print(f"egress proxy tunnel: can't reach {hosts[index]}:{port}: {error!r}", file=sys.stderr, flush=True)
+                continue
+            preferred = index
+            return connection
+        return None
+
     async def handle(client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter) -> None:
-        try:
-            proxy_reader, proxy_writer = await asyncio.wait_for(
-                asyncio.open_connection(host, port, ssl=context), timeout=30
-            )
-        except (OSError, asyncio.TimeoutError) as error:
-            print(f"egress proxy tunnel: can't reach {host}:{port}: {error!r}", file=sys.stderr, flush=True)
+        connection = await connect()
+        if connection is None:
             client_writer.close()
             return
+        proxy_reader, proxy_writer = connection
         relays = [
             asyncio.ensure_future(_relay(client_reader, proxy_writer)),
             asyncio.ensure_future(_relay(proxy_reader, client_writer)),
@@ -68,7 +93,7 @@ def _running(pid_file: str) -> bool:
 
 
 def main() -> None:
-    host, port, ca_file, listen_port, pid_file = sys.argv[1:6]
+    hosts, port, ca_file, listen_port, pid_file = sys.argv[1:6]
     # A retried run stage in the same sandbox reuses the tunnel the first attempt started.
     if _running(pid_file):
         return
@@ -90,7 +115,7 @@ def main() -> None:
     os.dup2(log, 2)
     with open(pid_file, "w") as f:
         f.write(str(os.getpid()))
-    asyncio.run(serve(listener, host, int(port), context))
+    asyncio.run(serve(listener, [host for host in hosts.split(",") if host], int(port), context))
 
 
 if __name__ == "__main__":

@@ -177,9 +177,10 @@ class BenchmarkServiceApp(FastAPI):
         super().__init__(title=service_cls.__name__, lifespan=lifespan)
         self._deployment_name = deployment_name
         self._sentry = sentry
-        if drain_path := os.environ.get(DRAIN_STATE_PATH_ENV):
-            self.add_middleware(DrainMiddleware, state=DrainState(drain_path))
         self._register_routes()
+        if drain_path := os.environ.get(DRAIN_STATE_PATH_ENV):
+            # Count the outer response send, including the HTTP middleware relay.
+            self.add_middleware(DrainMiddleware, state=DrainState(drain_path))
 
     def _sentry_enabled(self) -> bool:
         """Let app subclasses opt into the optional Sentry integration."""

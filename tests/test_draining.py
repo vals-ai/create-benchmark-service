@@ -470,3 +470,57 @@ async def test_websocket_context_closes_after_payload_failure_without_replay(can
             await asyncio.wait_for(closed.wait(), 5)
     assert len(received) == 1
     assert close_codes == [1011]
+
+
+async def test_request_remains_counted_until_outer_response_send_finishes(
+    state: DrainState, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(DRAIN_STATE_PATH_ENV, str(state.path))
+    monkeypatch.delenv("AUTH_REQUIRED", raising=False)
+    app = BenchmarkServiceApp(StubBenchmark)
+    sending = asyncio.Event()
+    release = asyncio.Event()
+    completed = asyncio.Event()
+    original_complete = DrainState.complete
+
+    def complete(store: DrainState, request_id: str) -> None:
+        original_complete(store, request_id)
+        loop.call_soon_threadsafe(completed.set)
+
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(DrainState, "complete", complete)
+
+    async def receive() -> Message:
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.body" and message.get("body"):
+            sending.set()
+            await release.wait()
+
+    scope: Scope = {
+        "type": "http",
+        "method": "GET",
+        "path": "/version",
+        "query_string": b"",
+        "scheme": "http",
+        "http_version": "1.1",
+        "headers": [],
+        "server": ("test", 80),
+        "client": ("caller", 1234),
+    }
+    async with app.router.lifespan_context(app):
+        request = asyncio.create_task(app(scope, receive, send))
+        try:
+            await asyncio.wait_for(sending.wait(), 5)
+            configure(state, False, 1)
+            # Allow the inner response producer to finish while the actual send
+            # stays blocked. Its completion must not release request ownership.
+            with pytest.raises(TimeoutError):
+                await asyncio.wait_for(completed.wait(), 0.25)
+            assert state.snapshot().in_flight == 1
+        finally:
+            release.set()
+            await asyncio.wait_for(request, 5)
+        assert completed.is_set()
+        assert state.snapshot().in_flight == 0

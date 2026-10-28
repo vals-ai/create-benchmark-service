@@ -456,7 +456,7 @@ async def test_websocket_context_closes_after_payload_failure_without_replay(can
             raise RuntimeError("consumer failed after request started")
 
     async with serve_websocket(handler, "127.0.0.1", 0) as server:
-        port = server.sockets[0].getsockname()[1]
+        port = next(iter(server.sockets)).getsockname()[1]
         async with BenchmarkServiceClient(f"http://127.0.0.1:{port}", {}) as client:
             request = asyncio.create_task(client.resume_evaluation("task-1", {}, on_message=on_message))
             await asyncio.wait_for(started.wait(), 5)

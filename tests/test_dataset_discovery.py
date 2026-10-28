@@ -131,12 +131,12 @@ async def test_client_preserves_errors_including_older_services(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock], status: int
 ) -> None:
     client, http = benchmark_client
-    http.get.return_value = httpx.Response(status, json={"detail": "Not available"})
+    http.request.return_value = httpx.Response(status, json={"detail": "Not available"})
     error_type = BenchmarkServiceUnauthenticatedError if status == 401 else BenchmarkServiceError
     with pytest.raises(error_type) as failure:
         await client.list_datasets()
     assert failure.value.status_code == status
-    http.get.assert_called_once_with("http://localhost:8000/v1/datasets")
+    http.request.assert_called_once_with("GET", "http://localhost:8000/v1/datasets")
 
 
 @pytest.mark.parametrize("body", [{}, {"datasets": [123]}, {"datasets": "default"}])
@@ -144,7 +144,7 @@ async def test_client_validates_discovery_response(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock], body: dict[str, object]
 ) -> None:
     client, http = benchmark_client
-    http.get.return_value = httpx.Response(200, json=body)
+    http.request.return_value = httpx.Response(200, json=body)
     with pytest.raises(ValidationError):
         await client.list_datasets()
 

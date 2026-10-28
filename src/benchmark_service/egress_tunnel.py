@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import asyncio
 import os
-import resource
 import socket
 import ssl
 import sys
@@ -93,6 +92,8 @@ def _running(pid_file: str) -> bool:
 
 
 def main() -> None:
+    import resource
+
     hosts, port, ca_file, listen_port, pid_file = sys.argv[1:6]
     # A retried run stage in the same sandbox reuses the tunnel the first attempt started.
     if _running(pid_file):

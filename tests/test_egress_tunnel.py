@@ -13,6 +13,7 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec
 from cryptography.x509.oid import NameOID
 
+from benchmark_service import egress_tunnel
 from benchmark_service.egress_tunnel import serve
 
 
@@ -92,6 +93,19 @@ async def test_tunnel_falls_over_to_the_next_address_and_stays_on_it(
         assert await send(tunnel_port, b"second") == b"second"
 
     assert capsys.readouterr().err.count("can't reach ::1") == 1
+
+
+async def test_tunnel_moves_past_an_address_that_accepts_but_never_answers(
+    certificate: tuple[Path, Path], monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(egress_tunnel, "_CONNECT_TIMEOUT_SECONDS", 0.2)
+    async with echo_proxy(certificate) as port:
+        # The kernel completes the handshake on ::1, but nothing ever answers TLS there.
+        with socket.create_server(("::1", port), family=socket.AF_INET6):
+            async with tunnel(["::1", "127.0.0.1"], port, certificate) as tunnel_port:
+                assert await asyncio.wait_for(send(tunnel_port, b"hello"), timeout=5) == b"hello"
+
+    assert "can't reach ::1" in capsys.readouterr().err
 
 
 async def test_tunnel_closes_the_client_when_no_address_answers(

@@ -1662,3 +1662,31 @@ def test_child_profiles_need_simple_names() -> None:
     assert plan.children["gpu-1"].models == ["a/b"]
     with pytest.raises(ValidationError):
         BenchmarkEgressPlan.model_validate({"children": {"GPU box": {}}})
+
+async def test_stream_evaluate_response_uses_no_sandbox_and_does_not_retry(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, _ = benchmark_client
+    mock_connect = _ws_mock([json.dumps({"type": "result", "data": {"status": "complete"}})])
+    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect) as connect:
+        result = await client.stream_evaluate_response("task-1", '{"analysis_run_id":"run-1"}', dataset="source-1")
+    ws = mock_connect.__aenter__.return_value
+    body = json.loads(ws.send.call_args.args[0])
+    assert body["task_id"] == "task-1"
+    assert body["response"] == '{"analysis_run_id":"run-1"}'
+    assert body["dataset"] == "source-1"
+    assert body.get("sandbox_provider") is None and body.get("instance_id") is None
+    assert result == {"status": "complete"}
+    assert connect.call_count == 1
+
+
+async def test_prepare_source_does_not_retry_unknown_outcome(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, http = benchmark_client
+    http.post.side_effect = httpx.ReadTimeout("unknown source preparation outcome")
+    with pytest.raises(httpx.ReadTimeout):
+        await client.prepare_source_dataset("source-1")
+    http.post.assert_awaited_once_with(
+        "http://localhost:8000/prepare-source", json={"source_run_id": "source-1"}, timeout=3600
+    )

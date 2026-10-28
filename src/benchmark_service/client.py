@@ -545,6 +545,18 @@ class BenchmarkServiceClient:
             raise BenchmarkServiceError("The service resolved a different dataset")
         return resolved
 
+    async def prepare_source_dataset(self, source_run_id: str) -> None:
+        """Freeze an authorized source run before resolving its dataset version.
+
+        This writes immutable source objects and deliberately has no transport retry.
+        """
+        if self._dataset_version is not None:
+            raise ValueError("Prepare a source with an unpinned client")
+        response = await self._http_client.post(
+            f"{self._url}/prepare-source", json={"source_run_id": source_run_id}, timeout=3600
+        )
+        _require_ok(response, "Source preparation")
+
     @_retry_http
     async def verify_task_ids(
         self, task_ids: list[str] | None, slice_str: str | None, dataset: str | None = None
@@ -731,6 +743,22 @@ class BenchmarkServiceClient:
         _require_ok(resp, "Evaluate response")
 
         return resp.json()
+
+    async def stream_evaluate_response(
+        self,
+        task_id: str,
+        response: str,
+        dataset: str | None = None,
+        on_message: Callable[[str], None] | None = None,
+        on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
+    ) -> JsonValue:
+        """Grade a supplied response in the service process without creating a sandbox.
+
+        Unlike the HTTP helper, this stream is not automatically retried after a
+        transport error: the service may already have dispatched a paid call.
+        """
+        request = EvaluateResponseRequest(task_id=task_id, response=response, dataset=dataset)
+        return await self._websocket_request("evaluate-response", request, on_message, on_eval_resume_state)
 
     async def resume_evaluation(
         self,

@@ -1645,6 +1645,10 @@ def test_child_egress_tunnel_command_starts_the_packaged_tunnel() -> None:
         "/tmp/egress_tunnel.py.pid",
     ]
     assert b"def main()" in files("benchmark_service").joinpath("egress_tunnel.py").read_bytes()
+    with_fallbacks = CHILD_EGRESS.model_copy(update={"proxy_hosts": ["192.0.2.1", "192.0.2.2"]})
+    assert (
+        with_fallbacks.tunnel_command("/tmp/egress_tunnel.py", "/tmp/egress-ca.pem", 3128)[2] == "192.0.2.1,192.0.2.2"
+    )
 
 
 def test_child_egress_keeps_credentials_out_of_its_repr() -> None:

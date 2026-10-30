@@ -78,6 +78,9 @@ It has its own version and dependencies and can run without CBS or the Vals plat
 
 The `benchmark_service` package is the core framework that generated services build on. It provides the FastAPI application, abstract base class, data models, and sandbox utilities — so you only need to implement benchmark-specific logic.
 
+The optional [request drain gate](docs/DRAINING.md) lets existing requests finish while it refuses new work.
+It is disabled by default and requires a deployment controller.
+
 ### `BenchmarkService` base class (`base.py`)
 
 Subclass `BenchmarkService` and implement its abstract methods. On instantiation, the `create()` factory method calls `load_datasets()` and stores the result as `self.datasets`.

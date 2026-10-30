@@ -432,6 +432,7 @@ class BenchmarkServiceApp(FastAPI):
         async with self._dataset_scope(request, request.state.tenant, dataset):
             return await self.service.retrieve_task(task_id, skip_validation, dataset=dataset)
 
+    @asynccontextmanager
     async def _stream_session(
         self, websocket: WebSocket, endpoint: str, sensitive: Callable[[], bool] | None = None
     ) -> AsyncGenerator[None, None]:

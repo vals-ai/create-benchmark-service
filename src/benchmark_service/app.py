@@ -4,7 +4,7 @@ import importlib.metadata
 import logging
 import os
 import traceback
-from collections.abc import AsyncGenerator, Mapping
+from collections.abc import AsyncGenerator, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, aclosing, asynccontextmanager, nullcontext, suppress
 from typing import Any, Literal, cast
 
@@ -33,6 +33,8 @@ from benchmark_service.schemas import (
     EvaluateResponseRequest,
     FinalScoreRequest,
     FinalScoreResponse,
+    GradingRequirementsRequest,
+    GradingRequirementsResponse,
     HealthCheckResponse,
     ListDatasetsResponse,
     RetrieveTaskResponse,
@@ -120,13 +122,16 @@ def _request_may_use_provider(config: SandboxProviderConfig | None) -> bool:
     return not isinstance(config, DockerProviderConfig) or os.environ.get(DOCKER_ENABLED_ENV, "").lower() == "true"
 
 
-def _grading_credentials(headers: Mapping[str, str], task_id: str) -> AbstractAsyncContextManager[None]:
-    """Gateway credentials for the run, attempt and email the caller names in its correlation headers."""
+def _grading_credentials(
+    headers: Mapping[str, str], task_id: str, grading_token: str | None = None
+) -> AbstractAsyncContextManager[None]:
+    """Gateway credentials for the evaluation; a supplied grader token takes precedence."""
     return grading_credentials(
         run_id=headers.get(RUN_ID_HEADER),
         task_id=task_id,
         attempt_id=headers.get(ATTEMPT_ID_HEADER),
         email=headers.get(EMAIL_HEADER),
+        grading_token=grading_token,
     )
 
 
@@ -238,6 +243,7 @@ class BenchmarkServiceApp(FastAPI):
         self.add_api_route("/version", self._version, methods=["GET"])
         self.add_api_route("/v1/datasets", self._list_datasets, methods=["GET"], response_model=ListDatasetsResponse)
         self.add_api_route("/resolve-dataset", self._resolve_dataset, methods=["POST"])
+        self.add_api_route("/grading-requirements", self._grading_requirements, methods=["POST"])
         self.add_api_route("/verify-task-ids", self._verify_task_ids, methods=["GET"])
         self.add_api_route("/retrieve-task/", self._retrieve_task, methods=["GET"])
         self.add_api_websocket_route("/ws/setup-task", self._setup_task)
@@ -340,6 +346,16 @@ class BenchmarkServiceApp(FastAPI):
                 raise HTTPException(status_code=400, detail="Dataset version selection is not supported")
             return ResolveDatasetResponse(dataset=body.dataset, version=resolved)
 
+    async def _grading_requirements(
+        self, request: Request, body: GradingRequirementsRequest
+    ) -> GradingRequirementsResponse:
+        if self._sentry is not None:
+            self._sentry.bind_request_context(request.headers, task_id=body.task_id, dataset=body.dataset)
+        async with self._dataset_scope(request, request.state.tenant, body.dataset):
+            return GradingRequirementsResponse(
+                models=self.service.grading_requirements(body.task_id, dataset=body.dataset)
+            )
+
     async def _authorize_websocket(self, websocket: WebSocket) -> str | None:
         """Authenticate a WebSocket caller. Returns tenant id, or None after closing 1008."""
         self.clear_request_context()
@@ -417,7 +433,9 @@ class BenchmarkServiceApp(FastAPI):
             return await self.service.retrieve_task(task_id, skip_validation, dataset=dataset)
 
     @asynccontextmanager
-    async def _stream_session(self, websocket: WebSocket, endpoint: str) -> AsyncGenerator[None, None]:
+    async def _stream_session(
+        self, websocket: WebSocket, endpoint: str, sensitive: Callable[[], bool] | None = None
+    ) -> AsyncGenerator[None, None]:
         try:
             yield
         except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed):
@@ -425,6 +443,12 @@ class BenchmarkServiceApp(FastAPI):
         except _DatasetVersionSelectionError as exc:
             await _send_dataset_version_error(websocket, exc)
         except Exception as exc:
+            if sensitive is not None and sensitive():
+                logger.error("%s websocket evaluation failed with supplied grading token", endpoint)
+                await send_json_if_connected(
+                    websocket, StreamErrorChunk(type="error", data="Evaluation failed").model_dump()
+                )
+                return
             if self._sentry is not None:
                 self._sentry.capture_exception(exc)
             error_msg = f"{str(exc)}\n{traceback.format_exc()}"
@@ -469,6 +493,8 @@ class BenchmarkServiceApp(FastAPI):
                         )
 
     async def _evaluate_response(self, request: Request, body: EvaluateResponseRequest) -> Any:
+        if body.grading_token is not None:
+            raise HTTPException(status_code=400, detail="grading_token is supported only on WebSocket evaluation")
         if self._sentry is not None:
             self._sentry.bind_request_context(request.headers, task_id=body.task_id, dataset=body.dataset)
         if not _request_may_use_provider(body.sandbox_provider):
@@ -481,12 +507,14 @@ class BenchmarkServiceApp(FastAPI):
 
     async def _evaluate_response_stream(self, websocket: WebSocket) -> None:
         await websocket.accept()
-        async with self._stream_session(websocket, "evaluate-response"):
+        token_supplied = False
+        async with self._stream_session(websocket, "evaluate-response", sensitive=lambda: token_supplied):
             tenant = await self._authorize_websocket(websocket)
             if tenant is None:
                 return
 
-            data = await websocket.receive_json()
+            data: dict[str, Any] = await websocket.receive_json()
+            token_supplied = "grading_token" in data
             request = EvaluateResponseRequest(**data)
             if self._sentry is not None:
                 self._sentry.bind_request_context(websocket.headers, task_id=request.task_id, dataset=request.dataset)
@@ -498,7 +526,7 @@ class BenchmarkServiceApp(FastAPI):
                 if not await self._admit_websocket_evaluation(websocket, tenant):
                     return
 
-                async with _grading_credentials(websocket.headers, request.task_id):
+                async with _grading_credentials(websocket.headers, request.task_id, request.grading_token):
                     async with (
                         request.sandbox_provider.create_provider() if request.sandbox_provider else nullcontext()
                     ) as provider:
@@ -511,18 +539,23 @@ class BenchmarkServiceApp(FastAPI):
                         ):
                             await _forward_stream(
                                 websocket,
-                                self.service.stream_evaluate_response(request, dataset=request.dataset),
+                                self.service.stream_evaluate_response(
+                                    request.model_copy(update={"grading_token": None}), dataset=request.dataset
+                                ),
                                 endpoint="evaluate-response",
                             )
 
     async def _evaluate_instance(self, websocket: WebSocket) -> None:
         await websocket.accept()
-        async with self._stream_session(websocket, "evaluate-instance"):
+        token_supplied = False
+        async with self._stream_session(websocket, "evaluate-instance", sensitive=lambda: token_supplied):
             tenant = await self._authorize_websocket(websocket)
             if tenant is None:
                 return
 
-            request = EvaluateInstanceRequest(**await websocket.receive_json())
+            data: dict[str, Any] = await websocket.receive_json()
+            token_supplied = "grading_token" in data
+            request = EvaluateInstanceRequest(**data)
             if self._sentry is not None:
                 self._sentry.bind_request_context(
                     websocket.headers,
@@ -544,7 +577,7 @@ class BenchmarkServiceApp(FastAPI):
 
                     # Benchmarks that grade in a second sandbox read the provider
                     # from the request scope; see benchmark_service.context.
-                    async with _grading_credentials(websocket.headers, request.task_id):
+                    async with _grading_credentials(websocket.headers, request.task_id, request.grading_token):
                         with (
                             sandbox_provider_scope(provider),
                             child_egress_scope(request.child_egress),

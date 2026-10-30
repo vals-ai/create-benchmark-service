@@ -8,6 +8,7 @@ a FastAPI app with your implementation.
 import asyncio
 import inspect
 import logging
+import os
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Mapping
 from contextlib import AbstractAsyncContextManager, aclosing, asynccontextmanager
@@ -229,6 +230,13 @@ class BenchmarkService(ABC):
             Dictionary mapping dataset names to dictionaries of task IDs to task objects
         """
         ...
+
+    def grading_requirements(self, task_id: str, dataset: str | None = None) -> list[str]:
+        """Gateway model keys used while grading this task, including grading finalizers.
+
+        Override for task-specific judges; direct-provider models are not Gateway keys.
+        """
+        return [model.strip() for model in os.environ.get("GRADING_MODELS", "").split(",") if model.strip()]
 
     async def check_auth(self, headers: dict[str, str]) -> bool:
         """Validate request authorization.

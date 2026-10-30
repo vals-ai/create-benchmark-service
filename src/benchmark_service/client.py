@@ -35,6 +35,8 @@ from benchmark_service.schemas import (
     EvaluateResponseRequest,
     FinalScoreResponse,
     HealthCheckResponse,
+    GradingRequirementsRequest,
+    GradingRequirementsResponse,
     JsonValue,
     ListDatasetsResponse,
     ResolveDatasetRequest,
@@ -605,6 +607,16 @@ class BenchmarkServiceClient:
         return VerifyTaskIdsResponse.model_validate(response.json())
 
     @_retry_http
+    async def grading_requirements(self, task_id: str, dataset: str | None = None) -> list[str]:
+        """Retrieve the Gateway model keys required to grade this task."""
+        body = GradingRequirementsRequest(task_id=task_id, dataset=dataset)
+        response = await self._http_request(
+            "POST", f"{self._url}/grading-requirements", json=body.model_dump()
+        )
+        _require_ok(response, "Grading requirements")
+        return GradingRequirementsResponse.model_validate(response.json()).models
+
+    @_retry_http
     async def retrieve_task(
         self, task_id: str, skip_validation: bool = False, dataset: str | None = None
     ) -> RetrieveTaskResponse:
@@ -779,6 +791,7 @@ class BenchmarkServiceClient:
         instance_id: str | None = None,
         on_sandbox_created: Callable[[SandboxCreatedData], None] | None = None,
         child_egress: dict[str, ChildEgress] | None = None,
+        grading_token: str | None = None,
     ) -> JsonValue:
         """Resume evaluation from state previously streamed by the benchmark service.
 
@@ -792,6 +805,7 @@ class BenchmarkServiceClient:
             sandbox_provider=sandbox_provider,
             instance_id=instance_id,
             dataset=dataset,
+            grading_token=grading_token,
             announce_sandboxes=on_sandbox_created is not None,
             child_egress=child_egress or {},
         )
@@ -809,6 +823,7 @@ class BenchmarkServiceClient:
         on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
         on_sandbox_created: Callable[[SandboxCreatedData], None] | None = None,
         child_egress: dict[str, ChildEgress] | None = None,
+        grading_token: str | None = None,
     ) -> JsonValue:
         """Evaluate a task instance via WebSocket.
 
@@ -824,6 +839,7 @@ class BenchmarkServiceClient:
             sandbox_provider=sandbox_provider,
             dataset=dataset,
             announce_sandboxes=on_sandbox_created is not None,
+            grading_token=grading_token,
             child_egress=child_egress or {},
         )
         return await self._websocket_request(

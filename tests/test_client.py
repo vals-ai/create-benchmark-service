@@ -847,6 +847,24 @@ async def test_resume_evaluation_with_eval_resume_state(
     on_eval_resume_state.assert_called_once_with(state)
 
 
+@pytest.mark.parametrize("with_token", [False, True])
+@pytest.mark.parametrize("resume", [False, True])
+async def test_grading_token_is_sent_only_for_project_keyed_evaluation(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock], with_token: bool, resume: bool
+) -> None:
+    client, _ = benchmark_client
+    mock_connect = _ws_mock([json.dumps({"type": "result", "data": {"score": 1.0}})])
+    token = "project-grader-token" if with_token else None
+    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=mock_connect)):
+        if resume:
+            await client.resume_evaluation("task-1", {"checkpoint": "saved"}, grading_token=token)
+        else:
+            await client.evaluate_instance("task-1", "i-1", grading_token=token)
+    sent = json.loads(mock_connect.__aenter__.return_value.send.call_args.args[0])
+    assert sent.get("grading_token") == token
+    assert ("grading_token" in sent) is with_token
+
+
 async def test_evaluate_instance_reports_each_sandbox_created_chunk(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:

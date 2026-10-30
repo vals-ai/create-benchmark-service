@@ -1,10 +1,11 @@
 """Per-evaluation Model Gateway credentials.
 
-For each evaluation that names a run, task and attempt, mint a Gateway run token
-from the service key (claims: those ids, ``IDENTITY`` with ``agent_name="grader"``
-and the caller's email, ``GRADING_MODELS``), bind it request-locally so judge calls
-carry it, and revoke it afterwards. Without ``GRADING_MODELS`` or Gateway settings nothing is bound; without a
-run id the service's own key applies; a run id without an attempt id fails the evaluation.
+A supplied grader token is bound to model_library and the current evaluation,
+without minting from the service key. Legacy callers still use the service key
+to mint and revoke run tokens when GRADING_MODELS is configured.
+
+Without Gateway settings legacy calls bind no credentials; without a run id
+they use the service key. A legacy run without an attempt id fails grading.
 
 The binding is a ``ContextVar``: asyncio tasks and ``asyncio.to_thread`` inherit it,
 but plain ``loop.run_in_executor`` and ``ThreadPoolExecutor.submit`` do not, so graders
@@ -20,6 +21,7 @@ from collections.abc import AsyncIterator
 from contextlib import AbstractContextManager, asynccontextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
+from typing import cast
 
 import httpx
 
@@ -141,9 +143,10 @@ async def _revoke(credentials: GradingCredentials, api_key: str) -> None:
 
 @asynccontextmanager
 async def grading_credentials(
-    *, run_id: str | None, task_id: str, attempt_id: str | None = None, email: str | None = None
+    *, run_id: str | None, task_id: str, attempt_id: str | None = None,
+    email: str | None = None, grading_token: str | None = None,
 ) -> AsyncIterator[None]:
-    """Mint, bind and finally revoke the Gateway credentials for one evaluation.
+    """Bind supplied credentials or mint and revoke legacy Gateway credentials.
 
     Spans the complete operation, so callers must leave the scope only after every
     task that grades (stream finalizers, cleanup) has finished. A scope entered
@@ -151,7 +154,9 @@ async def grading_credentials(
     """
     caller = _caller.set(EvaluationCaller(run_id, task_id, attempt_id, email)) if run_id is not None else None
     try:
-        async with _bind_credentials(run_id=run_id, task_id=task_id, attempt_id=attempt_id, email=email):
+        async with _bind_credentials(
+            run_id=run_id, task_id=task_id, attempt_id=attempt_id, email=email, grading_token=grading_token
+        ):
             yield
     finally:
         if caller is not None:
@@ -160,23 +165,34 @@ async def grading_credentials(
 
 @asynccontextmanager
 async def _bind_credentials(
-    *, run_id: str | None, task_id: str, attempt_id: str | None, email: str | None
+    *, run_id: str | None, task_id: str, attempt_id: str | None,
+    email: str | None, grading_token: str | None,
 ) -> AsyncIterator[None]:
-    service = _service_credentials()
-    models = [model.strip() for model in os.environ.get("GRADING_MODELS", "").split(",") if model.strip()]
-    if _current.get() is not None or service is None or not models:
+    if _current.get() is not None:
         yield
         return
-    credentials = service
+    service = _service_credentials()
+    gateway_url = os.environ.get("MODEL_GATEWAY_URL", "").strip().rstrip("/")
+    if grading_token is not None:
+        credentials = GradingCredentials(gateway_url, grading_token)
+    else:
+        models = [model.strip() for model in os.environ.get("GRADING_MODELS", "").split(",") if model.strip()]
+        if service is None or not models:
+            yield
+            return
+        credentials = service
+        if run_id is not None:
+            if attempt_id is None:
+                raise RuntimeError(f"cannot mint a grading token for run_id={run_id} task_id={task_id}: no attempt id")
+            from model_library.base.gateway import gateway_token_scope  # pyright: ignore[reportMissingImports, reportUnknownVariableType]
+
+            credentials = await _mint(
+                service, run_id=run_id, task_id=task_id, attempt_id=attempt_id, email=email, models=models
+            )
     scope: AbstractContextManager[None] = nullcontext()
-    if run_id is not None:
-        if attempt_id is None:
-            raise RuntimeError(f"cannot mint a grading token for run_id={run_id} task_id={task_id}: no attempt id")
+    if grading_token is not None or credentials.lease_id is not None:
         from model_library.base.gateway import gateway_token_scope  # pyright: ignore[reportMissingImports, reportUnknownVariableType]
 
-        credentials = await _mint(
-            service, run_id=run_id, task_id=task_id, attempt_id=attempt_id, email=email, models=models
-        )
         scope = gateway_token_scope(credentials.api_key)  # pyright: ignore[reportUnknownVariableType]
     token = _current.set(credentials)
     try:
@@ -185,4 +201,4 @@ async def _bind_credentials(
     finally:
         _current.reset(token)
         if credentials.lease_id is not None:
-            await _revoke(credentials, service.api_key)
+            await _revoke(credentials, cast(GradingCredentials, service).api_key)

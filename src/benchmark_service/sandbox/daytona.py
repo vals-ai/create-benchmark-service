@@ -41,6 +41,9 @@ from daytona import (
     GpuType,
 )
 from daytona import (
+    Image as DaytonaImage,
+)
+from daytona import (
     VolumeMount as DaytonaVolumeMount,
 )
 from daytona import (
@@ -79,6 +82,7 @@ from benchmark_service.sandbox.types import (
     ComposeSource,
     ControlledWorkload,
     ControlledWorkloadResult,
+    DockerfileSource,
     ExecResult,
     GenerationContainment,
     LINUX_CGROUP_V2_V1,
@@ -88,6 +92,7 @@ from benchmark_service.sandbox.types import (
     ResourceCapacity,
     Resources,
     Sandbox,
+    SandboxBuildError,
     SandboxCapacity,
     SandboxCapacityDomain,
     SandboxCommandError,
@@ -1701,9 +1706,9 @@ class DaytonaSandboxProvider(SandboxProvider):
             source = source.outer
         if self._organization_id is None:
             return True
-        if isinstance(source, ImageSource) and resources.gpu:
+        if isinstance(source, (ImageSource, DockerfileSource)) and resources.gpu:
             return True
-        if not isinstance(source, (ImageSource, TargetedSnapshotSource)):
+        if not isinstance(source, (ImageSource, DockerfileSource, TargetedSnapshotSource)):
             return True
 
         target = self._target
@@ -1915,7 +1920,11 @@ class DaytonaSandboxProvider(SandboxProvider):
         )
 
         match request.source:
-            case ImageSource(image=image):
+            case ImageSource() | DockerfileSource() as source:
+                try:
+                    image = source.image if isinstance(source, ImageSource) else DaytonaImage.from_dockerfile(source.dockerfile)
+                except (OSError, DaytonaError) as exc:
+                    raise SandboxError(f"Cannot read the Dockerfile: {exc}") from exc
                 params = CreateSandboxFromImageParams(
                     auto_stop_interval=request.auto_stop_interval,
                     auto_delete_interval=0,
@@ -1950,8 +1959,17 @@ class DaytonaSandboxProvider(SandboxProvider):
             case ComposeSource():
                 raise SandboxError("ComposeSource must be unwrapped before provider.create_sandbox")
 
+        builds_dockerfile = isinstance(request.source, DockerfileSource)
+        build_log: list[str] = []
         try:
-            inner = await daytona.create(params, timeout=request.create_timeout)
+            if isinstance(params, CreateSandboxFromImageParams):
+                inner = await daytona.create(
+                    params,
+                    timeout=request.provider_timeout,
+                    on_snapshot_create_logs=build_log.append if builds_dockerfile else None,
+                )
+            else:
+                inner = await daytona.create(params, timeout=request.provider_timeout)
         except DaytonaError as exc:
             # A name conflict means an earlier attempt of this same request
             # created the sandbox but the response was lost (transport retry).
@@ -1962,14 +1980,25 @@ class DaytonaSandboxProvider(SandboxProvider):
                 if existing is not None:
                     await notify_sandbox_created("daytona", existing.id)
                     return DaytonaSandbox(existing, daytona)
-            elif _is_transient_daytona_error(exc):
-                await self._delete_failed_sandbox(request.name, daytona)
-            raise self._sandbox_error(exc) from exc
+            elif _is_transient_daytona_error(exc) or builds_dockerfile:
+                await self._delete_failed_sandbox(
+                    request.name, daytona, abandoned_build=builds_dockerfile and isinstance(exc, DaytonaTimeoutError)
+                )
+            error = self._sandbox_error(exc)
+            if isinstance(request.source, DockerfileSource):
+                if isinstance(exc, DaytonaTimeoutError):
+                    raise SandboxBuildError(
+                        f"Timed out building {request.source.dockerfile} after {request.provider_timeout:g}s",
+                        "\n".join(build_log),
+                    ) from exc
+                if build_log and type(error) is SandboxError:
+                    raise SandboxBuildError(str(error), "\n".join(build_log)) from exc
+            raise error from exc
 
         await notify_sandbox_created("daytona", inner.id)
         return DaytonaSandbox(inner, daytona)
 
-    async def _delete_failed_sandbox(self, name: str, daytona: AsyncDaytona) -> None:
+    async def _delete_failed_sandbox(self, name: str, daytona: AsyncDaytona, *, abandoned_build: bool = False) -> None:
         try:
             sandbox = await _bounded("daytona.get", daytona.get(name), _TOOLBOX_CALL_TIMEOUT_SECONDS)
         except DaytonaNotFoundError:
@@ -1977,7 +2006,7 @@ class DaytonaSandboxProvider(SandboxProvider):
         except DaytonaError as exc:
             raise self._sandbox_error(exc) from exc
 
-        if sandbox.state in _FAILED_SANDBOX_STATES:
+        if sandbox.state in _FAILED_SANDBOX_STATES or (abandoned_build and sandbox.state not in _REMOVED_SANDBOX_STATES):
             await self.delete_sandbox(sandbox.id)
 
     async def _find_existing_sandbox(self, name: str, daytona: AsyncDaytona) -> AsyncSandbox | None:

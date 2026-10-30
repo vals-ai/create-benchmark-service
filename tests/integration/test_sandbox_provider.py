@@ -8,6 +8,7 @@ Requires AWS_PROFILE, TEST_AWS_REGION, TEST_DAYTONA_SECRET_NAME, and TEST_MODAL_
 import asyncio
 import shlex
 import time
+from pathlib import Path
 from collections.abc import Awaitable, Callable
 from datetime import timedelta
 from types import SimpleNamespace
@@ -19,9 +20,11 @@ from daytona import CreateSecretParams
 from modal import Sandbox as ModalSdkSandbox
 
 from benchmark_service import (
+    DockerfileSource,
     ImageSource,
     Resources,
     Sandbox,
+    SandboxBuildError,
     SandboxCommandError,
     SandboxCreateRequest,
     SandboxError,
@@ -126,6 +129,16 @@ async def _wait_until_not_listed(provider: SandboxProvider, query: SandboxQuery,
         await asyncio.sleep(_POLL_INTERVAL_SECONDS)
 
     pytest.fail(f"Sandbox {sandbox_id} was still listed after {_POLL_TIMEOUT_SECONDS} seconds.")
+
+
+async def _wait_until_none_listed(provider: SandboxProvider, query: SandboxQuery) -> None:
+    deadline = time.monotonic() + _POLL_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if not [sandbox async for sandbox in provider.list_sandboxes(query)]:
+            return
+        await asyncio.sleep(_POLL_INTERVAL_SECONDS)
+
+    pytest.fail(f"Sandboxes were still listed after {_POLL_TIMEOUT_SECONDS} seconds.")
 
 
 async def _consume_command(sandbox: Sandbox) -> str:
@@ -509,6 +522,68 @@ class TestSandboxProviderIntegration:
                 await provider.delete_sandbox(writer.id)
             if secret_id is not None:
                 await daytona.secret.delete(secret_id)
+
+    @staticmethod
+    def _dockerfile_request(
+        dockerfile: Path, name: str, *, create_timeout: int = 360, build_timeout: float = 600
+    ) -> SandboxCreateRequest:
+        return SandboxCreateRequest(
+            source=DockerfileSource(dockerfile=str(dockerfile), build_timeout=build_timeout),
+            resources=_TEST_RESOURCES,
+            name=name,
+            labels={"ProviderIntegrationTest": name},
+            env_vars={},
+            auto_stop_interval=10,
+            create_timeout=create_timeout,
+        )
+
+    async def test_dockerfile_source_is_built_with_its_folder_as_the_context(
+        self, sandbox_provider: SandboxProvider, tmp_path: Path
+    ) -> None:
+        """Build a Dockerfile whose COPY reads a file beside it, then delete the sandbox and see it gone."""
+        name = f"cbs-dockerfile-test-{uuid4().hex[:10]}"
+        (tmp_path / "Dockerfile").write_text(
+            f"FROM python:3.12-slim\nRUN echo {name}\nCOPY seed.txt /seed.txt\nRUN echo built > /built.txt\n"
+        )
+        (tmp_path / "seed.txt").write_text("from the build context")
+
+        sandbox = await sandbox_provider.create_sandbox(self._dockerfile_request(tmp_path / "Dockerfile", name))
+        try:
+            result = await sandbox.exec("cat /seed.txt /built.txt")
+            assert result.exit_code == 0
+            assert result.stdout == "from the build contextbuilt\n"
+        finally:
+            await sandbox_provider.delete_sandbox(sandbox.id)
+            await _wait_until_not_found(sandbox_provider, sandbox.id)
+
+    async def test_a_failing_dockerfile_build_raises_a_build_error_and_leaves_no_sandbox(
+        self, sandbox_provider: SandboxProvider, tmp_path: Path
+    ) -> None:
+        """Report a failed build with the provider's output, and leave nothing running under the test's label."""
+        name = f"cbs-dockerfile-test-{uuid4().hex[:10]}"
+        (tmp_path / "Dockerfile").write_text(f"FROM python:3.12-slim\nRUN echo {name} && exit 3\n")
+
+        with pytest.raises(SandboxBuildError) as error:
+            await sandbox_provider.create_sandbox(self._dockerfile_request(tmp_path / "Dockerfile", name))
+
+        assert error.value.build_log
+        await _wait_until_none_listed(sandbox_provider, SandboxQuery(labels={"ProviderIntegrationTest": name}))
+
+    async def test_a_slow_dockerfile_build_times_out_as_a_build_error_once(
+        self, sandbox_provider: SandboxProvider, tmp_path: Path
+    ) -> None:
+        """Stop a build at its own timeout, report it as a build error without retrying it, and leave nothing behind."""
+        name = f"cbs-dockerfile-test-{uuid4().hex[:10]}"
+        (tmp_path / "Dockerfile").write_text(f"FROM python:3.12-slim\nRUN echo {name}\nRUN sleep 300\n")
+        started = time.monotonic()
+
+        with pytest.raises(SandboxBuildError):
+            await sandbox_provider.create_sandbox(
+                self._dockerfile_request(tmp_path / "Dockerfile", name, create_timeout=10, build_timeout=25)
+            )
+
+        assert time.monotonic() - started < 120
+        await _wait_until_none_listed(sandbox_provider, SandboxQuery(labels={"ProviderIntegrationTest": name}))
 
     async def test_provider_contract(self, sandbox_provider: SandboxProvider) -> None:
         """Verify each provider implements the shared sandbox lifecycle and operation contract.

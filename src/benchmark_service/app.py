@@ -513,8 +513,8 @@ class BenchmarkServiceApp(FastAPI):
             if tenant is None:
                 return
 
-            data = await websocket.receive_json()
-            token_supplied = isinstance(data, dict) and "grading_token" in data
+            data: dict[str, Any] = await websocket.receive_json()
+            token_supplied = "grading_token" in data
             request = EvaluateResponseRequest(**data)
             if self._sentry is not None:
                 self._sentry.bind_request_context(websocket.headers, task_id=request.task_id, dataset=request.dataset)
@@ -553,8 +553,8 @@ class BenchmarkServiceApp(FastAPI):
             if tenant is None:
                 return
 
-            data = await websocket.receive_json()
-            token_supplied = isinstance(data, dict) and "grading_token" in data
+            data: dict[str, Any] = await websocket.receive_json()
+            token_supplied = "grading_token" in data
             request = EvaluateInstanceRequest(**data)
             if self._sentry is not None:
                 self._sentry.bind_request_context(

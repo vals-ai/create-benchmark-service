@@ -27,7 +27,8 @@ from benchmark_service.grading_credentials import (
 from benchmark_service.observability import ATTEMPT_ID_HEADER, EMAIL_HEADER, RUN_ID_HEADER, TASK_ID_HEADER
 from benchmark_service.schemas import EvaluateResponseRequest, StreamChunk, StreamResultChunk
 from tests.conftest import StubBenchmark
-from tests.test_sandbox_created import _PROVIDER_BODY, GetByIdClient, _patch_daytona_provider
+from tests.test_sandbox_created import GetByIdClient
+from tests.test_sandbox_created import _PROVIDER_BODY, _patch_daytona_provider  # pyright: ignore[reportPrivateUsage]
 
 GATEWAY = "https://gateway.test"
 STATIC_KEY = "static-key"

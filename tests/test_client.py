@@ -847,6 +847,22 @@ async def test_resume_evaluation_with_eval_resume_state(
     on_eval_resume_state.assert_called_once_with(state)
 
 
+async def test_grading_requirements_reports_gateway_models_and_old_service_404(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    mock_http.request = AsyncMock(return_value=_mock_response(json_data={"models": ["anthropic/judge"]}))
+    assert await client.grading_requirements("task-1", dataset="alt") == ["anthropic/judge"]
+    mock_http.request.assert_awaited_once_with(
+        "POST", f"{BASE_URL}/grading-requirements", json={"task_id": "task-1", "dataset": "alt"}
+    )
+
+    mock_http.request = AsyncMock(return_value=_mock_response(status_code=404, text="Not Found"))
+    with pytest.raises(BenchmarkServiceError) as exc:
+        await client.grading_requirements("task-1")
+    assert exc.value.status_code == 404
+
+
 @pytest.mark.parametrize("with_token", [False, True])
 @pytest.mark.parametrize("resume", [False, True])
 async def test_grading_token_is_sent_only_for_project_keyed_evaluation(

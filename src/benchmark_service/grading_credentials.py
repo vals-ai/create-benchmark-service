@@ -38,7 +38,7 @@ _REVOKE_TIMEOUT_S = 5.0
 
 @dataclass(frozen=True)
 class GradingCredentials:
-    """Gateway credentials for one evaluation; ``lease_id`` is set when ``api_key`` is a run token."""
+    """Gateway credentials for one evaluation; ``lease_id`` marks a service-minted token."""
 
     gateway_url: str
     api_key: str

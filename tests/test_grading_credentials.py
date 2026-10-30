@@ -7,6 +7,7 @@ import json
 import sys
 import types
 from collections.abc import AsyncGenerator, Iterator
+from contextlib import contextmanager
 from typing import Any
 
 import httpx

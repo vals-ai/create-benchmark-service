@@ -493,6 +493,8 @@ class BenchmarkServiceApp(FastAPI):
                         )
 
     async def _evaluate_response(self, request: Request, body: EvaluateResponseRequest) -> Any:
+        if body.grading_token is not None:
+            raise HTTPException(status_code=400, detail="grading_token is supported only on WebSocket evaluation")
         if self._sentry is not None:
             self._sentry.bind_request_context(request.headers, task_id=body.task_id, dataset=body.dataset)
         if not _request_may_use_provider(body.sandbox_provider):
@@ -501,9 +503,7 @@ class BenchmarkServiceApp(FastAPI):
             await self.consume_evaluation_request(cast(str, request.state.tenant))
             async with _grading_credentials(request.headers, body.task_id):
                 with child_egress_scope(body.child_egress):
-                    return await self.service.evaluate_response(
-                        body.model_copy(update={"grading_token": None}), dataset=body.dataset
-                    )
+                    return await self.service.evaluate_response(body, dataset=body.dataset)
 
     async def _evaluate_response_stream(self, websocket: WebSocket) -> None:
         await websocket.accept()

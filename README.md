@@ -124,6 +124,7 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 | `GET` | `/version` | Returns framework, service, and dataset versions plus the benchmark's `eval_mode` |
 | `GET` | `/v1/datasets` | Returns `{"datasets": ["default", "validation"]}` with the caller's accessible dataset names |
 | `POST` | `/resolve-dataset` | Resolves a dataset default or fixed release to an immutable version ID |
+| `POST` | `/grading-requirements` | Authenticated `{ "task_id": "…", "dataset": null }` → `{ "models": ["provider/model"] }` for Gateway-backed grading |
 | `GET` | `/verify-task-ids` | Return task IDs filtered by `?task_ids=…` or `?slice=start:stop:step` (optional `?dataset=…`) |
 | `GET` | `/retrieve-task/?task_id=…` | Return task metadata for a given task ID (optional `?dataset=…`) |
 | `POST` | `/evaluate-response/` | Evaluate without a sandbox and return one final response |
@@ -143,12 +144,20 @@ Services must upgrade to a framework release containing `/v1/datasets` before cl
 | Path | Description |
 |------|-------------|
 | `/ws/setup-task` | Set up a task in a sandbox; streams progress, errors, and a final result |
-| `/ws/evaluate-response` | Evaluate without a sandbox; streams progress, checkpoint state, errors, and a final result |
-| `/ws/evaluate-instance` | Evaluate a live sandbox solution; streams progress, errors, and a final result |
+| `/ws/evaluate-response` | Evaluate without a sandbox or resume grading; accepts optional `grading_token` in the request body |
+| `/ws/evaluate-instance` | Evaluate a live sandbox solution; accepts optional `grading_token` in the request body |
 
-**Grading credentials.** `BenchmarkServiceClient` sends `X-Vals-Run-ID`, `X-Vals-Task-ID` and `X-Vals-Attempt-ID` from `correlation_scope(...)`; `/v1/evaluate` carries them in the body. When a request names a run and an attempt and the service sets `MODEL_GATEWAY_URL`, `MODEL_GATEWAY_API_KEY` and `GRADING_MODELS` (comma-separated registry keys the judge may call), the framework mints a Gateway run token for that evaluation whose claims are the run, task and attempt plus the service `IDENTITY` with `agent_name="grader"` (and the authenticated `tenant`). The token is bound for the whole evaluation as `benchmark_service.grading_credentials.current_grading_credentials()`: model-library (required when minting, with `gateway_token_scope`) sends it on every judge query; framework grading sandboxes receive it as `MODEL_GATEWAY_API_KEY`; services that grade elsewhere forward `as_environment()`. The Gateway stamps the claims on each request, so grading code attaches nothing; the token is revoked when the evaluation ends. Without `GRADING_MODELS` or Gateway settings nothing is bound, so a grader that reads the binding to call the Gateway fails at use; without a run ID the service's own credentials are bound; a run ID without an attempt ID fails the evaluation rather than charging the service key. Whenever a request names a run, `current_evaluation_caller()` returns its run, task, attempt and `X-Vals-Email`, with or without `GRADING_MODELS`, for graders that mint their own Gateway credentials elsewhere. The binding is a `ContextVar`, so graders that run work on threads use `asyncio.to_thread` or `contextvars.copy_context().run`, not a bare `run_in_executor`.
+**Grading requirements.** Before minting a project-keyed grader child, call `BenchmarkServiceClient.grading_requirements(task_id, dataset=...)` to get the complete finite list of Gateway model keys needed for that task's grading and finalizers. The service's `grading_requirements(task_id, dataset=None)` hook defaults to comma-separated `GRADING_MODELS`; override it when the actual Gateway judges depend on the task, and omit direct-provider/BYOK models.
 
-Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` config so one hosted service can use different sandbox providers per request. Eval-only retry uses `/ws/evaluate-response` with `{"task_id": "…", "eval_resume_state": {...}, "sandbox_provider": {...}, "dataset": "…"}`. The provider config is optional because many benchmarks resume without a sandbox. It is request-only and must not be embedded in persisted `eval_resume_state`.
+**Grading credentials.** `BenchmarkServiceClient` sends `X-Vals-Run-ID`, `X-Vals-Task-ID` and `X-Vals-Attempt-ID` from `correlation_scope(...)`; `/v1/evaluate` carries them in the body. A client-supplied `grading_token` on `/ws/evaluate-instance` or resumed `/ws/evaluate-response` binds to `current_grading_credentials()` and model-library's `gateway_token_scope` for the whole stream, including finalizers, without minting or revoking a service-key token; `POST /evaluate-response/` rejects an explicit token with 400.
+
+Without a supplied token, a run and attempt plus `MODEL_GATEWAY_URL`, `MODEL_GATEWAY_API_KEY` and `GRADING_MODELS` cause the existing service-key mint and revoke. Its claims name the run, task, attempt and service `IDENTITY` with `agent_name="grader"` (and authenticated `tenant`); model-library sends it on judge queries, grading sandboxes receive it as `MODEL_GATEWAY_API_KEY`, and remote graders can forward `current_grading_credentials().as_environment()`.
+
+Without `GRADING_MODELS` or Gateway settings, legacy requests bind nothing; with both configured but no run ID, they bind the service credentials. A legacy run without an attempt ID fails instead of charging the service key, while `current_evaluation_caller()` exposes the run, task, attempt and `X-Vals-Email` even without `GRADING_MODELS` for graders that mint elsewhere.
+
+The binding is a `ContextVar`, so graders that hand work to threads use `asyncio.to_thread` or `contextvars.copy_context().run`, not a bare `run_in_executor`.
+
+Sandbox setup and live sandbox evaluation use request-scoped `sandbox_provider` config so one hosted service can use different sandbox providers per request. Eval-only retry uses `/ws/evaluate-response` with `{"task_id": "…", "eval_resume_state": {...}, "sandbox_provider": {...}, "dataset": "…", "grading_token": "…"}`; the provider is optional for benchmarks that resume without a sandbox, and neither it nor the optional grader token belongs in persisted `eval_resume_state`.
 
 A benchmark can set `RetrieveTaskResponse.resume_sandbox` to an `EvalSandboxSpec`
 when resumed grading needs a caller-owned sandbox. The caller uses its existing
@@ -739,9 +748,10 @@ Pydantic models used across requests and responses:
 - **`SandboxProviderConfig`** — request-scoped provider config selected by `type`: `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET, DAYTONA_ORGANIZATION_ID=None)`, `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)`, or `DockerProviderConfig(type="docker")`. Docker requests require `CBS_DOCKER_ENABLED=true` on the benchmark service.
 - **`Resources`** — `vcpu`, `memory`, `disk`, optional `gpu` (count, default 0) and `gpu_type` (requires `gpu >= 1`)
 - **`VolumeMount`** — named persistent volume, absolute `mount_path`, optional `read_only`, `create_if_missing`, and relative `subpath`; `{run_id}` in a subpath resolves from the sandbox's `run-id` or `run_id` label and fails when that label is absent
-- **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, optional `sandbox_provider` with Daytona header fallback, `dataset`, optional `child_egress` by profile name
+- **`GradingRequirementsRequest`** / **`GradingRequirementsResponse`** — task ID and nullable dataset select the complete Gateway model keys for that task
+- **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, optional `sandbox_provider` with Daytona header fallback, `dataset`, optional `child_egress` by profile name, optional WebSocket `grading_token`
 - **`ChildEgress`** — one child profile's proxy URL with its own per-attempt credential, proxy CIDRs, CA certificate, and a gateway URL and token when the profile names `models`; read it with `current_child_egress(profile)` during setup or evaluation (it raises when the caller sent none). `tunnel_command` starts the packaged `egress_tunnel.py` in the box (falling back across `proxy_hosts` when the caller sends more than one address), so `environment(tunnel_port=...)` also works for clients that can't speak TLS to a proxy
-- **`EvaluateResponseRequest`** — `task_id`, `response` or `eval_resume_state`, optional `sandbox_provider`, optional caller-owned `instance_id` for resume, `dataset`
+- **`EvaluateResponseRequest`** — `task_id`, `response` or `eval_resume_state`, optional `sandbox_provider`, optional caller-owned `instance_id` for resume, `dataset`, optional `grading_token` on WebSocket requests only
 - **`FinalScoreResult`** / **`FinalScoreResponse`** — `score` (float), `metadata`, `tasks_evaluated`
 - **`TaskFilter`** — `task_ids` list or `slice_str`; `parse_slice()` converts `"start:stop:step"` to a Python `slice`
 

@@ -1,4 +1,4 @@
-"""Per-evaluation Gateway credentials: minted from the caller's ids, bound while grading, revoked after."""
+"""Gateway credentials for legacy service-key runs and supplied project grader tokens."""
 
 from __future__ import annotations
 
@@ -246,6 +246,19 @@ def test_evaluate_response_names_the_callers_email_on_the_token(client: TestClie
 def test_evaluate_response_without_a_run_uses_the_service_key(client: TestClient, gateway: FakeGateway) -> None:
     response = client.post("/evaluate-response/", json={"task_id": "task-1", "response": "2"})
     assert response.json() == STATIC_KEY
+    assert gateway.calls == []
+
+
+def test_http_response_evaluation_rejects_a_grader_token_instead_of_service_billing(
+    client: TestClient, gateway: FakeGateway
+) -> None:
+    response = client.post(
+        "/evaluate-response/",
+        json={"task_id": "task-1", "response": "2", "grading_token": "project-grader-token"},
+        headers=HEADERS,
+    )
+    assert response.status_code == 400
+    assert response.json() == {"detail": "grading_token is supported only on WebSocket evaluation"}
     assert gateway.calls == []
 
 

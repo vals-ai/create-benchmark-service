@@ -29,7 +29,7 @@ Every PR targeting `main` must include one of `#patch`, `#minor`, or `#major` in
 
 `.github/workflows/auto-tag-release.yaml` runs on every push to `main` and uses [`anothrNick/github-tag-action`](https://github.com/anothrNick/github-tag-action) to bump and push a new tag. The action reads the merge commit message (which GitHub populates from the PR title) for the bump tag.
 
-The workflow requires a repository secret named `GH_PAT`. It must contain a GitHub personal access token that can check out the repository and push tags. If this secret is missing or lacks tag-write access, the release workflow will fail after merge.
+The workflow uses the built-in `GITHUB_TOKEN` with `contents: write` permission to read the repository and push tags. It does not require a personal access token. Tags created with this token do not trigger other GitHub Actions workflows. CBS does not require a separate workflow triggered by tags.
 
 ### Public surface for semver purposes
 

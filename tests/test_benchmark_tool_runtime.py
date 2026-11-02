@@ -80,6 +80,8 @@ threading.Thread(target=server.serve_forever,daemon=True).start()
 while not Path('/workspace/shared.txt').exists(): time.sleep(.01)
 with Path('/workspace/shared.txt').open('a') as stream: stream.write(' tools')
 (output/'generation-started.txt').write_text(Path('/run/benchmark-tools/generation_started_at').read_text())
+with (output/'tool_calls.jsonl').open('a') as stream:
+    stream.write(json.dumps({'result':'[REDACTED]'})+'\\n')
 (output/'shared-ready').touch()
 while True: time.sleep(1)
 """)
@@ -91,7 +93,7 @@ if '--version' in sys.argv: print('test Codex'); sys.exit(0)
 state=json.loads(Path('/workspace/public-state.json').read_text())
 blocked=[]
 for name in ['/app/hidden.txt','/run/benchmark-tools/runtime.json',
-             '/run/benchmark-tools/native.json',f"/proc/{state['broker_pid']}/environ"]:
+             '/run/benchmark-tools/native.json','/logs/benchmark_tools/tool_calls.jsonl',f"/proc/{state['broker_pid']}/environ"]:
     try: Path(name).read_bytes()
     except PermissionError: blocked.append(name)
     else: raise AssertionError('Agent read '+name)
@@ -168,10 +170,19 @@ try:
         time.sleep(.01)
     assert (workspace/'shared.txt').read_text()=='agent tools'
     assert Path('/app/results/task/generation-started.txt').read_text()==marker.read_text()
+    artifact=Path('/logs/benchmark_tools/tool_calls.jsonl')
+    assert artifact.read_text().splitlines()==[json.dumps({'result':'[REDACTED]'})]*2
+    assert Path('/app/results/task/tool_calls.jsonl').is_symlink()
+    assert Path('/app/results/task/tool_calls.jsonl').resolve()==artifact
+    assert artifact.parent.stat().st_uid==0
+    assert artifact.parent.stat().st_gid==config['tools_gid']
+    assert artifact.parent.stat().st_mode & 0o777 == 0o710
+    assert artifact.stat().st_uid==config['tools_uid']
+    assert artifact.stat().st_mode & 0o777 == 0o600
     stop=subprocess.run([sys.executable,'-I',str(runtime),'stop',str(config_path)],
                         capture_output=True,text=True,timeout=10)
     assert stop.returncode==0,stop.stdout+stop.stderr
-    assert Path('/logs/benchmark_tools/tool_calls.jsonl').read_text().strip()==json.dumps({'result':'[REDACTED]'})
+    assert artifact.read_text().splitlines()==[json.dumps({'result':'[REDACTED]'})]*2
     assert not Path('/logs/benchmark_tools/runtime.json').exists()
     proc=Path(f"/proc/{state['broker_pid']}/status")
     assert not proc.exists() or '\nState:\tZ' in proc.read_text()

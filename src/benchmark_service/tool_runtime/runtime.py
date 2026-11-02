@@ -117,6 +117,12 @@ def start(config: RuntimeConfig, config_path: Path) -> dict[str, int]:
     output.mkdir(parents=True, exist_ok=True)
     os.chown(output, config.tools_uid, config.tools_gid)
     output.chmod(0o700)
+    artifact = Path("/logs/benchmark_tools/tool_calls.jsonl")
+    artifact.parent.mkdir(parents=True, exist_ok=True)
+    os.chown(artifact.parent, 0, config.tools_gid)
+    artifact.parent.chmod(0o710)
+    _write(artifact, "", config.tools_uid, config.tools_gid, 0o600)
+    (output / "tool_calls.jsonl").symlink_to(artifact)
     credentials = {name: os.environ[name] for name in config.credential_names}
     credentials.update(config.tool_environment)
     _write(root / "native.json", json.dumps({**config.native, "credentials": credentials}), 0, config.tools_gid, 0o640)
@@ -241,12 +247,6 @@ def stop(config: RuntimeConfig) -> None:
             if time.monotonic() >= deadline:
                 raise TimeoutError("Benchmark processes did not stop before grading")
             time.sleep(0.01)
-    source = Path(config.native["output_dir"]) / "tool_calls.jsonl"
-    if source.is_file():
-        destination = Path("/logs/benchmark_tools/tool_calls.jsonl")
-        destination.parent.mkdir(parents=True, exist_ok=True)
-        shutil.copyfile(source, destination)
-        destination.chmod(0o600)
 
 
 if __name__ == "__main__":

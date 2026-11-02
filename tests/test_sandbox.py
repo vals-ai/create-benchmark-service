@@ -5060,7 +5060,7 @@ async def test_daytona_cgroup_probe_rejects_unsupported_kernel() -> None:
 
     inner = InnerSandbox()
     inner.process = UnsupportedProcess()
-    with pytest.raises(SandboxError, match="linux_cgroup_v2"):
+    with pytest.raises(SandboxError, match=r"linux_cgroup_v2 v1: .*: cgroup\.kill unavailable$"):
         await _daytona_sandbox(cast(Any, inner)).probe_generation_containment()
 
 

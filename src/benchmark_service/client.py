@@ -453,13 +453,13 @@ class BenchmarkServiceClient:
             on_sandbox_created: Optional callback invoked for each "sandbox_created" chunk.
 
         Returns:
-            The data payload from the final "result" chunk.
+            The data payload from the "result" chunk after the server closes the stream.
 
         Raises:
             BenchmarkServiceError: If an "error" chunk is received.
-            BenchmarkServiceStreamClosedError: If the established socket closes without a
-                terminal chunk. Pre-connection failures (DNS, connect, handshake) stay
-                distinguishable: they propagate unwrapped from websockets.connect.
+            BenchmarkServiceStreamClosedError: If the established socket closes
+                abnormally or closes cleanly without a result. Pre-connection failures
+                (DNS, connect, handshake) propagate unwrapped from websockets.connect.
             BenchmarkServiceStreamIdleError: If the socket stays open but produces no
                 application message within the idle budget.
         """
@@ -468,6 +468,8 @@ class BenchmarkServiceClient:
             async with await self._connect_websocket(path, headers) as websocket:
                 last_message_at = time.monotonic()
                 acknowledged = self._dataset_version is None
+                result_received = False
+                result: JsonValue = None
 
                 try:
                     await websocket.send(request.model_dump_json())
@@ -501,7 +503,9 @@ class BenchmarkServiceClient:
                             case "error":
                                 raise BenchmarkServiceError(chunk.data, status_code=chunk.status_code)
                             case "result":
-                                return chunk.data
+                                if not result_received:
+                                    result = chunk.data
+                                    result_received = True
                             case "message":
                                 if on_message:
                                     on_message(chunk.data)
@@ -518,6 +522,9 @@ class BenchmarkServiceClient:
                         close_reason=close_frame.reason if close_frame else None,
                         idle_s=time.monotonic() - last_message_at,
                     ) from exc
+
+                if result_received:
+                    return result
 
                 # The socket closed cleanly, but a stream without a terminal chunk is still broken.
                 raise BenchmarkServiceStreamClosedError(

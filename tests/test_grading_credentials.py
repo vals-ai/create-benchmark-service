@@ -16,6 +16,7 @@ from fastapi.testclient import TestClient
 
 from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL
+from benchmark_service.client import BenchmarkServiceClient
 from benchmark_service.context import tenant_scope
 from benchmark_service.grading_credentials import (
     EvaluationCaller,
@@ -25,8 +26,10 @@ from benchmark_service.grading_credentials import (
     grading_credentials,
 )
 from benchmark_service.observability import ATTEMPT_ID_HEADER, EMAIL_HEADER, RUN_ID_HEADER, TASK_ID_HEADER
+from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.schemas import EvaluateResponseRequest, StreamChunk, StreamResultChunk
 from tests.conftest import StubBenchmark
+from tests.test_draining import serve
 from tests.test_sandbox_created import GetByIdClient
 from tests.test_sandbox_created import _PROVIDER_BODY, _patch_daytona_provider  # pyright: ignore[reportPrivateUsage]
 
@@ -38,7 +41,7 @@ STATIC = GradingCredentials(GATEWAY, STATIC_KEY)
 
 
 class FakeGateway:
-    """Records /service-auth and /service-auth/revoke calls and hands out one token."""
+    """Records Gateway calls and hands out one service token."""
 
     def __init__(self) -> None:
         self.calls: list[tuple[str, str, dict[str, Any]]] = []
@@ -48,11 +51,12 @@ class FakeGateway:
 
         async def post(self: httpx.AsyncClient, url: str, *, headers: dict[str, str], json: dict[str, Any]) -> Any:
             gateway.calls.append((url, headers["Authorization"], json))
-            body = (
-                {"token": f"mgwt_{json['run_id']}", "lease_id": "lease-1", "expires_at": 1.0}
-                if url.endswith("/service-auth")
-                else {"revoked": 1}
-            )
+            if url.endswith("/models/query"):
+                body = {"score": 1.0}
+            elif url.endswith("/service-auth"):
+                body = {"token": f"mgwt_{json['run_id']}", "lease_id": "lease-1", "expires_at": 1.0}
+            else:
+                body = {"revoked": 1}
             return httpx.Response(200, json=body, request=httpx.Request("POST", url))
 
         monkeypatch.setattr(httpx.AsyncClient, "post", post)
@@ -355,6 +359,80 @@ def test_supplied_grader_token_reaches_instance_and_resume_without_service_mint(
             }
     assert gateway.calls == []
     assert scoped_tokens == ["project-grader-token", "project-grader-token"]
+
+
+@pytest.mark.parametrize("resume", [False, True])
+async def test_client_keeps_grading_token_through_server_finalizer(
+    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch, resume: bool
+) -> None:
+    query_started = asyncio.Event()
+    release_query = asyncio.Event()
+    gateway_post = httpx.AsyncClient.post
+
+    async def pending_query(
+        session: httpx.AsyncClient, url: str, *, headers: dict[str, str], json: dict[str, Any]
+    ) -> Any:
+        if url == f"{GATEWAY}/models/query":
+            query_started.set()
+            await release_query.wait()
+        return await gateway_post(session, url, headers=headers, json=json)
+
+    monkeypatch.setattr(httpx.AsyncClient, "post", pending_query)
+    _patch_daytona_provider(monkeypatch, GetByIdClient())
+
+    class FinalizingBenchmark(TaskScopedBenchmark):
+        async def _grade(self) -> AsyncGenerator[StreamChunk, None]:
+            try:
+                yield StreamResultChunk(type="result", data={"score": 1.0})
+            finally:
+                credentials = current_grading_credentials()
+                assert credentials is not None
+                async with httpx.AsyncClient() as session:
+                    response = await session.post(
+                        f"{GATEWAY}/models/query",
+                        headers={"Authorization": f"Bearer {credentials.api_key}"},
+                        json={"model": "anthropic/judge"},
+                    )
+                assert response.json() == {"score": 1.0}
+
+        async def evaluate_instance(
+            self, task_id: str, sandbox: Any, dataset: str | None = None
+        ) -> AsyncGenerator[StreamChunk, None]:
+            async for chunk in self._grade():
+                yield chunk
+
+        async def stream_evaluate_response(
+            self, request: EvaluateResponseRequest, dataset: str | None = None
+        ) -> AsyncGenerator[StreamChunk, None]:
+            assert request.grading_token is None
+            async for chunk in self._grade():
+                yield chunk
+
+    async with serve(BenchmarkServiceApp(FinalizingBenchmark)) as url:
+        async with BenchmarkServiceClient(url, HEADERS) as client:
+            if resume:
+                operation = asyncio.create_task(
+                    client.resume_evaluation("task-1", {"progress": 1}, grading_token="project-grader-token")
+                )
+            else:
+                operation = asyncio.create_task(
+                    client.evaluate_instance(
+                        "task-1",
+                        "i-1",
+                        sandbox_provider=DaytonaProviderConfig.model_validate(_PROVIDER_BODY),
+                        grading_token="project-grader-token",
+                    )
+                )
+            try:
+                await asyncio.wait_for(query_started.wait(), 5)
+                assert not operation.done()
+            finally:
+                release_query.set()
+            assert await asyncio.wait_for(operation, 5) == {"score": 1.0}
+
+    assert gateway.calls == [
+        (f"{GATEWAY}/models/query", "Bearer project-grader-token", {"model": "anthropic/judge"})
+    ]
 
 
 def test_supplied_token_is_not_echoed_on_websocket_exception(

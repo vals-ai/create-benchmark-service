@@ -515,7 +515,7 @@ class BenchmarkServiceApp(FastAPI):
 
             # A malformed frame can contain a token before its JSON can be inspected.
             token_supplied = True
-            data: dict[str, Any] = await websocket.receive_json()
+            data = await websocket.receive_json()
             token_supplied = data is not None and data.get("grading_token") is not None
             request = EvaluateResponseRequest(**data)
             if self._sentry is not None:
@@ -556,7 +556,7 @@ class BenchmarkServiceApp(FastAPI):
                 return
             # A malformed frame can contain a token before its JSON can be inspected.
             token_supplied = True
-            data: dict[str, Any] = await websocket.receive_json()
+            data = await websocket.receive_json()
             token_supplied = data is not None and data.get("grading_token") is not None
             request = EvaluateInstanceRequest(**data)
             if self._sentry is not None:

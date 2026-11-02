@@ -5056,12 +5056,14 @@ async def test_daytona_cgroup_probe_rejects_unsupported_kernel() -> None:
         async def exec(self, command: str) -> SimpleNamespace:
             if _unwrap_shell_command(command) == daytona_module._CGROUP_SELF_COMMAND:  # pyright: ignore[reportPrivateUsage]
                 return SimpleNamespace(exit_code=0, result="/init.scope\n")
-            return SimpleNamespace(exit_code=1, result="cgroup.kill unavailable")
+            return SimpleNamespace(exit_code=12, result="cgroup.kill unavailable")
 
     inner = InnerSandbox()
     inner.process = UnsupportedProcess()
-    with pytest.raises(SandboxError, match="linux_cgroup_v2"):
+    with pytest.raises(SandboxError, match="linux_cgroup_v2") as raised:
         await _daytona_sandbox(cast(Any, inner)).probe_generation_containment()
+
+    assert "probe exit 12 in /sys/fs/cgroup/init.scope: cgroup.kill unavailable" in str(raised.value)
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")

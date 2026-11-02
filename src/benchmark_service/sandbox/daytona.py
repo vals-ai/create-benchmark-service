@@ -595,16 +595,17 @@ class DaytonaSandbox(Sandbox):
         parent = await self._controlled_cgroup_parent()
         quoted = shlex.quote(f"{parent}/cbs-probe-{uuid.uuid4().hex}")
         result = await self._control_exec(
-            f'd={quoted}; mkdir "$d" || exit 1; '
+            f'd={quoted}; mkdir "$d" || exit 11; '
             "sh -c 'echo $$ > \"$1/cgroup.procs\"' sh \"$d\"; admitted=$?; "
-            'echo 1 > "$d/cgroup.kill" || exit 1; '
-            "grep -qx 'populated 0' \"$d/cgroup.events\" || exit 1; "
-            'rmdir "$d" || exit 1; test "$admitted" -eq 0'
+            'echo 1 > "$d/cgroup.kill" || exit 12; '
+            "grep -qx 'populated 0' \"$d/cgroup.events\" || exit 13; "
+            'rmdir "$d" || exit 14; test "$admitted" -eq 0 || exit 15'
         )
         if result.exit_code != 0:
             raise SandboxError(
                 f"Daytona sandbox does not support {LINUX_CGROUP_V2_V1.type} v"
-                f"{LINUX_CGROUP_V2_V1.version}: {self._sandbox_ref}"
+                f"{LINUX_CGROUP_V2_V1.version}: {self._sandbox_ref}: "
+                f"probe exit {result.exit_code} in {parent}: {result.output.strip()[-500:]}"
             )
 
     def controlled_workload(

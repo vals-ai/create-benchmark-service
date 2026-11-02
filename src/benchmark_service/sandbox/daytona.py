@@ -120,6 +120,7 @@ _PTY_STATUS_CHECK_ATTEMPTS = 30
 _PTY_STATUS_POLL_SECONDS = 30
 _PTY_STDOUT_TAIL_MAX_BYTES = 64 * 1024
 _SESSION_WATCH_REOPEN_SECONDS = 10
+_EXIT_REPORT_GRACE_SECONDS = 15
 _INVALID_UTF8_BYTES = dict.fromkeys(range(0xDC80, 0xDD00), "\ufffd")
 _PTY_CREATE_MARKER_ENV = "_CBS_PTY_CREATE_MARKER"
 _PTY_ROWS = 24
@@ -1275,7 +1276,9 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         self._group_created = False
         self._agent_ended_at: float | None = None
         self._completed = False
+        self._recorded_exit: int | None = None
         self._closed = asyncio.Event()
+        self._watch_stop = asyncio.Event()
         self._stop_requested = asyncio.Event()
         self._close_task: asyncio.Task[float] | None = None
         self._run_failure_reported = False
@@ -1357,6 +1360,10 @@ class _DaytonaControlledWorkload(ControlledWorkload):
                     self._consume_finish_exception(self._finish_task)
                     raise error
             raise
+        if self._completed:
+            await asyncio.wait({self._run_task}, timeout=_EXIT_REPORT_GRACE_SECONDS)
+            if not self._run_task.done():
+                await self._use_recorded_exit()
         result = await asyncio.shield(self._run_task)
         session_absent_at = await asyncio.shield(self._ensure_closed())
         return ControlledWorkloadResult(result=result, absence_confirmed_at=max(ended_at, session_absent_at))
@@ -1413,6 +1420,14 @@ class _DaytonaControlledWorkload(ControlledWorkload):
             if result.exit_code != 0:
                 raise SandboxError(f"Daytona controlled session release failed: {self._session_id}")
         return stopped_at
+
+    async def _use_recorded_exit(self) -> None:
+        recorded = await self._control_exec(f"cat {shlex.quote(self._complete)}")
+        code = recorded.output.strip()
+        if recorded.exit_code != 0 or not code.isdigit():
+            raise SandboxError(f"Daytona controlled command exit status is unreadable: {self._session_id}")
+        self._recorded_exit = int(code)
+        self._watch_stop.set()
 
     async def _complete_marker_present(self) -> bool | None:
         try:
@@ -1492,6 +1507,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
                 ) from delete_error
 
         self._closed.set()
+        self._watch_stop.set()
         return asyncio.get_running_loop().time()
 
     def _session_command(self) -> str:
@@ -1499,7 +1515,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         child = f"echo $$ > {shlex.quote(self._group)}/cgroup.procs || exit 1; {self._payload}"
         return (
             f"exec </dev/null; sh -c {shlex.quote(child)} & child=$!; wait \"$child\"; code=$?; "
-            f": > {shlex.quote(self._complete)} || exit 1; "
+            f"printf '%s' \"$code\" > {shlex.quote(self._complete)} || exit 1; "
             f"while ! test -e {shlex.quote(self._release)}; do sleep 0.05; done; (exit \"$code\")"
         )
 
@@ -1547,17 +1563,24 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         command_id = await self._launch()
         forwarded_stdout = 0
         forwarded_stderr = 0
-        while not self._closed.is_set():
-            exit_code, forwarded_stdout, forwarded_stderr = await _watch_session_command(
-                self._sandbox._daytona, self._sandbox.id, self._session_id, command_id,  # pyright: ignore[reportPrivateUsage]
-                forwarded_stdout, forwarded_stderr, self._append_output, self._closed,
-            )
+        while not self._watch_stop.is_set():
+            try:
+                exit_code, forwarded_stdout, forwarded_stderr = await _watch_session_command(
+                    self._sandbox._daytona, self._sandbox.id, self._session_id, command_id,  # pyright: ignore[reportPrivateUsage]
+                    forwarded_stdout, forwarded_stderr, self._append_output, self._watch_stop,
+                )
+            except SandboxError:
+                if self._recorded_exit is None:
+                    raise
+                break
             if exit_code is not None:
                 return ExecResult(exit_code=exit_code, output=b"".join(self._stdout).decode("utf-8"))
             try:
-                await asyncio.wait_for(self._closed.wait(), _SESSION_WATCH_REOPEN_SECONDS)
+                await asyncio.wait_for(self._watch_stop.wait(), _SESSION_WATCH_REOPEN_SECONDS)
             except TimeoutError:
                 continue
+        if self._recorded_exit is not None:
+            return ExecResult(exit_code=self._recorded_exit, output=b"".join(self._stdout).decode("utf-8"))
         raise SandboxError("Controlled workload closed before command exit")
 
 

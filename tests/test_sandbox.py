@@ -5737,6 +5737,45 @@ async def test_daytona_natural_completion_keeps_agent_processes_and_session() ->
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
+async def test_daytona_natural_exit_uses_recorded_status_when_exit_is_never_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(daytona_module, "_EXIT_REPORT_GRACE_SECONDS", 0.1)
+    monkeypatch.setattr(daytona_module, "_SESSION_WATCH_REOPEN_SECONDS", 0.01)
+
+    class HeldPipeProcess(CgroupProcess):
+        async def exec(self, command: str) -> SimpleNamespace:
+            plain = _unwrap_shell_command(command)
+            if plain.startswith("cat ") and plain.endswith(".complete"):
+                return SimpleNamespace(exit_code=0, result="7")
+            return await super().exec(command)
+
+        async def get_session_command_logs_async(
+            self, session_id: str, command_id: str,
+            on_stdout: Callable[[str], Awaitable[None]],
+            on_stderr: Callable[[str], Awaitable[None]],
+        ) -> None:
+            await on_stdout(self.stdout)
+            await asyncio.Event().wait()
+
+        async def get_session_command(self, session_id: str, command_id: str) -> SimpleNamespace:
+            return SimpleNamespace(exit_code=None)
+
+    process = HeldPipeProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("python3 -m http.server &")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    process.user_finished.set()
+
+    completed = await asyncio.wait_for(workload.wait(), 2)
+
+    assert completed.result.exit_code == 7
+    assert completed.result.output == "hello"
+    assert len(process.sessions) == 1
+
+
+@pytest.mark.usefixtures("_fake_cgroup_follow")
 async def test_daytona_native_exit_completes_while_follow_reader_is_open(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

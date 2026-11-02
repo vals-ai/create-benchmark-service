@@ -68,7 +68,7 @@ async def send_json_if_connected(websocket: WebSocket, payload: dict[str, Any]) 
     try:
         await websocket.send_json(payload)
         return True
-    except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed, RuntimeError):
+    except (WebSocketDisconnect, ClientDisconnected, ConnectionClosed, RuntimeError, OSError):
         return False
 
 
@@ -458,7 +458,7 @@ class BenchmarkServiceApp(FastAPI):
                 logger.warning("%s websocket disconnected before error chunk could be sent", endpoint)
         finally:
             self.clear_request_context()
-            with suppress(RuntimeError, WebSocketDisconnect):
+            with suppress(RuntimeError, WebSocketDisconnect, OSError):
                 await websocket.close()
 
     async def _setup_task(self, websocket: WebSocket) -> None:
@@ -516,7 +516,7 @@ class BenchmarkServiceApp(FastAPI):
             # A malformed frame can contain a token before its JSON can be inspected.
             token_supplied = True
             data: dict[str, Any] = await websocket.receive_json()
-            token_supplied = data.get("grading_token") is not None
+            token_supplied = data is not None and data.get("grading_token") is not None
             request = EvaluateResponseRequest(**data)
             if self._sentry is not None:
                 self._sentry.bind_request_context(websocket.headers, task_id=request.task_id, dataset=request.dataset)
@@ -557,7 +557,7 @@ class BenchmarkServiceApp(FastAPI):
             # A malformed frame can contain a token before its JSON can be inspected.
             token_supplied = True
             data: dict[str, Any] = await websocket.receive_json()
-            token_supplied = data.get("grading_token") is not None
+            token_supplied = data is not None and data.get("grading_token") is not None
             request = EvaluateInstanceRequest(**data)
             if self._sentry is not None:
                 self._sentry.bind_request_context(

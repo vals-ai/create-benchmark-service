@@ -546,10 +546,10 @@ def test_websocket_exception_is_captured_once_with_request_identity(
     assert transaction["contexts"]["trace"]["trace_id"] == _INCOMING_TRACE_ID
 
 @pytest.mark.parametrize("path", ["evaluate-instance", "evaluate-response"])
-@pytest.mark.parametrize("close_fails", [False, True])
+@pytest.mark.parametrize("transport_failure", ["none", "close_disconnect", "close_oserror", "send_oserror"])
 def test_malformed_grading_token_frame_is_not_reported(
     path: str,
-    close_fails: bool,
+    transport_failure: str,
     configured_sentry: _CaptureTransport,
     caplog: pytest.LogCaptureFixture,
     monkeypatch: pytest.MonkeyPatch,
@@ -559,6 +559,12 @@ def test_malformed_grading_token_frame_is_not_reported(
 
     async def disconnected_close(_websocket: WebSocket) -> None:
         raise WebSocketDisconnect(code=1006)
+
+    async def failed_close(_websocket: WebSocket) -> None:
+        raise OSError("transport closed")
+
+    async def failed_send(_websocket: WebSocket, _payload: Any) -> None:
+        raise OSError("transport closed")
 
     with TestClient(app) as client:
         with client.websocket_connect("/ws/evaluate-response") as websocket:
@@ -570,11 +576,19 @@ def test_malformed_grading_token_frame_is_not_reported(
         assert len(configured_sentry.events) == 1
 
         with monkeypatch.context() as patcher:
-            if close_fails:
+            if transport_failure == "close_disconnect":
                 patcher.setattr(WebSocket, "close", disconnected_close)
+            elif transport_failure == "close_oserror":
+                patcher.setattr(WebSocket, "close", failed_close)
+            elif transport_failure == "send_oserror":
+                patcher.setattr(WebSocket, "send_json", failed_send)
             with client.websocket_connect(f"/ws/{path}") as websocket:
                 websocket.send_text(f'{{"task_id":"task-2","grading_token":"{token}",')
-                assert websocket.receive_json() == {"type": "error", "data": "Evaluation failed"}
+                if transport_failure == "send_oserror":
+                    with pytest.raises(WebSocketDisconnect):
+                        websocket.receive_json()
+                else:
+                    assert websocket.receive_json() == {"type": "error", "data": "Evaluation failed"}
     sentry_sdk.flush()
 
     assert len(configured_sentry.events) == 1

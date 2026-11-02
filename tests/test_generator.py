@@ -135,6 +135,7 @@ def test_generates_project_structure() -> None:
         assert (output_dir / "Dockerfile").exists()
         assert (output_dir / ".gitignore").exists()
         assert (output_dir / ".dockerignore").exists()
+        assert "manifest_version: 1" in (output_dir / "service.yaml").read_text()
         assert (output_dir / ".python-version").exists()
         assert (output_dir / "src" / "swebench_benchmark_service").is_dir()
         assert (output_dir / "src" / "swebench_benchmark_service" / "__init__.py").exists()

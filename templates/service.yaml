@@ -1,0 +1,4 @@
+# What this service needs to run: memory, CPU, env, health check and so on.
+# The benchmark services registry reads this file from the commit it deploys.
+# Fields: infra/service_manifest.py in vals-ai/benchmark-services-registry.
+manifest_version: 1

@@ -1699,7 +1699,7 @@ class DaytonaSandboxProvider(SandboxProvider):
 
         target = self._target
         sandbox_class = SandboxClass.CONTAINER
-        demand: tuple[float, float, float] = (resources.vcpu, resources.memory, resources.disk)
+        demand: tuple[float, float, float] = (math.ceil(resources.vcpu), resources.memory, resources.disk)
 
         try:
             if isinstance(source, TargetedSnapshotSource):
@@ -1775,7 +1775,7 @@ class DaytonaSandboxProvider(SandboxProvider):
             source = source.outer
         target = source.target if isinstance(source, TargetedSnapshotSource) else self._target
         sandbox_class = SandboxClass.CONTAINER
-        cpu: float = resources.vcpu
+        cpu: float = math.ceil(resources.vcpu)
         memory: float = resources.memory
         disk: float = resources.disk
         gpu: float = resources.gpu
@@ -1894,7 +1894,7 @@ class DaytonaSandboxProvider(SandboxProvider):
         if isinstance(request.source, TargetedSnapshotSource):
             daytona = self._client_for_target(request.source.target)
         resources = DaytonaResources(
-            cpu=request.resources.vcpu,
+            cpu=math.ceil(request.resources.vcpu),
             memory=request.resources.memory,
             disk=request.resources.disk,
             gpu=request.resources.gpu or None,

@@ -4208,6 +4208,16 @@ async def test_daytona_provider_maps_gpu_resources() -> None:
     assert daytona.create_params.resources.gpu_type == GpuType.H100
 
 
+async def test_daytona_provider_rounds_a_fractional_cpu_up_to_a_whole_one() -> None:
+    inner = InnerSandbox()
+    daytona = CapturingCreateDaytonaClient(inner)
+
+    await _provider(daytona).create_sandbox(_request(inner.name, resources=Resources(vcpu=1.5, memory=4, disk=10)))
+
+    assert daytona.create_params is not None
+    assert daytona.create_params.resources.cpu == 2
+
+
 async def test_daytona_provider_passes_the_acceptable_gpu_types_it_offers_in_order() -> None:
     inner = InnerSandbox()
     daytona = CapturingCreateDaytonaClient(inner)

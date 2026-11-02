@@ -116,7 +116,11 @@ def _volume_subpath_fields(template: str) -> list[str]:
 
 
 class Resources(BaseModel):
-    vcpu: int = Field(gt=0, description="Logical sandbox CPU count")
+    vcpu: int | float = Field(
+        gt=0,
+        allow_inf_nan=False,
+        description="Logical sandbox CPU count; a provider that allocates whole CPUs rounds a fraction up",
+    )
     memory: int = Field(gt=0, description="Sandbox memory")
     disk: int = Field(gt=0, description="Sandbox ephemeral disk")
     gpu: int = Field(default=0, ge=0, description="Number of GPUs to allocate")

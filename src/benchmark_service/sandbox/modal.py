@@ -699,7 +699,7 @@ class ModalSandboxProvider(SandboxProvider):
             "image": image,
             "env": dict(request.env_vars),
             "tags": request.labels,
-            "cpu": float(request.resources.vcpu),
+            "cpu": (request.resources.vcpu, request.resources.vcpu),
             "memory": request.resources.memory * 1024,
             "gpu": gpu,
             "idle_timeout": request.auto_stop_interval * 60 if request.auto_stop_interval else None,

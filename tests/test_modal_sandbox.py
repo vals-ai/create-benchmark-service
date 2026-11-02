@@ -663,7 +663,7 @@ async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> N
     assert captured["image"] == ("image", "python:3.12")
     assert captured["env"] == {"FOO": "bar"}
     assert captured["tags"] == {"run_id": "r1"}
-    assert captured["cpu"] == 4.0
+    assert captured["cpu"] == (4, 4)
     assert captured["memory"] == 8192
     assert captured["idle_timeout"] == 1800
     assert captured["timeout"] == 86400
@@ -814,6 +814,20 @@ async def test_create_sandbox_maps_gpu_request(monkeypatch: pytest.MonkeyPatch) 
     await provider.create_sandbox(_request(resources=Resources(vcpu=4, memory=8, disk=30, gpu=2, gpu_type="H100")))
 
     assert captured["gpu"] == "H100:2"
+
+
+async def test_create_sandbox_reserves_and_caps_a_fractional_cpu_exactly(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return FakeInnerSandbox()
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    await provider.create_sandbox(_request(resources=Resources(vcpu=0.5, memory=8, disk=30)))
+
+    assert captured["cpu"] == (0.5, 0.5)
 
 
 async def test_create_sandbox_asks_modal_for_the_first_acceptable_gpu_type_it_knows_by_its_own_name(

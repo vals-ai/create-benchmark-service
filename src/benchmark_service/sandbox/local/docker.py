@@ -493,7 +493,7 @@ def _build_container_config(request: SandboxCreateRequest, image: str) -> JSONOb
         "Env": [f"{key}={value}" for key, value in request.env_vars.items()],
         "Labels": labels,
         "HostConfig": {
-            "NanoCpus": request.resources.vcpu * 1_000_000_000,
+            "NanoCpus": round(request.resources.vcpu * 1_000_000_000),
             "Memory": request.resources.memory * 1024**3,
             "NetworkMode": "none" if request.network_block_all else "bridge",
             "SecurityOpt": ["no-new-privileges:true"],

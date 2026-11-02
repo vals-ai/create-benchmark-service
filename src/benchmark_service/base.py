@@ -232,9 +232,10 @@ class BenchmarkService(ABC):
         ...
 
     def grading_requirements(self, task_id: str, dataset: str | None = None) -> list[str]:
-        """Gateway model keys used while grading this task, including grading finalizers.
+        """Gateway model keys for a caller-minted project token, including grading finalizers.
 
         Override for task-specific judges; direct-provider models are not Gateway keys.
+        Legacy service-key minting still uses GRADING_MODELS independently.
         """
         return [model.strip() for model in os.environ.get("GRADING_MODELS", "").split(",") if model.strip()]
 

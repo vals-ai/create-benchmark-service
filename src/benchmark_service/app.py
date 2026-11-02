@@ -444,7 +444,7 @@ class BenchmarkServiceApp(FastAPI):
             await _send_dataset_version_error(websocket, exc)
         except Exception as exc:
             if sensitive is not None and sensitive():
-                logger.error("%s websocket evaluation failed with supplied grading token", endpoint)
+                logger.error("%s websocket evaluation failed with possible grading token", endpoint)
                 await send_json_if_connected(
                     websocket, StreamErrorChunk(type="error", data="Evaluation failed").model_dump()
                 )
@@ -458,7 +458,7 @@ class BenchmarkServiceApp(FastAPI):
                 logger.warning("%s websocket disconnected before error chunk could be sent", endpoint)
         finally:
             self.clear_request_context()
-            with suppress(RuntimeError):
+            with suppress(RuntimeError, WebSocketDisconnect):
                 await websocket.close()
 
     async def _setup_task(self, websocket: WebSocket) -> None:
@@ -513,8 +513,10 @@ class BenchmarkServiceApp(FastAPI):
             if tenant is None:
                 return
 
+            # A malformed frame can contain a token before its JSON can be inspected.
+            token_supplied = True
             data: dict[str, Any] = await websocket.receive_json()
-            token_supplied = "grading_token" in data
+            token_supplied = data.get("grading_token") is not None
             request = EvaluateResponseRequest(**data)
             if self._sentry is not None:
                 self._sentry.bind_request_context(websocket.headers, task_id=request.task_id, dataset=request.dataset)
@@ -552,9 +554,10 @@ class BenchmarkServiceApp(FastAPI):
             tenant = await self._authorize_websocket(websocket)
             if tenant is None:
                 return
-
+            # A malformed frame can contain a token before its JSON can be inspected.
+            token_supplied = True
             data: dict[str, Any] = await websocket.receive_json()
-            token_supplied = "grading_token" in data
+            token_supplied = data.get("grading_token") is not None
             request = EvaluateInstanceRequest(**data)
             if self._sentry is not None:
                 self._sentry.bind_request_context(

@@ -90,7 +90,7 @@ async def test_probe_and_stop_negative_process_group(tmp_path: Path, session_lea
 
     control = tmp_path / "owner"
     process = await asyncio.create_subprocess_exec(
-        str(shell), "-c", owner_command("printf 'ready\n'; sleep 30 & wait", str(control), "/bin/sh -c"),
+        str(shell), "-c", owner_command("printf 'ready\n'; sleep 30 & wait", str(control), "/bin/sh -c", keep_background=True),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         start_new_session=session_leader,
@@ -122,7 +122,7 @@ async def test_workload_group_term_leaves_fifo_listener_to_stop_ignoring_helper(
         "IFS= read -r start; kill -TERM 0; printf 'signaled\n'; IFS= read -r finish"
     )
     process = await asyncio.create_subprocess_exec(
-        "/bin/sh", "-c", owner_command(command, str(control), "/bin/sh -c"),
+        "/bin/sh", "-c", owner_command(command, str(control), "/bin/sh -c", keep_background=True),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
     )
@@ -155,14 +155,14 @@ async def test_workload_group_term_leaves_fifo_listener_to_stop_ignoring_helper(
         assert not control.exists()
 
 @pytest.mark.parametrize("session_leader", [False, True])
-async def test_natural_owner_preserves_foreground_stdin_status_and_output(
+async def test_natural_owner_keeps_background_child_and_preserves_stdin_status_and_output(
     tmp_path: Path, session_leader: bool,
 ) -> None:
     control = tmp_path / "natural"
     process = await asyncio.create_subprocess_exec(
         "/bin/sh", "-c",
         owner_command('read word; printf "got:%s\n" "$word"; (sleep 0.2; echo child-tail) & exit 7',
-                      str(control), "/bin/sh -c"),
+                      str(control), "/bin/sh -c", keep_background=True),
         stdin=asyncio.subprocess.PIPE,
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         start_new_session=session_leader,
@@ -171,8 +171,8 @@ async def test_natural_owner_preserves_foreground_stdin_status_and_output(
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(process.wait(), 0.05)
         output, _ = await asyncio.wait_for(process.communicate(b"hello\n"), 5)
-        assert output == b"got:hello\n"
-        assert process.returncode != 0
+        assert output == b"got:hello\nchild-tail\n"
+        assert process.returncode == 0
         completed = await asyncio.create_subprocess_exec(
             "/bin/sh", "-c", stop_command(str(control), episode_owner=False),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
@@ -191,7 +191,7 @@ async def test_failed_assertion_cleanup_spares_unrelated_sibling(tmp_path: Path)
     try:
         control = tmp_path / "owned"
         process = await asyncio.create_subprocess_exec(
-            "/bin/sh", "-c", owner_command("printf 'ready:%s\n' $$; exec sleep 30", str(control), "/bin/sh -c"),
+            "/bin/sh", "-c", owner_command("printf 'ready:%s\n' $$; exec sleep 30", str(control), "/bin/sh -c", keep_background=True),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         )
         try:
@@ -234,7 +234,7 @@ async def test_preready_assertion_cleanup_waits_for_owned_group(tmp_path: Path) 
         command = (
             f"exec 5<>{shlex.quote(str(gate))}; printf 'gate-ready\n'; "
             f"read -r _ <&5; exec 5>&-; "
-            + owner_command("exec sleep 30", str(control), "/bin/sh -c")
+            + owner_command("exec sleep 30", str(control), "/bin/sh -c", keep_background=True)
         )
         process = await asyncio.create_subprocess_exec(
             "/bin/sh", "-c", command,

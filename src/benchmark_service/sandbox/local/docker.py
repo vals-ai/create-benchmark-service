@@ -58,6 +58,7 @@ _NAME_LABEL = "io.vals.cbs.name"
 _PULL_TIMEOUT_S = 1800
 _BUILD_LOG_BYTES = 64 * 1024
 _CONTROLLED_TAIL_BYTES = 64 * 1024
+_OUTPUT_DRAIN_SECONDS = 5
 
 
 class DockerProviderConfig(BaseModel):
@@ -361,7 +362,7 @@ class _DockerControlledWorkload(ControlledWorkload):
         script = (
             episode_owner_command(self._command, self._marker, self._episode_script)
             if self._episode_script is not None
-            else owner_command(self._command, self._marker, "/bin/sh -c")
+            else owner_command(self._command, self._marker, "/bin/sh -c", keep_background=True)
         )
         with _docker_errors():
             try:
@@ -382,7 +383,12 @@ class _DockerControlledWorkload(ControlledWorkload):
                             await drain
                         exit_code = await status
                         absence_confirmed_at, foreground_status = await self._ensure_stopped()
-                        await drain
+                        await asyncio.wait({drain}, timeout=_OUTPUT_DRAIN_SECONDS)
+                        if not drain.done():
+                            drain.cancel()
+                        await asyncio.gather(drain, return_exceptions=True)
+                        if not drain.cancelled() and drain.exception() is not None:
+                            await drain
                         assert self._cleanup_task is not None
                         await self._cleanup_task
                         if foreground_status is None and exit_code == 0:
@@ -468,7 +474,7 @@ class _DockerControlledWorkload(ControlledWorkload):
             yield chunk
         if self._drain_task is None:
             await asyncio.shield(self._result_task)
-        else:
+        elif not self._drain_task.cancelled():
             await asyncio.shield(self._drain_task)
 
     async def wait(self) -> ControlledWorkloadResult:

@@ -67,6 +67,7 @@ _RESOLVE_IN_SANDBOX = (
 )
 _COMMAND_STATUS_POLL_SECONDS = 10
 _CONTROLLED_OUTPUT_TAIL_BYTES = 64 * 1024
+_OUTPUT_DRAIN_SECONDS = 5
 _INVALID_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_.-]")
 logger = logging.getLogger(__name__)
 # Late allocations outlive request-scoped providers.
@@ -474,6 +475,7 @@ class _ModalControlledWorkload(ControlledWorkload):
         self._tail: deque[str] = deque()
         self._tail_bytes = 0
         self._output_changed = asyncio.Event()
+        self._output_detached = False
         self._launch_task = asyncio.create_task(self._launch())
         self._wait_task = asyncio.create_task(self._finish())
         self._stop_task: asyncio.Task[tuple[float, int | None]] | None = None
@@ -493,7 +495,7 @@ class _ModalControlledWorkload(ControlledWorkload):
         owner = (
             episode_owner_command(command, self._marker, self._episode_script)
             if self._episode_script is not None
-            else owner_command(command, self._marker, "sh -lc")
+            else owner_command(command, self._marker, "sh -lc", keep_background=True)
         )
         inner = f"exec 2>&1; {owner}"
         output, process_wait = await self._start_process(inner, self._env_vars)
@@ -503,6 +505,8 @@ class _ModalControlledWorkload(ControlledWorkload):
     async def _read_output(self, output: AsyncIterable[str]) -> None:
         try:
             async for text in output:
+                if self._output_detached:
+                    continue
                 self._output.put_nowait(text)
                 self._tail.append(text)
                 self._tail_bytes += len(text.encode("utf-8"))
@@ -531,6 +535,8 @@ class _ModalControlledWorkload(ControlledWorkload):
             if self._read_task.done():
                 await self._read_task
                 return
+            if self._output_detached:
+                return
             self._output_changed.clear()
             await self._output_changed.wait()
 
@@ -545,7 +551,8 @@ class _ModalControlledWorkload(ControlledWorkload):
         stopped_at, status = await self._ensure_stopped()
         assert self._cleanup_task is not None
         await self._cleanup_task
-        await self._read_task
+        if not self._output_detached:
+            await self._read_task
         if status is None and exit_code == 0:
             raise SandboxError("Modal workload exited without a foreground status")
         return ControlledWorkloadResult(
@@ -586,7 +593,11 @@ class _ModalControlledWorkload(ControlledWorkload):
     async def _cleanup(self) -> None:
         assert self._process_wait_task is not None
         assert self._read_task is not None
-        await asyncio.gather(self._process_wait_task, self._read_task, return_exceptions=True)
+        await asyncio.gather(self._process_wait_task, return_exceptions=True)
+        await asyncio.wait({self._read_task}, timeout=_OUTPUT_DRAIN_SECONDS)
+        if not self._read_task.done():
+            self._output_detached = True
+            self._output_changed.set()
         removed = await self._sandbox.exec(cleanup_command(self._marker))
         if removed.exit_code != 0:
             raise SandboxError(f"Modal process-group control cleanup failed: {removed.output}")

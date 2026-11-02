@@ -233,7 +233,7 @@ class _ComposeControlledWorkload(ControlledWorkload):
         inner = (
             episode_owner_command(self._command, self._marker, self._episode_script)
             if self._episode_script is not None
-            else owner_command(self._command, self._marker, "sh -lc")
+            else owner_command(self._command, self._marker, "sh -lc", keep_background=False)
         )
         args: list[str] = []
         for name in self._env_vars:

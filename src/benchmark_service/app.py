@@ -23,9 +23,10 @@ from benchmark_service.base import BenchmarkService
 from benchmark_service.draining import DRAIN_STATE_PATH_ENV, DrainMiddleware, DrainState
 from benchmark_service.grading_credentials import grading_credentials
 from benchmark_service.observability import ATTEMPT_ID_HEADER, EMAIL_HEADER, RUN_ID_HEADER
-from benchmark_service.context import child_egress_scope, sandbox_provider_scope, tenant_scope
+from benchmark_service.context import child_egress_scope, sandbox_provider_scope, tenant_scope, tool_context_scope
 from benchmark_service.sandbox.created import SandboxCreatedHook, sandbox_created_scope
 from benchmark_service.schemas import (
+    BENCHMARK_TOOLS_HEADER,
     DATASET_VERSION_HEADER,
     DatasetVersion,
     DatasetVersionId,
@@ -41,6 +42,8 @@ from benchmark_service.schemas import (
     ResolveDatasetRequest,
     ResolveDatasetResponse,
     SetupTaskRequest,
+    NativeToolContext,
+    ToolContext,
     StreamChunk,
     StreamDatasetVersionChunk,
     SandboxCreatedData,
@@ -58,6 +61,7 @@ from benchmark_service.sandbox import (
 
 logger = logging.getLogger(__name__)
 _dataset_version_id: TypeAdapter[str] = TypeAdapter(DatasetVersionId)
+_tool_context_adapter: TypeAdapter[ToolContext] = TypeAdapter(ToolContext)
 
 
 class _DatasetVersionSelectionError(HTTPException):
@@ -304,6 +308,17 @@ class BenchmarkServiceApp(FastAPI):
     async def _dataset_scope(
         self, connection: Request | WebSocket, tenant: str, dataset: str | None
     ) -> AsyncGenerator[None, None]:
+        tool_headers = connection.headers.getlist(BENCHMARK_TOOLS_HEADER)
+        if len(tool_headers) > 1:
+            raise HTTPException(400, f"Supply {BENCHMARK_TOOLS_HEADER} only once")
+        try:
+            tools = (
+                _tool_context_adapter.validate_json(tool_headers[0])
+                if tool_headers
+                else NativeToolContext(mode="native")
+            )
+        except ValidationError as exc:
+            raise HTTPException(400, f"Invalid {BENCHMARK_TOOLS_HEADER}") from exc
         values = connection.headers.getlist(DATASET_VERSION_HEADER)
         if len(values) > 1:
             raise _DatasetVersionSelectionError(400, f"Supply {DATASET_VERSION_HEADER} only once")
@@ -323,7 +338,7 @@ class BenchmarkServiceApp(FastAPI):
                     else:
                         connection.state.dataset_version = resolved
                 entered = True
-                with tenant_scope(tenant):
+                with tenant_scope(tenant), tool_context_scope(tools):
                     yield
         except HTTPException as exc:
             if isinstance(connection, WebSocket) and exc.status_code == 403:

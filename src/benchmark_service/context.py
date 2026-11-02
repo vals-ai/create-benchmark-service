@@ -23,6 +23,7 @@ from contextvars import Context, ContextVar, copy_context
 from typing import TYPE_CHECKING
 
 from benchmark_service.sandbox import SandboxProvider
+from benchmark_service.schemas import NativeToolContext, ToolContext
 
 if TYPE_CHECKING:
     from benchmark_service.schemas import ChildEgress
@@ -32,6 +33,9 @@ _current_sandbox_provider: ContextVar[SandboxProvider | None] = ContextVar(
 )
 
 _current_tenant: ContextVar[str | None] = ContextVar("benchmark_service_tenant", default=None)
+_current_tool_context: ContextVar[ToolContext] = ContextVar(
+    "benchmark_service_tools", default=NativeToolContext(mode="native")
+)
 
 _current_child_egress: ContextVar[Mapping[str, ChildEgress]] = ContextVar("benchmark_service_child_egress", default={})
 
@@ -56,6 +60,20 @@ def sandbox_provider_scope(provider: SandboxProvider | None) -> Iterator[None]:
 def current_tenant() -> str | None:
     """Return the authenticated tenant of the in-flight request, or None outside one."""
     return _current_tenant.get()
+
+
+def current_tool_context() -> ToolContext:
+    """Return the task tool interface selected by the caller's agent contract."""
+    return _current_tool_context.get()
+
+
+@contextmanager
+def tool_context_scope(context: ToolContext) -> Iterator[None]:
+    token = _current_tool_context.set(context)
+    try:
+        yield
+    finally:
+        _current_tool_context.reset(token)
 
 
 @contextmanager

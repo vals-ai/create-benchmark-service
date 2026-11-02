@@ -142,6 +142,7 @@ def _is_missing_volume_error(exc: ModalNotFoundError) -> bool:
 
 def _command(command: str, cwd: str | None, timeout: float | None) -> str:
     # Match Daytona semantics: timeout exits 124, stderr merges into stdout.
+    command = f"/bin/sh -c {shlex.quote(command)}"
     if timeout is not None:
         command = f"timeout {timeout:g} {command}"
     if cwd:

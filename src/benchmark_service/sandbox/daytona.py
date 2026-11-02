@@ -1274,6 +1274,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         self._creation_done = asyncio.Event()
         self._group_created = False
         self._agent_ended_at: float | None = None
+        self._completed = False
         self._closed = asyncio.Event()
         self._stop_requested = asyncio.Event()
         self._close_task: asyncio.Task[float] | None = None
@@ -1403,7 +1404,8 @@ class _DaytonaControlledWorkload(ControlledWorkload):
             with suppress(asyncio.CancelledError):
                 await stop_task
 
-        stopped_at = await (self._release_group() if marker_present else self._stop_group())
+        self._completed = bool(marker_present)
+        stopped_at = await (self._release_group() if self._completed else self._stop_group())
         if self._stop_requested.is_set() or self._run_task.done():
             await self._ensure_closed()
         else:
@@ -1457,7 +1459,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
 
     async def _close(self) -> float:
         await self._creation_done.wait()
-        if self._session_requested:
+        if self._session_requested and (self._stop_requested.is_set() or not self._completed):
             # A lost delete reply may still have deleted the session; only the lookup decides.
             delete_error: Exception | None = None
             try:

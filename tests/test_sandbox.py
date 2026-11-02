@@ -5234,7 +5234,7 @@ async def test_daytona_native_reopens_same_command_and_forwards_each_stream_once
     assert process.execute_calls == 1
     assert process.follow_calls >= 2
     assert not process.group_exists
-    assert process.sessions == set()
+    assert len(process.sessions) == 1
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
 async def test_daytona_native_status_failure_keeps_pending_follow(
@@ -5293,7 +5293,7 @@ async def test_daytona_native_status_failure_keeps_pending_follow(
         assert process.execute_calls == 1
         assert process.follow_calls == 1
         assert not process.group_exists
-        assert process.sessions == set()
+        assert len(process.sessions) == 1
     finally:
         process.send_later_output.set()
         if process.sessions:
@@ -5337,7 +5337,7 @@ async def test_daytona_reopen_from_ids_survives_discarded_launch_adapter(
     assert process.execute_calls == 1
     assert process.follow_calls >= 2
     assert not process.group_exists
-    assert process.sessions == set()
+    assert len(process.sessions) == 1
 
 
 class RawLogWebSocket:
@@ -5664,7 +5664,7 @@ async def test_daytona_native_shell_preserves_cwd_env_and_exit(tmp_path: Path) -
     assert "".join([chunk async for chunk in workload.output()]) == completed.result.output
     assert process.execute_calls == 1
     assert not process.group_exists
-    assert process.sessions == set()
+    assert len(process.sessions) == 1
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
@@ -5678,7 +5678,7 @@ async def test_daytona_native_long_episode_command_preserves_payload(tmp_path: P
     assert "".join([chunk async for chunk in workload.output()]) == payload
     assert process.execute_calls == 1
     assert not process.group_exists
-    assert process.sessions == set()
+    assert len(process.sessions) == 1
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
@@ -5712,19 +5712,8 @@ async def test_daytona_native_command_gets_stdin_eof_with_parent_pipe_open(
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_natural_completion_keeps_agent_processes_and_cleans_group_before_release() -> None:
-    class DelayedCloseProcess(CgroupProcess):
-        def __init__(self) -> None:
-            super().__init__()
-            self.close_started = asyncio.Event()
-            self.allow_close = asyncio.Event()
-
-        async def delete_session(self, session_id: str) -> None:
-            self.close_started.set()
-            await self.allow_close.wait()
-            await super().delete_session(session_id)
-
-    process = DelayedCloseProcess()
+async def test_daytona_natural_completion_keeps_agent_processes_and_session() -> None:
+    process = CgroupProcess()
     process.allow_creation.set()
     workload = _cgroup_sandbox(process).controlled_workload("exit 7")
     assert workload.agent_absence_confirmed_at is None
@@ -5734,22 +5723,17 @@ async def test_daytona_natural_completion_keeps_agent_processes_and_cleans_group
     await asyncio.wait_for(process.removal_started.wait(), 2)
     assert not waiting.done()
     assert not process.release_seen.is_set()
-    try:
-        process.allow_removal.set()
-        await asyncio.wait_for(process.close_started.wait(), 2)
-        receipt = workload.agent_absence_confirmed_at
-        assert receipt is not None
-        assert not waiting.done()
-        process.allow_close.set()
-        completed = await asyncio.wait_for(waiting, 2)
-        assert completed.absence_confirmed_at >= receipt
-        assert workload.agent_absence_confirmed_at == receipt
-        assert completed.result.exit_code == 7
-        assert completed.result.output.endswith("final frame")
-        assert process.sessions == set()
-        assert "cgroup.kill" not in process.group_command
-    finally:
-        process.allow_close.set()
+
+    process.allow_removal.set()
+    completed = await asyncio.wait_for(waiting, 2)
+
+    receipt = workload.agent_absence_confirmed_at
+    assert receipt is not None
+    assert completed.absence_confirmed_at >= receipt
+    assert completed.result.exit_code == 7
+    assert completed.result.output.endswith("final frame")
+    assert "cgroup.kill" not in process.group_command
+    assert len(process.sessions) == 1
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
@@ -5801,7 +5785,7 @@ async def test_daytona_native_exit_completes_while_follow_reader_is_open(
         assert process.follow_calls == 1
         assert process.execute_calls == 1
         assert not process.group_exists
-        assert process.sessions == set()
+        assert len(process.sessions) == 1
     finally:
         process.allow_follow_close.set()
         if process.sessions:
@@ -6449,7 +6433,7 @@ async def test_daytona_lost_cgroup_mkdir_reply_replays_owned_creation(tmp_path: 
     assert process.mkdir_calls == 2
     assert process.execute_calls == 1
     assert not process.group_exists
-    assert process.sessions == set()
+    assert len(process.sessions) == 1
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")

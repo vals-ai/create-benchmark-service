@@ -27,7 +27,7 @@ from benchmark_service.grading_credentials import (
 )
 from benchmark_service.observability import ATTEMPT_ID_HEADER, EMAIL_HEADER, RUN_ID_HEADER, TASK_ID_HEADER
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
-from benchmark_service.schemas import EvaluateResponseRequest, StreamChunk, StreamResultChunk
+from benchmark_service.schemas import EvaluateResponseRequest, StreamChunk, StreamMessageChunk, StreamResultChunk
 from tests.conftest import StubBenchmark
 from tests.test_draining import serve
 from tests.test_sandbox_created import GetByIdClient
@@ -336,7 +336,7 @@ def test_supplied_grader_token_reaches_instance_and_resume_without_service_mint(
 ) -> None:
     _patch_daytona_provider(monkeypatch, GetByIdClient())
     with TestClient(BenchmarkServiceApp(TaskScopedBenchmark)) as client:
-        with client.websocket_connect("/ws/evaluate-instance", headers=HEADERS) as websocket:
+        with client.websocket_connect("/ws/evaluate-instance", headers=HEADERS.copy()) as websocket:
             websocket.send_json(
                 {
                     "task_id": "task-1",
@@ -349,7 +349,7 @@ def test_supplied_grader_token_reaches_instance_and_resume_without_service_mint(
                 "type": "result",
                 "data": {"gateway_key": "project-grader-token"},
             }
-        with client.websocket_connect("/ws/evaluate-response", headers=HEADERS) as websocket:
+        with client.websocket_connect("/ws/evaluate-response", headers=HEADERS.copy()) as websocket:
             websocket.send_json(
                 {"task_id": "task-1", "eval_resume_state": {"progress": 1}, "grading_token": "project-grader-token"}
             )
@@ -366,8 +366,13 @@ async def test_client_keeps_grading_token_through_server_finalizer(
     gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch, resume: bool
 ) -> None:
     query_started = asyncio.Event()
+    post_result_received = asyncio.Event()
     release_query = asyncio.Event()
     gateway_post = httpx.AsyncClient.post
+
+    def on_message(message: str) -> None:
+        assert message == "after result"
+        post_result_received.set()
 
     async def pending_query(
         session: httpx.AsyncClient, url: str, *, headers: dict[str, str], json: dict[str, Any]
@@ -384,6 +389,7 @@ async def test_client_keeps_grading_token_through_server_finalizer(
         async def _grade(self) -> AsyncGenerator[StreamChunk, None]:
             try:
                 yield StreamResultChunk(type="result", data={"score": 1.0})
+                yield StreamMessageChunk(type="message", data="after result")
             finally:
                 credentials = current_grading_credentials()
                 assert credentials is not None
@@ -412,7 +418,12 @@ async def test_client_keeps_grading_token_through_server_finalizer(
         async with BenchmarkServiceClient(url, HEADERS) as client:
             if resume:
                 operation = asyncio.create_task(
-                    client.resume_evaluation("task-1", {"progress": 1}, grading_token="project-grader-token")
+                    client.resume_evaluation(
+                        "task-1",
+                        {"progress": 1},
+                        on_message=on_message,
+                        grading_token="project-grader-token",
+                    )
                 )
             else:
                 operation = asyncio.create_task(
@@ -420,10 +431,12 @@ async def test_client_keeps_grading_token_through_server_finalizer(
                         "task-1",
                         "i-1",
                         sandbox_provider=DaytonaProviderConfig.model_validate(_PROVIDER_BODY),
+                        on_message=on_message,
                         grading_token="project-grader-token",
                     )
                 )
             try:
+                await asyncio.wait_for(post_result_received.wait(), 5)
                 await asyncio.wait_for(query_started.wait(), 5)
                 assert not operation.done()
             finally:
@@ -447,7 +460,7 @@ def test_supplied_token_is_not_echoed_on_websocket_exception(
 
     _patch_daytona_provider(monkeypatch, GetByIdClient())
     with TestClient(BenchmarkServiceApp(FailingBenchmark)) as client:
-        with client.websocket_connect("/ws/evaluate-instance", headers=HEADERS) as websocket:
+        with client.websocket_connect("/ws/evaluate-instance", headers=HEADERS.copy()) as websocket:
             websocket.send_json(
                 {
                     "task_id": "task-1",

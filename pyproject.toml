@@ -93,4 +93,4 @@ create-benchmark-service = { workspace = true }
 
 [tool.uv]
 exclude-newer = "7 days"
-exclude-newer-package = { certifi = false }
+exclude-newer-package = { certifi = false, model-library = false }

@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import os
 import re
 import shlex
+import socket
 import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable, Coroutine, Mapping
@@ -59,7 +61,10 @@ _APP_NAME = "benchmark-service"
 # Modal's default sandbox timeout is 5 minutes; benchmark tasks run for hours.
 _MAX_LIFETIME_SECONDS = min(MAX_SANDBOX_LIFETIME_SECONDS, 24 * 60 * 60)
 _ALLOW_ALL_CIDRS = ("0.0.0.0/0",)
-_ALLOW_ALL_DOMAINS = ("*",)
+_RESOLVE_IN_SANDBOX = (
+    'for host in "$@"; do getent ahostsv4 "$host" 2>/dev/null | awk \'{print $1}\'; done; '
+    "awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null"
+)
 _COMMAND_STATUS_POLL_SECONDS = 10
 _CONTROLLED_OUTPUT_TAIL_BYTES = 64 * 1024
 _INVALID_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_.-]")
@@ -400,58 +405,51 @@ class ModalSandbox(Sandbox):
             raise _sandbox_error(exc) from exc
 
     @_PROVIDER_RETRY
-    async def _set_outbound_network_policy(
-        self,
-        cidrs: list[str] | None,
-        domains: list[str] | None,
-    ) -> None:
+    async def _set_outbound_network_policy(self, cidrs: list[str]) -> None:
         try:
             set_policy = cast(Any, self._sandbox)._experimental_set_outbound_network_policy
             await cast(
                 Awaitable[None],
-                set_policy.aio(
-                    outbound_cidr_allowlist=cidrs,
-                    outbound_domain_allowlist=domains,
-                ),
+                set_policy.aio(outbound_cidr_allowlist=cidrs, outbound_domain_allowlist=[]),
             )
         except ModalError as exc:
             raise _sandbox_error(exc) from exc
 
-    async def _resolve_domain_cidrs(self, domains: list[str]) -> list[str]:
-        domains_to_resolve = [domain for domain in domains if domain != "*" and not domain.startswith("*.")]
-        if not domains_to_resolve:
+    async def _host_cidrs(self, hosts: list[str]) -> list[str]:
+        """The IPv4 addresses the hosts resolve to here and in the sandbox, and the sandbox's DNS servers."""
+        if not hosts:
             return []
-
-        script = f"""
-import socket
-
-for domain in {domains_to_resolve!r}:
-    try:
-        infos = socket.getaddrinfo(domain, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
-    except OSError:
-        continue
-    for info in infos:
-        print(info[4][0])
-"""
-        result = await self.exec(f"python -c {shlex.quote(script)}")
-        if result.exit_code != 0:
-            return []
-
-        addresses = [f"{line.strip()}/32" for line in result.stdout.splitlines() if line.strip()]
-        return list(dict.fromkeys(addresses))
+        result = await self.exec(f"sh -c {shlex.quote(_RESOLVE_IN_SANDBOX)} _ " + " ".join(map(shlex.quote, hosts)))
+        local = [address for host in hosts for address in await _resolve_ipv4(host)]
+        return [f"{address}/32" for address in [*result.stdout.split(), *local] if _is_ipv4(address)]
 
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
-        cidrs, domains = resolve_allowed_addresses(allowed_addresses)
-        cidrs = list(dict.fromkeys([*cidrs, *await self._resolve_domain_cidrs(domains)]))
-        await self._set_outbound_network_policy(cidrs, domains)
+        cidrs, hosts = resolve_allowed_addresses(allowed_addresses)
+        if wildcards := [host for host in hosts if host.startswith("*")]:
+            raise ValueError(f"Modal can't allow a wildcard hostname such as {wildcards[0]}; list each hostname")
+        await self._set_outbound_network_policy(list(dict.fromkeys([*cidrs, *await self._host_cidrs(hosts)])))
 
     async def block_all_egress(self) -> None:
-        await self._set_outbound_network_policy([], [])
+        await self._set_outbound_network_policy([])
 
     async def clear_egress_rules(self) -> None:
-        # Modal rejects switching a running sandbox to OPEN. An allow-all
-        # allowlist provides the same access without that unsupported transition.
-        await self._set_outbound_network_policy(list(_ALLOW_ALL_CIDRS), list(_ALLOW_ALL_DOMAINS))
+        await self._set_outbound_network_policy(list(_ALLOW_ALL_CIDRS))
+
+
+def _is_ipv4(value: str) -> bool:
+    try:
+        return isinstance(ipaddress.ip_address(value), ipaddress.IPv4Address)
+    except ValueError:
+        return False
+
+
+async def _resolve_ipv4(host: str) -> list[str]:
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(host, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
+    except OSError:
+        return []
+    return [str(info[4][0]) for info in infos]
+
 
 class _ModalControlledWorkload(ControlledWorkload):
     def __init__(
@@ -706,7 +704,6 @@ class ModalSandboxProvider(SandboxProvider):
             "timeout": _MAX_LIFETIME_SECONDS,
             "block_network": request.network_block_all,
             "outbound_cidr_allowlist": list(_ALLOW_ALL_CIDRS) if allow_all_egress else None,
-            "outbound_domain_allowlist": list(_ALLOW_ALL_DOMAINS) if allow_all_egress else None,
             "client": client,
             "runtime": runtime,
             # Keep this flag: nested Docker's overlay2 failed without it on T4.

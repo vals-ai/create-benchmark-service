@@ -607,23 +607,32 @@ async def test_egress_rule_updates_retry_connection_errors(monkeypatch: pytest.M
     assert inner.outbound_policies == [{"outbound_cidr_allowlist": [], "outbound_domain_allowlist": []}]
 
 
-async def test_egress_rule_updates_replace_outbound_policy() -> None:
-    """Verify Modal egress updates call the SDK outbound policy API.
+async def test_egress_rule_updates_replace_outbound_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify Modal egress updates call the SDK outbound policy API with CIDRs only.
 
     Test cases:
-    - URLs, domains, and IPv4 addresses are split into Modal domain and CIDR allowlists.
+    - Hostnames become the addresses they resolve to here and in the sandbox, plus the sandbox's DNS servers.
+    - A wildcard hostname, which no address list can express, is refused.
     - Deny-all uses empty provider allowlists without overloading modify_egress_rules([]).
-    - Clearing egress rules uses an allow-all policy that Modal accepts on a running sandbox.
+    - Clearing egress rules allows every IPv4 address and never names a domain.
     """
-    inner = FakeInnerSandbox(process=FakeProcess(["198.51.100.8\n198.51.100.9\n"], 0))
+
+    async def resolve_ipv4(host: str) -> list[str]:
+        return {"api.openai.com": ["192.0.2.5"]}.get(host, [])
+
+    monkeypatch.setattr(modal_module, "_resolve_ipv4", resolve_ipv4)
+    inner = FakeInnerSandbox(process=FakeProcess(["198.51.100.8\n198.51.100.9\n10.0.0.2\n"], 0))
     sandbox = _sandbox(inner)
 
     await sandbox.modify_egress_rules(["https://api.openai.com/v1", "github.com", "203.0.113.10"])
 
     assert inner.outbound_policies[-1] == {
-        "outbound_cidr_allowlist": ["203.0.113.10/32", "198.51.100.8/32", "198.51.100.9/32"],
-        "outbound_domain_allowlist": ["api.openai.com", "github.com"],
+        "outbound_cidr_allowlist": ["203.0.113.10/32", "198.51.100.8/32", "198.51.100.9/32", "10.0.0.2/32", "192.0.2.5/32"],
+        "outbound_domain_allowlist": [],
     }
+
+    with pytest.raises(ValueError, match="wildcard hostname such as \\*.example.com"):
+        await sandbox.modify_egress_rules(["*.example.com"])
 
     with pytest.raises(ValueError, match="allowed addresses cannot be empty"):
         await sandbox.modify_egress_rules([])
@@ -639,7 +648,7 @@ async def test_egress_rule_updates_replace_outbound_policy() -> None:
 
     assert inner.outbound_policies[-1] == {
         "outbound_cidr_allowlist": ["0.0.0.0/0"],
-        "outbound_domain_allowlist": ["*"],
+        "outbound_domain_allowlist": [],
     }
 
 
@@ -669,7 +678,7 @@ async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> N
     assert captured["timeout"] == 86400
     assert captured["block_network"] is False
     assert captured["outbound_cidr_allowlist"] == ["0.0.0.0/0"]
-    assert captured["outbound_domain_allowlist"] == ["*"]
+    assert "outbound_domain_allowlist" not in captured
     assert captured["runtime"] == "gvisor"
     assert captured["experimental_options"] == {"enable_docker": True}
     assert captured["gpu"] is None
@@ -876,7 +885,7 @@ async def test_create_sandbox_blocks_network_without_conflicting_allowlists(
 
     assert captured["block_network"] is True
     assert captured["outbound_cidr_allowlist"] is None
-    assert captured["outbound_domain_allowlist"] is None
+    assert "outbound_domain_allowlist" not in captured
 
 
 async def test_create_sandbox_uses_modal_safe_name(monkeypatch: pytest.MonkeyPatch) -> None:

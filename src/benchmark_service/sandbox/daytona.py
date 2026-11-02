@@ -604,7 +604,7 @@ class DaytonaSandbox(Sandbox):
         if result.exit_code != 0:
             raise SandboxError(
                 f"Daytona sandbox does not support {LINUX_CGROUP_V2_V1.type} v"
-                f"{LINUX_CGROUP_V2_V1.version}: {self._sandbox_ref}"
+                f"{LINUX_CGROUP_V2_V1.version}: {self._sandbox_ref}: {result.output.strip()}"
             )
 
     def controlled_workload(

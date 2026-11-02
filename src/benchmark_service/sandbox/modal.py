@@ -8,6 +8,7 @@ import shlex
 import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable, Coroutine, Mapping
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
 
 from modal import App, Client, Image, Volume
@@ -15,6 +16,7 @@ from modal import Sandbox as ModalSdkSandbox
 from modal.exception import ConflictError as ModalConflictError
 from modal.exception import ConnectionError as ModalConnectionError
 from modal.exception import Error as ModalError
+from modal.exception import ImageBuildError as ModalImageBuildError
 from modal.exception import InvalidError as ModalInvalidError
 from modal.exception import NotFoundError as ModalNotFoundError
 from modal.exception import ResourceExhaustedError as ModalResourceExhaustedError
@@ -28,6 +30,7 @@ from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
     ControlledWorkload,
     ControlledWorkloadResult,
+    DockerfileSource,
     ExecResult,
     GenerationContainment,
     ImageSource,
@@ -35,6 +38,7 @@ from benchmark_service.sandbox.types import (
     MAX_SANDBOX_LIFETIME_SECONDS,
     MissingSandboxConfigError,
     Sandbox,
+    SandboxBuildError,
     SandboxCommandError,
     SandboxConnectionError,
     SandboxCreateRequest,
@@ -126,6 +130,8 @@ class ModalProviderConfig(BaseModel):
 
 
 def _sandbox_error(exc: ModalError) -> SandboxError:
+    if isinstance(exc, ModalImageBuildError):
+        return SandboxBuildError(f"Modal image build failed: {exc}", str(exc))
     if isinstance(exc, ModalNotFoundError):
         return SandboxNotFoundError(str(exc))
     if isinstance(exc, ModalConflictError) and "shutting down" in str(exc).lower():
@@ -143,7 +149,7 @@ def _is_missing_volume_error(exc: ModalNotFoundError) -> bool:
 def _command(command: str, cwd: str | None, timeout: float | None) -> str:
     # Match Daytona semantics: timeout exits 124, stderr merges into stdout.
     if timeout is not None:
-        command = f"timeout {timeout:g} {command}"
+        command = f"timeout {timeout:g} sh -c {shlex.quote(command)}"
     if cwd:
         command = f"cd {shlex.quote(cwd)} && {command}"
     return f"{{ {command} ; }} 2>&1"
@@ -655,6 +661,10 @@ class ModalSandboxProvider(SandboxProvider):
                 return Image.from_registry(image)  # pyright: ignore[reportUnknownMemberType]
             case SnapshotSource(snapshot=snapshot):
                 return Image.from_id(snapshot, client=client)
+            case DockerfileSource(dockerfile=dockerfile):
+                if not Path(dockerfile).is_file():
+                    raise SandboxError(f"Cannot read the Dockerfile {dockerfile}")
+                return Image.from_dockerfile(dockerfile, context_dir=str(PurePosixPath(dockerfile).parent))  # pyright: ignore[reportUnknownMemberType]
             case _:
                 raise SandboxError(f"Modal sandbox provider does not support source type: {source.type}")
 
@@ -706,7 +716,7 @@ class ModalSandboxProvider(SandboxProvider):
         # One SDK call preserves Modal's transport idempotency key.
         creation = asyncio.create_task(ModalSdkSandbox.create.aio(**create_kwargs))  # pyright: ignore[reportUnknownMemberType]
         try:
-            async with asyncio.timeout(request.create_timeout):
+            async with asyncio.timeout(request.provider_timeout):
                 inner = await asyncio.shield(creation)
         except (TimeoutError, asyncio.CancelledError) as exc:
             # Retain ownership until the late allocation can be terminated.
@@ -715,7 +725,11 @@ class ModalSandboxProvider(SandboxProvider):
             cleanup.add_done_callback(self._cleanup_tasks.discard)
             if isinstance(exc, asyncio.CancelledError):
                 raise
-            raise SandboxError(f"Failed to create Modal sandbox within {request.create_timeout}s") from exc
+            if isinstance(request.source, DockerfileSource):
+                raise SandboxBuildError(
+                    f"Timed out building {request.source.dockerfile} after {request.provider_timeout:g}s"
+                ) from exc
+            raise SandboxError(f"Failed to create Modal sandbox within {request.provider_timeout}s") from exc
         except ModalResourceExhaustedError as exc:
             raise SandboxError(f"Modal sandbox resources exhausted: {exc}") from exc
         except ModalNotFoundError as exc:

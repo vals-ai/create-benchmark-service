@@ -39,12 +39,14 @@ from benchmark_service.sandbox.compose import _COMPOSE_EXEC_ENV_ARGS  # pyright:
 from benchmark_service.sandbox import (
     ComposeSource,
     ComposeSandbox,
+    DockerfileSource,
     ExecResult,
     ImageSource,
     MissingSandboxConfigError,
     ResourceCapacity,
     Resources,
     Sandbox,
+    SandboxBuildError,
     SandboxCapacity,
     SandboxCommandError,
     SandboxConnectionError,
@@ -975,14 +977,16 @@ class DaytonaClient:
         self.deleted = False
         self.listed_query: Any | None = None
         self.create_params: Any = None
+        self.create_kwargs: dict[str, object] = {}
 
     async def get(self, instance_id: str) -> InnerSandbox:
         assert instance_id == self.sandbox.name
         return self.sandbox
 
-    async def create(self, params: object, *_args: object, **_kwargs: object) -> InnerSandbox:
+    async def create(self, params: object, *_args: object, **kwargs: object) -> InnerSandbox:
         self.created = True
         self.create_params = params
+        self.create_kwargs = kwargs
         return self.sandbox
 
     async def delete(self, sandbox: InnerSandbox) -> None:
@@ -3891,6 +3895,123 @@ async def test_daytona_provider_creates_fresh_sandbox() -> None:
     assert sandbox.id == inner.id
     assert daytona.created is True
     assert daytona.create_params.ttl_minutes == 167 * 60
+
+
+def _dockerfile_request(tmp_path: Path, name: str, build_timeout: float | None = None) -> SandboxCreateRequest:
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\nCOPY data.txt /data.txt\n")
+    (tmp_path / "data.txt").write_text("data")
+    source = DockerfileSource(dockerfile=str(tmp_path / "Dockerfile"), build_timeout=build_timeout)
+    return _request(name).model_copy(update={"source": source})
+
+
+async def test_daytona_provider_builds_a_dockerfile_source_from_its_folder(tmp_path: Path) -> None:
+    inner = InnerSandbox()
+    daytona = DaytonaClient(inner)
+
+    await _provider(daytona).create_sandbox(_dockerfile_request(tmp_path, inner.name))
+
+    image = daytona.create_params.image
+    assert image.dockerfile() == "FROM python:3.12-slim\nCOPY data.txt /data.txt\n"
+    assert [(context.source_path, context.archive_path) for context in image._context_list] == [  # pyright: ignore[reportPrivateUsage]
+        (str(tmp_path / "data.txt"), "data.txt")
+    ]
+    assert callable(daytona.create_kwargs["on_snapshot_create_logs"])
+
+
+async def test_daytona_gives_a_dockerfile_build_its_own_time_on_top_of_the_creation_timeout(tmp_path: Path) -> None:
+    inner = InnerSandbox()
+    daytona = DaytonaClient(inner)
+    request = _dockerfile_request(tmp_path, inner.name, build_timeout=600)
+
+    await _provider(daytona).create_sandbox(request)
+
+    assert daytona.create_kwargs["timeout"] == request.create_timeout + 600
+
+
+async def test_daytona_build_failure_carries_the_build_log_and_deletes_the_failed_sandbox(tmp_path: Path) -> None:
+    inner = InnerSandbox()
+    inner.state = SandboxState.BUILD_FAILED
+
+    class FailingBuildClient(DaytonaClient):
+        async def get(self, instance_id: str) -> InnerSandbox:
+            return self.sandbox
+
+        async def create(self, params: object, *_args: object, **kwargs: Any) -> InnerSandbox:
+            kwargs["on_snapshot_create_logs"]("Step 1/2 : FROM python:3.12-slim")
+            kwargs["on_snapshot_create_logs"]("COPY failed: file not found")
+            raise DaytonaError("Failed to build snapshot")
+
+    daytona = FailingBuildClient(inner)
+
+    with pytest.raises(SandboxBuildError, match="Failed to build snapshot") as error:
+        await _provider(daytona).create_sandbox(_dockerfile_request(tmp_path, inner.name))
+
+    assert error.value.build_log == "Step 1/2 : FROM python:3.12-slim\nCOPY failed: file not found"
+    assert daytona.deleted is True
+
+
+async def test_daytona_build_timeout_is_a_build_error_and_is_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inner = InnerSandbox()
+    inner.state = SandboxState.BUILDING_SNAPSHOT
+    attempts: list[int] = []
+
+    class TimingOutClient(DaytonaClient):
+        async def get(self, instance_id: str) -> InnerSandbox:
+            return self.sandbox
+
+        async def create(self, params: object, *_args: object, **kwargs: Any) -> InnerSandbox:
+            attempts.append(1)
+            kwargs["on_snapshot_create_logs"]("Step 1/2 : RUN sleep 9999")
+            raise DaytonaTimeoutError("Sandbox failed to become ready within the timeout period")
+
+    daytona = TimingOutClient(inner)
+
+    with pytest.raises(SandboxBuildError, match="Timed out building") as error:
+        await _provider(daytona).create_sandbox(_dockerfile_request(tmp_path, inner.name))
+
+    assert len(attempts) == 1
+    assert error.value.build_log == "Step 1/2 : RUN sleep 9999"
+    assert daytona.deleted is True
+
+
+async def test_daytona_registry_image_creation_never_collects_a_build_log() -> None:
+    inner = InnerSandbox()
+
+    class FailingImageClient(DaytonaClient):
+        async def create(self, params: object, *_args: object, **kwargs: Any) -> InnerSandbox:
+            self.create_kwargs = kwargs
+            raise DaytonaError("Failed to pull the image")
+
+    daytona = FailingImageClient(inner)
+
+    with pytest.raises(SandboxError, match="Failed to pull the image") as error:
+        await _provider(daytona).create_sandbox(_request(inner.name))
+
+    assert daytona.create_kwargs["on_snapshot_create_logs"] is None
+    assert not isinstance(error.value, SandboxBuildError)
+
+
+async def test_daytona_failure_before_any_build_output_is_not_a_build_error(tmp_path: Path) -> None:
+    inner = InnerSandbox()
+
+    class RejectingClient(DaytonaClient):
+        async def create(self, params: object, *_args: object, **_kwargs: object) -> InnerSandbox:
+            raise DaytonaError("Quota exceeded")
+
+    with pytest.raises(SandboxError, match="Quota exceeded") as error:
+        await _provider(RejectingClient(inner)).create_sandbox(_dockerfile_request(tmp_path, inner.name))
+
+    assert not isinstance(error.value, SandboxBuildError)
+
+
+async def test_daytona_dockerfile_that_cannot_be_read_is_a_sandbox_error(tmp_path: Path) -> None:
+    inner = InnerSandbox()
+    request = _request(inner.name).model_copy(update={"source": DockerfileSource(dockerfile=str(tmp_path / "Dockerfile"))})
+
+    with pytest.raises(SandboxError, match="Cannot read the Dockerfile"):
+        await _provider(DaytonaClient(inner)).create_sandbox(request)
 
 
 def test_daytona_sandbox_exposes_inventory_metadata() -> None:

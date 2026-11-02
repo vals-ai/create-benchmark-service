@@ -28,6 +28,27 @@ class TargetedSnapshotSource(BaseModel):
     target: str = Field(min_length=1)
 
 
+class DockerfileSource(BaseModel):
+    type: Literal["dockerfile"] = "dockerfile"
+    dockerfile: str = Field(
+        min_length=1,
+        description="Absolute path of the Dockerfile on the machine that creates the sandbox; "
+        "the folder that holds it is the build context",
+    )
+    build_timeout: float | None = Field(
+        default=None,
+        gt=0,
+        allow_inf_nan=False,
+        description="Seconds the build may take, on top of create_timeout; None builds within create_timeout",
+    )
+
+    @model_validator(mode="after")
+    def _validate_dockerfile(self) -> Self:
+        if not PurePosixPath(self.dockerfile).is_absolute():
+            raise ValueError(f"dockerfile must be an absolute path, got {self.dockerfile!r}")
+        return self
+
+
 BaseSandboxSource = Annotated[ImageSource | SnapshotSource, Field(discriminator="type")]
 
 
@@ -39,7 +60,7 @@ class ComposeSource(BaseModel):
 
 
 SandboxSource = Annotated[
-    ImageSource | SnapshotSource | TargetedSnapshotSource | ComposeSource,
+    ImageSource | SnapshotSource | TargetedSnapshotSource | DockerfileSource | ComposeSource,
     Field(discriminator="type"),
 ]
 
@@ -203,6 +224,12 @@ class SandboxCreateRequest(BaseModel):
         description="Persistent volumes to attach; empty keeps existing behaviour",
     )
 
+    @property
+    def provider_timeout(self) -> float:
+        """Seconds a provider may take to build the image, when the source has a build, and start the sandbox."""
+        build = self.source.build_timeout if isinstance(self.source, DockerfileSource) else None
+        return self.create_timeout + (build or 0)
+
     @model_validator(mode="after")
     def _validate_request(self) -> Self:
         validate_command_env(self.sandbox_secrets)
@@ -242,6 +269,12 @@ class SandboxError(Exception):
 
 class ControlledWorkloadUnsupportedError(SandboxError):
     pass
+
+
+class SandboxBuildError(SandboxError):
+    def __init__(self, message: str, build_log: str = "") -> None:
+        self.build_log = build_log
+        super().__init__(message)
 
 
 def resolve_volume_subpath(mount: VolumeMount, labels: Mapping[str, str]) -> str | None:

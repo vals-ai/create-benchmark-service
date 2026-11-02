@@ -1273,7 +1273,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         self._stdout_bytes = 0
         self._creation_done = asyncio.Event()
         self._group_created = False
-        self._group_stopped_at: float | None = None
+        self._agent_ended_at: float | None = None
         self._closed = asyncio.Event()
         self._stop_requested = asyncio.Event()
         self._close_task: asyncio.Task[float] | None = None
@@ -1286,7 +1286,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
 
     @property
     def agent_absence_confirmed_at(self) -> float | None:
-        return self._group_stopped_at
+        return self._agent_ended_at
 
     @staticmethod
     def _consume_run_exception(task: asyncio.Task[Any]) -> None:
@@ -1347,7 +1347,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
                     self._consume_finish_exception(self._finish_task)
                 raise error
         try:
-            group_stopped_at = await asyncio.shield(self._finish_task)
+            ended_at = await asyncio.shield(self._finish_task)
         except Exception:
             if self._run_task.done():
                 error = self._run_task.exception()
@@ -1358,14 +1358,14 @@ class _DaytonaControlledWorkload(ControlledWorkload):
             raise
         result = await asyncio.shield(self._run_task)
         session_absent_at = await asyncio.shield(self._ensure_closed())
-        return ControlledWorkloadResult(result=result, absence_confirmed_at=max(group_stopped_at, session_absent_at))
+        return ControlledWorkloadResult(result=result, absence_confirmed_at=max(ended_at, session_absent_at))
 
     async def kill(self) -> None:
         self._stop_requested.set()
         try:
             await asyncio.shield(self._finish_task)
         except SandboxError:
-            if self._group_stopped_at is None:
+            if self._agent_ended_at is None:
                 raise
         await asyncio.shield(self._ensure_closed())
 
@@ -1377,6 +1377,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
             raise SandboxError(f"Daytona controlled cgroup was not created: {self._group}")
 
         stop_task = asyncio.create_task(self._stop_requested.wait())
+        marker_present: bool | None = False
         try:
             while not self._run_task.done() and not stop_task.done():
                 probe = asyncio.create_task(self._complete_marker_present())
@@ -1402,7 +1403,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
             with suppress(asyncio.CancelledError):
                 await stop_task
 
-        stopped_at = await self._stop_group()
+        stopped_at = await (self._release_group() if marker_present else self._stop_group())
         if self._stop_requested.is_set() or self._run_task.done():
             await self._ensure_closed()
         else:
@@ -1433,8 +1434,14 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         )
         if result.exit_code != 0:
             raise SandboxError(f"Daytona controlled cgroup removal failed: {self._group}: {result.output}")
-        self._group_stopped_at = asyncio.get_running_loop().time()
-        return self._group_stopped_at
+        self._agent_ended_at = asyncio.get_running_loop().time()
+        return self._agent_ended_at
+
+    async def _release_group(self) -> float:
+        group = shlex.quote(self._group)
+        await self._control_exec(f'd={group}; find "$d" -depth -type d -exec rmdir {{}} \\; 2>/dev/null; exit 0')
+        self._agent_ended_at = asyncio.get_running_loop().time()
+        return self._agent_ended_at
 
     async def _ensure_closed(self) -> float:
         if (

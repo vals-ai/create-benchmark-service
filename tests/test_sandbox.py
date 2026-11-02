@@ -5025,6 +5025,7 @@ class CgroupProcess(Process):
         self.allow_removal = asyncio.Event()
         self.release_seen = asyncio.Event()
         self.group_exists = False
+        self.group_command = ""
         self.removal_fails = False
         self.sessions: set[str] = set()
         self.poll_error = False
@@ -5061,6 +5062,7 @@ class CgroupProcess(Process):
             return SimpleNamespace(exit_code=0 if self.user_finished.is_set() else 1, result="")
         if command.startswith("d=/sys/fs/cgroup/") and "/cbs-" in command.split(";", 1)[0]:
             self.removed_group = command.split(";", 1)[0].removeprefix("d=")
+            self.group_command = command
             self.removal_started.set()
             await self.allow_removal.wait()
             if self.removal_fails:
@@ -5710,7 +5712,7 @@ async def test_daytona_native_command_gets_stdin_eof_with_parent_pipe_open(
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_natural_completion_fences_group_before_release_and_final_output() -> None:
+async def test_daytona_natural_completion_keeps_agent_processes_and_cleans_group_before_release() -> None:
     class DelayedCloseProcess(CgroupProcess):
         def __init__(self) -> None:
             super().__init__()
@@ -5745,6 +5747,7 @@ async def test_daytona_natural_completion_fences_group_before_release_and_final_
         assert completed.result.exit_code == 7
         assert completed.result.output.endswith("final frame")
         assert process.sessions == set()
+        assert "cgroup.kill" not in process.group_command
     finally:
         process.allow_close.set()
 
@@ -5927,6 +5930,7 @@ async def test_daytona_kill_rejects_session_still_present_after_cgroup_stop() ->
     assert workload.agent_absence_confirmed_at is not None
     assert not process.group_exists
     assert process.sessions
+    assert "cgroup.kill" in process.group_command
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")

@@ -1,4 +1,4 @@
-"""Per-evaluation Gateway credentials: minted from the caller's ids, bound while grading, revoked after."""
+"""Gateway credentials for legacy service-key runs and supplied project grader tokens."""
 
 from __future__ import annotations
 
@@ -6,7 +6,7 @@ import asyncio
 import json
 import sys
 import types
-from collections.abc import Iterator
+from collections.abc import AsyncGenerator, Iterator
 from contextlib import contextmanager
 from typing import Any
 
@@ -25,8 +25,10 @@ from benchmark_service.grading_credentials import (
     grading_credentials,
 )
 from benchmark_service.observability import ATTEMPT_ID_HEADER, EMAIL_HEADER, RUN_ID_HEADER, TASK_ID_HEADER
-from benchmark_service.schemas import EvaluateResponseRequest
+from benchmark_service.schemas import EvaluateResponseRequest, StreamChunk, StreamResultChunk
 from tests.conftest import StubBenchmark
+from tests.test_sandbox_created import GetByIdClient
+from tests.test_sandbox_created import _PROVIDER_BODY, _patch_daytona_provider  # pyright: ignore[reportPrivateUsage]
 
 GATEWAY = "https://gateway.test"
 STATIC_KEY = "static-key"
@@ -247,6 +249,19 @@ def test_evaluate_response_without_a_run_uses_the_service_key(client: TestClient
     assert gateway.calls == []
 
 
+def test_http_response_evaluation_rejects_a_grader_token_instead_of_service_billing(
+    client: TestClient, gateway: FakeGateway
+) -> None:
+    response = client.post(
+        "/evaluate-response/",
+        json={"task_id": "task-1", "response": "2", "grading_token": "project-grader-token"},
+        headers=HEADERS,
+    )
+    assert response.status_code == 400
+    assert response.json() == {"detail": "grading_token is supported only on WebSocket evaluation"}
+    assert gateway.calls == []
+
+
 @pytest.mark.parametrize("grading_models", ["openai/gpt-4o", ""])
 async def test_the_callers_run_and_email_are_bound_with_or_without_grading_models(
     gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch, grading_models: str
@@ -260,3 +275,109 @@ async def test_the_callers_run_and_email_are_bound_with_or_without_grading_model
 async def test_without_a_run_no_caller_is_bound(gateway: FakeGateway) -> None:
     async with grading_credentials(run_id=None, task_id="task-1", email="a@example.com"):
         assert current_evaluation_caller() is None
+
+
+class TaskScopedBenchmark(CredentialReportingBenchmark):
+    def grading_requirements(self, task_id: str, dataset: str | None = None) -> list[str]:
+        if dataset == "alt":
+            return ["openai/alt-judge"]
+        return super().grading_requirements(task_id, dataset=dataset)
+
+    async def evaluate_instance(
+        self, task_id: str, sandbox: Any, dataset: str | None = None
+    ) -> AsyncGenerator[StreamChunk, None]:
+        credentials = current_grading_credentials()
+        yield StreamResultChunk(type="result", data={"gateway_key": credentials.api_key if credentials else None})
+
+    async def stream_evaluate_response(
+        self, request: EvaluateResponseRequest, dataset: str | None = None
+    ) -> AsyncGenerator[StreamChunk, None]:
+        assert request.grading_token is None
+        credentials = current_grading_credentials()
+        yield StreamResultChunk(type="result", data={"gateway_key": credentials.api_key if credentials else None})
+
+
+def test_requirements_are_authenticated_dataset_scoped_and_task_overridable(
+    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class AuthenticatedBenchmark(TaskScopedBenchmark):
+        async def resolve_tenant(self, headers: dict[str, str]) -> str | None:
+            return "tenant" if headers.get("authorization") == "Bearer authorized" else None
+
+        async def check_dataset_access(self, tenant: str, dataset: str | None) -> bool:
+            return dataset != "blocked"
+
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
+    with TestClient(BenchmarkServiceApp(AuthenticatedBenchmark)) as client:
+        body = {"task_id": "alt-task-1", "dataset": "alt"}
+        assert client.post("/grading-requirements", json=body).status_code == 401
+        assert client.post(
+            "/grading-requirements",
+            json={"task_id": "task-1", "dataset": "blocked"},
+            headers={"Authorization": "Bearer authorized"},
+        ).status_code == 403
+        response = client.post("/grading-requirements", json=body, headers={"Authorization": "Bearer authorized"})
+        assert response.status_code == 200
+        assert response.json() == {"models": ["openai/alt-judge"]}
+        response = client.post(
+            "/grading-requirements",
+            json={"task_id": "task-1", "dataset": None},
+            headers={"Authorization": "Bearer authorized"},
+        )
+        assert response.json() == {"models": ["anthropic/judge", "openai/helper"]}
+
+
+def test_supplied_grader_token_reaches_instance_and_resume_without_service_mint(
+    gateway: FakeGateway, scoped_tokens: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_daytona_provider(monkeypatch, GetByIdClient())
+    with TestClient(BenchmarkServiceApp(TaskScopedBenchmark)) as client:
+        with client.websocket_connect("/ws/evaluate-instance", headers=HEADERS) as websocket:
+            websocket.send_json(
+                {
+                    "task_id": "task-1",
+                    "instance_id": "i-1",
+                    "sandbox_provider": _PROVIDER_BODY,
+                    "grading_token": "project-grader-token",
+                }
+            )
+            assert websocket.receive_json() == {
+                "type": "result",
+                "data": {"gateway_key": "project-grader-token"},
+            }
+        with client.websocket_connect("/ws/evaluate-response", headers=HEADERS) as websocket:
+            websocket.send_json(
+                {"task_id": "task-1", "eval_resume_state": {"progress": 1}, "grading_token": "project-grader-token"}
+            )
+            assert websocket.receive_json() == {
+                "type": "result",
+                "data": {"gateway_key": "project-grader-token"},
+            }
+    assert gateway.calls == []
+    assert scoped_tokens == ["project-grader-token", "project-grader-token"]
+
+
+def test_supplied_token_is_not_echoed_on_websocket_exception(
+    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    class FailingBenchmark(TaskScopedBenchmark):
+        async def evaluate_instance(
+            self, task_id: str, sandbox: Any, dataset: str | None = None
+        ) -> AsyncGenerator[StreamChunk, None]:
+            raise RuntimeError("project-grader-token")
+            yield StreamResultChunk(type="result", data=None)
+
+    _patch_daytona_provider(monkeypatch, GetByIdClient())
+    with TestClient(BenchmarkServiceApp(FailingBenchmark)) as client:
+        with client.websocket_connect("/ws/evaluate-instance", headers=HEADERS) as websocket:
+            websocket.send_json(
+                {
+                    "task_id": "task-1",
+                    "instance_id": "i-1",
+                    "sandbox_provider": _PROVIDER_BODY,
+                    "grading_token": "project-grader-token",
+                }
+            )
+            assert websocket.receive_json() == {"type": "error", "data": "Evaluation failed"}
+    assert "project-grader-token" not in caplog.text
+    assert gateway.calls == []

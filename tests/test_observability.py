@@ -31,6 +31,7 @@ from sentry_sdk.integrations.opentelemetry import SentryPropagator, SentrySpanPr
 from sentry_sdk.integrations.stdlib import StdlibIntegration
 from sentry_sdk.tracing import Transaction
 from sentry_sdk.transport import Transport
+from starlette.websockets import WebSocketDisconnect
 
 import benchmark_service
 from benchmark_service import __version__ as framework_version
@@ -543,6 +544,56 @@ def test_websocket_exception_is_captured_once_with_request_identity(
         if item["contexts"]["trace"].get("parent_span_id") == _INCOMING_CLIENT_SPAN_ID
     )
     assert transaction["contexts"]["trace"]["trace_id"] == _INCOMING_TRACE_ID
+
+@pytest.mark.parametrize("path", ["evaluate-instance", "evaluate-response"])
+@pytest.mark.parametrize("transport_failure", ["none", "close_disconnect", "close_oserror", "send_oserror"])
+def test_malformed_grading_token_frame_is_not_reported(
+    path: str,
+    transport_failure: str,
+    configured_sentry: _CaptureTransport,
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app = ValsBenchmarkServiceApp(_FailingWebSocketBenchmark)
+    token = "project-grader-token"
+
+    async def disconnected_close(_websocket: WebSocket) -> None:
+        raise WebSocketDisconnect(code=1006)
+
+    async def failed_close(_websocket: WebSocket) -> None:
+        raise OSError("transport closed")
+
+    async def failed_send(_websocket: WebSocket, _payload: Any) -> None:
+        raise OSError("transport closed")
+
+    with TestClient(app) as client:
+        with client.websocket_connect("/ws/evaluate-response") as websocket:
+            websocket.send_json({"task_id": "task-2", "response": "answer", "grading_token": None})
+            response = websocket.receive_json()
+        sentry_sdk.flush()
+        assert response["type"] == "error"
+        assert "websocket evaluation failed" in response["data"]
+        assert len(configured_sentry.events) == 1
+
+        with monkeypatch.context() as patcher:
+            if transport_failure == "close_disconnect":
+                patcher.setattr(WebSocket, "close", disconnected_close)
+            elif transport_failure == "close_oserror":
+                patcher.setattr(WebSocket, "close", failed_close)
+            elif transport_failure == "send_oserror":
+                patcher.setattr(WebSocket, "send_json", failed_send)
+            with client.websocket_connect(f"/ws/{path}") as websocket:
+                websocket.send_text(f'{{"task_id":"task-2","grading_token":"{token}",')
+                if transport_failure == "send_oserror":
+                    with pytest.raises(WebSocketDisconnect):
+                        websocket.receive_json()
+                else:
+                    assert websocket.receive_json() == {"type": "error", "data": "Evaluation failed"}
+    sentry_sdk.flush()
+
+    assert len(configured_sentry.events) == 1
+    assert token not in str(configured_sentry.events)
+    assert token not in caplog.text
 
 
 async def test_http_client_transport_span_injects_trace_and_dynamic_identity(

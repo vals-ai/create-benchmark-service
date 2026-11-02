@@ -419,6 +419,7 @@ class EvaluateResponseRequest(BaseModel):
         exclude_if=lambda value: value is None,
         description="Caller-owned sandbox for eval_resume_state; the service must not delete it",
     )
+    grading_token: str | None = Field(default=None, exclude_if=lambda value: value is None)
     dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
     announce_sandboxes: bool = Field(
         default=False,
@@ -442,12 +443,26 @@ class EvaluateResponseRequest(BaseModel):
         return self
 
 
+class GradingRequirementsRequest(BaseModel):
+    """Identify the task whose Gateway-backed graders will run."""
+
+    task_id: str
+    dataset: str | None = None
+
+
+class GradingRequirementsResponse(BaseModel):
+    """Complete Gateway model keys required by this task's grading path."""
+
+    models: list[str]
+
+
 class EvaluateInstanceRequest(BaseModel):
     """Request to evaluate a task instance in a sandbox."""
 
     task_id: str = Field(description="Unique identifier for the task")
     instance_id: str = Field(description="Sandbox instance where the solution was implemented")
     sandbox_provider: SandboxProviderConfig | None = Field(default=None, description="Sandbox provider config")
+    grading_token: str | None = Field(default=None, exclude_if=lambda value: value is None)
     dataset: str | None = Field(default=None, description="Dataset name to use (defaults to 'default')")
     announce_sandboxes: bool = Field(
         default=False,

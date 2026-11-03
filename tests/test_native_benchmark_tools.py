@@ -474,7 +474,7 @@ def test_emb_prompt_uses_native_template_selection(
     expected = read_system_prompt(task_id)
     read_ids.clear()
     assert module.render_instructions("emb", task_id, "Build {model}.", "2026-06-01") == (
-        expected,
+        expected + "\n\nUse /opt/agent-runtime/bin/python to read and write workbooks with openpyxl.",
         "Build {model}.",
     )
     assert read_ids == [task_id]

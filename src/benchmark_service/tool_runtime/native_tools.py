@@ -165,7 +165,8 @@ def render_instructions(benchmark: str, task_id: str, question: str, as_of_date:
             prompt = import_module("legal_agent.prompt").instructions_prompt("tool_loop")
             return "", prompt.format(question=question)
         case "emb":
-            return import_module("emb_agent.cli")._read_system_prompt(task_id), question
+            prompt = import_module("emb_agent.cli")._read_system_prompt(task_id)
+            return prompt + "\n\nUse /opt/agent-runtime/bin/python to read and write workbooks with openpyxl.", question
         case _:
             raise ValueError(f"Unsupported research benchmark: {benchmark}")
 

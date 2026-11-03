@@ -100,6 +100,16 @@ def test_version_endpoint_returns_framework_version() -> None:
     assert "service_version" in body
 
 
+def test_version_endpoint_reports_the_deployed_commit(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SERVICE_COMMIT", "abc123")
+    app = BenchmarkServiceApp(_FakeService)
+    with TestClient(app) as client:
+        assert client.get("/version").json()["service_commit"] == "abc123"
+    monkeypatch.delenv("SERVICE_COMMIT")
+    with TestClient(app) as client:
+        assert client.get("/version").json()["service_commit"] is None
+
+
 def test_version_endpoint_prefers_service_version_hook() -> None:
     app = BenchmarkServiceApp(_VersionedService)
     with TestClient(app) as client:

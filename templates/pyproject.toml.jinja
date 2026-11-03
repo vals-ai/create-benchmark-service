@@ -52,3 +52,7 @@ reportAny = false
 reportMissingTypeStubs = false
 enableTypeIgnoreComments = true
 exclude = [".*"]
+
+[tool.uv]
+exclude-newer = "7 days"
+exclude-newer-package = { certifi = false }

@@ -31,18 +31,14 @@ def native_tools(monkeypatch: pytest.MonkeyPatch) -> tuple[Any, list[str], objec
         return llm
 
     registry.get_registry_model = get_registry_model
-    base: Any = types.ModuleType("model_library.base")
-    base.LLMConfig = types.SimpleNamespace
     gateway: Any = types.ModuleType("model_library.base.gateway")
 
-    def gateway_llm(model_name: str, provider: str, *, config: Any) -> object:
-        assert config.registry_key == f"{provider}/{model_name}"
-        model_calls.append(config.registry_key)
+    def gateway_llm(model_name: str, provider: str) -> object:
+        model_calls.append(f"{provider}/{model_name}")
         return llm
 
     gateway.GatewayLLM = gateway_llm
     monkeypatch.setitem(sys.modules, "model_library.registry_utils", registry)
-    monkeypatch.setitem(sys.modules, "model_library.base", base)
     monkeypatch.setitem(sys.modules, "model_library.base.gateway", gateway)
 
     names = {
@@ -195,6 +191,43 @@ def test_unknown_static_model_uses_scoped_gateway_only(
     helper = next(tool for tool in tools if tool.name == "retrieve_information")
     assert helper.kwargs == {"llm": llm}
     assert model_calls == ["openai/unlisted-model"]
+
+
+def test_native_helper_builds_a_valid_gateway_request(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MODEL_GATEWAY_API_KEY", "test-key")
+    monkeypatch.delenv("MODEL_GATEWAY_URL", raising=False)
+    gateway = pytest.importorskip("model_library.base.gateway")
+    base = pytest.importorskip("model_library.base")
+    finance: Any = types.ModuleType("finance_agent.tools")
+
+    class Tool:
+        def __init__(self, **kwargs: Any) -> None:
+            self.kwargs = kwargs
+
+    for name in (
+        "TavilyWebSearch",
+        "RetrieveInformation",
+        "ParseHtmlPage",
+        "EDGARSearch",
+        "Calculator",
+        "PriceHistory",
+        "SubmitFinalResult",
+    ):
+        setattr(finance, name, Tool)
+    monkeypatch.setitem(sys.modules, "finance_agent.tools", finance)
+    spec = importlib.util.spec_from_file_location("native_gateway_regression", NATIVE_TOOLS)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    tools = module.build_tools(
+        "fabv2-internal", "openai/unlisted-model", "2026-03-01", tmp_path / "submission.xlsx", tmp_path
+    )
+    llm = tools[1].kwargs["llm"]
+    assert isinstance(llm, gateway.GatewayLLM)
+    body = asyncio.run(llm.build_body([base.TextInput(text="Read the supplied document.")]))
+    assert body["model"] == "openai/unlisted-model"
+    assert body["config"].get("registry_key") is None
+    assert body["config"].get("custom_endpoint") is None
 
 
 def test_emb_never_exposes_shell_from_trusted_tool_process(

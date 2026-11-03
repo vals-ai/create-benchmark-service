@@ -125,9 +125,7 @@ def build_tools(benchmark: str, model: str, as_of_date: str, workbook: Path, pri
             raise ValueError(f"Unsupported research benchmark: {benchmark}")
 
     provider, model_name = model.split("/", 1)
-    llm = import_module("model_library.base.gateway").GatewayLLM(
-        model_name, provider, config=import_module("model_library.base").LLMConfig(registry_key=model)
-    )
+    llm = import_module("model_library.base.gateway").GatewayLLM(model_name, provider)
     module = import_module(module_name)
     tools: list[Tool] = []
     if benchmark == "emb":

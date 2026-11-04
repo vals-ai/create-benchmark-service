@@ -1,6 +1,7 @@
 """Tests for project generator."""
 
 import ast
+import re
 import runpy
 import tempfile
 import tomllib
@@ -8,6 +9,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+import yaml
 from click.testing import CliRunner
 
 import benchmark_service
@@ -121,6 +123,13 @@ def test_generated_pyproject_falls_back_to_main_for_dev_version(
     generate_project(benchmark_name="demo", output_dir=output_dir)
     pyproject = (output_dir / "pyproject.toml").read_text()
     assert "create-benchmark-service.git@main" in pyproject
+
+
+def test_the_service_yaml_example_passes_credentials_for_its_sandbox_provider() -> None:
+    template = (Path(__file__).parents[1] / "templates" / "service.yaml").read_text()
+    example = "\n".join(re.findall(r"^# (\s*(?:[A-Za-z_]+:|- ).*)$", template, flags=re.MULTILINE))
+    sandboxes = yaml.safe_load(example)["platform"]["sandboxes"]
+    assert sandboxes["provider"] in sandboxes["credentials"]
 
 
 def test_generates_project_structure() -> None:

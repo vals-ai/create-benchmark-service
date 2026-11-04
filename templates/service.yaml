@@ -11,6 +11,8 @@ manifest_version: 1
 #   model_gateway: true
 #   sandboxes:
 #     provider: daytona
+#     # The registry passes the API keys only for providers listed here.
+#     credentials: [daytona]
 #
 # framework:
 #   eval_resume:

@@ -10,6 +10,7 @@ import json
 import os
 import re
 import select
+import shlex
 import shutil
 import signal
 import subprocess
@@ -17,6 +18,7 @@ import sys
 import time
 import threading
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -80,6 +82,36 @@ class _RunningSlot:
     completion_reason: Literal["exited", "stopped", "exhausted"] | None = None
 
 
+def _shell_literal(value: str, quote: str | None) -> str:
+    if quote is None:
+        return shlex.quote(value)
+    if quote == "'":
+        return value.replace("'", "'\\''")
+    return re.sub(r'([\\$`"])', r"\\\1", value)
+
+
+def render_run_cmd(template: str, bindings: Mapping[str, str]) -> str:
+    """Substitute ``{name}`` placeholders with values that stay literal for the outer ``sh -c`` parse."""
+    placeholder = re.compile("|".join(re.escape("{" + name + "}") for name in bindings))
+    parts: list[str] = []
+    quote: str | None = None
+    index = 0
+    while index < len(template):
+        match = placeholder.match(template, index)
+        if match is not None:
+            parts.append(_shell_literal(bindings[match.group(0)[1:-1]], quote))
+            index = match.end()
+            continue
+        char = template[index]
+        escaped = template[index + 1 : index + 2]
+        step = 2 if char == "\\" and quote != "'" and escaped and escaped in "\\'\"`$" else 1
+        if char in "'\"" and quote in (None, char):
+            quote = None if quote else char
+        parts.append(template[index : index + step])
+        index += step
+    return "".join(parts)
+
+
 class Agents:
     """Launch selected-agent turns and report the union of running intervals."""
 
@@ -126,11 +158,7 @@ class Agents:
         bindings = {**self._command_bindings, "problem_statement_path": observation_path, "slot_dir": str(slot_dir)}
         if container is not None:
             bindings["container_name"] = container
-        command = re.sub(
-            "|".join(re.escape("{" + name + "}") for name in bindings),
-            lambda match: bindings[match.group()[1:-1]],
-            template,
-        )
+        command = render_run_cmd(template, bindings)
         final_output = (
             Path(self._final_output_template.replace("{slot_dir}", str(slot_dir)))
             if self._final_output_template is not None

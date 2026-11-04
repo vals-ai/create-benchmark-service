@@ -142,6 +142,26 @@ def test_commands_render_only_bound_tokens_once(tmp_path: Path, monkeypatch: pyt
     assert reporter.events == [("begin", None), ("end", None)] * 2
 
 
+@pytest.mark.parametrize(
+    "run_cmd",
+    [
+        "printf '%s' {task_id} > {slot_dir}/out",
+        "printf '%s' '{task_id}' > '{slot_dir}/out'",
+        'printf \'%s\' "{task_id}" > "{slot_dir}/out"',
+    ],
+)
+def test_bound_values_stay_literal_in_every_quoting_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_cmd: str
+) -> None:
+    marker = tmp_path / "pwned"
+    value = f"a b'$(touch {marker})`touch {marker}`\"; touch {marker}; echo \\"
+    worker, _ = agents(tmp_path, monkeypatch, run_cmd=run_cmd, command_bindings={"task_id": value})
+    worker.start("one", "observation")
+    assert worker.wait_any() == valkyrie_stage.SlotResult("one", "exited", 0)
+    assert (tmp_path / "slots" / "one" / "agent" / "out").read_text() == value
+    assert not marker.exists()
+
+
 def test_container_is_bound_only_when_configured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     worker, _ = agents(tmp_path, monkeypatch, run_cmd="printf '%s' '{container_name}' > '{slot_dir}/name'")
     worker.start("one", "observation")

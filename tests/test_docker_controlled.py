@@ -3,6 +3,7 @@
 import asyncio
 import os
 import shlex
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -14,6 +15,9 @@ from benchmark_service.sandbox._process_group import cleanup_command, stop_comma
 from benchmark_service.sandbox.local import docker as docker_module
 from benchmark_service.sandbox.local.docker import DockerSandboxProvider
 from benchmark_service.sandbox.types import Sandbox, SandboxConnectionError, SandboxError
+
+# Linux process groups: /proc, util-linux setsid --wait and PR_SET_CHILD_SUBREAPER.
+pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="needs Linux process groups")
 
 
 class _LocalStream:

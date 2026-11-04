@@ -23,6 +23,9 @@ import pytest
 
 from benchmark_service import valkyrie_stage
 
+# Linux process groups: /proc, util-linux setsid --wait and PR_SET_CHILD_SUBREAPER.
+pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="needs Linux process groups")
+
 
 def test_stage_reporter_retransmits_identical_signed_frames_until_ack(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch

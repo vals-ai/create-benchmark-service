@@ -4,12 +4,16 @@ import asyncio
 import os
 import shlex
 import signal
+import sys
 from pathlib import Path
 
 import pytest
 
 
 from benchmark_service.sandbox._process_group import cleanup_command, owner_command, probe_command, stop_command
+
+# Linux process groups: /proc, util-linux setsid --wait and PR_SET_CHILD_SUBREAPER.
+pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="needs Linux process groups")
 
 
 def _group_live(pgid: int) -> bool:

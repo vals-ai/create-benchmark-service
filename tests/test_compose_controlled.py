@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import sys
 from pathlib import Path
 from typing import cast
 
@@ -19,6 +20,9 @@ from benchmark_service.sandbox import (
     SandboxError,
 )
 from benchmark_service.sandbox import compose as compose_module
+
+# Linux process groups: /proc, util-linux setsid --wait and PR_SET_CHILD_SUBREAPER.
+pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="needs Linux process groups")
 
 
 _DOCKER_SHIM = """#!/bin/sh

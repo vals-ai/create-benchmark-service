@@ -308,17 +308,46 @@ async def test_exec_retries_modal_connection_errors(monkeypatch: pytest.MonkeyPa
         (StreamTerminatedError("Connection lost"), SandboxConnectionError),
         (ProtocolError("bad frame"), SandboxConnectionError),
         (ConnectionResetError("reset by peer"), SandboxConnectionError),
+        (GRPCError(Status.UNAVAILABLE, "unavailable"), SandboxConnectionError),
         (GRPCError(Status.FAILED_PRECONDITION, "rejected"), SandboxError),
     ],
-    ids=["stream-terminated", "protocol", "socket", "grpc"],
+    ids=["stream-terminated", "protocol", "socket", "grpc-unavailable", "grpc"],
 )
-async def test_exec_wraps_raw_transport_errors_from_output_stream(error: Exception, expected: type[SandboxError]) -> None:
+async def test_exec_wraps_raw_transport_errors_from_output_stream(
+    error: Exception, expected: type[SandboxError]
+) -> None:
     sandbox = _sandbox(FakeInnerSandbox(process=ErrorProcess(cast(Any, error))))
 
     with pytest.raises(expected) as raised:
         await sandbox.exec("true")
 
     assert raised.value.__cause__ is error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [StreamTerminatedError("Connection lost"), GRPCError(Status.DEADLINE_EXCEEDED, "deadline")],
+    ids=["stream-terminated", "grpc-deadline"],
+)
+async def test_exec_start_transport_error_is_not_retried(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    monkeypatch.setattr(cast(Any, modal_module.ModalSandbox._start_process).retry, "sleep", _noop)
+    inner = FakeInnerSandbox(exec_error=cast(Any, error))
+    attempts = 0
+    raise_error = inner.exec.aio
+
+    async def counted_exec(*args: Any, **kwargs: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        return await raise_error(*args, **kwargs)
+
+    inner.exec = _aio(counted_exec)
+    sandbox = _sandbox(inner)
+
+    with pytest.raises(SandboxError) as raised:
+        await sandbox.exec("true")
+
+    assert type(raised.value) is SandboxError
+    assert attempts == 1
 
 
 async def test_upload_wraps_raw_transport_errors() -> None:

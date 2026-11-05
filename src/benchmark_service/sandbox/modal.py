@@ -18,12 +18,17 @@ from modal.exception import Error as ModalError
 from modal.exception import InvalidError as ModalInvalidError
 from modal.exception import NotFoundError as ModalNotFoundError
 from modal.exception import ResourceExhaustedError as ModalResourceExhaustedError
+from grpclib import Status
 from grpclib.exceptions import GRPCError, ProtocolError, StreamTerminatedError
 from pydantic import BaseModel
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
 from benchmark_service.sandbox._process_group import (
-    cleanup_command, episode_owner_command, owner_command, probe_command, stop_command,
+    cleanup_command,
+    episode_owner_command,
+    owner_command,
+    probe_command,
+    stop_command,
 )
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
@@ -129,10 +134,17 @@ class ModalProviderConfig(BaseModel):
 # Modal re-raises these raw grpclib and socket errors once its own transport retries run out.
 _TRANSPORT_ERRORS = (StreamTerminatedError, ProtocolError, OSError)
 _PROVIDER_ERRORS = (ModalError, GRPCError, *_TRANSPORT_ERRORS)
+_TRANSIENT_GRPC_STATUSES = (Status.UNAVAILABLE, Status.DEADLINE_EXCEEDED)
+
+
+def _is_transport_error(exc: Exception) -> bool:
+    return isinstance(exc, _TRANSPORT_ERRORS) or (
+        isinstance(exc, GRPCError) and not isinstance(exc, ModalError) and exc.status in _TRANSIENT_GRPC_STATUSES
+    )
 
 
 def _sandbox_error(exc: Exception) -> SandboxError:
-    if isinstance(exc, _TRANSPORT_ERRORS):
+    if _is_transport_error(exc):
         return SandboxConnectionError(f"{type(exc).__name__}: {exc}")
     if isinstance(exc, ModalNotFoundError):
         return SandboxNotFoundError(str(exc))
@@ -192,8 +204,7 @@ class ModalSandbox(Sandbox):
             raise SandboxError(f"Modal sandbox does not support process groups: {result.output}")
 
     def _process_group_workload(
-        self, command: str, episode_script: str | None, *, cwd: str | None,
-        env_vars: Mapping[str, str] | None
+        self, command: str, episode_script: str | None, *, cwd: str | None, env_vars: Mapping[str, str] | None
     ) -> ControlledWorkload:
         return _ModalControlledWorkload(
             self, command, cwd, validate_command_env(env_vars), self._start_controlled_process, episode_script
@@ -262,6 +273,9 @@ class ModalSandbox(Sandbox):
                 text=True,
             )
         except _PROVIDER_ERRORS as exc:
+            if _is_transport_error(exc):
+                # The command may have started before its reply was lost, so a retry could run it twice.
+                raise SandboxError(f"Modal exec start lost its reply: {type(exc).__name__}: {exc}") from exc
             raise _sandbox_error(exc) from exc
 
     async def command(
@@ -454,6 +468,7 @@ for domain in {domains_to_resolve!r}:
         # allowlist provides the same access without that unsupported transition.
         await self._set_outbound_network_policy(list(_ALLOW_ALL_CIDRS), list(_ALLOW_ALL_DOMAINS))
 
+
 class _ModalControlledWorkload(ControlledWorkload):
     def __init__(
         self,
@@ -461,9 +476,7 @@ class _ModalControlledWorkload(ControlledWorkload):
         command: str,
         cwd: str | None,
         env_vars: dict[str, str],
-        start_process: Callable[
-            [str, dict[str, str]], Awaitable[tuple[AsyncIterable[str], Coroutine[Any, Any, int]]]
-        ],
+        start_process: Callable[[str, dict[str, str]], Awaitable[tuple[AsyncIterable[str], Coroutine[Any, Any, int]]]],
         episode_script: str | None,
     ) -> None:
         self._sandbox = sandbox
@@ -593,9 +606,6 @@ class _ModalControlledWorkload(ControlledWorkload):
         removed = await self._sandbox.exec(cleanup_command(self._marker))
         if removed.exit_code != 0:
             raise SandboxError(f"Modal process-group control cleanup failed: {removed.output}")
-
-
-
 
 
 class ModalSandboxProvider(SandboxProvider):

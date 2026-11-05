@@ -916,6 +916,23 @@ async def test_resume_evaluation_with_eval_resume_state(
     on_eval_resume_state.assert_called_once_with(state)
 
 
+async def test_monitoring_requirements_reports_rules_and_old_service_404(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    mock_http.request = AsyncMock(
+        return_value=_mock_response(json_data={"policy": "Stay in scope.", "watcher_policy_pack": "core+web"})
+    )
+    rules = await client.monitoring_requirements(dataset="alt")
+    assert (rules.policy, rules.watcher_policy_pack) == ("Stay in scope.", "core+web")
+    mock_http.request.assert_awaited_once_with("POST", f"{BASE_URL}/monitoring-requirements", json={"dataset": "alt"})
+
+    mock_http.request = AsyncMock(return_value=_mock_response(status_code=404, text="Not Found"))
+    with pytest.raises(BenchmarkServiceError) as exc:
+        await client.monitoring_requirements()
+    assert exc.value.status_code == 404
+
+
 async def test_grading_requirements_reports_gateway_models_and_old_service_404(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:

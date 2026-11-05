@@ -41,6 +41,7 @@ from benchmark_service.schemas import (
     FinalScoreResult,
     GradingSubmission,
     MaterializedSubmissionArtifact,
+    MonitoringRequirementsResponse,
     RetrieveTaskResponse,
     StreamChunk,
     StreamErrorChunk,
@@ -238,6 +239,13 @@ class BenchmarkService(ABC):
         Legacy service-key minting still uses GRADING_MODELS independently.
         """
         return [model.strip() for model in os.environ.get("GRADING_MODELS", "").split(",") if model.strip()]
+
+    def monitoring_requirements(self, dataset: str | None = None) -> MonitoringRequirementsResponse:
+        """Rules an external run monitor applies to this benchmark's runs.
+
+        Override to give the monitor run-specific policy text and a Watcher policy pack.
+        """
+        return MonitoringRequirementsResponse()
 
     async def check_auth(self, headers: dict[str, str]) -> bool:
         """Validate request authorization.

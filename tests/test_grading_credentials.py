@@ -191,13 +191,19 @@ async def test_without_grading_models_nothing_is_bound(
 
 async def test_concurrent_evaluations_keep_their_own_credentials(gateway: FakeGateway) -> None:
     async def observe(run_id: str) -> str | None:
-        async with grading_credentials(run_id=run_id, task_id="task-1", attempt_id="attempt-1"):
+        async with grading_credentials(
+            run_id=run_id, task_id="task-1", attempt_id="attempt-1", email=f"{run_id}@example.com"
+        ):
             await asyncio.sleep(0)
+            assert current_evaluation_caller() == EvaluationCaller(
+                run_id, "task-1", "attempt-1", f"{run_id}@example.com"
+            )
             credentials = current_grading_credentials()
             return credentials.api_key if credentials else None
 
     assert await asyncio.gather(observe("run-a"), observe("run-b")) == ["mgwt_run-a", "mgwt_run-b"]
     assert current_grading_credentials() is None
+    assert current_evaluation_caller() is None
 
 
 async def test_model_library_sends_the_token_while_grading(gateway: FakeGateway, scoped_tokens: list[str]) -> None:
@@ -299,6 +305,39 @@ class TaskScopedBenchmark(CredentialReportingBenchmark):
         assert request.grading_token is None
         credentials = current_grading_credentials()
         yield StreamResultChunk(type="result", data={"gateway_key": credentials.api_key if credentials else None})
+
+
+def test_setup_binds_caller_without_grading_credentials(gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch) -> None:
+    _patch_daytona_provider(monkeypatch, GetByIdClient())
+
+    class CallerReportingBenchmark(TaskScopedBenchmark):
+        async def setup_task(
+            self, task_id: str, sandbox: Any, dataset: str | None = None
+        ) -> AsyncGenerator[StreamChunk, None]:
+            caller = current_evaluation_caller()
+            assert current_grading_credentials() is None
+            yield StreamResultChunk(type="result", data={"caller": vars(caller) if caller else None})
+
+    with TestClient(BenchmarkServiceApp(CallerReportingBenchmark)) as client:
+        for headers, caller in [
+            (
+                {**HEADERS, EMAIL_HEADER: "starter@example.com"},
+                {
+                    "run_id": "run-1",
+                    "task_id": "task-1",
+                    "attempt_id": "attempt-1",
+                    "email": "starter@example.com",
+                },
+            ),
+            ({}, None),
+        ]:
+            with client.websocket_connect("/ws/setup-task", headers=headers) as websocket:
+                websocket.send_json(
+                    {"task_id": "task-1", "instance_id": "i-1", "sandbox_provider": _PROVIDER_BODY}
+                )
+                assert websocket.receive_json() == {"type": "result", "data": {"caller": caller}}
+
+    assert gateway.calls == []
 
 
 def test_requirements_are_authenticated_dataset_scoped_and_task_overridable(

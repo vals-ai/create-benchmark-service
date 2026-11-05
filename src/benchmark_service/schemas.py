@@ -451,9 +451,12 @@ class GradingRequirementsRequest(BaseModel):
 
 
 class GradingRequirementsResponse(BaseModel):
-    """Complete Gateway model keys required by this task's grading path."""
+    """Gateway model keys and optional remote-grader capability for this task."""
 
     models: list[str]
+    remote_grader_service: Literal["vcb", "vcb-1-100", "cyber-range"] | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
 
 
 class EvaluateInstanceRequest(BaseModel):

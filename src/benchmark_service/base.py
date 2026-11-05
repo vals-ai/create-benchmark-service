@@ -14,7 +14,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Mapping
 from contextlib import AbstractAsyncContextManager, aclosing, asynccontextmanager
 from functools import cached_property
 from pathlib import Path
-from typing import Any, ClassVar, Self, cast
+from typing import Any, ClassVar, Literal, Self, cast
 from uuid import uuid4
 
 from fastapi.encoders import jsonable_encoder
@@ -133,6 +133,8 @@ class BenchmarkService(ABC):
     # How /v1/evaluate grades this benchmark. The Vals app reads this at boot
     # and per dispatch, so it is class state, not a per-instance value.
     eval_mode: ClassVar[EvalMode] = EvalMode.TEXT
+    # Remote implementations register selected-project attempts before dispatch.
+    remote_grader_service: ClassVar[Literal["vcb", "vcb-1-100", "cyber-range"] | None] = None
     accepted_submission_schemas: ClassVar[dict[V1PayloadType, frozenset[str]]] = {}
 
     # Task order within a dataset is dispatch order (the tracker creates task

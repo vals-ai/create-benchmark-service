@@ -26,6 +26,13 @@ from benchmark_service.grading_credentials import (
     grading_credentials,
 )
 from benchmark_service.observability import ATTEMPT_ID_HEADER, EMAIL_HEADER, RUN_ID_HEADER, TASK_ID_HEADER
+from benchmark_service.remote_grading import (
+    REMOTE_GRADING_GRANT_HEADER,
+    REMOTE_GRADING_ISSUER_HEADER,
+    RemoteGradingAuthorization,
+    current_remote_grading_authorization,
+)
+from benchmark_service.sentry import _omit_remote_grading_grant  # pyright: ignore[reportPrivateUsage]
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.schemas import EvaluateResponseRequest, StreamChunk, StreamMessageChunk, StreamResultChunk
 from tests.conftest import StubBenchmark
@@ -472,3 +479,138 @@ def test_supplied_token_is_not_echoed_on_websocket_exception(
             assert websocket.receive_json() == {"type": "error", "data": "Evaluation failed"}
     assert "project-grader-token" not in caplog.text
     assert gateway.calls == []
+
+
+async def test_registered_remote_handoff_binds_setup_evaluation_and_resume_without_service_mint(
+    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_daytona_provider(monkeypatch, GetByIdClient())
+    seen: list[tuple[str, RemoteGradingAuthorization | None, GradingCredentials | None, EvaluationCaller | None]] = []
+
+    class RemoteBenchmark(TaskScopedBenchmark):
+        remote_grader_service = "vcb"
+
+        def observe(self, stage: str) -> None:
+            seen.append((
+                stage,
+                current_remote_grading_authorization(),
+                current_grading_credentials(),
+                current_evaluation_caller(),
+            ))
+
+        async def setup_task(
+            self, task_id: str, sandbox: Any, dataset: str | None = None
+        ) -> AsyncGenerator[StreamChunk, None]:
+            await asyncio.sleep(0)
+            self.observe("setup")
+            yield StreamResultChunk(type="result", data={"status": "ok"})
+
+        async def evaluate_instance(
+            self, task_id: str, sandbox: Any, dataset: str | None = None
+        ) -> AsyncGenerator[StreamChunk, None]:
+            await asyncio.sleep(0)
+            self.observe("instance")
+            yield StreamResultChunk(type="result", data={"score": 1.0})
+
+        async def stream_evaluate_response(
+            self, request: EvaluateResponseRequest, dataset: str | None = None
+        ) -> AsyncGenerator[StreamChunk, None]:
+            await asyncio.sleep(0)
+            self.observe("resume")
+            yield StreamResultChunk(type="result", data={"score": 1.0})
+
+    authorization_a = RemoteGradingAuthorization("tracker-a", "private-grant-a")
+    authorization_b = RemoteGradingAuthorization("tracker-b", "private-grant-b")
+    assert "private-grant-a" not in repr(authorization_a)
+    provider = DaytonaProviderConfig.model_validate(_PROVIDER_BODY)
+
+    async with serve(BenchmarkServiceApp(RemoteBenchmark)) as url:
+        async with BenchmarkServiceClient(url, HEADERS) as client:
+            requirements = await client.grading_requirements_response("task-1")
+            assert requirements.remote_grader_service == "vcb"
+            assert requirements.models == ["anthropic/judge", "openai/helper"]
+            assert await client.grading_requirements("task-1") == requirements.models
+            assert (
+                await client.setup_task(
+                    "task-1", "i-1", sandbox_provider=provider,
+                    remote_grading_authorization=authorization_a,
+                )
+            ).status == "ok"
+            assert await asyncio.gather(
+                client.evaluate_instance(
+                    "task-1", "i-1", sandbox_provider=provider,
+                    remote_grading_authorization=authorization_b,
+                ),
+                client.resume_evaluation(
+                    "task-1", {"checkpoint": "saved"},
+                    remote_grading_authorization=authorization_a,
+                ),
+            ) == [{"score": 1.0}, {"score": 1.0}]
+            assert await client.evaluate_instance("task-1", "i-1", sandbox_provider=provider) == {"score": 1.0}
+
+    caller = EvaluationCaller("run-1", "task-1", "attempt-1", None)
+    assert seen[0] == ("setup", authorization_a, None, None)
+    assert set(seen[1:3]) == {
+        ("instance", authorization_b, None, caller),
+        ("resume", authorization_a, None, caller),
+    }
+    assert seen[3] == ("instance", None, TOKEN, caller)
+    assert gateway.paths() == ["/service-auth", "/service-auth/revoke"]
+    assert current_remote_grading_authorization() is None
+
+
+def test_malformed_remote_handoff_never_falls_back_to_service_credentials(
+    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _patch_daytona_provider(monkeypatch, GetByIdClient())
+    with TestClient(BenchmarkServiceApp(TaskScopedBenchmark)) as client:
+        with client.websocket_connect(
+            "/ws/evaluate-instance", headers={**HEADERS, REMOTE_GRADING_ISSUER_HEADER: "tracker-a"}
+        ) as websocket:
+            websocket.send_json({"task_id": "task-1", "instance_id": "i-1", "sandbox_provider": _PROVIDER_BODY})
+            assert websocket.receive_json()["type"] == "error"
+        with client.websocket_connect(
+            "/ws/evaluate-instance", headers={**HEADERS, REMOTE_GRADING_GRANT_HEADER: "secret"}
+        ) as websocket:
+            websocket.send_json({"task_id": "task-1", "instance_id": "i-1", "sandbox_provider": _PROVIDER_BODY})
+            error = websocket.receive_json()
+            assert error["type"] == "error"
+            assert "Supply exactly one remote grading issuer and grant" in error["data"]
+            assert "secret" not in error["data"]
+    assert gateway.calls == []
+
+
+def test_sentry_preserves_remote_error_without_capturing_grant_in_frame_locals() -> None:
+    remote = {
+        "request": {"headers": {"x-vals-remote-grading-grant": "private-grant-a"}},
+        "exception": {"values": [{
+            "value": "worker failed",
+            "stacktrace": {"frames": [
+                {
+                    "function": "remote_grading_authorization_from_headers",
+                    "vars": {
+                        "headers": {"x-vals-remote-grading-grant": "'private-grant-a'"},
+                        "grants": ["'private-grant-a'"],
+                        "issuer": "tracker-a",
+                    },
+                },
+                {"function": "evaluate_instance", "vars": {"task_id": "task-1"}},
+            ]},
+        }]},
+    }
+    ordinary = {
+        "request": {"headers": {"x-vals-run-id": "run-1"}},
+        "exception": {"values": [{
+            "stacktrace": {"frames": [{"function": "evaluate_instance", "vars": {"task_id": "task-1"}}]},
+        }]},
+    }
+    _omit_remote_grading_grant(remote, {})
+    _omit_remote_grading_grant(ordinary, {})
+    assert "private-grant-a" not in repr(remote)
+    assert remote["exception"]["values"][0]["value"] == "worker failed"
+    frames = remote["exception"]["values"][0]["stacktrace"]["frames"]
+    assert frames == [
+        {"function": "remote_grading_authorization_from_headers"},
+        {"function": "evaluate_instance"},
+    ]
+    assert ordinary["exception"]["values"][0]["stacktrace"]["frames"][0]["vars"] == {"task_id": "task-1"}

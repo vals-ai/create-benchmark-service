@@ -24,6 +24,10 @@ from benchmark_service.draining import DRAIN_STATE_PATH_ENV, DrainMiddleware, Dr
 from benchmark_service.grading_credentials import grading_credentials
 from benchmark_service.observability import ATTEMPT_ID_HEADER, EMAIL_HEADER, RUN_ID_HEADER
 from benchmark_service.context import child_egress_scope, sandbox_provider_scope, tenant_scope
+from benchmark_service.remote_grading import (
+    remote_grading_authorization_from_headers,
+    remote_grading_authorization_scope,
+)
 from benchmark_service.sandbox.created import SandboxCreatedHook, sandbox_created_scope
 from benchmark_service.schemas import (
     DATASET_VERSION_HEADER,
@@ -125,7 +129,7 @@ def _request_may_use_provider(config: SandboxProviderConfig | None) -> bool:
 def _grading_credentials(
     headers: Mapping[str, str], task_id: str, grading_token: str | None = None
 ) -> AbstractAsyncContextManager[None]:
-    """Gateway credentials for the evaluation; a supplied grader token takes precedence."""
+    """Remote authorization defers credentials to the worker; otherwise a supplied grader token takes precedence."""
     return grading_credentials(
         run_id=headers.get(RUN_ID_HEADER),
         task_id=task_id,
@@ -304,6 +308,7 @@ class BenchmarkServiceApp(FastAPI):
     async def _dataset_scope(
         self, connection: Request | WebSocket, tenant: str, dataset: str | None
     ) -> AsyncGenerator[None, None]:
+        authorization = remote_grading_authorization_from_headers(connection.headers)
         values = connection.headers.getlist(DATASET_VERSION_HEADER)
         if len(values) > 1:
             raise _DatasetVersionSelectionError(400, f"Supply {DATASET_VERSION_HEADER} only once")
@@ -323,7 +328,7 @@ class BenchmarkServiceApp(FastAPI):
                     else:
                         connection.state.dataset_version = resolved
                 entered = True
-                with tenant_scope(tenant):
+                with tenant_scope(tenant), remote_grading_authorization_scope(authorization):
                     yield
         except HTTPException as exc:
             if isinstance(connection, WebSocket) and exc.status_code == 403:
@@ -353,7 +358,8 @@ class BenchmarkServiceApp(FastAPI):
             self._sentry.bind_request_context(request.headers, task_id=body.task_id, dataset=body.dataset)
         async with self._dataset_scope(request, request.state.tenant, body.dataset):
             return GradingRequirementsResponse(
-                models=self.service.grading_requirements(body.task_id, dataset=body.dataset)
+                models=self.service.grading_requirements(body.task_id, dataset=body.dataset),
+                remote_grader_service=self.service.remote_grader_service,
             )
 
     async def _authorize_websocket(self, websocket: WebSocket) -> str | None:

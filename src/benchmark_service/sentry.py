@@ -14,6 +14,30 @@ SENTRY_ENVIRONMENT_ENV = "SENTRY_ENVIRONMENT"
 SENTRY_RELEASE_ENV = "SENTRY_RELEASE"
 
 
+def _omit_remote_grading_grant(event: dict[str, object], _hint: object) -> dict[str, object]:
+    """Keep request headers and captured frame locals from exposing a remote grant."""
+    from sentry_sdk.utils import iter_event_frames
+
+    from benchmark_service.remote_grading import REMOTE_GRADING_GRANT_HEADER
+
+    request = event.get("request")
+    if not isinstance(request, dict):
+        return event
+    headers = request.get("headers")
+    if not isinstance(headers, dict):
+        return event
+    grant_headers = [name for name in headers if name.lower() == REMOTE_GRADING_GRANT_HEADER.lower()]
+    if not grant_headers:
+        return event
+    for name in grant_headers:
+        headers[name] = "[Filtered]"
+    # The SDK serializes Headers as a mapping and getlist() as a list in
+    # traceback locals; dropping only vars preserves the exception and frames.
+    for frame in iter_event_frames(event):
+        frame.pop("vars", None)
+    return event
+
+
 def init_sentry() -> bool:
     """Initialize the process-wide Sentry client once when a DSN is configured."""
     dsn = os.getenv(SENTRY_DSN_ENV)
@@ -27,6 +51,8 @@ def init_sentry() -> bool:
             release=os.getenv(SENTRY_RELEASE_ENV),
             traces_sample_rate=0.1,
             integrations=[LoggingIntegration(level=None, event_level=None, sentry_logs_level=None)],
+            before_send=_omit_remote_grading_grant,
+            before_send_transaction=_omit_remote_grading_grant,
         )
     return True
 

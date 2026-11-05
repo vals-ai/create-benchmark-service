@@ -776,9 +776,14 @@ async def test_list_datasets_error_carries_json_detail(
     ("response", "expected_message", "expected_detail"),
     [
         (httpx.Response(401, json={"detail": "Invalid token"}), "Invalid token", "Invalid token"),
+        (
+            httpx.Response(401, json={"detail": [{"msg": "expired"}]}),
+            '{"detail":[{"msg":"expired"}]}',
+            [{"msg": "expired"}],
+        ),
         (httpx.Response(401, text="Unauthorized"), "Unauthorized", None),
     ],
-    ids=["json", "text"],
+    ids=["json", "non-string-json", "text"],
 )
 async def test_unauthenticated_error_carries_json_detail(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],

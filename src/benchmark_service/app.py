@@ -21,7 +21,7 @@ from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_required
 from benchmark_service.base import BenchmarkService
 from benchmark_service.draining import DRAIN_STATE_PATH_ENV, DrainMiddleware, DrainState
-from benchmark_service.grading_credentials import grading_credentials
+from benchmark_service.grading_credentials import evaluation_caller_scope, grading_credentials
 from benchmark_service.observability import ATTEMPT_ID_HEADER, EMAIL_HEADER, RUN_ID_HEADER
 from benchmark_service.context import child_egress_scope, sandbox_provider_scope, tenant_scope
 from benchmark_service.sandbox.created import SandboxCreatedHook, sandbox_created_scope
@@ -485,7 +485,15 @@ class BenchmarkServiceApp(FastAPI):
                 async with sandbox_config.create_provider() as provider:
                     sandbox = await provider.get_sandbox(request.instance_id)
 
-                    with child_egress_scope(request.child_egress):
+                    with (
+                        evaluation_caller_scope(
+                            run_id=websocket.headers.get(RUN_ID_HEADER),
+                            task_id=request.task_id,
+                            attempt_id=websocket.headers.get(ATTEMPT_ID_HEADER),
+                            email=websocket.headers.get(EMAIL_HEADER),
+                        ),
+                        child_egress_scope(request.child_egress),
+                    ):
                         await _forward_stream(
                             websocket,
                             self.service.setup_task(request.task_id, sandbox, dataset=request.dataset),

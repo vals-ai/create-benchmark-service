@@ -29,6 +29,7 @@ from benchmark_service.client import (
     _SERVER_PING_TIMEOUT_S,  # pyright: ignore[reportPrivateUsage]
     BenchmarkServiceClient,
     BenchmarkServiceError,
+    BenchmarkServiceUnauthenticatedError,
     SandboxRecoveryAttempt,
 )
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
@@ -730,6 +731,74 @@ async def test_http_error(
         await getattr(client, method)(*args)
 
     assert exc_info.value.status_code == 500
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_detail"),
+    [
+        (httpx.Response(400, json={"detail": "Unknown task ids: x"}), "Unknown task ids: x"),
+        (httpx.Response(422, json={"detail": [{"loc": ["query"], "msg": "bad"}]}), [{"loc": ["query"], "msg": "bad"}]),
+        (httpx.Response(400, json={"error": "no detail key"}), None),
+        (httpx.Response(400, json=["not", "an", "object"]), None),
+        (httpx.Response(502, text="<html>Bad Gateway</html>"), None),
+    ],
+    ids=["string", "list", "missing", "non-object", "non-json"],
+)
+async def test_http_error_carries_json_detail(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    response: httpx.Response,
+    expected_detail: object,
+) -> None:
+    client, mock_http = benchmark_client
+    mock_http.request = AsyncMock(return_value=response)
+
+    with pytest.raises(BenchmarkServiceError) as exc_info:
+        await client.verify_task_ids(["x"], None)
+
+    assert exc_info.value.status_code == response.status_code
+    assert exc_info.value.detail == expected_detail
+    assert str(exc_info.value).endswith(f"response: {response.text}")
+
+
+async def test_list_datasets_error_carries_json_detail(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    mock_http.request = AsyncMock(return_value=httpx.Response(403, json={"detail": "Forbidden"}))
+
+    with pytest.raises(BenchmarkServiceError) as exc_info:
+        await client.list_datasets()
+
+    assert exc_info.value.detail == "Forbidden"
+
+
+@pytest.mark.parametrize(
+    ("response", "expected_message", "expected_detail"),
+    [
+        (httpx.Response(401, json={"detail": "Invalid token"}), "Invalid token", "Invalid token"),
+        (
+            httpx.Response(401, json={"detail": [{"msg": "expired"}]}),
+            '{"detail":[{"msg":"expired"}]}',
+            [{"msg": "expired"}],
+        ),
+        (httpx.Response(401, text="Unauthorized"), "Unauthorized", None),
+    ],
+    ids=["json", "non-string-json", "text"],
+)
+async def test_unauthenticated_error_carries_json_detail(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+    response: httpx.Response,
+    expected_message: str,
+    expected_detail: object,
+) -> None:
+    client, mock_http = benchmark_client
+    mock_http.request = AsyncMock(return_value=response)
+
+    with pytest.raises(BenchmarkServiceUnauthenticatedError) as exc_info:
+        await client.verify_task_ids(["x"], None)
+
+    assert str(exc_info.value) == f"Authentication failed: {expected_message}"
+    assert exc_info.value.detail == expected_detail
 
 
 @pytest.mark.parametrize(
@@ -1560,7 +1629,9 @@ async def test_client_v1_evaluate_raises_on_error_status(
 
 
 def test_non_http_service_error_has_no_status_code() -> None:
-    assert BenchmarkServiceError("websocket failed").status_code is None
+    error = BenchmarkServiceError("websocket failed")
+    assert error.status_code is None
+    assert error.detail is None
 
 
 @pytest.mark.parametrize(

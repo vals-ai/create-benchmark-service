@@ -18,11 +18,17 @@ from modal.exception import Error as ModalError
 from modal.exception import InvalidError as ModalInvalidError
 from modal.exception import NotFoundError as ModalNotFoundError
 from modal.exception import ResourceExhaustedError as ModalResourceExhaustedError
+from grpclib import Status
+from grpclib.exceptions import GRPCError, ProtocolError, StreamTerminatedError
 from pydantic import BaseModel
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
 from benchmark_service.sandbox._process_group import (
-    cleanup_command, episode_owner_command, owner_command, probe_command, stop_command,
+    cleanup_command,
+    episode_owner_command,
+    owner_command,
+    probe_command,
+    stop_command,
 )
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
@@ -125,7 +131,21 @@ class ModalProviderConfig(BaseModel):
         return ModalSandboxProvider(self)
 
 
-def _sandbox_error(exc: ModalError) -> SandboxError:
+# Modal re-raises these raw grpclib and socket errors once its own transport retries run out.
+_TRANSPORT_ERRORS = (StreamTerminatedError, ProtocolError, OSError)
+_PROVIDER_ERRORS = (ModalError, GRPCError, *_TRANSPORT_ERRORS)
+_TRANSIENT_GRPC_STATUSES = (Status.UNAVAILABLE, Status.DEADLINE_EXCEEDED)
+
+
+def _is_transport_error(exc: Exception) -> bool:
+    return isinstance(exc, _TRANSPORT_ERRORS) or (
+        isinstance(exc, GRPCError) and not isinstance(exc, ModalError) and exc.status in _TRANSIENT_GRPC_STATUSES
+    )
+
+
+def _sandbox_error(exc: Exception) -> SandboxError:
+    if _is_transport_error(exc):
+        return SandboxConnectionError(f"{type(exc).__name__}: {exc}")
     if isinstance(exc, ModalNotFoundError):
         return SandboxNotFoundError(str(exc))
     if isinstance(exc, ModalConflictError) and "shutting down" in str(exc).lower():
@@ -184,8 +204,7 @@ class ModalSandbox(Sandbox):
             raise SandboxError(f"Modal sandbox does not support process groups: {result.output}")
 
     def _process_group_workload(
-        self, command: str, episode_script: str | None, *, cwd: str | None,
-        env_vars: Mapping[str, str] | None
+        self, command: str, episode_script: str | None, *, cwd: str | None, env_vars: Mapping[str, str] | None
     ) -> ControlledWorkload:
         return _ModalControlledWorkload(
             self, command, cwd, validate_command_env(env_vars), self._start_controlled_process, episode_script
@@ -199,7 +218,7 @@ class ModalSandbox(Sandbox):
         try:
             # Do not use _start_process: its retry could create another workload on an ambiguous exec failure.
             process = await self._sandbox.exec.aio("/bin/sh", "-lc", command, env=modal_env, text=True)
-        except ModalError as exc:
+        except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
         return process.stdout, process.wait.aio()
 
@@ -212,7 +231,7 @@ class ModalSandbox(Sandbox):
                     raise SandboxNotFoundError(f"Sandbox not found: id={self.id}, poll_result={poll_result}.")
                 if attempt < attempts - 1:
                     await asyncio.sleep(wait_seconds)
-        except ModalError as exc:
+        except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
 
     async def exec(
@@ -227,7 +246,7 @@ class ModalSandbox(Sandbox):
         try:
             output = "".join([str(chunk) async for chunk in process.stdout])
             exit_code = await process.wait.aio()
-        except ModalError as exc:
+        except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
         if exit_code != 0:
             await self._raise_if_finished(attempts=6, wait_seconds=0.5)
@@ -253,7 +272,10 @@ class ModalSandbox(Sandbox):
                 env=modal_env,
                 text=True,
             )
-        except ModalError as exc:
+        except _PROVIDER_ERRORS as exc:
+            if _is_transport_error(exc):
+                # The command may have started before its reply was lost, so a retry could run it twice.
+                raise SandboxError(f"Modal exec start lost its reply: {type(exc).__name__}: {exc}") from exc
             raise _sandbox_error(exc) from exc
 
     async def command(
@@ -270,7 +292,7 @@ class ModalSandbox(Sandbox):
         try:
             async for chunk in self._stream_command(process):
                 yield chunk
-        except ModalError as exc:
+        except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
 
     async def _stream_command(self, process: Any) -> AsyncGenerator[str, None]:
@@ -360,7 +382,7 @@ class ModalSandbox(Sandbox):
         await self._raise_if_finished()
         try:
             await cast(Awaitable[None], self._sandbox.filesystem.write_bytes.aio(content, remote_path))
-        except ModalError as exc:
+        except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
 
     @_PROVIDER_RETRY
@@ -368,7 +390,7 @@ class ModalSandbox(Sandbox):
         await self._raise_if_finished()
         try:
             content = await cast(Awaitable[bytes], self._sandbox.filesystem.read_bytes.aio(remote_path))
-        except ModalError as exc:
+        except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
         return bytes(content)
 
@@ -379,7 +401,7 @@ class ModalSandbox(Sandbox):
             async for chunk in process.stdout:
                 yield bytes(chunk)
             exit_code = await process.wait.aio()
-        except ModalError as exc:
+        except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
         if exit_code != 0:
             await self._raise_if_finished(attempts=6, wait_seconds=0.5)
@@ -389,7 +411,7 @@ class ModalSandbox(Sandbox):
     async def _start_download_process(self, remote_path: str) -> Any:
         try:
             return await self._sandbox.exec.aio("cat", "--", remote_path, text=False)
-        except ModalError as exc:
+        except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
 
     @_PROVIDER_RETRY
@@ -407,7 +429,7 @@ class ModalSandbox(Sandbox):
                     outbound_domain_allowlist=domains,
                 ),
             )
-        except ModalError as exc:
+        except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
 
     async def _resolve_domain_cidrs(self, domains: list[str]) -> list[str]:
@@ -446,6 +468,7 @@ for domain in {domains_to_resolve!r}:
         # allowlist provides the same access without that unsupported transition.
         await self._set_outbound_network_policy(list(_ALLOW_ALL_CIDRS), list(_ALLOW_ALL_DOMAINS))
 
+
 class _ModalControlledWorkload(ControlledWorkload):
     def __init__(
         self,
@@ -453,9 +476,7 @@ class _ModalControlledWorkload(ControlledWorkload):
         command: str,
         cwd: str | None,
         env_vars: dict[str, str],
-        start_process: Callable[
-            [str, dict[str, str]], Awaitable[tuple[AsyncIterable[str], Coroutine[Any, Any, int]]]
-        ],
+        start_process: Callable[[str, dict[str, str]], Awaitable[tuple[AsyncIterable[str], Coroutine[Any, Any, int]]]],
         episode_script: str | None,
     ) -> None:
         self._sandbox = sandbox
@@ -511,7 +532,7 @@ class _ModalControlledWorkload(ControlledWorkload):
                         self._tail[0] = first[excess:].decode("utf-8", errors="ignore")
                         self._tail_bytes -= len(first) - len(self._tail[0].encode("utf-8"))
                 self._output_changed.set()
-        except ModalError as exc:
+        except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
         finally:
             self._output_changed.set()
@@ -535,7 +556,7 @@ class _ModalControlledWorkload(ControlledWorkload):
         assert self._read_task is not None
         try:
             exit_code = await self._process_wait_task
-        except ModalError as exc:
+        except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
         stopped_at, status = await self._ensure_stopped()
         assert self._cleanup_task is not None
@@ -587,9 +608,6 @@ class _ModalControlledWorkload(ControlledWorkload):
             raise SandboxError(f"Modal process-group control cleanup failed: {removed.output}")
 
 
-
-
-
 class ModalSandboxProvider(SandboxProvider):
     def __init__(self, config: ModalProviderConfig) -> None:
         self._config = config
@@ -607,7 +625,7 @@ class ModalSandboxProvider(SandboxProvider):
                     create_if_missing=True,
                 )
                 self._client = client
-            except ModalError as exc:
+            except _PROVIDER_ERRORS as exc:
                 raise _sandbox_error(exc) from exc
         return self._client, self._app
 
@@ -643,7 +661,7 @@ class ModalSandboxProvider(SandboxProvider):
                     f"Modal volume {mount.name!r} does not exist (mount {mount.mount_path}); "
                     "create it or set create_if_missing"
                 ) from exc
-            except ModalError as exc:
+            except _PROVIDER_ERRORS as exc:
                 raise _sandbox_error(exc) from exc
             resolved[mount.mount_path] = volume
         return resolved
@@ -662,7 +680,7 @@ class ModalSandboxProvider(SandboxProvider):
     async def _fetch_labels(self, sandbox: ModalSdkSandbox) -> dict[str, str]:
         try:
             return await cast(Any, sandbox.get_tags).aio()
-        except ModalError as exc:
+        except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
 
     async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
@@ -722,7 +740,7 @@ class ModalSandboxProvider(SandboxProvider):
             if request.volumes and _is_missing_volume_error(exc):
                 raise SandboxError(f"Modal volume mount failed: {exc}") from exc
             raise _sandbox_error(exc) from exc
-        except ModalError as exc:
+        except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
         return ModalSandbox(inner, name=request.name, labels=request.labels)
 
@@ -730,7 +748,7 @@ class ModalSandboxProvider(SandboxProvider):
         try:
             inner = await creation
             await inner.terminate.aio(wait=True)
-        except ModalError as exc:
+        except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
 
     @_PROVIDER_RETRY
@@ -742,7 +760,7 @@ class ModalSandboxProvider(SandboxProvider):
                 raise SandboxNotFoundError(f"Sandbox not found: id={instance_id}.")
         except ModalInvalidError as exc:
             raise SandboxNotFoundError(f"Sandbox not found: id={instance_id}.") from exc
-        except ModalError as exc:
+        except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
         return ModalSandbox(inner, labels=await self._fetch_labels(inner))
 
@@ -754,7 +772,7 @@ class ModalSandboxProvider(SandboxProvider):
             await inner.terminate.aio(wait=True)
         except ModalNotFoundError:
             return
-        except ModalError as exc:
+        except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
 
     async def list_sandboxes(self, query: SandboxQuery) -> AsyncGenerator[Sandbox, None]:
@@ -773,7 +791,7 @@ class ModalSandboxProvider(SandboxProvider):
                 if await inner.poll.aio() is None:
                     sandboxes.append(inner)
             return sandboxes
-        except ModalError as exc:
+        except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
 
     async def close(self) -> None:

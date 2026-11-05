@@ -9,7 +9,7 @@ import os
 import time
 from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass, field
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 from uuid import uuid4
 
 import httpx
@@ -131,13 +131,19 @@ _retry_http = retry(
 
 
 class BenchmarkServiceError(Exception):
-    """Exception raised for benchmark service communication errors."""
+    """Exception raised for benchmark service communication errors.
+
+    ``detail`` is the ``detail`` field of the service's JSON error body, or ``None`` when the
+    response had no JSON ``detail``.
+    """
 
     status_code: int | None
+    detail: object | None
 
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+    def __init__(self, message: str, *, status_code: int | None = None, detail: object | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.detail = detail
 
 
 class BenchmarkServiceUnauthenticatedError(BenchmarkServiceError):
@@ -191,25 +197,36 @@ class BenchmarkServiceStreamClosedError(BenchmarkServiceStreamError):
         self.idle_s = idle_s
 
 
-def _unauthenticated_error(response: httpx.Response) -> "BenchmarkServiceUnauthenticatedError":
-    """Parse the value from the httpx response"""
-
+def _response_detail(response: httpx.Response) -> object | None:
     try:
-        detail = response.json().get("detail", response.text)
-    except Exception:
-        detail = response.text
+        body: object = response.json()
+    except ValueError:
+        return None
+    return cast(dict[str, object], body).get("detail") if isinstance(body, dict) else None
 
-    return BenchmarkServiceUnauthenticatedError(detail, status_code=response.status_code)
+
+def _unauthenticated_error(response: httpx.Response) -> "BenchmarkServiceUnauthenticatedError":
+    detail = _response_detail(response)
+    return BenchmarkServiceUnauthenticatedError(
+        detail if isinstance(detail, str) else response.text,
+        status_code=response.status_code,
+        detail=detail,
+    )
+
+
+def _status_error(response: httpx.Response, operation: str) -> BenchmarkServiceError:
+    return BenchmarkServiceError(
+        f"{operation} failed with status code {response.status_code}, response: {response.text}",
+        status_code=response.status_code,
+        detail=_response_detail(response),
+    )
 
 
 def _require_ok(response: httpx.Response, operation: str) -> None:
     if response.status_code == 401:
         raise _unauthenticated_error(response)
     if response.status_code != 200:
-        raise BenchmarkServiceError(
-            f"{operation} failed with status code {response.status_code}, response: {response.text}",
-            status_code=response.status_code,
-        )
+        raise _status_error(response, operation)
 
 
 @dataclass(frozen=True)
@@ -570,10 +587,7 @@ class BenchmarkServiceClient:
         if response.status_code == 401:
             raise _unauthenticated_error(response)
         if response.status_code != 200:
-            raise BenchmarkServiceError(
-                f"Dataset listing failed with status code {response.status_code}, response: {response.text}",
-                status_code=response.status_code,
-            )
+            raise _status_error(response, "Dataset listing")
         return ListDatasetsResponse.model_validate(response.json())
 
     @_retry_http

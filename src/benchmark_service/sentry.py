@@ -6,6 +6,7 @@ from contextlib import contextmanager
 
 import sentry_sdk
 from sentry_sdk.integrations.logging import LoggingIntegration
+from sentry_sdk.types import Event, Hint
 
 from benchmark_service.observability import RUN_ID_HEADER, TASK_ID_HEADER
 
@@ -14,7 +15,7 @@ SENTRY_ENVIRONMENT_ENV = "SENTRY_ENVIRONMENT"
 SENTRY_RELEASE_ENV = "SENTRY_RELEASE"
 
 
-def _omit_remote_grading_grant(event: dict[str, object], _hint: object) -> dict[str, object]:
+def _omit_remote_grading_grant(event: Event, _hint: Hint) -> Event:
     """Keep request headers and captured frame locals from exposing a remote grant."""
     from sentry_sdk.utils import iter_event_frames
 

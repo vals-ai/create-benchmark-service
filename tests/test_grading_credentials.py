@@ -13,6 +13,7 @@ from typing import Any
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from sentry_sdk.types import Event
 
 from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL
@@ -581,7 +582,7 @@ def test_malformed_remote_handoff_never_falls_back_to_service_credentials(
 
 
 def test_sentry_preserves_remote_error_without_capturing_grant_in_frame_locals() -> None:
-    remote = {
+    remote: Event = {
         "request": {"headers": {"x-vals-remote-grading-grant": "private-grant-a"}},
         "exception": {"values": [{
             "value": "worker failed",
@@ -598,7 +599,7 @@ def test_sentry_preserves_remote_error_without_capturing_grant_in_frame_locals()
             ]},
         }]},
     }
-    ordinary = {
+    ordinary: Event = {
         "request": {"headers": {"x-vals-run-id": "run-1"}},
         "exception": {"values": [{
             "stacktrace": {"frames": [{"function": "evaluate_instance", "vars": {"task_id": "task-1"}}]},

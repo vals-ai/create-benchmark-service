@@ -27,7 +27,7 @@ from benchmark_service.grading_credentials import (
 )
 from benchmark_service.observability import ATTEMPT_ID_HEADER, EMAIL_HEADER, RUN_ID_HEADER, TASK_ID_HEADER
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
-from benchmark_service.schemas import EvaluateResponseRequest, StreamChunk, StreamMessageChunk, StreamResultChunk
+from benchmark_service.schemas import EvaluateResponseRequest, MonitoringRequirementsResponse, StreamChunk, StreamMessageChunk, StreamResultChunk
 from tests.conftest import StubBenchmark
 from tests.test_draining import serve
 from tests.test_sandbox_created import GetByIdClient
@@ -368,6 +368,33 @@ def test_requirements_are_authenticated_dataset_scoped_and_task_overridable(
             headers={"Authorization": "Bearer authorized"},
         )
         assert response.json() == {"models": ["anthropic/judge", "openai/helper"]}
+
+
+def test_monitoring_requirements_are_authenticated_dataset_scoped_and_overridable(
+    gateway: FakeGateway, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class MonitoredBenchmark(TaskScopedBenchmark):
+        async def resolve_tenant(self, headers: dict[str, str]) -> str | None:
+            return "tenant" if headers.get("authorization") == "Bearer authorized" else None
+
+        async def check_dataset_access(self, tenant: str, dataset: str | None) -> bool:
+            return dataset != "blocked"
+
+        def monitoring_requirements(self, dataset: str | None = None) -> MonitoringRequirementsResponse:
+            if dataset == "alt":
+                return MonitoringRequirementsResponse(policy="Stay in scope.", watcher_policy_pack="core+web")
+            return super().monitoring_requirements(dataset=dataset)
+
+    headers = {"Authorization": "Bearer authorized"}
+    monkeypatch.setenv("AUTH_REQUIRED", "true")
+    with TestClient(BenchmarkServiceApp(MonitoredBenchmark)) as client:
+        assert client.post("/monitoring-requirements", json={"dataset": "alt"}).status_code == 401
+        blocked = client.post("/monitoring-requirements", json={"dataset": "blocked"}, headers=headers)
+        assert blocked.status_code == 403
+        declared = client.post("/monitoring-requirements", json={"dataset": "alt"}, headers=headers)
+        assert declared.json() == {"policy": "Stay in scope.", "watcher_policy_pack": "core+web"}
+        default = client.post("/monitoring-requirements", json={"dataset": None}, headers=headers)
+        assert default.json() == {"policy": None, "watcher_policy_pack": None}
 
 
 def test_supplied_grader_token_reaches_instance_and_resume_without_service_mint(

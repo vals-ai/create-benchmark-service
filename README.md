@@ -355,7 +355,10 @@ bundle to `$VALKYRIE_STAGE_DIR/agent.json` after setup. Its required keys are `r
 continue command templates and the `command_bindings` map of validated contract kwargs
 plus the actual task ID. The standalone CBS stage owns turn rendering: it merges the current
 `problem_statement_path` and `slot_dir` (and configured `container_name`) over that
-map, then substitutes matching tokens in the original command template once per turn.
+map, then renders matching tokens in the original command template once per turn. Bound values
+are exported as `VALKYRIE_BINDING_<n>` environment variables and each token becomes a quoted
+reference to its variable, so a value is never parsed as shell code. Tokens inside single quotes
+or a quoted-delimiter here-document are inserted as literal text instead.
 The library owns a single `StageReporter` and starts each selected-agent turn in a new
 process group. `{problem_statement_path}` is that turn's observation file and `{slot_dir}`
 is `<slots_root>/<slot>/agent`. A configured `container_name` requires

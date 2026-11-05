@@ -441,6 +441,54 @@ async def test_command_maps_stream_errors(
     assert chunks == ["b'partial'"]
 
 
+class WaitErrorProcess(FakeProcess):
+    def __init__(self, error: Exception) -> None:
+        super().__init__([], 0)
+        self._error = error
+        self.wait = _aio(self._wait_error)
+
+    async def _wait_error(self) -> int:
+        raise self._error
+
+
+_RAW_TRANSPORT_ERRORS = pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (StreamTerminatedError("Connection lost"), SandboxConnectionError),
+        (ConnectionResetError("reset by peer"), SandboxConnectionError),
+        (GRPCError(Status.UNAVAILABLE, "unavailable"), SandboxConnectionError),
+        (GRPCError(Status.FAILED_PRECONDITION, "rejected"), SandboxError),
+    ],
+    ids=["stream-terminated", "socket", "grpc-unavailable", "grpc"],
+)
+
+
+@_RAW_TRANSPORT_ERRORS
+async def test_command_maps_raw_transport_errors_from_stream(error: Exception, expected: type[SandboxError]) -> None:
+    sandbox = _sandbox(FakeInnerSandbox(process=ErrorProcess(cast(Any, error))))
+    chunks: list[str] = []
+
+    with pytest.raises(expected) as raised:
+        async for chunk in sandbox.command("run"):
+            chunks.append(chunk)
+
+    assert type(raised.value) is expected
+    assert raised.value.__cause__ is error
+    assert chunks == ["b'partial'"]
+
+
+@_RAW_TRANSPORT_ERRORS
+async def test_command_maps_raw_transport_errors_from_wait(error: Exception, expected: type[SandboxError]) -> None:
+    sandbox = _sandbox(FakeInnerSandbox(process=WaitErrorProcess(error)))
+
+    with pytest.raises(expected) as raised:
+        async for _ in sandbox.command("run"):
+            pass
+
+    assert type(raised.value) is expected
+    assert raised.value.__cause__ is error
+
+
 async def test_command_uses_native_process_environment() -> None:
     secret = "value with spaces; $(touch /tmp/leaked)"
     inner = FakeInnerSandbox(process=FakeProcess(["ok"], 0))

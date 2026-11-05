@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from grpclib import GRPCError, Status
+from grpclib.exceptions import ProtocolError, StreamTerminatedError
 from modal import Sandbox as ModalSdkSandbox
 from modal.exception import ConflictError as ModalConflictError
 from modal.exception import ConnectionError as ModalConnectionError
@@ -298,6 +300,32 @@ async def test_exec_retries_modal_connection_errors(monkeypatch: pytest.MonkeyPa
     assert result.exit_code == 0
     assert result.output == "ok"
     assert inner.exec_attempts == 2
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (StreamTerminatedError("Connection lost"), SandboxConnectionError),
+        (ProtocolError("bad frame"), SandboxConnectionError),
+        (ConnectionResetError("reset by peer"), SandboxConnectionError),
+        (GRPCError(Status.FAILED_PRECONDITION, "rejected"), SandboxError),
+    ],
+    ids=["stream-terminated", "protocol", "socket", "grpc"],
+)
+async def test_exec_wraps_raw_transport_errors_from_output_stream(error: Exception, expected: type[SandboxError]) -> None:
+    sandbox = _sandbox(FakeInnerSandbox(process=ErrorProcess(cast(Any, error))))
+
+    with pytest.raises(expected) as raised:
+        await sandbox.exec("true")
+
+    assert raised.value.__cause__ is error
+
+
+async def test_upload_wraps_raw_transport_errors() -> None:
+    sandbox = _sandbox(FakeInnerSandbox(file_error=cast(Any, StreamTerminatedError("Connection lost"))))
+
+    with pytest.raises(SandboxConnectionError, match="StreamTerminatedError"):
+        await sandbox.upload_file("/tmp/result.txt", b"hello")
 
 
 async def test_file_operations_map_not_found_errors() -> None:

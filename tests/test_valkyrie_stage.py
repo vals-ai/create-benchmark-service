@@ -142,6 +142,55 @@ def test_commands_render_only_bound_tokens_once(tmp_path: Path, monkeypatch: pyt
     assert reporter.events == [("begin", None), ("end", None)] * 2
 
 
+@pytest.mark.parametrize(
+    "run_cmd",
+    [
+        "printf '%s' {task_id} > {slot_dir}/out",
+        "printf '%s' '{task_id}' > '{slot_dir}/out'",
+        'printf \'%s\' "{task_id}" > "{slot_dir}/out"',
+        "printf '%s' \"$(printf '%s' {task_id})\" > {slot_dir}/out",
+        "printf '%s' \"$(printf '%s' \"{task_id}\")\" > \"{slot_dir}/out\"",
+        "printf '%s' \"`printf '%s' {task_id}`\" > {slot_dir}/out",
+        "printf '%s' \"$(cat <<EOF\n{task_id}\nEOF\n)\" > {slot_dir}/out",
+        "cat <<-EOF | tr -d '\\n' > {slot_dir}/out\n\t{task_id}\n\tEOF",
+        "cat <<'EOF' | tr -d '\\n' > {slot_dir}/out\n{task_id}\nEOF",
+        "printf '%s' {task_id} > {slot_dir}/out # {task_id} 'unbalanced",
+    ],
+)
+def test_bound_values_stay_literal_in_every_quoting_context(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, run_cmd: str
+) -> None:
+    marker = tmp_path / "pwned"
+    value = f"a b'$(touch {marker})`touch {marker}`\"; touch {marker}; echo \\"
+    worker, _ = agents(tmp_path, monkeypatch, run_cmd=run_cmd, command_bindings={"task_id": value})
+    worker.start("one", "observation")
+    assert worker.wait_any() == valkyrie_stage.SlotResult("one", "exited", 0)
+    assert (tmp_path / "slots" / "one" / "agent" / "out").read_text() == value
+    assert not marker.exists()
+
+
+def test_newline_value_in_quoted_heredoc_is_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    marker = tmp_path / "pwned"
+    worker, reporter = agents(
+        tmp_path,
+        monkeypatch,
+        run_cmd="cat <<'EOF' > {slot_dir}/out\n{task_id}\nEOF",
+        command_bindings={"task_id": f"x\nEOF\ntouch {marker}"},
+    )
+    with pytest.raises(ValueError, match="quoted here-document"):
+        worker.start("one", "observation")
+    assert not marker.exists()
+    assert reporter.events == []
+
+
+def test_rendered_command_references_only_used_bindings() -> None:
+    command, env = valkyrie_stage.render_run_cmd(
+        "run {model} '{task_id}' \"{model}\"", {"model": "m", "task_id": "t", "unused": "u"}
+    )
+    assert command == 'run "${VALKYRIE_BINDING_0}" \'t\' "${VALKYRIE_BINDING_0}"'
+    assert env == {"VALKYRIE_BINDING_0": "m"}
+
+
 def test_container_is_bound_only_when_configured(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     worker, _ = agents(tmp_path, monkeypatch, run_cmd="printf '%s' '{container_name}' > '{slot_dir}/name'")
     worker.start("one", "observation")

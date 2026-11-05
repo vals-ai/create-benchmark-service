@@ -17,6 +17,7 @@ import sys
 import time
 import threading
 from collections import deque
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -80,6 +81,143 @@ class _RunningSlot:
     completion_reason: Literal["exited", "stopped", "exhausted"] | None = None
 
 
+_HEREDOC_DELIMITER_END = " \t\n;&|<>()"
+
+
+@dataclass
+class _Heredoc:
+    delimiter: str
+    expanding: bool
+    strip_tabs: bool
+
+
+def _read_heredoc(template: str, index: int) -> tuple[int, _Heredoc]:
+    strip_tabs = template.startswith("-", index)
+    index += strip_tabs
+    while index < len(template) and template[index] in " \t":
+        index += 1
+    delimiter: list[str] = []
+    expanding = True
+    quote: str | None = None
+    while index < len(template) and (quote is not None or template[index] not in _HEREDOC_DELIMITER_END):
+        char = template[index]
+        if quote is not None and char == quote:
+            quote = None
+        elif quote is None and char in "'\"":
+            quote, expanding = char, False
+        elif quote is None and char == "\\" and index + 1 < len(template):
+            expanding = False
+            index += 1
+            delimiter.append(template[index])
+        else:
+            delimiter.append(char)
+        index += 1
+    return index, _Heredoc("".join(delimiter), expanding, strip_tabs)
+
+
+def render_run_cmd(template: str, bindings: Mapping[str, str]) -> tuple[str, dict[str, str]]:
+    """Render ``{name}`` placeholders so bound values are never parsed as shell code.
+
+    Placeholders become references to ``VALKYRIE_BINDING_<n>`` variables, which the caller exports to the
+    command's environment: ``"${VAR}"`` in unquoted words, command substitutions, and backticks, and
+    ``${VAR}`` inside double quotes and expanding here-documents. Expansion results are not re-parsed, so the
+    values stay literal. Single-quoted and quoted-delimiter here-document text cannot expand variables, so
+    the value is inserted as text that the outer ``sh -c`` parse keeps literal. A value containing a newline
+    is rejected inside a quoted-delimiter here-document, where it could end the document early.
+    """
+    names = {name: f"VALKYRIE_BINDING_{number}" for number, name in enumerate(bindings)}
+    placeholder = re.compile("|".join(re.escape("{" + name + "}") for name in bindings)) if bindings else None
+    stack: list[list[str | int]] = [["sh", "", 0]]
+    pending: list[_Heredoc] = []
+    heredoc: _Heredoc | None = None
+    line_start = 0
+    parts: list[str] = []
+    used: set[str] = set()
+    index = 0
+    while index < len(template):
+        match = placeholder.match(template, index) if placeholder is not None else None
+        kind = stack[-1][0]
+        if match is not None:
+            name = match.group(0)[1:-1]
+            value = bindings[name]
+            if heredoc is not None and not heredoc.expanding:
+                if "\n" in value:
+                    raise ValueError(f"binding {name!r} contains a newline inside a quoted here-document")
+                parts.append(value)
+            elif heredoc is None and kind == "'":
+                parts.append(value.replace("'", "'\\''"))
+            else:
+                used.add(name)
+                reference = "${" + names[name] + "}"
+                parts.append(reference if heredoc is not None or kind == '"' else f'"{reference}"')
+            index = match.end()
+            continue
+        char = template[index]
+        if heredoc is not None:
+            if char == "\n":
+                line = template[line_start:index]
+                if (line.lstrip("\t") if heredoc.strip_tabs else line) == heredoc.delimiter:
+                    heredoc = pending.pop(0) if pending else None
+                line_start = index + 1
+            elif heredoc.expanding and char == "\\":
+                parts.append(template[index : index + 2])
+                index += 2
+                continue
+            parts.append(char)
+            index += 1
+            continue
+        if kind == "'":
+            if char == "'":
+                stack.pop()
+            parts.append(char)
+            index += 1
+            continue
+        if char == "\\":
+            parts.append(template[index : index + 2])
+            index += 2
+            continue
+        if template.startswith("$(", index):
+            stack.append(["sh", ")", 0])
+            parts.append("$(")
+            index += 2
+            continue
+        if char == "`":
+            if kind == "sh" and stack[-1][1] == "`":
+                stack.pop()
+            else:
+                stack.append(["sh", "`", 0])
+        elif kind == '"':
+            if char == '"':
+                stack.pop()
+        elif char in "'\"":
+            stack.append([char, "", 0])
+        elif char == "(":
+            stack[-1][2] = int(stack[-1][2]) + 1
+        elif char == ")":
+            if int(stack[-1][2]) > 0:
+                stack[-1][2] = int(stack[-1][2]) - 1
+            elif stack[-1][1] == ")":
+                stack.pop()
+        elif char == "#" and (index == 0 or template[index - 1] in " \t\n;&|()"):
+            end = template.find("\n", index)
+            end = len(template) if end == -1 else end
+            parts.append(template[index:end])
+            index = end
+            continue
+        elif template.startswith("<<", index) and not template.startswith("<<<", index):
+            end, document = _read_heredoc(template, index + 2)
+            pending.append(document)
+            parts.append(template[index:end])
+            index = end
+            continue
+        elif char == "\n" and pending:
+            heredoc = pending.pop(0)
+            line_start = index + 1
+        parts.append(char)
+        index += 1
+    return "".join(parts), {names[name]: bindings[name] for name in used}
+
+
 class Agents:
     """Launch selected-agent turns and report the union of running intervals."""
 
@@ -126,11 +264,7 @@ class Agents:
         bindings = {**self._command_bindings, "problem_statement_path": observation_path, "slot_dir": str(slot_dir)}
         if container is not None:
             bindings["container_name"] = container
-        command = re.sub(
-            "|".join(re.escape("{" + name + "}") for name in bindings),
-            lambda match: bindings[match.group()[1:-1]],
-            template,
-        )
+        command, binding_env = render_run_cmd(template, bindings)
         final_output = (
             Path(self._final_output_template.replace("{slot_dir}", str(slot_dir)))
             if self._final_output_template is not None
@@ -142,9 +276,8 @@ class Agents:
             if (self._stage_dir / "exhausted").exists():
                 raise Exhausted
         generation_gateway_url = os.environ.get("VALKYRIE_GENERATION_MODEL_GATEWAY_URL")
-        child_env = None
+        child_env = {**os.environ, **binding_env}
         if generation_gateway_url is not None:
-            child_env = os.environ.copy()
             child_env["MODEL_GATEWAY_URL"] = generation_gateway_url
         try:
             control_read, control_write = os.pipe()

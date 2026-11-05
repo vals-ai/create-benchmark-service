@@ -8,7 +8,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends curl git && rm 
 WORKDIR /app
 
 # Install uv for faster package management
-COPY --from=ghcr.io/astral-sh/uv:latest /uv /usr/local/bin/uv
+COPY --from=ghcr.io/astral-sh/uv:0.13.5@sha256:32a7bb39b496babbd997b0a39a4d66c126bdaf5661b302bf6f06abda8deca6ff /uv /usr/local/bin/uv
 
 # Install dependencies first so this layer caches unless pyproject changes;
 # --no-install-project skips the service itself, which needs no version yet.

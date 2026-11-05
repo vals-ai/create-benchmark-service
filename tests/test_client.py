@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import socket
+from importlib.resources import files
 from pathlib import Path
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -32,7 +33,13 @@ from benchmark_service.client import (
 )
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
-from benchmark_service.schemas import BenchmarkEgressPlan, EgressPolicy, HealthCheckResponse, RetrieveTaskResponse
+from benchmark_service.schemas import (
+    BenchmarkEgressPlan,
+    ChildEgress,
+    EgressPolicy,
+    HealthCheckResponse,
+    RetrieveTaskResponse,
+)
 from benchmark_service.v1_schemas import (
     V1DatasetTasksResponse,
     V1EvalResponse,
@@ -84,7 +91,7 @@ async def test_retrieve_task_accepts_legacy_shape(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
     client, mock_http = benchmark_client
-    mock_http.get = AsyncMock(
+    mock_http.request = AsyncMock(
         return_value=_mock_response(
             json_data={
                 "docker_image": "python:3.12",
@@ -103,7 +110,15 @@ async def test_retrieve_task_accepts_legacy_shape(
     assert result.resources.model_dump() == {"vcpu": 2, "memory": 4, "disk": 10, "gpu": 0, "gpu_type": None}
     assert result.agent_install_order == "before_setup"
     assert result.credited_generation is None
-    assert result.egress.model_dump() == {"setup_task": "*", "run": None, "evaluation": "*"}
+    assert result.egress.model_dump() == {
+        "setup_task": "*",
+        "run": None,
+        "evaluation": "*",
+        "run_through_proxy": False,
+        "sandbox_local_hosts": [],
+        "run_inspect": [],
+        "children": {},
+    }
 
 
 async def test_retrieve_task_accepts_credited_generation_opt_in(
@@ -112,7 +127,7 @@ async def test_retrieve_task_accepts_credited_generation_opt_in(
     client, mock_http = benchmark_client
     payload = _task_response().model_dump(mode="json")
     payload["credited_generation"] = {"allowance_seconds": 18000, "stage_protocol": None}
-    mock_http.get = AsyncMock(return_value=_mock_response(json_data=payload))
+    mock_http.request = AsyncMock(return_value=_mock_response(json_data=payload))
 
     result = await client.retrieve_task("task-1")
 
@@ -127,7 +142,7 @@ async def test_retrieve_task_accepts_explicit_agent_install_order(
     client, mock_http = benchmark_client
     payload = _task_response().model_dump(mode="json")
     payload["agent_install_order"] = "after_setup"
-    mock_http.get = AsyncMock(return_value=_mock_response(json_data=payload))
+    mock_http.request = AsyncMock(return_value=_mock_response(json_data=payload))
 
     result = await client.retrieve_task("task-1")
 
@@ -143,8 +158,12 @@ async def test_retrieve_task_accepts_explicit_egress_policies(
         "setup_task": [],
         "run": ["api.openai.com"],
         "evaluation": [],
+        "run_through_proxy": True,
+        "sandbox_local_hosts": ["api", "supabase-kong.local"],
+        "run_inspect": [],
+        "children": {},
     }
-    mock_http.get = AsyncMock(return_value=_mock_response(json_data=payload))
+    mock_http.request = AsyncMock(return_value=_mock_response(json_data=payload))
 
     result = await client.retrieve_task("task-1")
 
@@ -179,7 +198,41 @@ def test_benchmark_egress_plan_serializes_explicit_stage_policies(
         "setup_task": setup_task,
         "run": run,
         "evaluation": evaluation,
+        "run_through_proxy": False,
+        "sandbox_local_hosts": [],
+        "run_inspect": [],
+        "children": {},
     }
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "*",
+        ".internal",
+        "api.",
+        "10.0.0.0/8",
+        "api:8000",
+        "http://api",
+        "api,db",
+        "api db",
+        "-api",
+        "api-",
+        "",
+        "a" * 64,
+        ".".join(["a" * 63] * 4),
+    ],
+)
+def test_benchmark_egress_plan_rejects_non_hostname_local_hosts(host: str) -> None:
+    with pytest.raises(ValidationError):
+        BenchmarkEgressPlan.model_validate({"sandbox_local_hosts": [host]})
+
+
+def test_benchmark_egress_plan_lowercases_local_hosts() -> None:
+    longest_label = "a" * 63
+    plan = BenchmarkEgressPlan.model_validate({"sandbox_local_hosts": ["Supabase-Kong.local", longest_label]})
+
+    assert plan.sandbox_local_hosts == ["supabase-kong.local", longest_label]
 
 
 @pytest.mark.parametrize("policy", ["api.openai.com", None, ["api.openai.com", 1]])
@@ -206,7 +259,7 @@ async def test_retrieve_task_accepts_sandbox_recovery_policy(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
     client, mock_http = benchmark_client
-    mock_http.get = AsyncMock(
+    mock_http.request = AsyncMock(
         return_value=_mock_response(
             json_data={
                 "source": {"type": "image", "image": "python:3.12"},
@@ -553,7 +606,7 @@ async def test_retrieve_task_tolerates_legacy_enable_docker_field(
     # (providers grant nested-Docker capability unconditionally) and must be
     # ignored rather than rejected.
     client, mock_http = benchmark_client
-    mock_http.get = AsyncMock(
+    mock_http.request = AsyncMock(
         return_value=_mock_response(
             json_data={
                 "source": {"type": "image", "image": "docker:27-dind"},
@@ -574,7 +627,7 @@ async def test_retrieve_task_serializes_snapshot_source_for_legacy_clients(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
     client, mock_http = benchmark_client
-    mock_http.get = AsyncMock(
+    mock_http.request = AsyncMock(
         return_value=_mock_response(
             json_data={
                 "source": {"type": "snapshot", "snapshot": "vcb1-openhands-abc123"},
@@ -595,7 +648,7 @@ async def test_retrieve_task_serializes_targeted_snapshot_as_invalid_legacy_imag
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
     client, mock_http = benchmark_client
-    mock_http.get = AsyncMock(
+    mock_http.request = AsyncMock(
         return_value=_mock_response(
             json_data={
                 "source": {
@@ -631,7 +684,7 @@ async def test_retrieve_task_serializes_compose_source_as_invalid_legacy_image(
     - Compose source metadata is preserved.
     """
     client, mock_http = benchmark_client
-    mock_http.get = AsyncMock(
+    mock_http.request = AsyncMock(
         return_value=_mock_response(
             json_data={
                 "source": {
@@ -671,8 +724,7 @@ async def test_http_error(
 ) -> None:
     client, mock_http = benchmark_client
     mock_resp = _mock_response(status_code=500)
-    mock_http.get = AsyncMock(return_value=mock_resp)
-    mock_http.post = AsyncMock(return_value=mock_resp)
+    mock_http.request = AsyncMock(return_value=mock_resp)
 
     with pytest.raises(BenchmarkServiceError) as exc_info:
         await getattr(client, method)(*args)
@@ -698,11 +750,11 @@ async def test_verify_task_ids_params(
 ) -> None:
     client, mock_http = benchmark_client
     mock_resp = _mock_response(json_data={"task_ids": ["a"]})
-    mock_http.get = AsyncMock(return_value=mock_resp)
+    mock_http.request = AsyncMock(return_value=mock_resp)
 
     await client.verify_task_ids(task_ids, slice_str)
 
-    mock_http.get.assert_called_once_with(f"{BASE_URL}/verify-task-ids", params=expected_params)
+    mock_http.request.assert_called_once_with("GET", f"{BASE_URL}/verify-task-ids", params=expected_params)
 
 
 async def test_verify_task_ids_with_dataset(
@@ -710,12 +762,12 @@ async def test_verify_task_ids_with_dataset(
 ) -> None:
     client, mock_http = benchmark_client
     mock_resp = _mock_response(json_data={"task_ids": ["a"]})
-    mock_http.get = AsyncMock(return_value=mock_resp)
+    mock_http.request = AsyncMock(return_value=mock_resp)
 
     await client.verify_task_ids(["a"], None, dataset="mydata")
 
-    mock_http.get.assert_called_once_with(
-        f"{BASE_URL}/verify-task-ids", params={"task_ids": ["a"], "dataset": "mydata"}
+    mock_http.request.assert_called_once_with(
+        "GET", f"{BASE_URL}/verify-task-ids", params={"task_ids": ["a"], "dataset": "mydata"}
     )
 
 
@@ -731,12 +783,12 @@ async def test_retrieve_task_with_dataset(
             "resources": {"vcpu": 2, "memory": 4, "disk": 10},
         }
     )
-    mock_http.get = AsyncMock(return_value=mock_resp)
+    mock_http.request = AsyncMock(return_value=mock_resp)
 
     await client.retrieve_task("task-1", dataset="mydata")
 
-    mock_http.get.assert_called_once_with(
-        f"{BASE_URL}/retrieve-task/", params={"task_id": "task-1", "skip_validation": False, "dataset": "mydata"}
+    mock_http.request.assert_called_once_with(
+        "GET", f"{BASE_URL}/retrieve-task/", params={"task_id": "task-1", "skip_validation": False, "dataset": "mydata"}
     )
 
 
@@ -745,11 +797,12 @@ async def test_final_score_with_dataset(
 ) -> None:
     client, mock_http = benchmark_client
     mock_resp = _mock_response(json_data={"tasks_evaluated": ["t1"], "final_score": 100.0, "metadata": {}})
-    mock_http.post = AsyncMock(return_value=mock_resp)
+    mock_http.request = AsyncMock(return_value=mock_resp)
 
     await client.final_score({"t1": {"resolved": True}}, dataset="mydata")
 
-    mock_http.post.assert_called_once_with(
+    mock_http.request.assert_called_once_with(
+        "POST",
         f"{BASE_URL}/final-score/",
         json={"evaluation_results": {"t1": {"resolved": True}}, "dataset": "mydata"},
     )
@@ -768,7 +821,7 @@ async def test_resume_evaluation_with_eval_resume_state(
     mock_connect = _ws_mock(messages)
     on_eval_resume_state = MagicMock()
 
-    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=mock_connect)):
         result = await client.resume_evaluation(
             "task-1",
             eval_resume_state=state,
@@ -794,6 +847,40 @@ async def test_resume_evaluation_with_eval_resume_state(
     on_eval_resume_state.assert_called_once_with(state)
 
 
+async def test_grading_requirements_reports_gateway_models_and_old_service_404(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
+) -> None:
+    client, mock_http = benchmark_client
+    mock_http.request = AsyncMock(return_value=_mock_response(json_data={"models": ["anthropic/judge"]}))
+    assert await client.grading_requirements("task-1", dataset="alt") == ["anthropic/judge"]
+    mock_http.request.assert_awaited_once_with(
+        "POST", f"{BASE_URL}/grading-requirements", json={"task_id": "task-1", "dataset": "alt"}
+    )
+
+    mock_http.request = AsyncMock(return_value=_mock_response(status_code=404, text="Not Found"))
+    with pytest.raises(BenchmarkServiceError) as exc:
+        await client.grading_requirements("task-1")
+    assert exc.value.status_code == 404
+
+
+@pytest.mark.parametrize("with_token", [False, True])
+@pytest.mark.parametrize("resume", [False, True])
+async def test_grading_token_is_sent_only_for_project_keyed_evaluation(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock], with_token: bool, resume: bool
+) -> None:
+    client, _ = benchmark_client
+    mock_connect = _ws_mock([json.dumps({"type": "result", "data": {"score": 1.0}})])
+    token = "project-grader-token" if with_token else None
+    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=mock_connect)):
+        if resume:
+            await client.resume_evaluation("task-1", {"checkpoint": "saved"}, grading_token=token)
+        else:
+            await client.evaluate_instance("task-1", "i-1", grading_token=token)
+    sent = json.loads(mock_connect.__aenter__.return_value.send.call_args.args[0])
+    assert sent.get("grading_token") == token
+    assert ("grading_token" in sent) is with_token
+
+
 async def test_evaluate_instance_reports_each_sandbox_created_chunk(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
@@ -805,7 +892,7 @@ async def test_evaluate_instance_reports_each_sandbox_created_chunk(
     ]
     on_sandbox_created = MagicMock()
 
-    with patch("benchmark_service.client.websockets.connect", return_value=_ws_mock(messages)):
+    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=_ws_mock(messages))):
         result = await client.evaluate_instance(
             "task-1", "i-1", sandbox_provider=DAYTONA_CONFIG, on_sandbox_created=on_sandbox_created
         )
@@ -823,7 +910,7 @@ async def test_sandbox_created_chunk_is_skipped_without_a_callback(
         json.dumps({"type": "result", "data": {"score": 1.0}}),
     ]
 
-    with patch("benchmark_service.client.websockets.connect", return_value=_ws_mock(messages)):
+    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=_ws_mock(messages))):
         result = await client.evaluate_instance("task-1", "i-1", sandbox_provider=DAYTONA_CONFIG)
 
     assert result == {"score": 1.0}
@@ -836,7 +923,7 @@ async def test_evaluate_instance_asks_for_sandbox_announcements_only_with_a_call
     client, _mock_http = benchmark_client
     ws_connect = _ws_mock([json.dumps({"type": "result", "data": {"score": 1.0}})])
 
-    with patch("benchmark_service.client.websockets.connect", return_value=ws_connect):
+    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=ws_connect)):
         await client.evaluate_instance(
             "task-1", "i-1", sandbox_provider=DAYTONA_CONFIG, on_sandbox_created=MagicMock() if with_callback else None
         )
@@ -853,7 +940,7 @@ async def test_resume_evaluation_asks_for_sandbox_announcements_only_with_a_call
     client, _mock_http = benchmark_client
     ws_connect = _ws_mock([json.dumps({"type": "result", "data": {"score": 1.0}})])
 
-    with patch("benchmark_service.client.websockets.connect", return_value=ws_connect):
+    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=ws_connect)):
         await client.resume_evaluation(
             "task-1",
             {"k": "v"},
@@ -871,7 +958,7 @@ async def test_resume_evaluation_forwards_an_owned_sandbox_without_changing_stat
     client, _ = benchmark_client
     state = {"checkpoint": "immutable-artifact"}
     mock_connect = _ws_mock([json.dumps({"type": "result", "data": {"score": 1.0}})])
-    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=mock_connect)):
         result = await client.resume_evaluation(
             "task-1", state, sandbox_provider=DAYTONA_CONFIG, instance_id="owned-grader"
         )
@@ -887,7 +974,7 @@ async def test_evaluate_response_includes_optional_provider_config(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
     client, mock_http = benchmark_client
-    mock_http.post = AsyncMock(return_value=_mock_response(json_data={"score": 1.0}))
+    mock_http.request = AsyncMock(return_value=_mock_response(json_data={"score": 1.0}))
 
     result = await client.evaluate_response(
         "task-1",
@@ -897,7 +984,8 @@ async def test_evaluate_response_includes_optional_provider_config(
     )
 
     assert result == {"score": 1.0}
-    mock_http.post.assert_called_once_with(
+    mock_http.request.assert_called_once_with(
+        "POST",
         f"{BASE_URL}/evaluate-response/",
         json={
             "task_id": "task-1",
@@ -918,11 +1006,12 @@ async def test_evaluate_response_omits_unspecified_provider_config(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
     client, mock_http = benchmark_client
-    mock_http.post = AsyncMock(return_value=_mock_response(json_data={"score": 1.0}))
+    mock_http.request = AsyncMock(return_value=_mock_response(json_data={"score": 1.0}))
 
     await client.evaluate_response("task-1", "answer")
 
-    mock_http.post.assert_called_once_with(
+    mock_http.request.assert_called_once_with(
+        "POST",
         f"{BASE_URL}/evaluate-response/",
         json={"task_id": "task-1", "response": "answer"},
         timeout=10,
@@ -942,7 +1031,7 @@ async def test_websocket_request_includes_provider_config() -> None:
         mock_connect = _ws_mock(messages)
 
         client = _make_client()
-        with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+        with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=mock_connect)):
             await getattr(client, method)("task-1", "inst-1", sandbox_provider)
 
         ws = mock_connect.__aenter__.return_value
@@ -981,11 +1070,11 @@ async def test_verify_task_ids_no_dataset_omitted(
     """Verify dataset param is NOT included when None."""
     client, mock_http = benchmark_client
     mock_resp = _mock_response(json_data={"task_ids": ["a"]})
-    mock_http.get = AsyncMock(return_value=mock_resp)
+    mock_http.request = AsyncMock(return_value=mock_resp)
 
     await client.verify_task_ids(["a"], None)
 
-    mock_http.get.assert_called_once_with(f"{BASE_URL}/verify-task-ids", params={"task_ids": ["a"]})
+    mock_http.request.assert_called_once_with("GET", f"{BASE_URL}/verify-task-ids", params={"task_ids": ["a"]})
 
 
 class _AsyncIterator:
@@ -1013,14 +1102,14 @@ class _AsyncIterator:
 
 
 def _ws_mock(messages: list[str], terminal_error: Exception | None = None) -> AsyncMock:
-    """Create a mock websockets.connect context manager yielding messages."""
-    ws = _AsyncIterator(messages, terminal_error)
-    ws.send = AsyncMock()  # type: ignore[attr-defined]
-
-    mock_connect = AsyncMock()
-    mock_connect.__aenter__ = AsyncMock(return_value=ws)
-    mock_connect.__aexit__ = AsyncMock(return_value=False)
-    return mock_connect
+    """Create a connected WebSocket with an async context and message stream."""
+    connection = AsyncMock()
+    connection.__aenter__.return_value = connection
+    connection.__aexit__.return_value = False
+    connection.__aiter__.side_effect = lambda: _AsyncIterator(messages, terminal_error)
+    connection.close_code = 1000
+    connection.close_reason = ""
+    return connection
 
 
 def _make_client(url: str = BASE_URL) -> BenchmarkServiceClient:
@@ -1044,7 +1133,7 @@ async def test_ws_result_chunk(method: str, args: list[str]) -> None:
     mock_connect = _ws_mock(messages)
 
     client = _make_client()
-    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=mock_connect)):
         result = await getattr(client, method)(*args)
 
     if method == "setup_task":
@@ -1069,7 +1158,7 @@ async def test_ws_error_chunk(method: str, args: list[str]) -> None:
     mock_connect = _ws_mock(messages)
 
     client = _make_client()
-    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=mock_connect)):
         with pytest.raises(BenchmarkServiceError, match="something went wrong"):
             await getattr(client, method)(*args)
 
@@ -1096,7 +1185,7 @@ async def test_ws_message_chunks_with_callback(method: str, args: list[str]) -> 
     on_message = MagicMock()
 
     client = _make_client()
-    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=mock_connect)):
         await getattr(client, method)(*args, on_message=on_message)
 
     assert on_message.call_count == 2
@@ -1124,7 +1213,7 @@ async def test_ws_message_chunks_without_callback(method: str, args: list[str]) 
     mock_connect = _ws_mock(messages)
 
     client = _make_client()
-    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=mock_connect)):
         result = await getattr(client, method)(*args)
 
     if method == "setup_task":
@@ -1149,7 +1238,7 @@ async def test_ws_connection_closed_without_result(method: str, args: list[str])
     mock_connect = _ws_mock(messages)
 
     client = _make_client()
-    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=mock_connect)):
         with pytest.raises(BenchmarkServiceStreamClosedError) as exc_info:
             await getattr(client, method)(*args)
 
@@ -1173,7 +1262,7 @@ async def test_ws_close_reports_the_close_frame_detail(close_frame: Close | None
     mock_connect = _ws_mock([], ConnectionClosedError(close_frame, None))
     client = _make_client()
 
-    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=mock_connect)):
         with pytest.raises(BenchmarkServiceStreamClosedError) as exc_info:
             await client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG)
 
@@ -1186,7 +1275,7 @@ async def test_ws_connect_pings_on_the_server_cadence_without_a_pong_deadline() 
     mock_connect = _ws_mock([json.dumps({"type": "result", "data": {"score": 1.0}})])
     client = _make_client()
 
-    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect) as connect:
+    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=mock_connect)) as connect:
         await client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG)
 
     assert connect.call_args.kwargs["ping_interval"] == 30
@@ -1205,13 +1294,9 @@ class _SilentStream:
 
 
 def _silent_ws_mock() -> AsyncMock:
-    ws = _SilentStream()
-    ws.send = AsyncMock()  # type: ignore[attr-defined]
-
-    mock_connect = AsyncMock()
-    mock_connect.__aenter__ = AsyncMock(return_value=ws)
-    mock_connect.__aexit__ = AsyncMock(return_value=False)
-    return mock_connect
+    connection = _ws_mock([])
+    connection.__aiter__.side_effect = _SilentStream
+    return connection
 
 
 @pytest.mark.parametrize(
@@ -1232,7 +1317,7 @@ async def test_ws_idle_past_the_budget_fails_the_stream(health_status: str | Non
         health = AsyncMock(return_value=HealthCheckResponse(status=health_status))
 
     with (
-        patch("benchmark_service.client.websockets.connect", return_value=_silent_ws_mock()),
+        patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=_silent_ws_mock())),
         patch.object(client, "health_check", health),
     ):
         with pytest.raises(BenchmarkServiceStreamIdleError) as exc_info:
@@ -1253,7 +1338,7 @@ async def test_ws_idle_health_probe_is_bounded() -> None:
         raise AssertionError("unreachable")
 
     with (
-        patch("benchmark_service.client.websockets.connect", return_value=_silent_ws_mock()),
+        patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=_silent_ws_mock())),
         patch("benchmark_service.client._HEALTH_PROBE_TIMEOUT_S", 0.01),
         patch.object(client, "health_check", _hanging_health_check),
     ):
@@ -1268,7 +1353,7 @@ async def test_ws_idle_watchdog_can_be_disabled(ws_idle_timeout_s: float | None)
     """Both documented ways to disable it keep the pre-watchdog behavior of waiting indefinitely."""
     client = BenchmarkServiceClient(url=BASE_URL, headers=HEADERS, timeout=10, ws_idle_timeout_s=ws_idle_timeout_s)
 
-    with patch("benchmark_service.client.websockets.connect", return_value=_silent_ws_mock()):
+    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=_silent_ws_mock())):
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG), timeout=0.05)
 
@@ -1304,12 +1389,12 @@ async def test_ws_close_silence_is_measured_from_last_application_message() -> N
         ConnectionClosedError(close_frame, None),
     )
     client = _make_client()
-    # The client stamps time.monotonic() three times on this path: connection establishment,
+    # The client stamps time for the drain retry window, connection establishment,
     # the application message, and the close.
     fake_time = MagicMock()
-    fake_time.monotonic.side_effect = [100.0, 250.0, 251.5]
+    fake_time.monotonic.side_effect = [99.0, 100.0, 250.0, 251.5]
 
-    with patch("benchmark_service.client.websockets.connect", return_value=mock_connect):
+    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=mock_connect)):
         with patch("benchmark_service.client.time", fake_time):
             with pytest.raises(BenchmarkServiceStreamClosedError) as exc_info:
                 await client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG)
@@ -1344,14 +1429,14 @@ async def test_client_list_tasks_returns_v1_dataset_tasks_response(
             ],
         }
     )
-    mock_http.get = AsyncMock(return_value=mock_resp)
+    mock_http.request = AsyncMock(return_value=mock_resp)
 
     result = await client.list_tasks(dataset="default")
 
     assert isinstance(result, V1DatasetTasksResponse)
     assert result.dataset == "default"
     assert {t.id for t in result.tasks} == {"task-1", "task-2", "task-3"}
-    mock_http.get.assert_called_once_with(f"{BASE_URL}/v1/datasets/default/tasks")
+    mock_http.request.assert_called_once_with("GET", f"{BASE_URL}/v1/datasets/default/tasks")
 
 
 async def test_client_v1_evaluate_posts_payload_and_returns_v1_eval_response(
@@ -1368,7 +1453,7 @@ async def test_client_v1_evaluate_posts_payload_and_returns_v1_eval_response(
             "errors": [],
         }
     )
-    mock_http.post = AsyncMock(return_value=mock_resp)
+    mock_http.request = AsyncMock(return_value=mock_resp)
 
     result = await client.v1_evaluate(
         run_id="run-1",
@@ -1384,8 +1469,8 @@ async def test_client_v1_evaluate_posts_payload_and_returns_v1_eval_response(
     assert isinstance(result, V1EvalResponse)
     assert result.status == "evaluated"
     assert result.result == {"resolved": True}
-    called_url, called_kwargs = mock_http.post.call_args
-    assert called_url[0] == f"{BASE_URL}/v1/evaluate"
+    called_url, called_kwargs = mock_http.request.call_args
+    assert called_url == ("POST", f"{BASE_URL}/v1/evaluate")
     assert called_kwargs["json"]["payload"] == {
         "type": "artifact",
         "schema": "code-migration.workspace-tar.v1",
@@ -1400,7 +1485,7 @@ async def test_client_v1_upload_url_posts_artifact_identity(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
     client, mock_http = benchmark_client
-    mock_http.post = AsyncMock(
+    mock_http.request = AsyncMock(
         return_value=_mock_response(
             json_data={
                 "key": "submission-artifacts/acme/validation/run-1/task-1/submission.xlsx",
@@ -1419,7 +1504,8 @@ async def test_client_v1_upload_url_posts_artifact_identity(
 
     assert isinstance(result, V1UploadUrlResponse)
     assert result.expires_in == 900
-    mock_http.post.assert_awaited_once_with(
+    mock_http.request.assert_awaited_once_with(
+        "POST",
         f"{BASE_URL}/v1/submissions/upload-url",
         json={
             "run_id": "run-1",
@@ -1437,7 +1523,7 @@ async def test_client_v1_score_posts_results_and_returns_v1_score_response(
     mock_resp = _mock_response(
         json_data={"run_id": "run-1", "tasks_evaluated": ["task-1"], "final_score": 100.0, "metadata": {}}
     )
-    mock_http.post = AsyncMock(return_value=mock_resp)
+    mock_http.request = AsyncMock(return_value=mock_resp)
 
     result = await client.v1_score(
         run_id="run-1",
@@ -1450,8 +1536,8 @@ async def test_client_v1_score_posts_results_and_returns_v1_score_response(
 
     assert isinstance(result, V1ScoreResponse)
     assert result.final_score == 100.0
-    called_url, called_kwargs = mock_http.post.call_args
-    assert called_url[0] == f"{BASE_URL}/v1/score"
+    called_url, called_kwargs = mock_http.request.call_args
+    assert called_url == ("POST", f"{BASE_URL}/v1/score")
     assert called_kwargs["json"]["evaluation_results"]["task-2"] is None
 
 
@@ -1459,7 +1545,7 @@ async def test_client_v1_evaluate_raises_on_error_status(
     benchmark_client: tuple[BenchmarkServiceClient, AsyncMock],
 ) -> None:
     client, mock_http = benchmark_client
-    mock_http.post = AsyncMock(return_value=_mock_response(status_code=500))
+    mock_http.request = AsyncMock(return_value=_mock_response(status_code=500))
 
     with pytest.raises(BenchmarkServiceError, match="v1 evaluate failed") as exc_info:
         await client.v1_evaluate(
@@ -1513,7 +1599,7 @@ async def test_client_v1_mutations_do_not_retry_after_response_transport_failure
     kwargs: dict[str, Any],
 ) -> None:
     client, mock_http = benchmark_client
-    mock_http.post = AsyncMock(
+    mock_http.request = AsyncMock(
         side_effect=httpx.ReadTimeout(
             "response connection closed",
             request=httpx.Request("POST", f"{BASE_URL}/v1"),
@@ -1523,4 +1609,89 @@ async def test_client_v1_mutations_do_not_retry_after_response_transport_failure
     with pytest.raises(httpx.ReadTimeout):
         await getattr(client, method)(**kwargs)
 
-    mock_http.post.assert_awaited_once()
+    mock_http.request.assert_awaited_once()
+
+
+CHILD_EGRESS = ChildEgress(
+    proxy_url="https://key:token@proxy.example:3128",
+    proxy_cidrs=["192.0.2.1/32"],
+    ca_certificate="certificate",
+    gateway_url="https://gw.example",
+    gateway_token="run-token",
+)
+
+
+@pytest.mark.parametrize("child_egress", [None, {"gpu": CHILD_EGRESS}], ids=["omitted", "sent"])
+async def test_setup_task_sends_child_egress_only_when_given(
+    benchmark_client: tuple[BenchmarkServiceClient, AsyncMock], child_egress: dict[str, ChildEgress] | None
+) -> None:
+    client, _ = benchmark_client
+    ws_connect = _ws_mock([json.dumps({"type": "result", "data": {"status": "ok"}})])
+
+    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=ws_connect)):
+        await client.setup_task("task-1", "i-1", sandbox_provider=DAYTONA_CONFIG, child_egress=child_egress)
+
+    sent = json.loads((await ws_connect.__aenter__()).send.call_args.args[0])
+    assert sent.get("child_egress") == (None if child_egress is None else {"gpu": CHILD_EGRESS.model_dump()})
+
+
+async def test_evaluate_instance_sends_child_egress(benchmark_client: tuple[BenchmarkServiceClient, AsyncMock]) -> None:
+    client, _ = benchmark_client
+    ws_connect = _ws_mock([json.dumps({"type": "result", "data": {"score": 1.0}})])
+
+    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=ws_connect)):
+        await client.evaluate_instance(
+            "task-1", "i-1", sandbox_provider=DAYTONA_CONFIG, child_egress={"judge": CHILD_EGRESS}
+        )
+
+    sent = json.loads((await ws_connect.__aenter__()).send.call_args.args[0])
+    assert ChildEgress.model_validate(sent["child_egress"]["judge"]) == CHILD_EGRESS
+
+
+@pytest.mark.parametrize(
+    ("tunnel_port", "proxy_url"),
+    [(None, "https://key:token@proxy.example:3128"), (3128, "http://key:token@127.0.0.1:3128")],
+    ids=["direct", "tunnel"],
+)
+def test_child_egress_environment_points_clients_at_the_proxy_and_gateway(
+    tunnel_port: int | None, proxy_url: str
+) -> None:
+    environment = CHILD_EGRESS.environment(tunnel_port=tunnel_port)
+
+    assert environment["HTTPS_PROXY"] == environment["http_proxy"] == proxy_url
+    assert environment["NO_PROXY"] == "localhost,127.0.0.1,::1"
+    assert environment["MODEL_GATEWAY_URL"] == "https://gw.example"
+    assert environment["MODEL_GATEWAY_API_KEY"] == "run-token"
+    without_gateway = CHILD_EGRESS.model_copy(update={"gateway_token": None})
+    assert "MODEL_GATEWAY_URL" not in without_gateway.environment(tunnel_port=tunnel_port)
+
+
+def test_child_egress_tunnel_command_starts_the_packaged_tunnel() -> None:
+    command = CHILD_EGRESS.tunnel_command("/tmp/egress_tunnel.py", "/tmp/egress-ca.pem", 3128)
+
+    assert command == [
+        "python3",
+        "/tmp/egress_tunnel.py",
+        "proxy.example",
+        "3128",
+        "/tmp/egress-ca.pem",
+        "3128",
+        "/tmp/egress_tunnel.py.pid",
+    ]
+    assert b"def main()" in files("benchmark_service").joinpath("egress_tunnel.py").read_bytes()
+    with_fallbacks = CHILD_EGRESS.model_copy(update={"proxy_hosts": ["192.0.2.1", "192.0.2.2"]})
+    assert (
+        with_fallbacks.tunnel_command("/tmp/egress_tunnel.py", "/tmp/egress-ca.pem", 3128)[2] == "192.0.2.1,192.0.2.2"
+    )
+
+
+def test_child_egress_keeps_credentials_out_of_its_repr() -> None:
+    assert "token" not in repr(CHILD_EGRESS).replace("gateway_token", "")
+
+
+def test_child_profiles_need_simple_names() -> None:
+    plan = BenchmarkEgressPlan.model_validate({"children": {"gpu-1": {"egress": ["pypi.org"], "models": ["a/b"]}}})
+
+    assert plan.children["gpu-1"].models == ["a/b"]
+    with pytest.raises(ValidationError):
+        BenchmarkEgressPlan.model_validate({"children": {"GPU box": {}}})

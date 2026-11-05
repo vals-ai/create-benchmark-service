@@ -21,22 +21,27 @@ from tenacity import (
     stop_after_attempt,
     wait_random,
 )
-from websockets.exceptions import ConnectionClosed
+from websockets.asyncio.client import ClientConnection
+from websockets.exceptions import ConnectionClosed, InvalidStatus
 
+from benchmark_service.draining import is_drain_rejection
 from benchmark_service.observability import correlation_scope, request_headers, websocket_request_span
 from benchmark_service.sandbox import SandboxNotFoundError, SandboxProvider, SandboxProviderConfig
 from benchmark_service.schemas import (
     DATASET_VERSION_HEADER,
+    ChildEgress,
     DatasetVersionId,
     EvaluateInstanceRequest,
     EvaluateResponseRequest,
     FinalScoreResponse,
     HealthCheckResponse,
+    GradingRequirementsRequest,
+    GradingRequirementsResponse,
     JsonValue,
     ListDatasetsResponse,
-    RetrieveTaskResponse,
     ResolveDatasetRequest,
     ResolveDatasetResponse,
+    RetrieveTaskResponse,
     SandboxCreatedData,
     SetupTaskRequest,
     SetupTaskResponse,
@@ -89,6 +94,8 @@ _DEFAULT_WS_IDLE_TIMEOUT_S = 3600.0
 _HEALTH_PROBE_TIMEOUT_S = 5.0
 # Distinguishes "caller passed None to disable" from "caller said nothing".
 _UNSET_WS_IDLE_TIMEOUT: float = -1.0
+_DRAIN_RETRY_WINDOW_S = 60.0
+_DRAIN_RETRY_DELAY_S = 1.0
 
 
 def _default_ws_idle_timeout_s() -> float | None:
@@ -350,14 +357,33 @@ class BenchmarkServiceClient:
         )
         self._ws_idle_timeout_s = idle_timeout if idle_timeout is None or idle_timeout > 0 else None
         self._sandbox_providers = {}
-        self._http_client = httpx.AsyncClient(
+        self._http_client = self._new_http_client()
+
+    def _new_http_client(self, *, fresh_connections: bool = False) -> httpx.AsyncClient:
+        return httpx.AsyncClient(
             auth=_TelemetryAuth(),
             follow_redirects=True,
-            timeout=timeout,
+            timeout=self._timeout,
             headers=self._headers,
-            limits=httpx.Limits(max_connections=200),
+            limits=httpx.Limits(max_connections=200, max_keepalive_connections=0 if fresh_connections else 20),
             event_hooks={"response": [self._check_dataset_version]},
         )
+
+    async def _http_request(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+        response = await self._http_client.request(method, url, **kwargs)
+        if not is_drain_rejection(response.status_code, response.headers):
+            return response
+        deadline = time.monotonic() + _DRAIN_RETRY_WINDOW_S
+        # A fresh pool skips other idle sockets to the old task. The shared
+        # pool stays open because unrelated accepted requests may still use it.
+        async with self._new_http_client(fresh_connections=True) as fresh:
+            while is_drain_rejection(response.status_code, response.headers):
+                await asyncio.sleep(_DRAIN_RETRY_DELAY_S)
+                # Bound the start of retries, not the duration of accepted work.
+                if time.monotonic() >= deadline:
+                    return response
+                response = await fresh.request(method, url, **kwargs)
+        return response
 
     async def _check_dataset_version(self, response: httpx.Response) -> None:
         if self._dataset_version is None or not response.is_success:
@@ -391,6 +417,25 @@ class BenchmarkServiceClient:
     def _ws_url(self) -> str:
         return self._url.replace("http://", "ws://").replace("https://", "wss://")
 
+    async def _connect_websocket(self, path: str, headers: dict[str, str]) -> ClientConnection:
+        deadline = time.monotonic() + _DRAIN_RETRY_WINDOW_S
+        while True:
+            try:
+                return await websockets.connect(
+                    f"{self._ws_url}/ws/{path}",
+                    additional_headers=headers,
+                    open_timeout=60.0,
+                    ping_interval=_WS_PING_INTERVAL_S,
+                    ping_timeout=_WS_PING_TIMEOUT_S,
+                    max_size=10 * 1024 * 1024,
+                )
+            except InvalidStatus as exc:
+                if not is_drain_rejection(exc.response.status_code, exc.response.headers):
+                    raise
+                await asyncio.sleep(_DRAIN_RETRY_DELAY_S)
+                if time.monotonic() >= deadline:
+                    raise
+
     async def _websocket_request(
         self,
         path: str,
@@ -410,28 +455,23 @@ class BenchmarkServiceClient:
             on_sandbox_created: Optional callback invoked for each "sandbox_created" chunk.
 
         Returns:
-            The data payload from the final "result" chunk.
+            The data payload from the "result" chunk after the server closes the stream.
 
         Raises:
             BenchmarkServiceError: If an "error" chunk is received.
-            BenchmarkServiceStreamClosedError: If the established socket closes without a
-                terminal chunk. Pre-connection failures (DNS, connect, handshake) stay
-                distinguishable: they propagate unwrapped from websockets.connect.
+            BenchmarkServiceStreamClosedError: If the established socket closes
+                abnormally or closes cleanly without a result. Pre-connection failures
+                (DNS, connect, handshake) propagate unwrapped from websockets.connect.
             BenchmarkServiceStreamIdleError: If the socket stays open but produces no
                 application message within the idle budget.
         """
         operation = f"WEBSOCKET /ws/{path}"
         with websocket_request_span(operation, self._headers) as headers:
-            async with websockets.connect(
-                f"{self._ws_url}/ws/{path}",
-                additional_headers=headers,
-                open_timeout=60,
-                ping_interval=_WS_PING_INTERVAL_S,
-                ping_timeout=_WS_PING_TIMEOUT_S,
-                max_size=10 * 1024 * 1024,  # 10MB
-            ) as websocket:
+            async with await self._connect_websocket(path, headers) as websocket:
                 last_message_at = time.monotonic()
                 acknowledged = self._dataset_version is None
+                result_received = False
+                result: JsonValue = None
 
                 try:
                     await websocket.send(request.model_dump_json())
@@ -465,7 +505,9 @@ class BenchmarkServiceClient:
                             case "error":
                                 raise BenchmarkServiceError(chunk.data, status_code=chunk.status_code)
                             case "result":
-                                return chunk.data
+                                if not result_received:
+                                    result = chunk.data
+                                    result_received = True
                             case "message":
                                 if on_message:
                                     on_message(chunk.data)
@@ -485,6 +527,9 @@ class BenchmarkServiceClient:
                         idle_s=time.monotonic() - last_message_at,
                     ) from exc
 
+                if result_received:
+                    return result
+
                 # The socket closed cleanly, but a stream without a terminal chunk is still broken.
                 raise BenchmarkServiceStreamClosedError(
                     close_code=websocket.close_code,
@@ -503,7 +548,7 @@ class BenchmarkServiceClient:
     @_retry_http
     async def health_check(self) -> HealthCheckResponse:
         """Check if the benchmark service is healthy."""
-        response = await self._http_client.get(f"{self._url}/health")
+        response = await self._http_request("GET", f"{self._url}/health")
 
         _require_ok(response, "Health check")
 
@@ -513,9 +558,9 @@ class BenchmarkServiceClient:
     async def version(self, dataset: str | None = None) -> VersionResponse:
         """Fetch framework and benchmark service version metadata."""
         response = (
-            await self._http_client.get(f"{self._url}/version", params={"dataset": dataset})
+            await self._http_request("GET", f"{self._url}/version", params={"dataset": dataset})
             if dataset is not None
-            else await self._http_client.get(f"{self._url}/version")
+            else await self._http_request("GET", f"{self._url}/version")
         )
 
         _require_ok(response, "Version check")
@@ -525,7 +570,7 @@ class BenchmarkServiceClient:
     @_retry_http
     async def list_datasets(self) -> ListDatasetsResponse:
         """List dataset names visible to this caller, independently of a version pin."""
-        response = await self._http_client.get(f"{self._url}/v1/datasets")
+        response = await self._http_request("GET", f"{self._url}/v1/datasets")
         if response.status_code == 401:
             raise _unauthenticated_error(response)
         if response.status_code != 200:
@@ -541,7 +586,7 @@ class BenchmarkServiceClient:
         if self._dataset_version is not None:
             raise ValueError("Resolve a dataset with an unpinned client")
         body = ResolveDatasetRequest(dataset=dataset, version=version)
-        response = await self._http_client.post(f"{self._url}/resolve-dataset", json=body.model_dump())
+        response = await self._http_request("POST", f"{self._url}/resolve-dataset", json=body.model_dump())
         _require_ok(response, "Dataset resolution")
         resolved = ResolveDatasetResponse.model_validate(response.json())
         if resolved.dataset != dataset:
@@ -566,11 +611,21 @@ class BenchmarkServiceClient:
         if dataset is not None:
             params["dataset"] = dataset
 
-        response = await self._http_client.get(f"{self._url}/verify-task-ids", params=params)
+        response = await self._http_request("GET", f"{self._url}/verify-task-ids", params=params)
 
         _require_ok(response, "Verify task ids")
 
         return VerifyTaskIdsResponse.model_validate(response.json())
+
+    @_retry_http
+    async def grading_requirements(self, task_id: str, dataset: str | None = None) -> list[str]:
+        """Retrieve the Gateway model keys required to grade this task."""
+        body = GradingRequirementsRequest(task_id=task_id, dataset=dataset)
+        response = await self._http_request(
+            "POST", f"{self._url}/grading-requirements", json=body.model_dump()
+        )
+        _require_ok(response, "Grading requirements")
+        return GradingRequirementsResponse.model_validate(response.json()).models
 
     @_retry_http
     async def retrieve_task(
@@ -585,7 +640,7 @@ class BenchmarkServiceClient:
         params: dict[str, Any] = {"task_id": task_id, "skip_validation": skip_validation}
         if dataset is not None:
             params["dataset"] = dataset
-        response = await self._http_client.get(f"{self._url}/retrieve-task/", params=params)
+        response = await self._http_request("GET", f"{self._url}/retrieve-task/", params=params)
 
         _require_ok(response, "Retrieve task")
 
@@ -679,6 +734,7 @@ class BenchmarkServiceClient:
         sandbox_provider: SandboxProviderConfig | None = None,
         on_message: Callable[[str], None] | None = None,
         dataset: str | None = None,
+        child_egress: dict[str, ChildEgress] | None = None,
     ) -> SetupTaskResponse:
         """Set up a task instance via WebSocket.
 
@@ -693,6 +749,7 @@ class BenchmarkServiceClient:
             instance_id=instance_id,
             sandbox_provider=sandbox_provider,
             dataset=dataset,
+            child_egress=child_egress or {},
         )
         result = await self._websocket_request("setup-task", request, on_message)
         return SetupTaskResponse.model_validate(result)
@@ -704,6 +761,7 @@ class BenchmarkServiceClient:
         response: str,
         dataset: str | None = None,
         sandbox_provider: SandboxProviderConfig | None = None,
+        child_egress: dict[str, ChildEgress] | None = None,
     ) -> Any:
         """Evaluate a text response without a live sandbox.
 
@@ -718,10 +776,12 @@ class BenchmarkServiceClient:
             response=response,
             sandbox_provider=sandbox_provider,
             dataset=dataset,
+            child_egress=child_egress or {},
         )
         body = request.model_dump(exclude_none=True)
 
-        resp = await self._http_client.post(
+        resp = await self._http_request(
+            "POST",
             f"{self._url}/evaluate-response/",
             json=body,
             timeout=self._timeout,
@@ -741,6 +801,8 @@ class BenchmarkServiceClient:
         sandbox_provider: SandboxProviderConfig | None = None,
         instance_id: str | None = None,
         on_sandbox_created: Callable[[SandboxCreatedData], None] | None = None,
+        child_egress: dict[str, ChildEgress] | None = None,
+        grading_token: str | None = None,
     ) -> JsonValue:
         """Resume evaluation from state previously streamed by the benchmark service.
 
@@ -755,7 +817,9 @@ class BenchmarkServiceClient:
             sandbox_provider=sandbox_provider,
             instance_id=instance_id,
             dataset=dataset,
+            grading_token=grading_token,
             announce_sandboxes=on_sandbox_created is not None,
+            child_egress=child_egress or {},
         )
         return await self._websocket_request(
             "evaluate-response", request, on_message, on_eval_resume_state, on_sandbox_created
@@ -770,6 +834,8 @@ class BenchmarkServiceClient:
         dataset: str | None = None,
         on_eval_resume_state: Callable[[dict[str, Any]], None | Awaitable[None]] | None = None,
         on_sandbox_created: Callable[[SandboxCreatedData], None] | None = None,
+        child_egress: dict[str, ChildEgress] | None = None,
+        grading_token: str | None = None,
     ) -> JsonValue:
         """Evaluate a task instance via WebSocket.
 
@@ -788,6 +854,8 @@ class BenchmarkServiceClient:
             sandbox_provider=sandbox_provider,
             dataset=dataset,
             announce_sandboxes=on_sandbox_created is not None,
+            grading_token=grading_token,
+            child_egress=child_egress or {},
         )
         return await self._websocket_request(
             "evaluate-instance", request, on_message, on_eval_resume_state, on_sandbox_created
@@ -804,7 +872,8 @@ class BenchmarkServiceClient:
         if dataset is not None:
             body["dataset"] = dataset
 
-        response = await self._http_client.post(
+        response = await self._http_request(
+            "POST",
             f"{self._url}/final-score/",
             json=body,
         )
@@ -822,7 +891,7 @@ class BenchmarkServiceClient:
         unknown datasets, and 501 when the benchmark has not implemented task
         listing.
         """
-        response = await self._http_client.get(f"{self._url}/v1/datasets/{dataset}/tasks")
+        response = await self._http_request("GET", f"{self._url}/v1/datasets/{dataset}/tasks")
 
         _require_ok(response, "List tasks")
 
@@ -843,7 +912,8 @@ class BenchmarkServiceClient:
             filename=filename,
         )
         with correlation_scope(run_id=run_id, task_id=task_id):
-            response = await self._http_client.post(
+            response = await self._http_request(
+                "POST",
                 f"{self._url}/v1/submissions/upload-url",
                 json=request.model_dump(mode="json", exclude_none=True),
             )
@@ -879,7 +949,8 @@ class BenchmarkServiceClient:
             versions=versions or V1Versions(),
         )
         with correlation_scope(run_id=run_id, task_id=task_id, attempt_id=attempt_id):
-            response = await self._http_client.post(
+            response = await self._http_request(
+                "POST",
                 f"{self._url}/v1/evaluate",
                 json=request.model_dump(mode="json", by_alias=True, exclude_none=True),
             )
@@ -897,7 +968,8 @@ class BenchmarkServiceClient:
         """Score via the lab-facing /v1/score surface without retrying a submitted request."""
         request = V1ScoreRequest(run_id=run_id, dataset=dataset, evaluation_results=evaluation_results)
         with correlation_scope(run_id=run_id):
-            response = await self._http_client.post(
+            response = await self._http_request(
+                "POST",
                 f"{self._url}/v1/score",
                 json=request.model_dump(mode="json", exclude_none=True),
             )

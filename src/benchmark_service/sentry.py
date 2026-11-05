@@ -3,6 +3,7 @@
 import os
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager
+from typing import cast
 
 import sentry_sdk
 from sentry_sdk.integrations.logging import LoggingIntegration
@@ -27,6 +28,7 @@ def _omit_remote_grading_grant(event: Event, _hint: Hint) -> Event:
     headers = request.get("headers")
     if not isinstance(headers, dict):
         return event
+    headers = cast(dict[str, str], headers)
     grant_headers = [name for name in headers if name.lower() == REMOTE_GRADING_GRANT_HEADER.lower()]
     if not grant_headers:
         return event

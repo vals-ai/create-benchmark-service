@@ -659,6 +659,20 @@ async def test_stream_download_yields_chunks() -> None:
     assert chunks == [b"hello", b" world"]
 
 
+@_RAW_TRANSPORT_ERRORS
+async def test_stream_download_maps_raw_transport_errors(error: Exception, expected: type[SandboxError]) -> None:
+    sandbox = _sandbox(FakeInnerSandbox(process=ErrorProcess(cast(Any, error))))
+    chunks: list[bytes] = []
+
+    with pytest.raises(expected) as raised:
+        async for chunk in sandbox.stream_download("/tmp/out.bin"):
+            chunks.append(chunk)
+
+    assert type(raised.value) is expected
+    assert raised.value.__cause__ is error
+    assert chunks == [b"partial"]
+
+
 class ConnectionLostThenApplyPolicySandbox(FakeInnerSandbox):
     def __init__(self) -> None:
         super().__init__()

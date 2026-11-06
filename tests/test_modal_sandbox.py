@@ -3,8 +3,11 @@ from __future__ import annotations
 # pyright: reportPrivateUsage=false
 
 import asyncio
+import shlex
+import subprocess
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -265,11 +268,38 @@ def test_modal_config_reads_secrets_manager_shape() -> None:
 
 def test_command_merges_stderr_and_applies_timeout_inside_cwd() -> None:
     command = modal_module._command("echo hi", "/workspace", 60)
-    assert command == "{ cd /workspace && timeout 60 echo hi ; } 2>&1"
+    assert command == "{ cd /workspace && timeout 60 /bin/sh -c 'echo hi' ; } 2>&1"
 
 
 def test_command_preserves_fractional_timeout() -> None:
     assert "timeout 1.5 " in modal_module._command("true", None, 1.5)
+
+
+@pytest.mark.parametrize("timeout", [None, 0.2])
+def test_command_starts_background_process_without_timing_out_its_lifetime(tmp_path: Path, timeout: float | None) -> None:
+    marker = tmp_path / "daemon-ready"
+    background = f"/bin/sh -c {shlex.quote(f'sleep 0.4; touch {shlex.quote(str(marker))}')} &"
+    result = subprocess.run(["/bin/sh", "-c", modal_module._command(background, None, timeout)], capture_output=True)
+    assert result.returncode == 0, result.stderr
+    assert marker.exists()
+
+
+def test_command_timeout_covers_the_full_shell_program(tmp_path: Path) -> None:
+    marker = tmp_path / "must-not-run"
+    program = f"printf started; sleep 1; touch {shlex.quote(str(marker))}"
+    result = subprocess.run(["/bin/sh", "-c", modal_module._command(program, None, 0.2)], capture_output=True)
+    assert result.returncode == 124
+    assert result.stdout == b"started"
+    assert not marker.exists()
+
+
+def test_command_keeps_environment_assignments_and_standard_input() -> None:
+    program = "VALUE='hello world' /bin/sh -c 'printf \"%s\\n\" \"$VALUE\"; cat'"
+    result = subprocess.run(
+        ["/bin/sh", "-c", modal_module._command(program, None, 10)], input=b"input", capture_output=True
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == b"hello world\ninput"
 
 
 async def test_exec_returns_combined_output() -> None:
@@ -280,7 +310,7 @@ async def test_exec_returns_combined_output() -> None:
 
     assert result.exit_code == 3
     assert result.stdout == "outerr"
-    assert inner.commands == [("/bin/sh", "-lc", "{ timeout 10 boom ; } 2>&1")]
+    assert inner.commands == [("/bin/sh", "-lc", "{ timeout 10 /bin/sh -c boom ; } 2>&1")]
 
 
 async def test_exec_wraps_modal_errors() -> None:

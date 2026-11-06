@@ -28,6 +28,7 @@ from benchmark_service.draining import is_drain_rejection
 from benchmark_service.observability import correlation_scope, request_headers, websocket_request_span
 from benchmark_service.sandbox import SandboxNotFoundError, SandboxProvider, SandboxProviderConfig
 from benchmark_service.schemas import (
+    BENCHMARK_TOOLS_HEADER,
     DATASET_VERSION_HEADER,
     ChildEgress,
     DatasetVersionId,
@@ -47,6 +48,7 @@ from benchmark_service.schemas import (
     SetupTaskResponse,
     StreamChunk,
     StreamDatasetVersionChunk,
+    ToolContext,
     VerifyTaskIdsResponse,
     VersionResponse,
 )
@@ -70,6 +72,7 @@ _stream_chunk_adapter: TypeAdapter[StreamChunk | StreamDatasetVersionChunk] = Ty
     StreamChunk | StreamDatasetVersionChunk
 )
 _dataset_version_id: TypeAdapter[str] = TypeAdapter(DatasetVersionId)
+_tool_context_adapter: TypeAdapter[ToolContext] = TypeAdapter(ToolContext)
 _RecoveryResult = TypeVar("_RecoveryResult")
 
 _OUTAGE_ID_ENV = "VALKYRIE_SANDBOX_OUTAGE_ID"
@@ -658,7 +661,13 @@ class BenchmarkServiceClient:
 
         _require_ok(response, "Retrieve task")
 
-        return RetrieveTaskResponse.model_validate(response.json())
+        task = RetrieveTaskResponse.model_validate(response.json())
+        raw_context = httpx.Headers(self._headers).get(BENCHMARK_TOOLS_HEADER)
+        if raw_context is not None:
+            requested = _tool_context_adapter.validate_json(raw_context)
+            if requested.mode == "mcp" and task.tool_context != requested:
+                raise BenchmarkServiceError("Benchmark service did not honor the requested tool context")
+        return task
 
     async def run_with_sandbox_recovery(
         self,

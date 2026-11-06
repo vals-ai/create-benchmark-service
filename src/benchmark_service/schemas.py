@@ -457,8 +457,9 @@ class GradingRequirementsResponse(BaseModel):
 
 
 class MonitoringRequirementsRequest(BaseModel):
-    """Identify the dataset a monitored run will use."""
+    """Identify the tasks a monitored run will use."""
 
+    task_ids: list[str]
     dataset: str | None = None
 
 
@@ -467,6 +468,8 @@ class MonitoringRequirementsResponse(BaseModel):
 
     policy: str | None = None
     watcher_policy_pack: str | None = None
+    allowed_cidrs: list[str] = []
+    allowed_hosts: list[str] = []
 
 
 class EvaluateInstanceRequest(BaseModel):

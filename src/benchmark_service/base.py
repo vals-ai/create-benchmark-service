@@ -240,10 +240,12 @@ class BenchmarkService(ABC):
         """
         return [model.strip() for model in os.environ.get("GRADING_MODELS", "").split(",") if model.strip()]
 
-    def monitoring_requirements(self, dataset: str | None = None) -> MonitoringRequirementsResponse:
-        """Rules an external run monitor applies to this benchmark's runs.
+    def monitoring_requirements(
+        self, task_ids: list[str], dataset: str | None = None
+    ) -> MonitoringRequirementsResponse:
+        """Rules an external run monitor applies to a run of these tasks.
 
-        Override to give the monitor run-specific policy text and a Watcher policy pack.
+        Override to give the monitor policy text, a Watcher pack, and the run's network scope.
         """
         return MonitoringRequirementsResponse()
 

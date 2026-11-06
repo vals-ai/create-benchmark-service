@@ -363,7 +363,7 @@ class BenchmarkServiceApp(FastAPI):
         self, request: Request, body: MonitoringRequirementsRequest
     ) -> MonitoringRequirementsResponse:
         async with self._dataset_scope(request, request.state.tenant, body.dataset):
-            return self.service.monitoring_requirements(dataset=body.dataset)
+            return self.service.monitoring_requirements(body.task_ids, dataset=body.dataset)
 
     async def _authorize_websocket(self, websocket: WebSocket) -> str | None:
         """Authenticate a WebSocket caller. Returns tenant id, or None after closing 1008."""

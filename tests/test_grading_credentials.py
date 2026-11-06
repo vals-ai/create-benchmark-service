@@ -380,21 +380,29 @@ def test_monitoring_requirements_are_authenticated_dataset_scoped_and_overridabl
         async def check_dataset_access(self, tenant: str, dataset: str | None) -> bool:
             return dataset != "blocked"
 
-        def monitoring_requirements(self, dataset: str | None = None) -> MonitoringRequirementsResponse:
+        def monitoring_requirements(
+            self, task_ids: list[str], dataset: str | None = None
+        ) -> MonitoringRequirementsResponse:
             if dataset == "alt":
-                return MonitoringRequirementsResponse(policy="Stay in scope.", watcher_policy_pack="core+web")
-            return super().monitoring_requirements(dataset=dataset)
+                return MonitoringRequirementsResponse(policy="Stay in scope.", allowed_hosts=task_ids)
+            return super().monitoring_requirements(task_ids, dataset=dataset)
 
     headers = {"Authorization": "Bearer authorized"}
     monkeypatch.setenv("AUTH_REQUIRED", "true")
     with TestClient(BenchmarkServiceApp(MonitoredBenchmark)) as client:
-        assert client.post("/monitoring-requirements", json={"dataset": "alt"}).status_code == 401
-        blocked = client.post("/monitoring-requirements", json={"dataset": "blocked"}, headers=headers)
+        assert client.post("/monitoring-requirements", json={"task_ids": ["t"], "dataset": "alt"}).status_code == 401
+        blocked = client.post("/monitoring-requirements", json={"task_ids": ["t"], "dataset": "blocked"}, headers=headers)
         assert blocked.status_code == 403
-        declared = client.post("/monitoring-requirements", json={"dataset": "alt"}, headers=headers)
-        assert declared.json() == {"policy": "Stay in scope.", "watcher_policy_pack": "core+web"}
-        default = client.post("/monitoring-requirements", json={"dataset": None}, headers=headers)
-        assert default.json() == {"policy": None, "watcher_policy_pack": None}
+        declared = client.post("/monitoring-requirements", json={"task_ids": ["t"], "dataset": "alt"}, headers=headers)
+        assert declared.json()["policy"] == "Stay in scope."
+        assert declared.json()["allowed_hosts"] == ["t"]
+        default = client.post("/monitoring-requirements", json={"task_ids": ["t"]}, headers=headers)
+        assert default.json() == {
+            "policy": None,
+            "watcher_policy_pack": None,
+            "allowed_cidrs": [],
+            "allowed_hosts": [],
+        }
 
 
 def test_supplied_grader_token_reaches_instance_and_resume_without_service_mint(

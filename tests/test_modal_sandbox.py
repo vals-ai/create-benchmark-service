@@ -9,6 +9,8 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from grpclib import GRPCError, Status
+from grpclib.exceptions import ProtocolError, StreamTerminatedError
 from modal import Sandbox as ModalSdkSandbox
 from modal.exception import ConflictError as ModalConflictError
 from modal.exception import ConnectionError as ModalConnectionError
@@ -300,6 +302,61 @@ async def test_exec_retries_modal_connection_errors(monkeypatch: pytest.MonkeyPa
     assert inner.exec_attempts == 2
 
 
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (StreamTerminatedError("Connection lost"), SandboxConnectionError),
+        (ProtocolError("bad frame"), SandboxConnectionError),
+        (ConnectionResetError("reset by peer"), SandboxConnectionError),
+        (GRPCError(Status.UNAVAILABLE, "unavailable"), SandboxConnectionError),
+        (GRPCError(Status.FAILED_PRECONDITION, "rejected"), SandboxError),
+    ],
+    ids=["stream-terminated", "protocol", "socket", "grpc-unavailable", "grpc"],
+)
+async def test_exec_wraps_raw_transport_errors_from_output_stream(
+    error: Exception, expected: type[SandboxError]
+) -> None:
+    sandbox = _sandbox(FakeInnerSandbox(process=ErrorProcess(cast(Any, error))))
+
+    with pytest.raises(expected) as raised:
+        await sandbox.exec("true")
+
+    assert raised.value.__cause__ is error
+
+
+@pytest.mark.parametrize(
+    "error",
+    [StreamTerminatedError("Connection lost"), GRPCError(Status.DEADLINE_EXCEEDED, "deadline")],
+    ids=["stream-terminated", "grpc-deadline"],
+)
+async def test_exec_start_transport_error_is_not_retried(monkeypatch: pytest.MonkeyPatch, error: Exception) -> None:
+    monkeypatch.setattr(cast(Any, modal_module.ModalSandbox._start_process).retry, "sleep", _noop)
+    inner = FakeInnerSandbox(exec_error=cast(Any, error))
+    attempts = 0
+    raise_error = inner.exec.aio
+
+    async def counted_exec(*args: Any, **kwargs: Any) -> Any:
+        nonlocal attempts
+        attempts += 1
+        return await raise_error(*args, **kwargs)
+
+    inner.exec = _aio(counted_exec)
+    sandbox = _sandbox(inner)
+
+    with pytest.raises(SandboxError) as raised:
+        await sandbox.exec("true")
+
+    assert type(raised.value) is SandboxError
+    assert attempts == 1
+
+
+async def test_upload_wraps_raw_transport_errors() -> None:
+    sandbox = _sandbox(FakeInnerSandbox(file_error=cast(Any, StreamTerminatedError("Connection lost"))))
+
+    with pytest.raises(SandboxConnectionError, match="StreamTerminatedError"):
+        await sandbox.upload_file("/tmp/result.txt", b"hello")
+
+
 async def test_file_operations_map_not_found_errors() -> None:
     sandbox = _sandbox(FakeInnerSandbox(file_error=ModalNotFoundError("sandbox removed")))
 
@@ -382,6 +439,54 @@ async def test_command_maps_stream_errors(
             chunks.append(chunk)
 
     assert chunks == ["b'partial'"]
+
+
+class WaitErrorProcess(FakeProcess):
+    def __init__(self, error: Exception) -> None:
+        super().__init__([], 0)
+        self._error = error
+        self.wait = _aio(self._wait_error)
+
+    async def _wait_error(self) -> int:
+        raise self._error
+
+
+_RAW_TRANSPORT_ERRORS = pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (StreamTerminatedError("Connection lost"), SandboxConnectionError),
+        (ConnectionResetError("reset by peer"), SandboxConnectionError),
+        (GRPCError(Status.UNAVAILABLE, "unavailable"), SandboxConnectionError),
+        (GRPCError(Status.FAILED_PRECONDITION, "rejected"), SandboxError),
+    ],
+    ids=["stream-terminated", "socket", "grpc-unavailable", "grpc"],
+)
+
+
+@_RAW_TRANSPORT_ERRORS
+async def test_command_maps_raw_transport_errors_from_stream(error: Exception, expected: type[SandboxError]) -> None:
+    sandbox = _sandbox(FakeInnerSandbox(process=ErrorProcess(cast(Any, error))))
+    chunks: list[str] = []
+
+    with pytest.raises(expected) as raised:
+        async for chunk in sandbox.command("run"):
+            chunks.append(chunk)
+
+    assert type(raised.value) is expected
+    assert raised.value.__cause__ is error
+    assert chunks == ["b'partial'"]
+
+
+@_RAW_TRANSPORT_ERRORS
+async def test_command_maps_raw_transport_errors_from_wait(error: Exception, expected: type[SandboxError]) -> None:
+    sandbox = _sandbox(FakeInnerSandbox(process=WaitErrorProcess(error)))
+
+    with pytest.raises(expected) as raised:
+        async for _ in sandbox.command("run"):
+            pass
+
+    assert type(raised.value) is expected
+    assert raised.value.__cause__ is error
 
 
 async def test_command_uses_native_process_environment() -> None:
@@ -552,6 +657,20 @@ async def test_stream_download_yields_chunks() -> None:
     chunks = [chunk async for chunk in sandbox.stream_download("/tmp/out.bin")]
 
     assert chunks == [b"hello", b" world"]
+
+
+@_RAW_TRANSPORT_ERRORS
+async def test_stream_download_maps_raw_transport_errors(error: Exception, expected: type[SandboxError]) -> None:
+    sandbox = _sandbox(FakeInnerSandbox(process=ErrorProcess(cast(Any, error))))
+    chunks: list[bytes] = []
+
+    with pytest.raises(expected) as raised:
+        async for chunk in sandbox.stream_download("/tmp/out.bin"):
+            chunks.append(chunk)
+
+    assert type(raised.value) is expected
+    assert raised.value.__cause__ is error
+    assert chunks == [b"partial"]
 
 
 class ConnectionLostThenApplyPolicySandbox(FakeInnerSandbox):

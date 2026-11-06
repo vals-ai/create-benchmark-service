@@ -9,7 +9,7 @@ import os
 import time
 from collections.abc import Awaitable, Callable, Generator
 from dataclasses import dataclass, field
-from typing import Any, TypeVar
+from typing import Any, TypeVar, cast
 from uuid import uuid4
 
 import httpx
@@ -38,6 +38,8 @@ from benchmark_service.schemas import (
     HealthCheckResponse,
     GradingRequirementsRequest,
     GradingRequirementsResponse,
+    MonitoringRequirementsRequest,
+    MonitoringRequirementsResponse,
     JsonValue,
     ListDatasetsResponse,
     ResolveDatasetRequest,
@@ -132,13 +134,19 @@ _retry_http = retry(
 
 
 class BenchmarkServiceError(Exception):
-    """Exception raised for benchmark service communication errors."""
+    """Exception raised for benchmark service communication errors.
+
+    ``detail`` is the ``detail`` field of the service's JSON error body, or ``None`` when the
+    response had no JSON ``detail``.
+    """
 
     status_code: int | None
+    detail: object | None
 
-    def __init__(self, message: str, *, status_code: int | None = None) -> None:
+    def __init__(self, message: str, *, status_code: int | None = None, detail: object | None = None) -> None:
         super().__init__(message)
         self.status_code = status_code
+        self.detail = detail
 
 
 class BenchmarkServiceUnauthenticatedError(BenchmarkServiceError):
@@ -192,25 +200,36 @@ class BenchmarkServiceStreamClosedError(BenchmarkServiceStreamError):
         self.idle_s = idle_s
 
 
-def _unauthenticated_error(response: httpx.Response) -> "BenchmarkServiceUnauthenticatedError":
-    """Parse the value from the httpx response"""
-
+def _response_detail(response: httpx.Response) -> object | None:
     try:
-        detail = response.json().get("detail", response.text)
-    except Exception:
-        detail = response.text
+        body: object = response.json()
+    except ValueError:
+        return None
+    return cast(dict[str, object], body).get("detail") if isinstance(body, dict) else None
 
-    return BenchmarkServiceUnauthenticatedError(detail, status_code=response.status_code)
+
+def _unauthenticated_error(response: httpx.Response) -> "BenchmarkServiceUnauthenticatedError":
+    detail = _response_detail(response)
+    return BenchmarkServiceUnauthenticatedError(
+        detail if isinstance(detail, str) else response.text,
+        status_code=response.status_code,
+        detail=detail,
+    )
+
+
+def _status_error(response: httpx.Response, operation: str) -> BenchmarkServiceError:
+    return BenchmarkServiceError(
+        f"{operation} failed with status code {response.status_code}, response: {response.text}",
+        status_code=response.status_code,
+        detail=_response_detail(response),
+    )
 
 
 def _require_ok(response: httpx.Response, operation: str) -> None:
     if response.status_code == 401:
         raise _unauthenticated_error(response)
     if response.status_code != 200:
-        raise BenchmarkServiceError(
-            f"{operation} failed with status code {response.status_code}, response: {response.text}",
-            status_code=response.status_code,
-        )
+        raise _status_error(response, operation)
 
 
 @dataclass(frozen=True)
@@ -442,7 +461,7 @@ class BenchmarkServiceClient:
         path: str,
         request: BaseModel,
         on_message: Callable[[str], None] | None = None,
-        on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
+        on_eval_resume_state: Callable[[dict[str, Any]], None | Awaitable[None]] | None = None,
         on_sandbox_created: Callable[[SandboxCreatedData], None] | None = None,
         remote_grading_authorization: RemoteGradingAuthorization | None = None,
     ) -> JsonValue:
@@ -452,6 +471,8 @@ class BenchmarkServiceClient:
             path: WebSocket endpoint path (appended to /ws/).
             request: Pydantic model to serialize and send as the initial message.
             on_message: Optional callback invoked for each intermediate "message" chunk.
+            on_eval_resume_state: Checkpoint callback; awaitable results complete before
+                the next stream chunk is received.
             on_sandbox_created: Optional callback invoked for each "sandbox_created" chunk.
 
         Returns:
@@ -516,7 +537,9 @@ class BenchmarkServiceClient:
                                     on_message(chunk.data)
                             case "eval_resume_state":
                                 if on_eval_resume_state:
-                                    on_eval_resume_state(chunk.data)
+                                    callback_result = on_eval_resume_state(chunk.data)
+                                    if inspect.isawaitable(callback_result):
+                                        await callback_result
                             case "sandbox_created":
                                 if on_sandbox_created:
                                     on_sandbox_created(chunk.data)
@@ -575,10 +598,7 @@ class BenchmarkServiceClient:
         if response.status_code == 401:
             raise _unauthenticated_error(response)
         if response.status_code != 200:
-            raise BenchmarkServiceError(
-                f"Dataset listing failed with status code {response.status_code}, response: {response.text}",
-                status_code=response.status_code,
-            )
+            raise _status_error(response, "Dataset listing")
         return ListDatasetsResponse.model_validate(response.json())
 
     @_retry_http
@@ -633,6 +653,16 @@ class BenchmarkServiceClient:
     async def grading_requirements(self, task_id: str, dataset: str | None = None) -> list[str]:
         """Retrieve the Gateway model keys required to grade this task."""
         return (await self.grading_requirements_response(task_id, dataset=dataset)).models
+
+    @_retry_http
+    async def monitoring_requirements(
+        self, task_ids: list[str], dataset: str | None = None
+    ) -> MonitoringRequirementsResponse:
+        """Retrieve the rules an external run monitor applies to a run of these tasks."""
+        body = MonitoringRequirementsRequest(task_ids=task_ids, dataset=dataset)
+        response = await self._http_request("POST", f"{self._url}/monitoring-requirements", json=body.model_dump())
+        _require_ok(response, "Monitoring requirements")
+        return MonitoringRequirementsResponse.model_validate(response.json())
 
     @_retry_http
     async def retrieve_task(
@@ -807,7 +837,7 @@ class BenchmarkServiceClient:
         eval_resume_state: dict[str, Any],
         on_message: Callable[[str], None] | None = None,
         dataset: str | None = None,
-        on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
+        on_eval_resume_state: Callable[[dict[str, Any]], None | Awaitable[None]] | None = None,
         sandbox_provider: SandboxProviderConfig | None = None,
         instance_id: str | None = None,
         on_sandbox_created: Callable[[SandboxCreatedData], None] | None = None,
@@ -819,7 +849,8 @@ class BenchmarkServiceClient:
 
         ``sandbox_provider`` and ``instance_id`` are request-only. The caller
         owns admission and cleanup of a supplied sandbox; ``eval_resume_state``
-        remains independently persistable.
+        remains independently persistable. Awaitable checkpoint callbacks complete
+        before the next stream chunk is received.
         """
         request = EvaluateResponseRequest(
             task_id=task_id,
@@ -843,7 +874,7 @@ class BenchmarkServiceClient:
         sandbox_provider: SandboxProviderConfig | None = None,
         on_message: Callable[[str], None] | None = None,
         dataset: str | None = None,
-        on_eval_resume_state: Callable[[dict[str, Any]], None] | None = None,
+        on_eval_resume_state: Callable[[dict[str, Any]], None | Awaitable[None]] | None = None,
         on_sandbox_created: Callable[[SandboxCreatedData], None] | None = None,
         child_egress: dict[str, ChildEgress] | None = None,
         grading_token: str | None = None,
@@ -856,6 +887,9 @@ class BenchmarkServiceClient:
             instance_id: The instance to evaluate.
             sandbox_provider: Sandbox provider config for the task sandbox.
             on_message: Optional callback for intermediate progress messages.
+            on_eval_resume_state: Checkpoint callback; awaitable results complete before
+                the next stream chunk is received.
+            on_sandbox_created: Optional callback invoked for each "sandbox_created" chunk.
         """
         request = EvaluateInstanceRequest(
             task_id=task_id,

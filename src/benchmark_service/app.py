@@ -21,7 +21,7 @@ from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_required
 from benchmark_service.base import BenchmarkService
 from benchmark_service.draining import DRAIN_STATE_PATH_ENV, DrainMiddleware, DrainState
-from benchmark_service.grading_credentials import grading_credentials
+from benchmark_service.grading_credentials import evaluation_caller_scope, grading_credentials
 from benchmark_service.observability import ATTEMPT_ID_HEADER, EMAIL_HEADER, RUN_ID_HEADER
 from benchmark_service.context import child_egress_scope, sandbox_provider_scope, tenant_scope
 from benchmark_service.remote_grading import (
@@ -39,6 +39,8 @@ from benchmark_service.schemas import (
     FinalScoreResponse,
     GradingRequirementsRequest,
     GradingRequirementsResponse,
+    MonitoringRequirementsRequest,
+    MonitoringRequirementsResponse,
     HealthCheckResponse,
     ListDatasetsResponse,
     RetrieveTaskResponse,
@@ -248,6 +250,7 @@ class BenchmarkServiceApp(FastAPI):
         self.add_api_route("/v1/datasets", self._list_datasets, methods=["GET"], response_model=ListDatasetsResponse)
         self.add_api_route("/resolve-dataset", self._resolve_dataset, methods=["POST"])
         self.add_api_route("/grading-requirements", self._grading_requirements, methods=["POST"])
+        self.add_api_route("/monitoring-requirements", self._monitoring_requirements, methods=["POST"])
         self.add_api_route("/verify-task-ids", self._verify_task_ids, methods=["GET"])
         self.add_api_route("/retrieve-task/", self._retrieve_task, methods=["GET"])
         self.add_api_websocket_route("/ws/setup-task", self._setup_task)
@@ -361,6 +364,12 @@ class BenchmarkServiceApp(FastAPI):
                 models=self.service.grading_requirements(body.task_id, dataset=body.dataset),
                 remote_grader_service=self.service.remote_grader_service,
             )
+
+    async def _monitoring_requirements(
+        self, request: Request, body: MonitoringRequirementsRequest
+    ) -> MonitoringRequirementsResponse:
+        async with self._dataset_scope(request, request.state.tenant, body.dataset):
+            return self.service.monitoring_requirements(body.task_ids, dataset=body.dataset)
 
     async def _authorize_websocket(self, websocket: WebSocket) -> str | None:
         """Authenticate a WebSocket caller. Returns tenant id, or None after closing 1008."""
@@ -491,7 +500,15 @@ class BenchmarkServiceApp(FastAPI):
                 async with sandbox_config.create_provider() as provider:
                     sandbox = await provider.get_sandbox(request.instance_id)
 
-                    with child_egress_scope(request.child_egress):
+                    with (
+                        evaluation_caller_scope(
+                            run_id=websocket.headers.get(RUN_ID_HEADER),
+                            task_id=request.task_id,
+                            attempt_id=websocket.headers.get(ATTEMPT_ID_HEADER),
+                            email=websocket.headers.get(EMAIL_HEADER),
+                        ),
+                        child_egress_scope(request.child_egress),
+                    ):
                         await _forward_stream(
                             websocket,
                             self.service.setup_task(request.task_id, sandbox, dataset=request.dataset),

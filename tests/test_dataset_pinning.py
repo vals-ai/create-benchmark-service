@@ -3,9 +3,10 @@
 import asyncio
 import json
 import socket
-from collections.abc import AsyncGenerator
+from collections.abc import AsyncGenerator, AsyncIterator
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
+from functools import partial
 from typing import Any, cast
 
 import httpx
@@ -14,6 +15,7 @@ import uvicorn
 import websockets
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
+from websockets.asyncio.client import ClientConnection, connect
 from websockets.asyncio.server import serve
 
 from benchmark_service import BenchmarkServiceApp, BenchmarkServiceClient, BenchmarkServiceError, DatasetVersion
@@ -351,3 +353,65 @@ async def test_client_rejects_invalid_stream_before_callbacks(messages: list[dic
             with pytest.raises(BenchmarkServiceError, match="acknowledge"):
                 await client.resume_evaluation("task-1", {}, on_eval_resume_state=checkpoints.append)
             assert not checkpoints
+
+
+@pytest.mark.parametrize("callback_fails", [False, True], ids=["success", "callback-error"])
+async def test_client_awaits_checkpoint_before_terminal_result(
+    callback_fails: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    state = {"artifact_prefix": "s3://bucket/run"}
+    announced: list[str] = []
+    checkpoint_started = asyncio.Event()
+    release_checkpoint = asyncio.Event()
+    checkpoint_completed = asyncio.Event()
+
+    class CheckpointConnection(ClientConnection):
+        async def __aiter__(self) -> AsyncIterator[str | bytes]:
+            async for message in super().__aiter__():
+                yield message
+                assert checkpoint_completed.is_set(), "received again before checkpoint completed"
+
+    monkeypatch.setattr(
+        "benchmark_service.client.websockets.connect", partial(connect, create_connection=CheckpointConnection)
+    )
+
+    async def respond(ws: websockets.ServerConnection) -> None:
+        request = json.loads(await ws.recv())
+        assert request["announce_sandboxes"] is True
+        await ws.send(json.dumps({"type": "eval_resume_state", "data": state}))
+        await ws.send(
+            json.dumps({"type": "sandbox_created", "data": {"provider": "daytona", "sandbox_id": "sb-1"}})
+        )
+        await ws.send(json.dumps({"type": "result", "data": {"score": 1.0}}))
+
+    async def save_checkpoint(received: dict[str, Any]) -> None:
+        assert received == state
+        checkpoint_started.set()
+        await release_checkpoint.wait()
+        if callback_fails:
+            raise RuntimeError("checkpoint persistence failed")
+        checkpoint_completed.set()
+
+    async with serve(respond, "127.0.0.1", 0) as server:
+        port = next(iter(server.sockets)).getsockname()[1]
+        async with BenchmarkServiceClient(f"http://127.0.0.1:{port}", {}) as client:
+            evaluation = asyncio.create_task(
+                client.resume_evaluation(
+                    "task-1",
+                    {},
+                    on_eval_resume_state=save_checkpoint,
+                    on_sandbox_created=lambda data: announced.append(data.sandbox_id),
+                )
+            )
+            try:
+                await asyncio.wait_for(checkpoint_started.wait(), timeout=5)
+            finally:
+                release_checkpoint.set()
+                await asyncio.gather(evaluation, return_exceptions=True)
+            if callback_fails:
+                with pytest.raises(RuntimeError, match="checkpoint persistence failed"):
+                    await evaluation
+                assert announced == []
+            else:
+                assert await evaluation == {"score": 1.0}
+                assert announced == ["sb-1"]

@@ -1,4 +1,4 @@
-"""Per-evaluation Model Gateway credentials.
+"""Per-evaluation Model Gateway credentials and request-scoped caller attribution.
 
 A supplied grader token is bound to model_library and the current evaluation,
 without minting from the service key. Registered remote grading attempts defer
@@ -52,7 +52,7 @@ class GradingCredentials:
 
 @dataclass(frozen=True)
 class EvaluationCaller:
-    """The run, task, attempt and email the caller names for the in-flight evaluation."""
+    """The run, task, attempt and email the caller names for setup or evaluation."""
 
     run_id: str
     task_id: str
@@ -80,7 +80,7 @@ def current_grading_credentials() -> GradingCredentials | None:
 
 
 def current_evaluation_caller() -> EvaluationCaller | None:
-    """The in-flight evaluation's caller, else None when the request names no run.
+    """The in-flight setup or evaluation caller, else None when the request names no run.
 
     Services whose grader mints its own Gateway credentials (e.g. a remote eval
     server) forward these so judge spend lands on the caller's run and email.
@@ -99,6 +99,19 @@ def grading_credentials_scope(credentials: GradingCredentials) -> Iterator[None]
             yield
     finally:
         _current.reset(token)
+
+
+@contextmanager
+def evaluation_caller_scope(
+    *, run_id: str | None, task_id: str, attempt_id: str | None, email: str | None
+) -> Iterator[None]:
+    """Bind the caller without creating Gateway credentials."""
+    caller = _caller.set(EvaluationCaller(run_id, task_id, attempt_id, email)) if run_id is not None else None
+    try:
+        yield
+    finally:
+        if caller is not None:
+            _caller.reset(caller)
 
 
 def _identity(email: str | None) -> dict[str, object]:
@@ -166,15 +179,11 @@ async def grading_credentials(
     task that grades (stream finalizers, cleanup) has finished. A scope entered
     inside another reuses the enclosing credentials.
     """
-    caller = _caller.set(EvaluationCaller(run_id, task_id, attempt_id, email)) if run_id is not None else None
-    try:
+    with evaluation_caller_scope(run_id=run_id, task_id=task_id, attempt_id=attempt_id, email=email):
         async with _bind_credentials(
             run_id=run_id, task_id=task_id, attempt_id=attempt_id, email=email, grading_token=grading_token
         ):
             yield
-    finally:
-        if caller is not None:
-            _caller.reset(caller)
 
 
 @asynccontextmanager

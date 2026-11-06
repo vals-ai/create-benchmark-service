@@ -8,10 +8,12 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
+from grpclib import GRPCError, Status
+from grpclib.exceptions import StreamTerminatedError
 
 from benchmark_service.sandbox.modal import ModalSandbox
 from benchmark_service.sandbox import modal as modal_module
-from benchmark_service.sandbox.types import LINUX_PROCESS_GROUP_V1
+from benchmark_service.sandbox.types import LINUX_PROCESS_GROUP_V1, SandboxConnectionError, SandboxError
 
 
 class _LocalProcess:
@@ -44,6 +46,84 @@ class _LocalSdkSandbox:
 
     async def _poll(self) -> None:
         return None
+
+
+class _TransportFailingSdkSandbox(_LocalSdkSandbox):
+    def __init__(self, error: Exception, *, on_wait: bool) -> None:
+        super().__init__()
+        self._error = error
+        self._on_wait = on_wait
+        self._launched = False
+
+    async def _exec(
+        self, *args: str, env: dict[str, str] | None = None, text: bool = True
+    ) -> _LocalProcess:
+        process = await super()._exec(*args, env=env, text=text)
+        if self._launched:
+            return process
+        self._launched = True
+        if self._on_wait:
+            process.wait = SimpleNamespace(aio=self._fail_wait(process))
+        else:
+            process.stdout = self._fail_after_first_chunk(process.stdout)
+        return process
+
+    def _fail_wait(self, process: _LocalProcess) -> Any:
+        async def wait() -> int:
+            await process.process.wait()
+            raise self._error
+
+        return wait
+
+    async def _fail_after_first_chunk(self, output: AsyncGenerator[str, None]) -> AsyncGenerator[str, None]:
+        async for chunk in output:
+            yield chunk
+            raise self._error
+
+
+_RAW_TRANSPORT_ERRORS = pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (StreamTerminatedError("Connection lost"), SandboxConnectionError),
+        (ConnectionResetError("reset by peer"), SandboxConnectionError),
+        (GRPCError(Status.UNAVAILABLE, "unavailable"), SandboxConnectionError),
+        (GRPCError(Status.FAILED_PRECONDITION, "rejected"), SandboxError),
+    ],
+    ids=["stream-terminated", "socket", "grpc-unavailable", "grpc"],
+)
+
+
+@_RAW_TRANSPORT_ERRORS
+async def test_controlled_output_maps_raw_transport_errors(error: Exception, expected: type[SandboxError]) -> None:
+    vm = ModalSandbox(cast(Any, _TransportFailingSdkSandbox(error, on_wait=False)))
+    workload = vm.controlled_workload('printf "started\\n"')
+    chunks: list[str] = []
+    try:
+        with pytest.raises(expected) as raised:
+            async for chunk in workload.output():
+                chunks.append(chunk)
+        assert type(raised.value) is expected
+        assert raised.value.__cause__ is error
+        assert chunks == ["started\n"]
+        with pytest.raises(expected):
+            await asyncio.wait_for(workload.wait(), 5)
+    finally:
+        await asyncio.wait_for(workload.kill(), 5)
+        await asyncio.wait_for(cast(Any, workload)._cleanup_task, 5)
+
+
+@_RAW_TRANSPORT_ERRORS
+async def test_controlled_wait_maps_raw_transport_errors(error: Exception, expected: type[SandboxError]) -> None:
+    vm = ModalSandbox(cast(Any, _TransportFailingSdkSandbox(error, on_wait=True)))
+    workload = vm.controlled_workload('printf "started\\n"')
+    try:
+        with pytest.raises(expected) as raised:
+            await asyncio.wait_for(workload.wait(), 5)
+        assert type(raised.value) is expected
+        assert raised.value.__cause__ is error
+    finally:
+        await asyncio.wait_for(workload.kill(), 5)
+        await asyncio.wait_for(cast(Any, workload)._cleanup_task, 5)
 
 
 @pytest.fixture

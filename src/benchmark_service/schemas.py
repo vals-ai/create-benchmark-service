@@ -456,6 +456,22 @@ class GradingRequirementsResponse(BaseModel):
     models: list[str]
 
 
+class MonitoringRequirementsRequest(BaseModel):
+    """Identify the tasks a monitored run will use."""
+
+    task_ids: list[str]
+    dataset: str | None = None
+
+
+class MonitoringRequirementsResponse(BaseModel):
+    """Rules an external run monitor applies to this benchmark's runs."""
+
+    policy: str | None = None
+    watcher_policy_pack: str | None = None
+    allowed_cidrs: list[str] = []
+    allowed_hosts: list[str] = []
+
+
 class EvaluateInstanceRequest(BaseModel):
     """Request to evaluate a task instance in a sandbox."""
 

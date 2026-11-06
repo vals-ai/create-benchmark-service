@@ -37,6 +37,8 @@ from benchmark_service.schemas import (
     HealthCheckResponse,
     GradingRequirementsRequest,
     GradingRequirementsResponse,
+    MonitoringRequirementsRequest,
+    MonitoringRequirementsResponse,
     JsonValue,
     ListDatasetsResponse,
     ResolveDatasetRequest,
@@ -640,6 +642,16 @@ class BenchmarkServiceClient:
         )
         _require_ok(response, "Grading requirements")
         return GradingRequirementsResponse.model_validate(response.json()).models
+
+    @_retry_http
+    async def monitoring_requirements(
+        self, task_ids: list[str], dataset: str | None = None
+    ) -> MonitoringRequirementsResponse:
+        """Retrieve the rules an external run monitor applies to a run of these tasks."""
+        body = MonitoringRequirementsRequest(task_ids=task_ids, dataset=dataset)
+        response = await self._http_request("POST", f"{self._url}/monitoring-requirements", json=body.model_dump())
+        _require_ok(response, "Monitoring requirements")
+        return MonitoringRequirementsResponse.model_validate(response.json())
 
     @_retry_http
     async def retrieve_task(

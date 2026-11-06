@@ -35,6 +35,8 @@ from benchmark_service.schemas import (
     FinalScoreResponse,
     GradingRequirementsRequest,
     GradingRequirementsResponse,
+    MonitoringRequirementsRequest,
+    MonitoringRequirementsResponse,
     HealthCheckResponse,
     ListDatasetsResponse,
     RetrieveTaskResponse,
@@ -244,6 +246,7 @@ class BenchmarkServiceApp(FastAPI):
         self.add_api_route("/v1/datasets", self._list_datasets, methods=["GET"], response_model=ListDatasetsResponse)
         self.add_api_route("/resolve-dataset", self._resolve_dataset, methods=["POST"])
         self.add_api_route("/grading-requirements", self._grading_requirements, methods=["POST"])
+        self.add_api_route("/monitoring-requirements", self._monitoring_requirements, methods=["POST"])
         self.add_api_route("/verify-task-ids", self._verify_task_ids, methods=["GET"])
         self.add_api_route("/retrieve-task/", self._retrieve_task, methods=["GET"])
         self.add_api_websocket_route("/ws/setup-task", self._setup_task)
@@ -355,6 +358,12 @@ class BenchmarkServiceApp(FastAPI):
             return GradingRequirementsResponse(
                 models=self.service.grading_requirements(body.task_id, dataset=body.dataset)
             )
+
+    async def _monitoring_requirements(
+        self, request: Request, body: MonitoringRequirementsRequest
+    ) -> MonitoringRequirementsResponse:
+        async with self._dataset_scope(request, request.state.tenant, body.dataset):
+            return self.service.monitoring_requirements(body.task_ids, dataset=body.dataset)
 
     async def _authorize_websocket(self, websocket: WebSocket) -> str | None:
         """Authenticate a WebSocket caller. Returns tenant id, or None after closing 1008."""

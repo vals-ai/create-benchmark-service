@@ -625,7 +625,7 @@ async def test_registered_remote_handoff_binds_setup_evaluation_and_resume_witho
             assert await client.evaluate_instance("task-1", "i-1", sandbox_provider=provider) == {"score": 1.0}
 
     caller = EvaluationCaller("run-1", "task-1", "attempt-1", None)
-    assert seen[0] == ("setup", authorization_a, None, None)
+    assert seen[0] == ("setup", authorization_a, None, caller)
     assert set(seen[1:3]) == {
         ("instance", authorization_b, None, caller),
         ("resume", authorization_a, None, caller),

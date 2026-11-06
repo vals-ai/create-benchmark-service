@@ -362,7 +362,7 @@ class BenchmarkServiceApp(FastAPI):
         async with self._dataset_scope(request, request.state.tenant, body.dataset):
             return GradingRequirementsResponse(
                 models=self.service.grading_requirements(body.task_id, dataset=body.dataset),
-                remote_grader_service=self.service.remote_grader_service,
+                remote_grader_service=self.service.remote_grader_service(body.task_id, dataset=body.dataset),
             )
 
     async def _monitoring_requirements(

@@ -8,7 +8,7 @@ import sys
 import types
 from collections.abc import AsyncGenerator, Iterator
 from contextlib import contextmanager
-from typing import Any
+from typing import Any, Literal
 
 import httpx
 import pytest
@@ -563,7 +563,8 @@ async def test_registered_remote_handoff_binds_setup_evaluation_and_resume_witho
     seen: list[tuple[str, RemoteGradingAuthorization | None, GradingCredentials | None, EvaluationCaller | None]] = []
 
     class RemoteBenchmark(TaskScopedBenchmark):
-        remote_grader_service = "vcb"
+        def remote_grader_service(self, task_id: str, dataset: str | None = None) -> Literal["vcb"]:
+            return "vcb"
 
         def observe(self, stage: str) -> None:
             seen.append((

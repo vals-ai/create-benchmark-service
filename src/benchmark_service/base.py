@@ -134,8 +134,6 @@ class BenchmarkService(ABC):
     # How /v1/evaluate grades this benchmark. The Vals app reads this at boot
     # and per dispatch, so it is class state, not a per-instance value.
     eval_mode: ClassVar[EvalMode] = EvalMode.TEXT
-    # Remote implementations register selected-project attempts before dispatch.
-    remote_grader_service: ClassVar[Literal["vcb", "vcb-1-100", "cyber-range"] | None] = None
     accepted_submission_schemas: ClassVar[dict[V1PayloadType, frozenset[str]]] = {}
 
     # Task order within a dataset is dispatch order (the tracker creates task
@@ -241,6 +239,12 @@ class BenchmarkService(ABC):
         Legacy service-key minting still uses GRADING_MODELS independently.
         """
         return [model.strip() for model in os.environ.get("GRADING_MODELS", "").split(",") if model.strip()]
+
+    def remote_grader_service(
+        self, task_id: str, dataset: str | None = None
+    ) -> Literal["vcb", "vcb-1-100", "cyber-range"] | None:
+        """Remote grading service for this task, if it registers attempts before dispatch."""
+        return None
 
     def monitoring_requirements(
         self, task_ids: list[str], dataset: str | None = None

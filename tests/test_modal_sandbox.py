@@ -225,7 +225,12 @@ def _provider(monkeypatch: pytest.MonkeyPatch, sdk_sandbox: Any) -> ModalSandbox
 
     monkeypatch.setattr(modal_module, "Client", SimpleNamespace(from_credentials=_aio(from_credentials)))
     monkeypatch.setattr(modal_module, "App", SimpleNamespace(lookup=_aio(lookup)))
-    monkeypatch.setattr(modal_module, "Image", SimpleNamespace(from_registry=_from_registry, from_id=_from_id))
+    monkeypatch.setattr(
+        modal_module,
+        "Image",
+        SimpleNamespace(from_registry=_from_registry, from_id=_from_id, from_aws_ecr=_from_aws_ecr),
+    )
+    monkeypatch.setattr(modal_module, "Secret", SimpleNamespace(from_name=_secret_from_name))
     monkeypatch.setattr(modal_module, "ModalSdkSandbox", sdk_sandbox)
     return ModalSandboxProvider(_config())
 
@@ -236,6 +241,14 @@ async def _noop(*args: Any, **kwargs: Any) -> None:
 
 def _from_registry(image: str) -> tuple[str, str]:
     return ("image", image)
+
+
+def _secret_from_name(name: str) -> tuple[str, str]:
+    return ("secret", name)
+
+
+def _from_aws_ecr(image: str, secret: Any) -> tuple[str, str, Any]:
+    return ("ecr", image, secret)
 
 
 def _from_id(snapshot: str, **kwargs: Any) -> tuple[str, str]:
@@ -261,6 +274,44 @@ def test_modal_config_reads_secrets_manager_shape() -> None:
         }
     )
     assert config == ModalProviderConfig(runtime="vm", MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret")
+
+
+_ECR_IMAGE = "533328366429.dkr.ecr.us-east-1.amazonaws.com/harbor-benchmark-images@sha256:abc"
+
+
+@pytest.mark.parametrize(
+    ("ecr_secret", "image", "expected"),
+    [
+        (None, _ECR_IMAGE, ("image", _ECR_IMAGE)),
+        ("ecr-pull", _ECR_IMAGE, ("ecr", _ECR_IMAGE, ("secret", "ecr-pull"))),
+        ("ecr-pull", "python:3.12", ("image", "python:3.12")),
+        (
+            "ecr-pull",
+            "public.ecr.aws/docker/library/python:3.12",
+            ("image", "public.ecr.aws/docker/library/python:3.12"),
+        ),
+    ],
+)
+def test_resolve_image_uses_ecr_secret_only_for_private_ecr(
+    monkeypatch: pytest.MonkeyPatch, ecr_secret: str | None, image: str, expected: tuple[Any, ...]
+) -> None:
+    provider = _provider(monkeypatch, None)
+    provider._config = ModalProviderConfig(
+        MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret", MODAL_ECR_SECRET_NAME=ecr_secret
+    )
+
+    assert provider._resolve_image(ImageSource(image=image), cast(Any, None)) == expected
+
+
+def test_modal_config_reads_ecr_secret_name(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MODAL_TOKEN_ID", "id")
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "secret")
+    monkeypatch.setenv("MODAL_ECR_SECRET_NAME", "ecr-pull")
+
+    assert ModalProviderConfig.from_env().MODAL_ECR_SECRET_NAME == "ecr-pull"
+    assert sandbox_provider_config_from_mapping(
+        {"type": "modal", "MODAL_TOKEN_ID": "id", "MODAL_TOKEN_SECRET": "secret", "MODAL_ECR_SECRET_NAME": "ecr-pull"}
+    ) == ModalProviderConfig(MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret", MODAL_ECR_SECRET_NAME="ecr-pull")
 
 
 def test_command_merges_stderr_and_applies_timeout_inside_cwd() -> None:

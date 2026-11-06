@@ -10,7 +10,7 @@ from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable, Coroutine, Mapping
 from typing import Any, Literal, cast
 
-from modal import App, Client, Image, Volume
+from modal import App, Client, Image, Secret, Volume
 from modal import Sandbox as ModalSdkSandbox
 from modal.exception import ConflictError as ModalConflictError
 from modal.exception import ConnectionError as ModalConnectionError
@@ -57,6 +57,7 @@ from benchmark_service.sandbox.types import (
 
 # Modal sandboxes must belong to an app; all benchmark sandboxes share one.
 _APP_NAME = "benchmark-service"
+_PRIVATE_ECR_IMAGE = re.compile(r"^\d{12}\.dkr\.ecr\.[a-z0-9-]+\.amazonaws\.com(\.cn)?/")
 # Modal's default sandbox timeout is 5 minutes; benchmark tasks run for hours.
 _MAX_LIFETIME_SECONDS = min(MAX_SANDBOX_LIFETIME_SECONDS, 24 * 60 * 60)
 _ALLOW_ALL_CIDRS = ("0.0.0.0/0",)
@@ -104,6 +105,7 @@ class ModalProviderConfig(BaseModel):
     runtime: Literal["gvisor", "vm"] = "gvisor"
     MODAL_TOKEN_ID: str
     MODAL_TOKEN_SECRET: str
+    MODAL_ECR_SECRET_NAME: str | None = None
 
     @classmethod
     def from_env(cls) -> "ModalProviderConfig":
@@ -124,6 +126,7 @@ class ModalProviderConfig(BaseModel):
                 "runtime": os.environ.get("MODAL_RUNTIME", "gvisor"),
                 "MODAL_TOKEN_ID": token_id,
                 "MODAL_TOKEN_SECRET": token_secret,
+                "MODAL_ECR_SECRET_NAME": os.environ.get("MODAL_ECR_SECRET_NAME") or None,
             }
         )
 
@@ -670,6 +673,10 @@ class ModalSandboxProvider(SandboxProvider):
         # A snapshot is a Modal filesystem snapshot, referenced by its Image id.
         match source:
             case ImageSource(image=image):
+                # Private ECR pulls need AWS credentials from a Modal secret; other images pull anonymously.
+                ecr_secret = self._config.MODAL_ECR_SECRET_NAME
+                if ecr_secret and _PRIVATE_ECR_IMAGE.match(image):
+                    return Image.from_aws_ecr(image, secret=Secret.from_name(ecr_secret))  # pyright: ignore[reportUnknownMemberType]
                 return Image.from_registry(image)  # pyright: ignore[reportUnknownMemberType]
             case SnapshotSource(snapshot=snapshot):
                 return Image.from_id(snapshot, client=client)

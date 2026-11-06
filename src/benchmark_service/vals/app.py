@@ -22,6 +22,7 @@ from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.sandbox import (
     DaytonaProviderConfig,
     ModalProviderConfig,
+    SailProviderConfig,
     SandboxProvider,
     SandboxProviderConfig,
     sandbox_provider_config_from_mapping,
@@ -99,6 +100,8 @@ def _grading_provider_config() -> SandboxProviderConfig:
         return DaytonaProviderConfig.from_env()
     if provider_type == "modal":
         return ModalProviderConfig.from_env()
+    if provider_type == "sail":
+        return SailProviderConfig.from_env()
     return sandbox_provider_config_from_mapping({"type": provider_type})
 
 

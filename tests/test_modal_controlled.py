@@ -2,6 +2,7 @@
 
 import asyncio
 import os
+import sys
 from collections.abc import AsyncGenerator
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,9 @@ from grpclib.exceptions import StreamTerminatedError
 from benchmark_service.sandbox.modal import ModalSandbox
 from benchmark_service.sandbox import modal as modal_module
 from benchmark_service.sandbox.types import LINUX_PROCESS_GROUP_V1, SandboxConnectionError, SandboxError
+
+# Linux process groups: /proc, util-linux setsid --wait and PR_SET_CHILD_SUBREAPER.
+pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="needs Linux process groups")
 
 
 class _LocalProcess:

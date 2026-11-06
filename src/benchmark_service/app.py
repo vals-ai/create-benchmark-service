@@ -274,6 +274,7 @@ class BenchmarkServiceApp(FastAPI):
             framework_version=_framework_version,
             service_name=self._service_name,
             service_version=self._current_service_version(),
+            service_commit=os.getenv("SERVICE_COMMIT", "").strip() or None,
             dataset_version=self.service.get_dataset_version(dataset),
             dataset_version_selection=self.service.supports_dataset_version_selection(dataset or "default"),
             eval_mode=self.service.eval_mode,

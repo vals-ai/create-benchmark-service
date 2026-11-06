@@ -14,7 +14,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Awaitable, Mapping
 from contextlib import AbstractAsyncContextManager, aclosing, asynccontextmanager
 from functools import cached_property
 from pathlib import Path
-from typing import Any, ClassVar, Self, cast
+from typing import Any, ClassVar, Literal, Self, cast
 from uuid import uuid4
 
 from fastapi.encoders import jsonable_encoder
@@ -239,6 +239,12 @@ class BenchmarkService(ABC):
         Legacy service-key minting still uses GRADING_MODELS independently.
         """
         return [model.strip() for model in os.environ.get("GRADING_MODELS", "").split(",") if model.strip()]
+
+    def remote_grader_service(
+        self, task_id: str, dataset: str | None = None
+    ) -> Literal["vcb", "vcb-1-100", "cyber-range"] | None:
+        """Remote grading service for this task, if it registers attempts before dispatch."""
+        return None
 
     def monitoring_requirements(
         self, task_ids: list[str], dataset: str | None = None

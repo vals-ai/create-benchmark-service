@@ -24,6 +24,10 @@ from benchmark_service.draining import DRAIN_STATE_PATH_ENV, DrainMiddleware, Dr
 from benchmark_service.grading_credentials import evaluation_caller_scope, grading_credentials
 from benchmark_service.observability import ATTEMPT_ID_HEADER, EMAIL_HEADER, RUN_ID_HEADER
 from benchmark_service.context import child_egress_scope, sandbox_provider_scope, tenant_scope
+from benchmark_service.remote_grading import (
+    remote_grading_authorization_from_headers,
+    remote_grading_authorization_scope,
+)
 from benchmark_service.sandbox.created import SandboxCreatedHook, sandbox_created_scope
 from benchmark_service.schemas import (
     DATASET_VERSION_HEADER,
@@ -127,7 +131,7 @@ def _request_may_use_provider(config: SandboxProviderConfig | None) -> bool:
 def _grading_credentials(
     headers: Mapping[str, str], task_id: str, grading_token: str | None = None
 ) -> AbstractAsyncContextManager[None]:
-    """Gateway credentials for the evaluation; a supplied grader token takes precedence."""
+    """Remote authorization defers credentials to the worker; otherwise a supplied grader token takes precedence."""
     return grading_credentials(
         run_id=headers.get(RUN_ID_HEADER),
         task_id=task_id,
@@ -305,8 +309,9 @@ class BenchmarkServiceApp(FastAPI):
 
     @asynccontextmanager
     async def _dataset_scope(
-        self, connection: Request | WebSocket, tenant: str, dataset: str | None
+        self, connection: Request | WebSocket, tenant: str, dataset: str | None, *, task_id: str | None
     ) -> AsyncGenerator[None, None]:
+        authorization = remote_grading_authorization_from_headers(connection.headers)
         values = connection.headers.getlist(DATASET_VERSION_HEADER)
         if len(values) > 1:
             raise _DatasetVersionSelectionError(400, f"Supply {DATASET_VERSION_HEADER} only once")
@@ -327,7 +332,12 @@ class BenchmarkServiceApp(FastAPI):
                         connection.state.dataset_version = resolved
                 entered = True
                 with tenant_scope(tenant):
-                    yield
+                    if authorization is not None and (
+                        task_id is None or self.service.remote_grader_service(task_id, dataset) is None
+                    ):
+                        authorization = None
+                    with remote_grading_authorization_scope(authorization):
+                        yield
         except HTTPException as exc:
             if isinstance(connection, WebSocket) and exc.status_code == 403:
                 await connection.close(code=1008, reason="Dataset not allowed")
@@ -354,15 +364,16 @@ class BenchmarkServiceApp(FastAPI):
     ) -> GradingRequirementsResponse:
         if self._sentry is not None:
             self._sentry.bind_request_context(request.headers, task_id=body.task_id, dataset=body.dataset)
-        async with self._dataset_scope(request, request.state.tenant, body.dataset):
+        async with self._dataset_scope(request, request.state.tenant, body.dataset, task_id=body.task_id):
             return GradingRequirementsResponse(
-                models=self.service.grading_requirements(body.task_id, dataset=body.dataset)
+                models=self.service.grading_requirements(body.task_id, dataset=body.dataset),
+                remote_grader_service=self.service.remote_grader_service(body.task_id, dataset=body.dataset),
             )
 
     async def _monitoring_requirements(
         self, request: Request, body: MonitoringRequirementsRequest
     ) -> MonitoringRequirementsResponse:
-        async with self._dataset_scope(request, request.state.tenant, body.dataset):
+        async with self._dataset_scope(request, request.state.tenant, body.dataset, task_id=None):
             return self.service.monitoring_requirements(body.task_ids, dataset=body.dataset)
 
     async def _authorize_websocket(self, websocket: WebSocket) -> str | None:
@@ -416,7 +427,7 @@ class BenchmarkServiceApp(FastAPI):
     ) -> VerifyTaskIdsResponse:
         if self._sentry is not None:
             self._sentry.bind_request_context(request.headers, dataset=dataset)
-        async with self._dataset_scope(request, request.state.tenant, dataset):
+        async with self._dataset_scope(request, request.state.tenant, dataset, task_id=None):
             task_filter = TaskFilter()
 
             if task_ids:
@@ -438,7 +449,7 @@ class BenchmarkServiceApp(FastAPI):
     ) -> RetrieveTaskResponse:
         if self._sentry is not None:
             self._sentry.bind_request_context(request.headers, task_id=task_id, dataset=dataset)
-        async with self._dataset_scope(request, request.state.tenant, dataset):
+        async with self._dataset_scope(request, request.state.tenant, dataset, task_id=task_id):
             return await self.service.retrieve_task(task_id, skip_validation, dataset=dataset)
 
     @asynccontextmanager
@@ -490,7 +501,7 @@ class BenchmarkServiceApp(FastAPI):
                 await websocket.close(code=1008, reason=_DOCKER_DISABLED_REASON)
                 return
 
-            async with self._dataset_scope(websocket, tenant, request.dataset):
+            async with self._dataset_scope(websocket, tenant, request.dataset, task_id=request.task_id):
                 async with sandbox_config.create_provider() as provider:
                     sandbox = await provider.get_sandbox(request.instance_id)
 
@@ -516,7 +527,7 @@ class BenchmarkServiceApp(FastAPI):
             self._sentry.bind_request_context(request.headers, task_id=body.task_id, dataset=body.dataset)
         if not _request_may_use_provider(body.sandbox_provider):
             raise HTTPException(status_code=403, detail=_DOCKER_DISABLED_REASON)
-        async with self._dataset_scope(request, request.state.tenant, body.dataset):
+        async with self._dataset_scope(request, request.state.tenant, body.dataset, task_id=body.task_id):
             await self.consume_evaluation_request(cast(str, request.state.tenant))
             async with _grading_credentials(request.headers, body.task_id):
                 with child_egress_scope(body.child_egress):
@@ -541,7 +552,7 @@ class BenchmarkServiceApp(FastAPI):
                 await websocket.close(code=1008, reason=_DOCKER_DISABLED_REASON)
                 return
 
-            async with self._dataset_scope(websocket, tenant, request.dataset):
+            async with self._dataset_scope(websocket, tenant, request.dataset, task_id=request.task_id):
                 if not await self._admit_websocket_evaluation(websocket, tenant):
                     return
 
@@ -588,7 +599,7 @@ class BenchmarkServiceApp(FastAPI):
                 await websocket.close(code=1008, reason=_DOCKER_DISABLED_REASON)
                 return
 
-            async with self._dataset_scope(websocket, tenant, request.dataset):
+            async with self._dataset_scope(websocket, tenant, request.dataset, task_id=request.task_id):
                 if not await self._admit_websocket_evaluation(websocket, tenant):
                     return
 
@@ -614,7 +625,7 @@ class BenchmarkServiceApp(FastAPI):
     async def _final_score(self, request: Request, body: FinalScoreRequest) -> FinalScoreResponse:
         if self._sentry is not None:
             self._sentry.bind_request_context(request.headers, dataset=body.dataset)
-        async with self._dataset_scope(request, request.state.tenant, body.dataset):
+        async with self._dataset_scope(request, request.state.tenant, body.dataset, task_id=None):
             tasks_evaluated = list(body.evaluation_results.keys())
             validated_task_ids = await self.service.validate_task_ids(tasks_evaluated, dataset=body.dataset)
             result = await self.service.calculate_final_score(body.evaluation_results, dataset=body.dataset)

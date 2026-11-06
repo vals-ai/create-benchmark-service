@@ -563,8 +563,8 @@ async def test_registered_remote_handoff_binds_setup_evaluation_and_resume_witho
     seen: list[tuple[str, RemoteGradingAuthorization | None, GradingCredentials | None, EvaluationCaller | None]] = []
 
     class RemoteBenchmark(TaskScopedBenchmark):
-        def remote_grader_service(self, task_id: str, dataset: str | None = None) -> Literal["vcb"]:
-            return "vcb"
+        def remote_grader_service(self, task_id: str, dataset: str | None = None) -> Literal["vcb"] | None:
+            return "vcb" if task_id == "task-1" else None
 
         def observe(self, stage: str) -> None:
             seen.append((
@@ -606,6 +606,8 @@ async def test_registered_remote_handoff_binds_setup_evaluation_and_resume_witho
             assert requirements.remote_grader_service == "vcb"
             assert requirements.models == ["anthropic/judge", "openai/helper"]
             assert await client.grading_requirements("task-1") == requirements.models
+            ordinary = await client.grading_requirements_response("ordinary-task")
+            assert ordinary.remote_grader_service is None
             assert (
                 await client.setup_task(
                     "task-1", "i-1", sandbox_provider=provider,
@@ -623,6 +625,16 @@ async def test_registered_remote_handoff_binds_setup_evaluation_and_resume_witho
                 ),
             ) == [{"score": 1.0}, {"score": 1.0}]
             assert await client.evaluate_instance("task-1", "i-1", sandbox_provider=provider) == {"score": 1.0}
+            assert await asyncio.gather(
+                client.evaluate_instance(
+                    "ordinary-task", "i-1", sandbox_provider=provider,
+                    grading_token="project-grader-token", remote_grading_authorization=authorization_a,
+                ),
+                client.resume_evaluation(
+                    "ordinary-task", {"checkpoint": "saved"},
+                    grading_token="project-grader-token", remote_grading_authorization=authorization_b,
+                ),
+            ) == [{"score": 1.0}, {"score": 1.0}]
 
     caller = EvaluationCaller("run-1", "task-1", "attempt-1", None)
     assert seen[0] == ("setup", authorization_a, None, caller)
@@ -631,6 +643,12 @@ async def test_registered_remote_handoff_binds_setup_evaluation_and_resume_witho
         ("resume", authorization_a, None, caller),
     }
     assert seen[3] == ("instance", None, TOKEN, caller)
+    ordinary_caller = EvaluationCaller("run-1", "ordinary-task", "attempt-1", None)
+    ordinary_credentials = GradingCredentials(GATEWAY, "project-grader-token")
+    assert set(seen[4:]) == {
+        ("instance", None, ordinary_credentials, ordinary_caller),
+        ("resume", None, ordinary_credentials, ordinary_caller),
+    }
     assert gateway.paths() == ["/service-auth", "/service-auth/revoke"]
     assert current_remote_grading_authorization() is None
 

@@ -626,7 +626,9 @@ Daytona is the default grading provider and reads `DAYTONA_API_KEY`,
 `DAYTONA_API_URL`, and `DAYTONA_TARGET`. Optional `DAYTONA_ORGANIZATION_ID`
 enables organization-scoped capacity admission. Set
 `GRADING_SANDBOX_PROVIDER=modal` to use Modal with `MODAL_TOKEN_ID` and
-`MODAL_TOKEN_SECRET`. Artifact-capable benchmarks also require
+`MODAL_TOKEN_SECRET`, or `GRADING_SANDBOX_PROVIDER=sail` with `SAIL_API_KEY`
+and optional `SAIL_APP`. See [Sailboxes](docs/sailboxes.md) for image preparation
+and the initial provider's supported features. Artifact-capable benchmarks also require
 `SUBMISSION_ARTIFACT_BUCKET` and `AWS_REGION`; missing server configuration
 fails at startup. The task's `eval_sandbox` spec can override the grading
 source, image-backed resources, timeout, and network policy. Evaluator secrets
@@ -745,7 +747,7 @@ Pydantic models used across requests and responses:
 - **`SandboxSource`** — `ImageSource`, `SnapshotSource`, top-level Daytona-only `TargetedSnapshotSource`, or `ComposeSource` with an outer image/snapshot
 - **`EvalSandboxSpec`** — grading overrides whose optional `source` is an image or snapshot, never `ComposeSource`
 - **`GradingSubmission`** — typed `TextGradingSubmission` or `ArtifactGradingSubmission` passed only to the sandbox-grading hook
-- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`: `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET, DAYTONA_ORGANIZATION_ID=None)`, `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)`, or `DockerProviderConfig(type="docker")`. Docker requests require `CBS_DOCKER_ENABLED=true` on the benchmark service.
+- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`: `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET, DAYTONA_ORGANIZATION_ID=None)`, `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)`, `SailProviderConfig(type="sail", SAIL_API_KEY, SAIL_APP="vals-benchmark-service")`, or `DockerProviderConfig(type="docker")`. Docker requests require `CBS_DOCKER_ENABLED=true` on the benchmark service.
 - **`Resources`** — `vcpu`, `memory`, `disk`, optional `gpu` (count, default 0) and `gpu_type` (requires `gpu >= 1`)
 - **`VolumeMount`** — named persistent volume, absolute `mount_path`, optional `read_only`, `create_if_missing`, and relative `subpath`; `{run_id}` in a subpath resolves from the sandbox's `run-id` or `run_id` label and fails when that label is absent
 - **`GradingRequirementsRequest`** / **`GradingRequirementsResponse`** — task ID and nullable dataset select the complete Gateway model keys for that task

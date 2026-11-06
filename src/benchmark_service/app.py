@@ -330,13 +330,14 @@ class BenchmarkServiceApp(FastAPI):
                         await connection.send_json(StreamDatasetVersionChunk(data=resolved).model_dump())
                     else:
                         connection.state.dataset_version = resolved
-                if authorization is not None and (
-                    task_id is None or self.service.remote_grader_service(task_id, dataset) is None
-                ):
-                    authorization = None
                 entered = True
-                with tenant_scope(tenant), remote_grading_authorization_scope(authorization):
-                    yield
+                with tenant_scope(tenant):
+                    if authorization is not None and (
+                        task_id is None or self.service.remote_grader_service(task_id, dataset) is None
+                    ):
+                        authorization = None
+                    with remote_grading_authorization_scope(authorization):
+                        yield
         except HTTPException as exc:
             if isinstance(connection, WebSocket) and exc.status_code == 403:
                 await connection.close(code=1008, reason="Dataset not allowed")

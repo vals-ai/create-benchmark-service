@@ -1,13 +1,16 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import os
 import re
 import shlex
+import socket
 import uuid
 from collections import deque
 from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable, Coroutine, Mapping
+from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
 
 from modal import App, Client, Image, Volume
@@ -15,6 +18,7 @@ from modal import Sandbox as ModalSdkSandbox
 from modal.exception import ConflictError as ModalConflictError
 from modal.exception import ConnectionError as ModalConnectionError
 from modal.exception import Error as ModalError
+from modal.exception import ImageBuildError as ModalImageBuildError
 from modal.exception import InvalidError as ModalInvalidError
 from modal.exception import NotFoundError as ModalNotFoundError
 from modal.exception import ResourceExhaustedError as ModalResourceExhaustedError
@@ -31,9 +35,11 @@ from benchmark_service.sandbox._process_group import (
     stop_command,
 )
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
+from benchmark_service.sandbox.gpu import modal_gpu_type
 from benchmark_service.sandbox.types import (
     ControlledWorkload,
     ControlledWorkloadResult,
+    DockerfileSource,
     ExecResult,
     GenerationContainment,
     ImageSource,
@@ -41,6 +47,7 @@ from benchmark_service.sandbox.types import (
     MAX_SANDBOX_LIFETIME_SECONDS,
     MissingSandboxConfigError,
     Sandbox,
+    SandboxBuildError,
     SandboxCommandError,
     SandboxConnectionError,
     SandboxCreateRequest,
@@ -60,9 +67,13 @@ _APP_NAME = "benchmark-service"
 # Modal's default sandbox timeout is 5 minutes; benchmark tasks run for hours.
 _MAX_LIFETIME_SECONDS = min(MAX_SANDBOX_LIFETIME_SECONDS, 24 * 60 * 60)
 _ALLOW_ALL_CIDRS = ("0.0.0.0/0",)
-_ALLOW_ALL_DOMAINS = ("*",)
+_RESOLVE_IN_SANDBOX = (
+    'for host in "$@"; do getent ahostsv4 "$host" 2>/dev/null | awk \'{print $1}\'; done; '
+    "awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null"
+)
 _COMMAND_STATUS_POLL_SECONDS = 10
 _CONTROLLED_OUTPUT_TAIL_BYTES = 64 * 1024
+_OUTPUT_DRAIN_SECONDS = 5
 _INVALID_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_.-]")
 logger = logging.getLogger(__name__)
 # Late allocations outlive request-scoped providers.
@@ -146,6 +157,8 @@ def _is_transport_error(exc: Exception) -> bool:
 def _sandbox_error(exc: Exception) -> SandboxError:
     if _is_transport_error(exc):
         return SandboxConnectionError(f"{type(exc).__name__}: {exc}")
+    if isinstance(exc, ModalImageBuildError):
+        return SandboxBuildError(f"Modal image build failed: {exc}", str(exc))
     if isinstance(exc, ModalNotFoundError):
         return SandboxNotFoundError(str(exc))
     if isinstance(exc, ModalConflictError) and "shutting down" in str(exc).lower():
@@ -163,7 +176,7 @@ def _is_missing_volume_error(exc: ModalNotFoundError) -> bool:
 def _command(command: str, cwd: str | None, timeout: float | None) -> str:
     # Match Daytona semantics: timeout exits 124, stderr merges into stdout.
     if timeout is not None:
-        command = f"timeout {timeout:g} {command}"
+        command = f"timeout {timeout:g} sh -c {shlex.quote(command)}"
     if cwd:
         command = f"cd {shlex.quote(cwd)} && {command}"
     return f"{{ {command} ; }} 2>&1"
@@ -415,58 +428,51 @@ class ModalSandbox(Sandbox):
             raise _sandbox_error(exc) from exc
 
     @_PROVIDER_RETRY
-    async def _set_outbound_network_policy(
-        self,
-        cidrs: list[str] | None,
-        domains: list[str] | None,
-    ) -> None:
+    async def _set_outbound_network_policy(self, cidrs: list[str]) -> None:
         try:
             set_policy = cast(Any, self._sandbox)._experimental_set_outbound_network_policy
             await cast(
                 Awaitable[None],
-                set_policy.aio(
-                    outbound_cidr_allowlist=cidrs,
-                    outbound_domain_allowlist=domains,
-                ),
+                set_policy.aio(outbound_cidr_allowlist=cidrs, outbound_domain_allowlist=[]),
             )
         except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
 
-    async def _resolve_domain_cidrs(self, domains: list[str]) -> list[str]:
-        domains_to_resolve = [domain for domain in domains if domain != "*" and not domain.startswith("*.")]
-        if not domains_to_resolve:
+    async def _host_cidrs(self, hosts: list[str]) -> list[str]:
+        """The IPv4 addresses the hosts resolve to here and in the sandbox, and the sandbox's DNS servers."""
+        if not hosts:
             return []
-
-        script = f"""
-import socket
-
-for domain in {domains_to_resolve!r}:
-    try:
-        infos = socket.getaddrinfo(domain, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
-    except OSError:
-        continue
-    for info in infos:
-        print(info[4][0])
-"""
-        result = await self.exec(f"python -c {shlex.quote(script)}")
-        if result.exit_code != 0:
-            return []
-
-        addresses = [f"{line.strip()}/32" for line in result.stdout.splitlines() if line.strip()]
-        return list(dict.fromkeys(addresses))
+        result = await self.exec(f"sh -c {shlex.quote(_RESOLVE_IN_SANDBOX)} _ " + " ".join(map(shlex.quote, hosts)))
+        local = [address for host in hosts for address in await _resolve_ipv4(host)]
+        return [f"{address}/32" for address in [*result.stdout.split(), *local] if _is_ipv4(address)]
 
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
-        cidrs, domains = resolve_allowed_addresses(allowed_addresses)
-        cidrs = list(dict.fromkeys([*cidrs, *await self._resolve_domain_cidrs(domains)]))
-        await self._set_outbound_network_policy(cidrs, domains)
+        cidrs, hosts = resolve_allowed_addresses(allowed_addresses)
+        if wildcards := [host for host in hosts if host.startswith("*")]:
+            raise ValueError(f"Modal can't allow a wildcard hostname such as {wildcards[0]}; list each hostname")
+        await self._set_outbound_network_policy(list(dict.fromkeys([*cidrs, *await self._host_cidrs(hosts)])))
 
     async def block_all_egress(self) -> None:
-        await self._set_outbound_network_policy([], [])
+        await self._set_outbound_network_policy([])
 
     async def clear_egress_rules(self) -> None:
-        # Modal rejects switching a running sandbox to OPEN. An allow-all
-        # allowlist provides the same access without that unsupported transition.
-        await self._set_outbound_network_policy(list(_ALLOW_ALL_CIDRS), list(_ALLOW_ALL_DOMAINS))
+        await self._set_outbound_network_policy(list(_ALLOW_ALL_CIDRS))
+
+
+def _is_ipv4(value: str) -> bool:
+    try:
+        return isinstance(ipaddress.ip_address(value), ipaddress.IPv4Address)
+    except ValueError:
+        return False
+
+
+async def _resolve_ipv4(host: str) -> list[str]:
+    try:
+        infos = await asyncio.get_running_loop().getaddrinfo(host, None, family=socket.AF_INET, type=socket.SOCK_STREAM)
+    except OSError:
+        return []
+    return [str(info[4][0]) for info in infos]
+
 
 
 class _ModalControlledWorkload(ControlledWorkload):
@@ -490,6 +496,7 @@ class _ModalControlledWorkload(ControlledWorkload):
         self._tail: deque[str] = deque()
         self._tail_bytes = 0
         self._output_changed = asyncio.Event()
+        self._output_detached = False
         self._launch_task = asyncio.create_task(self._launch())
         self._wait_task = asyncio.create_task(self._finish())
         self._stop_task: asyncio.Task[tuple[float, int | None]] | None = None
@@ -509,7 +516,7 @@ class _ModalControlledWorkload(ControlledWorkload):
         owner = (
             episode_owner_command(command, self._marker, self._episode_script)
             if self._episode_script is not None
-            else owner_command(command, self._marker, "sh -lc")
+            else owner_command(command, self._marker, "sh -lc", keep_background=True)
         )
         inner = f"exec 2>&1; {owner}"
         output, process_wait = await self._start_process(inner, self._env_vars)
@@ -519,6 +526,8 @@ class _ModalControlledWorkload(ControlledWorkload):
     async def _read_output(self, output: AsyncIterable[str]) -> None:
         try:
             async for text in output:
+                if self._output_detached:
+                    continue
                 self._output.put_nowait(text)
                 self._tail.append(text)
                 self._tail_bytes += len(text.encode("utf-8"))
@@ -547,6 +556,8 @@ class _ModalControlledWorkload(ControlledWorkload):
             if self._read_task.done():
                 await self._read_task
                 return
+            if self._output_detached:
+                return
             self._output_changed.clear()
             await self._output_changed.wait()
 
@@ -561,7 +572,8 @@ class _ModalControlledWorkload(ControlledWorkload):
         stopped_at, status = await self._ensure_stopped()
         assert self._cleanup_task is not None
         await self._cleanup_task
-        await self._read_task
+        if not self._output_detached:
+            await self._read_task
         if status is None and exit_code == 0:
             raise SandboxError("Modal workload exited without a foreground status")
         return ControlledWorkloadResult(
@@ -602,7 +614,11 @@ class _ModalControlledWorkload(ControlledWorkload):
     async def _cleanup(self) -> None:
         assert self._process_wait_task is not None
         assert self._read_task is not None
-        await asyncio.gather(self._process_wait_task, self._read_task, return_exceptions=True)
+        await asyncio.gather(self._process_wait_task, return_exceptions=True)
+        await asyncio.wait({self._read_task}, timeout=_OUTPUT_DRAIN_SECONDS)
+        if not self._read_task.done():
+            self._output_detached = True
+            self._output_changed.set()
         removed = await self._sandbox.exec(cleanup_command(self._marker))
         if removed.exit_code != 0:
             raise SandboxError(f"Modal process-group control cleanup failed: {removed.output}")
@@ -673,6 +689,10 @@ class ModalSandboxProvider(SandboxProvider):
                 return Image.from_registry(image)  # pyright: ignore[reportUnknownMemberType]
             case SnapshotSource(snapshot=snapshot):
                 return Image.from_id(snapshot, client=client)
+            case DockerfileSource(dockerfile=dockerfile):
+                if not Path(dockerfile).is_file():
+                    raise SandboxError(f"Cannot read the Dockerfile {dockerfile}")
+                return Image.from_dockerfile(dockerfile, context_dir=str(PurePosixPath(dockerfile).parent))  # pyright: ignore[reportUnknownMemberType]
             case _:
                 raise SandboxError(f"Modal sandbox provider does not support source type: {source.type}")
 
@@ -695,9 +715,10 @@ class ModalSandboxProvider(SandboxProvider):
         allow_all_egress = not request.network_block_all
         gpu: str | None = None
         if request.resources.gpu:
-            if not request.resources.gpu_type:
+            gpu_type = modal_gpu_type(request.resources.acceptable_gpu_types)
+            if not gpu_type:
                 raise SandboxError("Modal sandbox provider requires gpu_type when gpu is requested")
-            gpu = f"{request.resources.gpu_type}:{request.resources.gpu}"
+            gpu = f"{gpu_type}:{request.resources.gpu}"
         runtime = "gvisor" if gpu else self._config.runtime
         create_kwargs: dict[str, Any] = {
             "app": app,
@@ -705,14 +726,13 @@ class ModalSandboxProvider(SandboxProvider):
             "image": image,
             "env": dict(request.env_vars),
             "tags": request.labels,
-            "cpu": float(request.resources.vcpu),
+            "cpu": (request.resources.vcpu, request.resources.vcpu),
             "memory": request.resources.memory * 1024,
             "gpu": gpu,
             "idle_timeout": request.auto_stop_interval * 60 if request.auto_stop_interval else None,
             "timeout": _MAX_LIFETIME_SECONDS,
             "block_network": request.network_block_all,
             "outbound_cidr_allowlist": list(_ALLOW_ALL_CIDRS) if allow_all_egress else None,
-            "outbound_domain_allowlist": list(_ALLOW_ALL_DOMAINS) if allow_all_egress else None,
             "client": client,
             "runtime": runtime,
             # Keep this flag: nested Docker's overlay2 failed without it on T4.
@@ -724,7 +744,7 @@ class ModalSandboxProvider(SandboxProvider):
         # One SDK call preserves Modal's transport idempotency key.
         creation = asyncio.create_task(ModalSdkSandbox.create.aio(**create_kwargs))  # pyright: ignore[reportUnknownMemberType]
         try:
-            async with asyncio.timeout(request.create_timeout):
+            async with asyncio.timeout(request.provider_timeout):
                 inner = await asyncio.shield(creation)
         except (TimeoutError, asyncio.CancelledError) as exc:
             # Retain ownership until the late allocation can be terminated.
@@ -733,7 +753,11 @@ class ModalSandboxProvider(SandboxProvider):
             cleanup.add_done_callback(self._cleanup_tasks.discard)
             if isinstance(exc, asyncio.CancelledError):
                 raise
-            raise SandboxError(f"Failed to create Modal sandbox within {request.create_timeout}s") from exc
+            if isinstance(request.source, DockerfileSource):
+                raise SandboxBuildError(
+                    f"Timed out building {request.source.dockerfile} after {request.provider_timeout:g}s"
+                ) from exc
+            raise SandboxError(f"Failed to create Modal sandbox within {request.provider_timeout}s") from exc
         except ModalResourceExhaustedError as exc:
             raise SandboxError(f"Modal sandbox resources exhausted: {exc}") from exc
         except ModalNotFoundError as exc:

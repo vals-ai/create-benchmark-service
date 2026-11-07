@@ -39,12 +39,14 @@ from benchmark_service.sandbox.compose import _COMPOSE_EXEC_ENV_ARGS  # pyright:
 from benchmark_service.sandbox import (
     ComposeSource,
     ComposeSandbox,
+    DockerfileSource,
     ExecResult,
     ImageSource,
     MissingSandboxConfigError,
     ResourceCapacity,
     Resources,
     Sandbox,
+    SandboxBuildError,
     SandboxCapacity,
     SandboxCommandError,
     SandboxConnectionError,
@@ -975,14 +977,16 @@ class DaytonaClient:
         self.deleted = False
         self.listed_query: Any | None = None
         self.create_params: Any = None
+        self.create_kwargs: dict[str, object] = {}
 
     async def get(self, instance_id: str) -> InnerSandbox:
         assert instance_id == self.sandbox.name
         return self.sandbox
 
-    async def create(self, params: object, *_args: object, **_kwargs: object) -> InnerSandbox:
+    async def create(self, params: object, *_args: object, **kwargs: object) -> InnerSandbox:
         self.created = True
         self.create_params = params
+        self.create_kwargs = kwargs
         return self.sandbox
 
     async def delete(self, sandbox: InnerSandbox) -> None:
@@ -3893,6 +3897,123 @@ async def test_daytona_provider_creates_fresh_sandbox() -> None:
     assert daytona.create_params.ttl_minutes == 167 * 60
 
 
+def _dockerfile_request(tmp_path: Path, name: str, build_timeout: float | None = None) -> SandboxCreateRequest:
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\nCOPY data.txt /data.txt\n")
+    (tmp_path / "data.txt").write_text("data")
+    source = DockerfileSource(dockerfile=str(tmp_path / "Dockerfile"), build_timeout=build_timeout)
+    return _request(name).model_copy(update={"source": source})
+
+
+async def test_daytona_provider_builds_a_dockerfile_source_from_its_folder(tmp_path: Path) -> None:
+    inner = InnerSandbox()
+    daytona = DaytonaClient(inner)
+
+    await _provider(daytona).create_sandbox(_dockerfile_request(tmp_path, inner.name))
+
+    image = daytona.create_params.image
+    assert image.dockerfile() == "FROM python:3.12-slim\nCOPY data.txt /data.txt\n"
+    assert [(context.source_path, context.archive_path) for context in image._context_list] == [  # pyright: ignore[reportPrivateUsage]
+        (str(tmp_path / "data.txt"), "data.txt")
+    ]
+    assert callable(daytona.create_kwargs["on_snapshot_create_logs"])
+
+
+async def test_daytona_gives_a_dockerfile_build_its_own_time_on_top_of_the_creation_timeout(tmp_path: Path) -> None:
+    inner = InnerSandbox()
+    daytona = DaytonaClient(inner)
+    request = _dockerfile_request(tmp_path, inner.name, build_timeout=600)
+
+    await _provider(daytona).create_sandbox(request)
+
+    assert daytona.create_kwargs["timeout"] == request.create_timeout + 600
+
+
+async def test_daytona_build_failure_carries_the_build_log_and_deletes_the_failed_sandbox(tmp_path: Path) -> None:
+    inner = InnerSandbox()
+    inner.state = SandboxState.BUILD_FAILED
+
+    class FailingBuildClient(DaytonaClient):
+        async def get(self, instance_id: str) -> InnerSandbox:
+            return self.sandbox
+
+        async def create(self, params: object, *_args: object, **kwargs: Any) -> InnerSandbox:
+            kwargs["on_snapshot_create_logs"]("Step 1/2 : FROM python:3.12-slim")
+            kwargs["on_snapshot_create_logs"]("COPY failed: file not found")
+            raise DaytonaError("Failed to build snapshot")
+
+    daytona = FailingBuildClient(inner)
+
+    with pytest.raises(SandboxBuildError, match="Failed to build snapshot") as error:
+        await _provider(daytona).create_sandbox(_dockerfile_request(tmp_path, inner.name))
+
+    assert error.value.build_log == "Step 1/2 : FROM python:3.12-slim\nCOPY failed: file not found"
+    assert daytona.deleted is True
+
+
+async def test_daytona_build_timeout_is_a_build_error_and_is_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inner = InnerSandbox()
+    inner.state = SandboxState.BUILDING_SNAPSHOT
+    attempts: list[int] = []
+
+    class TimingOutClient(DaytonaClient):
+        async def get(self, instance_id: str) -> InnerSandbox:
+            return self.sandbox
+
+        async def create(self, params: object, *_args: object, **kwargs: Any) -> InnerSandbox:
+            attempts.append(1)
+            kwargs["on_snapshot_create_logs"]("Step 1/2 : RUN sleep 9999")
+            raise DaytonaTimeoutError("Sandbox failed to become ready within the timeout period")
+
+    daytona = TimingOutClient(inner)
+
+    with pytest.raises(SandboxBuildError, match="Timed out building") as error:
+        await _provider(daytona).create_sandbox(_dockerfile_request(tmp_path, inner.name))
+
+    assert len(attempts) == 1
+    assert error.value.build_log == "Step 1/2 : RUN sleep 9999"
+    assert daytona.deleted is True
+
+
+async def test_daytona_registry_image_creation_never_collects_a_build_log() -> None:
+    inner = InnerSandbox()
+
+    class FailingImageClient(DaytonaClient):
+        async def create(self, params: object, *_args: object, **kwargs: Any) -> InnerSandbox:
+            self.create_kwargs = kwargs
+            raise DaytonaError("Failed to pull the image")
+
+    daytona = FailingImageClient(inner)
+
+    with pytest.raises(SandboxError, match="Failed to pull the image") as error:
+        await _provider(daytona).create_sandbox(_request(inner.name))
+
+    assert daytona.create_kwargs["on_snapshot_create_logs"] is None
+    assert not isinstance(error.value, SandboxBuildError)
+
+
+async def test_daytona_failure_before_any_build_output_is_not_a_build_error(tmp_path: Path) -> None:
+    inner = InnerSandbox()
+
+    class RejectingClient(DaytonaClient):
+        async def create(self, params: object, *_args: object, **_kwargs: object) -> InnerSandbox:
+            raise DaytonaError("Quota exceeded")
+
+    with pytest.raises(SandboxError, match="Quota exceeded") as error:
+        await _provider(RejectingClient(inner)).create_sandbox(_dockerfile_request(tmp_path, inner.name))
+
+    assert not isinstance(error.value, SandboxBuildError)
+
+
+async def test_daytona_dockerfile_that_cannot_be_read_is_a_sandbox_error(tmp_path: Path) -> None:
+    inner = InnerSandbox()
+    request = _request(inner.name).model_copy(update={"source": DockerfileSource(dockerfile=str(tmp_path / "Dockerfile"))})
+
+    with pytest.raises(SandboxError, match="Cannot read the Dockerfile"):
+        await _provider(DaytonaClient(inner)).create_sandbox(request)
+
+
 def test_daytona_sandbox_exposes_inventory_metadata() -> None:
     inner = InnerSandbox()
     inner.labels = {"Benchmark": "vcb", "clean-up": "true"}
@@ -4085,6 +4206,27 @@ async def test_daytona_provider_maps_gpu_resources() -> None:
     assert daytona.create_params is not None
     assert daytona.create_params.resources.gpu == 1
     assert daytona.create_params.resources.gpu_type == GpuType.H100
+
+
+async def test_daytona_provider_rounds_a_fractional_cpu_up_to_a_whole_one() -> None:
+    inner = InnerSandbox()
+    daytona = CapturingCreateDaytonaClient(inner)
+
+    await _provider(daytona).create_sandbox(_request(inner.name, resources=Resources(vcpu=1.5, memory=4, disk=10)))
+
+    assert daytona.create_params is not None
+    assert daytona.create_params.resources.cpu == 2
+
+
+async def test_daytona_provider_passes_the_acceptable_gpu_types_it_offers_in_order() -> None:
+    inner = InnerSandbox()
+    daytona = CapturingCreateDaytonaClient(inner)
+    resources = Resources(vcpu=2, memory=4, disk=10, gpu=1, gpu_type=["A100", "nvidia-h100-80gb", "h200", "H100"])
+
+    await _provider(daytona).create_sandbox(_request(inner.name, resources=resources))
+
+    assert daytona.create_params is not None
+    assert daytona.create_params.resources.gpu_type == [GpuType.H100, GpuType.H200]
 
 
 async def test_daytona_provider_omits_gpu_by_default() -> None:
@@ -4883,6 +5025,7 @@ class CgroupProcess(Process):
         self.allow_removal = asyncio.Event()
         self.release_seen = asyncio.Event()
         self.group_exists = False
+        self.group_command = ""
         self.removal_fails = False
         self.sessions: set[str] = set()
         self.poll_error = False
@@ -4919,6 +5062,7 @@ class CgroupProcess(Process):
             return SimpleNamespace(exit_code=0 if self.user_finished.is_set() else 1, result="")
         if command.startswith("d=/sys/fs/cgroup/") and "/cbs-" in command.split(";", 1)[0]:
             self.removed_group = command.split(";", 1)[0].removeprefix("d=")
+            self.group_command = command
             self.removal_started.set()
             await self.allow_removal.wait()
             if self.removal_fails:
@@ -5056,12 +5200,14 @@ async def test_daytona_cgroup_probe_rejects_unsupported_kernel() -> None:
         async def exec(self, command: str) -> SimpleNamespace:
             if _unwrap_shell_command(command) == daytona_module._CGROUP_SELF_COMMAND:  # pyright: ignore[reportPrivateUsage]
                 return SimpleNamespace(exit_code=0, result="/init.scope\n")
-            return SimpleNamespace(exit_code=1, result="cgroup.kill unavailable")
+            return SimpleNamespace(exit_code=12, result="cgroup.kill unavailable")
 
     inner = InnerSandbox()
     inner.process = UnsupportedProcess()
-    with pytest.raises(SandboxError, match=r"linux_cgroup_v2 v1: .*: cgroup\.kill unavailable$"):
+    with pytest.raises(SandboxError, match="linux_cgroup_v2") as raised:
         await _daytona_sandbox(cast(Any, inner)).probe_generation_containment()
+
+    assert "probe exit 12 in /sys/fs/cgroup/init.scope: cgroup.kill unavailable" in str(raised.value)
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
@@ -5088,7 +5234,7 @@ async def test_daytona_native_reopens_same_command_and_forwards_each_stream_once
     assert process.execute_calls == 1
     assert process.follow_calls >= 2
     assert not process.group_exists
-    assert process.sessions == set()
+    assert len(process.sessions) == 1
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
 async def test_daytona_native_status_failure_keeps_pending_follow(
@@ -5147,7 +5293,7 @@ async def test_daytona_native_status_failure_keeps_pending_follow(
         assert process.execute_calls == 1
         assert process.follow_calls == 1
         assert not process.group_exists
-        assert process.sessions == set()
+        assert len(process.sessions) == 1
     finally:
         process.send_later_output.set()
         if process.sessions:
@@ -5191,7 +5337,7 @@ async def test_daytona_reopen_from_ids_survives_discarded_launch_adapter(
     assert process.execute_calls == 1
     assert process.follow_calls >= 2
     assert not process.group_exists
-    assert process.sessions == set()
+    assert len(process.sessions) == 1
 
 
 class RawLogWebSocket:
@@ -5518,7 +5664,7 @@ async def test_daytona_native_shell_preserves_cwd_env_and_exit(tmp_path: Path) -
     assert "".join([chunk async for chunk in workload.output()]) == completed.result.output
     assert process.execute_calls == 1
     assert not process.group_exists
-    assert process.sessions == set()
+    assert len(process.sessions) == 1
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
@@ -5532,7 +5678,7 @@ async def test_daytona_native_long_episode_command_preserves_payload(tmp_path: P
     assert "".join([chunk async for chunk in workload.output()]) == payload
     assert process.execute_calls == 1
     assert not process.group_exists
-    assert process.sessions == set()
+    assert len(process.sessions) == 1
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
@@ -5566,19 +5712,8 @@ async def test_daytona_native_command_gets_stdin_eof_with_parent_pipe_open(
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_natural_completion_fences_group_before_release_and_final_output() -> None:
-    class DelayedCloseProcess(CgroupProcess):
-        def __init__(self) -> None:
-            super().__init__()
-            self.close_started = asyncio.Event()
-            self.allow_close = asyncio.Event()
-
-        async def delete_session(self, session_id: str) -> None:
-            self.close_started.set()
-            await self.allow_close.wait()
-            await super().delete_session(session_id)
-
-    process = DelayedCloseProcess()
+async def test_daytona_natural_completion_keeps_agent_processes_and_session() -> None:
+    process = CgroupProcess()
     process.allow_creation.set()
     workload = _cgroup_sandbox(process).controlled_workload("exit 7")
     assert workload.agent_absence_confirmed_at is None
@@ -5588,21 +5723,56 @@ async def test_daytona_natural_completion_fences_group_before_release_and_final_
     await asyncio.wait_for(process.removal_started.wait(), 2)
     assert not waiting.done()
     assert not process.release_seen.is_set()
-    try:
-        process.allow_removal.set()
-        await asyncio.wait_for(process.close_started.wait(), 2)
-        receipt = workload.agent_absence_confirmed_at
-        assert receipt is not None
-        assert not waiting.done()
-        process.allow_close.set()
-        completed = await asyncio.wait_for(waiting, 2)
-        assert completed.absence_confirmed_at >= receipt
-        assert workload.agent_absence_confirmed_at == receipt
-        assert completed.result.exit_code == 7
-        assert completed.result.output.endswith("final frame")
-        assert process.sessions == set()
-    finally:
-        process.allow_close.set()
+
+    process.allow_removal.set()
+    completed = await asyncio.wait_for(waiting, 2)
+
+    receipt = workload.agent_absence_confirmed_at
+    assert receipt is not None
+    assert completed.absence_confirmed_at >= receipt
+    assert completed.result.exit_code == 7
+    assert completed.result.output.endswith("final frame")
+    assert "cgroup.kill" not in process.group_command
+    assert len(process.sessions) == 1
+
+
+@pytest.mark.usefixtures("_fake_cgroup_follow")
+async def test_daytona_natural_exit_uses_recorded_status_when_exit_is_never_reported(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(daytona_module, "_EXIT_REPORT_GRACE_SECONDS", 0.1)
+    monkeypatch.setattr(daytona_module, "_SESSION_WATCH_REOPEN_SECONDS", 0.01)
+
+    class HeldPipeProcess(CgroupProcess):
+        async def exec(self, command: str) -> SimpleNamespace:
+            plain = _unwrap_shell_command(command)
+            if plain.startswith("cat ") and plain.endswith(".complete"):
+                return SimpleNamespace(exit_code=0, result="7")
+            return await super().exec(command)
+
+        async def get_session_command_logs_async(
+            self, session_id: str, command_id: str,
+            on_stdout: Callable[[str], Awaitable[None]],
+            on_stderr: Callable[[str], Awaitable[None]],
+        ) -> None:
+            await on_stdout(self.stdout)
+            await asyncio.Event().wait()
+
+        async def get_session_command(self, session_id: str, command_id: str) -> SimpleNamespace:
+            return SimpleNamespace(exit_code=None)
+
+    process = HeldPipeProcess()
+    process.allow_creation.set()
+    process.allow_removal.set()
+    workload = _cgroup_sandbox(process).controlled_workload("python3 -m http.server &")
+    await asyncio.wait_for(process.command_admitted.wait(), 2)
+    process.user_finished.set()
+
+    completed = await asyncio.wait_for(workload.wait(), 2)
+
+    assert completed.result.exit_code == 7
+    assert completed.result.output == "hello"
+    assert len(process.sessions) == 1
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
@@ -5654,7 +5824,7 @@ async def test_daytona_native_exit_completes_while_follow_reader_is_open(
         assert process.follow_calls == 1
         assert process.execute_calls == 1
         assert not process.group_exists
-        assert process.sessions == set()
+        assert len(process.sessions) == 1
     finally:
         process.allow_follow_close.set()
         if process.sessions:
@@ -5783,6 +5953,7 @@ async def test_daytona_kill_rejects_session_still_present_after_cgroup_stop() ->
     assert workload.agent_absence_confirmed_at is not None
     assert not process.group_exists
     assert process.sessions
+    assert "cgroup.kill" in process.group_command
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
@@ -6301,7 +6472,7 @@ async def test_daytona_lost_cgroup_mkdir_reply_replays_owned_creation(tmp_path: 
     assert process.mkdir_calls == 2
     assert process.execute_calls == 1
     assert not process.group_exists
-    assert process.sessions == set()
+    assert len(process.sessions) == 1
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")

@@ -38,7 +38,7 @@ from daytona_api_client_async import (
 from daytona_api_client_async.exceptions import NotFoundException, OpenApiException
 from daytona_api_client_async.models.region_usage_overview import RegionUsageOverview
 from daytona import (
-    GpuType,
+    Image as DaytonaImage,
 )
 from daytona import (
     VolumeMount as DaytonaVolumeMount,
@@ -75,10 +75,12 @@ from tenacity import (
 
 from benchmark_service.sandbox.created import notify_sandbox_created
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
+from benchmark_service.sandbox.gpu import daytona_gpu_type
 from benchmark_service.sandbox.types import (
     ComposeSource,
     ControlledWorkload,
     ControlledWorkloadResult,
+    DockerfileSource,
     ExecResult,
     GenerationContainment,
     LINUX_CGROUP_V2_V1,
@@ -88,6 +90,7 @@ from benchmark_service.sandbox.types import (
     ResourceCapacity,
     Resources,
     Sandbox,
+    SandboxBuildError,
     SandboxCapacity,
     SandboxCapacityDomain,
     SandboxCommandError,
@@ -117,6 +120,7 @@ _PTY_STATUS_CHECK_ATTEMPTS = 30
 _PTY_STATUS_POLL_SECONDS = 30
 _PTY_STDOUT_TAIL_MAX_BYTES = 64 * 1024
 _SESSION_WATCH_REOPEN_SECONDS = 10
+_EXIT_REPORT_GRACE_SECONDS = 15
 _INVALID_UTF8_BYTES = dict.fromkeys(range(0xDC80, 0xDD00), "\ufffd")
 _PTY_CREATE_MARKER_ENV = "_CBS_PTY_CREATE_MARKER"
 _PTY_ROWS = 24
@@ -299,19 +303,6 @@ def _daytona_client(config: DaytonaProviderConfig, target: str) -> AsyncDaytona:
             connection_pool_maxsize=None,
         )
     )
-
-
-def _daytona_gpu_type(gpu_type: str | None) -> GpuType | None:
-    if gpu_type is None:
-        return None
-    try:
-        member = GpuType(gpu_type)
-    except ValueError:
-        member = GpuType.UNKNOWN_DEFAULT_OPEN_API
-    if member is GpuType.UNKNOWN_DEFAULT_OPEN_API:
-        supported = ", ".join(t.value for t in GpuType if t is not GpuType.UNKNOWN_DEFAULT_OPEN_API)
-        raise SandboxError(f"Unsupported Daytona GPU type: {gpu_type}. Supported types: {supported}")
-    return member
 
 
 def _get_config_header(headers: Mapping[str, str], *names: str) -> str | None:
@@ -595,16 +586,17 @@ class DaytonaSandbox(Sandbox):
         parent = await self._controlled_cgroup_parent()
         quoted = shlex.quote(f"{parent}/cbs-probe-{uuid.uuid4().hex}")
         result = await self._control_exec(
-            f'd={quoted}; mkdir "$d" || exit 1; '
+            f'd={quoted}; mkdir "$d" || exit 11; '
             "sh -c 'echo $$ > \"$1/cgroup.procs\"' sh \"$d\"; admitted=$?; "
-            'echo 1 > "$d/cgroup.kill" || exit 1; '
-            "grep -qx 'populated 0' \"$d/cgroup.events\" || exit 1; "
-            'rmdir "$d" || exit 1; test "$admitted" -eq 0'
+            'echo 1 > "$d/cgroup.kill" || exit 12; '
+            "grep -qx 'populated 0' \"$d/cgroup.events\" || exit 13; "
+            'rmdir "$d" || exit 14; test "$admitted" -eq 0 || exit 15'
         )
         if result.exit_code != 0:
             raise SandboxError(
                 f"Daytona sandbox does not support {LINUX_CGROUP_V2_V1.type} v"
-                f"{LINUX_CGROUP_V2_V1.version}: {self._sandbox_ref}: {result.output.strip()}"
+                f"{LINUX_CGROUP_V2_V1.version}: {self._sandbox_ref}: "
+                f"probe exit {result.exit_code} in {parent}: {result.output.strip()[-500:]}"
             )
 
     def controlled_workload(
@@ -1282,8 +1274,11 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         self._stdout_bytes = 0
         self._creation_done = asyncio.Event()
         self._group_created = False
-        self._group_stopped_at: float | None = None
+        self._agent_ended_at: float | None = None
+        self._completed = False
+        self._recorded_exit: int | None = None
         self._closed = asyncio.Event()
+        self._watch_stop = asyncio.Event()
         self._stop_requested = asyncio.Event()
         self._close_task: asyncio.Task[float] | None = None
         self._run_failure_reported = False
@@ -1295,7 +1290,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
 
     @property
     def agent_absence_confirmed_at(self) -> float | None:
-        return self._group_stopped_at
+        return self._agent_ended_at
 
     @staticmethod
     def _consume_run_exception(task: asyncio.Task[Any]) -> None:
@@ -1356,7 +1351,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
                     self._consume_finish_exception(self._finish_task)
                 raise error
         try:
-            group_stopped_at = await asyncio.shield(self._finish_task)
+            ended_at = await asyncio.shield(self._finish_task)
         except Exception:
             if self._run_task.done():
                 error = self._run_task.exception()
@@ -1365,16 +1360,20 @@ class _DaytonaControlledWorkload(ControlledWorkload):
                     self._consume_finish_exception(self._finish_task)
                     raise error
             raise
+        if self._completed:
+            await asyncio.wait({self._run_task}, timeout=_EXIT_REPORT_GRACE_SECONDS)
+            if not self._run_task.done():
+                await self._use_recorded_exit()
         result = await asyncio.shield(self._run_task)
         session_absent_at = await asyncio.shield(self._ensure_closed())
-        return ControlledWorkloadResult(result=result, absence_confirmed_at=max(group_stopped_at, session_absent_at))
+        return ControlledWorkloadResult(result=result, absence_confirmed_at=max(ended_at, session_absent_at))
 
     async def kill(self) -> None:
         self._stop_requested.set()
         try:
             await asyncio.shield(self._finish_task)
         except SandboxError:
-            if self._group_stopped_at is None:
+            if self._agent_ended_at is None:
                 raise
         await asyncio.shield(self._ensure_closed())
 
@@ -1386,6 +1385,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
             raise SandboxError(f"Daytona controlled cgroup was not created: {self._group}")
 
         stop_task = asyncio.create_task(self._stop_requested.wait())
+        marker_present: bool | None = False
         try:
             while not self._run_task.done() and not stop_task.done():
                 probe = asyncio.create_task(self._complete_marker_present())
@@ -1411,7 +1411,8 @@ class _DaytonaControlledWorkload(ControlledWorkload):
             with suppress(asyncio.CancelledError):
                 await stop_task
 
-        stopped_at = await self._stop_group()
+        self._completed = bool(marker_present)
+        stopped_at = await (self._release_group() if self._completed else self._stop_group())
         if self._stop_requested.is_set() or self._run_task.done():
             await self._ensure_closed()
         else:
@@ -1419,6 +1420,14 @@ class _DaytonaControlledWorkload(ControlledWorkload):
             if result.exit_code != 0:
                 raise SandboxError(f"Daytona controlled session release failed: {self._session_id}")
         return stopped_at
+
+    async def _use_recorded_exit(self) -> None:
+        recorded = await self._control_exec(f"cat {shlex.quote(self._complete)}")
+        code = recorded.output.strip()
+        if recorded.exit_code != 0 or not code.isdigit():
+            raise SandboxError(f"Daytona controlled command exit status is unreadable: {self._session_id}")
+        self._recorded_exit = int(code)
+        self._watch_stop.set()
 
     async def _complete_marker_present(self) -> bool | None:
         try:
@@ -1442,8 +1451,14 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         )
         if result.exit_code != 0:
             raise SandboxError(f"Daytona controlled cgroup removal failed: {self._group}: {result.output}")
-        self._group_stopped_at = asyncio.get_running_loop().time()
-        return self._group_stopped_at
+        self._agent_ended_at = asyncio.get_running_loop().time()
+        return self._agent_ended_at
+
+    async def _release_group(self) -> float:
+        group = shlex.quote(self._group)
+        await self._control_exec(f'd={group}; find "$d" -depth -type d -exec rmdir {{}} \\; 2>/dev/null; exit 0')
+        self._agent_ended_at = asyncio.get_running_loop().time()
+        return self._agent_ended_at
 
     async def _ensure_closed(self) -> float:
         if (
@@ -1459,7 +1474,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
 
     async def _close(self) -> float:
         await self._creation_done.wait()
-        if self._session_requested:
+        if self._session_requested and (self._stop_requested.is_set() or not self._completed):
             # A lost delete reply may still have deleted the session; only the lookup decides.
             delete_error: Exception | None = None
             try:
@@ -1492,6 +1507,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
                 ) from delete_error
 
         self._closed.set()
+        self._watch_stop.set()
         return asyncio.get_running_loop().time()
 
     def _session_command(self) -> str:
@@ -1499,7 +1515,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         child = f"echo $$ > {shlex.quote(self._group)}/cgroup.procs || exit 1; {self._payload}"
         return (
             f"exec </dev/null; sh -c {shlex.quote(child)} & child=$!; wait \"$child\"; code=$?; "
-            f": > {shlex.quote(self._complete)} || exit 1; "
+            f"printf '%s' \"$code\" > {shlex.quote(self._complete)} || exit 1; "
             f"while ! test -e {shlex.quote(self._release)}; do sleep 0.05; done; (exit \"$code\")"
         )
 
@@ -1547,17 +1563,24 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         command_id = await self._launch()
         forwarded_stdout = 0
         forwarded_stderr = 0
-        while not self._closed.is_set():
-            exit_code, forwarded_stdout, forwarded_stderr = await _watch_session_command(
-                self._sandbox._daytona, self._sandbox.id, self._session_id, command_id,  # pyright: ignore[reportPrivateUsage]
-                forwarded_stdout, forwarded_stderr, self._append_output, self._closed,
-            )
+        while not self._watch_stop.is_set():
+            try:
+                exit_code, forwarded_stdout, forwarded_stderr = await _watch_session_command(
+                    self._sandbox._daytona, self._sandbox.id, self._session_id, command_id,  # pyright: ignore[reportPrivateUsage]
+                    forwarded_stdout, forwarded_stderr, self._append_output, self._watch_stop,
+                )
+            except SandboxError:
+                if self._recorded_exit is None:
+                    raise
+                break
             if exit_code is not None:
                 return ExecResult(exit_code=exit_code, output=b"".join(self._stdout).decode("utf-8"))
             try:
-                await asyncio.wait_for(self._closed.wait(), _SESSION_WATCH_REOPEN_SECONDS)
+                await asyncio.wait_for(self._watch_stop.wait(), _SESSION_WATCH_REOPEN_SECONDS)
             except TimeoutError:
                 continue
+        if self._recorded_exit is not None:
+            return ExecResult(exit_code=self._recorded_exit, output=b"".join(self._stdout).decode("utf-8"))
         raise SandboxError("Controlled workload closed before command exit")
 
 
@@ -1701,14 +1724,14 @@ class DaytonaSandboxProvider(SandboxProvider):
             source = source.outer
         if self._organization_id is None:
             return True
-        if isinstance(source, ImageSource) and resources.gpu:
+        if isinstance(source, (ImageSource, DockerfileSource)) and resources.gpu:
             return True
-        if not isinstance(source, (ImageSource, TargetedSnapshotSource)):
+        if not isinstance(source, (ImageSource, DockerfileSource, TargetedSnapshotSource)):
             return True
 
         target = self._target
         sandbox_class = SandboxClass.CONTAINER
-        demand: tuple[float, float, float] = (resources.vcpu, resources.memory, resources.disk)
+        demand: tuple[float, float, float] = (math.ceil(resources.vcpu), resources.memory, resources.disk)
 
         try:
             if isinstance(source, TargetedSnapshotSource):
@@ -1784,7 +1807,7 @@ class DaytonaSandboxProvider(SandboxProvider):
             source = source.outer
         target = source.target if isinstance(source, TargetedSnapshotSource) else self._target
         sandbox_class = SandboxClass.CONTAINER
-        cpu: float = resources.vcpu
+        cpu: float = math.ceil(resources.vcpu)
         memory: float = resources.memory
         disk: float = resources.disk
         gpu: float = resources.gpu
@@ -1903,11 +1926,11 @@ class DaytonaSandboxProvider(SandboxProvider):
         if isinstance(request.source, TargetedSnapshotSource):
             daytona = self._client_for_target(request.source.target)
         resources = DaytonaResources(
-            cpu=request.resources.vcpu,
+            cpu=math.ceil(request.resources.vcpu),
             memory=request.resources.memory,
             disk=request.resources.disk,
             gpu=request.resources.gpu or None,
-            gpu_type=_daytona_gpu_type(request.resources.gpu_type),
+            gpu_type=daytona_gpu_type(request.resources.acceptable_gpu_types),
         )
 
         volume_mounts = (
@@ -1915,7 +1938,11 @@ class DaytonaSandboxProvider(SandboxProvider):
         )
 
         match request.source:
-            case ImageSource(image=image):
+            case ImageSource() | DockerfileSource() as source:
+                try:
+                    image = source.image if isinstance(source, ImageSource) else DaytonaImage.from_dockerfile(source.dockerfile)
+                except (OSError, DaytonaError) as exc:
+                    raise SandboxError(f"Cannot read the Dockerfile: {exc}") from exc
                 params = CreateSandboxFromImageParams(
                     auto_stop_interval=request.auto_stop_interval,
                     auto_delete_interval=0,
@@ -1950,8 +1977,17 @@ class DaytonaSandboxProvider(SandboxProvider):
             case ComposeSource():
                 raise SandboxError("ComposeSource must be unwrapped before provider.create_sandbox")
 
+        builds_dockerfile = isinstance(request.source, DockerfileSource)
+        build_log: list[str] = []
         try:
-            inner = await daytona.create(params, timeout=request.create_timeout)
+            if isinstance(params, CreateSandboxFromImageParams):
+                inner = await daytona.create(
+                    params,
+                    timeout=request.provider_timeout,
+                    on_snapshot_create_logs=build_log.append if builds_dockerfile else None,
+                )
+            else:
+                inner = await daytona.create(params, timeout=request.provider_timeout)
         except DaytonaError as exc:
             # A name conflict means an earlier attempt of this same request
             # created the sandbox but the response was lost (transport retry).
@@ -1962,14 +1998,25 @@ class DaytonaSandboxProvider(SandboxProvider):
                 if existing is not None:
                     await notify_sandbox_created("daytona", existing.id)
                     return DaytonaSandbox(existing, daytona)
-            elif _is_transient_daytona_error(exc):
-                await self._delete_failed_sandbox(request.name, daytona)
-            raise self._sandbox_error(exc) from exc
+            elif _is_transient_daytona_error(exc) or builds_dockerfile:
+                await self._delete_failed_sandbox(
+                    request.name, daytona, abandoned_build=builds_dockerfile and isinstance(exc, DaytonaTimeoutError)
+                )
+            error = self._sandbox_error(exc)
+            if isinstance(request.source, DockerfileSource):
+                if isinstance(exc, DaytonaTimeoutError):
+                    raise SandboxBuildError(
+                        f"Timed out building {request.source.dockerfile} after {request.provider_timeout:g}s",
+                        "\n".join(build_log),
+                    ) from exc
+                if build_log and type(error) is SandboxError:
+                    raise SandboxBuildError(str(error), "\n".join(build_log)) from exc
+            raise error from exc
 
         await notify_sandbox_created("daytona", inner.id)
         return DaytonaSandbox(inner, daytona)
 
-    async def _delete_failed_sandbox(self, name: str, daytona: AsyncDaytona) -> None:
+    async def _delete_failed_sandbox(self, name: str, daytona: AsyncDaytona, *, abandoned_build: bool = False) -> None:
         try:
             sandbox = await _bounded("daytona.get", daytona.get(name), _TOOLBOX_CALL_TIMEOUT_SECONDS)
         except DaytonaNotFoundError:
@@ -1977,7 +2024,7 @@ class DaytonaSandboxProvider(SandboxProvider):
         except DaytonaError as exc:
             raise self._sandbox_error(exc) from exc
 
-        if sandbox.state in _FAILED_SANDBOX_STATES:
+        if sandbox.state in _FAILED_SANDBOX_STATES or (abandoned_build and sandbox.state not in _REMOVED_SANDBOX_STATES):
             await self.delete_sandbox(sandbox.id)
 
     async def _find_existing_sandbox(self, name: str, daytona: AsyncDaytona) -> AsyncSandbox | None:

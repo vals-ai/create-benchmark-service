@@ -24,6 +24,19 @@ from benchmark_service.sandbox.types import (
 _COMPOSE_LEGACY_DOCKER_IMAGE = "compose+source-required"
 _TARGETED_SNAPSHOT_LEGACY_DOCKER_IMAGE = "targeted-snapshot+source-required"
 DATASET_VERSION_HEADER = "X-Benchmark-Dataset-Version"
+BENCHMARK_TOOLS_HEADER = "X-Vals-Benchmark-Tools"
+
+
+class NativeToolContext(BaseModel):
+    mode: Literal["native"]
+
+
+class MCPToolContext(BaseModel):
+    mode: Literal["mcp"]
+    model: str = Field(min_length=1)
+
+
+ToolContext = Annotated[NativeToolContext | MCPToolContext, Field(discriminator="mode")]
 
 DatasetVersionId = Annotated[str, Field(min_length=1, max_length=1024, pattern=r"^[!-~]+$")]
 
@@ -299,6 +312,7 @@ class RetrieveTaskResponse(BaseModel):
     Customize fields based on what your benchmark tasks need.
     """
 
+    tool_context: ToolContext = Field(default_factory=lambda: NativeToolContext(mode="native"))
     source: SandboxSource = Field(description="Sandbox source")
     problem_path: str = Field(
         description="Path inside the sandbox where the problem statement file will be written during setup"

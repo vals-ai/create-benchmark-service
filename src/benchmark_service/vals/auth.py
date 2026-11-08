@@ -249,10 +249,13 @@ READ_ONLY_KEY_CLAIM = "valkyrie_read_only"
 
 
 def _is_read_only_key(jwt_response: Mapping[str, Any]) -> bool:
-    session_token = jwt_response.get("sessionToken")
-    claims: dict[str, Any] = {**jwt_response, **(session_token if isinstance(session_token, Mapping) else {})}
+    session_token: object = jwt_response.get("sessionToken")
+    sources: list[Mapping[str, object]] = [jwt_response]
+    if isinstance(session_token, Mapping):
+        sources.append(cast(Mapping[str, object], session_token))
     return any(
         isinstance(nested, Mapping) and cast(Mapping[str, object], nested).get(READ_ONLY_KEY_CLAIM)
+        for claims in sources
         for nested in (claims, claims.get("customClaims"), claims.get("nsec"))
     )
 

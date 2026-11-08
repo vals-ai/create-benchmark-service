@@ -188,6 +188,7 @@ async def test_catalog_mode_without_service_name_fails_closed_without_legacy_fal
         {"tenants": {"acme": {}}, "valkyrie_read_only": True},
         {"tenants": {"acme": {}}, "sessionToken": {"customClaims": {"valkyrie_read_only": True}}},
         {"tenants": {"acme": {}}, "sessionToken": {"nsec": {"valkyrie_read_only": True}}},
+        {"tenants": {"acme": {}}, "customClaims": {"valkyrie_read_only": True}, "sessionToken": {"customClaims": {}}},
     ],
 )
 async def test_read_only_tracker_key_is_refused(

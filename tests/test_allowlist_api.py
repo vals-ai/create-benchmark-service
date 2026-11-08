@@ -179,3 +179,24 @@ async def test_catalog_mode_without_service_name_fails_closed_without_legacy_fal
         assert await resolve_descope_tenant({"x-descope-api-key": "key-acme"}) is None
 
     assert load_allowlist().tenants == {}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "jwt_response",
+    [
+        {"tenants": {"acme": {}}, "valkyrie_read_only": True},
+        {"tenants": {"acme": {}}, "sessionToken": {"customClaims": {"valkyrie_read_only": True}}},
+        {"tenants": {"acme": {}}, "sessionToken": {"nsec": {"valkyrie_read_only": True}}},
+    ],
+)
+async def test_read_only_tracker_key_is_refused(
+    monkeypatch: pytest.MonkeyPatch, jwt_response: dict[str, object]
+) -> None:
+    transport, requests = _transport(httpx.Response(200, json={"name": "example-service", "datasets": ["default"]}))
+    _configure_api(monkeypatch, transport)
+
+    with patch.object(auth_module, "_exchange_descope_access_key", new=AsyncMock(return_value=jwt_response)):
+        assert await resolve_descope_tenant({"x-descope-api-key": "key-acme"}) is None
+
+    assert requests == []

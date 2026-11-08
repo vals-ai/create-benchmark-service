@@ -11,7 +11,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import yaml
 from cachetools import TTLCache
@@ -245,6 +245,18 @@ async def _exchange_descope_access_key(project_id: str, access_key: str) -> Mapp
     return await asyncio.to_thread(_get_descope_client(project_id).exchange_access_key, access_key)  # type: ignore[reportUnknownMemberType,reportUnknownVariableType]
 
 
+READ_ONLY_KEY_CLAIM = "valkyrie_read_only"
+
+
+def _is_read_only_key(jwt_response: Mapping[str, Any]) -> bool:
+    session_token = jwt_response.get("sessionToken")
+    claims: dict[str, Any] = {**jwt_response, **(session_token if isinstance(session_token, Mapping) else {})}
+    return any(
+        isinstance(nested, Mapping) and cast(Mapping[str, object], nested).get(READ_ONLY_KEY_CLAIM)
+        for nested in (claims, claims.get("customClaims"), claims.get("nsec"))
+    )
+
+
 async def resolve_descope_tenant(headers: Mapping[str, str]) -> str | None:
     """Validate a Descope access key and resolve a single allowlisted tenant."""
     settings = get_auth_settings()
@@ -269,6 +281,10 @@ async def resolve_descope_tenant(headers: Mapping[str, str]) -> str | None:
         tenants = list(tenants_claim.keys())
     except Exception:
         logger.warning("Failed to resolve tenant from Descope access key", exc_info=True)
+        return None
+
+    if _is_read_only_key(jwt_response):
+        logger.info("Descope access key is a read-only Tracker key, so it cannot call a benchmark service")
         return None
 
     if len(tenants) != 1:

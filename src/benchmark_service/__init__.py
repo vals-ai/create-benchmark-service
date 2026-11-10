@@ -20,6 +20,7 @@ from benchmark_service.client import (
     SandboxRecoveryAttempt,
 )
 from benchmark_service.inflight import InflightMiddleware
+from benchmark_service.sandbox_recovery import SandboxProviders, run_with_sandbox_recovery
 from benchmark_service.sandbox import (
     ComposeSource,
     ControlledWorkload,
@@ -100,7 +101,9 @@ __all__ = [
     "BenchmarkServiceStreamError",
     "BenchmarkServiceStreamClosedError",
     "BenchmarkServiceStreamIdleError",
+    "SandboxProviders",
     "SandboxRecoveryAttempt",
+    "run_with_sandbox_recovery",
     "ArtifactGradingSubmission",
     "ComposeSource",
     "ControlledWorkload",

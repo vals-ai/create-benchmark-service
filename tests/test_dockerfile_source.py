@@ -213,3 +213,30 @@ async def test_a_local_build_gets_its_own_timeout_and_the_container_keeps_the_cr
         await provider.create_sandbox(request)
 
     build.assert_awaited_once_with(source, 900)
+
+
+async def test_a_local_build_without_its_own_timeout_shares_the_creation_timeout_with_the_container() -> None:
+    provider = _provider()
+
+    async def build(source: DockerfileSource, timeout: float) -> str:
+        await asyncio.sleep(0.6)
+        return IMAGE_ID
+
+    async def run(config: dict[str, Any], name: str) -> None:
+        await asyncio.sleep(0.6)
+
+    provider._build_image = build  # pyright: ignore[reportPrivateUsage]
+    provider._docker = type("Docker", (), {"containers": type("Containers", (), {"run": staticmethod(run)})()})()  # pyright: ignore[reportPrivateUsage, reportAttributeAccessIssue]
+    provider._cleanup_failed_creation = AsyncMock()  # pyright: ignore[reportPrivateUsage]
+    request = SandboxCreateRequest(
+        source=DockerfileSource(dockerfile=DOCKERFILE),
+        resources=Resources(vcpu=1, memory=1, disk=1),
+        name="task",
+        labels={},
+        env_vars={},
+        auto_stop_interval=10,
+        create_timeout=1,
+    )
+
+    with pytest.raises(SandboxError, match="timed out"):
+        await provider.create_sandbox(request)

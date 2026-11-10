@@ -606,12 +606,16 @@ class DockerSandboxProvider(SandboxProvider):
 
     async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
         _reject_unsupported(request)
+        loop = asyncio.get_running_loop()
         match request.source:
             case ImageSource(image=image):
                 # create_timeout bounds container creation, so a large first pull must not run inside it.
                 await self._ensure_image(image)
-            case DockerfileSource():
-                image = await self._build_image(request.source, request.source.build_timeout or request.create_timeout)
+                deadline = loop.time() + request.create_timeout
+            case DockerfileSource(build_timeout=build_timeout):
+                started = loop.time()
+                image = await self._build_image(request.source, build_timeout or request.create_timeout)
+                deadline = (loop.time() if build_timeout else started) + request.create_timeout
             case _:
                 raise SandboxError(
                     "Local Docker supports image and Dockerfile sources only; snapshots and Compose are not supported"
@@ -621,7 +625,7 @@ class DockerSandboxProvider(SandboxProvider):
         run = asyncio.create_task(self._docker.containers.run(config, name=name))  # pyright: ignore[reportUnknownMemberType]
         with _docker_errors():
             try:
-                async with asyncio.timeout(request.create_timeout):
+                async with asyncio.timeout_at(deadline):
                     container = await asyncio.shield(run)
                     sandbox = await self.get_sandbox(container.id)
                     # Commands run under setsid --wait, which BusyBox images such as Alpine lack.

@@ -731,7 +731,7 @@ async def test_egress_rule_updates_replace_outbound_policy(monkeypatch: pytest.M
 
     Test cases:
     - Hostnames become the addresses they resolve to here and in the sandbox, plus the sandbox's DNS servers.
-    - A wildcard hostname, which no address list can express, is refused.
+    - A wildcard hostname, which no address list can express, goes on the domain allowlist.
     - Deny-all uses empty provider allowlists without overloading modify_egress_rules([]).
     - Clearing egress rules allows every IPv4 address and never names a domain.
     """
@@ -750,8 +750,12 @@ async def test_egress_rule_updates_replace_outbound_policy(monkeypatch: pytest.M
         "outbound_domain_allowlist": [],
     }
 
-    with pytest.raises(ValueError, match="wildcard hostname such as \\*.example.com"):
-        await sandbox.modify_egress_rules(["*.example.com"])
+    await sandbox.modify_egress_rules(["*.example.com", "203.0.113.10"])
+
+    assert inner.outbound_policies[-1] == {
+        "outbound_cidr_allowlist": ["203.0.113.10/32"],
+        "outbound_domain_allowlist": ["*.example.com"],
+    }
 
     with pytest.raises(ValueError, match="allowed addresses cannot be empty"):
         await sandbox.modify_egress_rules([])

@@ -428,12 +428,12 @@ class ModalSandbox(Sandbox):
             raise _sandbox_error(exc) from exc
 
     @_PROVIDER_RETRY
-    async def _set_outbound_network_policy(self, cidrs: list[str]) -> None:
+    async def _set_outbound_network_policy(self, cidrs: list[str], domains: list[str]) -> None:
         try:
             set_policy = cast(Any, self._sandbox)._experimental_set_outbound_network_policy
             await cast(
                 Awaitable[None],
-                set_policy.aio(outbound_cidr_allowlist=cidrs, outbound_domain_allowlist=[]),
+                set_policy.aio(outbound_cidr_allowlist=cidrs, outbound_domain_allowlist=domains),
             )
         except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
@@ -448,15 +448,18 @@ class ModalSandbox(Sandbox):
 
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
         cidrs, hosts = resolve_allowed_addresses(allowed_addresses)
-        if wildcards := [host for host in hosts if host.startswith("*")]:
-            raise ValueError(f"Modal can't allow a wildcard hostname such as {wildcards[0]}; list each hostname")
-        await self._set_outbound_network_policy(list(dict.fromkeys([*cidrs, *await self._host_cidrs(hosts)])))
+        # No address list can express a wildcard, so those stay hostname rules on Modal's domain allowlist.
+        wildcards = [host for host in hosts if host.startswith("*.")]
+        exact = [host for host in hosts if host not in wildcards]
+        await self._set_outbound_network_policy(
+            list(dict.fromkeys([*cidrs, *await self._host_cidrs(exact)])), wildcards
+        )
 
     async def block_all_egress(self) -> None:
-        await self._set_outbound_network_policy([])
+        await self._set_outbound_network_policy([], [])
 
     async def clear_egress_rules(self) -> None:
-        await self._set_outbound_network_policy(list(_ALLOW_ALL_CIDRS))
+        await self._set_outbound_network_policy(list(_ALLOW_ALL_CIDRS), [])
 
 
 def _is_ipv4(value: str) -> bool:

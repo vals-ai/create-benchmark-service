@@ -20,8 +20,10 @@ class TestNormalizeGpuName:
         ("name", "key"),
         [
             ("H100", "h100"),
-            ("NVIDIA H100 80GB", "h100"),
-            ("nvidia_h100_80gb", "h100"),
+            ("NVIDIA H100 80GB", "h100-80gb"),
+            ("nvidia_h100_80gb", "h100-80gb"),
+            ("rtx4090", "rtx-4090"),
+            ("RTX PRO6000", "rtx-pro-6000"),
             ("NVIDIA-GeForce-RTX-4090", "rtx-4090"),
             ("nvidia-tesla-t4", "t4"),
             ("  RTX_5090 ", "rtx-5090"),
@@ -83,6 +85,9 @@ class TestModalGpuType:
     def test_a_name_modal_does_not_list_is_passed_through_so_new_types_keep_working(self) -> None:
         assert modal_gpu_type(["", "B900"]) == "B900"
         assert modal_gpu_type(["rtx-4090", "rtx-5090"]) == "RTX-4090"
+
+    def test_a_listed_type_modal_names_wins_over_an_earlier_one_it_does_not(self) -> None:
+        assert modal_gpu_type(["rtx-4090", "nvidia-h100-80gb"]) == "H100"
 
 
 class TestResourcesGpuTypes:

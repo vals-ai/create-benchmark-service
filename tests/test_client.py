@@ -378,7 +378,7 @@ async def test_client_outage_ids_are_unique_across_invocations(
     client, _mock_http = benchmark_client
     monkeypatch.setattr(client, "retrieve_task", AsyncMock(return_value=_task_response(2)))
     identifiers = iter((UUID(int=1), UUID(int=2)))
-    monkeypatch.setattr("benchmark_service.client.uuid4", lambda: next(identifiers))
+    monkeypatch.setattr("benchmark_service.sandbox_recovery.uuid4", lambda: next(identifiers))
 
     async def operation(attempt: SandboxRecoveryAttempt) -> str:
         if attempt.number == 1:
@@ -400,8 +400,8 @@ async def test_client_recovers_consecutive_losses_with_distinct_outage_identity(
 ) -> None:
     client, _mock_http = benchmark_client
     monkeypatch.setattr(client, "retrieve_task", AsyncMock(return_value=_task_response(3)))
-    monkeypatch.setattr("benchmark_service.client.time.time", lambda: 1_234.5)
-    monkeypatch.setattr("benchmark_service.client.uuid4", lambda: UUID(int=1))
+    monkeypatch.setattr("benchmark_service.sandbox_recovery.time.time", lambda: 1_234.5)
+    monkeypatch.setattr("benchmark_service.sandbox_recovery.uuid4", lambda: UUID(int=1))
 
     attempts: list[SandboxRecoveryAttempt] = []
     retry_errors: list[Exception] = []
@@ -447,8 +447,8 @@ async def test_client_preserves_outage_identity_when_replacement_setup_retries(
 ) -> None:
     client, _mock_http = benchmark_client
     monkeypatch.setattr(client, "retrieve_task", AsyncMock(return_value=_task_response(3)))
-    monkeypatch.setattr("benchmark_service.client.time.time", lambda: 1_234.5)
-    monkeypatch.setattr("benchmark_service.client.uuid4", lambda: UUID(int=1))
+    monkeypatch.setattr("benchmark_service.sandbox_recovery.time.time", lambda: 1_234.5)
+    monkeypatch.setattr("benchmark_service.sandbox_recovery.uuid4", lambda: UUID(int=1))
 
     environments: list[dict[str, str]] = []
 

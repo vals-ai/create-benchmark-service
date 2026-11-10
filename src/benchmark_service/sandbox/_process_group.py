@@ -12,7 +12,7 @@ def probe_command(marker: str) -> str:
     return f"setsid sh -c {shlex.quote(probe)}; exit $?"
 
 
-def owner_command(command: str, control_dir: str, shell: str) -> str:
+def owner_command(command: str, control_dir: str, shell: str, *, keep_background: bool) -> str:
     directory = shlex.quote(control_dir)
     # Hold FD 3 before publishing pgid so an early RDWR writer cannot lose
     # its request before the same-group listener starts.
@@ -25,10 +25,11 @@ def owner_command(command: str, control_dir: str, shell: str) -> str:
         "trap '' TERM INT HUP\n"
         f"printf '%s\n' $$ > {directory}/pgid || exit 1\n"
         "( IFS= read -r request <&3; kill -KILL 0 ) >/dev/null 2>&1 &\n"
+        "listener=$!\n"
         "trap ':' TERM INT HUP\n"
         f"{shell} {shlex.quote(command)} 3>&-; status=$?\n"
         f"printf '%s\n' \"$status\" > {directory}/status\n"
-        "kill -KILL 0"
+        + ('kill -KILL "$listener"' if keep_background else "kill -KILL 0")
     )
     # Keep the waiting shell's signal notification off the workload stream;
     # the child restores stderr and closes FD 4 before becoming the owner.
@@ -52,7 +53,7 @@ def episode_owner_command(command: str, control_dir: str, uploaded_script: str) 
     return f"exec 4>&2 2>/dev/null; ( exec setsid sh -c {shlex.quote(script)} 2>&4 4>&- ); exit $?"
 
 
-def stop_command(control_dir: str, *, episode_owner: bool) -> str:
+def stop_command(control_dir: str, *, episode_owner: bool, keep_background: bool) -> str:
     directory = shlex.quote(control_dir)
     proof = (
         f'if [ ! -s {directory}/status ]; then exit 76; fi\n'
@@ -66,7 +67,11 @@ def stop_command(control_dir: str, *, episode_owner: bool) -> str:
     return (
         f'if [ ! -s {directory}/pgid ]; then exit 75; fi\n'
         f'IFS= read -r group_id < {directory}/pgid || exit 1\n'
-        "alive() {\n"
+        # A keep_background owner leaves its children running once the foreground
+        # exits, so its status alone ends the stop.
+        + (f'if [ -s {directory}/status ]; then cat {directory}/status; exit 0; fi\n'
+           if keep_background and not episode_owner else '')
+        + "alive() {\n"
         "  for stat in /proc/[0-9]*/stat; do\n"
         '    IFS= read -r line 2>/dev/null < "$stat" || continue\n'
         '    fields=${line##*) }\n'

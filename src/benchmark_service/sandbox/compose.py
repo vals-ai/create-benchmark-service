@@ -233,7 +233,7 @@ class _ComposeControlledWorkload(ControlledWorkload):
         inner = (
             episode_owner_command(self._command, self._marker, self._episode_script)
             if self._episode_script is not None
-            else owner_command(self._command, self._marker, "sh -lc")
+            else owner_command(self._command, self._marker, "sh -lc", keep_background=False)
         )
         args: list[str] = []
         for name in self._env_vars:
@@ -286,7 +286,9 @@ class _ComposeControlledWorkload(ControlledWorkload):
         _, container_id = await self._launch_task
         outer = self._sandbox._outer  # pyright: ignore[reportPrivateUsage]
         assert self._result_task is not None
-        command = stop_command(self._marker, episode_owner=self._episode_script is not None)
+        command = stop_command(
+            self._marker, episode_owner=self._episode_script is not None, keep_background=False
+        )
         while True:
             stopped = await outer.exec(
                 f"docker exec {shlex.quote(container_id)} sh -c {shlex.quote(command)}",

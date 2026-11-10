@@ -20,7 +20,12 @@ class _LocalProcess:
     def __init__(self, process: asyncio.subprocess.Process) -> None:
         self.process = process
         self.stdout = self._output()
-        self.wait = SimpleNamespace(aio=self.process.wait)
+        self.wait = SimpleNamespace(aio=self._wait)
+
+    async def _wait(self) -> int:
+        while self.process.returncode is None:
+            await asyncio.sleep(0.01)
+        return self.process.returncode
 
     async def _output(self) -> AsyncGenerator[str, None]:
         assert self.process.stdout is not None
@@ -197,6 +202,26 @@ async def test_deadline_kills_group_child_and_reuses_vm(
     finally:
         await asyncio.wait_for(workload.kill(), 5)
         await stream.aclose()
+
+
+async def test_natural_exit_keeps_background_child_holding_stdout(
+    sandbox: tuple[ModalSandbox, _LocalSdkSandbox], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(modal_module, "_OUTPUT_DRAIN_SECONDS", 0.2)
+    vm, _ = sandbox
+    workload = vm.controlled_workload('sleep 30 & echo "child:$!"; exit 3')
+    child: int | None = None
+    try:
+        completed = await asyncio.wait_for(workload.wait(), 5)
+        child = int(completed.result.output.strip().removeprefix("child:"))
+
+        assert completed.result.exit_code == 3
+        assert "".join([chunk async for chunk in workload.output()]) == completed.result.output
+        assert (await vm.exec(f"kill -0 {child}")).exit_code == 0
+    finally:
+        await asyncio.wait_for(workload.kill(), 5)
+        if child is not None:
+            await vm.exec(f"kill -KILL {child}")
 
 
 async def test_wait_and_kill_concurrently_then_early_kill_without_output(

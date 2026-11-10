@@ -18,6 +18,7 @@ from benchmark_service.sandbox.local.docker import (  # pyright: ignore[reportPr
     DockerSandbox,
     DockerSandboxProvider,
     _ContainerInfo,  # pyright: ignore[reportPrivateUsage]
+    _build_container_config,  # pyright: ignore[reportPrivateUsage]
 )
 from benchmark_service.sandbox.types import ExecResult, SandboxCreateRequest
 from benchmark_service.vals.app import _grading_provider_config  # pyright: ignore[reportPrivateUsage]
@@ -304,3 +305,19 @@ async def test_image_pull_uses_the_provider_host_over_the_cli_context(
         assert "DOCKER_CONTEXT" not in env
     else:
         assert env["DOCKER_CONTEXT"] == "other-daemon"
+
+
+def test_a_container_gets_a_fractional_cpu_exactly() -> None:
+    request = SandboxCreateRequest(
+        name="half-cpu",
+        source=ImageSource(image="python:3.12-slim"),
+        resources=Resources(vcpu=1.5, memory=1, disk=5),
+        labels={},
+        env_vars={},
+        auto_stop_interval=5,
+        create_timeout=60,
+    )
+
+    host_config = _build_container_config(request, "python:3.12-slim")["HostConfig"]
+
+    assert isinstance(host_config, dict) and host_config["NanoCpus"] == 1_500_000_000

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -15,6 +16,7 @@ from modal import Sandbox as ModalSdkSandbox
 from modal.exception import ConflictError as ModalConflictError
 from modal.exception import ConnectionError as ModalConnectionError
 from modal.exception import Error as ModalError
+from modal.exception import ImageBuildError as ModalImageBuildError
 from modal.exception import InvalidError as ModalInvalidError
 from modal.exception import NotFoundError as ModalNotFoundError
 from modal.exception import ResourceExhaustedError as ModalResourceExhaustedError
@@ -23,8 +25,10 @@ import benchmark_service.sandbox.modal as modal_module
 from benchmark_service.sandbox import sandbox_provider_config_from_mapping
 from benchmark_service.sandbox.modal import ModalProviderConfig, ModalSandbox, ModalSandboxProvider
 from benchmark_service.sandbox.types import (
+    DockerfileSource,
     ImageSource,
     Resources,
+    SandboxBuildError,
     SandboxCommandError,
     SandboxConnectionError,
     SandboxCreateRequest,
@@ -195,7 +199,7 @@ class FlakyExecSandbox(FakeInnerSandbox):
 
 
 def _request(
-    source: ImageSource | SnapshotSource | TargetedSnapshotSource | None = None,
+    source: ImageSource | SnapshotSource | TargetedSnapshotSource | DockerfileSource | None = None,
     resources: Resources | None = None,
     labels: dict[str, str] | None = None,
     volumes: list[VolumeMount] | None = None,
@@ -225,7 +229,11 @@ def _provider(monkeypatch: pytest.MonkeyPatch, sdk_sandbox: Any) -> ModalSandbox
 
     monkeypatch.setattr(modal_module, "Client", SimpleNamespace(from_credentials=_aio(from_credentials)))
     monkeypatch.setattr(modal_module, "App", SimpleNamespace(lookup=_aio(lookup)))
-    monkeypatch.setattr(modal_module, "Image", SimpleNamespace(from_registry=_from_registry, from_id=_from_id))
+    monkeypatch.setattr(
+        modal_module,
+        "Image",
+        SimpleNamespace(from_registry=_from_registry, from_id=_from_id, from_dockerfile=_from_dockerfile),
+    )
     monkeypatch.setattr(modal_module, "ModalSdkSandbox", sdk_sandbox)
     return ModalSandboxProvider(_config())
 
@@ -240,6 +248,10 @@ def _from_registry(image: str) -> tuple[str, str]:
 
 def _from_id(snapshot: str, **kwargs: Any) -> tuple[str, str]:
     return ("snapshot", snapshot)
+
+
+def _from_dockerfile(path: str, **kwargs: Any) -> tuple[str, str, dict[str, Any]]:
+    return ("dockerfile", path, kwargs)
 
 
 def _config() -> ModalProviderConfig:
@@ -265,11 +277,16 @@ def test_modal_config_reads_secrets_manager_shape() -> None:
 
 def test_command_merges_stderr_and_applies_timeout_inside_cwd() -> None:
     command = modal_module._command("echo hi", "/workspace", 60)
-    assert command == "{ cd /workspace && timeout 60 echo hi ; } 2>&1"
+    assert command == "{ cd /workspace && timeout 60 sh -c 'echo hi' ; } 2>&1"
+
+
+def test_command_keeps_variable_assignments_and_pipelines_under_the_timeout() -> None:
+    command = modal_module._command('id=$(echo 7); echo "$id" | cat', None, 5)
+    assert command == "{ timeout 5 sh -c 'id=$(echo 7); echo \"$id\" | cat' ; } 2>&1"
 
 
 def test_command_preserves_fractional_timeout() -> None:
-    assert "timeout 1.5 " in modal_module._command("true", None, 1.5)
+    assert "timeout 1.5 sh -c true" in modal_module._command("true", None, 1.5)
 
 
 async def test_exec_returns_combined_output() -> None:
@@ -280,7 +297,7 @@ async def test_exec_returns_combined_output() -> None:
 
     assert result.exit_code == 3
     assert result.stdout == "outerr"
-    assert inner.commands == [("/bin/sh", "-lc", "{ timeout 10 boom ; } 2>&1")]
+    assert inner.commands == [("/bin/sh", "-lc", "{ timeout 10 sh -c boom ; } 2>&1")]
 
 
 async def test_exec_wraps_modal_errors() -> None:
@@ -709,23 +726,32 @@ async def test_egress_rule_updates_retry_connection_errors(monkeypatch: pytest.M
     assert inner.outbound_policies == [{"outbound_cidr_allowlist": [], "outbound_domain_allowlist": []}]
 
 
-async def test_egress_rule_updates_replace_outbound_policy() -> None:
-    """Verify Modal egress updates call the SDK outbound policy API.
+async def test_egress_rule_updates_replace_outbound_policy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify Modal egress updates call the SDK outbound policy API with CIDRs only.
 
     Test cases:
-    - URLs, domains, and IPv4 addresses are split into Modal domain and CIDR allowlists.
+    - Hostnames become the addresses they resolve to here and in the sandbox, plus the sandbox's DNS servers.
+    - A wildcard hostname, which no address list can express, is refused.
     - Deny-all uses empty provider allowlists without overloading modify_egress_rules([]).
-    - Clearing egress rules uses an allow-all policy that Modal accepts on a running sandbox.
+    - Clearing egress rules allows every IPv4 address and never names a domain.
     """
-    inner = FakeInnerSandbox(process=FakeProcess(["198.51.100.8\n198.51.100.9\n"], 0))
+
+    async def resolve_ipv4(host: str) -> list[str]:
+        return {"api.openai.com": ["192.0.2.5"]}.get(host, [])
+
+    monkeypatch.setattr(modal_module, "_resolve_ipv4", resolve_ipv4)
+    inner = FakeInnerSandbox(process=FakeProcess(["198.51.100.8\n198.51.100.9\n10.0.0.2\n"], 0))
     sandbox = _sandbox(inner)
 
     await sandbox.modify_egress_rules(["https://api.openai.com/v1", "github.com", "203.0.113.10"])
 
     assert inner.outbound_policies[-1] == {
-        "outbound_cidr_allowlist": ["203.0.113.10/32", "198.51.100.8/32", "198.51.100.9/32"],
-        "outbound_domain_allowlist": ["api.openai.com", "github.com"],
+        "outbound_cidr_allowlist": ["203.0.113.10/32", "198.51.100.8/32", "198.51.100.9/32", "10.0.0.2/32", "192.0.2.5/32"],
+        "outbound_domain_allowlist": [],
     }
+
+    with pytest.raises(ValueError, match="wildcard hostname such as \\*.example.com"):
+        await sandbox.modify_egress_rules(["*.example.com"])
 
     with pytest.raises(ValueError, match="allowed addresses cannot be empty"):
         await sandbox.modify_egress_rules([])
@@ -741,7 +767,7 @@ async def test_egress_rule_updates_replace_outbound_policy() -> None:
 
     assert inner.outbound_policies[-1] == {
         "outbound_cidr_allowlist": ["0.0.0.0/0"],
-        "outbound_domain_allowlist": ["*"],
+        "outbound_domain_allowlist": [],
     }
 
 
@@ -765,16 +791,126 @@ async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> N
     assert captured["image"] == ("image", "python:3.12")
     assert captured["env"] == {"FOO": "bar"}
     assert captured["tags"] == {"run_id": "r1"}
-    assert captured["cpu"] == 4.0
+    assert captured["cpu"] == (4, 4)
     assert captured["memory"] == 8192
     assert captured["idle_timeout"] == 1800
     assert captured["timeout"] == 86400
     assert captured["block_network"] is False
     assert captured["outbound_cidr_allowlist"] == ["0.0.0.0/0"]
-    assert captured["outbound_domain_allowlist"] == ["*"]
+    assert "outbound_domain_allowlist" not in captured
     assert captured["runtime"] == "gvisor"
     assert captured["experimental_options"] == {"enable_docker": True}
     assert captured["gpu"] is None
+
+
+async def test_create_sandbox_builds_a_dockerfile_source_from_its_folder(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return FakeInnerSandbox()
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12\n")
+    dockerfile = str(tmp_path / "Dockerfile")
+
+    await provider.create_sandbox(_request(DockerfileSource(dockerfile=dockerfile)))
+
+    assert captured["image"] == ("dockerfile", dockerfile, {"context_dir": str(tmp_path)})
+
+
+async def test_create_sandbox_waits_for_a_dockerfile_build_on_top_of_the_creation_timeout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        return FakeInnerSandbox()
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12\n")
+    delays: list[float | None] = []
+    timeout = asyncio.timeout
+
+    def recording_timeout(delay: float | None) -> asyncio.Timeout:
+        delays.append(delay)
+        return timeout(delay)
+
+    monkeypatch.setattr(asyncio, "timeout", recording_timeout)
+
+    await provider.create_sandbox(
+        _request(DockerfileSource(dockerfile=str(tmp_path / "Dockerfile"), build_timeout=600))
+    )
+
+    assert delays == [120 + 600]
+
+
+async def test_create_sandbox_reports_a_failed_build_with_modals_log(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        raise ModalImageBuildError("Image build failed\nstep 2 exited with 1", "im-123")
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12\n")
+
+    with pytest.raises(SandboxBuildError, match="Modal image build failed") as error:
+        await provider.create_sandbox(_request(DockerfileSource(dockerfile=str(tmp_path / "Dockerfile"))))
+
+    assert error.value.build_log == "Image build failed\nstep 2 exited with 1"
+
+
+async def test_create_sandbox_reports_a_dockerfile_build_timeout_as_a_build_error_and_cleans_up(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    inner = FakeInnerSandbox()
+    finish_build = asyncio.Event()
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        await finish_build.wait()
+
+        return inner
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12\n")
+    timeout = asyncio.timeout
+
+    def short_timeout(_delay: float | None) -> asyncio.Timeout:
+        return timeout(0.01)
+
+    monkeypatch.setattr(asyncio, "timeout", short_timeout)
+
+    with pytest.raises(SandboxBuildError, match="Timed out building"):
+        await provider.create_sandbox(_request(DockerfileSource(dockerfile=str(tmp_path / "Dockerfile"))))
+
+    finish_build.set()
+    await asyncio.gather(*provider._cleanup_tasks)
+
+    assert inner.terminated is True
+
+
+async def test_create_sandbox_reports_a_missing_dockerfile_as_a_sandbox_error(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        raise AssertionError("Modal must not be asked to build a Dockerfile that is missing")
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    with pytest.raises(SandboxError, match="Cannot read the Dockerfile"):
+        await provider.create_sandbox(_request(DockerfileSource(dockerfile=str(tmp_path / "Dockerfile"))))
+
+
+async def test_create_sandbox_maps_a_failed_registry_image_build_to_a_build_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        raise ModalImageBuildError("Image build for im-123 failed", "im-123")
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    with pytest.raises(SandboxBuildError, match="Modal image build failed: Image build for im-123 failed"):
+        await provider.create_sandbox(_request())
 
 
 async def test_create_sandbox_uses_vm_runtime(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -808,14 +944,48 @@ async def test_create_sandbox_maps_gpu_request(monkeypatch: pytest.MonkeyPatch) 
     assert captured["gpu"] == "H100:2"
 
 
-async def test_create_sandbox_requires_gpu_type_for_gpu(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_create_sandbox_reserves_and_caps_a_fractional_cpu_exactly(monkeypatch: pytest.MonkeyPatch) -> None:
+    captured: dict[str, Any] = {}
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return FakeInnerSandbox()
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    await provider.create_sandbox(_request(resources=Resources(vcpu=0.5, memory=8, disk=30)))
+
+    assert captured["cpu"] == (0.5, 0.5)
+
+
+async def test_create_sandbox_asks_modal_for_the_first_acceptable_gpu_type_it_knows_by_its_own_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return FakeInnerSandbox()
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    resources = Resources(vcpu=4, memory=8, disk=30, gpu=2, gpu_type=["rtx-4090", "nvidia-h100-80gb", "a100"])
+
+    await provider.create_sandbox(_request(resources=resources))
+
+    assert captured["gpu"] == "H100:2"
+
+
+@pytest.mark.parametrize("gpu_type", [{}, {"gpu_type": ""}, {"gpu_type": "  "}, {"gpu_type": [""]}])
+async def test_create_sandbox_requires_gpu_type_for_gpu(
+    monkeypatch: pytest.MonkeyPatch, gpu_type: dict[str, Any]
+) -> None:
     async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
         raise AssertionError("create should not be called")
 
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
 
     with pytest.raises(SandboxError, match="requires gpu_type"):
-        await provider.create_sandbox(_request(resources=Resources(vcpu=4, memory=8, disk=30, gpu=1)))
+        await provider.create_sandbox(_request(resources=Resources(vcpu=4, memory=8, disk=30, gpu=1, **gpu_type)))
 
 
 async def test_create_sandbox_blocks_network_without_conflicting_allowlists(
@@ -834,7 +1004,7 @@ async def test_create_sandbox_blocks_network_without_conflicting_allowlists(
 
     assert captured["block_network"] is True
     assert captured["outbound_cidr_allowlist"] is None
-    assert captured["outbound_domain_allowlist"] is None
+    assert "outbound_domain_allowlist" not in captured
 
 
 async def test_create_sandbox_uses_modal_safe_name(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 
 from benchmark_service.sandbox import (
     ComposeSource,
+    DockerfileSource,
     Resources,
     SnapshotSource,
     TargetedSnapshotSource,
@@ -24,7 +25,7 @@ def auto_stop_minutes(budget_s: float) -> int:
 class ResolvedSpec:
     """The task's eval-sandbox spec with generation-value fallbacks applied."""
 
-    source: BaseSandboxSource | TargetedSnapshotSource
+    source: BaseSandboxSource | TargetedSnapshotSource | DockerfileSource
     resources: Resources
     volumes: list[VolumeMount]
     network_block_all: bool

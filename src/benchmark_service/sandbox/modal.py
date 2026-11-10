@@ -596,7 +596,9 @@ class _ModalControlledWorkload(ControlledWorkload):
     async def _stop(self) -> tuple[float, int | None]:
         await self._launch_task
         assert self._process_wait_task is not None
-        command = stop_command(self._marker, episode_owner=self._episode_script is not None)
+        command = stop_command(
+            self._marker, episode_owner=self._episode_script is not None, keep_background=True
+        )
         while True:
             stopped = await self._sandbox.exec(command)
             if stopped.exit_code == 0:

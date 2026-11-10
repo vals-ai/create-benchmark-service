@@ -36,7 +36,7 @@ async def _finish_owned_process(process: asyncio.subprocess.Process, control: Pa
                 await asyncio.sleep(0.01)
         if published.endswith('\n'):
             group_id = int(published)
-            stop = await asyncio.create_subprocess_exec('/bin/sh', '-c', stop_command(str(control), episode_owner=False))
+            stop = await asyncio.create_subprocess_exec('/bin/sh', '-c', stop_command(str(control), episode_owner=False, keep_background=True))
             assert await asyncio.wait_for(stop.wait(), 5) == 0
             stopped = True
     finally:
@@ -66,7 +66,7 @@ async def _finish_owned_process(process: asyncio.subprocess.Process, control: Pa
 
 async def test_stop_requires_published_marker(tmp_path: Path) -> None:
     stop = await asyncio.create_subprocess_exec(
-        "/bin/sh", "-c", stop_command(str(tmp_path / "not-admitted"), episode_owner=False),
+        "/bin/sh", "-c", stop_command(str(tmp_path / "not-admitted"), episode_owner=False, keep_background=True),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
     )
     output, _ = await asyncio.wait_for(stop.communicate(), 5)
@@ -101,7 +101,7 @@ async def test_probe_and_stop_negative_process_group(tmp_path: Path, session_lea
         with pytest.raises(asyncio.TimeoutError):
             await asyncio.wait_for(process.wait(), 0.05)
         stop = await asyncio.create_subprocess_exec(
-            str(shell), "-c", stop_command(str(control), episode_owner=False),
+            str(shell), "-c", stop_command(str(control), episode_owner=False, keep_background=True),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         )
         output, _ = await asyncio.wait_for(stop.communicate(), 5)
@@ -143,7 +143,7 @@ async def test_workload_group_term_leaves_fifo_listener_to_stop_ignoring_helper(
         assert process.returncode is None
         assert not (control / "status").exists()
         stop = await asyncio.create_subprocess_exec(
-            "/bin/sh", "-c", stop_command(str(control), episode_owner=False),
+            "/bin/sh", "-c", stop_command(str(control), episode_owner=False, keep_background=True),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         )
         output, _ = await asyncio.wait_for(stop.communicate(), 5)
@@ -174,7 +174,7 @@ async def test_natural_owner_keeps_background_child_and_preserves_stdin_status_a
         assert output == b"got:hello\nchild-tail\n"
         assert process.returncode == 0
         completed = await asyncio.create_subprocess_exec(
-            "/bin/sh", "-c", stop_command(str(control), episode_owner=False),
+            "/bin/sh", "-c", stop_command(str(control), episode_owner=False, keep_background=True),
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
         )
         status, _ = await asyncio.wait_for(completed.communicate(), 5)
@@ -205,7 +205,7 @@ async def test_failed_assertion_cleanup_spares_unrelated_sibling(tmp_path: Path)
                     assert False, "intentional"
             finally:
                 cleanup = await asyncio.create_subprocess_exec(
-                    "/bin/sh", "-c", stop_command(str(control), episode_owner=False),
+                    "/bin/sh", "-c", stop_command(str(control), episode_owner=False, keep_background=True),
                 )
                 assert await asyncio.wait_for(cleanup.wait(), 5) == 0
             owned_stat = Path(f"/proc/{owned_pid}/stat")
@@ -267,3 +267,24 @@ async def test_preready_assertion_cleanup_waits_for_owned_group(tmp_path: Path) 
         if sibling.returncode is None:
             sibling.kill()
         await sibling.wait()
+
+
+@pytest.mark.parametrize("keep_background", [False, True])
+async def test_recorded_status_ends_stop_only_for_kept_background(tmp_path: Path, keep_background: bool) -> None:
+    """A recorded exit status ends the stop only when the owner keeps background children."""
+    group = await asyncio.create_subprocess_exec("sleep", "30", start_new_session=True)
+    control = tmp_path / "control"
+    control.mkdir()
+    os.mkfifo(control / "stop")
+    (control / "pgid").write_text(f"{group.pid}\n")
+    (control / "status").write_text("0\n")
+    try:
+        stop = await asyncio.create_subprocess_exec(
+            "/bin/sh", "-c", stop_command(str(control), episode_owner=False, keep_background=keep_background),
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
+        )
+        output, _ = await asyncio.wait_for(stop.communicate(), 5)
+        assert (stop.returncode, output) == ((0, b"0\n") if keep_background else (1, b""))
+    finally:
+        group.kill()
+        await group.wait()

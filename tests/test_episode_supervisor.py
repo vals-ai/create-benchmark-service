@@ -47,7 +47,7 @@ def _start_owner(directory: Path, command: str, script: Path = SCRIPT) -> subpro
 
 def _stop(directory: Path) -> subprocess.CompletedProcess[bytes]:
     return subprocess.run(
-        ["/bin/sh", "-c", stop_command(str(directory), episode_owner=True)],
+        ["/bin/sh", "-c", stop_command(str(directory), episode_owner=True, keep_background=True)],
         capture_output=True,
         timeout=5,
     )

@@ -441,7 +441,9 @@ class _DockerControlledWorkload(ControlledWorkload):
         if self._execution is None:
             await self._result_task
             raise SandboxError("Docker controlled command did not start")
-        command = stop_command(self._marker, episode_owner=self._episode_script is not None)
+        command = stop_command(
+            self._marker, episode_owner=self._episode_script is not None, keep_background=True
+        )
         while True:
             stopped = await self._control_exec(command)
             if stopped.exit_code == 0:

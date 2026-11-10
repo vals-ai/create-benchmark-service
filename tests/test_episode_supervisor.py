@@ -4,6 +4,7 @@ import os
 import shutil
 import signal
 import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -14,6 +15,9 @@ from benchmark_service.sandbox._process_group import (
     episode_owner_command,
     stop_command,
 )
+
+# Linux process groups: /proc, util-linux setsid --wait and PR_SET_CHILD_SUBREAPER.
+pytestmark = pytest.mark.skipif(sys.platform != "linux", reason="needs Linux process groups")
 
 
 SCRIPT = Path(__file__).parents[1] / "src/benchmark_service/sandbox/episode_supervisor.py"

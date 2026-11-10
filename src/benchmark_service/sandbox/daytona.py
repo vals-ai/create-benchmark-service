@@ -1276,6 +1276,7 @@ class _DaytonaControlledWorkload(ControlledWorkload):
         self._group_created = False
         self._agent_ended_at: float | None = None
         self._completed = False
+        self._children_remain = True
         self._recorded_exit: int | None = None
         self._closed = asyncio.Event()
         self._watch_stop = asyncio.Event()
@@ -1456,7 +1457,11 @@ class _DaytonaControlledWorkload(ControlledWorkload):
 
     async def _release_group(self) -> float:
         group = shlex.quote(self._group)
-        await self._control_exec(f'd={group}; find "$d" -depth -type d -exec rmdir {{}} \\; 2>/dev/null; exit 0')
+        result = await self._control_exec(
+            f'd={group}; find "$d" -depth -type d -exec rmdir {{}} \\; 2>/dev/null; test -e "$d"'
+        )
+        # A populated cgroup cannot be removed, so a group that is left means background processes still run.
+        self._children_remain = result.exit_code != 1
         self._agent_ended_at = asyncio.get_running_loop().time()
         return self._agent_ended_at
 
@@ -1474,7 +1479,9 @@ class _DaytonaControlledWorkload(ControlledWorkload):
 
     async def _close(self) -> float:
         await self._creation_done.wait()
-        if self._session_requested and (self._stop_requested.is_set() or not self._completed):
+        if self._session_requested and (
+            self._stop_requested.is_set() or not self._completed or not self._children_remain
+        ):
             # A lost delete reply may still have deleted the session; only the lookup decides.
             delete_error: Exception | None = None
             try:

@@ -5027,6 +5027,7 @@ class CgroupProcess(Process):
         self.group_exists = False
         self.group_command = ""
         self.removal_fails = False
+        self.group_populated = False
         self.sessions: set[str] = set()
         self.poll_error = False
         self.marker_polled = asyncio.Event()
@@ -5067,6 +5068,11 @@ class CgroupProcess(Process):
             await self.allow_removal.wait()
             if self.removal_fails:
                 return SimpleNamespace(exit_code=1, result="cgroup still populated")
+            if "cgroup.kill" not in command:
+                self.group_exists = self.group_populated
+                if self.command_admitted.is_set():
+                    self.user_finished.set()
+                return SimpleNamespace(exit_code=0 if self.group_populated else 1, result="")
             self.group_exists = False
             if self.command_admitted.is_set():
                 self.user_finished.set()
@@ -5234,7 +5240,7 @@ async def test_daytona_native_reopens_same_command_and_forwards_each_stream_once
     assert process.execute_calls == 1
     assert process.follow_calls >= 2
     assert not process.group_exists
-    assert len(process.sessions) == 1
+    assert len(process.sessions) == 0
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
 async def test_daytona_native_status_failure_keeps_pending_follow(
@@ -5293,7 +5299,7 @@ async def test_daytona_native_status_failure_keeps_pending_follow(
         assert process.execute_calls == 1
         assert process.follow_calls == 1
         assert not process.group_exists
-        assert len(process.sessions) == 1
+        assert len(process.sessions) == 0
     finally:
         process.send_later_output.set()
         if process.sessions:
@@ -5337,7 +5343,7 @@ async def test_daytona_reopen_from_ids_survives_discarded_launch_adapter(
     assert process.execute_calls == 1
     assert process.follow_calls >= 2
     assert not process.group_exists
-    assert len(process.sessions) == 1
+    assert len(process.sessions) == 0
 
 
 class RawLogWebSocket:
@@ -5712,8 +5718,12 @@ async def test_daytona_native_command_gets_stdin_eof_with_parent_pipe_open(
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_natural_completion_keeps_agent_processes_and_session() -> None:
+@pytest.mark.parametrize("background_left", [True, False])
+async def test_daytona_natural_completion_keeps_the_session_only_for_background_processes(
+    background_left: bool,
+) -> None:
     process = CgroupProcess()
+    process.group_populated = background_left
     process.allow_creation.set()
     workload = _cgroup_sandbox(process).controlled_workload("exit 7")
     assert workload.agent_absence_confirmed_at is None
@@ -5733,7 +5743,7 @@ async def test_daytona_natural_completion_keeps_agent_processes_and_session() ->
     assert completed.result.exit_code == 7
     assert completed.result.output.endswith("final frame")
     assert "cgroup.kill" not in process.group_command
-    assert len(process.sessions) == 1
+    assert len(process.sessions) == (1 if background_left else 0)
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")
@@ -5764,6 +5774,7 @@ async def test_daytona_natural_exit_uses_recorded_status_when_exit_is_never_repo
     process = HeldPipeProcess()
     process.allow_creation.set()
     process.allow_removal.set()
+    process.group_populated = True
     workload = _cgroup_sandbox(process).controlled_workload("python3 -m http.server &")
     await asyncio.wait_for(process.command_admitted.wait(), 2)
     process.user_finished.set()
@@ -5824,7 +5835,7 @@ async def test_daytona_native_exit_completes_while_follow_reader_is_open(
         assert process.follow_calls == 1
         assert process.execute_calls == 1
         assert not process.group_exists
-        assert len(process.sessions) == 1
+        assert len(process.sessions) == 0
     finally:
         process.allow_follow_close.set()
         if process.sessions:
@@ -6472,7 +6483,7 @@ async def test_daytona_lost_cgroup_mkdir_reply_replays_owned_creation(tmp_path: 
     assert process.mkdir_calls == 2
     assert process.execute_calls == 1
     assert not process.group_exists
-    assert len(process.sessions) == 1
+    assert len(process.sessions) == 0
 
 
 @pytest.mark.usefixtures("_fake_cgroup_follow")

@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, computed_f
 
 from benchmark_service import egress_tunnel
 from benchmark_service.sandbox import SandboxProviderConfig
+from benchmark_service.sandbox.created import AnnouncedSandboxProvider
 from benchmark_service.sandbox.types import (
     BaseSandboxSource,
     ComposeSource,
@@ -598,7 +599,7 @@ class StreamEvalResumeStateChunk(BaseModel):
 class SandboxCreatedData(BaseModel):
     """Identity of a sandbox a provider created while serving the request."""
 
-    provider: Literal["daytona"]
+    provider: AnnouncedSandboxProvider
     sandbox_id: str
 
 

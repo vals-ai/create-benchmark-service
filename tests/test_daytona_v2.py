@@ -432,3 +432,25 @@ async def test_egress_change_raises_when_daytona_cannot_apply_it() -> None:
     final = {"status": "failed", "applied_revision": 4, "desired_revision": 5, "error": "bad domain"}
     with pytest.raises(SandboxError, match="bad domain"):
         await _sandbox(_policy_handler([], final)).block_all_egress()
+
+
+async def test_sandbox_is_deleted_when_announcement_is_cancelled() -> None:
+    deleted: list[str] = []
+
+    async def hook(provider: str, sandbox_id: str) -> None:
+        raise asyncio.CancelledError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/images":
+            return httpx.Response(201, json={"id": "img-1", "status": "ready"})
+        if request.method == "POST" and request.url.path == "/sandboxes":
+            return httpx.Response(201, json={"id": "sb-1", "status": "pending"})
+        if request.method == "DELETE":
+            deleted.append(request.url.path)
+            return httpx.Response(204)
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    with sandbox_created_scope(hook), pytest.raises(asyncio.CancelledError):
+        await _provider(handler).create_sandbox(_request(0.25))
+
+    assert deleted == ["/sandboxes/sb-1"]

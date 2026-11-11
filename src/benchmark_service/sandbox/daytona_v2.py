@@ -438,8 +438,8 @@ class DaytonaV2SandboxProvider(SandboxProvider):
             )
         ).json()
         sandbox_id = str(data["id"])
-        await notify_sandbox_created("daytona_v2", sandbox_id)
         try:
+            await notify_sandbox_created("daytona_v2", sandbox_id)
             while data.get("status") != _RUNNING:
                 if data.get("status") in _FAILED_SANDBOX_STATUSES or loop.time() > deadline:
                     detail = f"{data.get('status')} {data.get('error') or ''}".strip()

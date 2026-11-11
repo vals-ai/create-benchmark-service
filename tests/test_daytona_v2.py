@@ -55,11 +55,24 @@ def no_poll_delay(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(daytona_v2, "_POLL_SECONDS", 0)
 
 
-@pytest.mark.parametrize(("vcpu", "cores"), [(0.25, 0.125), (0.5, 0.25), (1, 0.5), (1.5, 0.75), (4, 2)])
-def test_v2_resources_keeps_fractional_cpu_in_cores(vcpu: float, cores: float) -> None:
+@pytest.mark.parametrize(
+    ("vcpu", "cores", "cores_max"),
+    [
+        (0.25, 0.125, 0.5),
+        (0.5, 0.25, 0.5),
+        (1, 0.5, 0.5),
+        (1.0000000001, 0.50000000005, 1.0),
+        (1.5, 0.75, 1.0),
+        (3, 1.5, 1.5),
+        (4, 2, 2.0),
+    ],
+)
+def test_v2_resources_reserves_fractional_cores_and_caps_them(vcpu: float, cores: float, cores_max: float) -> None:
     assert v2_resources(Resources(vcpu=vcpu, memory=2, disk=3)) == {
         "cpu": cores,
+        "cores_max": cores_max,
         "memory_mib": 2048,
+        "memory_max_mib": 2048,
         "disk_mib": 3072,
     }
 
@@ -130,7 +143,9 @@ async def test_create_sandbox_sends_fractional_cores_and_waits_for_running() -> 
         "labels": {"run": "r1"},
         "env": {"A": "1"},
         "cpu": 0.125,
+        "cores_max": 0.5,
         "memory_mib": 1024,
+        "memory_max_mib": 1024,
         "disk_mib": 3072,
         "spot": True,
         "create_timeout_seconds": 120,
@@ -188,7 +203,10 @@ def _sandbox(handler: Handler) -> DaytonaV2Sandbox:
 
 
 def _process_handler(
-    exit_code: int, created: list[dict[str, Any]], signals: list[dict[str, Any]] | None = None
+    exit_code: int,
+    created: list[dict[str, Any]],
+    signals: list[dict[str, Any]] | None = None,
+    final: dict[str, Any] | None = None,
 ) -> Handler:
     pages = {
         None: {"frames": [{"channel": "stdout", "data": "hi "}], "nextCursor": "c1", "eof": False},
@@ -204,7 +222,7 @@ def _process_handler(
             assert request.url.params["encoding"] == "text"
             return httpx.Response(200, json=pages[request.url.params.get("cursor")])
         if path == "/sb-1/processes/p1":
-            return httpx.Response(200, json={"id": "p1", "state": "exited", "exitCode": exit_code})
+            return httpx.Response(200, json=final or {"id": "p1", "state": "exited", "exitCode": exit_code})
         if signals is not None and path == "/sb-1/processes/p1/signals":
             signals.append(json.loads(request.content))
             return httpx.Response(202, json={})
@@ -217,7 +235,21 @@ async def test_exec_collects_logs_and_exit_code() -> None:
     created: list[dict[str, Any]] = []
     result = await _sandbox(_process_handler(3, created)).exec("echo hi", cwd="/work", timeout=5)
     assert (result.exit_code, result.output) == (3, "hi err")
-    assert created == [{"kind": "exec", "shellCommand": "echo hi", "cwd": "/work", "timeout_ms": 5000}]
+    assert created == [{"kind": "exec", "shellCommand": "echo hi", "cwd": "/work", "timeoutMs": 5000}]
+
+
+@pytest.mark.parametrize(
+    ("final", "exit_code"),
+    [
+        ({"state": "terminal", "signal": "SIGKILL", "reason": "timed_out"}, 124),
+        ({"state": "terminal", "signal": "SIGKILL"}, 137),
+        ({"state": "terminal", "signal": "TERM"}, 143),
+    ],
+)
+async def test_exec_maps_timed_out_and_signalled_processes_to_exit_codes(final: dict[str, Any], exit_code: int) -> None:
+    sandbox = _sandbox(_process_handler(0, [], final={"id": "p1", **final}))
+    result = await asyncio.wait_for(sandbox.exec("sleep 30", timeout=3), 5)
+    assert result.exit_code == exit_code
 
 
 async def test_command_streams_output_and_raises_on_failure() -> None:
@@ -296,16 +328,18 @@ async def test_file_transfer_on_lost_sandbox_raises_not_found() -> None:
         await sandbox.upload_file("/tmp/in.txt", b"payload")
 
 
-async def test_list_sandboxes_pages_by_labels() -> None:
+async def test_list_sandboxes_pages_by_labels_and_skips_deleted() -> None:
     searches: list[httpx.QueryParams] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/sandboxes/search":
             searches.append(request.url.params)
             if "cursor" in request.url.params:
-                return httpx.Response(200, json={"sandboxes": [{"id": "b"}], "next_cursor": None})
-            return httpx.Response(200, json={"sandboxes": [{"id": "a"}], "next_cursor": "n1"})
-        return httpx.Response(200, json={"id": request.url.path.rsplit("/", 1)[-1], "status": "running"})
+                return httpx.Response(200, json={"sandboxes": [{"id": "b"}, {"id": "gone"}], "next_cursor": None})
+            return httpx.Response(200, json={"sandboxes": [{"id": "a"}, {"id": "going"}], "next_cursor": "n1"})
+        sandbox_id = request.url.path.rsplit("/", 1)[-1]
+        status = {"gone": "deleted", "going": "deleting"}.get(sandbox_id, "running")
+        return httpx.Response(200, json={"id": sandbox_id, "status": status})
 
     found = [
         sandbox.id async for sandbox in _provider(handler).list_sandboxes(daytona_v2.SandboxQuery(labels={"run": "r1"}))

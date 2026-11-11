@@ -3,6 +3,7 @@ from __future__ import annotations
 import shlex
 import uuid
 from collections.abc import AsyncGenerator, Iterable, Mapping
+from datetime import datetime
 
 from benchmark_service.sandbox.types import (
     ComposeSource,
@@ -56,6 +57,13 @@ class ComposeSandbox(Sandbox):
     @property
     def provider_metadata(self) -> Mapping[str, str]:
         return self._outer.provider_metadata
+
+    @property
+    def has_ended(self) -> bool:
+        return self._outer.has_ended
+
+    def cost_usd(self, ended_at: datetime) -> float | None:
+        return self._outer.cost_usd(ended_at)
 
     def _compose_command(self, parts: list[str]) -> str:
         return f"{self._compose_command_prefix} {shlex.join(parts)}"

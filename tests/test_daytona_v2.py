@@ -11,6 +11,8 @@ import httpx
 import pytest
 
 from benchmark_service.sandbox import (
+    ComposeSandbox,
+    ComposeSource,
     DaytonaProviderConfig,
     DaytonaV2ProviderConfig,
     ImageSource,
@@ -483,6 +485,14 @@ def test_cost_needs_created_at_and_resources() -> None:
     assert _priced(created_at=None).cost_usd(ended) is None
     assert _priced(cpu=None).cost_usd(ended) is None
     assert _priced(spot=None).cost_usd(ended) is None
+
+
+def test_compose_sandbox_is_priced_as_its_outer_sandbox() -> None:
+    outer = _priced()
+    compose = ComposeSandbox(outer, ComposeSource(outer=ImageSource(image="docker:28.3.3-dind")))
+    ended = datetime(2026, 11, 11, 0, 30, tzinfo=UTC)
+    assert compose.has_ended is True
+    assert compose.cost_usd(ended) == outer.cost_usd(ended)
 
 
 @pytest.mark.parametrize(("status", "ended"), [("running", False), ("deleting", True), ("stopped", True)])

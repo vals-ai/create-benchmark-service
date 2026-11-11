@@ -14,7 +14,7 @@ from collections.abc import AsyncGenerator, AsyncIterator, Mapping
 from contextlib import aclosing, asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 from urllib.parse import quote
 
 import httpx
@@ -58,6 +58,7 @@ _POLICY_TIMEOUT_SECONDS = 60.0
 
 class DaytonaV2ProviderConfig(BaseModel):
     type: Literal["daytona_v2"] = "daytona_v2"
+    prices_sandboxes: ClassVar[bool] = True
     DAYTONA_V2_API_KEY: str
     DAYTONA_V2_API_URL: str = DEFAULT_DAYTONA_V2_API_URL
     DAYTONA_V2_REGION: str | None = Field(default=None, exclude_if=lambda value: value is None)
@@ -156,6 +157,15 @@ def _created_at(sandbox: Mapping[str, Any]) -> datetime | None:
     return created_at.astimezone(UTC) if created_at.utcoffset() is not None else None
 
 
+# On-demand AMD Zen 5 rates from the https://www.daytona.com/pricing calculator, billed per second while
+# running. Ephemeral disk and the Linux licence are $0. The region multiplier is taken as 1.0: Daytona
+# documents earth at 1.0, and the default region's multiplier needs an org key with read:billing to read.
+ZEN5_CORE_USD_PER_HOUR = 0.235
+MEMORY_GIB_USD_PER_HOUR = 0.0162
+PREEMPTIBLE_MULTIPLIER = 0.7
+_ENDED_STATUSES = frozenset({"stopped", "deleting", "deleted", "failed", "lost"})
+
+
 class DaytonaV2Sandbox(Sandbox):
     def __init__(self, data: Mapping[str, Any], client: httpx.AsyncClient) -> None:
         self._data = dict(data)
@@ -178,6 +188,19 @@ class DaytonaV2Sandbox(Sandbox):
     @property
     def provider_metadata(self) -> Mapping[str, str]:
         return {key: str(self._data[key]) for key in ("region_id", "cpu", "memory_mib", "spot") if key in self._data}
+
+    @property
+    def has_ended(self) -> bool:
+        return self.state in _ENDED_STATUSES
+
+    def cost_usd(self, ended_at: datetime) -> float | None:
+        cpu, memory_mib = self._data.get("cpu"), self._data.get("memory_mib")
+        if self.created_at is None or cpu is None or memory_mib is None:
+            return None
+        per_hour = float(cpu) * ZEN5_CORE_USD_PER_HOUR + float(memory_mib) / 1024 * MEMORY_GIB_USD_PER_HOUR
+        if self._data.get("spot") is True:
+            per_hour *= PREEMPTIBLE_MULTIPLIER
+        return per_hour * max((ended_at - self.created_at).total_seconds(), 0) / 3600
 
     @property
     def _toolbox(self) -> str:

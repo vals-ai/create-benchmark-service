@@ -193,10 +193,7 @@ async def _bind_credentials(
 ) -> AsyncIterator[None]:
     from benchmark_service.remote_grading import current_remote_grading_authorization
 
-    if current_remote_grading_authorization() is not None:
-        yield
-        return
-    if _current.get() is not None:
+    if current_remote_grading_authorization() is not None or _current.get() is not None:
         yield
         return
     service = _service_credentials()

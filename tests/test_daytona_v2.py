@@ -482,6 +482,7 @@ def test_cost_needs_created_at_and_resources() -> None:
     ended = datetime(2026, 11, 11, 1, tzinfo=UTC)
     assert _priced(created_at=None).cost_usd(ended) is None
     assert _priced(cpu=None).cost_usd(ended) is None
+    assert _priced(spot=None).cost_usd(ended) is None
 
 
 @pytest.mark.parametrize(("status", "ended"), [("running", False), ("deleting", True), ("stopped", True)])

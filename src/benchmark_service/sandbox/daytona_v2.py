@@ -194,11 +194,11 @@ class DaytonaV2Sandbox(Sandbox):
         return self.state in _ENDED_STATUSES
 
     def cost_usd(self, ended_at: datetime) -> float | None:
-        cpu, memory_mib = self._data.get("cpu"), self._data.get("memory_mib")
-        if self.created_at is None or cpu is None or memory_mib is None:
+        cpu, memory_mib, spot = self._data.get("cpu"), self._data.get("memory_mib"), self._data.get("spot")
+        if self.created_at is None or cpu is None or memory_mib is None or not isinstance(spot, bool):
             return None
         per_hour = float(cpu) * ZEN5_CORE_USD_PER_HOUR + float(memory_mib) / 1024 * MEMORY_GIB_USD_PER_HOUR
-        if self._data.get("spot") is True:
+        if spot:
             per_hour *= PREEMPTIBLE_MULTIPLIER
         return per_hour * max((ended_at - self.created_at).total_seconds(), 0) / 3600
 

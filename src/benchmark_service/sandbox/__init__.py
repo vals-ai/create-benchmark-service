@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Annotated, Any
+from typing import Annotated, Any, get_args
 
 from pydantic import Field, TypeAdapter
 
@@ -48,6 +48,12 @@ def sandbox_provider_config_from_mapping(data: Mapping[str, Any]) -> SandboxProv
     return _provider_config_adapter.validate_python(data)
 
 
+def priced_provider_types() -> list[str]:
+    """Provider types whose sandboxes price themselves through ``Sandbox.cost_usd``."""
+    configs = get_args(get_args(SandboxProviderConfig)[0])
+    return [config.model_fields["type"].default for config in configs if getattr(config, "prices_sandboxes", False)]
+
+
 __all__ = [
     "ComposeSource",
     "ComposeSandbox",
@@ -78,5 +84,6 @@ __all__ = [
     "SnapshotSource",
     "TargetedSnapshotSource",
     "VolumeMount",
+    "priced_provider_types",
     "sandbox_provider_config_from_mapping",
 ]

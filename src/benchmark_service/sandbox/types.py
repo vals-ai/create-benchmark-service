@@ -352,6 +352,18 @@ class Sandbox(ABC):
         """Provider-reported attributes (runner id, image revision, ...) useful for debugging allocation."""
         return {}
 
+    @property
+    def has_ended(self) -> bool:
+        """True once the provider reports the sandbox stopped or deleted, so its lifetime is final."""
+        return False
+
+    def cost_usd(self, ended_at: datetime) -> float | None:
+        """Cost from ``created_at`` to ``ended_at`` at the provider's published rates.
+
+        None when the provider isn't priced from rates or the sandbox lacks the fields to price it.
+        """
+        return None
+
     @abstractmethod
     async def exec(
         self,

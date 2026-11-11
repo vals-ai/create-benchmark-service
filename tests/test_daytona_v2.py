@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
@@ -10,6 +11,8 @@ import httpx
 import pytest
 
 from benchmark_service.sandbox import (
+    ComposeSandbox,
+    ComposeSource,
     DaytonaProviderConfig,
     DaytonaV2ProviderConfig,
     ImageSource,
@@ -19,6 +22,7 @@ from benchmark_service.sandbox import (
     SandboxCreateRequest,
     SandboxError,
     SandboxNotFoundError,
+    priced_provider_types,
     sandbox_provider_config_from_mapping,
 )
 from benchmark_service.sandbox import daytona_v2
@@ -454,3 +458,47 @@ async def test_sandbox_is_deleted_when_announcement_is_cancelled() -> None:
         await _provider(handler).create_sandbox(_request(0.25))
 
     assert deleted == ["/sandboxes/sb-1"]
+
+
+def _priced(**data: Any) -> DaytonaV2Sandbox:
+    fields: dict[str, Any] = {
+        "id": "a",
+        "status": "deleted",
+        "created_at": "2026-11-11T00:00:00Z",
+        "cpu": 0.25,
+        "memory_mib": 2048,
+        "spot": False,
+    }
+    fields.update(data)
+    return DaytonaV2Sandbox(fields, httpx.AsyncClient())
+
+
+def test_cost_is_cores_and_memory_over_lifetime() -> None:
+    ended = datetime(2026, 11, 11, 0, 30, tzinfo=UTC)
+    on_demand, spot = _priced().cost_usd(ended), _priced(spot=True).cost_usd(ended)
+    assert on_demand is not None and math.isclose(on_demand, (0.25 * 0.235 + 2 * 0.0162) / 2)
+    assert spot is not None and math.isclose(spot, 0.7 * on_demand)
+
+
+def test_cost_needs_created_at_and_resources() -> None:
+    ended = datetime(2026, 11, 11, 1, tzinfo=UTC)
+    assert _priced(created_at=None).cost_usd(ended) is None
+    assert _priced(cpu=None).cost_usd(ended) is None
+    assert _priced(spot=None).cost_usd(ended) is None
+
+
+def test_compose_sandbox_is_priced_as_its_outer_sandbox() -> None:
+    outer = _priced()
+    compose = ComposeSandbox(outer, ComposeSource(outer=ImageSource(image="docker:28.3.3-dind")))
+    ended = datetime(2026, 11, 11, 0, 30, tzinfo=UTC)
+    assert compose.has_ended is True
+    assert compose.cost_usd(ended) == outer.cost_usd(ended)
+
+
+@pytest.mark.parametrize(("status", "ended"), [("running", False), ("deleting", True), ("stopped", True)])
+def test_has_ended_follows_status(status: str, ended: bool) -> None:
+    assert _priced(status=status).has_ended is ended
+
+
+def test_only_daytona_v2_is_priced_from_rates() -> None:
+    assert priced_provider_types() == ["daytona_v2"]

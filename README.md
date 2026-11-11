@@ -181,7 +181,14 @@ allocate capacity or enforce a caller's scheduling policy.
 ```json
 {"type": "daytona", "DAYTONA_API_KEY": "...", "DAYTONA_API_URL": "...", "DAYTONA_TARGET": "...", "DAYTONA_ORGANIZATION_ID": "..."}
 {"type": "modal", "MODAL_TOKEN_ID": "...", "MODAL_TOKEN_SECRET": "..."}
+{"type": "daytona_v2", "DAYTONA_V2_API_KEY": "...", "DAYTONA_V2_API_URL": "https://api.daytona.com", "DAYTONA_V2_REGION": "...", "DAYTONA_V2_SPOT": false}
 ```
+
+`daytona_v2` is opt-in (Daytona v2 API, alpha):
+- Keeps fractional `vcpu`; v0 `daytona` rounds it up because the v0 API takes whole CPUs.
+- Converts units: `cpu` cores = `vcpu / 2` (1 core = 2 vCPUs), `memory_mib` / `disk_mib` = GiB x 1024.
+- Supports `image`, `snapshot` (an existing v2 image name or id) and self-contained `dockerfile` sources (no local `COPY`/`ADD` context).
+- Rejects GPUs, volumes and sandbox secrets.
 
 When a setup or evaluate-instance request omits `sandbox_provider`, the Daytona header fallback reads
 `x-api-key`, `x-api-url`, and `x-target`, plus optional `x-organization-id`. The
@@ -627,7 +634,9 @@ Daytona is the default grading provider and reads `DAYTONA_API_KEY`,
 `DAYTONA_API_URL`, and `DAYTONA_TARGET`. Optional `DAYTONA_ORGANIZATION_ID`
 enables organization-scoped capacity admission. Set
 `GRADING_SANDBOX_PROVIDER=modal` to use Modal with `MODAL_TOKEN_ID` and
-`MODAL_TOKEN_SECRET`. Artifact-capable benchmarks also require
+`MODAL_TOKEN_SECRET`, or `GRADING_SANDBOX_PROVIDER=daytona_v2` to use Daytona v2
+with `DAYTONA_V2_API_KEY` (optional `DAYTONA_V2_API_URL`, `DAYTONA_V2_REGION`,
+`DAYTONA_V2_SPOT`). Artifact-capable benchmarks also require
 `SUBMISSION_ARTIFACT_BUCKET` and `AWS_REGION`; missing server configuration
 fails at startup. The task's `eval_sandbox` spec can override the grading
 source, image-backed resources, timeout, and network policy. Evaluator secrets
@@ -746,7 +755,7 @@ Pydantic models used across requests and responses:
 - **`SandboxSource`** — `ImageSource`, `SnapshotSource`, top-level Daytona-only `TargetedSnapshotSource`, `DockerfileSource`, or `ComposeSource` with an outer image/snapshot
 - **`EvalSandboxSpec`** — grading overrides whose optional `source` is an image or snapshot, never `ComposeSource`
 - **`GradingSubmission`** — typed `TextGradingSubmission` or `ArtifactGradingSubmission` passed only to the sandbox-grading hook
-- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`: `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET, DAYTONA_ORGANIZATION_ID=None)`, `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)`, or `DockerProviderConfig(type="docker")`. Docker requests require `CBS_DOCKER_ENABLED=true` on the benchmark service.
+- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`: `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET, DAYTONA_ORGANIZATION_ID=None)`, `DaytonaV2ProviderConfig(type="daytona_v2", DAYTONA_V2_API_KEY, DAYTONA_V2_API_URL="https://api.daytona.com", DAYTONA_V2_REGION=None, DAYTONA_V2_SPOT=False)`, `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)`, or `DockerProviderConfig(type="docker")`. Docker requests require `CBS_DOCKER_ENABLED=true` on the benchmark service.
 - **`Resources`** — `vcpu`, `memory`, `disk`, optional `gpu` (count, default 0) and `gpu_type` (one type or a list of acceptable types, in order of preference; requires `gpu >= 1`)
 - **`VolumeMount`** — named persistent volume, absolute `mount_path`, optional `read_only`, `create_if_missing`, and relative `subpath`; `{run_id}` in a subpath resolves from the sandbox's `run-id` or `run_id` label and fails when that label is absent
 - **`GradingRequirementsRequest`** / **`GradingRequirementsResponse`** — task ID and nullable dataset select the complete Gateway model keys for that task

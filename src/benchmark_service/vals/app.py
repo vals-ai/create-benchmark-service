@@ -21,6 +21,7 @@ from benchmark_service.observability import EMAIL_HEADER
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.sandbox import (
     DaytonaProviderConfig,
+    DaytonaV2ProviderConfig,
     ModalProviderConfig,
     SandboxProvider,
     SandboxProviderConfig,
@@ -97,6 +98,8 @@ def _grading_provider_config() -> SandboxProviderConfig:
     provider_type = os.environ.get(GRADING_SANDBOX_PROVIDER_ENV) or "daytona"
     if provider_type == "daytona":
         return DaytonaProviderConfig.from_env()
+    if provider_type == "daytona_v2":
+        return DaytonaV2ProviderConfig.from_env()
     if provider_type == "modal":
         return ModalProviderConfig.from_env()
     return sandbox_provider_config_from_mapping({"type": provider_type})

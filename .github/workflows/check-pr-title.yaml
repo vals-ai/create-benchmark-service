@@ -7,7 +7,7 @@ on:
 
 jobs:
   check-pr-title:
-    runs-on: ubuntu-latest
+    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
     steps:
       - name: Check PR title for version tag
         env:

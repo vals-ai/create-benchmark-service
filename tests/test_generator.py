@@ -143,7 +143,7 @@ def test_generates_project_structure() -> None:
         assert (output_dir / ".github" / "workflows").is_dir()
 
 
-def test_generated_project_includes_release_workflows_but_not_cli_integration(tmp_path: Path) -> None:
+def test_generated_project_includes_release_workflows_but_not_framework_ci(tmp_path: Path) -> None:
     output_dir = tmp_path / "swebench-benchmark-service"
     generate_project("swebench", output_dir)
 
@@ -153,10 +153,9 @@ def test_generated_project_includes_release_workflows_but_not_cli_integration(tm
     assert (workflows_dir / "typecheck.yaml").exists()
     assert (workflows_dir / "auto-tag-release.yaml").exists()
     assert (workflows_dir / "check-pr-title.yaml").exists()
-    assert not (workflows_dir / "cli-integration.yaml").exists()
+    assert not (workflows_dir / "ci.yaml").exists()
     assert not (workflows_dir / "provider-integration.yaml").exists()
-    assert not (workflows_dir / "docker-integration.yaml").exists()
-    assert not (workflows_dir / "grading.yaml").exists()
+    assert "blacksmith" not in "".join(path.read_text() for path in workflows_dir.iterdir())
 
 
 @pytest.mark.parametrize("template", ["default", "vals-ai"])

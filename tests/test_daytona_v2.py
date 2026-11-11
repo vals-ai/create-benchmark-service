@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Callable
 from typing import Any
@@ -186,7 +187,9 @@ def _sandbox(handler: Handler) -> DaytonaV2Sandbox:
     return DaytonaV2Sandbox({"id": "sb-1", "status": "running", "toolbox_proxy_url": f"{TOOLBOX}/"}, client)
 
 
-def _process_handler(exit_code: int, created: list[dict[str, Any]]) -> Handler:
+def _process_handler(
+    exit_code: int, created: list[dict[str, Any]], signals: list[dict[str, Any]] | None = None
+) -> Handler:
     pages = {
         None: {"frames": [{"channel": "stdout", "data": "hi "}], "nextCursor": "c1", "eof": False},
         "c1": {"frames": [{"channel": "stderr", "data": "err"}], "nextCursor": "c2", "eof": True},
@@ -202,6 +205,9 @@ def _process_handler(exit_code: int, created: list[dict[str, Any]]) -> Handler:
             return httpx.Response(200, json=pages[request.url.params.get("cursor")])
         if path == "/sb-1/processes/p1":
             return httpx.Response(200, json={"id": "p1", "state": "exited", "exitCode": exit_code})
+        if signals is not None and path == "/sb-1/processes/p1/signals":
+            signals.append(json.loads(request.content))
+            return httpx.Response(202, json={})
         raise AssertionError(f"unexpected {request.method} {path}")
 
     return handler
@@ -222,6 +228,39 @@ async def test_command_streams_output_and_raises_on_failure() -> None:
             chunks.append(chunk)
     assert chunks == ["hi ", "err"]
     assert created[0]["env"] == {"K": "v"}
+
+
+STOP_SIGNAL = {"signal": "SIGTERM", "escalateAfterMs": 5000, "escalateTo": "SIGKILL"}
+
+
+async def test_closing_command_stops_remote_process() -> None:
+    signals: list[dict[str, Any]] = []
+    stream = _sandbox(_process_handler(0, [], signals)).command("serve")
+    assert await anext(stream) == "hi "
+    await stream.aclose()
+    assert signals == [STOP_SIGNAL]
+
+
+async def test_cancelling_exec_stops_remote_process() -> None:
+    signals: list[dict[str, Any]] = []
+    polled = asyncio.Event()
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/sb-1/processes":
+            return httpx.Response(201, json={"id": "p1", "state": "running"})
+        if request.url.path == "/sb-1/processes/p1/logs":
+            polled.set()
+            return httpx.Response(200, json={"frames": [], "nextCursor": None, "eof": False})
+        assert request.url.path == "/sb-1/processes/p1/signals"
+        signals.append(json.loads(request.content))
+        return httpx.Response(202, json={})
+
+    task = asyncio.create_task(_sandbox(handler).exec("sleep 100"))
+    await polled.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert signals == [STOP_SIGNAL]
 
 
 async def test_file_transfer_uses_toolbox_paths() -> None:

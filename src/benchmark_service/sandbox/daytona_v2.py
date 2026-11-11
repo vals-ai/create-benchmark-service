@@ -9,7 +9,7 @@ import asyncio
 import json
 import os
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping
-from contextlib import asynccontextmanager, suppress
+from contextlib import aclosing, asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import quote
@@ -42,6 +42,7 @@ MIB_PER_GIB = 1024
 VCPUS_PER_CORE = 2
 _POLL_SECONDS = 1.0
 _WAIT_MS = 30_000
+_KILL_AFTER_MS = 5_000
 _RUNNING = "running"
 _FAILED_SANDBOX_STATUSES = frozenset({"failed", "lost", "stopped", "deleting", "deleted"})
 _FAILED_IMAGE_STATUSES = frozenset({"failed", "error"})
@@ -189,31 +190,48 @@ class DaytonaV2Sandbox(Sandbox):
         """Yield output text, then the exit code as the final int."""
         process = await self._start_process(command, cwd, timeout, env, 0)
         process_id = str(process["id"])
-        cursor: str | None = None
-        while True:
-            page = await self._log_frames(process_id, cursor)
-            frames: list[dict[str, Any]] = page.get("frames") or []
-            for frame in frames:
-                if frame.get("channel") in ("stdout", "stderr", "pty"):
-                    yield str(frame.get("data", ""))
-            next_cursor = page.get("nextCursor")
-            if page.get("eof"):
-                break
-            if not frames or next_cursor == cursor:
-                await asyncio.sleep(_POLL_SECONDS)
-            cursor = next_cursor or cursor
-        while (exit_code := process.get("exitCode")) is None:
-            process = await self._process(process_id)
-        yield int(exit_code)
+        exit_code: int | None = None
+        try:
+            cursor: str | None = None
+            while True:
+                page = await self._log_frames(process_id, cursor)
+                frames: list[dict[str, Any]] = page.get("frames") or []
+                for frame in frames:
+                    if frame.get("channel") in ("stdout", "stderr", "pty"):
+                        yield str(frame.get("data", ""))
+                next_cursor = page.get("nextCursor")
+                if page.get("eof"):
+                    break
+                if not frames or next_cursor == cursor:
+                    await asyncio.sleep(_POLL_SECONDS)
+                cursor = next_cursor or cursor
+            while (exit_code := process.get("exitCode")) is None:
+                process = await self._process(process_id)
+            yield int(exit_code)
+        finally:
+            if exit_code is None:
+                await self._stop_process(process_id)
+
+    async def _stop_process(self, process_id: str) -> None:
+        """SIGTERM a process its caller cancelled or closed, escalating to SIGKILL."""
+        with suppress(SandboxError):
+            await _send(
+                self._client,
+                "POST",
+                f"{self._toolbox}/processes/{quote(process_id, safe='')}/signals",
+                f"stop {process_id} in {self.id}",
+                json={"signal": "SIGTERM", "escalateAfterMs": _KILL_AFTER_MS, "escalateTo": "SIGKILL"},
+            )
 
     async def exec(self, command: str, *, cwd: str | None = None, timeout: float | None = None) -> ExecResult:
         output: list[str] = []
         exit_code = -1
-        async for item in self._stream(command, cwd, timeout, None):
-            if isinstance(item, int):
-                exit_code = item
-            else:
-                output.append(item)
+        async with aclosing(self._stream(command, cwd, timeout, None)) as stream:
+            async for item in stream:
+                if isinstance(item, int):
+                    exit_code = item
+                else:
+                    output.append(item)
         return ExecResult(exit_code=exit_code, output="".join(output))
 
     async def command(
@@ -225,12 +243,13 @@ class DaytonaV2Sandbox(Sandbox):
         env_vars: Mapping[str, str] | None = None,
     ) -> AsyncGenerator[str, None]:
         env = validate_command_env(env_vars)
-        async for item in self._stream(command, cwd, timeout, env):
-            if isinstance(item, int):
-                if item != 0:
-                    raise SandboxCommandError(item)
-            else:
-                yield item
+        async with aclosing(self._stream(command, cwd, timeout, env)) as stream:
+            async for item in stream:
+                if isinstance(item, int):
+                    if item != 0:
+                        raise SandboxCommandError(item)
+                else:
+                    yield item
 
     @asynccontextmanager
     async def _missing_path_is_error(self, remote_path: str) -> AsyncIterator[None]:

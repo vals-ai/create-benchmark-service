@@ -158,11 +158,20 @@ def _created_at(sandbox: Mapping[str, Any]) -> datetime | None:
 
 
 # On-demand AMD Zen 5 rates from the https://www.daytona.com/pricing calculator, billed per second while
-# running. Ephemeral disk and the Linux licence are $0. The region multiplier is taken as 1.0: Daytona
-# documents earth at 1.0, and the default region's multiplier needs an org key with read:billing to read.
+# running. Ephemeral disk and the Linux licence are $0. Region multipliers scale every base rate; they come
+# from GET /orgs/{org_id}/billing/region-multipliers for the Vals org, and match
+# https://www.daytona.com/docs/en/regions (us-east-ash-1 at 2.0x). A sandbox's region_id is the region it
+# was placed in, never a broader one it was requested in.
 ZEN5_CORE_USD_PER_HOUR = 0.235
 MEMORY_GIB_USD_PER_HOUR = 0.0162
 PREEMPTIBLE_MULTIPLIER = 0.7
+REGION_MULTIPLIERS: dict[str, float] = {
+    "earth": 1.0,
+    "us": 1.15,
+    "us-east": 1.75,
+    "us-east-ash-1": 2.0,
+    "us-east-bos-1": 2.0,
+}
 _ENDED_STATUSES = frozenset({"stopped", "deleting", "deleted", "failed", "lost"})
 
 
@@ -195,9 +204,10 @@ class DaytonaV2Sandbox(Sandbox):
 
     def cost_usd(self, ended_at: datetime) -> float | None:
         cpu, memory_mib, spot = self._data.get("cpu"), self._data.get("memory_mib"), self._data.get("spot")
-        if self.created_at is None or cpu is None or memory_mib is None or not isinstance(spot, bool):
+        region = REGION_MULTIPLIERS.get(self._data.get("region_id") or "")
+        if self.created_at is None or cpu is None or memory_mib is None or not isinstance(spot, bool) or region is None:
             return None
-        per_hour = float(cpu) * ZEN5_CORE_USD_PER_HOUR + float(memory_mib) / 1024 * MEMORY_GIB_USD_PER_HOUR
+        per_hour = (float(cpu) * ZEN5_CORE_USD_PER_HOUR + float(memory_mib) / 1024 * MEMORY_GIB_USD_PER_HOUR) * region
         if spot:
             per_hour *= PREEMPTIBLE_MULTIPLIER
         return per_hour * max((ended_at - self.created_at).total_seconds(), 0) / 3600

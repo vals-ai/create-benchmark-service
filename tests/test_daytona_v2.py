@@ -468,6 +468,7 @@ def _priced(**data: Any) -> DaytonaV2Sandbox:
         "cpu": 0.25,
         "memory_mib": 2048,
         "spot": False,
+        "region_id": "us-east-ash-1",
     }
     fields.update(data)
     return DaytonaV2Sandbox(fields, httpx.AsyncClient())
@@ -476,8 +477,10 @@ def _priced(**data: Any) -> DaytonaV2Sandbox:
 def test_cost_is_cores_and_memory_over_lifetime() -> None:
     ended = datetime(2026, 11, 11, 0, 30, tzinfo=UTC)
     on_demand, spot = _priced().cost_usd(ended), _priced(spot=True).cost_usd(ended)
-    assert on_demand is not None and math.isclose(on_demand, (0.25 * 0.235 + 2 * 0.0162) / 2)
+    assert on_demand is not None and math.isclose(on_demand, 2.0 * (0.25 * 0.235 + 2 * 0.0162) / 2)
     assert spot is not None and math.isclose(spot, 0.7 * on_demand)
+    earth = _priced(region_id="earth").cost_usd(ended)
+    assert earth is not None and math.isclose(earth, on_demand / 2)
 
 
 def test_cost_needs_created_at_and_resources() -> None:
@@ -485,6 +488,8 @@ def test_cost_needs_created_at_and_resources() -> None:
     assert _priced(created_at=None).cost_usd(ended) is None
     assert _priced(cpu=None).cost_usd(ended) is None
     assert _priced(spot=None).cost_usd(ended) is None
+    assert _priced(region_id=None).cost_usd(ended) is None
+    assert _priced(region_id="eu-central-fra-1").cost_usd(ended) is None
 
 
 def test_compose_sandbox_is_priced_as_its_outer_sandbox() -> None:

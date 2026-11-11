@@ -8,8 +8,7 @@ import re
 import shlex
 import socket
 import uuid
-from collections import deque
-from collections.abc import AsyncGenerator, AsyncIterable, Awaitable, Callable, Coroutine, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Coroutine, Mapping
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
 
@@ -27,23 +26,12 @@ from grpclib.exceptions import GRPCError, ProtocolError, StreamTerminatedError
 from pydantic import BaseModel
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
-from benchmark_service.sandbox._process_group import (
-    cleanup_command,
-    episode_owner_command,
-    owner_command,
-    probe_command,
-    stop_command,
-)
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.gpu import modal_gpu_type
 from benchmark_service.sandbox.types import (
-    ControlledWorkload,
-    ControlledWorkloadResult,
     DockerfileSource,
     ExecResult,
-    GenerationContainment,
     ImageSource,
-    LINUX_PROCESS_GROUP_V1,
     MAX_SANDBOX_LIFETIME_SECONDS,
     MissingSandboxConfigError,
     Sandbox,
@@ -205,35 +193,6 @@ class ModalSandbox(Sandbox):
     def state(self) -> str:
         # Modal does not expose a cached lifecycle state on the sandbox handle.
         return "unknown"
-
-    @property
-    def generation_containment(self) -> GenerationContainment:
-        return LINUX_PROCESS_GROUP_V1
-
-    async def probe_generation_containment(self) -> None:
-        marker = f"/tmp/.cbs-probe-{uuid.uuid4().hex}"
-        result = await self.exec(probe_command(marker))
-        if result.exit_code != 0:
-            raise SandboxError(f"Modal sandbox does not support process groups: {result.output}")
-
-    def _process_group_workload(
-        self, command: str, episode_script: str | None, *, cwd: str | None, env_vars: Mapping[str, str] | None
-    ) -> ControlledWorkload:
-        return _ModalControlledWorkload(
-            self, command, cwd, validate_command_env(env_vars), self._start_controlled_process, episode_script
-        )
-
-    async def _start_controlled_process(
-        self, command: str, env_vars: dict[str, str]
-    ) -> tuple[AsyncIterable[str], Coroutine[Any, Any, int]]:
-        await self._raise_if_finished()
-        modal_env: dict[str, str | None] = {name: value for name, value in env_vars.items()}
-        try:
-            # Do not use _start_process: its retry could create another workload on an ambiguous exec failure.
-            process = await self._sandbox.exec.aio("/bin/sh", "-lc", command, env=modal_env, text=True)
-        except _PROVIDER_ERRORS as exc:
-            raise _sandbox_error(exc) from exc
-        return process.stdout, process.wait.aio()
 
     @_PROVIDER_RETRY
     async def _raise_if_finished(self, *, attempts: int = 1, wait_seconds: float = 0) -> None:
@@ -475,158 +434,6 @@ async def _resolve_ipv4(host: str) -> list[str]:
     except OSError:
         return []
     return [str(info[4][0]) for info in infos]
-
-
-
-class _ModalControlledWorkload(ControlledWorkload):
-    def __init__(
-        self,
-        sandbox: ModalSandbox,
-        command: str,
-        cwd: str | None,
-        env_vars: dict[str, str],
-        start_process: Callable[[str, dict[str, str]], Awaitable[tuple[AsyncIterable[str], Coroutine[Any, Any, int]]]],
-        episode_script: str | None,
-    ) -> None:
-        self._sandbox = sandbox
-        self._command = command
-        self._cwd = cwd
-        self._env_vars = env_vars
-        self._start_process = start_process
-        self._episode_script = episode_script
-        self._marker = f"/tmp/.cbs-controlled-{uuid.uuid4().hex}"
-        self._output: asyncio.Queue[str] = asyncio.Queue()
-        self._tail: deque[str] = deque()
-        self._tail_bytes = 0
-        self._output_changed = asyncio.Event()
-        self._output_detached = False
-        self._launch_task = asyncio.create_task(self._launch())
-        self._wait_task = asyncio.create_task(self._finish())
-        self._stop_task: asyncio.Task[tuple[float, int | None]] | None = None
-        self._cleanup_task: asyncio.Task[None] | None = None
-        self._read_task: asyncio.Task[None] | None = None
-        self._process_wait_task: asyncio.Task[int] | None = None
-        self._agent_absence_confirmed_at: float | None = None
-
-    @property
-    def agent_absence_confirmed_at(self) -> float | None:
-        return self._agent_absence_confirmed_at
-
-    async def _launch(self) -> None:
-        command = f"cd {shlex.quote(self._cwd)} && {self._command}" if self._cwd else self._command
-        # Modal exposes separate stdout/stderr pipes. Merge them before either
-        # owner; the shell owner saves FD 4 to suppress its own kill notice.
-        owner = (
-            episode_owner_command(command, self._marker, self._episode_script)
-            if self._episode_script is not None
-            else owner_command(command, self._marker, "sh -lc", keep_background=True)
-        )
-        inner = f"exec 2>&1; {owner}"
-        output, process_wait = await self._start_process(inner, self._env_vars)
-        self._read_task = asyncio.create_task(self._read_output(output))
-        self._process_wait_task = asyncio.create_task(process_wait)
-
-    async def _read_output(self, output: AsyncIterable[str]) -> None:
-        try:
-            async for text in output:
-                if self._output_detached:
-                    continue
-                self._output.put_nowait(text)
-                self._tail.append(text)
-                self._tail_bytes += len(text.encode("utf-8"))
-                while self._tail_bytes > _CONTROLLED_OUTPUT_TAIL_BYTES:
-                    excess = self._tail_bytes - _CONTROLLED_OUTPUT_TAIL_BYTES
-                    first = self._tail[0].encode("utf-8")
-                    if len(first) <= excess:
-                        self._tail_bytes -= len(first)
-                        self._tail.popleft()
-                    else:
-                        self._tail[0] = first[excess:].decode("utf-8", errors="ignore")
-                        self._tail_bytes -= len(first) - len(self._tail[0].encode("utf-8"))
-                self._output_changed.set()
-        except _PROVIDER_ERRORS as exc:
-            raise _sandbox_error(exc) from exc
-        finally:
-            self._output_changed.set()
-
-    async def output(self) -> AsyncGenerator[str, None]:
-        await asyncio.shield(self._launch_task)
-        assert self._read_task is not None
-        while True:
-            if not self._output.empty():
-                yield self._output.get_nowait()
-                continue
-            if self._read_task.done():
-                await self._read_task
-                return
-            if self._output_detached:
-                return
-            self._output_changed.clear()
-            await self._output_changed.wait()
-
-    async def _finish(self) -> ControlledWorkloadResult:
-        await self._launch_task
-        assert self._process_wait_task is not None
-        assert self._read_task is not None
-        try:
-            exit_code = await self._process_wait_task
-        except _PROVIDER_ERRORS as exc:
-            raise _sandbox_error(exc) from exc
-        stopped_at, status = await self._ensure_stopped()
-        assert self._cleanup_task is not None
-        await self._cleanup_task
-        if not self._output_detached:
-            await self._read_task
-        if status is None and exit_code == 0:
-            raise SandboxError("Modal workload exited without a foreground status")
-        return ControlledWorkloadResult(
-            ExecResult(exit_code=status if status is not None else exit_code, output="".join(self._tail)),
-            stopped_at,
-        )
-
-    async def wait(self) -> ControlledWorkloadResult:
-        return await asyncio.shield(self._wait_task)
-
-    async def kill(self) -> None:
-        await asyncio.shield(self._launch_task)
-        await asyncio.shield(self._ensure_stopped())
-
-    async def _ensure_stopped(self) -> tuple[float, int | None]:
-        if self._stop_task is None:
-            self._stop_task = asyncio.create_task(self._stop())
-        return await self._stop_task
-
-    async def _stop(self) -> tuple[float, int | None]:
-        await self._launch_task
-        assert self._process_wait_task is not None
-        command = stop_command(
-            self._marker, episode_owner=self._episode_script is not None, keep_background=True
-        )
-        while True:
-            stopped = await self._sandbox.exec(command)
-            if stopped.exit_code == 0:
-                break
-            if stopped.exit_code != 75:
-                raise SandboxError(f"Modal process group did not stop: {stopped.output}")
-            if self._process_wait_task.done():
-                await self._process_wait_task
-                raise SandboxError("Modal workload finished without a process-group marker")
-            await asyncio.sleep(0.05)
-        self._agent_absence_confirmed_at = asyncio.get_running_loop().time()
-        self._cleanup_task = asyncio.create_task(self._cleanup())
-        return self._agent_absence_confirmed_at, int(stopped.output.strip()) if stopped.output.strip() else None
-
-    async def _cleanup(self) -> None:
-        assert self._process_wait_task is not None
-        assert self._read_task is not None
-        await asyncio.gather(self._process_wait_task, return_exceptions=True)
-        await asyncio.wait({self._read_task}, timeout=_OUTPUT_DRAIN_SECONDS)
-        if not self._read_task.done():
-            self._output_detached = True
-            self._output_changed.set()
-        removed = await self._sandbox.exec(cleanup_command(self._marker))
-        if removed.exit_code != 0:
-            raise SandboxError(f"Modal process-group control cleanup failed: {removed.output}")
 
 
 class ModalSandboxProvider(SandboxProvider):

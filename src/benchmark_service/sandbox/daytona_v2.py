@@ -54,6 +54,8 @@ _FAILED_IMAGE_STATUSES = frozenset({"failed", "error"})
 _DELETED_SANDBOX_STATUSES = frozenset({"deleting", "deleted"})
 _TIMEOUT_EXIT_CODE = 124
 _POLICY_TIMEOUT_SECONDS = 60.0
+_RESERVED_ENV_PREFIX = "DAYTONA_"
+_ALLOWED_RESERVED_ENV = frozenset({"DAYTONA_API_URL", "DAYTONA_OTEL_ENDPOINT", "DAYTONA_DOCKER_START"})
 
 
 class DaytonaV2ProviderConfig(BaseModel):
@@ -438,7 +440,11 @@ class DaytonaV2SandboxProvider(SandboxProvider):
             "image": image,
             "name": request.name,
             "labels": request.labels,
-            "env": request.env_vars,
+            "env": {
+                name: value
+                for name, value in request.env_vars.items()
+                if not name.startswith(_RESERVED_ENV_PREFIX) or name in _ALLOWED_RESERVED_ENV
+            },
             **v2_resources(request.resources),
             "spot": self._config.DAYTONA_V2_SPOT,
             "create_timeout_seconds": request.create_timeout,

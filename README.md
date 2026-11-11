@@ -189,6 +189,8 @@ allocate capacity or enforce a caller's scheduling policy.
 - Converts units: `cpu` cores = `vcpu / 2` (1 core = 2 vCPUs), `memory_mib` / `disk_mib` = GiB x 1024.
 - Supports `image`, `snapshot` (an existing v2 image name or id) and self-contained `dockerfile` sources (no local `COPY`/`ADD` context).
 - Rejects GPUs, volumes and sandbox secrets.
+- No controlled workloads: `probe_generation_containment()` and `controlled_workload()` raise `ControlledWorkloadUnsupportedError`, so tasks that need `GenerationContainment` can't run on it.
+- Egress is set only at creation (`network_block_all`). `modify_egress_rules`, `block_all_egress` and `clear_egress_rules` raise, so eval resume with a non-empty `egress.evaluation` list fails right after it creates the sandbox.
 - Does not send `sandbox_created` announcements yet: `SandboxCreatedData.provider` only accepts `daytona`.
 
 When a setup or evaluate-instance request omits `sandbox_provider`, the Daytona header fallback reads

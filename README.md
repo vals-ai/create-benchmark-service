@@ -189,6 +189,7 @@ allocate capacity or enforce a caller's scheduling policy.
 - Converts units: `cpu` cores = `vcpu / 2` (1 core = 2 vCPUs), `memory_mib` / `disk_mib` = GiB x 1024.
 - Supports `image`, `snapshot` (an existing v2 image name or id) and self-contained `dockerfile` sources (no local `COPY`/`ADD` context).
 - Rejects GPUs, volumes and sandbox secrets.
+- Does not send `sandbox_created` announcements yet: `SandboxCreatedData.provider` only accepts `daytona`.
 
 When a setup or evaluate-instance request omits `sandbox_provider`, the Daytona header fallback reads
 `x-api-key`, `x-api-url`, and `x-target`, plus optional `x-organization-id`. The

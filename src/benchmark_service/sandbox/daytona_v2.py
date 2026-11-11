@@ -9,8 +9,9 @@ import asyncio
 import json
 import os
 from collections.abc import AsyncGenerator, Mapping
+from contextlib import contextmanager, suppress
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
 from urllib.parse import quote
 
 import httpx
@@ -56,6 +57,8 @@ class DaytonaV2ProviderConfig(BaseModel):
     @field_validator("DAYTONA_V2_API_URL")
     @classmethod
     def _normalize_api_url(cls, value: str) -> str:
+        if not value.startswith("https://"):
+            raise ValueError("DAYTONA_V2_API_URL must use https")
         return value.rstrip("/")
 
     @classmethod
@@ -101,6 +104,15 @@ async def _send(client: httpx.AsyncClient, method: str, url: str, what: str, **k
     except httpx.HTTPError as exc:
         raise _error(exc, what) from exc
     return response
+
+
+@contextmanager
+def _missing_path_is_error(remote_path: str, sandbox_id: str) -> Iterator[None]:
+    """A toolbox 404 names a missing file, not a lost sandbox, so recovery must not replace it."""
+    try:
+        yield
+    except SandboxNotFoundError as exc:
+        raise SandboxError(f"{remote_path} not found in sandbox {sandbox_id}") from exc
 
 
 def _toolbox_url(sandbox: Mapping[str, Any]) -> str:
@@ -230,23 +242,25 @@ class DaytonaV2Sandbox(Sandbox):
                 yield item
 
     async def upload_file(self, remote_path: str, content: bytes) -> None:
-        await _send(
-            self._client,
-            "POST",
-            f"{self._toolbox}/files/upload",
-            f"upload {remote_path} to {self.id}",
-            params={"path": remote_path},
-            files={"file": (Path(remote_path).name or "file", content, "application/octet-stream")},
-        )
+        with _missing_path_is_error(remote_path, self.id):
+            await _send(
+                self._client,
+                "POST",
+                f"{self._toolbox}/files/upload",
+                f"upload {remote_path} to {self.id}",
+                params={"path": remote_path},
+                files={"file": (Path(remote_path).name or "file", content, "application/octet-stream")},
+            )
 
     async def download_file(self, remote_path: str) -> bytes:
-        response = await _send(
-            self._client,
-            "GET",
-            f"{self._toolbox}/files/download",
-            f"download {remote_path} from {self.id}",
-            params={"path": remote_path},
-        )
+        with _missing_path_is_error(remote_path, self.id):
+            response = await _send(
+                self._client,
+                "GET",
+                f"{self._toolbox}/files/download",
+                f"download {remote_path} from {self.id}",
+                params={"path": remote_path},
+            )
         return response.content
 
 
@@ -288,7 +302,7 @@ class DaytonaV2SandboxProvider(SandboxProvider):
             ).json()
         return str(image["id"])
 
-    def _create_body(self, request: SandboxCreateRequest, image: str) -> dict[str, Any]:
+    def _reject_unsupported(self, request: SandboxCreateRequest) -> None:
         unsupported = [
             name
             for name, used in (
@@ -300,6 +314,8 @@ class DaytonaV2SandboxProvider(SandboxProvider):
         ]
         if unsupported:
             raise SandboxError(f"Daytona v2 provider does not support: {', '.join(unsupported)}")
+
+    def _create_body(self, request: SandboxCreateRequest, image: str) -> dict[str, Any]:
         body: dict[str, Any] = {
             "image": image,
             "name": request.name,
@@ -324,6 +340,7 @@ class DaytonaV2SandboxProvider(SandboxProvider):
     async def create_sandbox(self, request: SandboxCreateRequest) -> DaytonaV2Sandbox:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + request.provider_timeout
+        self._reject_unsupported(request)
         image = await self._image(request.source, deadline)
         data = (
             await _send(
@@ -335,14 +352,18 @@ class DaytonaV2SandboxProvider(SandboxProvider):
                 headers={"Idempotency-Key": request.name},
             )
         ).json()
-        while data.get("status") != _RUNNING:
-            if data.get("status") in _FAILED_SANDBOX_STATUSES or loop.time() > deadline:
-                await self.delete_sandbox(str(data["id"]))
-                raise SandboxError(
-                    f"Daytona v2 sandbox {data['id']} did not start: {data.get('status')} {data.get('error') or ''}".strip()
-                )
-            await asyncio.sleep(_POLL_SECONDS)
-            data = await self._get(str(data["id"]))
+        sandbox_id = str(data["id"])
+        try:
+            while data.get("status") != _RUNNING:
+                if data.get("status") in _FAILED_SANDBOX_STATUSES or loop.time() > deadline:
+                    detail = f"{data.get('status')} {data.get('error') or ''}".strip()
+                    raise SandboxError(f"Daytona v2 sandbox {sandbox_id} did not start: {detail}")
+                await asyncio.sleep(_POLL_SECONDS)
+                data = await self._get(sandbox_id)
+        except BaseException:
+            with suppress(SandboxError):
+                await self.delete_sandbox(sandbox_id)
+            raise
         return DaytonaV2Sandbox(data, self._client)
 
     async def _get(self, instance_id: str) -> dict[str, Any]:

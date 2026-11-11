@@ -16,6 +16,7 @@ from benchmark_service.sandbox import (
     SandboxCommandError,
     SandboxCreateRequest,
     SandboxError,
+    SandboxNotFoundError,
     sandbox_provider_config_from_mapping,
 )
 from benchmark_service.sandbox import daytona_v2
@@ -72,6 +73,11 @@ def test_config_parses_from_mapping_and_v0_stays_distinct() -> None:
         {"type": "daytona", "DAYTONA_API_KEY": "k", "DAYTONA_API_URL": "u", "DAYTONA_TARGET": "us"}
     )
     assert isinstance(v0, DaytonaProviderConfig)
+
+
+def test_config_rejects_plain_http_api_url() -> None:
+    with pytest.raises(ValueError, match="https"):
+        DaytonaV2ProviderConfig(DAYTONA_V2_API_KEY="key", DAYTONA_V2_API_URL="http://api.daytona.com")
 
 
 def test_grading_provider_selects_v2_only_when_opted_in(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -149,13 +155,28 @@ async def test_failed_sandbox_is_deleted_and_raises() -> None:
     assert deleted == ["/sandboxes/sb-2"]
 
 
+async def test_sandbox_is_deleted_when_startup_polling_fails() -> None:
+    deleted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/sandboxes":
+            return httpx.Response(201, json={"id": "sb-3", "status": "pending"})
+        if request.method == "GET":
+            return httpx.Response(403, text="forbidden")
+        deleted.append(request.url.path)
+        return httpx.Response(204)
+
+    request = _request(0.5, source=daytona_v2.SnapshotSource(snapshot="tts-image"))
+    with pytest.raises(SandboxError, match="HTTP 403"):
+        await _provider(handler).create_sandbox(request)
+    assert deleted == ["/sandboxes/sb-3"]
+
+
 async def test_unsupported_features_fail_before_any_api_call() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         raise AssertionError("no request expected")
 
-    request = _request(
-        1, source=daytona_v2.SnapshotSource(snapshot="img"), resources=Resources(vcpu=1, memory=1, disk=1, gpu=1)
-    )
+    request = _request(1, resources=Resources(vcpu=1, memory=1, disk=1, gpu=1))
     with pytest.raises(SandboxError, match="gpu"):
         await _provider(handler).create_sandbox(request)
 
@@ -217,6 +238,13 @@ async def test_file_transfer_uses_toolbox_paths() -> None:
     await sandbox.upload_file("/tmp/in.txt", b"payload")
     assert await sandbox.download_file("/tmp/out.txt") == b"data"
     assert seen == [("POST", "/sb-1/files/upload", "/tmp/in.txt"), ("GET", "/sb-1/files/download", "/tmp/out.txt")]
+
+
+async def test_missing_file_is_not_a_lost_sandbox() -> None:
+    sandbox = _sandbox(lambda request: httpx.Response(404, text="no such file"))
+    with pytest.raises(SandboxError, match="/tmp/missing not found") as raised:
+        await sandbox.download_file("/tmp/missing")
+    assert not isinstance(raised.value, SandboxNotFoundError)
 
 
 async def test_list_sandboxes_pages_by_labels() -> None:

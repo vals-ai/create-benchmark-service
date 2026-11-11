@@ -1,0 +1,35 @@
+name: Check for relevant changes
+description: Outputs relevant=false only for a pull request or push whose diff touches none of the given paths.
+inputs:
+  paths:
+    description: Extended regex matched against each changed file path.
+    required: true
+outputs:
+  relevant:
+    description: Whether the calling job's work should run.
+    value: ${{ steps.rel.outputs.relevant }}
+runs:
+  using: composite
+  steps:
+    - id: rel
+      shell: bash
+      env:
+        PATHS: ${{ inputs.paths }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      run: |
+        if [ "$GITHUB_EVENT_NAME" != pull_request ] && [ "$GITHUB_EVENT_NAME" != push ]; then
+          relevant=true
+        elif [ -z "${BASE_SHA//0/}" ]; then
+          echo "No base revision to diff against; running to be safe."
+          relevant=true
+        elif ! changed="$(git diff --name-only "$BASE_SHA...$HEAD_SHA")"; then
+          echo "Could not compute the diff; running to be safe."
+          relevant=true
+        elif grep -qE "$PATHS" <<<"$changed"; then
+          relevant=true
+        else
+          echo "No changes match $PATHS; skipping."
+          relevant=false
+        fi
+        echo "relevant=$relevant" >> "$GITHUB_OUTPUT"

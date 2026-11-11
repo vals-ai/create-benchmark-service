@@ -182,7 +182,7 @@ async def test_unsupported_features_fail_before_any_api_call() -> None:
 
 
 def _sandbox(handler: Handler) -> DaytonaV2Sandbox:
-    client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = httpx.AsyncClient(base_url=API, transport=httpx.MockTransport(handler))
     return DaytonaV2Sandbox({"id": "sb-1", "status": "running", "toolbox_proxy_url": f"{TOOLBOX}/"}, client)
 
 
@@ -241,10 +241,20 @@ async def test_file_transfer_uses_toolbox_paths() -> None:
 
 
 async def test_missing_file_is_not_a_lost_sandbox() -> None:
-    sandbox = _sandbox(lambda request: httpx.Response(404, text="no such file"))
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/sandboxes/sb-1":
+            return httpx.Response(200, json={"id": "sb-1", "status": "running"})
+        return httpx.Response(404, text="no such file")
+
     with pytest.raises(SandboxError, match="/tmp/missing not found") as raised:
-        await sandbox.download_file("/tmp/missing")
+        await _sandbox(handler).download_file("/tmp/missing")
     assert not isinstance(raised.value, SandboxNotFoundError)
+
+
+async def test_file_transfer_on_lost_sandbox_raises_not_found() -> None:
+    sandbox = _sandbox(lambda request: httpx.Response(404, text="not found"))
+    with pytest.raises(SandboxNotFoundError):
+        await sandbox.upload_file("/tmp/in.txt", b"payload")
 
 
 async def test_list_sandboxes_pages_by_labels() -> None:

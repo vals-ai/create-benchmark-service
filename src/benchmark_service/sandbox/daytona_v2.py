@@ -8,10 +8,10 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from collections.abc import AsyncGenerator, Mapping
-from contextlib import contextmanager, suppress
+from collections.abc import AsyncGenerator, AsyncIterator, Mapping
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
-from typing import Any, Iterator, Literal
+from typing import Any, Literal
 from urllib.parse import quote
 
 import httpx
@@ -104,15 +104,6 @@ async def _send(client: httpx.AsyncClient, method: str, url: str, what: str, **k
     except httpx.HTTPError as exc:
         raise _error(exc, what) from exc
     return response
-
-
-@contextmanager
-def _missing_path_is_error(remote_path: str, sandbox_id: str) -> Iterator[None]:
-    """A toolbox 404 names a missing file, not a lost sandbox, so recovery must not replace it."""
-    try:
-        yield
-    except SandboxNotFoundError as exc:
-        raise SandboxError(f"{remote_path} not found in sandbox {sandbox_id}") from exc
 
 
 def _toolbox_url(sandbox: Mapping[str, Any]) -> str:
@@ -241,8 +232,17 @@ class DaytonaV2Sandbox(Sandbox):
             else:
                 yield item
 
+    @asynccontextmanager
+    async def _missing_path_is_error(self, remote_path: str) -> AsyncIterator[None]:
+        """Raise SandboxNotFoundError on a toolbox 404 only if the sandbox is gone, so recovery skips missing files."""
+        try:
+            yield
+        except SandboxNotFoundError as exc:
+            await _send(self._client, "GET", f"/sandboxes/{quote(self.id, safe='')}", f"get sandbox {self.id}")
+            raise SandboxError(f"{remote_path} not found in sandbox {self.id}") from exc
+
     async def upload_file(self, remote_path: str, content: bytes) -> None:
-        with _missing_path_is_error(remote_path, self.id):
+        async with self._missing_path_is_error(remote_path):
             await _send(
                 self._client,
                 "POST",
@@ -253,7 +253,7 @@ class DaytonaV2Sandbox(Sandbox):
             )
 
     async def download_file(self, remote_path: str) -> bytes:
-        with _missing_path_is_error(remote_path, self.id):
+        async with self._missing_path_is_error(remote_path):
             response = await _send(
                 self._client,
                 "GET",

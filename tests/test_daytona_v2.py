@@ -136,7 +136,9 @@ async def test_create_sandbox_sends_fractional_cores_and_waits_for_running() -> 
             return httpx.Response(200, json={"id": "sb-1", "name": "tts-task-1", "status": next(statuses)})
         raise AssertionError(f"unexpected {request.method} {path}")
 
-    sandbox = await _provider(handler, spot=True).create_sandbox(_request(0.25))
+    sandbox = await _provider(handler, spot=True).create_sandbox(
+        _request(0.25, env_vars={"A": "1", "DAYTONA_SANDBOX_OTEL_EXTRA_LABELS": "run=r1"})
+    )
 
     assert (sandbox.id, sandbox.state) == ("sb-1", "running")
     assert all(call.headers["Authorization"] == "Bearer key" for call in calls)

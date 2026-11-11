@@ -187,6 +187,7 @@ allocate capacity or enforce a caller's scheduling policy.
 `daytona_v2` is opt-in (Daytona v2 API, alpha):
 - Keeps fractional `vcpu`; v0 `daytona` rounds it up because the v0 API takes whole CPUs.
 - Converts units: `cpu` cores = `vcpu / 2` (1 core = 2 vCPUs), `memory_mib` / `disk_mib` = GiB x 1024.
+- Reserves `cpu` and caps it at `cores_max` = `cpu` rounded up to 0.5 cores (v2's minimum step), so `vcpu=0.25` reserves 0.125 cores and can burst to 1 vCPU. Memory is capped at the request (`memory_max_mib`). Without caps v2 boots at the plan cap (4 cores, 2 GiB).
 - Supports `image`, `snapshot` (an existing v2 image name or id) and self-contained `dockerfile` sources (no local `COPY`/`ADD` context).
 - Rejects GPUs, volumes and sandbox secrets.
 - No controlled workloads: `probe_generation_containment()` and `controlled_workload()` raise `ControlledWorkloadUnsupportedError`, so tasks that need `GenerationContainment` can't run on it.

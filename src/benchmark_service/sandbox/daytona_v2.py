@@ -7,7 +7,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
+import signal
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping
 from contextlib import aclosing, asynccontextmanager, suppress
 from pathlib import Path
@@ -40,12 +42,15 @@ from benchmark_service.sandbox.types import (
 DEFAULT_DAYTONA_V2_API_URL = "https://api.daytona.com"
 MIB_PER_GIB = 1024
 VCPUS_PER_CORE = 2
+CORES_MAX_STEP = 0.5
 _POLL_SECONDS = 1.0
 _WAIT_MS = 30_000
 _KILL_AFTER_MS = 5_000
 _RUNNING = "running"
 _FAILED_SANDBOX_STATUSES = frozenset({"failed", "lost", "stopped", "deleting", "deleted"})
 _FAILED_IMAGE_STATUSES = frozenset({"failed", "error"})
+_DELETED_SANDBOX_STATUSES = frozenset({"deleting", "deleted"})
+_TIMEOUT_EXIT_CODE = 124
 
 
 class DaytonaV2ProviderConfig(BaseModel):
@@ -79,10 +84,18 @@ class DaytonaV2ProviderConfig(BaseModel):
 
 
 def v2_resources(resources: Resources) -> dict[str, Any]:
-    """Map CBS resources (logical vCPUs, GiB) to v2 create fields (cores, MiB); fractions pass through."""
+    """Map CBS resources (logical vCPUs, GiB) to v2 create fields (cores, MiB); fractions pass through.
+
+    v2 boots a sandbox at the plan cap unless told otherwise, so CPU is capped at the
+    smallest allowed `cores_max` step above the reservation and memory at the request.
+    """
+    cores = resources.vcpu / VCPUS_PER_CORE
+    memory_mib = resources.memory * MIB_PER_GIB
     return {
-        "cpu": resources.vcpu / VCPUS_PER_CORE,
-        "memory_mib": resources.memory * MIB_PER_GIB,
+        "cpu": cores,
+        "cores_max": math.ceil(round(cores / CORES_MAX_STEP, 9)) * CORES_MAX_STEP,
+        "memory_mib": memory_mib,
+        "memory_max_mib": memory_mib,
         "disk_mib": resources.disk * MIB_PER_GIB,
     }
 
@@ -117,6 +130,19 @@ def _toolbox_url(sandbox: Mapping[str, Any]) -> str:
         if placeholder in base:
             return base.replace(placeholder, sandbox_id)
     return f"{base}/{sandbox_id}"
+
+
+def _exit_code(process: Mapping[str, Any]) -> int | None:
+    """The process's exit code; a timeout exits 124 like the other providers, a signal 128 + its number."""
+    if process.get("exitCode") is not None:
+        return int(process["exitCode"])
+    if process.get("state") != "terminal":
+        return None
+    if process.get("reason") == "timed_out":
+        return _TIMEOUT_EXIT_CODE
+    name = str(process.get("signal") or "")
+    signum = getattr(signal.Signals, name if name.startswith("SIG") else f"SIG{name}", None)
+    return 128 + signum if signum is not None else -1
 
 
 class DaytonaV2Sandbox(Sandbox):
@@ -154,7 +180,7 @@ class DaytonaV2Sandbox(Sandbox):
         if env:
             body["env"] = dict(env)
         if timeout is not None:
-            body["timeout_ms"] = int(timeout * 1000)
+            body["timeoutMs"] = math.ceil(timeout * 1000)
         params = {"waitMs": wait_ms, "logs": "text"} if wait_ms else {}
         response = await _send(
             self._client, "POST", f"{self._toolbox}/processes", f"exec in {self.id}", json=body, params=params
@@ -205,9 +231,9 @@ class DaytonaV2Sandbox(Sandbox):
                 if not frames or next_cursor == cursor:
                     await asyncio.sleep(_POLL_SECONDS)
                 cursor = next_cursor or cursor
-            while (exit_code := process.get("exitCode")) is None:
+            while (exit_code := _exit_code(process)) is None:
                 process = await self._process(process_id)
-            yield int(exit_code)
+            yield exit_code
         finally:
             if exit_code is None:
                 await self._stop_process(process_id)
@@ -410,7 +436,9 @@ class DaytonaV2SandboxProvider(SandboxProvider):
             page = (await _send(self._client, "GET", "/sandboxes/search", "search sandboxes", params=params)).json()
             items: list[dict[str, Any]] = page.get("sandboxes") or []
             for item in items:
-                yield await self.get_sandbox(str(item["id"]))
+                sandbox = await self.get_sandbox(str(item["id"]))
+                if sandbox.state not in _DELETED_SANDBOX_STATUSES:
+                    yield sandbox
             if not page.get("next_cursor"):
                 return
             params["cursor"] = page["next_cursor"]

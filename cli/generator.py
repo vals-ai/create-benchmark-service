@@ -170,14 +170,7 @@ def generate_project(
         content = project_template.render(template_context)
         (output_dir / output_name).write_text(content)
 
-    # Copy .github directory, excluding framework maintenance workflows
-    shutil.copytree(
-        root / ".github",
-        output_dir / ".github",
-        ignore=shutil.ignore_patterns(
-            "cli-integration.yaml", "provider-integration.yaml", "docker-integration.yaml", "grading.yaml"
-        ),
-    )
+    shutil.copytree(templates_dir / ".github", output_dir / ".github")
 
     # Create empty tests directory
     (output_dir / "tests").mkdir(exist_ok=True)

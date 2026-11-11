@@ -42,7 +42,6 @@ from benchmark_service.sandbox.types import (
 DEFAULT_DAYTONA_V2_API_URL = "https://api.daytona.com"
 MIB_PER_GIB = 1024
 VCPUS_PER_CORE = 2
-CORES_MAX_STEP = 0.5
 _POLL_SECONDS = 1.0
 _WAIT_MS = 30_000
 _KILL_AFTER_MS = 5_000
@@ -86,14 +85,14 @@ class DaytonaV2ProviderConfig(BaseModel):
 def v2_resources(resources: Resources) -> dict[str, Any]:
     """Map CBS resources (logical vCPUs, GiB) to v2 create fields (cores, MiB); fractions pass through.
 
-    v2 boots a sandbox at the plan cap unless told otherwise, so CPU is capped at the
-    smallest allowed `cores_max` step above the reservation and memory at the request.
+    v2 boots a sandbox at the plan cap unless told otherwise, so memory is capped at the
+    request and CPU at whole vCPUs, the `cores_max` step (0.5 cores), rounded up.
     """
     cores = resources.vcpu / VCPUS_PER_CORE
     memory_mib = resources.memory * MIB_PER_GIB
     return {
         "cpu": cores,
-        "cores_max": math.ceil(round(cores / CORES_MAX_STEP, 9)) * CORES_MAX_STEP,
+        "cores_max": math.ceil(resources.vcpu) / VCPUS_PER_CORE,
         "memory_mib": memory_mib,
         "memory_max_mib": memory_mib,
         "disk_mib": resources.disk * MIB_PER_GIB,

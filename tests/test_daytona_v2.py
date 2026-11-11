@@ -57,7 +57,15 @@ def no_poll_delay(monkeypatch: pytest.MonkeyPatch) -> None:
 
 @pytest.mark.parametrize(
     ("vcpu", "cores", "cores_max"),
-    [(0.25, 0.125, 0.5), (0.5, 0.25, 0.5), (1, 0.5, 0.5), (1.5, 0.75, 1.0), (3, 1.5, 1.5), (4, 2, 2.0)],
+    [
+        (0.25, 0.125, 0.5),
+        (0.5, 0.25, 0.5),
+        (1, 0.5, 0.5),
+        (1.0000000001, 0.50000000005, 1.0),
+        (1.5, 0.75, 1.0),
+        (3, 1.5, 1.5),
+        (4, 2, 2.0),
+    ],
 )
 def test_v2_resources_reserves_fractional_cores_and_caps_them(vcpu: float, cores: float, cores_max: float) -> None:
     assert v2_resources(Resources(vcpu=vcpu, memory=2, disk=3)) == {

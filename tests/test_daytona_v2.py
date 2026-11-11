@@ -137,7 +137,10 @@ async def test_create_sandbox_sends_fractional_cores_and_waits_for_running() -> 
         raise AssertionError(f"unexpected {request.method} {path}")
 
     sandbox = await _provider(handler, spot=True).create_sandbox(
-        _request(0.25, env_vars={"A": "1", "DAYTONA_SANDBOX_OTEL_EXTRA_LABELS": "run=r1"})
+        _request(
+            0.25,
+            env_vars={"A": "1", "DAYTONA_SANDBOX_OTEL_EXTRA_LABELS": "run=r1", "DAYTONA_OTEL_ENDPOINT": "https://otel"},
+        )
     )
 
     assert (sandbox.id, sandbox.state) == ("sb-1", "running")
@@ -149,7 +152,7 @@ async def test_create_sandbox_sends_fractional_cores_and_waits_for_running() -> 
         "image": "img-1",
         "name": "tts-task-1",
         "labels": {"run": "r1"},
-        "env": {"A": "1"},
+        "env": {"A": "1", "DAYTONA_OTEL_ENDPOINT": "https://otel"},
         "cpu": 0.125,
         "cores_max": 0.5,
         "memory_mib": 1024,

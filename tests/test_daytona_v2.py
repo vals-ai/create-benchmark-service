@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import json
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
+from datetime import UTC, datetime
 from typing import Any
 
 import httpx
@@ -21,6 +22,7 @@ from benchmark_service.sandbox import (
     sandbox_provider_config_from_mapping,
 )
 from benchmark_service.sandbox import daytona_v2
+from benchmark_service.sandbox.created import sandbox_created_scope
 from benchmark_service.sandbox.daytona_v2 import DaytonaV2Sandbox, DaytonaV2SandboxProvider, v2_resources
 from benchmark_service.vals.app import _grading_provider_config  # pyright: ignore[reportPrivateUsage]
 
@@ -347,3 +349,108 @@ async def test_list_sandboxes_pages_by_labels_and_skips_deleted() -> None:
     assert found == ["a", "b"]
     assert json.loads(searches[0]["labels"]) == {"run": "r1"}
     assert searches[1]["cursor"] == "n1"
+
+
+async def test_list_sandboxes_bounds_creation_time_inclusively() -> None:
+    searches: list[httpx.QueryParams] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/sandboxes/search":
+            searches.append(request.url.params)
+            return httpx.Response(200, json={"sandboxes": [{"id": "a"}], "next_cursor": None})
+        return httpx.Response(200, json={"id": "a", "status": "running", "created_at": "2026-11-01T00:00:00Z"})
+
+    cutoff = datetime(2026, 11, 2, tzinfo=UTC)
+    query = daytona_v2.SandboxQuery(labels={}, created_at_lte=cutoff)
+    found = [sandbox async for sandbox in _provider(handler).list_sandboxes(query)]
+
+    assert [sandbox.created_at for sandbox in found] == [datetime(2026, 11, 1, tzinfo=UTC)]
+    assert searches[0]["created_end_at"] == "2026-11-02T00:00:00.000001+00:00"
+
+
+async def test_create_sandbox_announces_it_before_it_is_running() -> None:
+    announced: list[tuple[str, str]] = []
+
+    async def hook(provider: str, sandbox_id: str) -> None:
+        announced.append((provider, sandbox_id))
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/images":
+            return httpx.Response(201, json={"id": "img-1", "status": "ready"})
+        if request.method == "POST" and request.url.path == "/sandboxes":
+            return httpx.Response(201, json={"id": "sb-1", "status": "pending"})
+        assert announced == [("daytona_v2", "sb-1")]
+        return httpx.Response(200, json={"id": "sb-1", "status": "running"})
+
+    with sandbox_created_scope(hook):
+        await _provider(handler).create_sandbox(_request(0.25))
+
+    assert announced == [("daytona_v2", "sb-1")]
+
+
+def _policy_handler(puts: list[httpx.Request], final: dict[str, Any]) -> Handler:
+    reads = iter([{"status": "pending", "applied_revision": 4, "desired_revision": 5}, final])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/sandboxes/sb-1/network-policy"
+        if request.method == "PUT":
+            puts.append(request)
+            return httpx.Response(202, json={"status": "pending", "applied_revision": 4, "desired_revision": 5})
+        if not puts:
+            return httpx.Response(200, headers={"etag": '"np-4"'}, json={"status": "applied", "desired_revision": 4})
+        return httpx.Response(200, json=next(reads))
+
+    return handler
+
+
+EgressChange = Callable[[DaytonaV2Sandbox], Awaitable[None]]
+_EGRESS_CHANGES: list[tuple[EgressChange, dict[str, Any]]] = [
+    (
+        lambda sandbox: sandbox.modify_egress_rules(["example.com", "10.0.0.1"]),
+        {"block_all": True, "allow_cidrs": ["10.0.0.1/32"], "allow_domains": ["example.com"]},
+    ),
+    (
+        lambda sandbox: sandbox.modify_egress_rules(["10.0.0.0/8"]),
+        {"block_all": True, "allow_cidrs": ["10.0.0.0/8"], "allow_domains": None},
+    ),
+    (lambda sandbox: sandbox.block_all_egress(), {"block_all": True, "allow_cidrs": [], "allow_domains": None}),
+    (lambda sandbox: sandbox.clear_egress_rules(), {"block_all": False, "allow_cidrs": [], "allow_domains": None}),
+]
+
+
+@pytest.mark.parametrize(("change", "rules"), _EGRESS_CHANGES)
+async def test_egress_changes_replace_the_policy_and_wait_until_applied(
+    change: EgressChange, rules: dict[str, Any]
+) -> None:
+    puts: list[httpx.Request] = []
+    await change(_sandbox(_policy_handler(puts, {"status": "applied", "applied_revision": 5, "desired_revision": 5})))
+
+    assert [(put.headers["If-Match"], json.loads(put.content)) for put in puts] == [('"np-4"', rules)]
+
+
+async def test_egress_change_raises_when_daytona_cannot_apply_it() -> None:
+    final = {"status": "failed", "applied_revision": 4, "desired_revision": 5, "error": "bad domain"}
+    with pytest.raises(SandboxError, match="bad domain"):
+        await _sandbox(_policy_handler([], final)).block_all_egress()
+
+
+async def test_sandbox_is_deleted_when_announcement_is_cancelled() -> None:
+    deleted: list[str] = []
+
+    async def hook(provider: str, sandbox_id: str) -> None:
+        raise asyncio.CancelledError
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == "/images":
+            return httpx.Response(201, json={"id": "img-1", "status": "ready"})
+        if request.method == "POST" and request.url.path == "/sandboxes":
+            return httpx.Response(201, json={"id": "sb-1", "status": "pending"})
+        if request.method == "DELETE":
+            deleted.append(request.url.path)
+            return httpx.Response(204)
+        raise AssertionError(f"unexpected {request.method} {request.url.path}")
+
+    with sandbox_created_scope(hook), pytest.raises(asyncio.CancelledError):
+        await _provider(handler).create_sandbox(_request(0.25))
+
+    assert deleted == ["/sandboxes/sb-1"]

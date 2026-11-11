@@ -12,6 +12,7 @@ import os
 import signal
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping
 from contextlib import aclosing, asynccontextmanager, suppress
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import quote
@@ -19,6 +20,8 @@ from urllib.parse import quote
 import httpx
 from pydantic import BaseModel, Field, field_validator
 
+from benchmark_service.sandbox.created import notify_sandbox_created
+from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
     DockerfileSource,
     ExecResult,
@@ -50,6 +53,7 @@ _FAILED_SANDBOX_STATUSES = frozenset({"failed", "lost", "stopped", "deleting", "
 _FAILED_IMAGE_STATUSES = frozenset({"failed", "error"})
 _DELETED_SANDBOX_STATUSES = frozenset({"deleting", "deleted"})
 _TIMEOUT_EXIT_CODE = 124
+_POLICY_TIMEOUT_SECONDS = 60.0
 
 
 class DaytonaV2ProviderConfig(BaseModel):
@@ -144,11 +148,20 @@ def _exit_code(process: Mapping[str, Any]) -> int | None:
     return 128 + signum if signum is not None else -1
 
 
+def _created_at(sandbox: Mapping[str, Any]) -> datetime | None:
+    value = sandbox.get("created_at")
+    if not isinstance(value, str):
+        return None
+    created_at = datetime.fromisoformat(value)
+    return created_at.astimezone(UTC) if created_at.utcoffset() is not None else None
+
+
 class DaytonaV2Sandbox(Sandbox):
     def __init__(self, data: Mapping[str, Any], client: httpx.AsyncClient) -> None:
         self._data = dict(data)
         self._client = client
         self.labels = self._data.get("labels")
+        self.created_at = _created_at(self._data)
 
     @property
     def id(self) -> str:
@@ -276,6 +289,34 @@ class DaytonaV2Sandbox(Sandbox):
                 else:
                     yield item
 
+    async def _set_network_policy(self, rules: Mapping[str, Any]) -> None:
+        """Replace the sandbox's egress rules and wait until Daytona reports them applied."""
+        url = f"/sandboxes/{quote(self.id, safe='')}/network-policy"
+        what = f"network policy of {self.id}"
+        current = await _send(self._client, "GET", url, what)
+        policy = (
+            await _send(self._client, "PUT", url, what, json=rules, headers={"If-Match": current.headers["etag"]})
+        ).json()
+        revision = policy["desired_revision"]
+        deadline = asyncio.get_running_loop().time() + _POLICY_TIMEOUT_SECONDS
+        while policy.get("status") != "applied" or (policy.get("applied_revision") or 0) < revision:
+            if policy.get("error"):
+                raise SandboxError(f"Daytona v2 could not apply the {what}: {policy['error']}")
+            if asyncio.get_running_loop().time() > deadline:
+                raise SandboxConnectionError(f"Daytona v2 did not apply the {what} in time")
+            await asyncio.sleep(_POLL_SECONDS)
+            policy = (await _send(self._client, "GET", url, what)).json()
+
+    async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
+        cidrs, domains = resolve_allowed_addresses(allowed_addresses)
+        await self._set_network_policy({"block_all": True, "allow_cidrs": cidrs, "allow_domains": domains or None})
+
+    async def block_all_egress(self) -> None:
+        await self._set_network_policy({"block_all": True, "allow_cidrs": [], "allow_domains": None})
+
+    async def clear_egress_rules(self) -> None:
+        await self._set_network_policy({"block_all": False, "allow_cidrs": [], "allow_domains": None})
+
     @asynccontextmanager
     async def _missing_path_is_error(self, remote_path: str) -> AsyncIterator[None]:
         """Raise SandboxNotFoundError on a toolbox 404 only if the sandbox is gone, so recovery skips missing files."""
@@ -398,6 +439,7 @@ class DaytonaV2SandboxProvider(SandboxProvider):
         ).json()
         sandbox_id = str(data["id"])
         try:
+            await notify_sandbox_created("daytona_v2", sandbox_id)
             while data.get("status") != _RUNNING:
                 if data.get("status") in _FAILED_SANDBOX_STATUSES or loop.time() > deadline:
                     detail = f"{data.get('status')} {data.get('error') or ''}".strip()
@@ -428,9 +470,10 @@ class DaytonaV2SandboxProvider(SandboxProvider):
             return
 
     async def list_sandboxes(self, query: SandboxQuery) -> AsyncGenerator[Sandbox, None]:
-        if query.created_at_lte is not None:
-            raise SandboxError("Daytona v2 provider does not filter sandboxes by creation time")
         params: dict[str, Any] = {"labels": json.dumps(query.labels), "limit": query.page_size}
+        if query.created_at_lte is not None:
+            # The search end bound is exclusive.
+            params["created_end_at"] = (query.created_at_lte + timedelta(microseconds=1)).isoformat()
         while True:
             page = (await _send(self._client, "GET", "/sandboxes/search", "search sandboxes", params=params)).json()
             items: list[dict[str, Any]] = page.get("sandboxes") or []

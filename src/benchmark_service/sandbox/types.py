@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from collections.abc import AsyncGenerator, Mapping
 from datetime import datetime
 from pathlib import PurePosixPath
@@ -64,16 +63,6 @@ SandboxSource = Annotated[
     Field(discriminator="type"),
 ]
 
-
-class GenerationContainment(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    type: Literal["linux_cgroup_v2", "linux_process_group"]
-    version: int = Field(strict=True, ge=1)
-
-
-LINUX_CGROUP_V2_V1 = GenerationContainment(type="linux_cgroup_v2", version=1)
-LINUX_PROCESS_GROUP_V1 = GenerationContainment(type="linux_process_group", version=1)
 
 MAX_SANDBOX_LIFETIME_SECONDS = 167 * 60 * 60
 
@@ -280,10 +269,6 @@ class SandboxError(Exception):
     pass
 
 
-class ControlledWorkloadUnsupportedError(SandboxError):
-    pass
-
-
 class SandboxBuildError(SandboxError):
     def __init__(self, message: str, build_log: str = "") -> None:
         self.build_log = build_log
@@ -331,28 +316,6 @@ class ExecResult(BaseModel):
         return self.output
 
 
-@dataclass(frozen=True)
-class ControlledWorkloadResult:
-    result: ExecResult
-    absence_confirmed_at: float
-
-
-class ControlledWorkload(ABC):
-
-    @property
-    @abstractmethod
-    def agent_absence_confirmed_at(self) -> float | None: ...
-
-    @abstractmethod
-    def output(self) -> AsyncGenerator[str, None]: ...
-
-    @abstractmethod
-    async def wait(self) -> ControlledWorkloadResult: ...
-
-    @abstractmethod
-    async def kill(self) -> None: ...
-
-
 class Sandbox(ABC):
     @property
     @abstractmethod
@@ -388,37 +351,6 @@ class Sandbox(ABC):
     def provider_metadata(self) -> Mapping[str, str]:
         """Provider-reported attributes (runner id, image revision, ...) useful for debugging allocation."""
         return {}
-
-    @property
-    def generation_containment(self) -> GenerationContainment | None:
-        return None
-
-    async def probe_generation_containment(self) -> None:
-        raise ControlledWorkloadUnsupportedError(
-            f"{type(self).__name__} does not support controlled generation workloads"
-        )
-
-    def controlled_workload(
-        self,
-        command: str,
-        *,
-        cwd: str | None = None,
-        env_vars: Mapping[str, str] | None = None,
-    ) -> ControlledWorkload:
-        return self._process_group_workload(command, None, cwd=cwd, env_vars=env_vars)
-
-    def _controlled_episode_workload(
-        self, command: str, script: str, *, cwd: str | None, env_vars: Mapping[str, str] | None
-    ) -> ControlledWorkload:
-        return self._process_group_workload(command, script, cwd=cwd, env_vars=env_vars)
-
-    def _process_group_workload(
-        self, command: str, episode_script: str | None, *, cwd: str | None,
-        env_vars: Mapping[str, str] | None
-    ) -> ControlledWorkload:
-        raise ControlledWorkloadUnsupportedError(
-            f"{type(self).__name__} does not support controlled generation workloads"
-        )
 
     @abstractmethod
     async def exec(

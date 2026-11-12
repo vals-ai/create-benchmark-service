@@ -883,7 +883,7 @@ async def test_resume_evaluation_with_eval_resume_state(
     mock_connect = _ws_mock(messages)
     on_eval_resume_state = MagicMock()
 
-    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=mock_connect)):
+    with patch("benchmark_service.client._NoRedirectConnect", new=AsyncMock(return_value=mock_connect)):
         result = await client.resume_evaluation(
             "task-1",
             eval_resume_state=state,
@@ -952,7 +952,7 @@ async def test_grading_token_is_sent_only_for_project_keyed_evaluation(
     client, _ = benchmark_client
     mock_connect = _ws_mock([json.dumps({"type": "result", "data": {"score": 1.0}})])
     token = "project-grader-token" if with_token else None
-    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=mock_connect)):
+    with patch("benchmark_service.client._NoRedirectConnect", new=AsyncMock(return_value=mock_connect)):
         if resume:
             await client.resume_evaluation("task-1", {"checkpoint": "saved"}, grading_token=token)
         else:
@@ -973,7 +973,7 @@ async def test_evaluate_instance_reports_each_sandbox_created_chunk(
     ]
     on_sandbox_created = MagicMock()
 
-    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=_ws_mock(messages))):
+    with patch("benchmark_service.client._NoRedirectConnect", new=AsyncMock(return_value=_ws_mock(messages))):
         result = await client.evaluate_instance(
             "task-1", "i-1", sandbox_provider=DAYTONA_CONFIG, on_sandbox_created=on_sandbox_created
         )
@@ -991,7 +991,7 @@ async def test_sandbox_created_chunk_is_skipped_without_a_callback(
         json.dumps({"type": "result", "data": {"score": 1.0}}),
     ]
 
-    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=_ws_mock(messages))):
+    with patch("benchmark_service.client._NoRedirectConnect", new=AsyncMock(return_value=_ws_mock(messages))):
         result = await client.evaluate_instance("task-1", "i-1", sandbox_provider=DAYTONA_CONFIG)
 
     assert result == {"score": 1.0}
@@ -1004,7 +1004,7 @@ async def test_evaluate_instance_asks_for_sandbox_announcements_only_with_a_call
     client, _mock_http = benchmark_client
     ws_connect = _ws_mock([json.dumps({"type": "result", "data": {"score": 1.0}})])
 
-    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=ws_connect)):
+    with patch("benchmark_service.client._NoRedirectConnect", new=AsyncMock(return_value=ws_connect)):
         await client.evaluate_instance(
             "task-1", "i-1", sandbox_provider=DAYTONA_CONFIG, on_sandbox_created=MagicMock() if with_callback else None
         )
@@ -1021,7 +1021,7 @@ async def test_resume_evaluation_asks_for_sandbox_announcements_only_with_a_call
     client, _mock_http = benchmark_client
     ws_connect = _ws_mock([json.dumps({"type": "result", "data": {"score": 1.0}})])
 
-    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=ws_connect)):
+    with patch("benchmark_service.client._NoRedirectConnect", new=AsyncMock(return_value=ws_connect)):
         await client.resume_evaluation(
             "task-1",
             {"k": "v"},
@@ -1039,7 +1039,7 @@ async def test_resume_evaluation_forwards_an_owned_sandbox_without_changing_stat
     client, _ = benchmark_client
     state = {"checkpoint": "immutable-artifact"}
     mock_connect = _ws_mock([json.dumps({"type": "result", "data": {"score": 1.0}})])
-    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=mock_connect)):
+    with patch("benchmark_service.client._NoRedirectConnect", new=AsyncMock(return_value=mock_connect)):
         result = await client.resume_evaluation(
             "task-1", state, sandbox_provider=DAYTONA_CONFIG, instance_id="owned-grader"
         )
@@ -1112,7 +1112,7 @@ async def test_websocket_request_includes_provider_config() -> None:
         mock_connect = _ws_mock(messages)
 
         client = _make_client()
-        with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=mock_connect)):
+        with patch("benchmark_service.client._NoRedirectConnect", new=AsyncMock(return_value=mock_connect)):
             await getattr(client, method)("task-1", "inst-1", sandbox_provider)
 
         ws = mock_connect.__aenter__.return_value
@@ -1214,7 +1214,7 @@ async def test_ws_result_chunk(method: str, args: list[str]) -> None:
     mock_connect = _ws_mock(messages)
 
     client = _make_client()
-    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=mock_connect)):
+    with patch("benchmark_service.client._NoRedirectConnect", new=AsyncMock(return_value=mock_connect)):
         result = await getattr(client, method)(*args)
 
     if method == "setup_task":
@@ -1239,7 +1239,7 @@ async def test_ws_error_chunk(method: str, args: list[str]) -> None:
     mock_connect = _ws_mock(messages)
 
     client = _make_client()
-    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=mock_connect)):
+    with patch("benchmark_service.client._NoRedirectConnect", new=AsyncMock(return_value=mock_connect)):
         with pytest.raises(BenchmarkServiceError, match="something went wrong"):
             await getattr(client, method)(*args)
 
@@ -1266,7 +1266,7 @@ async def test_ws_message_chunks_with_callback(method: str, args: list[str]) -> 
     on_message = MagicMock()
 
     client = _make_client()
-    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=mock_connect)):
+    with patch("benchmark_service.client._NoRedirectConnect", new=AsyncMock(return_value=mock_connect)):
         await getattr(client, method)(*args, on_message=on_message)
 
     assert on_message.call_count == 2
@@ -1294,7 +1294,7 @@ async def test_ws_message_chunks_without_callback(method: str, args: list[str]) 
     mock_connect = _ws_mock(messages)
 
     client = _make_client()
-    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=mock_connect)):
+    with patch("benchmark_service.client._NoRedirectConnect", new=AsyncMock(return_value=mock_connect)):
         result = await getattr(client, method)(*args)
 
     if method == "setup_task":
@@ -1319,7 +1319,7 @@ async def test_ws_connection_closed_without_result(method: str, args: list[str])
     mock_connect = _ws_mock(messages)
 
     client = _make_client()
-    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=mock_connect)):
+    with patch("benchmark_service.client._NoRedirectConnect", new=AsyncMock(return_value=mock_connect)):
         with pytest.raises(BenchmarkServiceStreamClosedError) as exc_info:
             await getattr(client, method)(*args)
 
@@ -1343,7 +1343,7 @@ async def test_ws_close_reports_the_close_frame_detail(close_frame: Close | None
     mock_connect = _ws_mock([], ConnectionClosedError(close_frame, None))
     client = _make_client()
 
-    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=mock_connect)):
+    with patch("benchmark_service.client._NoRedirectConnect", new=AsyncMock(return_value=mock_connect)):
         with pytest.raises(BenchmarkServiceStreamClosedError) as exc_info:
             await client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG)
 
@@ -1356,7 +1356,7 @@ async def test_ws_connect_pings_on_the_server_cadence_without_a_pong_deadline() 
     mock_connect = _ws_mock([json.dumps({"type": "result", "data": {"score": 1.0}})])
     client = _make_client()
 
-    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=mock_connect)) as connect:
+    with patch("benchmark_service.client._NoRedirectConnect", new=AsyncMock(return_value=mock_connect)) as connect:
         await client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG)
 
     assert connect.call_args.kwargs["ping_interval"] == 30
@@ -1398,7 +1398,7 @@ async def test_ws_idle_past_the_budget_fails_the_stream(health_status: str | Non
         health = AsyncMock(return_value=HealthCheckResponse(status=health_status))
 
     with (
-        patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=_silent_ws_mock())),
+        patch("benchmark_service.client._NoRedirectConnect", new=AsyncMock(return_value=_silent_ws_mock())),
         patch.object(client, "health_check", health),
     ):
         with pytest.raises(BenchmarkServiceStreamIdleError) as exc_info:
@@ -1419,7 +1419,7 @@ async def test_ws_idle_health_probe_is_bounded() -> None:
         raise AssertionError("unreachable")
 
     with (
-        patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=_silent_ws_mock())),
+        patch("benchmark_service.client._NoRedirectConnect", new=AsyncMock(return_value=_silent_ws_mock())),
         patch("benchmark_service.client._HEALTH_PROBE_TIMEOUT_S", 0.01),
         patch.object(client, "health_check", _hanging_health_check),
     ):
@@ -1434,7 +1434,7 @@ async def test_ws_idle_watchdog_can_be_disabled(ws_idle_timeout_s: float | None)
     """Both documented ways to disable it keep the pre-watchdog behavior of waiting indefinitely."""
     client = BenchmarkServiceClient(url=BASE_URL, headers=HEADERS, timeout=10, ws_idle_timeout_s=ws_idle_timeout_s)
 
-    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=_silent_ws_mock())):
+    with patch("benchmark_service.client._NoRedirectConnect", new=AsyncMock(return_value=_silent_ws_mock())):
         with pytest.raises(TimeoutError):
             await asyncio.wait_for(client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG), timeout=0.05)
 
@@ -1475,7 +1475,7 @@ async def test_ws_close_silence_is_measured_from_last_application_message() -> N
     fake_time = MagicMock()
     fake_time.monotonic.side_effect = [99.0, 100.0, 250.0, 251.5]
 
-    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=mock_connect)):
+    with patch("benchmark_service.client._NoRedirectConnect", new=AsyncMock(return_value=mock_connect)):
         with patch("benchmark_service.client.time", fake_time):
             with pytest.raises(BenchmarkServiceStreamClosedError) as exc_info:
                 await client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG)
@@ -1490,7 +1490,7 @@ async def test_ws_preconnection_failure_propagates_as_transport_error() -> None:
     """DNS/connect/handshake failures stay distinguishable: they are never wrapped in a service error."""
     client = _make_client()
 
-    with patch("benchmark_service.client.websockets.connect", side_effect=socket.gaierror("Name or service not known")):
+    with patch("benchmark_service.client._NoRedirectConnect", side_effect=socket.gaierror("Name or service not known")):
         with pytest.raises(socket.gaierror):
             await client.evaluate_instance("task-1", "inst-1", DAYTONA_CONFIG)
 
@@ -1711,7 +1711,7 @@ async def test_setup_task_sends_child_egress_only_when_given(
     client, _ = benchmark_client
     ws_connect = _ws_mock([json.dumps({"type": "result", "data": {"status": "ok"}})])
 
-    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=ws_connect)):
+    with patch("benchmark_service.client._NoRedirectConnect", new=AsyncMock(return_value=ws_connect)):
         await client.setup_task("task-1", "i-1", sandbox_provider=DAYTONA_CONFIG, child_egress=child_egress)
 
     sent = json.loads((await ws_connect.__aenter__()).send.call_args.args[0])
@@ -1722,7 +1722,7 @@ async def test_evaluate_instance_sends_child_egress(benchmark_client: tuple[Benc
     client, _ = benchmark_client
     ws_connect = _ws_mock([json.dumps({"type": "result", "data": {"score": 1.0}})])
 
-    with patch("benchmark_service.client.websockets.connect", new=AsyncMock(return_value=ws_connect)):
+    with patch("benchmark_service.client._NoRedirectConnect", new=AsyncMock(return_value=ws_connect)):
         await client.evaluate_instance(
             "task-1", "i-1", sandbox_provider=DAYTONA_CONFIG, child_egress={"judge": CHILD_EGRESS}
         )
@@ -1778,3 +1778,17 @@ def test_child_profiles_need_simple_names() -> None:
     assert plan.children["gpu-1"].models == ["a/b"]
     with pytest.raises(ValidationError):
         BenchmarkEgressPlan.model_validate({"children": {"GPU box": {}}})
+
+
+async def test_client_does_not_follow_redirects() -> None:
+    requests: list[str] = []
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        requests.append(str(request.url))
+        return httpx.Response(302, headers={"location": "http://169.254.169.254/latest/meta-data/"})
+
+    async with BenchmarkServiceClient("http://test", {"X-Descope-Api-Key": "secret"}) as client:
+        client._http_client._transport = httpx.MockTransport(respond)  # pyright: ignore[reportPrivateUsage]
+        with pytest.raises(BenchmarkServiceError):
+            await client.health_check()
+    assert all(url == "http://test/health" for url in requests)

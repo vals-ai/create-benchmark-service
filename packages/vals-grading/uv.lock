@@ -19,6 +19,8 @@ exclude-newer-span = "P7D"
 
 [options.exclude-newer-package]
 certifi = false
+model-library = false
+valsai = false
 
 [[package]]
 name = "ai21"
@@ -2671,7 +2673,7 @@ dev = [
 
 [[package]]
 name = "valsai"
-version = "0.3.13"
+version = "0.3.14"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "aiofiles" },
@@ -2694,9 +2696,9 @@ dependencies = [
     { name = "tabulate" },
     { name = "tqdm" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/70/82/b4fc5ac87e905c708d582aad93a83db66986fe881655324461ebb34e1654/valsai-0.3.13.tar.gz", hash = "sha256:7bb051224f4246a785ced6ababcd9332e0c3118a3b2a5543dad712647f075c4b", size = 377420, upload-time = "2026-10-25T23:29:43.927Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/9a/2a/638fb9ffbd2534f6571c9b327fa9d59a30f053dd41792e15d682a221279b/valsai-0.3.14.tar.gz", hash = "sha256:18656cff26f1e8c7a4f0d5eb04751be4f0a12621bdab137ab836697b2e864fe4", size = 377606, upload-time = "2026-11-11T08:22:12.546Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/59/c5/9ca06800e771d7dcdcc56a170d4c811c8a27c895b3fdf5238ec1a57de5bf/valsai-0.3.13-py3-none-any.whl", hash = "sha256:286a21a184e1cfbbc823d22dca2b0a93fc25adef65aaa027ed959123aa46d250", size = 113833, upload-time = "2026-10-25T23:29:42.265Z" },
+    { url = "https://files.pythonhosted.org/packages/f6/ac/38e7419cebfbc82f0f7b7ac6c21bf65adf5972ee647371c6268fc244375e/valsai-0.3.14-py3-none-any.whl", hash = "sha256:bfc3cf17ee2a8f6825f18b9c318e1ba104c3c4a85c5a8303986ff4c3d1e296d1", size = 113822, upload-time = "2026-11-11T08:22:10.948Z" },
 ]
 
 [[package]]

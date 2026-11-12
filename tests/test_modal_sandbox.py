@@ -992,7 +992,7 @@ async def test_create_sandbox_requires_gpu_type_for_gpu(
         await provider.create_sandbox(_request(resources=Resources(vcpu=4, memory=8, disk=30, gpu=1, **gpu_type)))
 
 
-async def test_create_sandbox_blocks_network_without_conflicting_allowlists(
+async def test_create_sandbox_blocks_egress_with_empty_allowlist(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     captured: dict[str, Any] = {}
@@ -1006,8 +1006,8 @@ async def test_create_sandbox_blocks_network_without_conflicting_allowlists(
 
     await provider.create_sandbox(request)
 
-    assert captured["block_network"] is True
-    assert captured["outbound_cidr_allowlist"] is None
+    assert captured["block_network"] is False
+    assert captured["outbound_cidr_allowlist"] == []
     assert "outbound_domain_allowlist" not in captured
 
 

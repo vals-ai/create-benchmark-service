@@ -10,9 +10,11 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, computed_f
 
 from benchmark_service import egress_tunnel
 from benchmark_service.sandbox import SandboxProviderConfig
+from benchmark_service.sandbox.created import AnnouncedSandboxProvider
 from benchmark_service.sandbox.types import (
     BaseSandboxSource,
     ComposeSource,
+    DockerfileSource,
     ImageSource,
     Resources,
     SandboxSource,
@@ -23,6 +25,7 @@ from benchmark_service.sandbox.types import (
 
 _COMPOSE_LEGACY_DOCKER_IMAGE = "compose+source-required"
 _TARGETED_SNAPSHOT_LEGACY_DOCKER_IMAGE = "targeted-snapshot+source-required"
+_DOCKERFILE_LEGACY_DOCKER_IMAGE = "dockerfile+source-required"
 DATASET_VERSION_HEADER = "X-Benchmark-Dataset-Version"
 
 DatasetVersionId = Annotated[str, Field(min_length=1, max_length=1024, pattern=r"^[!-~]+$")]
@@ -107,6 +110,8 @@ def legacy_docker_image(source: SandboxSource) -> str:
         return f"snapshot:{source.snapshot}"
     if isinstance(source, TargetedSnapshotSource):
         return _TARGETED_SNAPSHOT_LEGACY_DOCKER_IMAGE
+    if isinstance(source, DockerfileSource):
+        return _DOCKERFILE_LEGACY_DOCKER_IMAGE
     if isinstance(source, ComposeSource):  # pyright: ignore[reportUnnecessaryIsInstance]
         return _COMPOSE_LEGACY_DOCKER_IMAGE
     assert_never(source)
@@ -597,7 +602,7 @@ class StreamEvalResumeStateChunk(BaseModel):
 class SandboxCreatedData(BaseModel):
     """Identity of a sandbox a provider created while serving the request."""
 
-    provider: Literal["daytona"]
+    provider: AnnouncedSandboxProvider
     sandbox_id: str
 
 

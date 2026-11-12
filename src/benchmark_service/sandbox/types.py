@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import re
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
 from collections.abc import AsyncGenerator, Mapping
 from datetime import datetime
 from pathlib import PurePosixPath
@@ -28,6 +27,27 @@ class TargetedSnapshotSource(BaseModel):
     target: str = Field(min_length=1)
 
 
+class DockerfileSource(BaseModel):
+    type: Literal["dockerfile"] = "dockerfile"
+    dockerfile: str = Field(
+        min_length=1,
+        description="Absolute path of the Dockerfile on the machine that creates the sandbox; "
+        "the folder that holds it is the build context",
+    )
+    build_timeout: float | None = Field(
+        default=None,
+        gt=0,
+        allow_inf_nan=False,
+        description="Seconds the build may take, on top of create_timeout; None builds within create_timeout",
+    )
+
+    @model_validator(mode="after")
+    def _validate_dockerfile(self) -> Self:
+        if not PurePosixPath(self.dockerfile).is_absolute():
+            raise ValueError(f"dockerfile must be an absolute path, got {self.dockerfile!r}")
+        return self
+
+
 BaseSandboxSource = Annotated[ImageSource | SnapshotSource, Field(discriminator="type")]
 
 
@@ -39,20 +59,10 @@ class ComposeSource(BaseModel):
 
 
 SandboxSource = Annotated[
-    ImageSource | SnapshotSource | TargetedSnapshotSource | ComposeSource,
+    ImageSource | SnapshotSource | TargetedSnapshotSource | DockerfileSource | ComposeSource,
     Field(discriminator="type"),
 ]
 
-
-class GenerationContainment(BaseModel):
-    model_config = ConfigDict(frozen=True)
-
-    type: Literal["linux_cgroup_v2", "linux_process_group"]
-    version: int = Field(strict=True, ge=1)
-
-
-LINUX_CGROUP_V2_V1 = GenerationContainment(type="linux_cgroup_v2", version=1)
-LINUX_PROCESS_GROUP_V1 = GenerationContainment(type="linux_process_group", version=1)
 
 MAX_SANDBOX_LIFETIME_SECONDS = 167 * 60 * 60
 
@@ -95,17 +105,30 @@ def _volume_subpath_fields(template: str) -> list[str]:
 
 
 class Resources(BaseModel):
-    vcpu: int = Field(gt=0, description="Logical sandbox CPU count")
+    vcpu: int | float = Field(
+        gt=0,
+        allow_inf_nan=False,
+        description="Logical sandbox CPU count; a provider that allocates whole CPUs rounds a fraction up",
+    )
     memory: int = Field(gt=0, description="Sandbox memory")
     disk: int = Field(gt=0, description="Sandbox ephemeral disk")
     gpu: int = Field(default=0, ge=0, description="Number of GPUs to allocate")
-    gpu_type: str | None = Field(default=None, description="GPU type to allocate, e.g. 'H100' (provider-specific)")
+    gpu_type: str | list[str] | None = Field(
+        default=None,
+        description="GPU type to allocate, e.g. 'H100' (provider-specific), or acceptable types in order of preference",
+    )
 
     @model_validator(mode="after")
     def _validate_gpu(self) -> Self:
-        if self.gpu_type is not None and self.gpu < 1:
+        if self.acceptable_gpu_types and self.gpu < 1:
             raise ValueError("gpu_type requires gpu >= 1")
         return self
+
+    @property
+    def acceptable_gpu_types(self) -> list[str]:
+        if isinstance(self.gpu_type, list):
+            return self.gpu_type
+        return [self.gpu_type] if self.gpu_type is not None else []
 
 
 class ResourceCapacity(BaseModel):
@@ -203,6 +226,12 @@ class SandboxCreateRequest(BaseModel):
         description="Persistent volumes to attach; empty keeps existing behaviour",
     )
 
+    @property
+    def provider_timeout(self) -> float:
+        """Seconds a provider may take to build the image, when the source has a build, and start the sandbox."""
+        build = self.source.build_timeout if isinstance(self.source, DockerfileSource) else None
+        return self.create_timeout + (build or 0)
+
     @model_validator(mode="after")
     def _validate_request(self) -> Self:
         validate_command_env(self.sandbox_secrets)
@@ -240,8 +269,10 @@ class SandboxError(Exception):
     pass
 
 
-class ControlledWorkloadUnsupportedError(SandboxError):
-    pass
+class SandboxBuildError(SandboxError):
+    def __init__(self, message: str, build_log: str = "") -> None:
+        self.build_log = build_log
+        super().__init__(message)
 
 
 def resolve_volume_subpath(mount: VolumeMount, labels: Mapping[str, str]) -> str | None:
@@ -285,28 +316,6 @@ class ExecResult(BaseModel):
         return self.output
 
 
-@dataclass(frozen=True)
-class ControlledWorkloadResult:
-    result: ExecResult
-    absence_confirmed_at: float
-
-
-class ControlledWorkload(ABC):
-
-    @property
-    @abstractmethod
-    def agent_absence_confirmed_at(self) -> float | None: ...
-
-    @abstractmethod
-    def output(self) -> AsyncGenerator[str, None]: ...
-
-    @abstractmethod
-    async def wait(self) -> ControlledWorkloadResult: ...
-
-    @abstractmethod
-    async def kill(self) -> None: ...
-
-
 class Sandbox(ABC):
     @property
     @abstractmethod
@@ -344,35 +353,16 @@ class Sandbox(ABC):
         return {}
 
     @property
-    def generation_containment(self) -> GenerationContainment | None:
+    def has_ended(self) -> bool:
+        """True once the provider reports the sandbox stopped or deleted, so its lifetime is final."""
+        return False
+
+    def cost_usd(self, ended_at: datetime) -> float | None:
+        """Cost from ``created_at`` to ``ended_at`` at the provider's published rates.
+
+        None when the provider isn't priced from rates or the sandbox lacks the fields to price it.
+        """
         return None
-
-    async def probe_generation_containment(self) -> None:
-        raise ControlledWorkloadUnsupportedError(
-            f"{type(self).__name__} does not support controlled generation workloads"
-        )
-
-    def controlled_workload(
-        self,
-        command: str,
-        *,
-        cwd: str | None = None,
-        env_vars: Mapping[str, str] | None = None,
-    ) -> ControlledWorkload:
-        return self._process_group_workload(command, None, cwd=cwd, env_vars=env_vars)
-
-    def _controlled_episode_workload(
-        self, command: str, script: str, *, cwd: str | None, env_vars: Mapping[str, str] | None
-    ) -> ControlledWorkload:
-        return self._process_group_workload(command, script, cwd=cwd, env_vars=env_vars)
-
-    def _process_group_workload(
-        self, command: str, episode_script: str | None, *, cwd: str | None,
-        env_vars: Mapping[str, str] | None
-    ) -> ControlledWorkload:
-        raise ControlledWorkloadUnsupportedError(
-            f"{type(self).__name__} does not support controlled generation workloads"
-        )
 
     @abstractmethod
     async def exec(

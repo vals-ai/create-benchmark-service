@@ -1,0 +1,182 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  changes:
+    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
+    outputs:
+      grading: ${{ steps.grading.outputs.relevant }}
+    steps:
+      - uses: useblacksmith/checkout@2b9fe87d796feea153b455ec2f3125b471a7b0e7 # v1.8.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check for grading package changes
+        id: grading
+        uses: ./.github/actions/changed
+        with:
+          paths: '^(packages/vals-grading/|\.github/workflows/ci\.yaml$|\.github/actions/changed/)'
+
+  lint:
+    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
+    steps:
+      - uses: useblacksmith/checkout@2b9fe87d796feea153b455ec2f3125b471a7b0e7 # v1.8.2
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@0c5e2b8115b80b4c7c5ddf6ffdd634974642d182 # v5.4.1
+        with:
+          version: "0.13.5"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: make install
+
+      - name: Run lint check
+        run: make lint
+
+      - name: Run typecheck
+        if: ${{ !cancelled() }}
+        run: make typecheck
+
+  test:
+    if: github.event.pull_request.draft != true
+    runs-on: blacksmith-4vcpu-ubuntu-2404-arm
+    timeout-minutes: 10
+    steps:
+      - uses: useblacksmith/checkout@2b9fe87d796feea153b455ec2f3125b471a7b0e7 # v1.8.2
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@0c5e2b8115b80b4c7c5ddf6ffdd634974642d182 # v5.4.1
+        with:
+          version: "0.13.5"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: make install
+
+      - name: Run tests
+        run: uv run pytest --ignore=tests/integration -n 4
+
+  integration:
+    if: github.event.pull_request.draft != true
+    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
+    timeout-minutes: 15
+    steps:
+      - uses: useblacksmith/checkout@2b9fe87d796feea153b455ec2f3125b471a7b0e7 # v1.8.2
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@0c5e2b8115b80b4c7c5ddf6ffdd634974642d182 # v5.4.1
+        with:
+          version: "0.13.5"
+          enable-cache: true
+          cache-dependency-glob: "uv.lock"
+
+      - name: Install dependencies
+        run: make install
+
+      - name: Run Docker provider tests
+        env:
+          DOCKER_HOST: unix:///var/run/docker.sock
+        run: uv run pytest tests/integration/test_docker_sandbox.py -v
+
+      - name: Build wheel
+        if: ${{ !cancelled() }}
+        run: uv build --wheel
+
+      - name: Install CLI from wheel
+        if: ${{ !cancelled() }}
+        env:
+          UV_TOOL_BIN_DIR: ${{ runner.temp }}/uv-tool-bin
+          UV_TOOL_DIR: ${{ runner.temp }}/uv-tools
+        run: |
+          uv tool install --exclude-newer "7 days" --exclude-newer-package certifi=false dist/*.whl
+          echo "$UV_TOOL_BIN_DIR" >> "$GITHUB_PATH"
+
+      - name: Generate, install, lint and boot a service from each template
+        if: ${{ !cancelled() }}
+        env:
+          PYTHONPATH: src
+          AUTH_REQUIRED: "false"
+        run: |
+          for template in default vals-ai; do
+            extras=""
+            if [[ "$template" == vals-ai ]]; then extras="[vals-ai]"; fi
+            dir="$RUNNER_TEMP/cli-test-$template"
+            mkdir "$dir"
+            (
+              cd "$dir"
+              create-benchmark-service test --template "$template"
+              cd test-benchmark-service
+              uv add --no-sync "create-benchmark-service${extras} @ file://${GITHUB_WORKSPACE}"
+              make install
+              make lint
+              TEMPLATE="$template" uv run python - <<'PYTHON'
+          import os
+          from fastapi.testclient import TestClient
+          from main import app
+
+          with TestClient(app) as client:
+              response = client.post("/evaluate-response/", json={"task_id": "example-task-2", "response": "4"})
+              assert response.status_code == 200, response.text
+              assert response.json()["score"] == 1.0
+              tasks = client.get("/v1/datasets/default/tasks")
+              assert tasks.status_code == (200 if os.environ["TEMPLATE"] == "vals-ai" else 404)
+          PYTHON
+            )
+          done
+
+  grading:
+    needs: changes
+    if: ${{ !cancelled() && (needs.changes.result != 'success' || needs.changes.outputs.grading == 'true') && github.event.pull_request.draft != true }}
+    runs-on: blacksmith-2vcpu-ubuntu-2404-arm
+    defaults:
+      run:
+        working-directory: packages/vals-grading
+    steps:
+      - uses: useblacksmith/checkout@2b9fe87d796feea153b455ec2f3125b471a7b0e7 # v1.8.2
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@0c5e2b8115b80b4c7c5ddf6ffdd634974642d182 # v5.4.1
+        with:
+          version: "0.13.5"
+          enable-cache: true
+          cache-dependency-glob: "packages/vals-grading/uv.lock"
+
+      - name: Test, lint, typecheck and build on each Python
+        run: |
+          for python in 3.12 3.13; do
+            echo "::group::Python $python"
+            UV_PYTHON="$python" uv sync --locked --all-extras
+            UV_PYTHON="$python" make test lint typecheck build
+            echo "::endgroup::"
+          done
+
+      - name: Run standalone smoke test
+        if: ${{ !cancelled() }}
+        env:
+          UV_PYTHON: "3.12"
+        run: |
+          uv sync --locked --no-dev
+          uv run --no-sync python tests/standalone_smoke.py

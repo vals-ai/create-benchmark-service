@@ -1,17 +1,16 @@
 import asyncio
 import logging
-import os
 import shlex
 import subprocess
 from collections.abc import AsyncGenerator, Mapping
-from contextlib import nullcontext, suppress
+from contextlib import nullcontext
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, cast
 
 import pytest
-from aiohttp import ClientConnectionError, ClientPayloadError, ClientResponseError, InvalidURL, RequestInfo, WSMessage, WSMsgType
+from aiohttp import ClientConnectionError, ClientPayloadError, ClientResponseError, InvalidURL, RequestInfo
 from daytona import DaytonaConfig, GpuType, SandboxState
 from daytona.common.errors import (
     SOURCE_API,
@@ -39,12 +38,14 @@ from benchmark_service.sandbox.compose import _COMPOSE_EXEC_ENV_ARGS  # pyright:
 from benchmark_service.sandbox import (
     ComposeSource,
     ComposeSandbox,
+    DockerfileSource,
     ExecResult,
     ImageSource,
     MissingSandboxConfigError,
     ResourceCapacity,
     Resources,
     Sandbox,
+    SandboxBuildError,
     SandboxCapacity,
     SandboxCommandError,
     SandboxConnectionError,
@@ -975,14 +976,16 @@ class DaytonaClient:
         self.deleted = False
         self.listed_query: Any | None = None
         self.create_params: Any = None
+        self.create_kwargs: dict[str, object] = {}
 
     async def get(self, instance_id: str) -> InnerSandbox:
         assert instance_id == self.sandbox.name
         return self.sandbox
 
-    async def create(self, params: object, *_args: object, **_kwargs: object) -> InnerSandbox:
+    async def create(self, params: object, *_args: object, **kwargs: object) -> InnerSandbox:
         self.created = True
         self.create_params = params
+        self.create_kwargs = kwargs
         return self.sandbox
 
     async def delete(self, sandbox: InnerSandbox) -> None:
@@ -3893,6 +3896,123 @@ async def test_daytona_provider_creates_fresh_sandbox() -> None:
     assert daytona.create_params.ttl_minutes == 167 * 60
 
 
+def _dockerfile_request(tmp_path: Path, name: str, build_timeout: float | None = None) -> SandboxCreateRequest:
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\nCOPY data.txt /data.txt\n")
+    (tmp_path / "data.txt").write_text("data")
+    source = DockerfileSource(dockerfile=str(tmp_path / "Dockerfile"), build_timeout=build_timeout)
+    return _request(name).model_copy(update={"source": source})
+
+
+async def test_daytona_provider_builds_a_dockerfile_source_from_its_folder(tmp_path: Path) -> None:
+    inner = InnerSandbox()
+    daytona = DaytonaClient(inner)
+
+    await _provider(daytona).create_sandbox(_dockerfile_request(tmp_path, inner.name))
+
+    image = daytona.create_params.image
+    assert image.dockerfile() == "FROM python:3.12-slim\nCOPY data.txt /data.txt\n"
+    assert [(context.source_path, context.archive_path) for context in image._context_list] == [  # pyright: ignore[reportPrivateUsage]
+        (str(tmp_path / "data.txt"), "data.txt")
+    ]
+    assert callable(daytona.create_kwargs["on_snapshot_create_logs"])
+
+
+async def test_daytona_gives_a_dockerfile_build_its_own_time_on_top_of_the_creation_timeout(tmp_path: Path) -> None:
+    inner = InnerSandbox()
+    daytona = DaytonaClient(inner)
+    request = _dockerfile_request(tmp_path, inner.name, build_timeout=600)
+
+    await _provider(daytona).create_sandbox(request)
+
+    assert daytona.create_kwargs["timeout"] == request.create_timeout + 600
+
+
+async def test_daytona_build_failure_carries_the_build_log_and_deletes_the_failed_sandbox(tmp_path: Path) -> None:
+    inner = InnerSandbox()
+    inner.state = SandboxState.BUILD_FAILED
+
+    class FailingBuildClient(DaytonaClient):
+        async def get(self, instance_id: str) -> InnerSandbox:
+            return self.sandbox
+
+        async def create(self, params: object, *_args: object, **kwargs: Any) -> InnerSandbox:
+            kwargs["on_snapshot_create_logs"]("Step 1/2 : FROM python:3.12-slim")
+            kwargs["on_snapshot_create_logs"]("COPY failed: file not found")
+            raise DaytonaError("Failed to build snapshot")
+
+    daytona = FailingBuildClient(inner)
+
+    with pytest.raises(SandboxBuildError, match="Failed to build snapshot") as error:
+        await _provider(daytona).create_sandbox(_dockerfile_request(tmp_path, inner.name))
+
+    assert error.value.build_log == "Step 1/2 : FROM python:3.12-slim\nCOPY failed: file not found"
+    assert daytona.deleted is True
+
+
+async def test_daytona_build_timeout_is_a_build_error_and_is_not_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inner = InnerSandbox()
+    inner.state = SandboxState.BUILDING_SNAPSHOT
+    attempts: list[int] = []
+
+    class TimingOutClient(DaytonaClient):
+        async def get(self, instance_id: str) -> InnerSandbox:
+            return self.sandbox
+
+        async def create(self, params: object, *_args: object, **kwargs: Any) -> InnerSandbox:
+            attempts.append(1)
+            kwargs["on_snapshot_create_logs"]("Step 1/2 : RUN sleep 9999")
+            raise DaytonaTimeoutError("Sandbox failed to become ready within the timeout period")
+
+    daytona = TimingOutClient(inner)
+
+    with pytest.raises(SandboxBuildError, match="Timed out building") as error:
+        await _provider(daytona).create_sandbox(_dockerfile_request(tmp_path, inner.name))
+
+    assert len(attempts) == 1
+    assert error.value.build_log == "Step 1/2 : RUN sleep 9999"
+    assert daytona.deleted is True
+
+
+async def test_daytona_registry_image_creation_never_collects_a_build_log() -> None:
+    inner = InnerSandbox()
+
+    class FailingImageClient(DaytonaClient):
+        async def create(self, params: object, *_args: object, **kwargs: Any) -> InnerSandbox:
+            self.create_kwargs = kwargs
+            raise DaytonaError("Failed to pull the image")
+
+    daytona = FailingImageClient(inner)
+
+    with pytest.raises(SandboxError, match="Failed to pull the image") as error:
+        await _provider(daytona).create_sandbox(_request(inner.name))
+
+    assert daytona.create_kwargs["on_snapshot_create_logs"] is None
+    assert not isinstance(error.value, SandboxBuildError)
+
+
+async def test_daytona_failure_before_any_build_output_is_not_a_build_error(tmp_path: Path) -> None:
+    inner = InnerSandbox()
+
+    class RejectingClient(DaytonaClient):
+        async def create(self, params: object, *_args: object, **_kwargs: object) -> InnerSandbox:
+            raise DaytonaError("Quota exceeded")
+
+    with pytest.raises(SandboxError, match="Quota exceeded") as error:
+        await _provider(RejectingClient(inner)).create_sandbox(_dockerfile_request(tmp_path, inner.name))
+
+    assert not isinstance(error.value, SandboxBuildError)
+
+
+async def test_daytona_dockerfile_that_cannot_be_read_is_a_sandbox_error(tmp_path: Path) -> None:
+    inner = InnerSandbox()
+    request = _request(inner.name).model_copy(update={"source": DockerfileSource(dockerfile=str(tmp_path / "Dockerfile"))})
+
+    with pytest.raises(SandboxError, match="Cannot read the Dockerfile"):
+        await _provider(DaytonaClient(inner)).create_sandbox(request)
+
+
 def test_daytona_sandbox_exposes_inventory_metadata() -> None:
     inner = InnerSandbox()
     inner.labels = {"Benchmark": "vcb", "clean-up": "true"}
@@ -4085,6 +4205,27 @@ async def test_daytona_provider_maps_gpu_resources() -> None:
     assert daytona.create_params is not None
     assert daytona.create_params.resources.gpu == 1
     assert daytona.create_params.resources.gpu_type == GpuType.H100
+
+
+async def test_daytona_provider_rounds_a_fractional_cpu_up_to_a_whole_one() -> None:
+    inner = InnerSandbox()
+    daytona = CapturingCreateDaytonaClient(inner)
+
+    await _provider(daytona).create_sandbox(_request(inner.name, resources=Resources(vcpu=1.5, memory=4, disk=10)))
+
+    assert daytona.create_params is not None
+    assert daytona.create_params.resources.cpu == 2
+
+
+async def test_daytona_provider_passes_the_acceptable_gpu_types_it_offers_in_order() -> None:
+    inner = InnerSandbox()
+    daytona = CapturingCreateDaytonaClient(inner)
+    resources = Resources(vcpu=2, memory=4, disk=10, gpu=1, gpu_type=["A100", "nvidia-h100-80gb", "h200", "H100"])
+
+    await _provider(daytona).create_sandbox(_request(inner.name, resources=resources))
+
+    assert daytona.create_params is not None
+    assert daytona.create_params.resources.gpu_type == [GpuType.H100, GpuType.H200]
 
 
 async def test_daytona_provider_omits_gpu_by_default() -> None:
@@ -4852,1644 +4993,3 @@ def test_provider_secret_references_reject_invalid_configuration(
 def test_volume_mount_rejects_invalid_subpath(subpath: str) -> None:
     with pytest.raises(ValidationError):
         VolumeMount(name="fixtures", mount_path="/fixtures", subpath=subpath)
-
-
-
-@pytest.fixture
-def _fake_cgroup_follow(monkeypatch: pytest.MonkeyPatch) -> None:  # pyright: ignore[reportUnusedFunction]
-    async def consume(
-        reader: Any, url: str, headers: dict[str, str],
-        on_stdout: Callable[[str], Awaitable[None]],
-        on_stderr: Callable[[str], Awaitable[None]],
-    ) -> None:
-        process = reader._api_client
-        await process.get_session_command_logs_async(
-            process.follow_session_id, process.follow_command_id, on_stdout, on_stderr,
-        )
-
-    monkeypatch.setattr(daytona_module._NativeSessionLogProcess, "_consume_log_websocket", consume)  # pyright: ignore[reportPrivateUsage]
-
-
-class CgroupProcess(Process):
-    def __init__(self) -> None:
-        super().__init__()
-        self.cgroup_parent = "/\n"
-        self._language = "python"
-        self._api_client = self
-        self.allow_creation = asyncio.Event()
-        self.command_admitted = asyncio.Event()
-        self.user_finished = asyncio.Event()
-        self.removal_started = asyncio.Event()
-        self.allow_removal = asyncio.Event()
-        self.release_seen = asyncio.Event()
-        self.group_exists = False
-        self.removal_fails = False
-        self.sessions: set[str] = set()
-        self.poll_error = False
-        self.marker_polled = asyncio.Event()
-        self.status_error = False
-        self.follow_error = False
-        self.snapshot_error = False
-        self.follow_calls = 0
-        self.execute_calls = 0
-        self.stdout = "hello"
-        self.stderr = ""
-        self.exit_code = 7
-
-    def _get_session_command_logs_serialize(
-        self, session_id: str, command_id: str, **kwargs: Any,
-    ) -> tuple[str, str, dict[str, str]]:
-        self.follow_session_id = session_id
-        self.follow_command_id = command_id
-        return "GET", "http://fake/native-logs", {}
-
-    async def exec(self, command: str) -> SimpleNamespace:
-        command = _unwrap_shell_command(command)
-        if command == daytona_module._CGROUP_SELF_COMMAND:  # pyright: ignore[reportPrivateUsage]
-            return SimpleNamespace(exit_code=0, result=self.cgroup_parent)
-        if command.startswith("mkdir -p /sys/fs/cgroup/") and "/cbs-" in command:
-            await self.allow_creation.wait()
-            self.created_group = command.removeprefix("mkdir -p ")
-            self.group_exists = True
-            return SimpleNamespace(exit_code=0, result="")
-        if command.startswith("test -e ") and command.endswith(".complete"):
-            self.marker_polled.set()
-            if self.poll_error:
-                raise DaytonaConnectionError("control channel unavailable")
-            return SimpleNamespace(exit_code=0 if self.user_finished.is_set() else 1, result="")
-        if command.startswith("d=/sys/fs/cgroup/") and "/cbs-" in command.split(";", 1)[0]:
-            self.removed_group = command.split(";", 1)[0].removeprefix("d=")
-            self.removal_started.set()
-            await self.allow_removal.wait()
-            if self.removal_fails:
-                return SimpleNamespace(exit_code=1, result="cgroup still populated")
-            self.group_exists = False
-            if self.command_admitted.is_set():
-                self.user_finished.set()
-            return SimpleNamespace(exit_code=0, result="")
-        if command.startswith(": > ") and command.endswith(".release"):
-            self.release_seen.set()
-            return SimpleNamespace(exit_code=0, result="")
-        return await super().exec(command)
-
-    async def create_session(self, session_id: str) -> None:
-        self.sessions.add(session_id)
-
-    async def execute_session_command(self, session_id: str, req: Any) -> SimpleNamespace:
-        assert session_id in self.sessions
-        assert req.run_async is True
-        self.command = req.command
-        self.execute_calls += 1
-        self.command_admitted.set()
-        return SimpleNamespace(cmd_id="command-1")
-
-    async def get_session_command_logs_async(
-        self, session_id: str, command_id: str,
-        on_stdout: Callable[[str], Awaitable[None]],
-        on_stderr: Callable[[str], Awaitable[None]],
-    ) -> None:
-        self.follow_calls += 1
-        await on_stdout(self.stdout)
-        await on_stderr(self.stderr)
-        if self.follow_error:
-            self.follow_error = False
-            raise DaytonaConnectionError("follow dropped")
-        await self.release_seen.wait()
-        self.stdout += "final frame"
-        await on_stdout("final frame")
-
-    async def get_session_command(self, session_id: str, command_id: str) -> SimpleNamespace:
-        if self.status_error:
-            self.status_error = False
-            raise DaytonaConnectionError("status unavailable")
-        return SimpleNamespace(exit_code=self.exit_code if self.release_seen.is_set() else None)
-
-    async def get_session_command_logs(self, session_id: str, command_id: str) -> SimpleNamespace:
-        if self.snapshot_error:
-            raise DaytonaConnectionError("snapshot unavailable")
-        return SimpleNamespace(stdout=self.stdout, stderr=self.stderr)
-
-    async def delete_session(self, session_id: str) -> None:
-        self.sessions.discard(session_id)
-        self.release_seen.set()
-
-    async def get_session(self, session_id: str) -> SimpleNamespace:
-        if session_id not in self.sessions:
-            raise DaytonaNotFoundError("session not found")
-        return SimpleNamespace(id=session_id)
-
-
-class CgroupDaytonaClient:
-    def __init__(self, inner: InnerSandbox, process: CgroupProcess) -> None:
-        self.inner = inner
-        self.process = process
-
-    async def get(self, sandbox_id: str) -> InnerSandbox:
-        assert sandbox_id == self.inner.id
-        fresh = InnerSandbox()
-        fresh.state = self.inner.state
-        fresh.process = self.process
-        return fresh
-
-def _cgroup_sandbox(process: CgroupProcess) -> DaytonaSandbox:
-    inner = InnerSandbox()
-    inner.process = process
-    return DaytonaSandbox(cast(Any, inner), cast(Any, CgroupDaytonaClient(inner, process)))
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_controlled_cgroup_stays_under_toolbox_cgroup() -> None:
-    # Daytona applies egress rules to the toolbox cgroup; a sibling cgroup at the root escapes them.
-    process = CgroupProcess()
-    process.cgroup_parent = "/init.scope\n"
-    process.allow_creation.set()
-    process.allow_removal.set()
-    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
-    await asyncio.wait_for(process.command_admitted.wait(), 2)
-    process.user_finished.set()
-    completed = await asyncio.wait_for(workload.wait(), 2)
-    assert completed.result.exit_code == 7
-    assert process.created_group.startswith("/sys/fs/cgroup/init.scope/cbs-")
-    assert process.removed_group == process.created_group
-    assert process.command is not None
-    assert f"echo $$ > {process.created_group}/cgroup.procs" in process.command
-
-
-async def test_daytona_cgroup_probe_runs_under_toolbox_cgroup() -> None:
-    class ProbeProcess(Process):
-        probe = ""
-
-        async def exec(self, command: str) -> SimpleNamespace:
-            command = _unwrap_shell_command(command)
-            if command == daytona_module._CGROUP_SELF_COMMAND:  # pyright: ignore[reportPrivateUsage]
-                return SimpleNamespace(exit_code=0, result="/init.scope\n")
-            self.probe = command
-            return SimpleNamespace(exit_code=0, result="")
-
-    inner = InnerSandbox()
-    process = ProbeProcess()
-    inner.process = process
-    await _daytona_sandbox(cast(Any, inner)).probe_generation_containment()
-    assert process.probe.startswith("d=/sys/fs/cgroup/init.scope/cbs-probe-")
-
-
-@pytest.mark.parametrize("error_type", [SandboxNotFoundError, SandboxConnectionError])
-async def test_daytona_cgroup_probe_preserves_parent_lookup_error(
-    monkeypatch: pytest.MonkeyPatch, error_type: type[SandboxError]
-) -> None:
-    error = error_type("parent lookup failed")
-
-    async def fail_control(_command: str) -> ExecResult:
-        raise error
-
-    sandbox = _daytona_sandbox(InnerSandbox())
-    monkeypatch.setattr(sandbox, "_control_exec", fail_control)
-
-    with pytest.raises(error_type) as raised:
-        await sandbox.probe_generation_containment()
-
-    assert raised.value is error
-
-
-async def test_daytona_cgroup_probe_rejects_unsupported_kernel() -> None:
-    class UnsupportedProcess(Process):
-        async def exec(self, command: str) -> SimpleNamespace:
-            if _unwrap_shell_command(command) == daytona_module._CGROUP_SELF_COMMAND:  # pyright: ignore[reportPrivateUsage]
-                return SimpleNamespace(exit_code=0, result="/init.scope\n")
-            return SimpleNamespace(exit_code=1, result="cgroup.kill unavailable")
-
-    inner = InnerSandbox()
-    inner.process = UnsupportedProcess()
-    with pytest.raises(SandboxError, match=r"linux_cgroup_v2 v1: .*: cgroup\.kill unavailable$"):
-        await _daytona_sandbox(cast(Any, inner)).probe_generation_containment()
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_native_reopens_same_command_and_forwards_each_stream_once(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(daytona_module, "_SESSION_WATCH_REOPEN_SECONDS", 0.01)
-    process = CgroupProcess()
-    process.allow_creation.set()
-    process.allow_removal.set()
-    process.follow_error = True
-    process.status_error = True
-    process.stdout = "before-"
-    process.stderr = "error-"
-    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
-    await asyncio.wait_for(process.command_admitted.wait(), 2)
-    process.user_finished.set()
-    completed = await asyncio.wait_for(workload.wait(), 2)
-    streamed = "".join([chunk async for chunk in workload.output()])
-    assert completed.result.exit_code == 7
-    assert streamed.count("before-") == 1
-    assert streamed.count("error-") == 1
-    assert streamed.count("final frame") == 1
-    assert process.execute_calls == 1
-    assert process.follow_calls >= 2
-    assert not process.group_exists
-    assert process.sessions == set()
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_native_status_failure_keeps_pending_follow(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(daytona_module, "_SESSION_WATCH_REOPEN_SECONDS", 0.01)
-
-    class PendingFollowProcess(CgroupProcess):
-        def __init__(self) -> None:
-            super().__init__()
-            self.status_error = True
-            self.stdout = "before-"
-            self.recovered_status = asyncio.Event()
-            self.send_later_output = asyncio.Event()
-            self.later_output_sent = asyncio.Event()
-            self.status_calls = 0
-
-        async def get_session_command_logs_async(
-            self, session_id: str, command_id: str,
-            on_stdout: Callable[[str], Awaitable[None]],
-            on_stderr: Callable[[str], Awaitable[None]],
-        ) -> None:
-            self.follow_calls += 1
-            await on_stdout(self.stdout)
-            await self.send_later_output.wait()
-            self.stdout += "after-status-"
-            await on_stdout("after-status-")
-            self.later_output_sent.set()
-            await self.release_seen.wait()
-            self.stdout += "final frame"
-            await on_stdout("final frame")
-
-        async def get_session_command(self, session_id: str, command_id: str) -> SimpleNamespace:
-            self.status_calls += 1
-            status = await super().get_session_command(session_id, command_id)
-            if status.exit_code is None:
-                self.recovered_status.set()
-            return status
-
-    process = PendingFollowProcess()
-    process.allow_creation.set()
-    process.allow_removal.set()
-    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
-    try:
-        await asyncio.wait_for(process.recovered_status.wait(), 2)
-        assert process.status_calls >= 2
-        assert process.follow_calls == 1
-        process.send_later_output.set()
-        await asyncio.wait_for(process.later_output_sent.wait(), 2)
-        assert process.follow_calls == 1
-        process.user_finished.set()
-        completed = await asyncio.wait_for(workload.wait(), 2)
-        streamed = "".join([chunk async for chunk in workload.output()])
-        assert completed.result.exit_code == 7
-        assert streamed == "before-after-status-final frame"
-        assert process.execute_calls == 1
-        assert process.follow_calls == 1
-        assert not process.group_exists
-        assert process.sessions == set()
-    finally:
-        process.send_later_output.set()
-        if process.sessions:
-            await asyncio.wait_for(workload.kill(), 2)
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_reopen_from_ids_survives_discarded_launch_adapter(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(daytona_module, "_SESSION_WATCH_REOPEN_SECONDS", 0.01)
-    process = CgroupProcess()
-    process.allow_creation.set()
-    process.allow_removal.set()
-    process.follow_error = True
-    process.status_error = True
-    process.stdout = "before-"
-
-    class LaunchOnlyProcess:
-        def __getattr__(self, name: str) -> Any:
-            return getattr(process, name)
-
-        async def get_session_command_logs_async(
-            self, session_id: str, command_id: str,
-            on_stdout: Callable[[str], Awaitable[None]],
-            on_stderr: Callable[[str], Awaitable[None]],
-        ) -> None:
-            raise AssertionError("discarded launch adapter used for observation")
-
-    inner = InnerSandbox()
-    inner.process = cast(Any, LaunchOnlyProcess())
-    client = CgroupDaytonaClient(inner, process)
-    sandbox = DaytonaSandbox(cast(Any, inner), cast(Any, client))
-    workload = sandbox.controlled_workload("exit 7")
-    await asyncio.wait_for(process.command_admitted.wait(), 2)
-    process.user_finished.set()
-    completed = await asyncio.wait_for(workload.wait(), 2)
-    output = "".join([chunk async for chunk in workload.output()])
-    assert completed.result.exit_code == 7
-    assert output == "before-final frame"
-    assert process.execute_calls == 1
-    assert process.follow_calls >= 2
-    assert not process.group_exists
-    assert process.sessions == set()
-
-
-class RawLogWebSocket:
-    def __init__(self, events: list[WSMessage | BaseException]) -> None:
-        self.events = iter(events)
-        self.closed = False
-
-    async def receive(self) -> WSMessage:
-        event = next(self.events)
-        if isinstance(event, BaseException):
-            raise event
-        return event
-
-    async def close(self) -> None:
-        self.closed = True
-
-
-def _raw_log_frame(data: bytes) -> WSMessage:
-    return WSMessage(WSMsgType.BINARY, data, "")
-
-
-def _normal_log_close() -> WSMessage:
-    return WSMessage(WSMsgType.CLOSE, 1000, "")
-
-
-def _raw_log_reader(monkeypatch: pytest.MonkeyPatch, socket: RawLogWebSocket) -> Any:
-    def serialize(**kwargs: Any) -> tuple[str, str, dict[str, str]]:
-        return "GET", "http://toolbox/session/command/logs?follow=true", {"Authorization": "Bearer test"}
-
-    api = SimpleNamespace(_get_session_command_logs_serialize=serialize)
-    reader = daytona_module._NativeSessionLogProcess("python", cast(Any, api))  # pyright: ignore[reportPrivateUsage]
-
-    async def open_ws(url: str, headers: dict[str, str]) -> RawLogWebSocket:
-        return socket
-
-    monkeypatch.setattr(reader, "_open_ws", open_ws)
-    return reader
-
-
-def _unexpected_stderr(text: str) -> None:
-    raise AssertionError(f"Unexpected stderr: {text!r}")
-
-
-@pytest.mark.parametrize(
-    "pieces",
-    [
-        [b"\x01\x01\x01A\xe2\x82\xac\n\x02\x02\x02", b"!\xe2\x9a\x91\n\x01\x01\x01Z\n"],
-        [b"\x01\x01\x01A\xe2", b"\x82\xac\n\x02", b"\x02\x02!\xe2", b"\x9a\x91\n\x01\x01", b"\x01Z\n"],
-    ],
-)
-async def test_native_log_reader_preserves_streams_across_ws_boundaries(
-    monkeypatch: pytest.MonkeyPatch, pieces: list[bytes],
-) -> None:
-    socket = RawLogWebSocket([*map(_raw_log_frame, pieces), _normal_log_close()])
-    reader = _raw_log_reader(monkeypatch, socket)
-    stdout: list[str] = []
-    stderr: list[str] = []
-    await reader.get_session_command_logs_async("session", "command", stdout.append, stderr.append)
-    assert "".join(stdout) == "A€\nZ\n"
-    assert "".join(stderr) == "!⚑\n"
-    assert socket.closed
-
-
-@pytest.mark.parametrize("tail", [b"\x01", b"\xe2\x82"])
-@pytest.mark.parametrize("failure", [ClientConnectionError("receive dropped"), asyncio.CancelledError()])
-async def test_native_log_reader_does_not_flush_incomplete_data_on_failed_receive(
-    monkeypatch: pytest.MonkeyPatch, tail: bytes, failure: BaseException,
-) -> None:
-    socket = RawLogWebSocket([_raw_log_frame(b"\x01\x01\x01ok\n" + tail), failure])
-    reader = _raw_log_reader(monkeypatch, socket)
-    stdout: list[str] = []
-    if isinstance(failure, asyncio.CancelledError):
-        with pytest.raises(asyncio.CancelledError):
-            await reader.get_session_command_logs_async("session", "command", stdout.append, _unexpected_stderr)
-    else:
-        with pytest.raises(DaytonaConnectionError):
-            await reader.get_session_command_logs_async("session", "command", stdout.append, _unexpected_stderr)
-    assert "".join(stdout) == "ok\n"
-    assert socket.closed
-
-
-
-async def test_native_log_reader_non_normal_close_reports_error_without_partial_flush(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    socket = RawLogWebSocket([
-        _raw_log_frame(b"\x01\x01\x01ok\n\x02"),
-        WSMessage(WSMsgType.CLOSE, 1011, "daemon failed"),
-    ])
-    reader = _raw_log_reader(monkeypatch, socket)
-    stdout: list[str] = []
-    with pytest.raises(DaytonaError, match="1011"):
-        await reader.get_session_command_logs_async("session", "command", stdout.append, _unexpected_stderr)
-    assert "".join(stdout) == "ok\n"
-    assert socket.closed
-
-
-async def test_native_log_reader_callback_failure_does_not_reemit_buffer(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    socket = RawLogWebSocket([_raw_log_frame(b"\x01\x01\x01ok\n\x01")])
-    reader = _raw_log_reader(monkeypatch, socket)
-    received: list[str] = []
-
-    def fail_after_receive(text: str) -> None:
-        received.append(text)
-        raise RuntimeError("consumer failed")
-
-    with pytest.raises(DaytonaError, match="consumer failed") as error:
-        await reader.get_session_command_logs_async("session", "command", fail_after_receive, _unexpected_stderr)
-    assert isinstance(error.value.__cause__, RuntimeError)
-    assert received == ["ok\n"]
-    assert socket.closed
-
-
-@pytest.mark.parametrize(
-    ("first_frame", "canonical"),
-    [
-        (b"\x01\x01\x01ok\n\xe2\x82", "ok\n€done\n"),
-        (b"\x01\x01\x01ok\n\x02\x02", "ok\n\x02\x02done\n"),
-        (b"\x01\x01\x01ok\n\x01", "ok\n\x01"),
-    ],
-    ids=["utf8-tail", "framing-prefix", "terminal-literal-control"],
-)
-async def test_daytona_native_watcher_normal_follow_close_replays_uncommitted_tail_from_snapshot(
-    monkeypatch: pytest.MonkeyPatch, first_frame: bytes, canonical: str,
-) -> None:
-    first = RawLogWebSocket([_raw_log_frame(first_frame), _normal_log_close()])
-    second = RawLogWebSocket([_raw_log_frame(b"\x01\x01\x01" + canonical.encode()), _normal_log_close()])
-    sockets = iter([first, second])
-
-    async def open_ws(self: Any, url: str, headers: dict[str, str]) -> RawLogWebSocket:
-        return next(sockets)
-
-    monkeypatch.setattr(daytona_module._NativeSessionLogProcess, "_open_ws", open_ws)  # pyright: ignore[reportPrivateUsage]
-    process = CgroupProcess()
-    process.stdout = canonical
-    inner = InnerSandbox()
-    inner.process = process
-    client = CgroupDaytonaClient(inner, process)
-    forwarded: list[str] = []
-    closed = asyncio.Event()
-    first_result = await daytona_module._watch_session_command(  # pyright: ignore[reportPrivateUsage]
-        cast(Any, client), inner.id, "session", "command", 0, 0, forwarded.append, closed,
-    )
-    assert first_result[0] is None
-    assert "".join(forwarded) == "ok\n"
-    process.release_seen.set()
-    second_result = await daytona_module._watch_session_command(  # pyright: ignore[reportPrivateUsage]
-        cast(Any, client), inner.id, "session", "command", first_result[1], first_result[2],
-        forwarded.append, closed,
-    )
-    assert second_result[0] == 7
-    assert "".join(forwarded) == canonical
-    assert first.closed and second.closed
-
-async def test_daytona_native_watcher_malformed_follow_matches_final_snapshot_after_reopen(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    stdout = "A\ufffd\ufffdB\ufffd\ufffdC|TAIL-9Z\n"
-    stderr = "E\ufffd\ufffdZ|ERR-TAIL-9Z\n"
-    raw_stdout = b"A\xe2\x82B\xe2\x82C|TAIL-9Z\n"
-    raw_stderr = b"E\xf0\x90Z|ERR-TAIL-9Z\n"
-    first = RawLogWebSocket([
-        _raw_log_frame(b"\x01\x01\x01A\xe2"),
-        _raw_log_frame(b"\x82B\xe2\x82C|TAIL-9Z\n\x02\x02\x02" + raw_stderr),
-        _normal_log_close(),
-    ])
-    second = RawLogWebSocket([
-        _raw_log_frame(b"\x01\x01\x01" + raw_stdout + b"\x02\x02\x02" + raw_stderr),
-        _normal_log_close(),
-    ])
-    sockets = iter([first, second])
-
-    async def open_ws(self: Any, url: str, headers: dict[str, str]) -> RawLogWebSocket:
-        return next(sockets)
-
-    monkeypatch.setattr(daytona_module._NativeSessionLogProcess, "_open_ws", open_ws)  # pyright: ignore[reportPrivateUsage]
-    process = CgroupProcess()
-    process.stdout = stdout
-    process.stderr = stderr
-    inner = InnerSandbox()
-    inner.process = process
-    client = CgroupDaytonaClient(inner, process)
-    forwarded: list[str] = []
-    closed = asyncio.Event()
-
-    first_result = await daytona_module._watch_session_command(  # pyright: ignore[reportPrivateUsage]
-        cast(Any, client), inner.id, "session", "command", 0, 0, forwarded.append, closed,
-    )
-    assert first_result == (None, len(stdout), len(stderr))
-    assert "".join(forwarded) == stdout + stderr
-
-    process.release_seen.set()
-    second_result = await daytona_module._watch_session_command(  # pyright: ignore[reportPrivateUsage]
-        cast(Any, client), inner.id, "session", "command", first_result[1], first_result[2],
-        forwarded.append, closed,
-    )
-    assert second_result == (7, len(stdout), len(stderr))
-    assert "".join(forwarded) == process.stdout + process.stderr
-    assert first.closed and second.closed
-
-
-async def test_daytona_native_watcher_replays_exact_stage_frame_after_raw_receive_drop(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    marker = "VALKYRIE-STAGE/1 YWJj " + "a" * 64 + "\n"
-    canonical = "hello\n" + marker + "界done\n"
-    first = RawLogWebSocket([
-        _raw_log_frame(b"\x01\x01\x01hello\n\x01"), ClientConnectionError("receive dropped"),
-    ])
-    second = RawLogWebSocket([
-        _raw_log_frame(b"\x01\x01\x01hello\n\x01\x01\x01"),
-        _raw_log_frame((marker + "界done\n").encode()), _normal_log_close(),
-    ])
-    sockets = iter([first, second])
-
-    async def open_ws(self: Any, url: str, headers: dict[str, str]) -> RawLogWebSocket:
-        return next(sockets)
-
-    monkeypatch.setattr(daytona_module._NativeSessionLogProcess, "_open_ws", open_ws)  # pyright: ignore[reportPrivateUsage]
-    process = CgroupProcess()
-    process.stdout = canonical
-    inner = InnerSandbox()
-    inner.process = process
-    client = CgroupDaytonaClient(inner, process)
-    forwarded: list[str] = []
-    closed = asyncio.Event()
-    first_result = await daytona_module._watch_session_command(  # pyright: ignore[reportPrivateUsage]
-        cast(Any, client), inner.id, "session", "command", 0, 0, forwarded.append, closed,
-    )
-    assert first_result == (None, len("hello\n"), 0)
-    assert "".join(forwarded) == "hello\n"
-    process.release_seen.set()
-    second_result = await daytona_module._watch_session_command(  # pyright: ignore[reportPrivateUsage]
-        cast(Any, client), inner.id, "session", "command", first_result[1], first_result[2],
-        forwarded.append, closed,
-    )
-    assert second_result == (7, len(canonical), 0)
-    assert "".join(forwarded) == canonical
-    assert "".join(forwarded).count(marker) == 1
-    assert first.closed and second.closed
-
-class LocalNativeShellCgroupProcess(CgroupProcess):
-    def __init__(self, root: Path) -> None:
-        super().__init__()
-        self.group = root / "group"
-        self.status = root / "status"
-        self.allow_creation.set()
-        self.allow_removal.set()
-        self.worker: asyncio.subprocess.Process
-
-    def _local_path(self, path: str) -> Path:
-        return Path(path.replace(daytona_module._STATUS_DIR, str(self.status)))  # pyright: ignore[reportPrivateUsage]
-
-    async def exec(self, command: str) -> SimpleNamespace:
-        plain = _unwrap_shell_command(command)
-        if plain == daytona_module._CGROUP_SELF_COMMAND:  # pyright: ignore[reportPrivateUsage]
-            return SimpleNamespace(exit_code=0, result=self.cgroup_parent)
-        if plain == f"mkdir -p {daytona_module._STATUS_DIR}":  # pyright: ignore[reportPrivateUsage]
-            self.status.mkdir()
-            return SimpleNamespace(exit_code=0, result="")
-        if plain.startswith("mkdir -p /sys/fs/cgroup/cbs-"):
-            self.remote_group = plain.removeprefix("mkdir -p ")
-            self.group.mkdir()
-            (self.group / "cgroup.procs").touch()
-            self.group_exists = True
-            return SimpleNamespace(exit_code=0, result="")
-        if plain.startswith("test -e ") and plain.endswith(".complete"):
-            path = self._local_path(shlex.split(plain)[-1])
-            return SimpleNamespace(exit_code=0 if path.exists() else 1, result="")
-        if plain.startswith("d=/sys/fs/cgroup/cbs-"):
-            assert any(self.status.glob("*.complete"))
-            self.group_exists = False
-            self.removal_started.set()
-            return SimpleNamespace(exit_code=0, result="")
-        if plain.startswith(": > ") and plain.endswith(".release"):
-            self._local_path(shlex.split(plain)[-1]).touch()
-            self.release_seen.set()
-            return SimpleNamespace(exit_code=0, result="")
-        return await super().exec(command)
-
-    async def execute_session_command(self, session_id: str, req: Any) -> SimpleNamespace:
-        result = await super().execute_session_command(session_id, req)
-        local_command = req.command.replace(self.remote_group, str(self.group)).replace(
-            daytona_module._STATUS_DIR, str(self.status)  # pyright: ignore[reportPrivateUsage]
-        )
-        self.worker = await asyncio.create_subprocess_exec(
-            "/bin/sh", "-c", local_command,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-        )
-        return result
-
-    async def get_session_command_logs_async(
-        self, session_id: str, command_id: str,
-        on_stdout: Callable[[str], Awaitable[None]],
-        on_stderr: Callable[[str], Awaitable[None]],
-    ) -> None:
-        self.follow_calls += 1
-        output, _ = await self.worker.communicate()
-        self.stdout = output.decode()
-        self.exit_code = self.worker.returncode
-        await on_stdout(self.stdout)
-
-    async def get_session_command(self, session_id: str, command_id: str) -> SimpleNamespace:
-        return SimpleNamespace(exit_code=self.exit_code if self.worker.returncode is not None else None)
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_native_shell_preserves_cwd_env_and_exit(tmp_path: Path) -> None:
-    process = LocalNativeShellCgroupProcess(tmp_path)
-    cwd = tmp_path / "working directory with spaces"
-    cwd.mkdir()
-    workload = _cgroup_sandbox(process).controlled_workload(
-        'printf "cwd:%s|env:%s\n" "$PWD" "$CBS_TOKEN"; exit 17',
-        cwd=str(cwd), env_vars={"CBS_TOKEN": "one two"},
-    )
-    completed = await asyncio.wait_for(workload.wait(), 5)
-    assert completed.result.exit_code == 17
-    admitted_pid = (process.group / "cgroup.procs").read_text().strip()
-    assert admitted_pid.isdecimal()
-    assert int(admitted_pid) != process.worker.pid
-    assert completed.result.output == f"cwd:{cwd}|env:one two\n"
-    assert "".join([chunk async for chunk in workload.output()]) == completed.result.output
-    assert process.execute_calls == 1
-    assert not process.group_exists
-    assert process.sessions == set()
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_native_long_episode_command_preserves_payload(tmp_path: Path) -> None:
-    process = LocalNativeShellCgroupProcess(tmp_path)
-    payload = "x" * 5000
-    workload = _cgroup_sandbox(process).controlled_workload(f"printf '%s' '{payload}'; exit 17")
-    completed = await asyncio.wait_for(workload.wait(), 5)
-    assert completed.result.exit_code == 17
-    assert completed.result.output == payload
-    assert "".join([chunk async for chunk in workload.output()]) == payload
-    assert process.execute_calls == 1
-    assert not process.group_exists
-    assert process.sessions == set()
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_native_command_gets_stdin_eof_with_parent_pipe_open(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    process = LocalNativeShellCgroupProcess(tmp_path)
-    read_fd, write_fd = os.pipe()
-    create_subprocess_exec = asyncio.create_subprocess_exec
-
-    async def spawn_with_parent_pipe(*args: str, **kwargs: Any) -> asyncio.subprocess.Process:
-        # Bash job control preserves the open pipe as background-command stdin.
-        return await create_subprocess_exec("bash", "-c", f"set -m; {args[2]}", stdin=read_fd, **kwargs)
-
-    try:
-        with monkeypatch.context() as patch:
-            patch.setattr(asyncio, "create_subprocess_exec", spawn_with_parent_pipe)
-            workload = _cgroup_sandbox(process).controlled_workload(
-                'if IFS= read -r line; then printf "unexpected input\n"; else printf "stdin-eof\n"; fi'
-            )
-            completed = await asyncio.wait_for(workload.wait(), 5)
-        assert completed.result.exit_code == 0
-        # Bash can append a job-completion notice after the child reports EOF.
-        assert completed.result.output.splitlines()[0] == "stdin-eof"
-        assert process.execute_calls == 1
-    finally:
-        os.close(read_fd)
-        os.close(write_fd)
-        if hasattr(process, "worker"):
-            await asyncio.wait_for(process.worker.wait(), 5)
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_natural_completion_fences_group_before_release_and_final_output() -> None:
-    class DelayedCloseProcess(CgroupProcess):
-        def __init__(self) -> None:
-            super().__init__()
-            self.close_started = asyncio.Event()
-            self.allow_close = asyncio.Event()
-
-        async def delete_session(self, session_id: str) -> None:
-            self.close_started.set()
-            await self.allow_close.wait()
-            await super().delete_session(session_id)
-
-    process = DelayedCloseProcess()
-    process.allow_creation.set()
-    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
-    assert workload.agent_absence_confirmed_at is None
-    await asyncio.wait_for(process.command_admitted.wait(), 2)
-    process.user_finished.set()
-    waiting = asyncio.create_task(workload.wait())
-    await asyncio.wait_for(process.removal_started.wait(), 2)
-    assert not waiting.done()
-    assert not process.release_seen.is_set()
-    try:
-        process.allow_removal.set()
-        await asyncio.wait_for(process.close_started.wait(), 2)
-        receipt = workload.agent_absence_confirmed_at
-        assert receipt is not None
-        assert not waiting.done()
-        process.allow_close.set()
-        completed = await asyncio.wait_for(waiting, 2)
-        assert completed.absence_confirmed_at >= receipt
-        assert workload.agent_absence_confirmed_at == receipt
-        assert completed.result.exit_code == 7
-        assert completed.result.output.endswith("final frame")
-        assert process.sessions == set()
-    finally:
-        process.allow_close.set()
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_native_exit_completes_while_follow_reader_is_open(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(daytona_module, "_SESSION_WATCH_REOPEN_SECONDS", 0.01)
-
-    class OpenReaderProcess(CgroupProcess):
-        def __init__(self) -> None:
-            super().__init__()
-            self.follow_started = asyncio.Event()
-            self.allow_follow_close = asyncio.Event()
-            self.follow_returned = asyncio.Event()
-            self.status_polled = asyncio.Event()
-
-        async def get_session_command_logs_async(
-            self, session_id: str, command_id: str,
-            on_stdout: Callable[[str], Awaitable[None]],
-            on_stderr: Callable[[str], Awaitable[None]],
-        ) -> None:
-            self.follow_calls += 1
-            await on_stdout(self.stdout)
-            await on_stderr(self.stderr)
-            self.follow_started.set()
-            await self.allow_follow_close.wait()
-            self.follow_returned.set()
-
-        async def get_session_command(self, session_id: str, command_id: str) -> SimpleNamespace:
-            self.status_polled.set()
-            return await super().get_session_command(session_id, command_id)
-
-    process = OpenReaderProcess()
-    process.allow_creation.set()
-    process.allow_removal.set()
-    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
-    try:
-        await asyncio.wait_for(process.follow_started.wait(), 2)
-        assert not process.release_seen.is_set()
-        process.stdout = "hellofinal frame"
-        process.user_finished.set()
-        completed = await asyncio.wait_for(workload.wait(), 2)
-        assert process.marker_polled.is_set()
-        assert process.release_seen.is_set()
-        assert process.status_polled.is_set()
-        assert not process.follow_returned.is_set()
-        assert completed.result.exit_code == 7
-        assert completed.result.output == "hellofinal frame"
-        assert process.follow_calls == 1
-        assert process.execute_calls == 1
-        assert not process.group_exists
-        assert process.sessions == set()
-    finally:
-        process.allow_follow_close.set()
-        if process.sessions:
-            await asyncio.wait_for(workload.kill(), 2)
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_stop_wins_over_inflight_status_reply(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(daytona_module, "_SESSION_WATCH_REOPEN_SECONDS", 0.01)
-
-    class PausedStatusProcess(CgroupProcess):
-        def __init__(self) -> None:
-            super().__init__()
-            self.status_started = asyncio.Event()
-            self.allow_status = asyncio.Event()
-
-        async def get_session_command(self, session_id: str, command_id: str) -> SimpleNamespace:
-            self.status_started.set()
-            await self.allow_status.wait()
-            return SimpleNamespace(exit_code=7)
-
-    process = PausedStatusProcess()
-    process.allow_creation.set()
-    process.allow_removal.set()
-    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
-    waiting = asyncio.create_task(workload.wait())
-    try:
-        await asyncio.wait_for(process.status_started.wait(), 2)
-        await asyncio.wait_for(workload.kill(), 2)
-        assert not process.group_exists
-        assert process.sessions == set()
-    finally:
-        process.allow_status.set()
-    with pytest.raises(SandboxError, match="closed before command exit"):
-        await asyncio.wait_for(waiting, 2)
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_stop_wins_during_follow_cancel_join(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(daytona_module, "_SESSION_WATCH_REOPEN_SECONDS", 0.01)
-
-    class PausedFollowCancelProcess(CgroupProcess):
-        def __init__(self) -> None:
-            super().__init__()
-            self.cancel_started = asyncio.Event()
-            self.allow_cancel = asyncio.Event()
-            self.allow_follow_close = asyncio.Event()
-
-        async def get_session_command_logs_async(
-            self, session_id: str, command_id: str,
-            on_stdout: Callable[[str], Awaitable[None]],
-            on_stderr: Callable[[str], Awaitable[None]],
-        ) -> None:
-            await on_stdout("hello")
-            try:
-                await self.allow_follow_close.wait()
-            except asyncio.CancelledError:
-                self.cancel_started.set()
-                await self.allow_cancel.wait()
-                raise
-
-    process = PausedFollowCancelProcess()
-    process.allow_creation.set()
-    process.allow_removal.set()
-    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
-    waiting = asyncio.create_task(workload.wait())
-    try:
-        await asyncio.wait_for(process.command_admitted.wait(), 2)
-        process.user_finished.set()
-        await asyncio.wait_for(process.cancel_started.wait(), 2)
-        assert process.marker_polled.is_set()
-        assert process.release_seen.is_set()
-        await asyncio.wait_for(workload.kill(), 2)
-        assert not process.group_exists
-        assert process.sessions == set()
-    finally:
-        process.allow_cancel.set()
-        process.allow_follow_close.set()
-    with pytest.raises(SandboxError, match="closed before command exit"):
-        await asyncio.wait_for(waiting, 2)
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_transient_marker_observation_recovers_without_stop(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(daytona_module, "_SESSION_WATCH_REOPEN_SECONDS", 0.01)
-
-    class FlakyMarkerProcess(CgroupProcess):
-        marker_failed = False
-
-        async def exec(self, command: str) -> SimpleNamespace:
-            plain = _unwrap_shell_command(command)
-            if plain.startswith("test -e ") and plain.endswith(".complete") and not self.marker_failed:
-                self.marker_failed = True
-                raise DaytonaConnectionError("marker read unavailable")
-            return await super().exec(command)
-
-    process = FlakyMarkerProcess()
-    process.allow_creation.set()
-    process.allow_removal.set()
-    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
-    await asyncio.wait_for(process.command_admitted.wait(), 2)
-    process.user_finished.set()
-    completed = await asyncio.wait_for(workload.wait(), 2)
-    assert process.marker_failed
-    assert completed.result.exit_code == 7
-    assert process.execute_calls == 1
-    assert not process.group_exists
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_kill_rejects_session_still_present_after_cgroup_stop() -> None:
-    class StillPresentProcess(CgroupProcess):
-        async def delete_session(self, session_id: str) -> None:
-            self.release_seen.set()
-
-    process = StillPresentProcess()
-    process.allow_creation.set()
-    process.allow_removal.set()
-    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
-    await asyncio.wait_for(process.command_admitted.wait(), 2)
-    assert workload.agent_absence_confirmed_at is None
-    with pytest.raises(SandboxError, match="session is still present"):
-        await asyncio.wait_for(workload.kill(), 2)
-    assert workload.agent_absence_confirmed_at is not None
-    assert not process.group_exists
-    assert process.sessions
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_kill_retries_failed_native_close_in_same_call() -> None:
-    class InitiallyPresentProcess(CgroupProcess):
-        def __init__(self) -> None:
-            super().__init__()
-            self.delete_calls = 0
-            self.lookup_calls = 0
-            self.removal_calls = 0
-
-        async def exec(self, command: str) -> SimpleNamespace:
-            if _unwrap_shell_command(command).startswith("d=/sys/fs/cgroup/cbs-"):
-                self.removal_calls += 1
-            return await super().exec(command)
-
-        async def delete_session(self, session_id: str) -> None:
-            self.delete_calls += 1
-            if self.delete_calls == 1:
-                self.release_seen.set()
-                return
-            await super().delete_session(session_id)
-
-        async def get_session(self, session_id: str) -> SimpleNamespace:
-            self.lookup_calls += 1
-            return await super().get_session(session_id)
-
-    process = InitiallyPresentProcess()
-    process.allow_creation.set()
-    process.allow_removal.set()
-    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
-    await asyncio.wait_for(process.command_admitted.wait(), 2)
-    await asyncio.wait_for(workload.kill(), 2)
-    assert process.delete_calls == process.lookup_calls == 2
-    assert process.removal_calls == 1
-    assert process.execute_calls == 1
-    assert not process.group_exists
-    assert process.sessions == set()
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_later_kill_retries_failed_native_close_without_restoring_failed_wait() -> None:
-    class RecoveringProcess(CgroupProcess):
-        def __init__(self) -> None:
-            super().__init__()
-            self.delete_calls = 0
-            self.lookup_calls = 0
-            self.removal_calls = 0
-            self.can_delete = False
-
-        async def exec(self, command: str) -> SimpleNamespace:
-            if _unwrap_shell_command(command).startswith("d=/sys/fs/cgroup/cbs-"):
-                self.removal_calls += 1
-            return await super().exec(command)
-
-        async def delete_session(self, session_id: str) -> None:
-            self.delete_calls += 1
-            self.release_seen.set()
-            if self.can_delete:
-                await super().delete_session(session_id)
-
-        async def get_session(self, session_id: str) -> SimpleNamespace:
-            self.lookup_calls += 1
-            return await super().get_session(session_id)
-
-    process = RecoveringProcess()
-    process.allow_creation.set()
-    process.allow_removal.set()
-    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
-    await asyncio.wait_for(process.command_admitted.wait(), 2)
-    with pytest.raises(SandboxError, match="session is still present"):
-        await asyncio.wait_for(workload.kill(), 2)
-    assert process.delete_calls == process.lookup_calls == 2
-    assert process.sessions
-    process.can_delete = True
-    await asyncio.wait_for(workload.kill(), 2)
-    assert process.delete_calls == process.lookup_calls == 3
-    assert process.removal_calls == 1
-    assert process.execute_calls == 1
-    assert not process.group_exists
-    assert process.sessions == set()
-    with pytest.raises(SandboxError, match="session is still present"):
-        await asyncio.wait_for(workload.wait(), 2)
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_concurrent_kills_share_native_close_replacement_after_cancelled_waiter() -> None:
-    class PausedRecoveryProcess(CgroupProcess):
-        def __init__(self) -> None:
-            super().__init__()
-            self.delete_calls = 0
-            self.lookup_calls = 0
-            self.retry_started = asyncio.Event()
-            self.allow_retry = asyncio.Event()
-
-        async def delete_session(self, session_id: str) -> None:
-            self.delete_calls += 1
-            if self.delete_calls < 3:
-                self.release_seen.set()
-                return
-            self.retry_started.set()
-            await self.allow_retry.wait()
-            await super().delete_session(session_id)
-
-        async def get_session(self, session_id: str) -> SimpleNamespace:
-            self.lookup_calls += 1
-            return await super().get_session(session_id)
-
-    process = PausedRecoveryProcess()
-    process.allow_creation.set()
-    process.allow_removal.set()
-    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
-    await asyncio.wait_for(process.command_admitted.wait(), 2)
-    with pytest.raises(SandboxError, match="session is still present"):
-        await asyncio.wait_for(workload.kill(), 2)
-
-    first = asyncio.create_task(workload.kill())
-    try:
-        await asyncio.wait_for(process.retry_started.wait(), 2)
-        assert process.sessions
-        second = asyncio.create_task(workload.kill())
-        await asyncio.sleep(0)
-        second.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await second
-        assert process.sessions
-    finally:
-        process.allow_retry.set()
-    await asyncio.wait_for(first, 2)
-    assert process.delete_calls == process.lookup_calls == 3
-    assert process.execute_calls == 1
-    assert not process.group_exists
-    assert process.sessions == set()
-
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_cleanup_retries_failed_close_after_provider_recovers() -> None:
-    class FailedConfirmationProcess(CgroupProcess):
-        def __init__(self) -> None:
-            super().__init__()
-            self.lookup_calls = 0
-            self.lookup_error = True
-
-        async def get_session(self, session_id: str) -> SimpleNamespace:
-            self.lookup_calls += 1
-            if self.lookup_error:
-                raise DaytonaConnectionError("session lookup unavailable")
-            return await super().get_session(session_id)
-
-    process = FailedConfirmationProcess()
-    process.allow_creation.set()
-    process.allow_removal.set()
-    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
-    await asyncio.wait_for(process.command_admitted.wait(), 2)
-    with pytest.raises(SandboxConnectionError, match="session lookup unavailable"):
-        await asyncio.wait_for(workload.kill(), 2)
-    assert process.lookup_calls == 2
-    assert process.sessions == set()
-    assert not process.group_exists
-
-    process.lookup_error = False
-    await asyncio.wait_for(workload.kill(), 2)
-    assert process.lookup_calls == 3
-    assert process.execute_calls == 1
-    with pytest.raises(SandboxConnectionError, match="session lookup unavailable"):
-        await asyncio.wait_for(workload.wait(), 2)
-    assert process.lookup_calls == 3
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_kill_retries_internal_failed_close_in_final_step() -> None:
-    class FirstConfirmationFailsProcess(CgroupProcess):
-        def __init__(self) -> None:
-            super().__init__()
-            self.lookup_calls = 0
-
-        async def get_session(self, session_id: str) -> SimpleNamespace:
-            self.lookup_calls += 1
-            if self.lookup_calls == 1:
-                raise DaytonaConnectionError("session lookup unavailable")
-            return await super().get_session(session_id)
-
-    process = FirstConfirmationFailsProcess()
-    process.allow_creation.set()
-    process.allow_removal.set()
-    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
-    await asyncio.wait_for(process.command_admitted.wait(), 2)
-    await asyncio.wait_for(workload.kill(), 2)
-    assert process.lookup_calls == 2
-    assert process.sessions == set()
-    assert not process.group_exists
-    assert process.execute_calls == 1
-    with pytest.raises(SandboxConnectionError, match="session lookup unavailable"):
-        await asyncio.wait_for(workload.wait(), 2)
-    assert process.lookup_calls == 2
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_control_poll_failure_does_not_stop_without_owner_request() -> None:
-    process = CgroupProcess()
-    process.allow_creation.set()
-    process.allow_removal.set()
-    process.poll_error = True
-    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
-    await asyncio.wait_for(process.command_admitted.wait(), 2)
-    await asyncio.wait_for(process.marker_polled.wait(), 2)
-    assert process.group_exists
-    assert process.sessions
-    await asyncio.wait_for(workload.kill(), 2)
-    assert not process.group_exists
-    assert process.sessions == set()
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_kill_during_group_creation_prevents_command_admission() -> None:
-    process = CgroupProcess()
-    process.allow_removal.set()
-    workload = _cgroup_sandbox(process).controlled_workload("must-not-run")
-    killing = asyncio.create_task(workload.kill())
-    await asyncio.sleep(0)
-    process.allow_creation.set()
-    await asyncio.wait_for(killing, 2)
-    assert not process.command_admitted.is_set()
-    assert process.execute_calls == 0
-    assert not process.group_exists
-    assert process.sessions == set()
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_unconfirmed_group_removal_reports_error() -> None:
-    process = CgroupProcess()
-    process.allow_creation.set()
-    process.allow_removal.set()
-    process.removal_fails = True
-    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
-    await asyncio.wait_for(process.command_admitted.wait(), 2)
-    with pytest.raises(SandboxError, match="cgroup removal failed"):
-        await asyncio.wait_for(workload.kill(), 2)
-    assert process.group_exists
-    assert process.sessions
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_output_consumer_waits_for_confirmed_group_stop() -> None:
-    class OpenReaderProcess(CgroupProcess):
-        def __init__(self) -> None:
-            super().__init__()
-            self.allow_follow_close = asyncio.Event()
-
-        async def get_session_command_logs_async(
-            self, session_id: str, command_id: str,
-            on_stdout: Callable[[str], Awaitable[None]],
-            on_stderr: Callable[[str], Awaitable[None]],
-        ) -> None:
-            await on_stdout(self.stdout)
-            await on_stderr(self.stderr)
-            await self.allow_follow_close.wait()
-
-    process = OpenReaderProcess()
-    process.allow_creation.set()
-    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
-    stream = workload.output()
-    await asyncio.wait_for(process.command_admitted.wait(), 2)
-    assert await asyncio.wait_for(anext(stream), 2) == "hello"
-    pending_output = asyncio.create_task(anext(stream))
-    killing = asyncio.create_task(workload.kill())
-    await asyncio.wait_for(process.removal_started.wait(), 2)
-    assert not pending_output.done()
-
-    process.allow_removal.set()
-    await asyncio.wait_for(killing, 2)
-    process.allow_follow_close.set()
-    with pytest.raises(StopAsyncIteration):
-        await asyncio.wait_for(pending_output, 2)
-    await stream.aclose()
-    assert not process.group_exists
-    assert process.sessions == set()
-
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_output_cancellation_does_not_stop_admitted_work() -> None:
-    process = CgroupProcess()
-    process.allow_creation.set()
-    process.allow_removal.set()
-    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
-    stream = workload.output()
-    await asyncio.wait_for(anext(stream), 2)
-    pending = asyncio.create_task(anext(stream))
-    pending.cancel()
-    with pytest.raises(asyncio.CancelledError):
-        await pending
-    assert process.group_exists
-    assert process.sessions
-    await asyncio.wait_for(workload.kill(), 2)
-    assert not process.group_exists
-    await stream.aclose()
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-@pytest.mark.parametrize("split_frames", [False, True], ids=["oversized-frame", "many-frames"])
-async def test_daytona_native_stream_keeps_bounded_result_tail(split_frames: bool) -> None:
-    class LargeOutputProcess(CgroupProcess):
-        async def get_session_command_logs_async(
-            self, session_id: str, command_id: str,
-            on_stdout: Callable[[str], Awaitable[None]],
-            on_stderr: Callable[[str], Awaitable[None]],
-        ) -> None:
-            self.follow_calls += 1
-            chunks = [f"chunk-{index:02d}:" + "x" * 1024 for index in range(80)]
-            chunks += ["€" * 300] * 100 if split_frames else ["€" * 30000]
-            for chunk in chunks:
-                await on_stdout(chunk)
-            await self.release_seen.wait()
-            self.stdout = "".join(chunks) + "final frame"
-            await on_stdout("final frame")
-
-    process = LargeOutputProcess()
-    process.allow_creation.set()
-    process.allow_removal.set()
-    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
-    await asyncio.wait_for(process.command_admitted.wait(), 2)
-    process.user_finished.set()
-    completed = await asyncio.wait_for(workload.wait(), 2)
-    streamed = "".join([chunk async for chunk in workload.output()])
-    assert streamed == process.stdout
-    assert completed.result.output.endswith("final frame")
-    assert "chunk-00:" not in completed.result.output
-    assert len(completed.result.output.encode("utf-8")) <= 64 * 1024
-    assert completed.result.output == streamed.encode("utf-8")[-64 * 1024:].decode("utf-8", errors="ignore")
-
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_failed_cgroup_stop_keeps_output_consumer_open() -> None:
-    process = CgroupProcess()
-    process.allow_creation.set()
-    process.allow_removal.set()
-    process.removal_fails = True
-    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
-    stream = workload.output()
-    assert await asyncio.wait_for(anext(stream), 2) == "hello"
-    pending = asyncio.create_task(anext(stream))
-    with pytest.raises(SandboxError, match="cgroup removal failed"):
-        await asyncio.wait_for(workload.kill(), 2)
-    assert process.group_exists
-    assert not pending.done()
-    process.release_seen.set()
-    assert await asyncio.wait_for(pending, 2) == "final frame"
-    await stream.aclose()
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_cancelled_wait_does_not_interrupt_shared_kill_cleanup() -> None:
-    class PausedDeleteProcess(CgroupProcess):
-        def __init__(self) -> None:
-            super().__init__()
-            self.delete_started = asyncio.Event()
-            self.allow_delete = asyncio.Event()
-            self.delete_calls = 0
-
-        async def delete_session(self, session_id: str) -> None:
-            self.delete_calls += 1
-            self.delete_started.set()
-            await self.allow_delete.wait()
-            await super().delete_session(session_id)
-
-    process = PausedDeleteProcess()
-    process.allow_creation.set()
-    process.allow_removal.set()
-    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
-    await asyncio.wait_for(process.command_admitted.wait(), 2)
-    waiting = asyncio.create_task(workload.wait())
-    killing = asyncio.create_task(workload.kill())
-    try:
-        await asyncio.wait_for(process.delete_started.wait(), 2)
-        waiting.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await waiting
-    finally:
-        process.allow_delete.set()
-    await asyncio.wait_for(killing, 2)
-    assert not process.group_exists
-    assert process.sessions == set()
-    assert process.delete_calls == 1
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_queued_output_remains_consumable_after_confirmed_stop() -> None:
-    class BufferedOutputProcess(CgroupProcess):
-        def __init__(self) -> None:
-            super().__init__()
-            self.output_buffered = asyncio.Event()
-
-        async def get_session_command_logs_async(
-            self, session_id: str, command_id: str,
-            on_stdout: Callable[[str], Awaitable[None]],
-            on_stderr: Callable[[str], Awaitable[None]],
-        ) -> None:
-            async def buffered_stdout(text: str) -> None:
-                await on_stdout(text)
-                self.output_buffered.set()
-
-            await super().get_session_command_logs_async(
-                session_id, command_id, buffered_stdout, on_stderr,
-            )
-
-    process = BufferedOutputProcess()
-    process.allow_creation.set()
-    process.allow_removal.set()
-    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
-    await asyncio.wait_for(process.output_buffered.wait(), 2)
-    await asyncio.wait_for(workload.kill(), 2)
-    assert not process.group_exists
-    assert process.sessions == set()
-    stream = workload.output()
-    assert await asyncio.wait_for(anext(stream), 2) == "hello"
-    await stream.aclose()
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_kill_when_observer_is_disconnected() -> None:
-    class DisconnectedProcess(CgroupProcess):
-        async def get_session_command_logs_async(
-            self, session_id: str, command_id: str,
-            on_stdout: Callable[[str], Awaitable[None]],
-            on_stderr: Callable[[str], Awaitable[None]],
-        ) -> None:
-            self.follow_calls += 1
-            raise DaytonaConnectionError("follow unavailable")
-
-    process = DisconnectedProcess()
-    process.allow_creation.set()
-    process.allow_removal.set()
-    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
-    await asyncio.wait_for(process.command_admitted.wait(), 2)
-    await asyncio.wait_for(workload.kill(), 2)
-    assert process.execute_calls == 1
-    assert not process.group_exists
-    assert process.sessions == set()
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_final_snapshot_failure_warns_but_preserves_native_exit(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    process = CgroupProcess()
-    process.allow_creation.set()
-    process.allow_removal.set()
-    process.snapshot_error = True
-    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
-    await asyncio.wait_for(process.command_admitted.wait(), 2)
-    process.user_finished.set()
-    with caplog.at_level(logging.WARNING, logger=daytona_module.__name__):
-        completed = await asyncio.wait_for(workload.wait(), 2)
-    assert completed.result.exit_code == 7
-    assert "final log snapshot failed" in caplog.text
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_lost_launch_reply_does_not_resend() -> None:
-    class LostLaunchProcess(CgroupProcess):
-        async def execute_session_command(self, session_id: str, req: Any) -> SimpleNamespace:
-            await super().execute_session_command(session_id, req)
-            raise DaytonaConnectionError("launch reply lost")
-
-    process = LostLaunchProcess()
-    process.allow_creation.set()
-    process.allow_removal.set()
-    workload = _cgroup_sandbox(process).controlled_workload("must-not-resend")
-    with pytest.raises(SandboxConnectionError):
-        await asyncio.wait_for(workload.wait(), 2)
-    assert process.execute_calls == 1
-    await asyncio.wait_for(workload.kill(), 2)
-    assert not process.group_exists
-    assert process.sessions == set()
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_lost_cgroup_mkdir_reply_replays_owned_creation(tmp_path: Path) -> None:
-    class LostMkdirReplyProcess(CgroupProcess):
-        def __init__(self) -> None:
-            super().__init__()
-            self.mkdir_calls = 0
-            self.local_group = tmp_path / "owned-group"
-            self.allow_creation.set()
-            self.allow_removal.set()
-
-        async def exec(self, command: str) -> SimpleNamespace:
-            plain = _unwrap_shell_command(command)
-            if plain.startswith("mkdir ") and "/sys/fs/cgroup/cbs-" in plain:
-                self.mkdir_calls += 1
-                remote_group = shlex.split(plain)[-1]
-                local_command = plain.replace(remote_group, shlex.quote(str(self.local_group)))
-                mkdir = await asyncio.create_subprocess_exec(
-                    "/bin/sh", "-c", local_command,
-                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT,
-                )
-                output, _ = await mkdir.communicate()
-                self.group_exists = self.local_group.exists()
-                if self.mkdir_calls == 1:
-                    assert mkdir.returncode == 0
-                    raise DaytonaConnectionError("mkdir reply lost after creation")
-                return SimpleNamespace(exit_code=mkdir.returncode, result=output.decode())
-            return await super().exec(command)
-
-        async def execute_session_command(self, session_id: str, req: Any) -> SimpleNamespace:
-            response = await super().execute_session_command(session_id, req)
-            self.user_finished.set()
-            return response
-
-    process = LostMkdirReplyProcess()
-    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
-    completed = await asyncio.wait_for(workload.wait(), 12)
-    assert completed.result.exit_code == 7
-    assert process.mkdir_calls == 2
-    assert process.execute_calls == 1
-    assert not process.group_exists
-    assert process.sessions == set()
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_confirmed_sandbox_loss_surfaces_not_found() -> None:
-    class LostSandboxProcess(CgroupProcess):
-        async def get_session_command_logs_async(
-            self, session_id: str, command_id: str,
-            on_stdout: Callable[[str], Awaitable[None]],
-            on_stderr: Callable[[str], Awaitable[None]],
-        ) -> None:
-            raise DaytonaConnectionError("follow unavailable")
-
-    process = LostSandboxProcess()
-    process.allow_creation.set()
-    process.allow_removal.set()
-    inner = InnerSandbox()
-    inner.process = process
-    sandbox = DaytonaSandbox(cast(Any, inner), cast(Any, CgroupDaytonaClient(inner, process)))
-    workload = sandbox.controlled_workload("exec sleep 30")
-    await asyncio.wait_for(process.command_admitted.wait(), 2)
-    inner.state = SandboxState.DESTROYED
-    with pytest.raises(SandboxNotFoundError):
-        await asyncio.wait_for(workload.wait(), 2)
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_sandbox_loss_precedes_distinct_cgroup_cleanup_failure(
-    caplog: pytest.LogCaptureFixture,
-) -> None:
-    class LostSandboxProcess(CgroupProcess):
-        async def get_session_command_logs_async(
-            self, session_id: str, command_id: str,
-            on_stdout: Callable[[str], Awaitable[None]],
-            on_stderr: Callable[[str], Awaitable[None]],
-        ) -> None:
-            raise DaytonaConnectionError("follow unavailable")
-
-    process = LostSandboxProcess()
-    process.allow_creation.set()
-    process.removal_fails = True
-    inner = InnerSandbox()
-    inner.process = process
-    workload = DaytonaSandbox(cast(Any, inner), cast(Any, CgroupDaytonaClient(inner, process))).controlled_workload(
-        "exec sleep 30"
-    )
-    await asyncio.wait_for(process.command_admitted.wait(), 2)
-    inner.state = SandboxState.DESTROYED
-    waiting = asyncio.create_task(workload.wait())
-    with caplog.at_level(logging.ERROR, logger=daytona_module.__name__):
-        await asyncio.wait_for(process.removal_started.wait(), 2)
-        assert not waiting.done()
-        inner.state = SandboxState.STARTED
-        process.allow_removal.set()
-        with pytest.raises(SandboxNotFoundError) as raised:
-            await asyncio.wait_for(waiting, 2)
-    native_workload = cast(daytona_module._DaytonaControlledWorkload, workload)  # pyright: ignore[reportPrivateUsage]
-    assert raised.value is native_workload._run_task.exception()  # pyright: ignore[reportPrivateUsage]
-    cleanup_errors = [
-        record for record in caplog.records
-        if record.name == daytona_module.__name__ and record.levelno == logging.ERROR
-    ]
-    assert len(cleanup_errors) == 1
-    cleanup_args = cast(tuple[object, ...], cleanup_errors[0].args)
-    assert isinstance(cleanup_args[-1], SandboxError)
-    assert cleanup_args[-1] is not raised.value
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-@pytest.mark.parametrize("state", [SandboxState.STOPPED, SandboxState.ERROR])
-async def test_daytona_native_watcher_terminates_on_existing_dead_sandbox_state(
-    monkeypatch: pytest.MonkeyPatch, state: SandboxState,
-) -> None:
-    monkeypatch.setattr(daytona_module, "_SESSION_WATCH_REOPEN_SECONDS", 0.01)
-
-    class UnavailableProcess(CgroupProcess):
-        async def get_session_command(self, session_id: str, command_id: str) -> SimpleNamespace:
-            raise DaytonaConnectionError("status unavailable")
-
-    class ObservedClient(CgroupDaytonaClient):
-        def __init__(self, sandbox: InnerSandbox, native: CgroupProcess) -> None:
-            super().__init__(sandbox, native)
-            self.get_calls = 0
-            self.started_after_error = asyncio.Event()
-            self.dead_observed = asyncio.Event()
-
-        async def get(self, sandbox_id: str) -> InnerSandbox:
-            observed = await super().get(sandbox_id)
-            self.get_calls += 1
-            if self.get_calls >= 2 and observed.state == SandboxState.STARTED:
-                self.started_after_error.set()
-            if observed.state == state:
-                self.dead_observed.set()
-            return observed
-    process = UnavailableProcess()
-    process.allow_creation.set()
-    inner = InnerSandbox()
-    inner.process = process
-    client = ObservedClient(inner, process)
-    workload = DaytonaSandbox(cast(Any, inner), cast(Any, client)).controlled_workload("exec sleep 30")
-    await asyncio.wait_for(process.command_admitted.wait(), 2)
-    waiting = asyncio.create_task(workload.wait())
-    try:
-        await asyncio.wait_for(client.started_after_error.wait(), 2)
-        assert not waiting.done()
-        assert process.group_exists
-        inner.state = state
-        with pytest.raises(SandboxError, match="Sandbox is not running"):
-            await asyncio.wait_for(waiting, 0.3)
-        await asyncio.wait_for(process.removal_started.wait(), 2)
-        assert process.group_exists
-        assert client.dead_observed.is_set()
-        assert process.execute_calls == 1
-    finally:
-        inner.state = SandboxState.STARTED
-        process.allow_removal.set()
-        process.user_finished.set()
-        with suppress(SandboxError):
-            await asyncio.wait_for(workload.kill(), 2)
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_native_watcher_reconnects_transient_started_failure(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setattr(daytona_module, "_SESSION_WATCH_REOPEN_SECONDS", 0.01)
-    process = CgroupProcess()
-    process.follow_error = True
-    process.allow_creation.set()
-    process.allow_removal.set()
-    workload = _cgroup_sandbox(process).controlled_workload("exit 7")
-    await asyncio.wait_for(process.command_admitted.wait(), 2)
-    process.user_finished.set()
-    completed = await asyncio.wait_for(workload.wait(), 2)
-    assert completed.result.exit_code == 7
-    assert process.execute_calls == 1
-    assert process.follow_calls >= 2
-
-
-class NestedCgroupProcess(CgroupProcess):
-    def __init__(self, root: Path) -> None:
-        super().__init__()
-        self.root = root / "group"
-        self.removal_bin = root / "bin"
-        self.removal_bin.mkdir()
-        wrapper = self.removal_bin / "rmdir"
-        wrapper.write_text(
-            '#!/bin/sh\nfor dir do\n'
-            '  rm -f "$dir/cgroup.events" "$dir/cgroup.kill" "$dir/cgroup.procs"\n'
-            '  PATH=/usr/bin:/bin rmdir "$dir" || exit $?\n'
-            'done\n'
-        )
-        wrapper.chmod(0o700)
-
-    async def exec(self, command: str) -> SimpleNamespace:
-        plain = _unwrap_shell_command(command)
-        if plain == daytona_module._CGROUP_SELF_COMMAND:  # pyright: ignore[reportPrivateUsage]
-            return SimpleNamespace(exit_code=0, result=self.cgroup_parent)
-        if plain.startswith("mkdir -p /sys/fs/cgroup/cbs-"):
-            self.group_name = plain.removeprefix("mkdir -p ")
-            for directory in (self.root, self.root / ".hidden", self.root / ".hidden" / "nested"):
-                directory.mkdir()
-                (directory / "cgroup.events").write_text("populated 0\n")
-                (directory / "cgroup.kill").touch()
-                (directory / "cgroup.procs").touch()
-            self.group_exists = True
-            return SimpleNamespace(exit_code=0, result="")
-        if plain.startswith("d=/sys/fs/cgroup/cbs-"):
-            self.removal_started.set()
-            shell = plain.replace(self.group_name, str(self.root))
-            process = await asyncio.create_subprocess_exec(
-                "/bin/sh", "-c", shell, stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-                env={**os.environ, "PATH": f"{self.removal_bin}:{os.environ['PATH']}"},
-            )
-            output, _ = await process.communicate()
-            self.group_exists = self.root.exists()
-            if process.returncode == 0 and self.command_admitted.is_set():
-                self.user_finished.set()
-            return SimpleNamespace(exit_code=process.returncode, result=output.decode())
-        return await super().exec(command)
-
-
-@pytest.mark.usefixtures("_fake_cgroup_follow")
-async def test_daytona_kill_removes_hidden_nested_groups_before_root_fence(tmp_path: Path) -> None:
-    process = NestedCgroupProcess(tmp_path)
-    workload = _cgroup_sandbox(process).controlled_workload("exec sleep 30")
-    await asyncio.wait_for(process.command_admitted.wait(), 2)
-    await asyncio.wait_for(workload.kill(), 2)
-    assert not process.root.exists()
-    assert not (process.root / ".hidden" / "nested").exists()
-    assert process.sessions == set()

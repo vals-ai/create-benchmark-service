@@ -10,35 +10,28 @@ import math
 import os
 import shlex
 import tarfile
-from collections import deque
+import tempfile
 from collections.abc import AsyncGenerator, Generator, Mapping
 from contextlib import aclosing, contextmanager
 from datetime import datetime
-from pathlib import PurePosixPath
-from typing import Awaitable, Callable, Literal
+from pathlib import Path, PurePosixPath
+from typing import Literal
 from uuid import uuid4
 
 from aiodocker import Docker
 from aiodocker.containers import DockerContainer
 from aiodocker.exceptions import DockerError
-from aiodocker.execs import Exec
-from aiodocker.stream import Stream
 from aiodocker.types import JSONObject
 from aiohttp import ClientError
 from pydantic import AliasPath, BaseModel, Field
 
-from benchmark_service.sandbox._process_group import (
-    cleanup_command, episode_owner_command, owner_command, probe_command, stop_command,
-)
 from benchmark_service.sandbox.types import (
-    ControlledWorkload,
-    ControlledWorkloadResult,
+    DockerfileSource,
     ExecResult,
-    GenerationContainment,
     ImageSource,
-    LINUX_PROCESS_GROUP_V1,
     MAX_SANDBOX_LIFETIME_SECONDS,
     Sandbox,
+    SandboxBuildError,
     SandboxCommandError,
     SandboxConnectionError,
     SandboxCreateRequest,
@@ -53,7 +46,9 @@ logger = logging.getLogger(__name__)
 _MANAGED_LABEL = "io.vals.cbs.managed"
 _NAME_LABEL = "io.vals.cbs.name"
 _PULL_TIMEOUT_S = 1800
+_BUILD_LOG_BYTES = 64 * 1024
 _CONTROLLED_TAIL_BYTES = 64 * 1024
+_OUTPUT_DRAIN_SECONDS = 5
 
 
 class DockerProviderConfig(BaseModel):
@@ -114,25 +109,6 @@ class DockerSandbox(Sandbox):
     @property
     def state(self) -> str:
         return self._info.state
-
-    @property
-    def generation_containment(self) -> GenerationContainment:
-        return LINUX_PROCESS_GROUP_V1
-
-    async def probe_generation_containment(self) -> None:
-        marker = f"/tmp/.cbs-probe-{uuid4().hex}"
-        result = await self.exec(probe_command(marker))
-        if result.exit_code:
-            raise SandboxError(f"Docker container does not support process groups: {result.output}")
-
-    def _process_group_workload(
-        self, command: str, episode_script: str | None, *, cwd: str | None,
-        env_vars: Mapping[str, str] | None
-    ) -> ControlledWorkload:
-        return _DockerControlledWorkload(
-            self._container, self._raise_if_finished, command, cwd,
-            validate_command_env(env_vars), episode_script
-        )
 
     async def _raise_if_finished(self) -> None:
         # Docker reports a killed command's exit before it marks the container stopped.
@@ -276,219 +252,22 @@ class DockerSandbox(Sandbox):
         return self._command_bytes(f"cat -- {shlex.quote(str(path))}")
 
 
-
-class _DockerControlledWorkload(ControlledWorkload):
-    def __init__(
-        self,
-        container: DockerContainer,
-        raise_if_finished: Callable[[], Awaitable[None]],
-        command: str,
-        cwd: str | None,
-        env_vars: dict[str, str],
-        episode_script: str | None,
-    ) -> None:
-        self._container = container
-        self._raise_if_finished = raise_if_finished
-        self._command = command
-        self._cwd = cwd
-        self._env_vars = env_vars
-        self._episode_script = episode_script
-        self._marker = f"/tmp/.cbs-controlled-{uuid4().hex}"
-        self._started = asyncio.Event()
-        self._status_done = asyncio.Event()
-        self._execution: Exec | None = None
-        self._output: asyncio.Queue[str | None] = asyncio.Queue()
-        self._drain_task: asyncio.Task[None] | None = None
-        self._tail: deque[str] = deque()
-        self._tail_bytes = 0
-        self._stop_task: asyncio.Task[tuple[float, int | None]] | None = None
-        self._cleanup_task: asyncio.Task[None] | None = None
-        self._result_task = asyncio.create_task(self._run())
-        self._agent_absence_confirmed_at: float | None = None
-
-    @property
-    def agent_absence_confirmed_at(self) -> float | None:
-        return self._agent_absence_confirmed_at
-
-    def _accept(self, text: str) -> None:
-        if not text:
-            return
-        self._output.put_nowait(text)
-        self._tail.append(text)
-        self._tail_bytes += len(text.encode("utf-8"))
-        while self._tail_bytes > _CONTROLLED_TAIL_BYTES:
-            excess = self._tail_bytes - _CONTROLLED_TAIL_BYTES
-            first = self._tail[0].encode("utf-8")
-            if len(first) <= excess:
-                self._tail_bytes -= len(first)
-                self._tail.popleft()
-            else:
-                self._tail[0] = first[excess:].decode("utf-8", errors="ignore")
-                self._tail_bytes -= len(first) - len(self._tail[0].encode("utf-8"))
-
-    async def _drain(self, stream: Stream) -> None:
-        try:
-            with _docker_errors():
-                decoders: dict[int, codecs.IncrementalDecoder] = {}
-                while (message := await stream.read_out()) is not None:
-                    decoder = decoders.get(message.stream)
-                    if decoder is None:
-                        decoder = decoders[message.stream] = codecs.getincrementaldecoder("utf-8")(errors="replace")
-                    self._accept(decoder.decode(message.data))
-                for decoder in decoders.values():
-                    self._accept(decoder.decode(b"", final=True))
-        finally:
-            self._output.put_nowait(None)
-
-    async def _status(self, execution: Exec) -> int:
-        info = await execution.inspect()
-        while info.get("Running"):
-            await asyncio.sleep(0.05)
-            info = await execution.inspect()
-        exit_code = info.get("ExitCode")
-        if not isinstance(exit_code, int):
-            raise SandboxError("Docker controlled command finished without an exit code")
-        if exit_code == 137:
-            await self._raise_if_finished()
-        self._status_done.set()
-        return exit_code
-
-    async def _run(self) -> ControlledWorkloadResult:
-        script = (
-            episode_owner_command(self._command, self._marker, self._episode_script)
-            if self._episode_script is not None
-            else owner_command(self._command, self._marker, "/bin/sh -c")
-        )
-        with _docker_errors():
-            try:
-                execution = await self._container.exec(
-                    ["/bin/sh", "-c", script],
-                    environment=self._env_vars,
-                    workdir=self._cwd,
-                )
-                stream = execution.start()
-                async with stream:
-                    self._execution = execution
-                    self._started.set()
-                    drain = self._drain_task = asyncio.create_task(self._drain(stream))
-                    status = asyncio.create_task(self._status(execution))
-                    try:
-                        done, _ = await asyncio.wait((status, drain), return_when=asyncio.FIRST_COMPLETED)
-                        if drain in done:
-                            await drain
-                        exit_code = await status
-                        absence_confirmed_at, foreground_status = await self._ensure_stopped()
-                        await drain
-                        assert self._cleanup_task is not None
-                        await self._cleanup_task
-                        if foreground_status is None and exit_code == 0:
-                            raise SandboxError("Docker workload exited without a foreground status")
-                        result = ExecResult(
-                            exit_code=foreground_status if foreground_status is not None else exit_code,
-                            output="".join(self._tail),
-                        )
-                        return ControlledWorkloadResult(result, absence_confirmed_at)
-                    except Exception:
-                        status_failed = status.done() and not status.cancelled() and status.exception() is not None
-                        drain_failed = drain.done() and not drain.cancelled() and drain.exception() is not None
-                        if not status.done():
-                            status.cancel()
-                        await asyncio.gather(status, return_exceptions=True)
-                        if status_failed and not drain_failed:
-                            if not drain.done():
-                                self._drain_task = None
-                            raise
-                        await self._ensure_stopped()
-                        await drain
-                        raise
-                    finally:
-                        if not drain.done():
-                            drain.cancel()
-                            await asyncio.gather(drain, return_exceptions=True)
-            finally:
-                self._started.set()
-                if self._drain_task is None:
-                    self._output.put_nowait(None)
-
-    async def _control_exec(self, command: str) -> ExecResult:
-        with _docker_errors():
-            execution = await self._container.exec(["/bin/sh", "-c", command])
-            output: list[bytes] = []
-            async with execution.start() as stream:
-                while (message := await stream.read_out()) is not None:
-                    output.append(message.data)
-            info = await execution.inspect()
-            while info.get("Running"):
-                await asyncio.sleep(0.01)
-                info = await execution.inspect()
-            exit_code = info.get("ExitCode")
-            if not isinstance(exit_code, int):
-                raise SandboxError("Docker control command finished without an exit code")
-            return ExecResult(exit_code=exit_code, output=b"".join(output).decode(errors="replace"))
-
-    async def _stop(self) -> tuple[float, int | None]:
-        await self._started.wait()
-        if self._execution is None:
-            await self._result_task
-            raise SandboxError("Docker controlled command did not start")
-        command = stop_command(self._marker, episode_owner=self._episode_script is not None)
-        while True:
-            stopped = await self._control_exec(command)
-            if stopped.exit_code == 0:
-                break
-            if stopped.exit_code != 75:
-                raise SandboxError(f"Docker process group did not stop: {stopped.output}")
-            if self._status_done.is_set():
-                raise SandboxError("Docker workload finished without a process-group marker")
-            await asyncio.sleep(0.05)
-        self._agent_absence_confirmed_at = asyncio.get_running_loop().time()
-        self._cleanup_task = asyncio.create_task(self._cleanup())
-        return self._agent_absence_confirmed_at, int(stopped.output.strip()) if stopped.output.strip() else None
-
-    async def _cleanup(self) -> None:
-        if self._drain_task is None:
-            await asyncio.gather(self._result_task, return_exceptions=True)
-        else:
-            await asyncio.gather(self._drain_task, return_exceptions=True)
-        removed = await self._control_exec(cleanup_command(self._marker))
-        if removed.exit_code != 0:
-            raise SandboxError(f"Docker process-group control cleanup failed: {removed.output}")
-
-    async def _ensure_stopped(self) -> tuple[float, int | None]:
-        if self._stop_task is None:
-            self._stop_task = asyncio.create_task(self._stop())
-        return await asyncio.shield(self._stop_task)
-
-    async def output(self) -> AsyncGenerator[str, None]:
-        while (chunk := await self._output.get()) is not None:
-            yield chunk
-        if self._drain_task is None:
-            await asyncio.shield(self._result_task)
-        else:
-            await asyncio.shield(self._drain_task)
-
-    async def wait(self) -> ControlledWorkloadResult:
-        return await asyncio.shield(self._result_task)
-
-    async def kill(self) -> None:
-        await self._ensure_stopped()
-
-
-def _build_container_config(request: SandboxCreateRequest) -> JSONObject:
-    """Validate Docker support and build the container creation settings."""
-    if not isinstance(request.source, ImageSource):
-        raise SandboxError("Local Docker supports image sources only; snapshots and Compose are not supported")
+def _reject_unsupported(request: SandboxCreateRequest) -> None:
     if request.resources.gpu or request.volumes or request.sandbox_secrets:
         raise SandboxError("Local Docker does not support GPUs, persistent volumes, or provider-managed secrets")
+
+
+def _build_container_config(request: SandboxCreateRequest, image: str) -> JSONObject:
+    """Build the container creation settings."""
     labels = {**request.labels, _MANAGED_LABEL: "true", _NAME_LABEL: request.name}
     return {
-        "Image": request.source.image,
+        "Image": image,
         "Entrypoint": ["/bin/sh", "-c"],
         "Cmd": [f"trap 'exit 0' TERM INT; sleep {MAX_SANDBOX_LIFETIME_SECONDS} & wait $!"],
         "Env": [f"{key}={value}" for key, value in request.env_vars.items()],
         "Labels": labels,
         "HostConfig": {
-            "NanoCpus": request.resources.vcpu * 1_000_000_000,
+            "NanoCpus": round(request.resources.vcpu * 1_000_000_000),
             "Memory": request.resources.memory * 1024**3,
             "NetworkMode": "none" if request.network_block_all else "bridge",
             "SecurityOpt": ["no-new-privileges:true"],
@@ -513,6 +292,60 @@ class DockerSandboxProvider(SandboxProvider):
             container, info = await self._get_container(instance_id)
             return DockerSandbox(container, info)
 
+    async def _docker_cli(self, *args: str) -> asyncio.subprocess.Process:
+        # The docker CLI applies the host's registry logins and credential helpers, which aiodocker does not read.
+        # DOCKER_CONTEXT overrides DOCKER_HOST in the CLI, unlike the explicit URL passed to aiodocker.
+        # Pin CLI calls to the same host selected when this provider was created, even if the environment changes.
+        env = os.environ.copy()
+        host_args: list[str] = []
+        if self._docker_host:
+            env.pop("DOCKER_CONTEXT", None)
+            host_args = ["--host", self._docker_host]
+        return await asyncio.create_subprocess_exec(
+            "docker",
+            *host_args,
+            *args,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+
+    async def _build_image(self, source: DockerfileSource, timeout: float) -> str:
+        with tempfile.TemporaryDirectory() as staging:
+            image_id_file = Path(staging) / "image-id"
+            try:
+                process = await self._docker_cli(
+                    "build",
+                    "--progress=plain",
+                    "--iidfile",
+                    str(image_id_file),
+                    "--file",
+                    source.dockerfile,
+                    str(PurePosixPath(source.dockerfile).parent),
+                )
+            except OSError as error:
+                raise SandboxError("Building a Dockerfile requires the docker CLI on PATH") from error
+            if process.stdout is None:
+                raise SandboxError("The docker build produced no output stream")
+            log = bytearray()
+            try:
+                async with asyncio.timeout(timeout):
+                    while chunk := await process.stdout.read(65536):
+                        log.extend(chunk)
+                        del log[:-_BUILD_LOG_BYTES]
+                    await process.wait()
+            except TimeoutError as error:
+                raise SandboxBuildError(
+                    f"Timed out building {source.dockerfile} after {timeout:g}s", log.decode(errors="replace")
+                ) from error
+            finally:
+                if process.returncode is None:
+                    process.kill()
+                    await process.wait()
+            if process.returncode != 0:
+                raise SandboxBuildError(f"Failed to build {source.dockerfile}", log.decode(errors="replace"))
+            return image_id_file.read_text().strip()
+
     async def _ensure_image(self, image: str) -> None:
         with _docker_errors():
             try:
@@ -522,25 +355,8 @@ class DockerSandboxProvider(SandboxProvider):
                 if error.status != 404:
                     raise
 
-        # The docker CLI applies the host's registry logins and credential helpers, which aiodocker does not read.
-        # DOCKER_CONTEXT overrides DOCKER_HOST in the CLI, unlike the explicit URL passed to aiodocker.
-        # Pin pulls to the same host selected when this provider was created, even if the environment changes.
-        env = os.environ.copy()
-        host_args: list[str] = []
-        if self._docker_host:
-            env.pop("DOCKER_CONTEXT", None)
-            host_args = ["--host", self._docker_host]
         try:
-            process = await asyncio.create_subprocess_exec(
-                "docker",
-                *host_args,
-                "pull",
-                "--quiet",
-                image,
-                env=env,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
+            process = await self._docker_cli("pull", "--quiet", image)
         except OSError as error:
             raise SandboxError("Pulling a missing Docker image requires the docker CLI on PATH") from error
         try:
@@ -557,14 +373,27 @@ class DockerSandboxProvider(SandboxProvider):
             raise SandboxError(f"Failed to pull Docker image {image}: {output.decode(errors='replace').strip()}")
 
     async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
-        config = _build_container_config(request)
-        # create_timeout bounds container creation, so a large first pull must not run inside it.
-        await self._ensure_image(str(config["Image"]))
+        _reject_unsupported(request)
+        loop = asyncio.get_running_loop()
+        match request.source:
+            case ImageSource(image=image):
+                # create_timeout bounds container creation, so a large first pull must not run inside it.
+                await self._ensure_image(image)
+                deadline = loop.time() + request.create_timeout
+            case DockerfileSource(build_timeout=build_timeout):
+                started = loop.time()
+                image = await self._build_image(request.source, build_timeout or request.create_timeout)
+                deadline = (loop.time() if build_timeout else started) + request.create_timeout
+            case _:
+                raise SandboxError(
+                    "Local Docker supports image and Dockerfile sources only; snapshots and Compose are not supported"
+                )
+        config = _build_container_config(request, image)
         name = f"cbs-{uuid4().hex}"
         run = asyncio.create_task(self._docker.containers.run(config, name=name))  # pyright: ignore[reportUnknownMemberType]
         with _docker_errors():
             try:
-                async with asyncio.timeout(request.create_timeout):
+                async with asyncio.timeout_at(deadline):
                     container = await asyncio.shield(run)
                     sandbox = await self.get_sandbox(container.id)
                     # Commands run under setsid --wait, which BusyBox images such as Alpine lack.

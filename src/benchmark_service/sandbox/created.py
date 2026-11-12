@@ -10,7 +10,8 @@ from typing import Literal
 
 logger = logging.getLogger(__name__)
 
-SandboxCreatedHook = Callable[[Literal["daytona"], str], Awaitable[None]]
+AnnouncedSandboxProvider = Literal["daytona", "daytona_v2"]
+SandboxCreatedHook = Callable[[AnnouncedSandboxProvider, str], Awaitable[None]]
 
 _sandbox_created_hook: ContextVar[SandboxCreatedHook | None] = ContextVar(
     "benchmark_service_sandbox_created_hook", default=None
@@ -27,7 +28,7 @@ def sandbox_created_scope(hook: SandboxCreatedHook | None) -> Iterator[None]:
         _sandbox_created_hook.reset(token)
 
 
-async def notify_sandbox_created(provider: Literal["daytona"], sandbox_id: str) -> None:
+async def notify_sandbox_created(provider: AnnouncedSandboxProvider, sandbox_id: str) -> None:
     hook = _sandbox_created_hook.get()
     if hook is None:
         return

@@ -3,6 +3,7 @@
 import asyncio
 import os
 from collections.abc import AsyncGenerator
+from pathlib import Path
 from uuid import uuid4
 
 import pytest
@@ -10,9 +11,11 @@ from aiodocker import Docker
 
 from benchmark_service import (
     DockerProviderConfig,
+    DockerfileSource,
     ImageSource,
     Resources,
     Sandbox,
+    SandboxBuildError,
     SandboxCommandError,
     SandboxCreateRequest,
     SandboxError,
@@ -91,48 +94,6 @@ async def test_docker_commands_and_binary_files(docker_sandbox: Sandbox) -> None
     assert result.exit_code == 0
     assert result.output == "payload"
 
-
-async def test_docker_controlled_natural_status_stream_and_tail(docker_sandbox: Sandbox) -> None:
-    await docker_sandbox.probe_generation_containment()
-    workload = docker_sandbox.controlled_workload(
-        "printf '\\316'; sleep 0.05; printf '\\261'; printf ' stderr' >&2; exit 7",
-        env_vars={"CUSTOM": "present"},
-    )
-    output = "".join([part async for part in workload.output()])
-    result = await workload.wait()
-    assert result.result.exit_code == 7
-    assert output == result.result.output
-    assert output.count("α") == 1
-    assert output.replace("α", "") == " stderr"
-    assert result.absence_confirmed_at <= asyncio.get_running_loop().time()
-
-    large = docker_sandbox.controlled_workload("head -c 80000 /dev/zero | tr '\\000' x; printf 'final frame'")
-    tail = await large.wait()
-    streamed = "".join([part async for part in large.output()])
-    expected = "x" * 80_000 + "final frame"
-    assert tail.result.exit_code == 0
-    assert streamed == expected
-    assert 0 < len(tail.result.output) < len(expected)
-    assert tail.result.output == expected[-len(tail.result.output):]
-    assert (await docker_sandbox.exec("printf collection")).output == "collection"
-
-
-async def test_docker_controlled_early_kill_unblocks_reader_and_keeps_container(docker_sandbox: Sandbox) -> None:
-    workload = docker_sandbox.controlled_workload("(sleep 3; touch /tmp/controlled-child-survived) & sleep 3")
-
-    async def collect() -> str:
-        return "".join([part async for part in workload.output()])
-
-    reader = asyncio.create_task(collect())
-    await asyncio.wait_for(workload.kill(), timeout=5)
-    await workload.kill()
-    result = await asyncio.wait_for(workload.wait(), timeout=5)
-    assert await asyncio.wait_for(reader, timeout=5) == result.result.output
-    assert result.result.exit_code != 0
-    assert result.absence_confirmed_at <= asyncio.get_running_loop().time()
-    await asyncio.sleep(3.1)
-    assert (await docker_sandbox.exec("test ! -e /tmp/controlled-child-survived")).exit_code == 0
-    assert (await docker_sandbox.exec("printf collection")).output == "collection"
 
 
 async def test_docker_timeout_and_cancel_kill_commands(docker_sandbox: Sandbox) -> None:
@@ -267,3 +228,42 @@ async def test_docker_rejects_images_without_setsid_wait(
         )
 
     assert [sandbox async for sandbox in docker_provider.list_sandboxes(SandboxQuery(labels=docker_labels))] == []
+
+
+def _dockerfile_request(dockerfile: Path, labels: dict[str, str]) -> SandboxCreateRequest:
+    return SandboxCreateRequest(
+        source=DockerfileSource(dockerfile=str(dockerfile)),
+        resources=Resources(vcpu=1, memory=1, disk=1),
+        name="docker-contract-build",
+        labels=labels,
+        env_vars={"LANG": "C.UTF-8", "TERM": "xterm"},
+        auto_stop_interval=10,
+        create_timeout=300,
+        network_block_all=True,
+    )
+
+
+async def test_a_dockerfile_source_is_built_with_its_folder_as_the_context(
+    docker_provider: SandboxProvider, docker_labels: dict[str, str], tmp_path: Path
+) -> None:
+    """Build the image from the folder, so COPY reaches files next to the Dockerfile."""
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\nCOPY data.txt /data.txt\n")
+    (tmp_path / "data.txt").write_text("from the context")
+
+    sandbox = await docker_provider.create_sandbox(_dockerfile_request(tmp_path / "Dockerfile", docker_labels))
+
+    result = await sandbox.exec("cat /data.txt")
+    assert result.exit_code == 0
+    assert result.output == "from the context"
+
+
+async def test_a_failing_dockerfile_build_raises_with_its_log(
+    docker_provider: SandboxProvider, docker_labels: dict[str, str], tmp_path: Path
+) -> None:
+    """Report why a build failed instead of a bare creation error."""
+    (tmp_path / "Dockerfile").write_text("FROM python:3.12-slim\nRUN echo broken-step && exit 3\n")
+
+    with pytest.raises(SandboxBuildError) as error:
+        await docker_provider.create_sandbox(_dockerfile_request(tmp_path / "Dockerfile", docker_labels))
+
+    assert "broken-step" in error.value.build_log

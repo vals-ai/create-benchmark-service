@@ -181,7 +181,17 @@ allocate capacity or enforce a caller's scheduling policy.
 ```json
 {"type": "daytona", "DAYTONA_API_KEY": "...", "DAYTONA_API_URL": "...", "DAYTONA_TARGET": "...", "DAYTONA_ORGANIZATION_ID": "..."}
 {"type": "modal", "MODAL_TOKEN_ID": "...", "MODAL_TOKEN_SECRET": "..."}
+{"type": "daytona_v2", "DAYTONA_V2_API_KEY": "...", "DAYTONA_V2_API_URL": "https://api.daytona.com", "DAYTONA_V2_REGION": "...", "DAYTONA_V2_SPOT": false}
 ```
+
+`daytona_v2` is opt-in (Daytona v2 API, alpha):
+- Keeps fractional `vcpu`; v0 `daytona` rounds it up because the v0 API takes whole CPUs.
+- Converts units: `cpu` cores = `vcpu / 2` (1 core = 2 vCPUs), `memory_mib` / `disk_mib` = GiB x 1024.
+- Reserves `cpu` and caps it at `cores_max` = `cpu` rounded up to 0.5 cores (v2's minimum step), so `vcpu=0.25` reserves 0.125 cores and can burst to 1 vCPU. Memory is capped at the request (`memory_max_mib`). Without caps v2 boots at the plan cap (4 cores, 2 GiB).
+- Supports `image`, `snapshot` (an existing v2 image name or id) and self-contained `dockerfile` sources (no local `COPY`/`ADD` context).
+- Rejects GPUs, volumes and sandbox secrets.
+- Egress is set only at creation (`network_block_all`). `modify_egress_rules`, `block_all_egress` and `clear_egress_rules` raise, so eval resume with a non-empty `egress.evaluation` list fails right after it creates the sandbox.
+- Does not send `sandbox_created` announcements yet: `SandboxCreatedData.provider` only accepts `daytona`.
 
 When a setup or evaluate-instance request omits `sandbox_provider`, the Daytona header fallback reads
 `x-api-key`, `x-api-url`, and `x-target`, plus optional `x-organization-id`. The
@@ -200,12 +210,14 @@ snapshot admission and snapshot demand also require snapshot-read access.
 
 Provider compatibility notes:
 
-- `Sandbox.modify_egress_rules(addresses)` applies a non-empty allowlist, `Sandbox.block_all_egress()` denies all outbound access, and `Sandbox.clear_egress_rules()` restores unrestricted access. Deny-all is a separate provider-native operation; do not represent it as `modify_egress_rules([])`. `ComposeSandbox` forwards all three operations to its outer sandbox.
+- `Sandbox.modify_egress_rules(addresses)` applies a non-empty allowlist, `Sandbox.block_all_egress()` denies all outbound access, and `Sandbox.clear_egress_rules()` restores unrestricted access. Deny-all is a separate provider-native operation; do not represent it as `modify_egress_rules([])`. `ComposeSandbox` forwards all three operations to its outer sandbox. On Modal, an exact hostname is enforced as the IPv4 addresses it resolves to, so other sites sharing those addresses are reachable too, and a `*.` wildcard goes on Modal's domain allowlist.
 - `Sandbox.labels` and `Sandbox.created_at` expose provider inventory metadata when available; unsupported metadata is `None`, and creation times are timezone-aware UTC. `SandboxQuery.created_at_lte` is an inclusive creation-time bound. Daytona supports it and always limits listing to the provider's configured target, which may be a Daytona region name or ID. Modal rejects creation-time-bounded listing.
+- `Sandbox.cost_usd(ended_at)` prices a sandbox from `created_at` to `ended_at` at the provider's published rates, and `Sandbox.has_ended` says when that lifetime is final. Both are for providers with no usage API; `priced_provider_types()` lists them (currently `daytona_v2`). Other providers return `None` and `False`.
 - Modal supports both `ImageSource` (registry pull) and `SnapshotSource` (a Modal filesystem snapshot created via `Sandbox.snapshot_filesystem()`, restored by image id). `TargetedSnapshotSource` is Daytona-only.
 - Daytona uses `TargetedSnapshotSource(snapshot=..., target=...)` to select the target for admission and creation. CPU snapshot admission uses the snapshot's CPU, memory, disk, and sandbox class with the exact target's organization-usage row. GPU snapshot prechecks validate target availability; `reservable_demand()` reports their GPU quota charge. `docker_image` is invalid on targeted snapshots because that field cannot preserve the target.
+- `DockerfileSource(dockerfile=...)` builds the sandbox image from an absolute Dockerfile path on the machine that creates the sandbox; the folder holding the Dockerfile is the build context. Daytona builds it with `Image.from_dockerfile`, Modal with `Image.from_dockerfile(context_dir=...)`, and local Docker with `docker build`. `create_timeout` bounds the build, and a source's optional `build_timeout` adds that many seconds for the build on top of it (local Docker bounds the build by `build_timeout` alone, and the container start by `create_timeout`). A failed build raises `SandboxBuildError`, a `SandboxError` whose `build_log` holds the build output: Daytona's streamed log (only once the build has produced output), Docker's last 64 KB, and for Modal the error text it reports. Daytona's builder does not read `.dockerignore`, so everything the Dockerfile copies from the folder is uploaded even if `.dockerignore` lists it; local Docker and Modal honor it. A Dockerfile source is not accepted as a Compose outer source or as `eval_sandbox.source`, but sandbox grading uses the task's own source when `eval_sandbox.source` is unset, so a task with a Dockerfile source is built again for grading.
 - Modal sandboxes do not expose a disk-size parameter; `Resources.disk` is accepted for schema compatibility but not enforced.
-- GPUs are requested via `Resources.gpu` (count) and `Resources.gpu_type`. Modal requires `gpu_type` (any Modal GPU name, e.g. `H100`, `A100-80GB`, `T4`) and passes `"<type>:<count>"` to the sandbox. Daytona accepts a count with an optional type restricted to its `GpuType` enum (`H100`, `H200`, `RTX-PRO-6000`, `RTX-4090`, `RTX-5090`); GPU requests are rejected for Daytona snapshot sandboxes because snapshot resources are fixed at snapshot creation.
+- GPUs are requested via `Resources.gpu` (count) and `Resources.gpu_type` (one type, or a list of acceptable types in order of preference). Common spellings such as `nvidia-h100-80gb` or `RTX 4090` are understood. An unknown name is refused on every provider. Modal requires a type, asks for the first listed that Modal offers in Modal's spelling, and sends `"<type>:<count>"` to the sandbox. Daytona accepts a count with an optional type from its `GpuType` enum (`H100`, `H200`, `RTX-PRO-6000`, `RTX-4090`, `RTX-5090`), passes the listed types it offers in order so Daytona pins the sandbox to the first with capacity, and refuses the request when none match; GPU requests are rejected for Daytona snapshot sandboxes because snapshot resources are fixed at snapshot creation.
 - Modal GPU requests always use `gvisor`, because Modal does not support GPUs on `vm`. CPU requests use the configured runtime.
 - Daytona supports nested Docker natively. For Modal, `vm` is the documented Docker runtime. The adapter retains the undocumented `enable_docker` option on `gvisor`: live T4 checks showed that removing it breaks Docker's `overlay2` storage. A nested container passed with the option, Docker bridge networking disabled, and host networking; default bridge networking failed. The benchmark service owns the Docker-capable image, dockerd startup flags, compose workflow, and cleanup.
 - Transient Modal lookup, execution, and deletion connection errors are retried up to three attempts. Non-transient command failures still surface as `SandboxCommandError` with the command exit code.
@@ -235,9 +247,7 @@ must delete containers after use and reconcile abandoned containers after restar
 and deletion include only containers marked as managed by this provider.
 
 Commands stream output and preserve exit codes. Timeouts and cancelled streams terminate
-the command's process group. Controlled workloads use a separate process group inside the
-same local task container; group stop leaves that container available for collection and
-evaluation. File upload and download support binary data. Network access
+the command's process group. File upload and download support binary data. Network access
 can be disabled only at creation with `network_block_all`. `modify_egress_rules`, `block_all_egress`
 and `clear_egress_rules` raise `SandboxError`, so egress allowlists and staged egress policies fail
 on Docker sandboxes (#182). Docker also
@@ -252,7 +262,7 @@ DOCKER_HOST=unix:///var/run/docker.sock \
   uv run pytest tests/integration/test_docker_sandbox.py
 ```
 
-#### Controlled generation workloads
+#### Credited generation
 
 ```python
 from benchmark_service import CreditedGeneration
@@ -264,22 +274,21 @@ credited_generation = CreditedGeneration(allowance_seconds=5 * 60 * 60, stage_pr
 active-generation clock for every task: an explicit credited allowance takes precedence,
 otherwise `agent_timeout` supplies the allowance, otherwise there is no generation deadline.
 The explicit credited allowance is positive and finite; `stage_protocol=None` charges through
-observed agent-group absence, while `"valkyrie-stage/1"` selects benchmark-owned intervals and requires
+the agent command's exit, while `"valkyrie-stage/1"` selects benchmark-owned intervals and requires
 that finite credited allowance. Tracker charges a finite base `B` plus capped optional accounting
 credit `C` across intervals; setup, evaluation, and gaps between intervals do not debit the
 clock. A configured accounting proxy counts neutral overhead for the native Gateway bearer.
-Tracker reads the counter during generation and, unless exhaustion has frozen the accepted credit, after confirmed stop.
+Tracker reads the counter during generation and, unless exhaustion has frozen the accepted credit, after the command stops.
 In Tracker task results, `base_generation_allowance_seconds` is null when there is no
 generation deadline; effective allowance is derived from that base plus applied accounting credit,
 not stored separately. `external_service_credit_applied_seconds` is null without an accounting
 snapshot. For non-staged generation, `generation_elapsed_seconds` and `agent_run_duration` end at
-the provider-observed agent-group absence, rather than terminal result finalization; each duration
+the agent command's exit, rather than terminal result finalization; each duration
 uses its own start time. Staged generation retains benchmark-owned interval accounting. The elapsed
 field is measured even without a deadline; null means no generation-time measurement was recorded.
-For finite non-staged runs, a group absence confirmed strictly before the effective cutoff permits
-normal result/output/cleanup collection only through that cutoff plus the existing 20-second grace.
-If collection is still unconfirmed, Tracker reports `ERROR` without evaluation; without a timely
-absence receipt, existing deadline stop handling applies.
+For finite non-staged runs, a command exit strictly before the effective cutoff permits
+normal result/output collection only through that cutoff plus the existing 20-second grace;
+otherwise existing deadline stop handling applies.
 The independent 166-hour whole-task wall applies to every selected task, including those without a generation deadline. Daytona requests a 167-hour sandbox TTL, local Docker uses a 167-hour keepalive, and Modal caps sandbox lifetime at 24 hours.
 Accounting credit is optional and independent of whether `credited_generation` is present; eligibility needs
 configured proxy access, a resolved native Gateway URL and key, and an attested model. Missing
@@ -287,7 +296,7 @@ eligibility uses the base clock; failure of an eligible counter read does not si
 Without a base allowance, optional accounting credit does not create a generation deadline.
 
 When an explicit finite credited allowance selects `stage_protocol="valkyrie-stage/1"`, Tracker
-gives the outer controlled workload (agent command or episode orchestrator) `VALKYRIE_STAGE_DIR=/run/valkyrie-stage`. The sandbox-private directory contains a 64-hex-character
+gives the agent command or episode orchestrator `VALKYRIE_STAGE_DIR=/run/valkyrie-stage`. The sandbox-private directory contains a 64-hex-character
 `key` and an initially empty `ack/` directory. During `setup_task`, upload the bytes from
 `benchmark_service.valkyrie_stage_source()` as `valkyrie_stage.py` and import `StageReporter`
 from that standalone file inside the benchmark-owned supervisor. The supervisor owns stage
@@ -300,7 +309,7 @@ copies the orchestrator environment into selected-agent child subprocesses, incl
 before launching that model-capable container. `end()` reports the same container only
 after confirmed absence of the container and its nested workload; it blocks until ACK before
 evaluation or the next round. `container` is the Docker container name, or `None` for a
-workload in the outer controlled-workload process tree. To separate a frame from preceding output
+workload in the agent command's own process tree. To separate a frame from preceding output
 without a final newline, the reporter emits `\nVALKYRIE-STAGE/1 <payload> <mac>\n`;
 the stage frame itself is `VALKYRIE-STAGE/1 <payload> <mac>\n`, where `payload` is unpadded base64url of compact
 ASCII JSON `{"seq":<int>,"event":"begin"|"end","container":<str|null>}`;
@@ -338,16 +347,7 @@ code may assert a generation credit.
 An opt-in episode declares
 `RetrieveTaskResponse.episode = Episode(command="exec python /opt/bench/orchestrator.py", parallel_agents=5)`.
 It requires `credited_generation` with `stage_protocol="valkyrie-stage/1"`; without an episode,
-Tracker runs the agent command directly. Every episode sandbox must expose readable
-`/proc/$$/task/$$/children` to its command shell; CBS checks this before preparing the
-episode supervisor or launching the workload. Ordinary controlled commands are unchanged.
-In a `linux_process_group` sandbox, the image must provide Python 3.8+ as `python3`
-on `PATH` for the CBS-owned episode supervisor; the benchmark orchestrator owns its
-command and interpreter. CBS uploads the supervisor before constructing
-the native workload. A single process-group leader publishes a FIFO and PGID, then replaces
-itself with the Python subreaper. An episode stop waits for that owner to drain its adopted
-descendants and publish a numeric status; a missing status after launch is not confirmation.
-Native Daytona cgroup episodes run inside a dedicated cgroup v2 subgroup. Tracker runs the
+Tracker runs the agent command directly. With one, Tracker runs the
 benchmark-owned `episode.command` in place of the agent command and writes the selected agent
 bundle to `$VALKYRIE_STAGE_DIR/agent.json` after setup. Its required keys are `run_cmd`,
 `continue_cmd`, `command_bindings`, `interrupt_grace_seconds`, `container_name`,
@@ -413,118 +413,6 @@ time already charged between BEGIN and END is not refunded. Unknown owner readin
 proof of child absence and does not trigger END. If named-container absence cannot be confirmed
 after an owner exits, the slot retains its initial completion reason and pending result; a later
 public call resumes Docker cleanup before END, output snapshot, and the completed result.
-
-For every task, check `sandbox.generation_containment` and run
-`await sandbox.probe_generation_containment()` before starting a controlled workload. An advertised
-capability alone does not prove the effective sandbox can start it. A Compose capability still
-requires a usable outer transport and effective inner service. Unsupported probes or starts
-raise rather than silently falling back to an ordinary command.
-
-A direct Daytona sandbox supports `LINUX_CGROUP_V2_V1` (`linux_cgroup_v2` v1).
-`sandbox.controlled_workload(command, cwd=..., env_vars=...)` launches one native
-asynchronous Daytona session command whose child enters a dedicated cgroup v2
-subgroup. Its stdin is `/dev/null`, so noninteractive readers see EOF at launch.
-Stdout and stderr use pipes, not a PTY. Agents must flush output when they need
-logs delivered promptly; output still buffered inside the agent can be lost when
-it is killed. CBS does not force unbuffered mode.
-The shell stays outside the subgroup and publishes completion before
-release, so descendants are fenced before the native exit status and final output
-are returned. Natural completion and `kill()` use `cgroup.kill`, confirm
-`populated 0`, and remove the subgroup; the native session is also confirmed absent.
-The watcher checks command status on a 10-second idle interval while following logs,
-and whenever the follower ends. Network calls can add time; the interval is not a
-latency bound. A known exit does not depend on the log connection closing.
-After exit, the watcher cancels and joins the reader, then makes one final
-log snapshot request. Confirmed sandbox removal raises `SandboxNotFoundError`;
-other handled snapshot failures warn with sandbox, session, and command identifiers
-without retrying or changing the command exit result; any tail not already followed
-can then be lost. Native Daytona follow keeps
-incomplete UTF-8 sequences across chunks and replaces each malformed byte with
-`U+FFFD` before forwarding, consistent with the observed final snapshot text.
-Reopen and final-snapshot suffixes use separate stdout/stderr character offsets;
-this text stream does not preserve the original malformed bytes. While command exit
-is unknown, an observed sandbox `STOPPED` or `ERROR`
-ends the watcher with `SandboxError`; `wait()` reports that observed failure promptly
-even if independent cgroup and session cleanup is still pending. A later cleanup
-failure is logged. If cleanup fails after a separate observed sandbox loss,
-`wait()` raises the original `SandboxNotFoundError` and logs the distinct cleanup
-failure once; a mirrored copy of the same exception is not a second failure.
-Other failures retain cleanup-first ordering. Success still waits for cleanup and
-confirmed absence. After a handled status-query error with a pending log follower,
-if the existing sandbox-state check does not establish confirmed loss or
-`STOPPED`/`ERROR`, the watcher retains that follower and retries status on the
-same idle interval. If the follower ends without a known exit, the watcher reopens
-it for the same command at saved forwarded offsets, without restarting or stopping
-the workload. Its warning identifies sandbox, session, and command, and reports
-the captured watcher error or that the log stream closed.
-Completion-marker observation retries independently.
-The caller still owns the deadline and explicit stop. The probe
-requires writable cgroup v2 delegation with `cgroup.kill`; other sandbox services
-remain outside the subgroup.
-
-Launch setup is a one-shot phase, separate from repeated observation. Creation
-of the UUID-owned cgroup tolerates a lost toolbox reply on retry without
-replaying the native workload. Completion and stop handling run independently
-of the log watcher. `wait()` and `kill()` share session cleanup, which waits
-for the launch attempt to settle before deleting the session and confirming
-absence. A prompt watcher failure does not cancel cleanup;
-`kill()` still waits for stop and absence confirmation.
-A completed failed session close may be retried by `kill()` but still requires fresh
-absence confirmation, without replaying the command, recovering its result, or
-extending the caller's deadline.
-
-See the [Daytona reconnect diagram](docs/diagrams/daytona-reconnect.png).
-
-`ComposeSandbox` supports `linux_process_group` v1 (`LINUX_PROCESS_GROUP_V1`).
-It pins the running service container, starts the command in a new process group inside
-that container, and streams its output through the outer controlled workload transport.
-Natural completion retains the command's exit status and output; `kill()` targets that
-in-container group independently of the outer Docker client. Docker-client completion
-without the service process-group marker raises rather than confirming absence.
-The group stop leaves the main service and sidecars running for collection and evaluation.
-The effective service image needs `/bin/sh`, `setsid`, shell group signaling, a writable
-`/tmp`, and `/proc` process status; the probe checks session creation, marker write/removal,
-and proc visibility before launch.
-
-Native Modal and local Docker also advertise `linux_process_group` v1, probe the same group
-boundary, and run controlled commands through their own provider process transports. Stop
-targets the workload group, not the enclosing Modal sandbox (regardless of runtime)
-or local Docker task container. For ordinary controlled commands, confirmation covers live
-members of the marked process group in the same PID namespace, not independently detached
-processes. For supervised process-group episodes, the subreaper also drains adopted
-descendants before confirmation; Docker-daemon-owned descendants remain outside that boundary.
-For ordinary controlled commands, the shell's FIFO listener ignores TERM/INT/HUP to accept stop
-requests while the owner and workload remain active; normal foreground completion still triggers group cleanup.
-
-Consume `workload.output()` for streamed text. A successful `await workload.wait()` returns
-`ControlledWorkloadResult(result=ExecResult(exit_code, output), absence_confirmed_at=...)`
-after collecting the exit result, output, and provider cleanup.
-`workload.agent_absence_confirmed_at` is `None` until the provider confirms the agent group absent,
-then remains a sticky monotonic timestamp. It can precede the full `wait()` result and is an
-observation of group absence, not the physical process-exit time. Daytona records its existing
-cgroup-removal confirmation; Compose, native Modal, and local Docker record their existing
-successful marked process-group stop confirmation. On natural completion, Compose confirms the
-inner group only after its outer workload has fully waited, while Modal and local Docker first wait
-for their existing process status. The returned result timestamp keeps its provider-specific meaning;
-on Daytona it also includes native session absence and may be later than the property.
-On a deadline or other abort, `await workload.kill()` stops that boundary before returning and
-raises if the stop cannot be confirmed; it does not promise a normal result. During timeout stop,
-existing process-group control-file cleanup may continue asynchronously. On Daytona, cleanup may
-retry a completed failed session close when it reaches the close step again, including within the
-same `kill()` call. A retry still requires fresh confirmation of absence and does not turn an
-earlier workload failure into success. The returned timestamp is monotonic time, not a wall-clock
-datetime. The caller owns deadline arbitration and must not proceed to independent
-collection on unconfirmed stop. Ordinary `Sandbox.command()` and `Sandbox.exec()`
-do not provide this contract. On Daytona, native Modal, and local Docker, `result.output` is a bounded
-tail (at most 64 KiB of UTF-8 bytes for Daytona); consume `workload.output()` while running for the full stream.
-For process-group backends (Compose, native Modal, and local Docker), a waiting shell's synthetic signal-exit notice is excluded from controlled output while the workload's actual stderr is preserved.
-Local Docker decodes UTF-8 independently for stdout and stderr; their relative ordering
-is not guaranteed.
-
-Process containment is separate from `BenchmarkEgressPlan`: setup, run, and evaluation egress
-policies control network access at their respective stages, not whether generation descendants
-have stopped. Run-stage deny-all or an allowlist cannot substitute for confirmed workload absence;
-using the controlled workload does not automatically apply an egress policy.
 
 Benchmark services can send `eval_resume_state` updates to the tracker while evaluation is running. The tracker stores the latest value and sends it back on eval-only retry, so the benchmark service can continue evaluation without recreating the original agent sandbox.
 
@@ -626,7 +514,9 @@ Daytona is the default grading provider and reads `DAYTONA_API_KEY`,
 `DAYTONA_API_URL`, and `DAYTONA_TARGET`. Optional `DAYTONA_ORGANIZATION_ID`
 enables organization-scoped capacity admission. Set
 `GRADING_SANDBOX_PROVIDER=modal` to use Modal with `MODAL_TOKEN_ID` and
-`MODAL_TOKEN_SECRET`. Artifact-capable benchmarks also require
+`MODAL_TOKEN_SECRET`, or `GRADING_SANDBOX_PROVIDER=daytona_v2` to use Daytona v2
+with `DAYTONA_V2_API_KEY` (optional `DAYTONA_V2_API_URL`, `DAYTONA_V2_REGION`,
+`DAYTONA_V2_SPOT`). Artifact-capable benchmarks also require
 `SUBMISSION_ARTIFACT_BUCKET` and `AWS_REGION`; missing server configuration
 fails at startup. The task's `eval_sandbox` spec can override the grading
 source, image-backed resources, timeout, and network policy. Evaluator secrets
@@ -738,15 +628,14 @@ result = await client.run_with_sandbox_recovery(
 Pydantic models used across requests and responses:
 
 - **`RetrieveTaskResponse`** — `source`, `problem_path`, `cwd`, `agent_timeout`, optional `CreditedGeneration(allowance_seconds, stage_protocol)`, optional `Episode(command, parallel_agents)`, `resources`, `agent_install_order`, stage-specific `egress`, optional persistent `volumes`, optional bounded `sandbox_recovery`, optional non-secret `eval_sandbox` and `resume_sandbox`
-- **`GenerationContainment`** — effective-sandbox capability: `linux_cgroup_v2` v1 for direct Daytona native-session commands fenced by cgroup v2, or `linux_process_group` v1 for Compose service, native Modal, and local Docker workloads. Tracker probes the effective sandbox for every task before its `ControlledWorkload` and does not fall back to `Sandbox.command()` on unsupported providers.
 - **`agent_install_order`** — `"before_setup"` installs agent dependencies before benchmark setup; `"after_setup"` lets setup prepare the environment first. The default is `"before_setup"`; lifecycle execution is the caller's responsibility.
 - **`BenchmarkEgressPlan`** — declarative `setup_task`, agent `run`, and `evaluation` policies. `"*"` is unrestricted, `[]` is deny-all, and a non-empty list is an allowlist. Setup and evaluation default to `"*"`; `run=None` leaves the benchmark without a run-policy opinion. `run_through_proxy=True` asks the caller to send the run stage through its egress proxy, which enforces `run` per request; a caller without one should refuse the task. `sandbox_local_hosts` names hosts inside the sandbox (for example compose service names) that the run stage reaches directly rather than through the proxy. `run_inspect` lists hosts the proxy decrypts and holds to GET/HEAD; others are spliced. `children` names `ChildPolicy` profiles (`egress`, `inspect`, `models`) for sandboxes the service creates itself. Applying and composing the plan is the caller's responsibility.
 - **`SandboxRecoveryPolicy`** — explicit opt-in to recreate a lost generation sandbox with the same run identity and volumes; `max_sandbox_attempts` (2–20, inclusive) includes the initial sandbox
-- **`SandboxSource`** — `ImageSource`, `SnapshotSource`, top-level Daytona-only `TargetedSnapshotSource`, or `ComposeSource` with an outer image/snapshot
+- **`SandboxSource`** — `ImageSource`, `SnapshotSource`, top-level Daytona-only `TargetedSnapshotSource`, `DockerfileSource`, or `ComposeSource` with an outer image/snapshot
 - **`EvalSandboxSpec`** — grading overrides whose optional `source` is an image or snapshot, never `ComposeSource`
 - **`GradingSubmission`** — typed `TextGradingSubmission` or `ArtifactGradingSubmission` passed only to the sandbox-grading hook
-- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`: `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET, DAYTONA_ORGANIZATION_ID=None)`, `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)`, or `DockerProviderConfig(type="docker")`. Docker requests require `CBS_DOCKER_ENABLED=true` on the benchmark service.
-- **`Resources`** — `vcpu`, `memory`, `disk`, optional `gpu` (count, default 0) and `gpu_type` (requires `gpu >= 1`)
+- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`: `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET, DAYTONA_ORGANIZATION_ID=None)`, `DaytonaV2ProviderConfig(type="daytona_v2", DAYTONA_V2_API_KEY, DAYTONA_V2_API_URL="https://api.daytona.com", DAYTONA_V2_REGION=None, DAYTONA_V2_SPOT=False)`, `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)`, or `DockerProviderConfig(type="docker")`. Docker requests require `CBS_DOCKER_ENABLED=true` on the benchmark service.
+- **`Resources`** — `vcpu`, `memory`, `disk`, optional `gpu` (count, default 0) and `gpu_type` (one type or a list of acceptable types, in order of preference; requires `gpu >= 1`)
 - **`VolumeMount`** — named persistent volume, absolute `mount_path`, optional `read_only`, `create_if_missing`, and relative `subpath`; `{run_id}` in a subpath resolves from the sandbox's `run-id` or `run_id` label and fails when that label is absent
 - **`GradingRequirementsRequest`** / **`GradingRequirementsResponse`** — task ID and nullable dataset select the complete Gateway model keys for that task
 - **`SetupTaskRequest`** / **`EvaluateInstanceRequest`** — `task_id`, `instance_id`, optional `sandbox_provider` with Daytona header fallback, `dataset`, optional `child_egress` by profile name; only `EvaluateInstanceRequest` accepts optional WebSocket `grading_token`

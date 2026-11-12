@@ -6,7 +6,7 @@ import os
 import traceback
 from collections.abc import AsyncGenerator, Callable, Mapping
 from contextlib import AbstractAsyncContextManager, aclosing, asynccontextmanager, nullcontext, suppress
-from typing import Any, Literal, cast
+from typing import Any, cast
 
 from fastapi import FastAPI, HTTPException, Query, Request, Response, WebSocket
 from fastapi.responses import JSONResponse
@@ -28,7 +28,7 @@ from benchmark_service.remote_grading import (
     remote_grading_authorization_from_headers,
     remote_grading_authorization_scope,
 )
-from benchmark_service.sandbox.created import SandboxCreatedHook, sandbox_created_scope
+from benchmark_service.sandbox.created import AnnouncedSandboxProvider, SandboxCreatedHook, sandbox_created_scope
 from benchmark_service.schemas import (
     DATASET_VERSION_HEADER,
     DatasetVersion,
@@ -94,7 +94,7 @@ async def _forward_stream(
 
 
 def _sandbox_created_hook(websocket: WebSocket) -> SandboxCreatedHook:
-    async def announce(provider: Literal["daytona"], sandbox_id: str) -> None:
+    async def announce(provider: AnnouncedSandboxProvider, sandbox_id: str) -> None:
         chunk = StreamSandboxCreatedChunk(
             type="sandbox_created",
             data=SandboxCreatedData(provider=provider, sandbox_id=sandbox_id),

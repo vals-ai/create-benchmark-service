@@ -737,13 +737,14 @@ class MyBenchmarkService(BenchmarkService):
 
 Header names are lowercase per HTTP convention. Requests that fail auth receive a `401 Unauthorized` response automatically.
 
-Valkyrie users configure their Descope credential via the CLI. Service-specific credentials can be configured separately:
+Valkyrie users sign in with `valkyrie login`; a service's own credential is separate. To have Valkyrie send it, store it as an organization secret exactly as the header carries it (such as `Bearer TOKEN`), then name the secret when saving the service URL:
 
 ```bash
-valkyrie config auth set <benchmark-name> <credential>
+valkyrie secret set <benchmark-name>-token
+valkyrie benchmark service set <benchmark-name> <service-url> --auth-secret <benchmark-name>-token
 ```
 
-The credential is stored under `benchmark_auth` and sent as the `Authorization` header on every request. Users can also pass arbitrary headers at runtime with `-H`:
+Valkyrie sends the secret's value as the `Authorization` header on every request to that service; `--auth-header` picks another header. Users can also pass headers for one run with `-H NAME VALUE`:
 
 ```bash
 valkyrie run start --benchmark my-benchmark --agent my-agent -H X-Custom value
@@ -760,6 +761,6 @@ Setup
 3. Start the project using either `make dev` or `make docker-build && make docker-run`
 4. Run ngrok on the matching port that is exposed: `ngrok http 8001` (forwards the traffic from the tunnel to the FastAPI server running on your machine)
    - Copy the forwarding address on the left. Example: `https://hemagglutinative-vonnie-fungic.ngrok-free.dev`
-5. Using Valkyrie, run `valkyrie config service add <benchmark-name> <forwarding-address>`
+5. Using Valkyrie, run `valkyrie benchmark service set <benchmark-name> <forwarding-address>`
 
 If the forwarding address changes you will need to run step 5 again.

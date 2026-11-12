@@ -55,6 +55,7 @@ _APP_NAME = "benchmark-service"
 # Modal's default sandbox timeout is 5 minutes; benchmark tasks run for hours.
 _MAX_LIFETIME_SECONDS = min(MAX_SANDBOX_LIFETIME_SECONDS, 24 * 60 * 60)
 _ALLOW_ALL_CIDRS = ("0.0.0.0/0",)
+_ALLOW_ALL_DOMAINS = ("*",)
 _RESOLVE_IN_SANDBOX = (
     'for host in "$@"; do getent ahostsv4 "$host" 2>/dev/null | awk \'{print $1}\'; done; '
     "awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null"
@@ -407,18 +408,15 @@ class ModalSandbox(Sandbox):
 
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
         cidrs, hosts = resolve_allowed_addresses(allowed_addresses)
-        # No address list can express a wildcard, so those stay hostname rules on Modal's domain allowlist.
-        wildcards = [host for host in hosts if host.startswith("*.")]
-        exact = [host for host in hosts if host not in wildcards]
-        await self._set_outbound_network_policy(
-            list(dict.fromkeys([*cidrs, *await self._host_cidrs(exact)])), wildcards
-        )
+        # Hostnames are domain rules, so a CDN host that resolves elsewhere later stays reachable.
+        exact = [host for host in hosts if not host.startswith("*.")]
+        await self._set_outbound_network_policy(list(dict.fromkeys([*cidrs, *await self._host_cidrs(exact)])), hosts)
 
     async def block_all_egress(self) -> None:
         await self._set_outbound_network_policy([], [])
 
     async def clear_egress_rules(self) -> None:
-        await self._set_outbound_network_policy(list(_ALLOW_ALL_CIDRS), [])
+        await self._set_outbound_network_policy(list(_ALLOW_ALL_CIDRS), list(_ALLOW_ALL_DOMAINS))
 
 
 def _is_ipv4(value: str) -> bool:
@@ -545,6 +543,8 @@ class ModalSandboxProvider(SandboxProvider):
             "timeout": _MAX_LIFETIME_SECONDS,
             "block_network": request.network_block_all,
             "outbound_cidr_allowlist": list(_ALLOW_ALL_CIDRS) if allow_all_egress else None,
+            # Modal only allows domain rules later on a sandbox created with a domain allowlist.
+            "outbound_domain_allowlist": list(_ALLOW_ALL_DOMAINS) if allow_all_egress else None,
             "client": client,
             "runtime": runtime,
             # Keep this flag: nested Docker's overlay2 failed without it on T4.

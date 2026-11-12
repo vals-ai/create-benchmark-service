@@ -542,15 +542,24 @@ async def test_request_remains_counted_until_outer_response_send_finishes(
 
 
 async def test_websocket_does_not_follow_redirects() -> None:
-    def redirect(_connection: ServerConnection, _request: Any) -> Response:
-        return Response(302, "Found", Headers({"Location": "ws://169.254.169.254/ws/evaluate"}), b"")
+    reached: list[str] = []
 
-    async def handler(_websocket: ServerConnection) -> None:
-        raise AssertionError("redirect handshake must not complete")
+    async def target(websocket: ServerConnection) -> None:
+        reached.append(websocket.request.path if websocket.request else "")
 
-    async with serve_websocket(handler, "127.0.0.1", 0, process_request=redirect) as server:
-        port = next(iter(server.sockets)).getsockname()[1]
-        async with BenchmarkServiceClient(f"http://127.0.0.1:{port}", {"X-Descope-Api-Key": "secret"}) as client:
-            with pytest.raises(InvalidStatus) as raised:
-                await client.resume_evaluation("task-1", {})
+    async with serve_websocket(target, "127.0.0.1", 0) as target_server:
+        target_port = next(iter(target_server.sockets)).getsockname()[1]
+
+        def redirect(_connection: ServerConnection, _request: Any) -> Response:
+            return Response(302, "Found", Headers({"Location": f"ws://127.0.0.1:{target_port}/ws/evaluate"}), b"")
+
+        async def handler(_websocket: ServerConnection) -> None:
+            raise AssertionError("redirect handshake must not complete")
+
+        async with serve_websocket(handler, "127.0.0.1", 0, process_request=redirect) as server:
+            port = next(iter(server.sockets)).getsockname()[1]
+            async with BenchmarkServiceClient(f"http://127.0.0.1:{port}", {"X-Descope-Api-Key": "secret"}) as client:
+                with pytest.raises(InvalidStatus) as raised:
+                    await client.resume_evaluation("task-1", {})
     assert raised.value.response.status_code == 302
+    assert reached == []

@@ -14,6 +14,7 @@ import signal
 import subprocess
 import sys
 import threading
+import tempfile
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -22,6 +23,46 @@ from typing import Literal
 import pytest
 
 from benchmark_service import valkyrie_stage
+
+
+@pytest.mark.skipif(sys.platform != "linux" or os.geteuid() != 0, reason="UID isolation needs Linux root")
+@pytest.mark.parametrize("isolated", [False, True])
+def test_slot_uid_isolation(monkeypatch: pytest.MonkeyPatch, isolated: bool) -> None:
+    with tempfile.TemporaryDirectory() as directory:
+        base = Path(directory)
+        base.chmod(0o755)
+        command = (
+            "id -u > '{slot_dir}/uid'; id -G > '{slot_dir}/groups'; "
+            "grep '^NoNewPrivs:' /proc/self/status > '{slot_dir}/privileges'; "
+            "printf %s \"$HOME\" > '{slot_dir}/home'; "
+            f"if cat {directory}/stage/key > '{{slot_dir}}/key-copy' 2>/dev/null; "
+            "then echo readable; else echo blocked; fi > '{slot_dir}/access'; "
+            "printf done > '{slot_dir}/output'"
+        )
+        config: dict[str, object] = {"isolate_agent_uid": True} if isolated else {}
+        worker, _reporter = agents(base, monkeypatch, run_cmd=command, **config)
+        stage = base / "stage"
+        stage.chmod(0o700)
+        (stage / "key").write_text("test signing key")
+        (stage / "key").chmod(0o600)
+        inherited = next(
+            line.split()[1]
+            for line in Path("/proc/self/status").read_text().splitlines()
+            if line.startswith("NoNewPrivs:")
+        )
+
+        worker.start("one", "observation")
+        assert worker.wait_any() == valkyrie_stage.SlotResult("one", "exited", 0)
+
+        slot = base / "slots" / "one" / "agent"
+        assert (slot / "uid").read_text().strip() == ("65534" if isolated else "0")
+        assert (slot / "privileges").read_text().split()[1] == ("1" if isolated else inherited)
+        assert (slot / "access").read_text().strip() == ("blocked" if isolated else "readable")
+        assert (slot / "key-copy").read_text() == ("" if isolated else "test signing key")
+        assert (slot / "output").read_text() == "done"
+        if isolated:
+            assert (slot / "home").read_text() == str(slot)
+            assert (slot / "groups").read_text().strip() == "65534"
 
 
 def test_stage_reporter_retransmits_identical_signed_frames_until_ack(

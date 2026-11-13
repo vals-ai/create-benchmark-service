@@ -23,6 +23,7 @@ from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from benchmark_service.draining import is_drain_rejection
 from benchmark_service.observability import correlation_scope, request_headers, websocket_request_span
+from benchmark_service.remote_grading import RemoteGradingAuthorization
 from benchmark_service.sandbox import SandboxProvider, SandboxProviderConfig
 from benchmark_service.sandbox_recovery import (
     SandboxProviders,
@@ -369,6 +370,7 @@ class BenchmarkServiceClient:
         on_message: Callable[[str], None] | None = None,
         on_eval_resume_state: Callable[[dict[str, Any]], None | Awaitable[None]] | None = None,
         on_sandbox_created: Callable[[SandboxCreatedData], None] | None = None,
+        remote_grading_authorization: RemoteGradingAuthorization | None = None,
     ) -> JsonValue:
         """Send a request over WebSocket and stream the response.
 
@@ -392,7 +394,10 @@ class BenchmarkServiceClient:
                 application message within the idle budget.
         """
         operation = f"WEBSOCKET /ws/{path}"
-        with websocket_request_span(operation, self._headers) as headers:
+        headers_for_call = self._headers | (
+            remote_grading_authorization.as_headers() if remote_grading_authorization is not None else {}
+        )
+        with websocket_request_span(operation, headers_for_call) as headers:
             async with await self._connect_websocket(path, headers) as websocket:
                 last_message_at = time.monotonic()
                 acknowledged = self._dataset_version is None
@@ -541,12 +546,18 @@ class BenchmarkServiceClient:
         return VerifyTaskIdsResponse.model_validate(response.json())
 
     @_retry_http
-    async def grading_requirements(self, task_id: str, dataset: str | None = None) -> list[str]:
-        """Retrieve the Gateway model keys required to grade this task."""
+    async def grading_requirements_response(
+        self, task_id: str, dataset: str | None = None
+    ) -> GradingRequirementsResponse:
+        """Retrieve grading models and the service's remote-grader capability."""
         body = GradingRequirementsRequest(task_id=task_id, dataset=dataset)
         response = await self._http_request("POST", f"{self._url}/grading-requirements", json=body.model_dump())
         _require_ok(response, "Grading requirements")
-        return GradingRequirementsResponse.model_validate(response.json()).models
+        return GradingRequirementsResponse.model_validate(response.json())
+
+    async def grading_requirements(self, task_id: str, dataset: str | None = None) -> list[str]:
+        """Retrieve the Gateway model keys required to grade this task."""
+        return (await self.grading_requirements_response(task_id, dataset=dataset)).models
 
     @_retry_http
     async def monitoring_requirements(
@@ -616,6 +627,7 @@ class BenchmarkServiceClient:
         on_message: Callable[[str], None] | None = None,
         dataset: str | None = None,
         child_egress: dict[str, ChildEgress] | None = None,
+        remote_grading_authorization: RemoteGradingAuthorization | None = None,
     ) -> SetupTaskResponse:
         """Set up a task instance via WebSocket.
 
@@ -632,7 +644,9 @@ class BenchmarkServiceClient:
             dataset=dataset,
             child_egress=child_egress or {},
         )
-        result = await self._websocket_request("setup-task", request, on_message)
+        result = await self._websocket_request(
+            "setup-task", request, on_message, remote_grading_authorization=remote_grading_authorization
+        )
         return SetupTaskResponse.model_validate(result)
 
     @_retry_http
@@ -684,6 +698,7 @@ class BenchmarkServiceClient:
         on_sandbox_created: Callable[[SandboxCreatedData], None] | None = None,
         child_egress: dict[str, ChildEgress] | None = None,
         grading_token: str | None = None,
+        remote_grading_authorization: RemoteGradingAuthorization | None = None,
     ) -> JsonValue:
         """Resume evaluation from state previously streamed by the benchmark service.
 
@@ -703,7 +718,8 @@ class BenchmarkServiceClient:
             child_egress=child_egress or {},
         )
         return await self._websocket_request(
-            "evaluate-response", request, on_message, on_eval_resume_state, on_sandbox_created
+            "evaluate-response", request, on_message, on_eval_resume_state, on_sandbox_created,
+            remote_grading_authorization=remote_grading_authorization,
         )
 
     async def evaluate_instance(
@@ -717,6 +733,7 @@ class BenchmarkServiceClient:
         on_sandbox_created: Callable[[SandboxCreatedData], None] | None = None,
         child_egress: dict[str, ChildEgress] | None = None,
         grading_token: str | None = None,
+        remote_grading_authorization: RemoteGradingAuthorization | None = None,
     ) -> JsonValue:
         """Evaluate a task instance via WebSocket.
 
@@ -739,7 +756,8 @@ class BenchmarkServiceClient:
             child_egress=child_egress or {},
         )
         return await self._websocket_request(
-            "evaluate-instance", request, on_message, on_eval_resume_state, on_sandbox_created
+            "evaluate-instance", request, on_message, on_eval_resume_state, on_sandbox_created,
+            remote_grading_authorization=remote_grading_authorization,
         )
 
     @_retry_http

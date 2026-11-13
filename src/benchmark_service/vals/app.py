@@ -363,7 +363,7 @@ class ValsBenchmarkServiceApp(BenchmarkServiceApp):
 
     async def _v1_evaluate(self, request: Request, body: V1EvalRequest) -> V1EvalResponse:
         _require_descope_tenant(request.state.tenant)
-        async with self._dataset_scope(request, request.state.tenant, body.dataset):
+        async with self._dataset_scope(request, request.state.tenant, body.dataset, task_id=body.task_id):
             async with grading_credentials(
                 run_id=body.run_id,
                 task_id=body.task_id,
@@ -544,7 +544,7 @@ class ValsBenchmarkServiceApp(BenchmarkServiceApp):
 
     async def _v1_submission_upload_url(self, request: Request, body: V1UploadUrlRequest) -> V1UploadUrlResponse:
         _require_descope_tenant(request.state.tenant)
-        async with self._dataset_scope(request, request.state.tenant, body.dataset):
+        async with self._dataset_scope(request, request.state.tenant, body.dataset, task_id=body.task_id):
             if self._sentry is not None:
                 self._sentry.bind_request_context(request.headers, run_id=body.run_id, task_id=body.task_id, dataset=body.dataset)
             tenant = cast(str, request.state.tenant)
@@ -573,7 +573,7 @@ class ValsBenchmarkServiceApp(BenchmarkServiceApp):
 
     async def _v1_score(self, request: Request, body: V1ScoreRequest) -> V1ScoreResponse:
         _require_descope_tenant(request.state.tenant)
-        async with self._dataset_scope(request, request.state.tenant, body.dataset):
+        async with self._dataset_scope(request, request.state.tenant, body.dataset, task_id=None):
             if self._sentry is not None:
                 self._sentry.bind_request_context(request.headers, run_id=body.run_id, dataset=body.dataset)
 
@@ -592,7 +592,7 @@ class ValsBenchmarkServiceApp(BenchmarkServiceApp):
 
     async def _v1_list_dataset_tasks(self, request: Request, dataset: str) -> V1DatasetTasksResponse:
         _require_descope_tenant(request.state.tenant)
-        async with self._dataset_scope(request, request.state.tenant, dataset):
+        async with self._dataset_scope(request, request.state.tenant, dataset, task_id=None):
             if self._sentry is not None:
                 self._sentry.bind_request_context(request.headers, dataset=dataset)
             try:

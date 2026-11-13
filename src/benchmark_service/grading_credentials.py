@@ -1,8 +1,9 @@
 """Per-evaluation Model Gateway credentials and request-scoped caller attribution.
 
 A supplied grader token is bound to model_library and the current evaluation,
-without minting from the service key. Legacy callers still use the service key
-to mint and revoke run tokens when GRADING_MODELS is configured.
+without minting from the service key. Registered remote grading attempts defer
+credential acquisition to their worker; legacy callers still mint and revoke
+run tokens when GRADING_MODELS is configured.
 
 Without Gateway settings legacy calls bind no credentials; without a run id
 they use the service key. A legacy run without an attempt id fails grading.
@@ -17,11 +18,11 @@ from __future__ import annotations
 import json
 import logging
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from contextlib import AbstractContextManager, asynccontextmanager, contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Iterator, cast
+from typing import cast
 
 import httpx
 
@@ -85,6 +86,19 @@ def current_evaluation_caller() -> EvaluationCaller | None:
     server) forward these so judge spend lands on the caller's run and email.
     """
     return _caller.get()
+
+
+@contextmanager
+def grading_credentials_scope(credentials: GradingCredentials) -> Iterator[None]:
+    """Bind already-acquired worker credentials without minting or revoking them."""
+    from model_library.base.gateway import gateway_token_scope  # pyright: ignore[reportMissingImports, reportUnknownVariableType]
+
+    token = _current.set(credentials)
+    try:
+        with gateway_token_scope(credentials.api_key):  # pyright: ignore[reportUnknownVariableType]
+            yield
+    finally:
+        _current.reset(token)
 
 
 @contextmanager
@@ -159,7 +173,7 @@ async def grading_credentials(
     *, run_id: str | None, task_id: str, attempt_id: str | None = None,
     email: str | None = None, grading_token: str | None = None,
 ) -> AsyncIterator[None]:
-    """Bind supplied credentials or mint and revoke legacy Gateway credentials.
+    """Bind supplied credentials, defer registered remote attempts, or mint legacy Gateway credentials.
 
     Spans the complete operation, so callers must leave the scope only after every
     task that grades (stream finalizers, cleanup) has finished. A scope entered
@@ -177,7 +191,9 @@ async def _bind_credentials(
     *, run_id: str | None, task_id: str, attempt_id: str | None,
     email: str | None, grading_token: str | None,
 ) -> AsyncIterator[None]:
-    if _current.get() is not None:
+    from benchmark_service.remote_grading import current_remote_grading_authorization
+
+    if current_remote_grading_authorization() is not None or _current.get() is not None:
         yield
         return
     service = _service_credentials()

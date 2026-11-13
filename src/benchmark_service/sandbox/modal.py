@@ -524,7 +524,6 @@ class ModalSandboxProvider(SandboxProvider):
         prefix = _INVALID_NAME_CHARS.sub("_", request.name)[:31] or "sandbox"
         modal_name = f"{prefix}-{uuid.uuid4().hex}"
         image = self._resolve_image(request.source, client)
-        allow_all_egress = not request.network_block_all
         gpu: str | None = None
         if request.resources.gpu:
             gpu_type = modal_gpu_type(request.resources.acceptable_gpu_types)
@@ -543,8 +542,8 @@ class ModalSandboxProvider(SandboxProvider):
             "gpu": gpu,
             "idle_timeout": request.auto_stop_interval * 60 if request.auto_stop_interval else None,
             "timeout": _MAX_LIFETIME_SECONDS,
-            "block_network": request.network_block_all,
-            "outbound_cidr_allowlist": list(_ALLOW_ALL_CIDRS) if allow_all_egress else None,
+            "block_network": False,
+            "outbound_cidr_allowlist": [] if request.network_block_all else list(_ALLOW_ALL_CIDRS),
             "client": client,
             "runtime": runtime,
             # Keep this flag: nested Docker's overlay2 failed without it on T4.

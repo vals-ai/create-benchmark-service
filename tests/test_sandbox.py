@@ -1911,27 +1911,40 @@ async def test_daytona_reservable_demand_preserves_snapshot_metadata_validation(
 
 
 @pytest.mark.parametrize(
-    "error",
-    [TimeoutError(), DaytonaError("temporary", status_code=503), DaytonaError("not found", status_code=404)],
+    ("error", "transient"),
+    [
+        (TimeoutError(), True),
+        (DaytonaError("temporary", status_code=503), True),
+        (DaytonaError("not found", status_code=404), False),
+    ],
     ids=["timeout", "transient", "not_found"],
 )
 async def test_daytona_reservable_demand_preserves_snapshot_error_classification(
     monkeypatch: pytest.MonkeyPatch,
     error: Exception,
+    transient: bool,
 ) -> None:
     provider, _targets, _snapshots = _demand_provider(monkeypatch, error)
 
-    with pytest.raises(SandboxError):
+    with pytest.raises(SandboxError) as caught:
         await provider.reservable_demand(SnapshotSource(snapshot="snap"), _ADMISSION_RESOURCES)
+    assert isinstance(caught.value, SandboxConnectionError) is transient
 
 
-async def test_daytona_reservable_demand_preserves_region_error_classification(monkeypatch: pytest.MonkeyPatch) -> None:
-    error = ApiException(status=403, reason="denied")
+@pytest.mark.parametrize(
+    ("status", "message", "transient"),
+    [(403, "rejected the target metadata request", False), (429, "target metadata is unavailable", True)],
+)
+async def test_daytona_reservable_demand_preserves_region_error_classification(
+    monkeypatch: pytest.MonkeyPatch, status: int, message: str, transient: bool
+) -> None:
+    error = ApiException(status=status, reason="denied")
     provider, _targets, _snapshots = _demand_provider(monkeypatch, AssertionError("image"), regions=error)
 
-    with pytest.raises(SandboxError, match="rejected the target metadata request") as caught:
+    with pytest.raises(SandboxError, match=message) as caught:
         await provider.reservable_demand(_ADMISSION_IMAGE, _ADMISSION_RESOURCES)
     assert caught.value.__cause__ is error
+    assert isinstance(caught.value, SandboxConnectionError) is transient
 
 
 async def test_daytona_reservable_demand_rejects_unavailable_target(monkeypatch: pytest.MonkeyPatch) -> None:

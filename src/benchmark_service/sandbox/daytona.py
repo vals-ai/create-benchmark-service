@@ -1223,12 +1223,14 @@ class DaytonaSandboxProvider(SandboxProvider):
                     raise SandboxError("Daytona targeted snapshot is not available in the requested target")
         except DaytonaError as exc:
             if _is_transient_daytona_error(exc):
-                raise SandboxError("Daytona snapshot metadata is unavailable") from None
+                raise SandboxConnectionError("Daytona snapshot metadata is unavailable") from exc
             raise SandboxError("Daytona rejected the snapshot metadata request") from exc
         except (OpenApiException, ClientResponseError) as exc:
+            if getattr(exc, "status", None) in _RETRYABLE_PROVIDER_STATUSES:
+                raise SandboxConnectionError("Daytona target metadata is unavailable") from exc
             raise SandboxError("Daytona rejected the target metadata request") from exc
-        except (TimeoutError, ClientError):
-            raise SandboxError("Daytona snapshot metadata is unavailable") from None
+        except (TimeoutError, ClientError) as exc:
+            raise SandboxConnectionError("Daytona snapshot metadata is unavailable") from exc
 
         # GPU-attached CPU, memory and disk do not consume ordinary compute quota.
         return SandboxReservationDemand(

@@ -6,6 +6,7 @@ from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
+from descope.exceptions import AuthException
 from fastapi import WebSocket
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -132,15 +133,18 @@ def test_retrieve_task(client: TestClient) -> None:
     assert data["docker_image"] == "python:3.12-slim"
     assert data["agent_install_order"] == "before_setup"
     assert data["egress"] == {
-        "setup_task": "*",
+        "setup_task": None,
         "run": None,
-        "evaluation": "*",
+        "evaluation": None,
         "run_through_proxy": False,
         "sandbox_local_hosts": [],
         "run_inspect": [],
         "children": {},
     }
     assert data["credited_generation"] is None
+    restored = RetrieveTaskResponse.model_validate(data)
+    assert restored.egress.setup_task is None
+    assert restored.egress.evaluation is None
 
 
 def test_retrieve_task_credited_generation_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -722,7 +726,7 @@ class TestDescopeAuth:
                 return {"tenants": {"tenant-a": {}}}
             if access_key == "multi-tenant-key":
                 return {"tenants": {"tenant-a": {}, "tenant-b": {}}}
-            raise RuntimeError("invalid access key")
+            raise AuthException(401, "invalid token", "invalid access key")
 
         monkeypatch.setattr(auth_module, "_exchange_descope_access_key", exchange)
 

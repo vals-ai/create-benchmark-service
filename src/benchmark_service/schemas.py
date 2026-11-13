@@ -225,9 +225,9 @@ class ChildPolicy(BaseModel):
 class BenchmarkEgressPlan(BaseModel):
     """Benchmark-declared network policy for each task lifecycle stage."""
 
-    setup_task: EgressPolicy = "*"
+    setup_task: EgressPolicy | None = None
     run: EgressPolicy | None = None
-    evaluation: EgressPolicy = "*"
+    evaluation: EgressPolicy | None = None
     run_through_proxy: bool = False
     sandbox_local_hosts: list[SandboxLocalHost] = []
     run_inspect: list[str] = Field(default=[], description="Hosts the proxy decrypts and holds to GET/HEAD")

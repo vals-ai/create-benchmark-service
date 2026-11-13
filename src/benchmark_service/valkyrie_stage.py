@@ -21,6 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+_AGENT_UID = 65534
+
 
 class StageReporter:
     """Send ordered generation boundaries and wait for Tracker acknowledgments."""
@@ -94,6 +96,7 @@ class Agents:
         self._final_output_template: str | None = config["final_output"]
         self._parallel_agents: int = config["parallel_agents"]
         self._slots_root = Path(config["slots_root"])
+        self._isolate_agent_uid: bool = config.get("isolate_agent_uid", False)
         self._lock = threading.RLock()
         self._reporter = StageReporter()
         self._active: dict[str, _RunningSlot] = {}
@@ -116,6 +119,9 @@ class Agents:
 
         slot_dir = self._slots_root / slot / "agent"
         slot_dir.mkdir(parents=True, exist_ok=True)
+        if self._isolate_agent_uid:
+            os.chown(slot_dir, _AGENT_UID, _AGENT_UID)
+            slot_dir.chmod(0o700)
         container = self._container_template.replace("{slot}", slot) if self._container_template is not None else None
         if slot in self._turns:
             if self._continue_cmd is None:
@@ -162,7 +168,15 @@ class Agents:
             raise
         try:
             process = subprocess.Popen(
-                [sys.executable, __file__, "--turn-owner", str(control_read), str(result_write), command],
+                [
+                    sys.executable,
+                    __file__,
+                    "--turn-owner",
+                    str(control_read),
+                    str(result_write),
+                    command,
+                    *([str(slot_dir)] if self._isolate_agent_uid else []),
+                ],
                 env=child_env,
                 pass_fds=(control_read, result_write),
             )
@@ -353,11 +367,24 @@ def _finish_turn(root: subprocess.Popen[bytes], result_fd: int) -> None:
     os.write(result_fd, json.dumps({"exit_code": root.wait()}).encode())
 
 
-def _turn_owner(control_fd: int, result_fd: int, command: str) -> None:
+def _drop_agent_uid() -> None:
+    os.setgroups([])
+    os.setgid(_AGENT_UID)
+    os.setuid(_AGENT_UID)
+
+
+def _turn_owner(control_fd: int, result_fd: int, command: str, home: str | None = None) -> None:
     try:
         if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) != 0:
             raise OSError(ctypes.get_errno(), "PR_SET_CHILD_SUBREAPER")
-        root = subprocess.Popen(["sh", "-c", command], start_new_session=True)
+        if home is not None and ctypes.CDLL(None, use_errno=True).prctl(38, 1, 0, 0, 0) != 0:
+            raise OSError(ctypes.get_errno(), "PR_SET_NO_NEW_PRIVS")
+        root = subprocess.Popen(
+            ["sh", "-c", command],
+            start_new_session=True,
+            preexec_fn=_drop_agent_uid if home is not None else None,
+            env=dict(os.environ, HOME=home, USER="nobody", LOGNAME="nobody") if home is not None else None,
+        )
     except OSError as exc:
         os.write(result_fd, b"F" + json.dumps({"errno": exc.errno, "strerror": exc.strerror, "filename": exc.filename}).encode())
         return
@@ -390,4 +417,4 @@ def _turn_owner(control_fd: int, result_fd: int, command: str) -> None:
 
 
 if __name__ == "__main__" and sys.argv[1:2] == ["--turn-owner"]:
-    _turn_owner(int(sys.argv[2]), int(sys.argv[3]), sys.argv[4])
+    _turn_owner(int(sys.argv[2]), int(sys.argv[3]), sys.argv[4], sys.argv[5] if len(sys.argv) > 5 else None)

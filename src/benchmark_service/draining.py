@@ -33,6 +33,29 @@ def is_drain_rejection(status: int, headers: _Headers) -> bool:
     return status == 503 and headers.get(DRAIN_HEADER) == "1"
 
 
+def unstarted_response(detail: str) -> JSONResponse:
+    """Build the retryable rejection for a request that did not start."""
+    return JSONResponse(
+        {"detail": detail},
+        status_code=503,
+        headers={DRAIN_HEADER: "1", "Retry-After": "1", "Connection": "close"},
+    )
+
+
+async def reject_unstarted(scope: Scope, receive: Receive, send: Send, detail: str) -> None:
+    """Reject a request before it starts, so clients may replay it."""
+    response = unstarted_response(detail)
+    if scope["type"] == "http":
+        await response(scope, receive, send)
+    elif "websocket.http.response" in scope.get("extensions", {}):
+        await send({"type": "websocket.http.response.start", "status": 503, "headers": response.raw_headers})
+        await send({"type": "websocket.http.response.body", "body": response.body})
+    else:
+        # No application payload is accepted. Older ASGI servers cannot
+        # attach a retry marker to the denial, so callers must not replay it.
+        await send({"type": "websocket.close", "code": 1013})
+
+
 @dataclass(frozen=True)
 class DrainSnapshot:
     store_id: str
@@ -153,17 +176,4 @@ class DrainMiddleware:
             await run_blocking(lambda: self.state.complete(request_id))
 
     async def _reject(self, scope: Scope, receive: Receive, send: Send) -> None:
-        response = JSONResponse(
-            {"detail": "Service is draining; this request was not started"},
-            status_code=503,
-            headers={DRAIN_HEADER: "1", "Retry-After": "1", "Connection": "close"},
-        )
-        if scope["type"] == "http":
-            await response(scope, receive, send)
-        elif "websocket.http.response" in scope.get("extensions", {}):
-            await send({"type": "websocket.http.response.start", "status": 503, "headers": response.raw_headers})
-            await send({"type": "websocket.http.response.body", "body": response.body})
-        else:
-            # No application payload is accepted. Older ASGI servers cannot
-            # attach a retry marker to the denial, so callers must not replay it.
-            await send({"type": "websocket.close", "code": 1013})
+        await reject_unstarted(scope, receive, send, "Service is draining; this request was not started")

@@ -18,9 +18,9 @@ from uvicorn.protocols.utils import ClientDisconnected
 from websockets.exceptions import ConnectionClosed
 
 from benchmark_service._version import __version__ as _framework_version
-from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_required
+from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, AuthenticationUnavailableError, is_auth_required
 from benchmark_service.base import BenchmarkService
-from benchmark_service.draining import DRAIN_STATE_PATH_ENV, DrainMiddleware, DrainState
+from benchmark_service.draining import DRAIN_STATE_PATH_ENV, DrainMiddleware, DrainState, reject_unstarted, unstarted_response
 from benchmark_service.grading_credentials import evaluation_caller_scope, grading_credentials
 from benchmark_service.observability import ATTEMPT_ID_HEADER, EMAIL_HEADER, RUN_ID_HEADER
 from benchmark_service.context import child_egress_scope, sandbox_provider_scope, tenant_scope
@@ -121,6 +121,7 @@ def _request_sandbox_provider_config(
 
 DOCKER_ENABLED_ENV = "CBS_DOCKER_ENABLED"
 _DOCKER_DISABLED_REASON = "Docker sandboxes are disabled on this service"
+_AUTH_UNAVAILABLE_DETAIL = "Authentication is unavailable; this request was not started"
 
 
 def _request_may_use_provider(config: SandboxProviderConfig | None) -> bool:
@@ -225,7 +226,11 @@ class BenchmarkServiceApp(FastAPI):
                     return await call_next(request)  # type: ignore[reportUnknownVariableType]
                 tenant = UNAUTHENTICATED_TENANT_SENTINEL
                 if is_auth_required():
-                    tenant = await self.service.resolve_tenant(dict(request.headers))
+                    try:
+                        tenant = await self.service.resolve_tenant(dict(request.headers))
+                    except AuthenticationUnavailableError:
+                        logger.warning("Authentication is unavailable, so the request was not started", exc_info=True)
+                        return unstarted_response(_AUTH_UNAVAILABLE_DETAIL)
                 if tenant is None:
                     return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
                 request.state.tenant = tenant
@@ -377,12 +382,22 @@ class BenchmarkServiceApp(FastAPI):
             return self.service.monitoring_requirements(body.task_ids, dataset=body.dataset)
 
     async def _authorize_websocket(self, websocket: WebSocket) -> str | None:
-        """Authenticate a WebSocket caller. Returns tenant id, or None after closing 1008."""
+        """Authenticate, then accept, a WebSocket caller. Returns tenant id, or None after rejecting.
+
+        A refusal closes 1008. An unavailable authentication dependency denies the
+        handshake with a retryable 503, because no work has started.
+        """
         self.clear_request_context()
         self._bind_service_context(self._current_service_version())
         tenant = UNAUTHENTICATED_TENANT_SENTINEL
         if is_auth_required():
-            tenant = await self.service.resolve_tenant(dict(websocket.headers))
+            try:
+                tenant = await self.service.resolve_tenant(dict(websocket.headers))
+            except AuthenticationUnavailableError:
+                logger.warning("Authentication is unavailable, so the stream was not started", exc_info=True)
+                await reject_unstarted(websocket.scope, websocket.receive, websocket.send, _AUTH_UNAVAILABLE_DETAIL)
+                return None
+        await websocket.accept()
         if tenant is None:
             await websocket.close(code=1008, reason="Unauthorized")
             return None
@@ -482,7 +497,6 @@ class BenchmarkServiceApp(FastAPI):
                 await websocket.close()
 
     async def _setup_task(self, websocket: WebSocket) -> None:
-        await websocket.accept()
         async with self._stream_session(websocket, "setup-task"):
             tenant = await self._authorize_websocket(websocket)
             if tenant is None:
@@ -534,7 +548,6 @@ class BenchmarkServiceApp(FastAPI):
                     return await self.service.evaluate_response(body, dataset=body.dataset)
 
     async def _evaluate_response_stream(self, websocket: WebSocket) -> None:
-        await websocket.accept()
         token_supplied = False
         async with self._stream_session(websocket, "evaluate-response", sensitive=lambda: token_supplied):
             tenant = await self._authorize_websocket(websocket)
@@ -576,7 +589,6 @@ class BenchmarkServiceApp(FastAPI):
                             )
 
     async def _evaluate_instance(self, websocket: WebSocket) -> None:
-        await websocket.accept()
         token_supplied = False
         async with self._stream_session(websocket, "evaluate-instance", sensitive=lambda: token_supplied):
             tenant = await self._authorize_websocket(websocket)

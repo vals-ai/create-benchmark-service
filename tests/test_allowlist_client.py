@@ -6,7 +6,10 @@ import asyncio
 
 import httpx
 import pytest
+from benchmark_service.auth import AuthenticationUnavailableError
 from benchmark_service.vals.allowlist import (
+    ALLOWLIST_UNAVAILABLE_GRACE_SECONDS,
+    DEFAULT_ALLOWLIST_CACHE_TTL_SECONDS,
     CatalogAllowlistClient,
     TenantConfig,
 )
@@ -173,11 +176,42 @@ async def test_permanent_failure_is_not_retried(status: int) -> None:
 
 
 @pytest.mark.asyncio
-async def test_exhausted_retries_do_not_reuse_expired_policy_or_cache_failure() -> None:
+async def test_unavailable_catalog_keeps_last_policy_only_within_grace() -> None:
     clock = [0.0]
     policy = {"name": "example-service", "datasets": ["default"], "trial_mode": False}
     transport, requests = _transport(
-        [_response(policy), *[_response({}, status_code=503) for _ in range(3)], _response(policy)]
+        [
+            _response(policy),
+            *[_response({}, status_code=503) for _ in range(3)],
+            *[_response({}, status_code=503) for _ in range(3)],
+            _response(policy),
+        ]
+    )
+    client = CatalogAllowlistClient(
+        "https://catalog.example.test", "example-service", transport=transport, cache_timer=lambda: clock[0]
+    )
+
+    first = await client.get_tenant_config("key-acme", "acme")
+    assert first is not None
+    clock[0] = 301.0
+    assert await client.get_tenant_config("key-acme", "acme") == first
+    assert len(requests) == 4
+    clock[0] = DEFAULT_ALLOWLIST_CACHE_TTL_SECONDS + ALLOWLIST_UNAVAILABLE_GRACE_SECONDS + 1.0
+    with pytest.raises(AuthenticationUnavailableError):
+        await client.get_tenant_config("key-acme", "acme")
+    assert len(requests) == 7
+    assert await client.get_tenant_config("key-acme", "acme") is not None
+    assert len(requests) == 8
+    await client.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [401, 403, 404])
+async def test_refusal_drops_last_policy(status: int) -> None:
+    clock = [0.0]
+    policy = {"name": "example-service", "datasets": ["default"], "trial_mode": False}
+    transport, _ = _transport(
+        [_response(policy), _response({}, status_code=status), *[_response({}, status_code=503) for _ in range(3)]]
     )
     client = CatalogAllowlistClient(
         "https://catalog.example.test", "example-service", transport=transport, cache_timer=lambda: clock[0]
@@ -186,9 +220,8 @@ async def test_exhausted_retries_do_not_reuse_expired_policy_or_cache_failure() 
     assert await client.get_tenant_config("key-acme", "acme") is not None
     clock[0] = 301.0
     assert await client.get_tenant_config("key-acme", "acme") is None
-    assert len(requests) == 4
-    assert await client.get_tenant_config("key-acme", "acme") is not None
-    assert len(requests) == 5
+    with pytest.raises(AuthenticationUnavailableError):
+        await client.get_tenant_config("key-acme", "acme")
     await client.aclose()
 
 
@@ -201,7 +234,8 @@ async def test_request_deadline_bounds_the_whole_lookup() -> None:
     client = CatalogAllowlistClient(
         "https://catalog.example.test", "example-service", transport=httpx.MockTransport(handler), timeout=0.01
     )
-    assert await asyncio.wait_for(client.get_tenant_config("key-acme", "acme"), timeout=1) is None
+    with pytest.raises(AuthenticationUnavailableError):
+        await asyncio.wait_for(client.get_tenant_config("key-acme", "acme"), timeout=1)
     await client.aclose()
 
 

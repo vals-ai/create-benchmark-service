@@ -7,6 +7,10 @@ UNAUTHENTICATED_TENANT_SENTINEL = "unauthenticated"
 AUTH_REQUIRED_ENV = "AUTH_REQUIRED"
 
 
+class AuthenticationUnavailableError(Exception):
+    """An authentication dependency failed, so the caller was neither accepted nor refused."""
+
+
 def is_auth_required() -> bool:
     """Return whether this deployment explicitly requires authentication."""
     return os.environ.get(AUTH_REQUIRED_ENV, "").strip().lower() in {"1", "true", "yes", "on"}

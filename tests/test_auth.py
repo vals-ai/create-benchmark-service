@@ -8,8 +8,11 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+import requests
+from descope.exceptions import AuthException, RateLimitException
 
 from benchmark_service import Sandbox
+from benchmark_service.auth import AuthenticationUnavailableError
 from benchmark_service.vals import auth as auth_module
 from benchmark_service.vals.auth import (
     UNAUTHENTICATED_TENANT_SENTINEL,
@@ -196,3 +199,27 @@ async def test_check_dataset_access_unauthenticated_sentinel_always_allowed() ->
     service = _BareBenchmark()
     assert await service.check_dataset_access(UNAUTHENTICATED_TENANT_SENTINEL, "anything") is True
     assert await service.check_dataset_access(UNAUTHENTICATED_TENANT_SENTINEL, None) is True
+
+
+@pytest.mark.usefixtures("descope_env")
+async def test_descope_refusal_returns_none() -> None:
+    refusal = AuthException(401, "invalid token", "invalid access key")
+    with patch.object(auth_module, "_exchange_descope_access_key", side_effect=refusal):
+        assert await resolve_descope_tenant({"x-descope-api-key": "revoked"}) is None
+
+
+@pytest.mark.usefixtures("descope_env")
+@pytest.mark.parametrize(
+    "failure",
+    [
+        AuthException(503, "server error", "unavailable"),
+        AuthException(None, "server error", "no status"),
+        RateLimitException(429, "API rate limit exceeded"),
+        requests.ConnectionError("connection reset"),
+        requests.Timeout("read timed out"),
+    ],
+)
+async def test_descope_outage_is_unavailable_not_a_refusal(failure: Exception) -> None:
+    with patch.object(auth_module, "_exchange_descope_access_key", side_effect=failure):
+        with pytest.raises(AuthenticationUnavailableError):
+            await resolve_descope_tenant({"x-descope-api-key": "valid"})

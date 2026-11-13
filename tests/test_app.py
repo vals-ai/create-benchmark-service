@@ -6,6 +6,7 @@ from typing import Any, cast
 from unittest.mock import patch
 
 import pytest
+from descope.exceptions import AuthException
 from fastapi import WebSocket
 from fastapi.testclient import TestClient
 from starlette.websockets import WebSocketDisconnect
@@ -725,7 +726,7 @@ class TestDescopeAuth:
                 return {"tenants": {"tenant-a": {}}}
             if access_key == "multi-tenant-key":
                 return {"tenants": {"tenant-a": {}, "tenant-b": {}}}
-            raise RuntimeError("invalid access key")
+            raise AuthException(401, "invalid token", "invalid access key")
 
         monkeypatch.setattr(auth_module, "_exchange_descope_access_key", exchange)
 

@@ -663,7 +663,7 @@ Services generated with `--template vals-ai` import `ValsBenchmarkService` and `
 
 When authentication is required, the allowlist is loaded in this order:
 
-1. `BENCHMARK_CATALOG_API_URL` plus `SERVICE_NAME` — the service-specific catalog API fetches the authenticated tenant policy. The Vals layer caches positive policies for 300 seconds, refreshes an unknown tenant immediately, and fails closed when the API is unavailable or returns invalid data.
+1. `BENCHMARK_CATALOG_API_URL` plus `SERVICE_NAME` — the service-specific catalog API fetches the authenticated tenant policy. The Vals layer caches positive policies for 300 seconds, refreshes an unknown tenant immediately, and fails closed when the API refuses the tenant or returns invalid data.
 2. `DESCOPE_TENANT_ALLOWLIST_JSON` — JSON payload retained during the staged production rollout.
 3. `DESCOPE_ALLOWLIST_PATH` — path to a local YAML file, useful for development.
 4. Empty config — allowed at startup, but Descope-authenticated requests fail closed.
@@ -677,7 +677,9 @@ SERVICE_NAME=<registered-service-name>
 
 Catalog requests use the authenticated `x-descope-api-key` header. The service never reads the catalog bucket directly. Leave `BENCHMARK_CATALOG_API_URL` unset to retain the JSON/YAML behavior during rollout.
 
-Catalog lookups retry connection failures, timeouts, HTTP 408/429, and server errors up to three attempts with randomized backoff. The default total deadline is five seconds, with at most two seconds per attempt. Authorization denials and malformed policies are not retried. Exhausted retries deny access without reusing expired policy or caching the failure.
+Catalog lookups retry connection failures, timeouts, HTTP 408/429, and server errors up to three attempts with randomized backoff. The default total deadline is five seconds, with at most two seconds per attempt. Authorization denials and malformed policies are not retried and drop the tenant's policy at once.
+
+An unavailable catalog or Descope exchange is not a refusal. When the catalog cannot answer, a tenant's last good policy still answers for up to 15 minutes past its TTL, so a revoked tenant keeps access for at most 20 minutes, and only while the catalog is unreachable. Without such a policy the request is not started: HTTP routes return `503` and WebSocket handshakes are denied with `503`, both with the `X-Benchmark-Service-Draining: 1` marker that `BenchmarkServiceClient` already retries for up to 60 seconds.
 
 Example allowlist:
 

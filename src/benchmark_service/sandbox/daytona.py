@@ -166,6 +166,7 @@ _PROVIDER_RETRY_DELAYS_SECONDS = (5, 25, 90, 300, 420)
 _FIXED_PROVIDER_WAIT = wait_chain(*(wait_random(delay * 0.9, delay) for delay in _PROVIDER_RETRY_DELAYS_SECONDS))
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
 _ADMISSION_TIMEOUT_SECONDS = 30
+_CAPACITY_LOOKUP_ERRORS = (OpenApiException, ClientError, TimeoutError, ValueError)
 
 # Far above a healthy round trip, but low enough that a worst-case pass through the full
 # _PROVIDER_RETRY_DELAYS_SECONDS ladder stays under half an hour.
@@ -447,30 +448,19 @@ def _parse_retry_after_seconds(value: object) -> float | None:
     return seconds
 
 
-def _get_header(headers: dict[str, Any], header_name: str) -> object | None:
-    header_name = header_name.lower()
-    for key, value in headers.items():
-        if str(key).lower() == header_name:
-            return value
-    return None
-
-
 def daytona_retry_after_seconds(exc: DaytonaRateLimitError) -> float | None:
-    for throttler in _KNOWN_THROTTLERS:
-        seconds = _parse_retry_after_seconds(_get_header(exc.headers, f"retry-after-{throttler}"))
-        if seconds is not None:
-            return seconds
-
-    seconds = _parse_retry_after_seconds(_get_header(exc.headers, "retry-after"))
-    if seconds is not None:
-        return seconds
-
+    """Known throttlers first, then plain retry-after, then any other retry-after-* header."""
+    headers: dict[str, object] = {}
     for key, value in exc.headers.items():
-        if str(key).lower().startswith(_RETRY_AFTER_PREFIX):
-            seconds = _parse_retry_after_seconds(value)
-            if seconds is not None:
-                return seconds
-
+        headers.setdefault(str(key).lower(), value)
+    names = [
+        *(f"{_RETRY_AFTER_PREFIX}{throttler}" for throttler in _KNOWN_THROTTLERS),
+        "retry-after",
+        *(key for key in headers if key.startswith(_RETRY_AFTER_PREFIX)),
+    ]
+    for name in names:
+        if name in headers and (seconds := _parse_retry_after_seconds(headers[name])) is not None:
+            return seconds
     return None
 
 
@@ -760,9 +750,7 @@ class DaytonaSandbox(Sandbox):
             output.put_nowait(text)
 
         try:
-            handle = await self._open_pty_session(
-                session_id, on_data, pty_envs, create_state
-            )
+            handle = await self._open_pty_session(session_id, on_data, pty_envs, create_state)
 
             await _bounded(
                 "handle.send_input",
@@ -926,9 +914,7 @@ class DaytonaSandbox(Sandbox):
             return handle
 
         session_info = await self._get_pty_create_session_info(session_id)
-        expected_environment_matches = all(
-            session_info.envs.get(key) == value for key, value in envs.items()
-        )
+        expected_environment_matches = all(session_info.envs.get(key) == value for key, value in envs.items())
         if (
             session_info.id != session_id
             or session_info.rows != _PTY_ROWS
@@ -1051,23 +1037,22 @@ class DaytonaSandboxProvider(SandboxProvider):
         ):
             organizations_api = OrganizationsApi(api_client)
             overview = await organizations_api.get_organization_usage_overview(self._organization_id)
-            matches = [
-                usage
-                for usage in overview.region_usage
-                if usage.region_id == target and usage.sandbox_class == sandbox_class
-            ]
-            if not matches:
-                target_id = await self._resolve_capacity_target_id(
-                    target,
-                    organizations_api.list_available_regions,
-                    cache_configured_target=cache_configured_target,
-                    gpu=False,
-                )
-                matches = [
-                    usage
-                    for usage in overview.region_usage
-                    if usage.region_id == target_id and usage.sandbox_class == sandbox_class
+
+            def rows(region_id: str) -> list[RegionUsageOverview]:
+                return [
+                    u for u in overview.region_usage if u.region_id == region_id and u.sandbox_class == sandbox_class
                 ]
+
+            matches = rows(target)
+            if not matches:
+                matches = rows(
+                    await self._resolve_capacity_target_id(
+                        target,
+                        organizations_api.list_available_regions,
+                        cache_configured_target=cache_configured_target,
+                        gpu=False,
+                    )
+                )
             if len(matches) != 1:
                 raise SandboxError(
                     f"Expected one Daytona capacity row for target {target!r} and class "
@@ -1084,9 +1069,7 @@ class DaytonaSandboxProvider(SandboxProvider):
                 sandbox_class=SandboxClass.CONTAINER,
             )
             return _capacity_from_usage(usage)
-        except SandboxError:
-            raise
-        except (OpenApiException, ClientError, TimeoutError, ValueError):
+        except _CAPACITY_LOOKUP_ERRORS:
             raise SandboxError("Daytona capacity is unavailable") from None
 
     async def get_capacity_domains(self) -> list[SandboxCapacityDomain] | None:
@@ -1115,9 +1098,7 @@ class DaytonaSandboxProvider(SandboxProvider):
                         )
                     )
                 return sorted(domains, key=lambda domain: (domain.target_id, domain.sandbox_class))
-        except SandboxError:
-            raise
-        except (OpenApiException, ClientError, TimeoutError, ValueError):
+        except _CAPACITY_LOOKUP_ERRORS:
             raise SandboxError("Daytona capacity is unavailable") from None
 
     async def check_admission(
@@ -1365,7 +1346,11 @@ class DaytonaSandboxProvider(SandboxProvider):
         match request.source:
             case ImageSource() | DockerfileSource() as source:
                 try:
-                    image = source.image if isinstance(source, ImageSource) else DaytonaImage.from_dockerfile(source.dockerfile)
+                    image = (
+                        source.image
+                        if isinstance(source, ImageSource)
+                        else DaytonaImage.from_dockerfile(source.dockerfile)
+                    )
                 except (OSError, DaytonaError) as exc:
                     raise SandboxError(f"Cannot read the Dockerfile: {exc}") from exc
                 params = CreateSandboxFromImageParams(
@@ -1451,7 +1436,9 @@ class DaytonaSandboxProvider(SandboxProvider):
         except DaytonaError as exc:
             raise self._sandbox_error(exc) from exc
 
-        if sandbox.state in _FAILED_SANDBOX_STATES or (abandoned_build and sandbox.state not in _REMOVED_SANDBOX_STATES):
+        if sandbox.state in _FAILED_SANDBOX_STATES or (
+            abandoned_build and sandbox.state not in _REMOVED_SANDBOX_STATES
+        ):
             await self.delete_sandbox(sandbox.id)
 
     async def _find_existing_sandbox(self, name: str, daytona: AsyncDaytona) -> AsyncSandbox | None:

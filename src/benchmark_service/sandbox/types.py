@@ -4,6 +4,7 @@ import re
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator, Mapping
 from datetime import datetime
+from enum import StrEnum
 from pathlib import PurePosixPath
 from string import Formatter
 from typing import Annotated, Literal, Self
@@ -48,6 +49,55 @@ class DockerfileSource(BaseModel):
         return self
 
 
+CHECKPOINT_TIMEOUT_SECONDS = 600
+
+
+class CheckpointKind(StrEnum):
+    """The least a checkpoint keeps. FILES is the root filesystem; MEMORY adds running processes."""
+
+    FILES = "files"
+    MEMORY = "memory"
+
+
+class Checkpoint(BaseModel):
+    """Saved sandbox state, restored by passing it as `SandboxCreateRequest.source`.
+
+    `ref` is the provider's own id for the state, so a checkpoint only restores on the provider that made it.
+    Open network connections never survive a restore.
+    """
+
+    type: Literal["checkpoint"] = "checkpoint"
+    provider: str
+    kind: CheckpointKind
+    ref: str
+
+
+def files_checkpoint_source(checkpoint: Checkpoint, provider: str) -> SnapshotSource:
+    """The snapshot behind a FILES checkpoint, for providers that restore checkpoints as snapshots."""
+    if checkpoint.provider != provider or checkpoint.kind != CheckpointKind.FILES:
+        raise SandboxError(f"{provider} cannot restore a {checkpoint.kind} checkpoint from {checkpoint.provider}")
+    return SnapshotSource(snapshot=checkpoint.ref)
+
+
+def check_memory_restore(request: "SandboxCreateRequest") -> None:
+    """A memory restore resumes processes with their saved env and network policy before anything else can apply."""
+    if request.network_block_all:
+        raise SandboxError(
+            "A memory checkpoint resumes under its saved network policy, before network_block_all could apply"
+        )
+    if request.env_vars or request.sandbox_secrets:
+        raise SandboxError("A memory checkpoint keeps its saved environment; pass fresh values per command instead")
+
+
+class SandboxCapabilities(BaseModel):
+    """Optional operations a provider supports, so callers can plan without probing for errors."""
+
+    model_config = ConfigDict(frozen=True)
+
+    checkpoints: frozenset[CheckpointKind] = frozenset()
+    fork: bool = False
+
+
 BaseSandboxSource = Annotated[ImageSource | SnapshotSource, Field(discriminator="type")]
 
 
@@ -59,7 +109,7 @@ class ComposeSource(BaseModel):
 
 
 SandboxSource = Annotated[
-    ImageSource | SnapshotSource | TargetedSnapshotSource | DockerfileSource | ComposeSource,
+    ImageSource | SnapshotSource | TargetedSnapshotSource | DockerfileSource | ComposeSource | Checkpoint,
     Field(discriminator="type"),
 ]
 
@@ -406,8 +456,27 @@ class Sandbox(ABC):
     async def clear_egress_rules(self) -> None:
         raise SandboxError("Sandbox provider does not support modifying egress rules")
 
+    async def checkpoint(self, kind: CheckpointKind, name: str) -> Checkpoint:
+        """Save at least `kind` of this sandbox's state. The sandbox keeps running.
+
+        `name` is a unique label for providers that name saved state and is ignored by those that assign ids.
+        """
+        raise SandboxError(f"Sandbox provider does not support {kind} checkpoints")
+
+    async def fork(self, name: str) -> Sandbox:
+        """Start a running copy of this sandbox, processes included, and leave this one running."""
+        raise SandboxError("Sandbox provider does not support forking")
+
 
 class SandboxProvider(ABC):
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities()
+
+    async def delete_checkpoint(self, checkpoint: Checkpoint) -> None:
+        """Delete a checkpoint made by `Sandbox.checkpoint`; a missing one is a no-op."""
+        raise SandboxError("Sandbox provider does not support checkpoints")
+
     @property
     def admission_pool_id(self) -> str | None:
         return None

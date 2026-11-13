@@ -13,6 +13,7 @@ from benchmark_service.sandbox import SandboxProviderConfig
 from benchmark_service.sandbox.created import AnnouncedSandboxProvider
 from benchmark_service.sandbox.types import (
     BaseSandboxSource,
+    Checkpoint,
     ComposeSource,
     DockerfileSource,
     ImageSource,
@@ -26,6 +27,7 @@ from benchmark_service.sandbox.types import (
 _COMPOSE_LEGACY_DOCKER_IMAGE = "compose+source-required"
 _TARGETED_SNAPSHOT_LEGACY_DOCKER_IMAGE = "targeted-snapshot+source-required"
 _DOCKERFILE_LEGACY_DOCKER_IMAGE = "dockerfile+source-required"
+_CHECKPOINT_LEGACY_DOCKER_IMAGE = "checkpoint+source-required"
 DATASET_VERSION_HEADER = "X-Benchmark-Dataset-Version"
 
 DatasetVersionId = Annotated[str, Field(min_length=1, max_length=1024, pattern=r"^[!-~]+$")]
@@ -112,8 +114,10 @@ def legacy_docker_image(source: SandboxSource) -> str:
         return _TARGETED_SNAPSHOT_LEGACY_DOCKER_IMAGE
     if isinstance(source, DockerfileSource):
         return _DOCKERFILE_LEGACY_DOCKER_IMAGE
-    if isinstance(source, ComposeSource):  # pyright: ignore[reportUnnecessaryIsInstance]
+    if isinstance(source, ComposeSource):
         return _COMPOSE_LEGACY_DOCKER_IMAGE
+    if isinstance(source, Checkpoint):  # pyright: ignore[reportUnnecessaryIsInstance]
+        return _CHECKPOINT_LEGACY_DOCKER_IMAGE
     assert_never(source)
 
 

@@ -80,7 +80,11 @@ from benchmark_service.sandbox.types import (
     MissingSandboxConfigError,
     ResourceCapacity,
     Resources,
+    CHECKPOINT_TIMEOUT_SECONDS,
+    Checkpoint,
+    CheckpointKind,
     Sandbox,
+    SandboxCapabilities,
     SandboxBuildError,
     SandboxCapacity,
     SandboxCapacityDomain,
@@ -94,6 +98,7 @@ from benchmark_service.sandbox.types import (
     SandboxReservationDemand,
     SandboxSource,
     SnapshotSource,
+    files_checkpoint_source,
     TargetedSnapshotSource,
     VolumeMount,
     resolve_volume_subpath,
@@ -161,6 +166,7 @@ _PROVIDER_RETRY_DELAYS_SECONDS = (5, 25, 90, 300, 420)
 _FIXED_PROVIDER_WAIT = wait_chain(*(wait_random(delay * 0.9, delay) for delay in _PROVIDER_RETRY_DELAYS_SECONDS))
 _RATE_LIMIT_WAIT = wait_exponential(multiplier=1, min=1, max=30)
 _ADMISSION_TIMEOUT_SECONDS = 30
+_CAPACITY_LOOKUP_ERRORS = (OpenApiException, ClientError, TimeoutError, ValueError)
 
 # Far above a healthy round trip, but low enough that a worst-case pass through the full
 # _PROVIDER_RETRY_DELAYS_SECONDS ladder stays under half an hour.
@@ -442,30 +448,15 @@ def _parse_retry_after_seconds(value: object) -> float | None:
     return seconds
 
 
-def _get_header(headers: dict[str, Any], header_name: str) -> object | None:
-    header_name = header_name.lower()
-    for key, value in headers.items():
-        if str(key).lower() == header_name:
-            return value
-    return None
-
-
 def daytona_retry_after_seconds(exc: DaytonaRateLimitError) -> float | None:
-    for throttler in _KNOWN_THROTTLERS:
-        seconds = _parse_retry_after_seconds(_get_header(exc.headers, f"retry-after-{throttler}"))
-        if seconds is not None:
+    """The first copy of each known throttler's header, then plain retry-after, then any valid retry-after-* value."""
+    headers = [(str(key).lower(), value) for key, value in exc.headers.items()]
+    names = [*(f"{_RETRY_AFTER_PREFIX}{throttler}" for throttler in _KNOWN_THROTTLERS), "retry-after"]
+    first = [next((value for key, value in headers if key == name), None) for name in names]
+    rest = [value for key, value in headers if key.startswith(_RETRY_AFTER_PREFIX)]
+    for value in (*first, *rest):
+        if value is not None and (seconds := _parse_retry_after_seconds(value)) is not None:
             return seconds
-
-    seconds = _parse_retry_after_seconds(_get_header(exc.headers, "retry-after"))
-    if seconds is not None:
-        return seconds
-
-    for key, value in exc.headers.items():
-        if str(key).lower().startswith(_RETRY_AFTER_PREFIX):
-            seconds = _parse_retry_after_seconds(value)
-            if seconds is not None:
-                return seconds
-
     return None
 
 
@@ -672,6 +663,17 @@ class DaytonaSandbox(Sandbox):
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
 
+    async def checkpoint(self, kind: CheckpointKind, name: str) -> Checkpoint:
+        if kind != CheckpointKind.FILES:
+            raise SandboxError(f"Daytona sandboxes do not support {kind} checkpoints")
+        # Snapshot the started container in place: CBS creates sandboxes with auto_delete_interval=0,
+        # so stop() would delete it.
+        try:
+            await self._sandbox.create_snapshot(name, timeout=CHECKPOINT_TIMEOUT_SECONDS)
+        except _SANDBOX_OPERATION_ERRORS as exc:
+            raise self._sandbox_error(exc) from exc
+        return Checkpoint(provider="daytona", kind=kind, ref=name)
+
     @_PROVIDER_RETRY
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
         network_allow_list, domain_allow_list = _resolve_daytona_allowed_addresses(allowed_addresses)
@@ -744,9 +746,7 @@ class DaytonaSandbox(Sandbox):
             output.put_nowait(text)
 
         try:
-            handle = await self._open_pty_session(
-                session_id, on_data, pty_envs, create_state
-            )
+            handle = await self._open_pty_session(session_id, on_data, pty_envs, create_state)
 
             await _bounded(
                 "handle.send_input",
@@ -910,9 +910,7 @@ class DaytonaSandbox(Sandbox):
             return handle
 
         session_info = await self._get_pty_create_session_info(session_id)
-        expected_environment_matches = all(
-            session_info.envs.get(key) == value for key, value in envs.items()
-        )
+        expected_environment_matches = all(session_info.envs.get(key) == value for key, value in envs.items())
         if (
             session_info.id != session_id
             or session_info.rows != _PTY_ROWS
@@ -1035,23 +1033,22 @@ class DaytonaSandboxProvider(SandboxProvider):
         ):
             organizations_api = OrganizationsApi(api_client)
             overview = await organizations_api.get_organization_usage_overview(self._organization_id)
-            matches = [
-                usage
-                for usage in overview.region_usage
-                if usage.region_id == target and usage.sandbox_class == sandbox_class
-            ]
-            if not matches:
-                target_id = await self._resolve_capacity_target_id(
-                    target,
-                    organizations_api.list_available_regions,
-                    cache_configured_target=cache_configured_target,
-                    gpu=False,
-                )
-                matches = [
-                    usage
-                    for usage in overview.region_usage
-                    if usage.region_id == target_id and usage.sandbox_class == sandbox_class
+
+            def rows(region_id: str) -> list[RegionUsageOverview]:
+                return [
+                    u for u in overview.region_usage if u.region_id == region_id and u.sandbox_class == sandbox_class
                 ]
+
+            matches = rows(target)
+            if not matches:
+                matches = rows(
+                    await self._resolve_capacity_target_id(
+                        target,
+                        organizations_api.list_available_regions,
+                        cache_configured_target=cache_configured_target,
+                        gpu=False,
+                    )
+                )
             if len(matches) != 1:
                 raise SandboxError(
                     f"Expected one Daytona capacity row for target {target!r} and class "
@@ -1068,9 +1065,7 @@ class DaytonaSandboxProvider(SandboxProvider):
                 sandbox_class=SandboxClass.CONTAINER,
             )
             return _capacity_from_usage(usage)
-        except SandboxError:
-            raise
-        except (OpenApiException, ClientError, TimeoutError, ValueError):
+        except _CAPACITY_LOOKUP_ERRORS:
             raise SandboxError("Daytona capacity is unavailable") from None
 
     async def get_capacity_domains(self) -> list[SandboxCapacityDomain] | None:
@@ -1099,9 +1094,7 @@ class DaytonaSandboxProvider(SandboxProvider):
                         )
                     )
                 return sorted(domains, key=lambda domain: (domain.target_id, domain.sandbox_class))
-        except SandboxError:
-            raise
-        except (OpenApiException, ClientError, TimeoutError, ValueError):
+        except _CAPACITY_LOOKUP_ERRORS:
             raise SandboxError("Daytona capacity is unavailable") from None
 
     async def check_admission(
@@ -1111,6 +1104,8 @@ class DaytonaSandboxProvider(SandboxProvider):
     ) -> bool:
         if isinstance(source, ComposeSource):
             source = source.outer
+        if isinstance(source, Checkpoint):
+            source = files_checkpoint_source(source, "daytona")
         if self._organization_id is None:
             return True
         if isinstance(source, (ImageSource, DockerfileSource)) and resources.gpu:
@@ -1194,6 +1189,8 @@ class DaytonaSandboxProvider(SandboxProvider):
     ) -> SandboxReservationDemand:
         if isinstance(source, ComposeSource):
             source = source.outer
+        if isinstance(source, Checkpoint):
+            source = files_checkpoint_source(source, "daytona")
         target = source.target if isinstance(source, TargetedSnapshotSource) else self._target
         sandbox_class = SandboxClass.CONTAINER
         cpu: float = math.ceil(resources.vcpu)
@@ -1309,8 +1306,24 @@ class DaytonaSandboxProvider(SandboxProvider):
             )
         return resolved
 
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities(checkpoints=frozenset({CheckpointKind.FILES}))
+
+    @_PROVIDER_RETRY
+    async def delete_checkpoint(self, checkpoint: Checkpoint) -> None:
+        try:
+            snapshot = await self._daytona.snapshot.get(files_checkpoint_source(checkpoint, "daytona").snapshot)
+            await self._daytona.snapshot.delete(snapshot)
+        except DaytonaNotFoundError:
+            return
+        except DaytonaError as exc:
+            raise self._sandbox_error(exc) from exc
+
     @_PROVIDER_RETRY
     async def create_sandbox(self, request: SandboxCreateRequest) -> DaytonaSandbox:
+        if isinstance(request.source, Checkpoint):
+            request = request.model_copy(update={"source": files_checkpoint_source(request.source, "daytona")})
         daytona = self._daytona
         if isinstance(request.source, TargetedSnapshotSource):
             daytona = self._client_for_target(request.source.target)
@@ -1329,7 +1342,11 @@ class DaytonaSandboxProvider(SandboxProvider):
         match request.source:
             case ImageSource() | DockerfileSource() as source:
                 try:
-                    image = source.image if isinstance(source, ImageSource) else DaytonaImage.from_dockerfile(source.dockerfile)
+                    image = (
+                        source.image
+                        if isinstance(source, ImageSource)
+                        else DaytonaImage.from_dockerfile(source.dockerfile)
+                    )
                 except (OSError, DaytonaError) as exc:
                     raise SandboxError(f"Cannot read the Dockerfile: {exc}") from exc
                 params = CreateSandboxFromImageParams(
@@ -1365,6 +1382,8 @@ class DaytonaSandboxProvider(SandboxProvider):
                 )
             case ComposeSource():
                 raise SandboxError("ComposeSource must be unwrapped before provider.create_sandbox")
+            case Checkpoint():
+                raise SandboxError("Checkpoint must be unwrapped before provider.create_sandbox")
 
         builds_dockerfile = isinstance(request.source, DockerfileSource)
         build_log: list[str] = []
@@ -1413,7 +1432,9 @@ class DaytonaSandboxProvider(SandboxProvider):
         except DaytonaError as exc:
             raise self._sandbox_error(exc) from exc
 
-        if sandbox.state in _FAILED_SANDBOX_STATES or (abandoned_build and sandbox.state not in _REMOVED_SANDBOX_STATES):
+        if sandbox.state in _FAILED_SANDBOX_STATES or (
+            abandoned_build and sandbox.state not in _REMOVED_SANDBOX_STATES
+        ):
             await self.delete_sandbox(sandbox.id)
 
     async def _find_existing_sandbox(self, name: str, daytona: AsyncDaytona) -> AsyncSandbox | None:

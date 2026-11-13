@@ -8,11 +8,14 @@ import re
 import shlex
 import socket
 import uuid
-from collections.abc import AsyncGenerator, Awaitable, Coroutine, Mapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Coroutine, Mapping
+from contextlib import suppress
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
 
-from modal import App, Client, Image, Volume
+import modal.experimental as modal_experimental
+
+from modal import App, Client, Image, SandboxSnapshot, Volume
 from modal import Sandbox as ModalSdkSandbox
 from modal.exception import ConflictError as ModalConflictError
 from modal.exception import ConnectionError as ModalConnectionError
@@ -29,6 +32,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fi
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.gpu import modal_gpu_type
 from benchmark_service.sandbox.types import (
+    check_memory_restore,
     DockerfileSource,
     ExecResult,
     ImageSource,
@@ -38,6 +42,10 @@ from benchmark_service.sandbox.types import (
     SandboxBuildError,
     SandboxCommandError,
     SandboxConnectionError,
+    CHECKPOINT_TIMEOUT_SECONDS,
+    Checkpoint,
+    CheckpointKind,
+    SandboxCapabilities,
     SandboxCreateRequest,
     SandboxError,
     SandboxNotFoundError,
@@ -45,6 +53,7 @@ from benchmark_service.sandbox.types import (
     SandboxQuery,
     SandboxSource,
     SnapshotSource,
+    files_checkpoint_source,
     VolumeMount,
     resolve_volume_subpath,
     validate_command_env,
@@ -101,6 +110,8 @@ _PROVIDER_RETRY = retry(
 class ModalProviderConfig(BaseModel):
     type: Literal["modal"] = "modal"
     runtime: Literal["gvisor", "vm"] = "gvisor"
+    # Modal's memory snapshots are early preview and must be enabled when a sandbox is created.
+    memory_snapshots: bool = False
     MODAL_TOKEN_ID: str
     MODAL_TOKEN_SECRET: str
 
@@ -121,6 +132,7 @@ class ModalProviderConfig(BaseModel):
         return cls.model_validate(
             {
                 "runtime": os.environ.get("MODAL_RUNTIME", "gvisor"),
+                "memory_snapshots": os.environ.get("MODAL_MEMORY_SNAPSHOTS", "false"),
                 "MODAL_TOKEN_ID": token_id,
                 "MODAL_TOKEN_SECRET": token_secret,
             }
@@ -405,6 +417,17 @@ class ModalSandbox(Sandbox):
         local = [address for host in hosts for address in await _resolve_ipv4(host)]
         return [f"{address}/32" for address in [*result.stdout.split(), *local] if _is_ipv4(address)]
 
+    async def checkpoint(self, kind: CheckpointKind, name: str) -> Checkpoint:
+        try:
+            if kind == CheckpointKind.FILES:
+                saved = await self._sandbox.snapshot_filesystem.aio(timeout=CHECKPOINT_TIMEOUT_SECONDS)
+            else:
+                # Memory snapshots are an early-preview private API.
+                saved = await self._sandbox._experimental_snapshot.aio()  # pyright: ignore[reportPrivateUsage]
+        except _PROVIDER_ERRORS as exc:
+            raise _sandbox_error(exc) from exc
+        return Checkpoint(provider="modal", kind=kind, ref=saved.object_id)
+
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
         cidrs, hosts = resolve_allowed_addresses(allowed_addresses)
         # No address list can express a wildcard, so those stay hostname rules on Modal's domain allowlist.
@@ -515,7 +538,30 @@ class ModalSandboxProvider(SandboxProvider):
         except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
 
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        if self._config.memory_snapshots:
+            return SandboxCapabilities(checkpoints=frozenset(CheckpointKind))
+        return SandboxCapabilities(checkpoints=frozenset({CheckpointKind.FILES}))
+
+    async def delete_checkpoint(self, checkpoint: Checkpoint) -> None:
+        if checkpoint.provider == "modal" and checkpoint.kind == CheckpointKind.MEMORY:
+            return  # Modal has no API to delete memory snapshots.
+        image_id = files_checkpoint_source(checkpoint, "modal").snapshot
+        client, _ = await self._connect()
+        try:
+            # modal.experimental has no stubs, so the .aio variant is untyped.
+            await cast(Any, modal_experimental.image_delete).aio(image_id, client=client)
+        except ModalNotFoundError:
+            return
+        except _PROVIDER_ERRORS as exc:
+            raise _sandbox_error(exc) from exc
+
     async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
+        if isinstance(request.source, Checkpoint):
+            if request.source.provider == "modal" and request.source.kind == CheckpointKind.MEMORY:
+                return await self._restore_memory(request, request.source.ref)
+            request = request.model_copy(update={"source": files_checkpoint_source(request.source, "modal")})
         if request.sandbox_secrets:
             raise SandboxError("Modal sandbox provider does not support sandbox_secrets")
 
@@ -549,6 +595,7 @@ class ModalSandboxProvider(SandboxProvider):
             "runtime": runtime,
             # Keep this flag: nested Docker's overlay2 failed without it on T4.
             "experimental_options": {"enable_docker": True} if runtime == "gvisor" else None,
+            "_experimental_enable_snapshot": self._config.memory_snapshots,
         }
         if request.volumes:
             create_kwargs["volumes"] = self._resolve_volumes(request.volumes, client, request.labels)
@@ -579,6 +626,39 @@ class ModalSandboxProvider(SandboxProvider):
         except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
         return ModalSandbox(inner, name=request.name, labels=request.labels)
+
+    async def _restore_memory(self, request: SandboxCreateRequest, snapshot_id: str) -> Sandbox:
+        """Restore keeps the snapshot's image, resources and env; the name and tags are set and egress is opened."""
+        check_memory_restore(request)
+        client, _ = await self._connect()
+        prefix = _INVALID_NAME_CHARS.sub("_", request.name)[:31] or "sandbox"
+        snapshot = SandboxSnapshot.from_id(snapshot_id, client)
+        restore = cast(
+            Callable[..., Coroutine[Any, Any, ModalSdkSandbox]],
+            ModalSdkSandbox._experimental_from_snapshot.aio,  # pyright: ignore[reportPrivateUsage, reportUnknownMemberType]
+        )
+        creation = asyncio.create_task(restore(snapshot, client, name=f"{prefix}-{uuid.uuid4().hex}"))
+        try:
+            async with asyncio.timeout(request.provider_timeout):
+                inner = await asyncio.shield(creation)
+        except (TimeoutError, asyncio.CancelledError) as exc:
+            cleanup = _start_background(self._cleanup_create(creation), f"Modal cleanup {request.name}")
+            self._cleanup_tasks.add(cleanup)
+            cleanup.add_done_callback(self._cleanup_tasks.discard)
+            if isinstance(exc, asyncio.CancelledError):
+                raise
+            raise SandboxError(f"Failed to restore Modal sandbox within {request.provider_timeout}s") from exc
+        except _PROVIDER_ERRORS as exc:
+            raise _sandbox_error(exc) from exc
+        sandbox = ModalSandbox(inner, name=request.name, labels=request.labels)
+        try:
+            await inner.set_tags.aio(request.labels)
+            await sandbox.clear_egress_rules()
+        except BaseException:
+            with suppress(*_PROVIDER_ERRORS):
+                await inner.terminate.aio()
+            raise
+        return sandbox
 
     async def _cleanup_create(self, creation: asyncio.Task[ModalSdkSandbox]) -> None:
         try:

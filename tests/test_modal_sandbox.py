@@ -25,10 +25,13 @@ import benchmark_service.sandbox.modal as modal_module
 from benchmark_service.sandbox import sandbox_provider_config_from_mapping
 from benchmark_service.sandbox.modal import ModalProviderConfig, ModalSandbox, ModalSandboxProvider
 from benchmark_service.sandbox.types import (
+    Checkpoint,
+    CheckpointKind,
     DockerfileSource,
     ImageSource,
     Resources,
     SandboxBuildError,
+    SandboxCapabilities,
     SandboxCommandError,
     SandboxConnectionError,
     SandboxCreateRequest,
@@ -795,6 +798,7 @@ async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> N
     assert captured["image"] == ("image", "python:3.12")
     assert captured["env"] == {"FOO": "bar"}
     assert captured["tags"] == {"run_id": "r1"}
+    assert captured["_experimental_enable_snapshot"] is False
     assert captured["cpu"] == (4, 4)
     assert captured["memory"] == 8192
     assert captured["idle_timeout"] == 1800
@@ -1309,3 +1313,89 @@ async def test_create_sandbox_reports_a_missing_volume_clearly(monkeypatch: pyte
         await provider.create_sandbox(_request(volumes=[VolumeMount(name="absent", mount_path="/vol")]))
 
     assert type(raised.value) is SandboxError
+
+
+async def test_checkpoint_is_a_filesystem_image_or_memory_snapshot() -> None:
+    inner = FakeInnerSandbox()
+    timeouts: list[int] = []
+
+    async def snapshot_filesystem(timeout: int) -> SimpleNamespace:
+        timeouts.append(timeout)
+        return SimpleNamespace(object_id="im-snap-1")
+
+    async def snapshot_memory() -> SimpleNamespace:
+        return SimpleNamespace(object_id="sn-1")
+
+    inner.snapshot_filesystem = _aio(snapshot_filesystem)  # pyright: ignore[reportAttributeAccessIssue]
+    inner._experimental_snapshot = _aio(snapshot_memory)  # pyright: ignore[reportAttributeAccessIssue]
+    sandbox = _sandbox(inner)
+
+    assert await sandbox.checkpoint(CheckpointKind.FILES, "ignored") == Checkpoint(
+        provider="modal", kind=CheckpointKind.FILES, ref="im-snap-1"
+    )
+    assert await sandbox.checkpoint(CheckpointKind.MEMORY, "ignored") == Checkpoint(
+        provider="modal", kind=CheckpointKind.MEMORY, ref="sn-1"
+    )
+    assert timeouts == [600]
+
+
+async def test_memory_restore_resumes_the_snapshot_with_tags(monkeypatch: pytest.MonkeyPatch) -> None:
+    inner = FakeInnerSandbox()
+    restored: list[tuple[str, str]] = []
+    tags: list[dict[str, str]] = []
+
+    async def from_snapshot(snapshot: Any, client: Any, *, name: str) -> FakeInnerSandbox:
+        restored.append((snapshot.object_id, name))
+        return inner
+
+    async def set_tags(labels: dict[str, str]) -> None:
+        tags.append(labels)
+
+    inner.set_tags = _aio(set_tags)  # pyright: ignore[reportAttributeAccessIssue]
+    def from_id(ref: str, client: Any) -> SimpleNamespace:
+        return SimpleNamespace(object_id=ref)
+
+    monkeypatch.setattr(modal_module, "SandboxSnapshot", SimpleNamespace(from_id=from_id))
+    provider = _provider(monkeypatch, SimpleNamespace(_experimental_from_snapshot=_aio(from_snapshot)))
+    memory = Checkpoint(provider="modal", kind=CheckpointKind.MEMORY, ref="sn-1")
+
+    restore = _request().model_copy(update={"source": memory, "env_vars": {}})
+    sandbox = await provider.create_sandbox(restore)
+
+    assert sandbox.id == inner.object_id
+    assert restored[0][0] == "sn-1"
+    assert tags == [_request().labels]
+    assert inner.outbound_policies[-1]["outbound_cidr_allowlist"] == ["0.0.0.0/0"]
+    with pytest.raises(SandboxError, match="saved network policy"):
+        await provider.create_sandbox(restore.model_copy(update={"network_block_all": True}))
+    with pytest.raises(SandboxError, match="saved environment"):
+        await provider.create_sandbox(restore.model_copy(update={"env_vars": {"FOO": "bar"}}))
+
+
+async def test_delete_checkpoint_ignores_missing_image(monkeypatch: pytest.MonkeyPatch) -> None:
+    deleted: list[str] = []
+
+    async def image_delete(image_id: str, *, client: Any) -> None:
+        if image_id == "im-missing":
+            raise ModalNotFoundError("image not found")
+        deleted.append(image_id)
+
+    monkeypatch.setattr(modal_module, "modal_experimental", SimpleNamespace(image_delete=_aio(image_delete)))
+    provider = _provider(monkeypatch, SimpleNamespace())
+
+    await provider.delete_checkpoint(Checkpoint(provider="modal", kind=CheckpointKind.FILES, ref="im-snap-1"))
+    await provider.delete_checkpoint(Checkpoint(provider="modal", kind=CheckpointKind.FILES, ref="im-missing"))
+
+    await provider.delete_checkpoint(Checkpoint(provider="modal", kind=CheckpointKind.MEMORY, ref="sn-1"))
+
+    assert deleted == ["im-snap-1"]
+    assert provider.capabilities == SandboxCapabilities(checkpoints=frozenset({CheckpointKind.FILES}))
+    with_memory = ModalSandboxProvider(_config().model_copy(update={"memory_snapshots": True}))
+    assert with_memory.capabilities == SandboxCapabilities(checkpoints=frozenset(CheckpointKind))
+
+
+async def test_create_rejects_checkpoints_modal_cannot_restore(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = _provider(monkeypatch, SimpleNamespace())
+    checkpoint = Checkpoint(provider="daytona", kind=CheckpointKind.FILES, ref="snap")
+    with pytest.raises(SandboxError, match="cannot restore"):
+        await provider.create_sandbox(_request().model_copy(update={"source": checkpoint}))

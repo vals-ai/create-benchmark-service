@@ -36,6 +36,8 @@ from yarl import URL
 import benchmark_service.sandbox.daytona as daytona_module
 from benchmark_service.sandbox.compose import _COMPOSE_EXEC_ENV_ARGS  # pyright: ignore[reportPrivateUsage]
 from benchmark_service.sandbox import (
+    Checkpoint,
+    CheckpointKind,
     ComposeSource,
     ComposeSandbox,
     DockerfileSource,
@@ -50,6 +52,7 @@ from benchmark_service.sandbox import (
     SandboxCommandError,
     SandboxConnectionError,
     SandboxCreateRequest,
+    SandboxCapabilities,
     SandboxError,
     SandboxNotFoundError,
     SandboxProvider,
@@ -2620,6 +2623,12 @@ def test_daytona_retry_after_uses_any_retry_after_header() -> None:
     assert daytona_retry_after_seconds(exc) == 5
 
 
+def test_daytona_retry_after_falls_back_past_an_invalid_duplicate() -> None:
+    headers = {"Retry-After-Sandbox-Create": "invalid", "retry-after-sandbox-create": "120"}
+
+    assert daytona_retry_after_seconds(DaytonaRateLimitError("rate limited", headers=headers)) == 120
+
+
 @pytest.mark.parametrize(
     "invalid_delay",
     [
@@ -4993,3 +5002,68 @@ def test_provider_secret_references_reject_invalid_configuration(
 def test_volume_mount_rejects_invalid_subpath(subpath: str) -> None:
     with pytest.raises(ValidationError):
         VolumeMount(name="fixtures", mount_path="/fixtures", subpath=subpath)
+
+
+async def test_daytona_files_checkpoint_snapshots_running_sandbox_without_stopping_it() -> None:
+    inner = SnapshottingInnerSandbox()
+
+    checkpoint = await DaytonaSandbox(cast(Any, inner), cast(Any, DaytonaClient(inner))).checkpoint(
+        CheckpointKind.FILES, "task-1-post-gen"
+    )
+
+    assert checkpoint == Checkpoint(provider="daytona", kind=CheckpointKind.FILES, ref="task-1-post-gen")
+    assert inner.snapshots == [("task-1-post-gen", 600.0)]
+    assert inner.state == SandboxState.STARTED
+
+
+async def test_daytona_delete_checkpoint_ignores_missing_snapshot() -> None:
+    deleted: list[str] = []
+
+    async def get(name: str) -> SimpleNamespace:
+        if name == "missing":
+            raise DaytonaNotFoundError("snapshot not found")
+        return SimpleNamespace(name=name)
+
+    async def delete(snapshot: SimpleNamespace) -> None:
+        deleted.append(snapshot.name)
+
+    daytona = DaytonaClient(InnerSandbox())
+    daytona.snapshot = SimpleNamespace(get=get, delete=delete)  # pyright: ignore[reportAttributeAccessIssue]
+    provider = _provider(daytona)
+
+    await provider.delete_checkpoint(Checkpoint(provider="daytona", kind=CheckpointKind.FILES, ref="kept"))
+    await provider.delete_checkpoint(Checkpoint(provider="daytona", kind=CheckpointKind.FILES, ref="missing"))
+
+    assert deleted == ["kept"]
+    assert provider.capabilities == SandboxCapabilities(checkpoints=frozenset({CheckpointKind.FILES}))
+
+
+async def test_checkpoints_and_fork_default_to_unsupported() -> None:
+    provider = cast(SandboxProvider, SimpleNamespace())
+    checkpoint = Checkpoint(provider="docker", kind=CheckpointKind.FILES, ref="img")
+
+    assert SandboxProvider.capabilities.fget(provider) == SandboxCapabilities()  # pyright: ignore[reportOptionalCall]
+    with pytest.raises(SandboxError, match="does not support files checkpoints"):
+        await Sandbox.checkpoint(RecordingSandbox(), CheckpointKind.FILES, "cp")
+    with pytest.raises(SandboxError, match="does not support forking"):
+        await Sandbox.fork(RecordingSandbox(), "fork")
+    with pytest.raises(SandboxError, match="does not support checkpoints"):
+        await SandboxProvider.delete_checkpoint(provider, checkpoint)
+
+
+def test_checkpoint_round_trips_as_a_sandbox_source() -> None:
+    checkpoint = Checkpoint(provider="daytona_v2", kind=CheckpointKind.MEMORY, ref="snap-9")
+
+    assert TypeAdapter(SandboxSource).validate_python(checkpoint.model_dump(mode="json")) == checkpoint
+
+
+class SnapshottingInnerSandbox(InnerSandbox):
+    def __init__(self) -> None:
+        super().__init__()
+        self.snapshots: list[tuple[str, float | None]] = []
+
+    async def stop(self, timeout: float | None = 60, force: bool = False) -> None:
+        raise AssertionError("stopping a CBS sandbox deletes it (auto_delete_interval=0)")
+
+    async def create_snapshot(self, name: str, timeout: float | None = 60) -> None:
+        self.snapshots.append((name, timeout))

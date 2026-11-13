@@ -41,7 +41,7 @@ def resolve_grading_spec(task: RetrieveTaskResponse) -> ResolvedSpec:
             "sandbox grading does not support ComposeSource; set eval_sandbox.source to an image or snapshot"
         )
     if spec is not None and spec.resources is not None and isinstance(
-        source, (SnapshotSource, TargetedSnapshotSource)
+        source, (SnapshotSource, TargetedSnapshotSource, Checkpoint)
     ):
         raise ValueError(
             "eval_sandbox.resources cannot override a snapshot-backed sandbox; use an image source with explicit resources"

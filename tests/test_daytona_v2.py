@@ -589,7 +589,9 @@ async def test_restoring_checkpoints_creates_from_their_ref() -> None:
     files = Checkpoint(provider="daytona_v2", kind=CheckpointKind.FILES, ref="img-9")
     memory = Checkpoint(provider="daytona_v2", kind=CheckpointKind.MEMORY, ref="snap-9")
     await provider.create_sandbox(_request(1, source=files))
-    await provider.create_sandbox(_request(1, source=memory, network_block_all=True))
+    await provider.create_sandbox(_request(1, source=memory))
+    with pytest.raises(SandboxError, match="saved network policy"):
+        await provider.create_sandbox(_request(1, source=memory, network_block_all=True))
 
     assert creates[0]["image"] == "img-9"
     assert creates[1] == {
@@ -600,7 +602,24 @@ async def test_restoring_checkpoints_creates_from_their_ref() -> None:
         "wait_seconds": 0,
         "lifecycle_policy": {"idle_expiry_seconds": 900, "on_idle_timeout": "delete"},
     }
-    assert puts == [{"block_all": True, "allow_cidrs": [], "allow_domains": None}]
+    assert (len(creates), puts) == (2, [])
+
+
+async def test_failed_checkpoint_deletes_its_capture() -> None:
+    deleted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            return httpx.Response(201, json={"id": "img-1", "status": "pending"})
+        if request.method == "DELETE":
+            deleted.append(request.url.path)
+            return httpx.Response(204)
+        return httpx.Response(200, json={"id": "img-1", "status": "failed", "error": "disk"})
+
+    with pytest.raises(SandboxError, match="failed disk"):
+        await _sandbox(handler).checkpoint(CheckpointKind.FILES, "cp-1")
+
+    assert deleted == ["/images/img-1"]
 
 
 async def test_delete_checkpoint_targets_its_kind_and_ignores_missing() -> None:

@@ -1127,6 +1127,8 @@ class DaytonaSandboxProvider(SandboxProvider):
     ) -> bool:
         if isinstance(source, ComposeSource):
             source = source.outer
+        if isinstance(source, Checkpoint):
+            source = files_checkpoint_source(source, "daytona")
         if self._organization_id is None:
             return True
         if isinstance(source, (ImageSource, DockerfileSource)) and resources.gpu:
@@ -1210,6 +1212,8 @@ class DaytonaSandboxProvider(SandboxProvider):
     ) -> SandboxReservationDemand:
         if isinstance(source, ComposeSource):
             source = source.outer
+        if isinstance(source, Checkpoint):
+            source = files_checkpoint_source(source, "daytona")
         target = source.target if isinstance(source, TargetedSnapshotSource) else self._target
         sandbox_class = SandboxClass.CONTAINER
         cpu: float = math.ceil(resources.vcpu)

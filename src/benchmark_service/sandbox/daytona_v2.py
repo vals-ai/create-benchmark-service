@@ -373,9 +373,19 @@ class DaytonaV2Sandbox(Sandbox):
                 self._client, "POST", f"/sandboxes/{sandbox}/snapshots", f"snapshot {self.id}", json={"name": name}
             )
             path = f"/snapshots/{quote(str(created.json()['id']), safe='')}"
-        data = await _await_status(
-            self._client, path, f"checkpoint of {self.id}", "ready", _FAILED_IMAGE_STATUSES, CHECKPOINT_TIMEOUT_SECONDS
-        )
+        try:
+            data = await _await_status(
+                self._client,
+                path,
+                f"checkpoint of {self.id}",
+                "ready",
+                _FAILED_IMAGE_STATUSES,
+                CHECKPOINT_TIMEOUT_SECONDS,
+            )
+        except BaseException:
+            with suppress(SandboxError):
+                await _send(self._client, "DELETE", path, f"delete checkpoint of {self.id}")
+            raise
         return Checkpoint(provider="daytona_v2", kind=kind, ref=str(data["id"]))
 
     async def fork(self, name: str) -> DaytonaV2Sandbox:
@@ -550,6 +560,10 @@ class DaytonaV2SandboxProvider(SandboxProvider):
         self._reject_unsupported(request)
         match request.source:
             case Checkpoint(provider="daytona_v2", kind=CheckpointKind.MEMORY, ref=ref):
+                if request.network_block_all:
+                    raise SandboxError(
+                        "A memory checkpoint resumes under its saved network policy, before network_block_all could apply"
+                    )
                 body = self._restore_body(request, ref)
             case source:
                 body = self._create_body(request, await self._image(source, deadline))
@@ -573,9 +587,6 @@ class DaytonaV2SandboxProvider(SandboxProvider):
                 await asyncio.sleep(_POLL_SECONDS)
                 data = await self._get(sandbox_id)
             sandbox = DaytonaV2Sandbox(data, self._client)
-            if request.network_block_all and "network_policy" not in body:
-                # A restore can't set network policy at create time.
-                await sandbox.block_all_egress()
         except BaseException:
             with suppress(SandboxError):
                 await self.delete_sandbox(sandbox_id)

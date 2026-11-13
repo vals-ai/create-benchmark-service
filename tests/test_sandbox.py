@@ -4421,6 +4421,26 @@ async def test_daytona_create_reports_permanent_refusals_as_rejected(message: st
     assert daytona.create_attempts == 1
 
 
+async def test_daytona_create_retries_an_exhausted_org_quota() -> None:
+    class QuotaThenFreeDaytonaClient(DaytonaClient):
+        create_attempts = 0
+
+        async def create(self, *args: object, **kwargs: object) -> InnerSandbox:
+            self.create_attempts += 1
+            if self.create_attempts == 1:
+                raise DaytonaError("Failed to create sandbox: Total CPU limit exceeded. Maximum allowed: 2500", status_code=400)
+            return await super().create(*args, **kwargs)
+
+    inner = InnerSandbox()
+    daytona = QuotaThenFreeDaytonaClient(inner)
+
+    sandbox = await _provider(daytona).create_sandbox(_request(inner.name))
+
+    assert sandbox.id == inner.id
+    assert daytona.create_attempts == 2
+
+
+
 def test_sandbox_query_rejects_naive_creation_cutoff() -> None:
     with pytest.raises(ValueError):
         SandboxQuery(labels={"Benchmark": "vcb"}, created_at_lte=datetime(2026, 7, 24, 12, 30))

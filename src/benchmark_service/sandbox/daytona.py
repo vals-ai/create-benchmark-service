@@ -158,6 +158,8 @@ _TRANSPORT_ERROR_MESSAGES = (
 # throttled call carries (a 401 when it is Bearer token validation), so the status cannot identify it.
 _THROTTLED_ERROR_MESSAGES = ("throttlerexception",)
 _REJECTED_REQUEST_MESSAGES = ("did you add it through the daytona dashboard", "organization is suspended")
+# The org-wide quota frees up as other sandboxes end, so creating again later can succeed.
+_QUOTA_EXHAUSTED_MESSAGES = ("total cpu limit exceeded",)
 _RETRYABLE_DAYTONA_CAUSES = (ClientConnectionError, ClientPayloadError, ConnectionError, TimeoutError)
 _PROVIDER_RETRY_DELAYS_SECONDS = (5, 25, 90, 300, 420)
 _FIXED_PROVIDER_WAIT = wait_chain(*(wait_random(delay * 0.9, delay) for delay in _PROVIDER_RETRY_DELAYS_SECONDS))
@@ -1247,6 +1249,8 @@ class DaytonaSandboxProvider(SandboxProvider):
     def _sandbox_error(self, exc: DaytonaError) -> SandboxError:
         if _message_contains(exc, _REJECTED_REQUEST_MESSAGES):
             return SandboxRejectedError(f"Daytona rejected the sandbox request: {exc}")
+        if _message_contains(exc, _QUOTA_EXHAUSTED_MESSAGES):
+            return SandboxConnectionError(f"Daytona organization quota is exhausted: {exc}")
         if _is_not_found_error(exc):
             return SandboxNotFoundError(f"Sandbox not found: {exc}")
         if _is_transient_daytona_error(exc):

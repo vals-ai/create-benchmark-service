@@ -363,6 +363,9 @@ is `<slots_root>/<slot>/agent`. A configured `container_name` requires
 first. Without a configured container, a contract kwarg can still bind that token; otherwise it
 remains literal, as do other unbound tokens.
 The episode orchestrator must be able to write under `slots_root`; when `container_name` is configured, its environment must also provide the `docker` CLI on `PATH` for named-container cleanup.
+Optional `isolate_agent_uid` defaults to `false`. When true, the orchestrator must run as
+root and slot commands run as UID/GID 65534. Only `<slots_root>/<slot>/agent` is made
+writable for that UID; inputs the commands read must also be readable by UID 65534.
 Command token replacements insert values opaquely, including any braces they contain; they do
 not shell-escape inserted text. In `final_output`, `{slot_dir}` is replaced for each
 configured path. The orchestrator names slots and shares one workspace and budget across

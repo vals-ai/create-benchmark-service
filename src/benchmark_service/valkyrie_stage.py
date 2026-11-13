@@ -367,6 +367,12 @@ def _finish_turn(root: subprocess.Popen[bytes], result_fd: int) -> None:
     os.write(result_fd, json.dumps({"exit_code": root.wait()}).encode())
 
 
+def _drop_agent_uid() -> None:
+    os.setgroups([])
+    os.setgid(_AGENT_UID)
+    os.setuid(_AGENT_UID)
+
+
 def _turn_owner(control_fd: int, result_fd: int, command: str, home: str | None = None) -> None:
     try:
         if ctypes.CDLL(None, use_errno=True).prctl(36, 1, 0, 0, 0) != 0:
@@ -376,9 +382,7 @@ def _turn_owner(control_fd: int, result_fd: int, command: str, home: str | None 
         root = subprocess.Popen(
             ["sh", "-c", command],
             start_new_session=True,
-            user=_AGENT_UID if home is not None else None,
-            group=_AGENT_UID if home is not None else None,
-            extra_groups=[] if home is not None else None,
+            preexec_fn=_drop_agent_uid if home is not None else None,
             env=dict(os.environ, HOME=home, USER="nobody", LOGNAME="nobody") if home is not None else None,
         )
     except OSError as exc:

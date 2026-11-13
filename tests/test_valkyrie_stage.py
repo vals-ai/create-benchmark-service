@@ -18,11 +18,23 @@ import tempfile
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from unittest.mock import Mock, call
 from typing import Literal
 
 import pytest
 
 from benchmark_service import valkyrie_stage
+
+
+def test_agent_uid_drop_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    identity = Mock()
+    monkeypatch.setattr(os, "setgroups", identity.setgroups)
+    monkeypatch.setattr(os, "setgid", identity.setgid)
+    monkeypatch.setattr(os, "setuid", identity.setuid)
+
+    valkyrie_stage._drop_agent_uid()
+
+    assert identity.mock_calls == [call.setgroups([]), call.setgid(65534), call.setuid(65534)]
 
 
 @pytest.mark.skipif(sys.platform != "linux" or os.geteuid() != 0, reason="UID isolation needs Linux root")

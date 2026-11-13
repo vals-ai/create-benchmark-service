@@ -16,9 +16,10 @@ from typing import Any, cast
 import yaml
 from cachetools import TTLCache
 from descope.descope_client import DescopeClient
+from descope.exceptions import AuthException
 from pydantic import BaseModel, ConfigDict, Field
 
-from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, is_auth_required
+from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, AuthenticationUnavailableError, is_auth_required
 
 from benchmark_service.vals.allowlist import (
     ALLOWLIST_CACHE_MAX_SIZE,
@@ -260,8 +261,17 @@ def _is_read_only_key(jwt_response: Mapping[str, Any]) -> bool:
     )
 
 
+def _is_descope_refusal(exc: AuthException) -> bool:
+    status = exc.status_code
+    return isinstance(status, int) and 400 <= status < 500 and status not in (408, 429)
+
+
 async def resolve_descope_tenant(headers: Mapping[str, str]) -> str | None:
-    """Validate a Descope access key and resolve a single allowlisted tenant."""
+    """Validate a Descope access key and resolve a single allowlisted tenant.
+
+    Returns ``None`` when the caller is refused. Raises ``AuthenticationUnavailableError``
+    when Descope or the catalog cannot decide.
+    """
     settings = get_auth_settings()
     if not settings.descope_project_id:
         logger.warning("DESCOPE_PROJECT_ID is not configured, so no caller can authenticate")
@@ -282,9 +292,13 @@ async def resolve_descope_tenant(headers: Mapping[str, str]) -> str | None:
         jwt_response = await _exchange_descope_access_key(settings.descope_project_id, access_key)
         tenants_claim = jwt_response.get("tenants", {})
         tenants = list(tenants_claim.keys())
-    except Exception:
-        logger.warning("Failed to resolve tenant from Descope access key", exc_info=True)
+    except AuthException as exc:
+        if not _is_descope_refusal(exc):
+            raise AuthenticationUnavailableError("Descope access key exchange is unavailable") from exc
+        logger.info("Descope refused the access key with status %s", exc.status_code)
         return None
+    except Exception as exc:
+        raise AuthenticationUnavailableError("Descope access key exchange is unavailable") from exc
 
     if _is_read_only_key(jwt_response):
         logger.info("Descope access key is a read-only Tracker key, so it cannot call a benchmark service")

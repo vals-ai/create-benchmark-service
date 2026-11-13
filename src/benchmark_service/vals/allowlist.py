@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from collections.abc import Callable
 from typing import Literal
 from urllib.parse import quote
@@ -13,10 +14,14 @@ from cachetools import TTLCache
 from pydantic import BaseModel, ConfigDict, Field, PositiveInt
 from tenacity import retry, retry_if_exception_type, retry_if_result, stop_after_attempt, wait_random_exponential
 
+from benchmark_service.auth import AuthenticationUnavailableError
+
 logger = logging.getLogger(__name__)
 
 DESCOPE_API_KEY_HEADER = "x-descope-api-key"
 DEFAULT_ALLOWLIST_CACHE_TTL_SECONDS = 300
+# How long past its TTL a policy still answers when the catalog cannot.
+ALLOWLIST_UNAVAILABLE_GRACE_SECONDS = 900
 ALLOWLIST_CACHE_MAX_SIZE = 1024
 DEFAULT_CATALOG_REQUEST_TIMEOUT_SECONDS = 5.0
 CATALOG_ATTEMPT_TIMEOUT_SECONDS = 2.0
@@ -105,17 +110,15 @@ class CatalogAllowlistClient:
         self._client = httpx.AsyncClient(
             timeout=min(timeout, CATALOG_ATTEMPT_TIMEOUT_SECONDS), transport=client_transport
         )
-        if cache_timer is None:
-            self._cache = TTLCache[str, TenantConfig](
-                maxsize=ALLOWLIST_CACHE_MAX_SIZE,
-                ttl=DEFAULT_ALLOWLIST_CACHE_TTL_SECONDS,
-            )
-        else:
-            self._cache = TTLCache[str, TenantConfig](
-                maxsize=ALLOWLIST_CACHE_MAX_SIZE,
-                ttl=DEFAULT_ALLOWLIST_CACHE_TTL_SECONDS,
-                timer=cache_timer,
-            )
+        timer = cache_timer or time.monotonic
+        self._cache = TTLCache[str, TenantConfig](
+            maxsize=ALLOWLIST_CACHE_MAX_SIZE, ttl=DEFAULT_ALLOWLIST_CACHE_TTL_SECONDS, timer=timer
+        )
+        self._last_good = TTLCache[str, TenantConfig](
+            maxsize=ALLOWLIST_CACHE_MAX_SIZE,
+            ttl=DEFAULT_ALLOWLIST_CACHE_TTL_SECONDS + ALLOWLIST_UNAVAILABLE_GRACE_SECONDS,
+            timer=timer,
+        )
 
     @property
     def endpoint(self) -> str:
@@ -129,6 +132,7 @@ class CatalogAllowlistClient:
     def clear_cache(self) -> None:
         """Clear successful tenant policies."""
         self._cache.clear()
+        self._last_good.clear()
 
     def cached_tenant_config(self, tenant: str) -> TenantConfig | None:
         """Return a cached policy without making a network request."""
@@ -148,17 +152,41 @@ class CatalogAllowlistClient:
             return await self._client.get(self.endpoint, headers={DESCOPE_API_KEY_HEADER: access_key})
 
     async def get_tenant_config(self, access_key: str, tenant: str) -> TenantConfig | None:
-        """Fetch a tenant policy, returning ``None`` for misses or failures."""
+        """Fetch a tenant policy, returning ``None`` when the catalog refuses the tenant.
+
+        When the catalog cannot answer, the tenant's last good policy answers for up to
+        ``ALLOWLIST_UNAVAILABLE_GRACE_SECONDS`` past its TTL. Without one, this raises
+        ``AuthenticationUnavailableError``.
+        """
         cached = self._cache.get(tenant)
         if cached is not None:
             return cached
 
         try:
+            config = await self._fetch_tenant_config(access_key)
+        except AuthenticationUnavailableError:
+            last_good = self._last_good.get(tenant)
+            if last_good is None:
+                raise
+            logger.warning("Benchmark catalog API is unavailable, so tenant %s keeps its last policy", tenant, exc_info=True)
+            return last_good
+
+        if config is None:
+            self._last_good.pop(tenant, None)
+            return None
+        self._cache[tenant] = config
+        self._last_good[tenant] = config
+        return config
+
+    async def _fetch_tenant_config(self, access_key: str) -> TenantConfig | None:
+        try:
             async with asyncio.timeout(self._request_timeout):
                 response = await self._fetch_policy(access_key)
-        except Exception:
-            logger.warning("Failed to fetch tenant policy from benchmark catalog API", exc_info=True)
-            return None
+        except Exception as exc:
+            raise AuthenticationUnavailableError("Benchmark catalog API is unavailable") from exc
+
+        if _transient_catalog_response(response):
+            raise AuthenticationUnavailableError(f"Benchmark catalog API returned status {response.status_code}")
 
         if response.status_code != 200:
             logger.warning("Benchmark catalog API returned status %s", response.status_code)
@@ -174,10 +202,8 @@ class CatalogAllowlistClient:
             logger.warning("Benchmark catalog API returned policy for unexpected service %s", payload.name)
             return None
 
-        config = TenantConfig(
+        return TenantConfig(
             datasets=payload.datasets,
             evaluation_quota=payload.evaluation_quota,
             trial_mode=payload.trial_mode,
         )
-        self._cache[tenant] = config
-        return config

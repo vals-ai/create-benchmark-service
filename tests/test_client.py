@@ -105,9 +105,9 @@ async def test_retrieve_task_accepts_legacy_shape(
     assert result.agent_install_order == "before_setup"
     assert result.credited_generation is None
     assert result.egress.model_dump() == {
-        "setup_task": "*",
+        "setup_task": None,
         "run": None,
-        "evaluation": "*",
+        "evaluation": None,
         "run_through_proxy": False,
         "sandbox_local_hosts": [],
         "run_inspect": [],
@@ -175,6 +175,7 @@ def test_retrieve_task_rejects_invalid_agent_install_order() -> None:
 @pytest.mark.parametrize(
     ("setup_task", "run", "evaluation"),
     [
+        (None, None, None),
         ("*", None, "*"),
         ("*", "*", "*"),
         ([], [], ["api.openai.com", "203.0.113.10/32"]),
@@ -182,9 +183,9 @@ def test_retrieve_task_rejects_invalid_agent_install_order() -> None:
     ],
 )
 def test_benchmark_egress_plan_serializes_explicit_stage_policies(
-    setup_task: EgressPolicy,
+    setup_task: EgressPolicy | None,
     run: EgressPolicy | None,
-    evaluation: EgressPolicy,
+    evaluation: EgressPolicy | None,
 ) -> None:
     plan = BenchmarkEgressPlan(setup_task=setup_task, run=run, evaluation=evaluation)
 
@@ -229,7 +230,7 @@ def test_benchmark_egress_plan_lowercases_local_hosts() -> None:
     assert plan.sandbox_local_hosts == ["supabase-kong.local", longest_label]
 
 
-@pytest.mark.parametrize("policy", ["api.openai.com", None, ["api.openai.com", 1]])
+@pytest.mark.parametrize("policy", ["api.openai.com", ["api.openai.com", 1]])
 def test_benchmark_egress_plan_rejects_invalid_policies(policy: object) -> None:
     with pytest.raises(ValidationError):
         BenchmarkEgressPlan.model_validate({"setup_task": policy})

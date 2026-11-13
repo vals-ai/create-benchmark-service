@@ -2623,6 +2623,12 @@ def test_daytona_retry_after_uses_any_retry_after_header() -> None:
     assert daytona_retry_after_seconds(exc) == 5
 
 
+def test_daytona_retry_after_falls_back_past_an_invalid_duplicate() -> None:
+    headers = {"Retry-After-Sandbox-Create": "invalid", "retry-after-sandbox-create": "120"}
+
+    assert daytona_retry_after_seconds(DaytonaRateLimitError("rate limited", headers=headers)) == 120
+
+
 @pytest.mark.parametrize(
     "invalid_delay",
     [

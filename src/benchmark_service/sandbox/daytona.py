@@ -449,17 +449,13 @@ def _parse_retry_after_seconds(value: object) -> float | None:
 
 
 def daytona_retry_after_seconds(exc: DaytonaRateLimitError) -> float | None:
-    """Known throttlers first, then plain retry-after, then any other retry-after-* header."""
-    headers: dict[str, object] = {}
-    for key, value in exc.headers.items():
-        headers.setdefault(str(key).lower(), value)
-    names = [
-        *(f"{_RETRY_AFTER_PREFIX}{throttler}" for throttler in _KNOWN_THROTTLERS),
-        "retry-after",
-        *(key for key in headers if key.startswith(_RETRY_AFTER_PREFIX)),
-    ]
-    for name in names:
-        if name in headers and (seconds := _parse_retry_after_seconds(headers[name])) is not None:
+    """The first copy of each known throttler's header, then plain retry-after, then any valid retry-after-* value."""
+    headers = [(str(key).lower(), value) for key, value in exc.headers.items()]
+    names = [*(f"{_RETRY_AFTER_PREFIX}{throttler}" for throttler in _KNOWN_THROTTLERS), "retry-after"]
+    first = [next((value for key, value in headers if key == name), None) for name in names]
+    rest = [value for key, value in headers if key.startswith(_RETRY_AFTER_PREFIX)]
+    for value in (*first, *rest):
+        if value is not None and (seconds := _parse_retry_after_seconds(value)) is not None:
             return seconds
     return None
 

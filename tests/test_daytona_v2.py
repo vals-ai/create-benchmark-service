@@ -11,6 +11,8 @@ import httpx
 import pytest
 
 from benchmark_service.sandbox import (
+    Checkpoint,
+    CheckpointKind,
     ComposeSandbox,
     ComposeSource,
     DaytonaProviderConfig,
@@ -18,6 +20,7 @@ from benchmark_service.sandbox import (
     ImageSource,
     MissingSandboxConfigError,
     Resources,
+    SandboxCapabilities,
     SandboxCommandError,
     SandboxCreateRequest,
     SandboxError,
@@ -512,3 +515,107 @@ def test_has_ended_follows_status(status: str, ended: bool) -> None:
 
 def test_only_daytona_v2_is_priced_from_rates() -> None:
     assert priced_provider_types() == ["daytona_v2"]
+
+
+@pytest.mark.parametrize(
+    ("kind", "post", "body", "poll", "ref"),
+    [
+        (CheckpointKind.FILES, "/sandboxes/sb-1/images", {}, "/images/img-9", "img-9"),
+        (CheckpointKind.MEMORY, "/sandboxes/sb-1/snapshots", {"name": "cp-1"}, "/snapshots/snap-9", "snap-9"),
+    ],
+)
+async def test_checkpoint_captures_kind_and_waits_until_ready(
+    kind: CheckpointKind, post: str, body: dict[str, Any], poll: str, ref: str
+) -> None:
+    posts: list[httpx.Request] = []
+    statuses = iter(["capturing", "ready"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST" and request.url.path == post:
+            posts.append(request)
+            return httpx.Response(201, json={"id": ref, "status": "pending"})
+        assert request.url.path == poll
+        return httpx.Response(200, json={"id": ref, "status": next(statuses)})
+
+    checkpoint = await _sandbox(handler).checkpoint(kind, "cp-1")
+
+    assert checkpoint == Checkpoint(provider="daytona_v2", kind=kind, ref=ref)
+    assert [json.loads(post.content) for post in posts] == [body]
+
+
+async def test_fork_keeps_memory_and_waits_for_the_copy() -> None:
+    posts: list[httpx.Request] = []
+    announced: list[str] = []
+    statuses = iter(["forking", "running"])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "POST":
+            assert request.url.path == "/sandboxes/sb-1/fork"
+            posts.append(request)
+            return httpx.Response(201, json={"id": "sb-2", "status": "pending"})
+        assert request.url.path == "/sandboxes/sb-2"
+        return httpx.Response(200, json={"id": "sb-2", "status": next(statuses)})
+
+    async def hook(provider: str, sandbox_id: str) -> None:
+        announced.append(sandbox_id)
+
+    with sandbox_created_scope(hook):
+        fork = await _sandbox(handler).fork("fork-1")
+
+    assert (fork.id, fork.state, announced) == ("sb-2", "running", ["sb-2"])
+    assert json.loads(posts[0].content) == {"name": "fork-1", "memory": True}
+
+
+async def test_restoring_checkpoints_creates_from_their_ref() -> None:
+    creates: list[dict[str, Any]] = []
+    puts: list[dict[str, Any]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if request.method == "POST" and path == "/sandboxes":
+            creates.append(json.loads(request.content))
+            return httpx.Response(201, json={"id": "sb-2", "status": "running"})
+        if path == "/sandboxes/sb-2/network-policy":
+            if request.method == "PUT":
+                puts.append(json.loads(request.content))
+            return httpx.Response(
+                200,
+                headers={"etag": '"np-1"'},
+                json={"status": "applied", "applied_revision": 1, "desired_revision": 1},
+            )
+        raise AssertionError(f"unexpected {request.method} {path}")
+
+    provider = _provider(handler)
+    files = Checkpoint(provider="daytona_v2", kind=CheckpointKind.FILES, ref="img-9")
+    memory = Checkpoint(provider="daytona_v2", kind=CheckpointKind.MEMORY, ref="snap-9")
+    await provider.create_sandbox(_request(1, source=files))
+    await provider.create_sandbox(_request(1, source=memory, network_block_all=True))
+
+    assert creates[0]["image"] == "img-9"
+    assert creates[1] == {
+        "snapshot": "snap-9",
+        "name": "tts-task-1",
+        "labels": {"run": "r1"},
+        "create_timeout_seconds": 120,
+        "wait_seconds": 0,
+        "lifecycle_policy": {"idle_expiry_seconds": 900, "on_idle_timeout": "delete"},
+    }
+    assert puts == [{"block_all": True, "allow_cidrs": [], "allow_domains": None}]
+
+
+async def test_delete_checkpoint_targets_its_kind_and_ignores_missing() -> None:
+    deleted: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.method == "DELETE"
+        deleted.append(request.url.path)
+        return httpx.Response(404 if "missing" in request.url.path else 204)
+
+    provider = _provider(handler)
+    await provider.delete_checkpoint(Checkpoint(provider="daytona_v2", kind=CheckpointKind.FILES, ref="img-9"))
+    await provider.delete_checkpoint(Checkpoint(provider="daytona_v2", kind=CheckpointKind.MEMORY, ref="missing"))
+    with pytest.raises(SandboxError, match="cannot delete a modal checkpoint"):
+        await provider.delete_checkpoint(Checkpoint(provider="modal", kind=CheckpointKind.FILES, ref="im-1"))
+
+    assert deleted == ["/images/img-9", "/snapshots/missing"]
+    assert provider.capabilities == SandboxCapabilities(checkpoints=frozenset(CheckpointKind), fork=True)

@@ -12,6 +12,8 @@ from collections.abc import AsyncGenerator, Awaitable, Coroutine, Mapping
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
 
+import modal.experimental as modal_experimental
+
 from modal import App, Client, Image, Volume
 from modal import Sandbox as ModalSdkSandbox
 from modal.exception import ConflictError as ModalConflictError
@@ -38,6 +40,10 @@ from benchmark_service.sandbox.types import (
     SandboxBuildError,
     SandboxCommandError,
     SandboxConnectionError,
+    CHECKPOINT_TIMEOUT_SECONDS,
+    Checkpoint,
+    CheckpointKind,
+    SandboxCapabilities,
     SandboxCreateRequest,
     SandboxError,
     SandboxNotFoundError,
@@ -45,6 +51,7 @@ from benchmark_service.sandbox.types import (
     SandboxQuery,
     SandboxSource,
     SnapshotSource,
+    files_checkpoint_source,
     VolumeMount,
     resolve_volume_subpath,
     validate_command_env,
@@ -405,6 +412,15 @@ class ModalSandbox(Sandbox):
         local = [address for host in hosts for address in await _resolve_ipv4(host)]
         return [f"{address}/32" for address in [*result.stdout.split(), *local] if _is_ipv4(address)]
 
+    async def checkpoint(self, kind: CheckpointKind, name: str) -> Checkpoint:
+        if kind != CheckpointKind.FILES:
+            raise SandboxError(f"Modal sandboxes do not support {kind} checkpoints")
+        try:
+            image = await self._sandbox.snapshot_filesystem.aio(timeout=CHECKPOINT_TIMEOUT_SECONDS)
+        except _PROVIDER_ERRORS as exc:
+            raise _sandbox_error(exc) from exc
+        return Checkpoint(provider="modal", kind=kind, ref=image.object_id)
+
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
         cidrs, hosts = resolve_allowed_addresses(allowed_addresses)
         # No address list can express a wildcard, so those stay hostname rules on Modal's domain allowlist.
@@ -515,7 +531,24 @@ class ModalSandboxProvider(SandboxProvider):
         except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
 
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities(checkpoints=frozenset({CheckpointKind.FILES}))
+
+    async def delete_checkpoint(self, checkpoint: Checkpoint) -> None:
+        image_id = files_checkpoint_source(checkpoint, "modal").snapshot
+        client, _ = await self._connect()
+        try:
+            # modal.experimental has no stubs, so the .aio variant is untyped.
+            await cast(Any, modal_experimental.image_delete).aio(image_id, client=client)
+        except ModalNotFoundError:
+            return
+        except _PROVIDER_ERRORS as exc:
+            raise _sandbox_error(exc) from exc
+
     async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
+        if isinstance(request.source, Checkpoint):
+            request = request.model_copy(update={"source": files_checkpoint_source(request.source, "modal")})
         if request.sandbox_secrets:
             raise SandboxError("Modal sandbox provider does not support sandbox_secrets")
 

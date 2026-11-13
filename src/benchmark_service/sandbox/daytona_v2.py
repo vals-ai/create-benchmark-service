@@ -23,6 +23,9 @@ from pydantic import BaseModel, Field, field_validator
 from benchmark_service.sandbox.created import notify_sandbox_created
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
+    CHECKPOINT_TIMEOUT_SECONDS,
+    Checkpoint,
+    CheckpointKind,
     DockerfileSource,
     ExecResult,
     ImageSource,
@@ -30,6 +33,7 @@ from benchmark_service.sandbox.types import (
     Resources,
     Sandbox,
     SandboxBuildError,
+    SandboxCapabilities,
     SandboxCommandError,
     SandboxConnectionError,
     SandboxCreateRequest,
@@ -124,6 +128,22 @@ async def _send(client: httpx.AsyncClient, method: str, url: str, what: str, **k
     except httpx.HTTPError as exc:
         raise _error(exc, what) from exc
     return response
+
+
+async def _await_status(
+    client: httpx.AsyncClient, path: str, what: str, ready: str, failed: frozenset[str], timeout: float
+) -> dict[str, Any]:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while (data := (await _send(client, "GET", path, what)).json()).get("status") != ready:
+        if data.get("status") in failed or asyncio.get_running_loop().time() > deadline:
+            detail = f"{data.get('status')} {data.get('error') or ''}".strip()
+            raise SandboxError(f"Daytona v2 {what} did not become {ready}: {detail}")
+        await asyncio.sleep(_POLL_SECONDS)
+    return data
+
+
+def _idle_delete_policy(auto_stop_minutes: int) -> dict[str, Any]:
+    return {"idle_expiry_seconds": auto_stop_minutes * 60, "on_idle_timeout": "delete"}
 
 
 def _toolbox_url(sandbox: Mapping[str, Any]) -> str:
@@ -342,6 +362,42 @@ class DaytonaV2Sandbox(Sandbox):
             await asyncio.sleep(_POLL_SECONDS)
             policy = (await _send(self._client, "GET", url, what)).json()
 
+    async def checkpoint(self, kind: CheckpointKind, name: str) -> Checkpoint:
+        sandbox = quote(self.id, safe="")
+        if kind == CheckpointKind.FILES:
+            # An unnamed image is deleted after 7 days without a sandbox created from it.
+            created = await _send(self._client, "POST", f"/sandboxes/{sandbox}/images", f"capture {self.id}", json={})
+            path = f"/images/{quote(str(created.json()['id']), safe='')}"
+        else:
+            created = await _send(
+                self._client, "POST", f"/sandboxes/{sandbox}/snapshots", f"snapshot {self.id}", json={"name": name}
+            )
+            path = f"/snapshots/{quote(str(created.json()['id']), safe='')}"
+        data = await _await_status(
+            self._client, path, f"checkpoint of {self.id}", "ready", _FAILED_IMAGE_STATUSES, CHECKPOINT_TIMEOUT_SECONDS
+        )
+        return Checkpoint(provider="daytona_v2", kind=kind, ref=str(data["id"]))
+
+    async def fork(self, name: str) -> DaytonaV2Sandbox:
+        url = f"/sandboxes/{quote(self.id, safe='')}/fork"
+        created = await _send(self._client, "POST", url, f"fork {self.id}", json={"name": name, "memory": True})
+        fork_id = str(created.json()["id"])
+        try:
+            await notify_sandbox_created("daytona_v2", fork_id)
+            data = await _await_status(
+                self._client,
+                f"/sandboxes/{quote(fork_id, safe='')}",
+                f"fork {fork_id}",
+                _RUNNING,
+                _FAILED_SANDBOX_STATUSES,
+                CHECKPOINT_TIMEOUT_SECONDS,
+            )
+        except BaseException:
+            with suppress(SandboxError):
+                await _send(self._client, "DELETE", f"/sandboxes/{quote(fork_id, safe='')}", f"delete fork {fork_id}")
+            raise
+        return DaytonaV2Sandbox(data, self._client)
+
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
         cidrs, domains = resolve_allowed_addresses(allowed_addresses)
         await self._set_network_policy({"block_all": True, "allow_cidrs": cidrs, "allow_domains": domains or None})
@@ -397,10 +453,25 @@ class DaytonaV2SandboxProvider(SandboxProvider):
     async def close(self) -> None:
         await self._client.aclose()
 
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities(checkpoints=frozenset(CheckpointKind), fork=True)
+
+    async def delete_checkpoint(self, checkpoint: Checkpoint) -> None:
+        if checkpoint.provider != "daytona_v2":
+            raise SandboxError(f"Daytona v2 cannot delete a {checkpoint.provider} checkpoint")
+        kind = "images" if checkpoint.kind == CheckpointKind.FILES else "snapshots"
+        try:
+            await _send(self._client, "DELETE", f"/{kind}/{quote(checkpoint.ref, safe='')}", f"delete {checkpoint.ref}")
+        except SandboxNotFoundError:
+            return
+
     async def _image(self, source: SandboxSource, deadline: float) -> str:
         match source:
             case SnapshotSource(snapshot=snapshot):
                 return snapshot
+            case Checkpoint(provider="daytona_v2", kind=CheckpointKind.FILES, ref=ref):
+                return ref
             case ImageSource(image=image):
                 body: dict[str, Any] = {"source": {"type": "registry", "ref": image}}
             case DockerfileSource(dockerfile=dockerfile):
@@ -435,6 +506,21 @@ class DaytonaV2SandboxProvider(SandboxProvider):
         if unsupported:
             raise SandboxError(f"Daytona v2 provider does not support: {', '.join(unsupported)}")
 
+    def _restore_body(self, request: SandboxCreateRequest, snapshot: str) -> dict[str, Any]:
+        """Daytona's restore takes no image, resources, env or network policy; those come from the snapshot."""
+        body: dict[str, Any] = {
+            "snapshot": snapshot,
+            "name": request.name,
+            "labels": request.labels,
+            "create_timeout_seconds": request.create_timeout,
+            "wait_seconds": 0,
+        }
+        if self._config.DAYTONA_V2_REGION:
+            body["region_id"] = self._config.DAYTONA_V2_REGION
+        if request.auto_stop_interval > 0:
+            body["lifecycle_policy"] = _idle_delete_policy(request.auto_stop_interval)
+        return body
+
     def _create_body(self, request: SandboxCreateRequest, image: str) -> dict[str, Any]:
         body: dict[str, Any] = {
             "image": image,
@@ -455,24 +541,25 @@ class DaytonaV2SandboxProvider(SandboxProvider):
         if request.network_block_all:
             body["network_policy"] = {"block_all": True}
         if request.auto_stop_interval > 0:
-            body["lifecycle_policy"] = {
-                "idle_expiry_seconds": request.auto_stop_interval * 60,
-                "on_idle_timeout": "delete",
-            }
+            body["lifecycle_policy"] = _idle_delete_policy(request.auto_stop_interval)
         return body
 
     async def create_sandbox(self, request: SandboxCreateRequest) -> DaytonaV2Sandbox:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + request.provider_timeout
         self._reject_unsupported(request)
-        image = await self._image(request.source, deadline)
+        match request.source:
+            case Checkpoint(provider="daytona_v2", kind=CheckpointKind.MEMORY, ref=ref):
+                body = self._restore_body(request, ref)
+            case source:
+                body = self._create_body(request, await self._image(source, deadline))
         data = (
             await _send(
                 self._client,
                 "POST",
                 "/sandboxes",
                 f"create {request.name}",
-                json=self._create_body(request, image),
+                json=body,
                 headers={"Idempotency-Key": request.name},
             )
         ).json()
@@ -485,11 +572,15 @@ class DaytonaV2SandboxProvider(SandboxProvider):
                     raise SandboxError(f"Daytona v2 sandbox {sandbox_id} did not start: {detail}")
                 await asyncio.sleep(_POLL_SECONDS)
                 data = await self._get(sandbox_id)
+            sandbox = DaytonaV2Sandbox(data, self._client)
+            if request.network_block_all and "network_policy" not in body:
+                # A restore can't set network policy at create time.
+                await sandbox.block_all_egress()
         except BaseException:
             with suppress(SandboxError):
                 await self.delete_sandbox(sandbox_id)
             raise
-        return DaytonaV2Sandbox(data, self._client)
+        return sandbox
 
     async def _get(self, instance_id: str) -> dict[str, Any]:
         response = await _send(

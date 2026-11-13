@@ -80,7 +80,11 @@ from benchmark_service.sandbox.types import (
     MissingSandboxConfigError,
     ResourceCapacity,
     Resources,
+    CHECKPOINT_TIMEOUT_SECONDS,
+    Checkpoint,
+    CheckpointKind,
     Sandbox,
+    SandboxCapabilities,
     SandboxBuildError,
     SandboxCapacity,
     SandboxCapacityDomain,
@@ -94,6 +98,7 @@ from benchmark_service.sandbox.types import (
     SandboxReservationDemand,
     SandboxSource,
     SnapshotSource,
+    files_checkpoint_source,
     TargetedSnapshotSource,
     VolumeMount,
     resolve_volume_subpath,
@@ -671,6 +676,17 @@ class DaytonaSandbox(Sandbox):
                 yield chunk
         except _SANDBOX_OPERATION_ERRORS as exc:
             raise self._sandbox_error(exc) from exc
+
+    async def checkpoint(self, kind: CheckpointKind, name: str) -> Checkpoint:
+        if kind != CheckpointKind.FILES:
+            raise SandboxError(f"Daytona sandboxes do not support {kind} checkpoints")
+        # Snapshot the started container in place: CBS creates sandboxes with auto_delete_interval=0,
+        # so stop() would delete it.
+        try:
+            await self._sandbox.create_snapshot(name, timeout=CHECKPOINT_TIMEOUT_SECONDS)
+        except _SANDBOX_OPERATION_ERRORS as exc:
+            raise self._sandbox_error(exc) from exc
+        return Checkpoint(provider="daytona", kind=kind, ref=name)
 
     @_PROVIDER_RETRY
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
@@ -1309,8 +1325,24 @@ class DaytonaSandboxProvider(SandboxProvider):
             )
         return resolved
 
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities(checkpoints=frozenset({CheckpointKind.FILES}))
+
+    @_PROVIDER_RETRY
+    async def delete_checkpoint(self, checkpoint: Checkpoint) -> None:
+        try:
+            snapshot = await self._daytona.snapshot.get(files_checkpoint_source(checkpoint, "daytona").snapshot)
+            await self._daytona.snapshot.delete(snapshot)
+        except DaytonaNotFoundError:
+            return
+        except DaytonaError as exc:
+            raise self._sandbox_error(exc) from exc
+
     @_PROVIDER_RETRY
     async def create_sandbox(self, request: SandboxCreateRequest) -> DaytonaSandbox:
+        if isinstance(request.source, Checkpoint):
+            request = request.model_copy(update={"source": files_checkpoint_source(request.source, "daytona")})
         daytona = self._daytona
         if isinstance(request.source, TargetedSnapshotSource):
             daytona = self._client_for_target(request.source.target)
@@ -1365,6 +1397,8 @@ class DaytonaSandboxProvider(SandboxProvider):
                 )
             case ComposeSource():
                 raise SandboxError("ComposeSource must be unwrapped before provider.create_sandbox")
+            case Checkpoint():
+                raise SandboxError("Checkpoint must be unwrapped before provider.create_sandbox")
 
         builds_dockerfile = isinstance(request.source, DockerfileSource)
         build_log: list[str] = []

@@ -25,10 +25,13 @@ import benchmark_service.sandbox.modal as modal_module
 from benchmark_service.sandbox import sandbox_provider_config_from_mapping
 from benchmark_service.sandbox.modal import ModalProviderConfig, ModalSandbox, ModalSandboxProvider
 from benchmark_service.sandbox.types import (
+    Checkpoint,
+    CheckpointKind,
     DockerfileSource,
     ImageSource,
     Resources,
     SandboxBuildError,
+    SandboxCapabilities,
     SandboxCommandError,
     SandboxConnectionError,
     SandboxCreateRequest,
@@ -1309,3 +1312,50 @@ async def test_create_sandbox_reports_a_missing_volume_clearly(monkeypatch: pyte
         await provider.create_sandbox(_request(volumes=[VolumeMount(name="absent", mount_path="/vol")]))
 
     assert type(raised.value) is SandboxError
+
+
+async def test_files_checkpoint_is_the_filesystem_image() -> None:
+    inner = FakeInnerSandbox()
+    timeouts: list[int] = []
+
+    async def snapshot_filesystem(timeout: int) -> SimpleNamespace:
+        timeouts.append(timeout)
+        return SimpleNamespace(object_id="im-snap-1")
+
+    inner.snapshot_filesystem = _aio(snapshot_filesystem)  # pyright: ignore[reportAttributeAccessIssue]
+    sandbox = _sandbox(inner)
+
+    assert await sandbox.checkpoint(CheckpointKind.FILES, "ignored") == Checkpoint(
+        provider="modal", kind=CheckpointKind.FILES, ref="im-snap-1"
+    )
+    assert timeouts == [600]
+    with pytest.raises(SandboxError, match="do not support memory checkpoints"):
+        await sandbox.checkpoint(CheckpointKind.MEMORY, "ignored")
+
+
+async def test_delete_checkpoint_ignores_missing_image(monkeypatch: pytest.MonkeyPatch) -> None:
+    deleted: list[str] = []
+
+    async def image_delete(image_id: str, *, client: Any) -> None:
+        if image_id == "im-missing":
+            raise ModalNotFoundError("image not found")
+        deleted.append(image_id)
+
+    monkeypatch.setattr(modal_module, "modal_experimental", SimpleNamespace(image_delete=_aio(image_delete)))
+    provider = _provider(monkeypatch, SimpleNamespace())
+
+    await provider.delete_checkpoint(Checkpoint(provider="modal", kind=CheckpointKind.FILES, ref="im-snap-1"))
+    await provider.delete_checkpoint(Checkpoint(provider="modal", kind=CheckpointKind.FILES, ref="im-missing"))
+
+    assert deleted == ["im-snap-1"]
+    assert provider.capabilities == SandboxCapabilities(checkpoints=frozenset({CheckpointKind.FILES}))
+
+
+async def test_create_rejects_checkpoints_modal_cannot_restore(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = _provider(monkeypatch, SimpleNamespace())
+    for checkpoint in (
+        Checkpoint(provider="daytona", kind=CheckpointKind.FILES, ref="snap"),
+        Checkpoint(provider="modal", kind=CheckpointKind.MEMORY, ref="im-1"),
+    ):
+        with pytest.raises(SandboxError, match="cannot restore"):
+            await provider.create_sandbox(_request().model_copy(update={"source": checkpoint}))

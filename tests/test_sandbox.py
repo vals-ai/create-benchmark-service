@@ -49,6 +49,7 @@ from benchmark_service.sandbox import (
     SandboxCapacity,
     SandboxCommandError,
     SandboxConnectionError,
+    SandboxRejectedError,
     SandboxCreateRequest,
     SandboxError,
     SandboxNotFoundError,
@@ -4398,6 +4399,26 @@ async def test_daytona_provider_create_maps_not_found_errors() -> None:
 
     with pytest.raises(SandboxNotFoundError, match="Sandbox not found: sandbox not found"):
         await _provider(daytona).create_sandbox(_request("sandbox-name"))
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Failed to create sandbox: Snapshot snap not found. Did you add it through the Daytona Dashboard?",
+        "Failed to create sandbox: Organization is suspended: Depleted credits",
+    ],
+)
+async def test_daytona_create_reports_permanent_refusals_as_rejected(message: str) -> None:
+    class RejectingDaytonaClient(CreateFailureDaytonaClient):
+        async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
+            self.create_attempts += 1
+            raise DaytonaError(message, status_code=404)
+
+    daytona = RejectingDaytonaClient(InnerSandbox())
+
+    with pytest.raises(SandboxRejectedError, match="Daytona rejected the sandbox request"):
+        await _provider(daytona).create_sandbox(_request("sandbox-name"))
+    assert daytona.create_attempts == 1
 
 
 def test_sandbox_query_rejects_naive_creation_cutoff() -> None:

@@ -18,7 +18,6 @@ from unittest.mock import AsyncMock
 import httpx
 import pytest
 import uvicorn
-import websockets
 from starlette.types import Message, Scope
 from websockets.asyncio.server import ServerConnection, serve as serve_websocket
 from websockets.datastructures import Headers
@@ -285,7 +284,7 @@ async def test_real_websocket_denial_retries_before_payload_and_preserves_existi
     running: tuple[str, SlowBenchmark], state: DrainState, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     url, service = running
-    original = websockets.connect
+    original = client_module._NoRedirectConnect  # pyright: ignore[reportPrivateUsage]
     attempts = 0
 
     def connect(*args: Any, **kwargs: Any) -> Any:
@@ -295,7 +294,7 @@ async def test_real_websocket_denial_retries_before_payload_and_preserves_existi
             configure(state, True, 2)
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(websockets, "connect", connect)
+    monkeypatch.setattr(client_module, "_NoRedirectConnect", connect)
     async with BenchmarkServiceClient(url, {}) as client:
         old = asyncio.create_task(client.resume_evaluation("task-1", {"hold": True}))
         await asyncio.wait_for(service.started.wait(), 5)
@@ -357,14 +356,14 @@ async def test_websocket_failure_after_payload_is_not_replayed(
 ) -> None:
     url, service = running
     attempts = 0
-    original = websockets.connect
+    original = client_module._NoRedirectConnect  # pyright: ignore[reportPrivateUsage]
 
     def connect(*args: Any, **kwargs: Any) -> Any:
         nonlocal attempts
         attempts += 1
         return original(*args, **kwargs)
 
-    monkeypatch.setattr(websockets, "connect", connect)
+    monkeypatch.setattr(client_module, "_NoRedirectConnect", connect)
     async with BenchmarkServiceClient(url, {}) as client:
 
         def fail(_message: str) -> None:
@@ -423,7 +422,7 @@ async def test_websocket_retry_deadline_bounds_start_not_handshake(
     times = iter([0.0, retry_time])
     monkeypatch.setattr(client_module, "time", SimpleNamespace(monotonic=lambda: next(times)))
     monkeypatch.setattr(client_module, "_DRAIN_RETRY_DELAY_S", 0)
-    monkeypatch.setattr(websockets, "connect", connect)
+    monkeypatch.setattr(client_module, "_NoRedirectConnect", connect)
     async with BenchmarkServiceClient("http://test", {}) as client:
         if attempts == 2:
             assert await client._connect_websocket("evaluate", {}) is connection  # pyright: ignore[reportPrivateUsage]
@@ -540,3 +539,27 @@ async def test_request_remains_counted_until_outer_response_send_finishes(
         assert statuses == [500 if fail else 200]
         assert completed.is_set()
         assert state.snapshot().in_flight == 0
+
+
+async def test_websocket_does_not_follow_redirects() -> None:
+    reached: list[str] = []
+
+    async def target(websocket: ServerConnection) -> None:
+        reached.append(websocket.request.path if websocket.request else "")
+
+    async with serve_websocket(target, "127.0.0.1", 0) as target_server:
+        target_port = next(iter(target_server.sockets)).getsockname()[1]
+
+        def redirect(_connection: ServerConnection, _request: Any) -> Response:
+            return Response(302, "Found", Headers({"Location": f"ws://127.0.0.1:{target_port}/ws/evaluate"}), b"")
+
+        async def handler(_websocket: ServerConnection) -> None:
+            raise AssertionError("redirect handshake must not complete")
+
+        async with serve_websocket(handler, "127.0.0.1", 0, process_request=redirect) as server:
+            port = next(iter(server.sockets)).getsockname()[1]
+            async with BenchmarkServiceClient(f"http://127.0.0.1:{port}", {"X-Descope-Api-Key": "secret"}) as client:
+                with pytest.raises(InvalidStatus) as raised:
+                    await client.resume_evaluation("task-1", {})
+    assert raised.value.response.status_code == 302
+    assert reached == []

@@ -15,9 +15,10 @@ import uvicorn
 import websockets
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
-from websockets.asyncio.client import ClientConnection, connect
+from websockets.asyncio.client import ClientConnection
 from websockets.asyncio.server import serve
 
+import benchmark_service.client as client_module
 from benchmark_service import BenchmarkServiceApp, BenchmarkServiceClient, BenchmarkServiceError, DatasetVersion
 from benchmark_service.schemas import (
     DATASET_VERSION_HEADER,
@@ -372,7 +373,9 @@ async def test_client_awaits_checkpoint_before_terminal_result(
                 assert checkpoint_completed.is_set(), "received again before checkpoint completed"
 
     monkeypatch.setattr(
-        "benchmark_service.client.websockets.connect", partial(connect, create_connection=CheckpointConnection)
+        client_module,
+        "_NoRedirectConnect",
+        partial(client_module._NoRedirectConnect, create_connection=CheckpointConnection),  # pyright: ignore[reportPrivateUsage]
     )
 
     async def respond(ws: websockets.ServerConnection) -> None:

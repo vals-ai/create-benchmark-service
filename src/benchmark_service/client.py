@@ -11,7 +11,6 @@ from collections.abc import Awaitable, Callable, Generator
 from typing import Any, TypeVar, cast
 
 import httpx
-import websockets
 from pydantic import BaseModel, TypeAdapter
 from tenacity import (
     retry,
@@ -19,7 +18,7 @@ from tenacity import (
     stop_after_attempt,
     wait_random,
 )
-from websockets.asyncio.client import ClientConnection
+from websockets.asyncio.client import ClientConnection, connect as ws_connect
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 
 from benchmark_service.draining import is_drain_rejection
@@ -235,6 +234,11 @@ def _require_ok(response: httpx.Response, operation: str) -> None:
         raise _status_error(response, operation)
 
 
+class _NoRedirectConnect(ws_connect):
+    def process_redirect(self, exc: Exception) -> Exception:
+        return exc
+
+
 class _TelemetryAuth(httpx.Auth):
     def auth_flow(self, request: httpx.Request) -> Generator[httpx.Request, httpx.Response, None]:
         request.headers.update(request_headers(request.headers))
@@ -290,7 +294,6 @@ class BenchmarkServiceClient:
     def _new_http_client(self, *, fresh_connections: bool = False) -> httpx.AsyncClient:
         return httpx.AsyncClient(
             auth=_TelemetryAuth(),
-            follow_redirects=True,
             timeout=self._timeout,
             headers=self._headers,
             limits=httpx.Limits(max_connections=200, max_keepalive_connections=0 if fresh_connections else 20),
@@ -345,7 +348,7 @@ class BenchmarkServiceClient:
         deadline = time.monotonic() + _DRAIN_RETRY_WINDOW_S
         while True:
             try:
-                return await websockets.connect(
+                return await _NoRedirectConnect(
                     f"{self._ws_url}/ws/{path}",
                     additional_headers=headers,
                     open_timeout=60.0,

@@ -407,12 +407,10 @@ class ModalSandbox(Sandbox):
 
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
         cidrs, hosts = resolve_allowed_addresses(allowed_addresses)
-        # No address list can express a wildcard, so those stay hostname rules on Modal's domain allowlist.
-        wildcards = [host for host in hosts if host.startswith("*.")]
-        exact = [host for host in hosts if host not in wildcards]
-        await self._set_outbound_network_policy(
-            list(dict.fromkeys([*cidrs, *await self._host_cidrs(exact)])), wildcards
-        )
+        # A domain rule needs a domain allowlist at creation, which stops Modal applying later policy changes.
+        if wildcards := [host for host in hosts if host.startswith("*")]:
+            raise ValueError(f"Modal can't allow a wildcard hostname such as {wildcards[0]}; list each hostname")
+        await self._set_outbound_network_policy(list(dict.fromkeys([*cidrs, *await self._host_cidrs(hosts)])), [])
 
     async def block_all_egress(self) -> None:
         await self._set_outbound_network_policy([], [])

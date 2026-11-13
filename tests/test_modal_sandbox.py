@@ -3,6 +3,7 @@ from __future__ import annotations
 # pyright: reportPrivateUsage=false
 
 import asyncio
+import ipaddress
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -731,7 +732,8 @@ async def test_egress_rule_updates_replace_outbound_policy(monkeypatch: pytest.M
 
     Test cases:
     - Hostnames become the addresses they resolve to here and in the sandbox, plus the sandbox's DNS servers.
-    - A wildcard hostname, which no address list can express, goes on the domain allowlist.
+    - An address the allowlist doesn't list stays unreachable and no domain rule is set.
+    - A wildcard hostname, which no address list can express, is refused.
     - Deny-all uses empty provider allowlists without overloading modify_egress_rules([]).
     - Clearing egress rules allows every IPv4 address and never names a domain.
     """
@@ -746,16 +748,22 @@ async def test_egress_rule_updates_replace_outbound_policy(monkeypatch: pytest.M
     await sandbox.modify_egress_rules(["https://api.openai.com/v1", "github.com", "203.0.113.10"])
 
     assert inner.outbound_policies[-1] == {
-        "outbound_cidr_allowlist": ["203.0.113.10/32", "198.51.100.8/32", "198.51.100.9/32", "10.0.0.2/32", "192.0.2.5/32"],
+        "outbound_cidr_allowlist": [
+            "203.0.113.10/32",
+            "198.51.100.8/32",
+            "198.51.100.9/32",
+            "10.0.0.2/32",
+            "192.0.2.5/32",
+        ],
         "outbound_domain_allowlist": [],
     }
+    allowed = [ipaddress.ip_network(cidr) for cidr in inner.outbound_policies[-1]["outbound_cidr_allowlist"] or []]
+    assert not any(ipaddress.ip_address("93.184.216.34") in network for network in allowed)
 
-    await sandbox.modify_egress_rules(["*.example.com", "203.0.113.10"])
-
-    assert inner.outbound_policies[-1] == {
-        "outbound_cidr_allowlist": ["203.0.113.10/32"],
-        "outbound_domain_allowlist": ["*.example.com"],
-    }
+    policies = len(inner.outbound_policies)
+    with pytest.raises(ValueError, match="wildcard hostname such as \\*.example.com"):
+        await sandbox.modify_egress_rules(["*.example.com", "203.0.113.10"])
+    assert len(inner.outbound_policies) == policies
 
     with pytest.raises(ValueError, match="allowed addresses cannot be empty"):
         await sandbox.modify_egress_rules([])

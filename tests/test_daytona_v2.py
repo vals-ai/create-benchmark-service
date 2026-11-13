@@ -6,6 +6,7 @@ import math
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -508,6 +509,20 @@ def test_compose_sandbox_is_priced_as_its_outer_sandbox() -> None:
     assert compose.cost_usd(ended) == outer.cost_usd(ended)
 
 
+async def test_compose_sandbox_checkpoints_and_forks_its_outer_sandbox() -> None:
+    saved = Checkpoint(provider="daytona_v2", kind=CheckpointKind.MEMORY, ref="snap-1")
+    copy = _priced(id="b")
+    outer = _priced()
+    outer.checkpoint = AsyncMock(return_value=saved)  # pyright: ignore[reportAttributeAccessIssue]
+    outer.fork = AsyncMock(return_value=copy)  # pyright: ignore[reportAttributeAccessIssue]
+    compose = ComposeSandbox(outer, ComposeSource(outer=ImageSource(image="docker:28.3.3-dind"), service="app"))
+
+    assert await compose.checkpoint(CheckpointKind.MEMORY, "cp-1") is saved
+    fork = await compose.fork("fork-1")
+    assert isinstance(fork, ComposeSandbox) and fork.id == copy.id
+    assert fork._service == "app"  # pyright: ignore[reportPrivateUsage]
+
+
 @pytest.mark.parametrize(("status", "ended"), [("running", False), ("deleting", True), ("stopped", True)])
 def test_has_ended_follows_status(status: str, ended: bool) -> None:
     assert _priced(status=status).has_ended is ended
@@ -589,9 +604,11 @@ async def test_restoring_checkpoints_creates_from_their_ref() -> None:
     files = Checkpoint(provider="daytona_v2", kind=CheckpointKind.FILES, ref="img-9")
     memory = Checkpoint(provider="daytona_v2", kind=CheckpointKind.MEMORY, ref="snap-9")
     await provider.create_sandbox(_request(1, source=files))
-    await provider.create_sandbox(_request(1, source=memory))
+    await provider.create_sandbox(_request(1, source=memory, env_vars={}))
     with pytest.raises(SandboxError, match="saved network policy"):
-        await provider.create_sandbox(_request(1, source=memory, network_block_all=True))
+        await provider.create_sandbox(_request(1, source=memory, env_vars={}, network_block_all=True))
+    with pytest.raises(SandboxError, match="saved environment"):
+        await provider.create_sandbox(_request(1, source=memory))
 
     assert creates[0]["image"] == "img-9"
     assert creates[1] == {
@@ -602,7 +619,7 @@ async def test_restoring_checkpoints_creates_from_their_ref() -> None:
         "wait_seconds": 0,
         "lifecycle_policy": {"idle_expiry_seconds": 900, "on_idle_timeout": "delete"},
     }
-    assert (len(creates), puts) == (2, [])
+    assert (len(creates), puts) == (2, [{"block_all": False, "allow_cidrs": [], "allow_domains": None}])
 
 
 async def test_failed_checkpoint_deletes_its_capture() -> None:

@@ -32,6 +32,7 @@ from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fi
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.gpu import modal_gpu_type
 from benchmark_service.sandbox.types import (
+    check_memory_restore,
     DockerfileSource,
     ExecResult,
     ImageSource,
@@ -627,11 +628,8 @@ class ModalSandboxProvider(SandboxProvider):
         return ModalSandbox(inner, name=request.name, labels=request.labels)
 
     async def _restore_memory(self, request: SandboxCreateRequest, snapshot_id: str) -> Sandbox:
-        """Restore keeps the snapshot's image, resources and network policy; only the name and tags are set."""
-        if request.network_block_all:
-            raise SandboxError(
-                "A memory checkpoint resumes under its saved network policy, before network_block_all could apply"
-            )
+        """Restore keeps the snapshot's image, resources and env; the name and tags are set and egress is opened."""
+        check_memory_restore(request)
         client, _ = await self._connect()
         prefix = _INVALID_NAME_CHARS.sub("_", request.name)[:31] or "sandbox"
         snapshot = SandboxSnapshot.from_id(snapshot_id, client)
@@ -652,13 +650,15 @@ class ModalSandboxProvider(SandboxProvider):
             raise SandboxError(f"Failed to restore Modal sandbox within {request.provider_timeout}s") from exc
         except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
+        sandbox = ModalSandbox(inner, name=request.name, labels=request.labels)
         try:
             await inner.set_tags.aio(request.labels)
+            await sandbox.clear_egress_rules()
         except BaseException:
             with suppress(*_PROVIDER_ERRORS):
                 await inner.terminate.aio()
             raise
-        return ModalSandbox(inner, name=request.name, labels=request.labels)
+        return sandbox
 
     async def _cleanup_create(self, creation: asyncio.Task[ModalSdkSandbox]) -> None:
         try:

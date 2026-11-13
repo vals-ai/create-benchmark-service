@@ -1359,13 +1359,17 @@ async def test_memory_restore_resumes_the_snapshot_with_tags(monkeypatch: pytest
     provider = _provider(monkeypatch, SimpleNamespace(_experimental_from_snapshot=_aio(from_snapshot)))
     memory = Checkpoint(provider="modal", kind=CheckpointKind.MEMORY, ref="sn-1")
 
-    sandbox = await provider.create_sandbox(_request().model_copy(update={"source": memory}))
+    restore = _request().model_copy(update={"source": memory, "env_vars": {}})
+    sandbox = await provider.create_sandbox(restore)
 
     assert sandbox.id == inner.object_id
     assert restored[0][0] == "sn-1"
     assert tags == [_request().labels]
+    assert inner.outbound_policies[-1]["outbound_cidr_allowlist"] == ["0.0.0.0/0"]
     with pytest.raises(SandboxError, match="saved network policy"):
-        await provider.create_sandbox(_request().model_copy(update={"source": memory, "network_block_all": True}))
+        await provider.create_sandbox(restore.model_copy(update={"network_block_all": True}))
+    with pytest.raises(SandboxError, match="saved environment"):
+        await provider.create_sandbox(restore.model_copy(update={"env_vars": {"FOO": "bar"}}))
 
 
 async def test_delete_checkpoint_ignores_missing_image(monkeypatch: pytest.MonkeyPatch) -> None:

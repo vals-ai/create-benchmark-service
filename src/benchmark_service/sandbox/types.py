@@ -79,6 +79,16 @@ def files_checkpoint_source(checkpoint: Checkpoint, provider: str) -> SnapshotSo
     return SnapshotSource(snapshot=checkpoint.ref)
 
 
+def check_memory_restore(request: "SandboxCreateRequest") -> None:
+    """A memory restore resumes processes with their saved env and network policy before anything else can apply."""
+    if request.network_block_all:
+        raise SandboxError(
+            "A memory checkpoint resumes under its saved network policy, before network_block_all could apply"
+        )
+    if request.env_vars or request.sandbox_secrets:
+        raise SandboxError("A memory checkpoint keeps its saved environment; pass fresh values per command instead")
+
+
 class SandboxCapabilities(BaseModel):
     """Optional operations a provider supports, so callers can plan without probing for errors."""
 

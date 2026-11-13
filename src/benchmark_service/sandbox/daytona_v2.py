@@ -26,6 +26,7 @@ from benchmark_service.sandbox.types import (
     CHECKPOINT_TIMEOUT_SECONDS,
     Checkpoint,
     CheckpointKind,
+    check_memory_restore,
     DockerfileSource,
     ExecResult,
     ImageSource,
@@ -517,7 +518,10 @@ class DaytonaV2SandboxProvider(SandboxProvider):
             raise SandboxError(f"Daytona v2 provider does not support: {', '.join(unsupported)}")
 
     def _restore_body(self, request: SandboxCreateRequest, snapshot: str) -> dict[str, Any]:
-        """Daytona's restore takes no image, resources, env or network policy; those come from the snapshot."""
+        """Daytona's restore takes no image, resources, env or network policy; those come from the snapshot.
+
+        The saved policy is cleared once the copy runs, since an open request expects an open sandbox.
+        """
         body: dict[str, Any] = {
             "snapshot": snapshot,
             "name": request.name,
@@ -560,10 +564,7 @@ class DaytonaV2SandboxProvider(SandboxProvider):
         self._reject_unsupported(request)
         match request.source:
             case Checkpoint(provider="daytona_v2", kind=CheckpointKind.MEMORY, ref=ref):
-                if request.network_block_all:
-                    raise SandboxError(
-                        "A memory checkpoint resumes under its saved network policy, before network_block_all could apply"
-                    )
+                check_memory_restore(request)
                 body = self._restore_body(request, ref)
             case source:
                 body = self._create_body(request, await self._image(source, deadline))
@@ -587,6 +588,8 @@ class DaytonaV2SandboxProvider(SandboxProvider):
                 await asyncio.sleep(_POLL_SECONDS)
                 data = await self._get(sandbox_id)
             sandbox = DaytonaV2Sandbox(data, self._client)
+            if "snapshot" in body:
+                await sandbox.clear_egress_rules()
         except BaseException:
             with suppress(SandboxError):
                 await self.delete_sandbox(sandbox_id)

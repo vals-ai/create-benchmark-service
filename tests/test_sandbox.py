@@ -1934,7 +1934,7 @@ async def test_daytona_reservable_demand_preserves_snapshot_error_classification
 
 @pytest.mark.parametrize(
     ("status", "message", "transient"),
-    [(403, "rejected the target metadata request", False), (429, "target metadata is unavailable", True)],
+    [(403, "rejected the admission metadata request", False), (429, "admission metadata is unavailable", True)],
 )
 async def test_daytona_reservable_demand_preserves_region_error_classification(
     monkeypatch: pytest.MonkeyPatch, status: int, message: str, transient: bool

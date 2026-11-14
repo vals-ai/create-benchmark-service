@@ -430,10 +430,11 @@ def _is_transient_daytona_error(exc: DaytonaError | ClientResponseError) -> bool
 
 def _is_transient_error(exc: BaseException) -> bool:
     match exc:
-        case DaytonaError() | ClientResponseError():
+        case DaytonaError():
             return _is_transient_daytona_error(exc)
-        case OpenApiException():
-            return getattr(exc, "status", None) in _RETRYABLE_PROVIDER_STATUSES
+        case OpenApiException() | ClientResponseError():
+            status = getattr(exc, "status", None)
+            return status in _RETRYABLE_PROVIDER_STATUSES or (status is not None and 500 <= status <= 599)
         case InvalidURL():
             return False
         case TimeoutError() | ClientError():

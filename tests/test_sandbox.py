@@ -49,6 +49,7 @@ from benchmark_service.sandbox import (
     SandboxCapacity,
     SandboxCommandError,
     SandboxConnectionError,
+    SandboxRejectedError,
     SandboxCreateRequest,
     SandboxError,
     SandboxNotFoundError,
@@ -1911,27 +1912,44 @@ async def test_daytona_reservable_demand_preserves_snapshot_metadata_validation(
 
 
 @pytest.mark.parametrize(
-    "error",
-    [TimeoutError(), DaytonaError("temporary", status_code=503), DaytonaError("not found", status_code=404)],
+    ("error", "transient"),
+    [
+        (TimeoutError(), True),
+        (DaytonaError("temporary", status_code=503), True),
+        (DaytonaError("not found", status_code=404), False),
+    ],
     ids=["timeout", "transient", "not_found"],
 )
 async def test_daytona_reservable_demand_preserves_snapshot_error_classification(
     monkeypatch: pytest.MonkeyPatch,
     error: Exception,
+    transient: bool,
 ) -> None:
     provider, _targets, _snapshots = _demand_provider(monkeypatch, error)
 
-    with pytest.raises(SandboxError):
+    with pytest.raises(SandboxError) as caught:
         await provider.reservable_demand(SnapshotSource(snapshot="snap"), _ADMISSION_RESOURCES)
+    assert isinstance(caught.value, SandboxConnectionError) is transient
 
 
-async def test_daytona_reservable_demand_preserves_region_error_classification(monkeypatch: pytest.MonkeyPatch) -> None:
-    error = ApiException(status=403, reason="denied")
+@pytest.mark.parametrize(
+    ("status", "message", "transient"),
+    [
+        (403, "rejected the admission metadata request", False),
+        (429, "admission metadata is unavailable", True),
+        (507, "admission metadata is unavailable", True),
+    ],
+)
+async def test_daytona_reservable_demand_preserves_region_error_classification(
+    monkeypatch: pytest.MonkeyPatch, status: int, message: str, transient: bool
+) -> None:
+    error = ApiException(status=status, reason="denied")
     provider, _targets, _snapshots = _demand_provider(monkeypatch, AssertionError("image"), regions=error)
 
-    with pytest.raises(SandboxError, match="rejected the target metadata request") as caught:
+    with pytest.raises(SandboxError, match=message) as caught:
         await provider.reservable_demand(_ADMISSION_IMAGE, _ADMISSION_RESOURCES)
     assert caught.value.__cause__ is error
+    assert isinstance(caught.value, SandboxConnectionError) is transient
 
 
 async def test_daytona_reservable_demand_rejects_unavailable_target(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -4385,6 +4403,46 @@ async def test_daytona_provider_create_maps_not_found_errors() -> None:
 
     with pytest.raises(SandboxNotFoundError, match="Sandbox not found: sandbox not found"):
         await _provider(daytona).create_sandbox(_request("sandbox-name"))
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Failed to create sandbox: Snapshot snap not found. Did you add it through the Daytona Dashboard?",
+        "Failed to create sandbox: Organization is suspended: Depleted credits",
+    ],
+)
+async def test_daytona_create_reports_permanent_refusals_as_rejected(message: str) -> None:
+    class RejectingDaytonaClient(CreateFailureDaytonaClient):
+        async def create(self, *_args: object, **_kwargs: object) -> InnerSandbox:
+            self.create_attempts += 1
+            raise DaytonaError(message, status_code=404)
+
+    daytona = RejectingDaytonaClient(InnerSandbox())
+
+    with pytest.raises(SandboxRejectedError, match="Daytona rejected the sandbox request"):
+        await _provider(daytona).create_sandbox(_request("sandbox-name"))
+    assert daytona.create_attempts == 1
+
+
+async def test_daytona_create_retries_an_exhausted_org_quota() -> None:
+    class QuotaThenFreeDaytonaClient(DaytonaClient):
+        create_attempts = 0
+
+        async def create(self, *args: object, **kwargs: object) -> InnerSandbox:
+            self.create_attempts += 1
+            if self.create_attempts == 1:
+                raise DaytonaError("Failed to create sandbox: Total CPU limit exceeded. Maximum allowed: 2500", status_code=400)
+            return await super().create(*args, **kwargs)
+
+    inner = InnerSandbox()
+    daytona = QuotaThenFreeDaytonaClient(inner)
+
+    sandbox = await _provider(daytona).create_sandbox(_request(inner.name))
+
+    assert sandbox.id == inner.id
+    assert daytona.create_attempts == 2
+
 
 
 def test_sandbox_query_rejects_naive_creation_cutoff() -> None:

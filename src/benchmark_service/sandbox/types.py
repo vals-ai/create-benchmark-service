@@ -301,6 +301,10 @@ class SandboxConnectionError(SandboxError):
     pass
 
 
+class SandboxRejectedError(SandboxError):
+    """The provider refuses this request every time, e.g. a missing snapshot or image or a suspended account."""
+
+
 class SandboxCommandError(SandboxError):
     def __init__(self, exit_code: int) -> None:
         self.exit_code = exit_code

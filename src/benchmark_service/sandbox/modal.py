@@ -38,6 +38,7 @@ from benchmark_service.sandbox.types import (
     SandboxBuildError,
     SandboxCommandError,
     SandboxConnectionError,
+    SandboxRejectedError,
     SandboxCreateRequest,
     SandboxError,
     SandboxNotFoundError,
@@ -576,6 +577,8 @@ class ModalSandboxProvider(SandboxProvider):
             if request.volumes and _is_missing_volume_error(exc):
                 raise SandboxError(f"Modal volume mount failed: {exc}") from exc
             raise _sandbox_error(exc) from exc
+        except ModalInvalidError as exc:
+            raise SandboxRejectedError(f"Modal rejected the sandbox request: {exc}") from exc
         except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
         return ModalSandbox(inner, name=request.name, labels=request.labels)

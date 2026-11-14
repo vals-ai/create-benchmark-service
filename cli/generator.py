@@ -188,3 +188,4 @@ def generate_project(
     (benchmark_package_dir / "benchmark_service.py").write_text(service_template.render(template_context))
     copy_file(templates_dir / "Dockerfile", output_dir / "Dockerfile")
     copy_file(templates_dir / ".dockerignore", output_dir / ".dockerignore")
+    copy_file(templates_dir / "service.yaml", output_dir / "service.yaml")

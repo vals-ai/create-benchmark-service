@@ -1,6 +1,7 @@
 """Tests for project generator."""
 
 import ast
+import re
 import runpy
 import tempfile
 import tomllib
@@ -8,6 +9,7 @@ from pathlib import Path
 from typing import cast
 
 import pytest
+import yaml
 from click.testing import CliRunner
 
 import benchmark_service
@@ -123,6 +125,13 @@ def test_generated_pyproject_falls_back_to_main_for_dev_version(
     assert "create-benchmark-service.git@main" in pyproject
 
 
+def test_the_service_yaml_example_passes_credentials_for_its_sandbox_provider() -> None:
+    template = (Path(__file__).parents[1] / "templates" / "service.yaml").read_text()
+    example = "\n".join(re.findall(r"^# (\s*(?:[A-Za-z_]+:|- ).*)$", template, flags=re.MULTILINE))
+    sandboxes = yaml.safe_load(example)["platform"]["sandboxes"]
+    assert sandboxes["provider"] in sandboxes["credentials"]
+
+
 def test_generates_project_structure() -> None:
     with tempfile.TemporaryDirectory() as tmpdir:
         output_dir = Path(tmpdir) / "swebench-benchmark-service"
@@ -135,6 +144,7 @@ def test_generates_project_structure() -> None:
         assert (output_dir / "Dockerfile").exists()
         assert (output_dir / ".gitignore").exists()
         assert (output_dir / ".dockerignore").exists()
+        assert "manifest_version: 1" in (output_dir / "service.yaml").read_text()
         assert (output_dir / ".python-version").exists()
         assert (output_dir / "src" / "swebench_benchmark_service").is_dir()
         assert (output_dir / "src" / "swebench_benchmark_service" / "__init__.py").exists()

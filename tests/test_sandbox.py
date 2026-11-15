@@ -3885,11 +3885,13 @@ async def test_daytona_command_cleans_up_when_consumer_stops() -> None:
     assert process.killed_session_id is not None
 
 
-async def test_daytona_provider_creates_fresh_sandbox() -> None:
+@pytest.mark.parametrize("requires_nested_docker", [False, True])
+async def test_daytona_provider_creates_fresh_sandbox(requires_nested_docker: bool) -> None:
     inner = InnerSandbox()
     daytona = DaytonaClient(inner)
 
-    sandbox = await _provider(daytona).create_sandbox(_request(inner.name))
+    request = _request(inner.name).model_copy(update={"requires_nested_docker": requires_nested_docker})
+    sandbox = await _provider(daytona).create_sandbox(request)
 
     assert sandbox.id == inner.id
     assert daytona.created is True

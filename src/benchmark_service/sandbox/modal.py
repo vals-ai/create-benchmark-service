@@ -40,6 +40,7 @@ from benchmark_service.sandbox.types import (
     SandboxConnectionError,
     SandboxCreateRequest,
     SandboxError,
+    UnsupportedSandboxConfigError,
     SandboxNotFoundError,
     SandboxProvider,
     SandboxQuery,
@@ -516,6 +517,17 @@ class ModalSandboxProvider(SandboxProvider):
             raise _sandbox_error(exc) from exc
 
     async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
+        runtime = "gvisor" if request.resources.gpu else self._config.runtime
+        if request.requires_nested_docker and runtime != "vm":
+            if request.resources.gpu:
+                raise UnsupportedSandboxConfigError(
+                    "This sandbox runs Docker-in-Docker, but Modal runs GPU sandboxes on its "
+                    '\"gvisor\" runtime, which cannot run it. Use the daytona provider.'
+                )
+            raise UnsupportedSandboxConfigError(
+                'This sandbox runs Docker-in-Docker, which Modal\'s "gvisor" runtime cannot run. '
+                'Set "runtime": "vm" in the modal provider settings or use the daytona provider.'
+            )
         if request.sandbox_secrets:
             raise SandboxError("Modal sandbox provider does not support sandbox_secrets")
 
@@ -531,7 +543,6 @@ class ModalSandboxProvider(SandboxProvider):
             if not gpu_type:
                 raise SandboxError("Modal sandbox provider requires gpu_type when gpu is requested")
             gpu = f"{gpu_type}:{request.resources.gpu}"
-        runtime = "gvisor" if gpu else self._config.runtime
         create_kwargs: dict[str, Any] = {
             "app": app,
             "name": modal_name,

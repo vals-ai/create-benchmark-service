@@ -210,6 +210,7 @@ class VolumeMount(BaseModel):
 
 class SandboxCreateRequest(BaseModel):
     source: SandboxSource
+    requires_nested_docker: bool = False
     resources: Resources
     name: str
     labels: dict[str, str]
@@ -266,6 +267,10 @@ class MissingSandboxConfigError(ValueError):
 
 
 class SandboxError(Exception):
+    pass
+
+
+class UnsupportedSandboxConfigError(SandboxError):
     pass
 
 

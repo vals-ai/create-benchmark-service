@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
 from grpclib import GRPCError, Status
@@ -33,6 +34,7 @@ from benchmark_service.sandbox.types import (
     SandboxConnectionError,
     SandboxCreateRequest,
     SandboxError,
+    UnsupportedSandboxConfigError,
     SandboxNotFoundError,
     SandboxQuery,
     SnapshotSource,
@@ -775,7 +777,8 @@ async def test_egress_rule_updates_replace_outbound_policy(monkeypatch: pytest.M
     }
 
 
-async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> None:
+@pytest.mark.parametrize("requires_nested_docker", [False, True])
+async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch, requires_nested_docker: bool) -> None:
     inner = FakeInnerSandbox()
     captured: dict[str, Any] = {}
 
@@ -785,8 +788,13 @@ async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> N
         return inner
 
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    request = _request()
+    assert request.requires_nested_docker is False
+    if requires_nested_docker:
+        provider._config = _config().model_copy(update={"runtime": "vm"})
+        request = request.model_copy(update={"requires_nested_docker": True})
 
-    sandbox = await provider.create_sandbox(_request())
+    sandbox = await provider.create_sandbox(request)
 
     assert sandbox.id == "sb-123"
     assert sandbox.name == "task-1"
@@ -802,9 +810,30 @@ async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch) -> N
     assert captured["block_network"] is False
     assert captured["outbound_cidr_allowlist"] == ["0.0.0.0/0"]
     assert "outbound_domain_allowlist" not in captured
-    assert captured["runtime"] == "gvisor"
-    assert captured["experimental_options"] == {"enable_docker": True}
+    assert captured["runtime"] == ("vm" if requires_nested_docker else "gvisor")
+    assert captured["experimental_options"] == (None if requires_nested_docker else {"enable_docker": True})
     assert captured["gpu"] is None
+
+
+@pytest.mark.parametrize(("runtime", "gpu"), [("gvisor", 0), ("gvisor", 1), ("vm", 1)])
+async def test_nested_docker_rejection_precedes_connection(
+    monkeypatch: pytest.MonkeyPatch, runtime: str, gpu: int
+) -> None:
+    provider = ModalSandboxProvider(_config().model_copy(update={"runtime": runtime}))
+    connect = AsyncMock()
+    monkeypatch.setattr(provider, "_connect", connect)
+    request = _request(resources=Resources(vcpu=1, memory=2, disk=5, gpu=gpu, gpu_type="T4" if gpu else None))
+
+    with pytest.raises(UnsupportedSandboxConfigError) as raised:
+        await provider.create_sandbox(request.model_copy(update={"requires_nested_docker": True}))
+
+    assert '"gvisor"' in str(raised.value)
+    assert "daytona" in str(raised.value)
+    if gpu:
+        assert "Modal runs GPU sandboxes" in str(raised.value)
+    else:
+        assert 'Set "runtime": "vm"' in str(raised.value)
+    connect.assert_not_called()
 
 
 async def test_create_sandbox_builds_a_dockerfile_source_from_its_folder(

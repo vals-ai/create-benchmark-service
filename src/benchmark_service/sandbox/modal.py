@@ -60,6 +60,7 @@ _RESOLVE_IN_SANDBOX = (
     "awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null"
 )
 _COMMAND_STATUS_POLL_SECONDS = 10
+_CAPACITY_RETRY_DELAYS_SECONDS = (10, 20, 40, 60, 60)
 _CONTROLLED_OUTPUT_TAIL_BYTES = 64 * 1024
 _OUTPUT_DRAIN_SECONDS = 5
 _INVALID_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_.-]")
@@ -436,6 +437,19 @@ async def _resolve_ipv4(host: str) -> list[str]:
     return [str(info[4][0]) for info in infos]
 
 
+async def _create_with_capacity_retry(**kwargs: Any) -> ModalSdkSandbox:
+    delays = iter(_CAPACITY_RETRY_DELAYS_SECONDS)
+    while True:
+        try:
+            return await ModalSdkSandbox.create.aio(**kwargs)  # pyright: ignore[reportUnknownMemberType]
+        except ModalResourceExhaustedError as exc:
+            delay = next(delays, None)
+            if delay is None:
+                raise
+            logger.warning("Modal sandbox capacity exhausted, retrying in %ds: %s", delay, exc)
+            await asyncio.sleep(delay)
+
+
 class ModalSandboxProvider(SandboxProvider):
     def __init__(self, config: ModalProviderConfig) -> None:
         self._config = config
@@ -553,8 +567,7 @@ class ModalSandboxProvider(SandboxProvider):
         if request.volumes:
             create_kwargs["volumes"] = self._resolve_volumes(request.volumes, client, request.labels)
 
-        # One SDK call preserves Modal's transport idempotency key.
-        creation = asyncio.create_task(ModalSdkSandbox.create.aio(**create_kwargs))  # pyright: ignore[reportUnknownMemberType]
+        creation = asyncio.create_task(_create_with_capacity_retry(**create_kwargs))
         try:
             async with asyncio.timeout(request.provider_timeout):
                 inner = await asyncio.shield(creation)

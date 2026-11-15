@@ -3,11 +3,13 @@ from __future__ import annotations
 # pyright: reportPrivateUsage=false
 
 import asyncio
+import logging
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import pytest
 from grpclib import GRPCError, Status
@@ -1197,7 +1199,25 @@ async def test_list_sandboxes_rejects_creation_time_filter(monkeypatch: pytest.M
         _ = [sandbox async for sandbox in provider.list_sandboxes(query)]
 
 
-async def test_create_sandbox_reports_resource_exhaustion_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_create_sandbox_retries_resource_exhaustion(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    inner = FakeInnerSandbox()
+    create = AsyncMock(side_effect=[ModalResourceExhaustedError("Insufficient capacity to create sandbox."), inner])
+    sleep = AsyncMock()
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    monkeypatch.setattr(modal_module.asyncio, "sleep", sleep)
+
+    with caplog.at_level(logging.WARNING, logger=modal_module.__name__):
+        sandbox = await provider.create_sandbox(_request())
+
+    assert sandbox.id == inner.object_id
+    assert create.await_count == 2
+    sleep.assert_awaited_once_with(10)
+    assert "capacity exhausted, retrying in 10s" in caplog.text
+
+
+async def test_create_sandbox_reports_resource_exhaustion_after_retries(monkeypatch: pytest.MonkeyPatch) -> None:
     attempts = 0
     exhausted = ModalResourceExhaustedError("Insufficient capacity to create sandbox.")
 
@@ -1207,11 +1227,14 @@ async def test_create_sandbox_reports_resource_exhaustion_without_retry(monkeypa
         raise exhausted
 
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    sleep = AsyncMock()
+    monkeypatch.setattr(modal_module.asyncio, "sleep", sleep)
 
     with pytest.raises(SandboxError, match="resources exhausted: Insufficient capacity") as error:
         await provider.create_sandbox(_request().model_copy(update={"create_timeout": 1}))
     assert error.value.__cause__ is exhausted
-    assert attempts == 1
+    assert attempts == 6
+    assert [call.args[0] for call in sleep.await_args_list] == [10, 20, 40, 60, 60]
 
 
 async def test_create_sandbox_without_volumes_passes_none(monkeypatch: pytest.MonkeyPatch) -> None:

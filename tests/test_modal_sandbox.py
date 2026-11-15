@@ -824,15 +824,44 @@ async def test_nested_docker_rejection_precedes_connection(
     monkeypatch.setattr(provider, "_connect", connect)
     request = _request(resources=Resources(vcpu=1, memory=2, disk=5, gpu=gpu, gpu_type="T4" if gpu else None))
 
+    with pytest.raises(UnsupportedSandboxConfigError) as preflight:
+        provider.validate_sandbox_config(requires_nested_docker=True, resources=request.resources)
+
     with pytest.raises(UnsupportedSandboxConfigError) as raised:
         await provider.create_sandbox(request.model_copy(update={"requires_nested_docker": True}))
 
+    assert str(raised.value) == str(preflight.value)
     assert '"gvisor"' in str(raised.value)
     assert "daytona" in str(raised.value)
     if gpu:
         assert "Modal runs GPU sandboxes" in str(raised.value)
     else:
         assert 'Set "runtime": "vm"' in str(raised.value)
+    connect.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    ("runtime", "gpu", "requires_nested_docker"),
+    [
+        ("gvisor", 0, False),
+        ("gvisor", 1, False),
+        ("vm", 0, False),
+        ("vm", 1, False),
+        ("vm", 0, True),
+    ],
+)
+def test_validate_sandbox_config_allows_supported_requirements(
+    monkeypatch: pytest.MonkeyPatch, runtime: str, gpu: int, requires_nested_docker: bool
+) -> None:
+    provider = ModalSandboxProvider(_config().model_copy(update={"runtime": runtime}))
+    connect = AsyncMock()
+    monkeypatch.setattr(provider, "_connect", connect)
+
+    provider.validate_sandbox_config(
+        requires_nested_docker=requires_nested_docker,
+        resources=Resources(vcpu=1, memory=2, disk=5, gpu=gpu, gpu_type="T4" if gpu else None),
+    )
+
     connect.assert_not_called()
 
 

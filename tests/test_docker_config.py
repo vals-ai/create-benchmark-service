@@ -46,6 +46,11 @@ async def test_nested_docker_rejection_precedes_provisioning(monkeypatch: pytest
     )
 
     with pytest.raises(UnsupportedSandboxConfigError, match='daytona.*"runtime": "vm"'):
+        provider.validate_sandbox_config(requires_nested_docker=True, resources=request.resources)
+
+    provider.validate_sandbox_config(requires_nested_docker=False, resources=request.resources)
+
+    with pytest.raises(UnsupportedSandboxConfigError, match='daytona.*"runtime": "vm"'):
         await provider.create_sandbox(request)
 
     ensure_image.assert_not_called()

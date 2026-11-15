@@ -32,6 +32,7 @@ from benchmark_service.sandbox.types import (
     DockerfileSource,
     ExecResult,
     ImageSource,
+    Resources,
     MAX_SANDBOX_LIFETIME_SECONDS,
     MissingSandboxConfigError,
     Sandbox,
@@ -516,18 +517,22 @@ class ModalSandboxProvider(SandboxProvider):
         except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
 
-    async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
-        runtime = "gvisor" if request.resources.gpu else self._config.runtime
-        if request.requires_nested_docker and runtime != "vm":
-            if request.resources.gpu:
+    def validate_sandbox_config(self, *, requires_nested_docker: bool, resources: Resources) -> None:
+        runtime = "gvisor" if resources.gpu else self._config.runtime
+        if requires_nested_docker and runtime != "vm":
+            if resources.gpu:
                 raise UnsupportedSandboxConfigError(
                     "This sandbox runs Docker-in-Docker, but Modal runs GPU sandboxes on its "
-                    '\"gvisor\" runtime, which cannot run it. Use the daytona provider.'
+                    '"gvisor" runtime, which cannot run it. Use the daytona provider.'
                 )
             raise UnsupportedSandboxConfigError(
                 'This sandbox runs Docker-in-Docker, which Modal\'s "gvisor" runtime cannot run. '
                 'Set "runtime": "vm" in the modal provider settings or use the daytona provider.'
             )
+
+    async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
+        self.validate_sandbox_config(requires_nested_docker=request.requires_nested_docker, resources=request.resources)
+        runtime = "gvisor" if request.resources.gpu else self._config.runtime
         if request.sandbox_secrets:
             raise SandboxError("Modal sandbox provider does not support sandbox_secrets")
 

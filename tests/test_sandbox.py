@@ -3891,6 +3891,9 @@ async def test_daytona_provider_creates_fresh_sandbox(requires_nested_docker: bo
     daytona = DaytonaClient(inner)
 
     request = _request(inner.name).model_copy(update={"requires_nested_docker": requires_nested_docker})
+    _provider(daytona).validate_sandbox_config(
+        requires_nested_docker=requires_nested_docker, resources=request.resources
+    )
     sandbox = await _provider(daytona).create_sandbox(request)
 
     assert sandbox.id == inner.id

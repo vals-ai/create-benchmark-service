@@ -413,6 +413,9 @@ class Sandbox(ABC):
 
 
 class SandboxProvider(ABC):
+    def validate_sandbox_config(self, *, requires_nested_docker: bool, resources: Resources) -> None:
+        """Raise UnsupportedSandboxConfigError for unsupported requirements without provisioning."""
+
     @property
     def admission_pool_id(self) -> str | None:
         return None

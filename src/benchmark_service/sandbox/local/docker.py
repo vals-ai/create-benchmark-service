@@ -29,6 +29,7 @@ from benchmark_service.sandbox.types import (
     DockerfileSource,
     ExecResult,
     ImageSource,
+    Resources,
     MAX_SANDBOX_LIFETIME_SECONDS,
     Sandbox,
     SandboxBuildError,
@@ -373,12 +374,15 @@ class DockerSandboxProvider(SandboxProvider):
         if process.returncode != 0:
             raise SandboxError(f"Failed to pull Docker image {image}: {output.decode(errors='replace').strip()}")
 
-    async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
-        if request.requires_nested_docker:
+    def validate_sandbox_config(self, *, requires_nested_docker: bool, resources: Resources) -> None:
+        if requires_nested_docker:
             raise UnsupportedSandboxConfigError(
                 "This sandbox runs Docker-in-Docker, which the local docker provider cannot run. "
                 'Use the daytona provider or set "runtime": "vm" in the modal provider settings.'
             )
+
+    async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
+        self.validate_sandbox_config(requires_nested_docker=request.requires_nested_docker, resources=request.resources)
         _reject_unsupported(request)
         loop = asyncio.get_running_loop()
         match request.source:

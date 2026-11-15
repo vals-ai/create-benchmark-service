@@ -137,7 +137,13 @@ async def test_create_sandbox_sends_fractional_cores_and_waits_for_running(requi
             return httpx.Response(200, json={"id": "sb-1", "name": "tts-task-1", "status": next(statuses)})
         raise AssertionError(f"unexpected {request.method} {path}")
 
-    sandbox = await _provider(handler, spot=True).create_sandbox(
+    provider = _provider(handler, spot=True)
+    provider.validate_sandbox_config(
+        requires_nested_docker=requires_nested_docker, resources=_request(0.25).resources
+    )
+    assert calls == []
+
+    sandbox = await provider.create_sandbox(
         _request(
             0.25,
             requires_nested_docker=requires_nested_docker,

@@ -12,7 +12,7 @@ from aiodocker.stream import Stream
 from benchmark_service import DockerProviderConfig
 from aiodocker.exceptions import DockerError
 
-from benchmark_service import ImageSource, Resources, SandboxError
+from benchmark_service import ImageSource, Resources, SandboxError, UnsupportedSandboxConfigError
 from benchmark_service.sandbox.local.docker import (  # pyright: ignore[reportPrivateUsage]
     _MANAGED_LABEL,  # pyright: ignore[reportPrivateUsage]
     DockerSandbox,
@@ -28,6 +28,27 @@ def test_docker_grading_selects_docker(monkeypatch: pytest.MonkeyPatch) -> None:
     """Resolve Docker when selected for sandbox grading."""
     monkeypatch.setenv("GRADING_SANDBOX_PROVIDER", "docker")
     assert isinstance(_grading_provider_config(), DockerProviderConfig)
+
+
+async def test_nested_docker_rejection_precedes_provisioning(monkeypatch: pytest.MonkeyPatch) -> None:
+    provider = DockerSandboxProvider.__new__(DockerSandboxProvider)
+    ensure_image = AsyncMock()
+    monkeypatch.setattr(provider, "_ensure_image", ensure_image)
+    request = SandboxCreateRequest(
+        source=ImageSource(image="docker:28.3.3-dind"),
+        resources=Resources(vcpu=1, memory=2, disk=5),
+        name="nested-docker",
+        labels={},
+        env_vars={},
+        auto_stop_interval=5,
+        create_timeout=120,
+        requires_nested_docker=True,
+    )
+
+    with pytest.raises(UnsupportedSandboxConfigError, match='daytona.*"runtime": "vm"'):
+        await provider.create_sandbox(request)
+
+    ensure_image.assert_not_called()
 
 
 @pytest.mark.parametrize("outcome", ["exit", "timeout", "cancel_before_cleanup", "cancel_during_cleanup"])

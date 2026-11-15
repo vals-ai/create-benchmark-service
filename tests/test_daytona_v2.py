@@ -119,7 +119,8 @@ def test_grading_provider_selects_v2_only_when_opted_in(monkeypatch: pytest.Monk
         _grading_provider_config()
 
 
-async def test_create_sandbox_sends_fractional_cores_and_waits_for_running() -> None:
+@pytest.mark.parametrize("requires_nested_docker", [False, True])
+async def test_create_sandbox_sends_fractional_cores_and_waits_for_running(requires_nested_docker: bool) -> None:
     calls: list[httpx.Request] = []
     statuses = iter(["booting", "running"])
 
@@ -139,6 +140,7 @@ async def test_create_sandbox_sends_fractional_cores_and_waits_for_running() -> 
     sandbox = await _provider(handler, spot=True).create_sandbox(
         _request(
             0.25,
+            requires_nested_docker=requires_nested_docker,
             env_vars={"A": "1", "DAYTONA_SANDBOX_OTEL_EXTRA_LABELS": "run=r1", "DAYTONA_OTEL_ENDPOINT": "https://otel"},
         )
     )

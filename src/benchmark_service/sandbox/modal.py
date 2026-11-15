@@ -437,19 +437,6 @@ async def _resolve_ipv4(host: str) -> list[str]:
     return [str(info[4][0]) for info in infos]
 
 
-async def _create_with_capacity_retry(**kwargs: Any) -> ModalSdkSandbox:
-    delays = iter(_CAPACITY_RETRY_DELAYS_SECONDS)
-    while True:
-        try:
-            return await ModalSdkSandbox.create.aio(**kwargs)  # pyright: ignore[reportUnknownMemberType]
-        except ModalResourceExhaustedError as exc:
-            delay = next(delays, None)
-            if delay is None:
-                raise
-            logger.warning("Modal sandbox capacity exhausted, retrying in %ds: %s", delay, exc)
-            await asyncio.sleep(delay)
-
-
 class ModalSandboxProvider(SandboxProvider):
     def __init__(self, config: ModalProviderConfig) -> None:
         self._config = config
@@ -567,15 +554,28 @@ class ModalSandboxProvider(SandboxProvider):
         if request.volumes:
             create_kwargs["volumes"] = self._resolve_volumes(request.volumes, client, request.labels)
 
-        creation = asyncio.create_task(_create_with_capacity_retry(**create_kwargs))
+        creation: asyncio.Task[ModalSdkSandbox] | None = None
+        delays = iter(_CAPACITY_RETRY_DELAYS_SECONDS)
         try:
             async with asyncio.timeout(request.provider_timeout):
-                inner = await asyncio.shield(creation)
+                while True:
+                    creation = asyncio.create_task(ModalSdkSandbox.create.aio(**create_kwargs))  # pyright: ignore[reportUnknownMemberType]
+                    try:
+                        inner = await asyncio.shield(creation)
+                        break
+                    except ModalResourceExhaustedError as exc:
+                        creation = None
+                        delay = next(delays, None)
+                        if delay is None:
+                            raise
+                        logger.warning("Modal sandbox capacity exhausted, retrying in %ds: %s", delay, exc)
+                        await asyncio.sleep(delay)
         except (TimeoutError, asyncio.CancelledError) as exc:
             # Retain ownership until the late allocation can be terminated.
-            cleanup = _start_background(self._cleanup_create(creation), f"Modal cleanup {request.name}")
-            self._cleanup_tasks.add(cleanup)
-            cleanup.add_done_callback(self._cleanup_tasks.discard)
+            if creation is not None:
+                cleanup = _start_background(self._cleanup_create(creation), f"Modal cleanup {request.name}")
+                self._cleanup_tasks.add(cleanup)
+                cleanup.add_done_callback(self._cleanup_tasks.discard)
             if isinstance(exc, asyncio.CancelledError):
                 raise
             if isinstance(request.source, DockerfileSource):

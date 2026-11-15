@@ -62,6 +62,7 @@ _RESOLVE_IN_SANDBOX = (
     "awk '/^nameserver/ {print $2}' /etc/resolv.conf 2>/dev/null"
 )
 _COMMAND_STATUS_POLL_SECONDS = 10
+_CAPACITY_RETRY_DELAYS_SECONDS = (10, 20, 40, 60, 60)
 _CONTROLLED_OUTPUT_TAIL_BYTES = 64 * 1024
 _OUTPUT_DRAIN_SECONDS = 5
 _INVALID_NAME_CHARS = re.compile(r"[^a-zA-Z0-9_.-]")
@@ -569,16 +570,28 @@ class ModalSandboxProvider(SandboxProvider):
         if request.volumes:
             create_kwargs["volumes"] = self._resolve_volumes(request.volumes, client, request.labels)
 
-        # One SDK call preserves Modal's transport idempotency key.
-        creation = asyncio.create_task(ModalSdkSandbox.create.aio(**create_kwargs))  # pyright: ignore[reportUnknownMemberType]
+        creation: asyncio.Task[ModalSdkSandbox] | None = None
+        delays = iter(_CAPACITY_RETRY_DELAYS_SECONDS)
         try:
             async with asyncio.timeout(request.provider_timeout):
-                inner = await asyncio.shield(creation)
+                while True:
+                    creation = asyncio.create_task(ModalSdkSandbox.create.aio(**create_kwargs))  # pyright: ignore[reportUnknownMemberType]
+                    try:
+                        inner = await asyncio.shield(creation)
+                        break
+                    except ModalResourceExhaustedError as exc:
+                        creation = None
+                        delay = next(delays, None)
+                        if delay is None:
+                            raise
+                        logger.warning("Modal sandbox capacity exhausted, retrying in %ds: %s", delay, exc)
+                        await asyncio.sleep(delay)
         except (TimeoutError, asyncio.CancelledError) as exc:
             # Retain ownership until the late allocation can be terminated.
-            cleanup = _start_background(self._cleanup_create(creation), f"Modal cleanup {request.name}")
-            self._cleanup_tasks.add(cleanup)
-            cleanup.add_done_callback(self._cleanup_tasks.discard)
+            if creation is not None:
+                cleanup = _start_background(self._cleanup_create(creation), f"Modal cleanup {request.name}")
+                self._cleanup_tasks.add(cleanup)
+                cleanup.add_done_callback(self._cleanup_tasks.discard)
             if isinstance(exc, asyncio.CancelledError):
                 raise
             if isinstance(request.source, DockerfileSource):

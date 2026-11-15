@@ -3,6 +3,7 @@ from __future__ import annotations
 # pyright: reportPrivateUsage=false
 
 import asyncio
+import logging
 from collections.abc import AsyncGenerator
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1255,7 +1256,64 @@ async def test_list_sandboxes_rejects_creation_time_filter(monkeypatch: pytest.M
         _ = [sandbox async for sandbox in provider.list_sandboxes(query)]
 
 
-async def test_create_sandbox_reports_resource_exhaustion_without_retry(monkeypatch: pytest.MonkeyPatch) -> None:
+async def test_create_sandbox_retries_resource_exhaustion(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    inner = FakeInnerSandbox()
+    create = AsyncMock(side_effect=[ModalResourceExhaustedError("Insufficient capacity to create sandbox."), inner])
+    sleep = AsyncMock()
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    monkeypatch.setattr(modal_module.asyncio, "sleep", sleep)
+
+    with caplog.at_level(logging.WARNING, logger=modal_module.__name__):
+        sandbox = await provider.create_sandbox(_request())
+
+    assert sandbox.id == inner.object_id
+    assert create.await_count == 2
+    sleep.assert_awaited_once_with(10)
+    assert "capacity exhausted, retrying in 10s" in caplog.text
+
+
+@pytest.mark.parametrize("departure", ["timeout", "cancel"])
+async def test_create_sandbox_stops_capacity_retries_after_caller_leaves(
+    monkeypatch: pytest.MonkeyPatch, departure: str
+) -> None:
+    create = AsyncMock(
+        side_effect=[ModalResourceExhaustedError("Insufficient capacity to create sandbox."), FakeInnerSandbox()]
+    )
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    backoff_started = asyncio.Event()
+    finish_backoff = asyncio.Event()
+
+    async def sleep(_delay: float) -> None:
+        backoff_started.set()
+        await finish_backoff.wait()
+
+    monkeypatch.setattr(modal_module.asyncio, "sleep", sleep)
+    if departure == "timeout":
+        timeout = asyncio.timeout
+
+        def short_timeout(_delay: float | None) -> asyncio.Timeout:
+            return timeout(0.01)
+
+        monkeypatch.setattr(asyncio, "timeout", short_timeout)
+
+    caller = asyncio.create_task(provider.create_sandbox(_request()))
+    await backoff_started.wait()
+    if departure == "cancel":
+        caller.cancel()
+
+    with pytest.raises(asyncio.CancelledError if departure == "cancel" else SandboxError):
+        await caller
+
+    finish_backoff.set()
+    await asyncio.gather(*provider._cleanup_tasks)
+
+    assert create.await_count == 1
+    assert not provider._cleanup_tasks
+
+
+async def test_create_sandbox_reports_resource_exhaustion_after_retries(monkeypatch: pytest.MonkeyPatch) -> None:
     attempts = 0
     exhausted = ModalResourceExhaustedError("Insufficient capacity to create sandbox.")
 
@@ -1265,11 +1323,14 @@ async def test_create_sandbox_reports_resource_exhaustion_without_retry(monkeypa
         raise exhausted
 
     provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    sleep = AsyncMock()
+    monkeypatch.setattr(modal_module.asyncio, "sleep", sleep)
 
     with pytest.raises(SandboxError, match="resources exhausted: Insufficient capacity") as error:
         await provider.create_sandbox(_request().model_copy(update={"create_timeout": 1}))
     assert error.value.__cause__ is exhausted
-    assert attempts == 1
+    assert attempts == 6
+    assert [call.args[0] for call in sleep.await_args_list] == [10, 20, 40, 60, 60]
 
 
 async def test_create_sandbox_without_volumes_passes_none(monkeypatch: pytest.MonkeyPatch) -> None:

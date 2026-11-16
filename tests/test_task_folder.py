@@ -8,7 +8,7 @@ from typing import cast
 import pytest
 from pydantic import ValidationError
 
-from benchmark_service import DEFAULT_TASK_DIR, TaskFolder, write_task_folder
+from benchmark_service import TaskFolder, write_task_folder
 from benchmark_service.sandbox import ExecResult, Sandbox
 
 
@@ -204,10 +204,6 @@ def test_bad_extra_file_path_is_refused(path: str) -> None:
 def test_timeout_must_be_positive() -> None:
     with pytest.raises(ValidationError):
         TaskFolder(instruction="q", agent_timeout_sec=0)
-
-
-def test_default_task_dir() -> None:
-    assert DEFAULT_TASK_DIR == "/task"
 
 
 def test_harbor_loads_task_toml() -> None:

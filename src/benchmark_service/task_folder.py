@@ -55,7 +55,7 @@ class TaskFolder(BaseModel):
         """The `task.toml` text: Harbor's task file with `schema_version`, `[metadata]`, `[agent]`."""
         data: dict[str, Any] = {"schema_version": TASK_SCHEMA_VERSION, "metadata": dict(self.metadata)}
         if self.agent_timeout_sec is not None:
-            data["agent"] = {"timeout_sec": float(self.agent_timeout_sec)}
+            data["agent"] = {"timeout_sec": self.agent_timeout_sec}
         text = _dump_toml(data)
         # The `toml` writer is old. Refuse its output if it does not read back as the same data.
         if tomllib.loads(text) != data:

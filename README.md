@@ -112,6 +112,26 @@ Subclass `BenchmarkService` and implement its abstract methods. On instantiation
 
 **Dispatch order.** Task order within a dataset is the order the tracker dispatches tasks in (task rows are created in `filter_tasks` order, and `?slice=` slices that same order). Set the `priority_dataset` class attribute (e.g. `priority_dataset = "vals_index"`) to stably move the tasks a dataset shares with that subset to its front, so a run of a full split finishes the index subset before the long tail. `create()` fails if the named dataset is not loaded.
 
+### Task folder (`task_folder.py`)
+
+A service can give its agent a task folder in Harbor's layout: `instruction.md` and `task.toml` at the root, and other files below. The service describes the folder with a `TaskFolder` and calls `write_task_folder` from its own `setup_task`. The framework does not write the folder by itself.
+
+```python
+from benchmark_service import TaskFolder, write_task_folder
+
+async def setup_task(self, task_id, sandbox, dataset=None):
+    folder = TaskFolder(
+        instruction=query,  # written to instruction.md exactly as given, as UTF-8
+        metadata={"benchmark": "a2j", "task_id": task_id},  # the [metadata] table
+        agent_timeout_sec=10800,  # optional: [agent].timeout_sec. Leave it out for no [agent] table.
+        extra_files={"agent/conductor/conductor.json": conductor_json},  # paths relative to the folder
+    )
+    await write_task_folder(sandbox, folder)  # task_dir="/task" by default
+    yield StreamResultChunk(type="result", data={"status": "ok"})
+```
+
+`write_task_folder` creates every directory with one `mkdir -p`, then uploads `instruction.md`, `task.toml`, and each extra file in order. If the sandbox cannot create the directories, it raises `RuntimeError`. `task.toml` has `schema_version = "1.3"`, so Harbor's `TaskConfig` loads it. `TaskFolder` refuses an extra file path that is absolute, that contains `..`, or that is `instruction.md` or `task.toml`.
+
 ### FastAPI application factory (`app.py`)
 
 `BenchmarkServiceApp(service_cls)` wraps your `BenchmarkService` subclass in a fully configured FastAPI app. Pass your subclass and run the result with any ASGI server.

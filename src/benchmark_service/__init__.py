@@ -72,9 +72,13 @@ from benchmark_service.schemas import (
     SubmissionArtifactReference,
     TextGradingSubmission,
 )
+from benchmark_service.task_folder import DEFAULT_TASK_DIR, TaskFolder, write_task_folder
 from benchmark_service.valkyrie_stage import Agents, Exhausted, SlotResult, StageReporter, valkyrie_stage_source
 
 __all__ = [
+    "DEFAULT_TASK_DIR",
+    "TaskFolder",
+    "write_task_folder",
     "DATASET_VERSION_HEADER",
     "CreditedGeneration",
     "Episode",

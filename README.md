@@ -130,7 +130,7 @@ async def setup_task(self, task_id, sandbox, dataset=None):
     yield StreamResultChunk(type="result", data={"status": "ok"})
 ```
 
-`write_task_folder` creates every directory with one `mkdir -p`, then uploads `instruction.md`, `task.toml`, and each extra file in order. If the sandbox cannot create the directories, it raises `RuntimeError`. `task.toml` has `schema_version = "1.3"`, so Harbor's `TaskConfig` loads it. `TaskFolder` refuses an extra file path that is absolute, that contains `..`, or that is `instruction.md` or `task.toml`.
+`write_task_folder` creates every directory with one `mkdir -p`, then uploads `instruction.md`, `task.toml`, and each extra file in order. If the sandbox cannot create the directories, it raises `RuntimeError`. `task.toml` has `schema_version = "1.3"`, so Harbor's `TaskConfig` loads it. `TaskFolder` refuses an extra file path that is absolute, that contains `..`, that is `instruction.md` or `task.toml`, or that is below another file of the folder.
 
 ### FastAPI application factory (`app.py`)
 

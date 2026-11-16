@@ -193,12 +193,31 @@ async def test_mkdir_failure_raises_and_uploads_nothing() -> None:
         "agent//x",
         "agent\\x",
         "",
+        ".",
+        "instruction.md/child.txt",
+        "task.toml/child.txt",
     ],
 )
 def test_bad_extra_file_path_is_refused(path: str) -> None:
     with pytest.raises(ValidationError) as caught:
         TaskFolder(instruction="q", extra_files={path: b""})
     assert repr(path) in str(caught.value)
+
+
+def test_path_below_another_extra_file_is_refused() -> None:
+    with pytest.raises(ValidationError, match=r"'a/b/c\.txt' is below 'a/b', which is a file"):
+        TaskFolder(instruction="q", extra_files={"a/b/c.txt": b"", "a/b": b""})
+
+
+@pytest.mark.parametrize("path", ["task.toml", "../x", "a.txt/child.txt"])
+async def test_path_added_after_construction_is_refused(path: str) -> None:
+    folder = TaskFolder(instruction="q", extra_files={"a.txt": b""})
+    folder.extra_files[path] = b""
+    sandbox = RecordingSandbox()
+    with pytest.raises(ValueError, match="Extra file path"):
+        await write_task_folder(sandbox, folder)
+    assert sandbox.commands == []
+    assert sandbox.uploads == []
 
 
 def test_timeout_must_be_positive() -> None:

@@ -8,7 +8,7 @@ instruction text, the metadata, and any extra files, which go in by path relativ
 
 import shlex
 import tomllib
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from pathlib import PurePosixPath
 from typing import Any, cast
 
@@ -47,8 +47,7 @@ class TaskFolder(BaseModel):
     @field_validator("extra_files")
     @classmethod
     def _check_extra_paths(cls, files: dict[str, bytes | str]) -> dict[str, bytes | str]:
-        for path in files:
-            _check_relative_path(path)
+        _check_file_paths(files)
         return files
 
     def task_toml(self) -> str:
@@ -64,6 +63,8 @@ class TaskFolder(BaseModel):
 
     def files(self) -> dict[str, bytes]:
         """Every file of the folder, keyed by path relative to the folder, in upload order."""
+        # `frozen` does not stop a change to the mapping after construction, so check the paths again.
+        _check_file_paths(self.extra_files)
         files = {
             INSTRUCTION_FILE: self.instruction.encode("utf-8"),
             TASK_FILE: self.task_toml().encode("utf-8"),
@@ -79,10 +80,22 @@ def _check_relative_path(path: str) -> None:
         raise ValueError(f"Extra file path must be relative to the task folder: {path!r}")
     if ".." in pure.parts:
         raise ValueError(f"Extra file path must not contain '..': {path!r}")
-    if pure.as_posix() != path or "\\" in path:
+    if pure.as_posix() != path or "\\" in path or path == ".":
         raise ValueError(f"Extra file path must be a plain POSIX path such as 'a/b.json': {path!r}")
     if path in (INSTRUCTION_FILE, TASK_FILE):
         raise ValueError(f"Extra file path is reserved by the task folder: {path!r}")
+
+
+def _check_file_paths(paths: Iterable[str]) -> None:
+    """Refuse a bad path, and a path below another file of the folder, which cannot be written."""
+    files = {INSTRUCTION_FILE, TASK_FILE}
+    for path in paths:
+        _check_relative_path(path)
+        files.add(path)
+    for path in sorted(files):
+        for parent in PurePosixPath(path).parents:
+            if str(parent) in files:
+                raise ValueError(f"Extra file path {path!r} is below {str(parent)!r}, which is a file")
 
 
 async def write_task_folder(sandbox: Sandbox, folder: TaskFolder, *, task_dir: str = DEFAULT_TASK_DIR) -> None:

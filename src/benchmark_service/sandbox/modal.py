@@ -562,6 +562,7 @@ class ModalSandboxProvider(SandboxProvider):
             "timeout": _MAX_LIFETIME_SECONDS,
             "block_network": request.network_block_all,
             "outbound_cidr_allowlist": list(_ALLOW_ALL_CIDRS) if allow_all_egress else None,
+            "outbound_domain_allowlist": ["*"] if allow_all_egress else None,
             "client": client,
             "runtime": runtime,
             # Keep this flag: nested Docker's overlay2 failed without it on T4.

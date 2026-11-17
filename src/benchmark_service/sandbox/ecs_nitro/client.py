@@ -31,7 +31,7 @@ class AgentClient:
             detail = str(response.json().get("error"))
         except ValueError:
             detail = response.text[:500]
-        if response.status_code == 404:
+        if response.status_code == 404 and not action.startswith(("upload", "download")):
             return SandboxNotFoundError(f"{action}: {detail}")
         return SandboxError(f"{action} failed with HTTP {response.status_code}: {detail}")
 

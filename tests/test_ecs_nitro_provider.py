@@ -122,8 +122,11 @@ async def test_create_runs_isolated_task_and_serves_commands_and_files(
     assert await sandbox.download_file(f"/tmp/cbs-ecs-test-{agent_port}/nested/file.bin") == payload
     streamed = [c async for c in sandbox.stream_download(f"/tmp/cbs-ecs-test-{agent_port}/nested/file.bin")]
     assert b"".join(streamed) == payload
-    with pytest.raises(SandboxNotFoundError):
+    with pytest.raises(SandboxError, match="not found") as missing:
         await sandbox.download_file(f"/tmp/cbs-ecs-test-{agent_port}/missing")
+    assert not isinstance(missing.value, SandboxNotFoundError)
+    split = [c async for c in sandbox.command("printf '\\303'; sleep 0.2; printf '\\251'")]
+    assert "".join(split) == "\u00e9"
 
     await sandbox.modify_egress_rules(["10.0.4.0/24", "10.0.5.6"])
     assert sorted(egress_of(ec2, group)) == ["10.0.4.0/24", "10.0.5.6/32"]
@@ -203,9 +206,12 @@ async def test_missing_sandbox_lookup_and_idempotent_delete() -> None:
 
 
 class LostResponseEcs(FakeEcs):
+    lost = False
+
     async def call(self, action: str, params: Mapping[str, Any]) -> dict[str, Any]:
         result = await super().call(action, params)
-        if action == "RunTask":
+        if action == "RunTask" and not self.lost:
+            self.lost = True
             raise httpx.ReadError("connection lost after RunTask was accepted")
         return result
 
@@ -248,3 +254,11 @@ async def test_group_that_never_becomes_visible_fails_before_run_task() -> None:
         await make_provider(ecs, ec2).create_sandbox(make_request())
     assert not any(action == "RunTask" for action, _ in ecs.calls)
     assert ec2.deleted == ["sg-0"]
+
+
+@pytest.mark.asyncio
+async def test_describe_lag_after_run_task_does_not_fail_the_create(agent_port: int) -> None:
+    ecs, ec2 = AgentStartingEcs(agent_port), FakeEc2()
+    ecs.describe_lag = 2
+    sandbox = await make_provider(ecs, ec2, agent_port).create_sandbox(make_request())
+    assert (await sandbox.exec("echo ok")).output == "ok\n"

@@ -92,6 +92,8 @@ class FakeEcs:
         self.nitro = nitro
         self.run_status = run_status
         self.place = place
+        self.tokens: dict[str, str] = {}
+        self.describe_lag = 0
 
     async def call(self, action: str, params: Mapping[str, Any]) -> dict[str, Any]:
         self.calls.append((action, dict(params)))
@@ -113,6 +115,8 @@ class FakeEcs:
             definition = {**params, "taskDefinitionArn": f"arn:td/{params['family']}:1", "status": "ACTIVE"}
             self.definitions[params["family"]] = definition
             return {"taskDefinition": definition}
+        if action == "RunTask" and params.get("clientToken") in self.tokens:
+            return {"tasks": [self.tasks[self.tokens[params["clientToken"]]]]}
         if action == "RunTask":
             if not self.place:
                 return {"tasks": [], "failures": [{"reason": "RESOURCE:CPU"}]}
@@ -135,7 +139,12 @@ class FakeEcs:
                 ],
             }
             self.tasks[task_id] = task
+            if params.get("clientToken"):
+                self.tokens[params["clientToken"]] = task_id
             return {"tasks": [task]}
+        if action == "DescribeTasks" and self.describe_lag:
+            self.describe_lag -= 1
+            return {"tasks": []}
         if action == "DescribeTasks":
             found = [
                 self.tasks[ref.rsplit("/", 1)[-1]] for ref in params["tasks"] if ref.rsplit("/", 1)[-1] in self.tasks

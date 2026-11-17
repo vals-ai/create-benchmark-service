@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import codecs
 from collections.abc import AsyncGenerator, Awaitable, Callable, Mapping
 from datetime import UTC, datetime
 from typing import Any
@@ -169,12 +170,16 @@ class EcsNitroSandbox(Sandbox):
         timeout: float | None = None,
         env_vars: Mapping[str, str] | None = None,
     ) -> AsyncGenerator[str, None]:
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
         async for item in self._run(command, cwd, timeout, env_vars or {}):
             if isinstance(item, int):
+                if tail := decoder.decode(b"", final=True):
+                    yield tail
                 if item != 0:
                     raise SandboxCommandError(item)
                 return
-            yield item.decode(errors="replace")
+            if text := decoder.decode(item):
+                yield text
 
     async def upload_file(self, remote_path: str, content: bytes) -> None:
         try:

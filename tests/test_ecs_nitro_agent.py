@@ -3,8 +3,10 @@ from __future__ import annotations
 import asyncio
 import os
 import time
+from collections.abc import AsyncIterator
 from typing import Any
 
+import httpx
 import pytest
 from ecs_nitro_agents import KEY, ready_agent
 
@@ -51,3 +53,19 @@ async def test_disconnected_client_kills_silent_command(tmp_path: Any) -> None:
             return
         await asyncio.sleep(0.05)
     raise AssertionError("silent command survived its client")
+
+
+@pytest.mark.asyncio
+async def test_agent_rejects_chunked_uploads_and_bad_timeouts() -> None:
+    client = await ready_agent("strict")
+    base = client._base  # pyright: ignore[reportPrivateUsage]
+    headers = client._headers  # pyright: ignore[reportPrivateUsage]
+
+    async def chunks() -> AsyncIterator[bytes]:
+        yield b"data"
+
+    async with httpx.AsyncClient(base_url=base, headers=headers) as http:
+        upload = await http.put("/files?path=/tmp/cbs-chunked", content=chunks())
+        assert upload.status_code == 411
+        bad = await http.post("/exec", json={"command": "sleep 30", "timeout": "bad"})
+        assert bad.status_code == 400

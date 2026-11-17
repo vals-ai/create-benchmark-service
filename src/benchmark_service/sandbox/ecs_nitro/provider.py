@@ -100,12 +100,11 @@ class EcsNitroSandboxProvider(SandboxProvider):
     async def _wait_running(self, task_arn: str, deadline: float) -> dict[str, Any]:
         while True:
             task = await self.describe_task(task_arn)
-            if task is None:
-                raise SandboxError(f"ECS task {task_arn} disappeared during startup")
-            status = task.get("lastStatus")
-            if status == "RUNNING":
+            # RunTask returned this ARN, so a missing task is DescribeTasks lagging, not a lost task.
+            status = None if task is None else task.get("lastStatus")
+            if task is not None and status == "RUNNING":
                 return task
-            if status in ENDED_STATUSES:
+            if task is not None and status in ENDED_STATUSES:
                 raise SandboxError(f"ECS task {task_arn} stopped during startup: {task.get('stoppedReason', status)}")
             if time.monotonic() >= deadline:
                 raise TimeoutError(f"ECS task {task_arn} was still {status} at the create timeout")
@@ -151,6 +150,7 @@ class EcsNitroSandboxProvider(SandboxProvider):
         initial_egress = [] if request.network_block_all else list(self.config.egress_ceiling_cidrs)
         group_id = await self.network.create(sandbox_id, initial_egress)
         task_arn: str | None = None
+        run_params: dict[str, Any] | None = None
         try:
             environment = {
                 **request.env_vars,
@@ -166,36 +166,35 @@ class EcsNitroSandboxProvider(SandboxProvider):
                 SECURITY_GROUP_TAG: group_id,
             }
             run_task_submitted_at = now()
-            started = await self.ecs.call(
-                "RunTask",
-                {
-                    "cluster": self.config.cluster,
-                    "taskDefinition": task_definition,
-                    "count": 1,
-                    "capacityProviderStrategy": [{"capacityProvider": self.config.capacity_provider, "weight": 1}],
-                    "networkConfiguration": {
-                        "awsvpcConfiguration": {
-                            "subnets": self.config.subnet_ids,
-                            "securityGroups": [group_id],
-                            "assignPublicIp": "DISABLED",
-                        }
-                    },
-                    "overrides": {
-                        "cpu": str(math.ceil(request.resources.vcpu * 1024)),
-                        "memory": str(request.resources.memory * 1024),
-                        "containerOverrides": [
-                            {
-                                "name": SANDBOX_CONTAINER,
-                                "environment": [{"name": k, "value": v} for k, v in environment.items()],
-                            }
-                        ],
-                    },
-                    "enableExecuteCommand": False,
-                    "startedBy": STARTED_BY,
-                    "clientToken": sandbox_id,
-                    "tags": [{"key": key, "value": value} for key, value in tags.items()],
+            run_params = {
+                "cluster": self.config.cluster,
+                "taskDefinition": task_definition,
+                "count": 1,
+                "capacityProviderStrategy": [{"capacityProvider": self.config.capacity_provider, "weight": 1}],
+                "networkConfiguration": {
+                    "awsvpcConfiguration": {
+                        "subnets": self.config.subnet_ids,
+                        "securityGroups": [group_id],
+                        "assignPublicIp": "DISABLED",
+                    }
                 },
-            )
+                "overrides": {
+                    "cpu": str(math.ceil(request.resources.vcpu * 1024)),
+                    "memory": str(request.resources.memory * 1024),
+                    "containerOverrides": [
+                        {
+                            "name": SANDBOX_CONTAINER,
+                            "environment": [{"name": k, "value": v} for k, v in environment.items()],
+                        }
+                    ],
+                },
+                "enableExecuteCommand": False,
+                "startedBy": STARTED_BY,
+                "clientToken": sandbox_id,
+                "tags": [{"key": key, "value": value} for key, value in tags.items()],
+            }
+            started = await self.ecs.call("RunTask", run_params)
+            run_params = None
             tasks = started.get("tasks", [])
             if not tasks:
                 reasons = "; ".join(
@@ -224,19 +223,15 @@ class EcsNitroSandboxProvider(SandboxProvider):
             )
             return sandbox
         except BaseException:
-            await asyncio.shield(self._cleanup(sandbox_id, task_arn, group_id))
+            await asyncio.shield(self._cleanup(task_arn, run_params, group_id))
             raise
 
-    async def _find_task_arn(self, sandbox_id: str) -> str | None:
-        async for task in list_tasks(self.ecs, self.config.cluster, ("RUNNING",)):
-            if task_tags(task).get(SANDBOX_ID_TAG) == sandbox_id:
-                return str(task["taskArn"])
-        return None
-
-    async def _cleanup(self, sandbox_id: str, task_arn: str | None, group_id: str) -> None:
+    async def _cleanup(self, task_arn: str | None, run_params: dict[str, Any] | None, group_id: str) -> None:
         try:
-            if task_arn is None:
-                task_arn = await self._find_task_arn(sandbox_id)
+            if task_arn is None and run_params is not None:
+                # Replaying RunTask with the same clientToken returns the task ECS accepted, or one we stop at once.
+                replayed = (await self.ecs.call("RunTask", run_params)).get("tasks", [])
+                task_arn = str(replayed[0]["taskArn"]) if replayed else None
             if task_arn is not None:
                 await self._stop_and_wait(task_arn)
             await self.network.delete(group_id)

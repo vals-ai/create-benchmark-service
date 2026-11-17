@@ -152,7 +152,7 @@ class _Handler(BaseHTTPRequestHandler):
             cwd = request.get("cwd")
             raw_env: dict[str, Any] = request.get("env") or {}
             env = {str(key): str(value) for key, value in raw_env.items()}
-            timeout = request.get("timeout")
+            timeout = None if request.get("timeout") is None else float(request["timeout"])
         except (ValueError, KeyError, TypeError, AttributeError) as error:
             self._reply(400, {"error": f"invalid exec request: {error}"})
             return
@@ -176,7 +176,7 @@ class _Handler(BaseHTTPRequestHandler):
             return
 
         assert process.stdout is not None
-        deadline = None if timeout is None else time.monotonic() + float(timeout)
+        deadline = None if timeout is None else time.monotonic() + timeout
         selector = selectors.DefaultSelector()
         selector.register(process.stdout, selectors.EVENT_READ)
         selector.register(self.connection, selectors.EVENT_READ)
@@ -214,12 +214,15 @@ class _Handler(BaseHTTPRequestHandler):
         path = self._path_param()
         if path is None:
             return
+        if self.headers.get("Content-Length") is None:
+            self._reply(411, {"error": "upload needs a Content-Length"})
+            return
         directory = os.path.dirname(path) or "/"
         try:
             os.makedirs(directory, exist_ok=True)
             fd, temp_path = tempfile.mkstemp(dir=directory, prefix=".cbs-upload-")
             try:
-                remaining = int(self.headers.get("Content-Length") or 0)
+                remaining = int(self.headers["Content-Length"])
                 with os.fdopen(fd, "wb") as handle:
                     while remaining:
                         chunk = self.rfile.read(min(_CHUNK, remaining))

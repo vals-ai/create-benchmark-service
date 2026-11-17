@@ -108,7 +108,7 @@ class Admission:
                 raise SandboxError(f"capacity provider {config.capacity_provider} is not attached to {config.cluster}")
             described = await self.ecs.call(
                 "DescribeCapacityProviders",
-                {"capacityProviders": [config.capacity_provider], "cluster": config.cluster},
+                {"capacityProviders": [config.capacity_provider]},
             )
             provider = next(iter(described.get("capacityProviders", [])), None)
             if provider is None or provider.get("status") != "ACTIVE":

@@ -22,6 +22,23 @@ def _admission(ecs: FakeEcs, **config: Any) -> Admission:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cluster", ["proof", "arn:aws:ecs:us-east-1:123456789012:cluster/proof"])
+async def test_capacity_provider_lookup_uses_only_provider_names(cluster: str) -> None:
+    ecs = FakeEcs()
+    admission = _admission(ecs, cluster=cluster)
+    target_id = admission.target_id
+
+    await admission.verify_infrastructure()
+
+    assert ecs.calls[:2] == [
+        ("DescribeClusters", {"clusters": [cluster]}),
+        ("DescribeCapacityProviders", {"capacityProviders": ["nitro-mi"]}),
+    ]
+    assert admission.config.cluster == cluster
+    assert admission.target_id == target_id
+
+
+@pytest.mark.asyncio
 async def test_capacity_provider_without_nitro_is_refused() -> None:
     with pytest.raises(SandboxError, match="Nitro Enclaves"):
         await _admission(FakeEcs(nitro=False)).verify_infrastructure()

@@ -98,8 +98,19 @@ class FakeEcs:
     async def call(self, action: str, params: Mapping[str, Any]) -> dict[str, Any]:
         self.calls.append((action, dict(params)))
         if action == "DescribeClusters":
-            return {"clusters": [{"status": "ACTIVE", "capacityProviders": ["nitro-mi"]}]}
+            return {
+                "clusters": [
+                    {
+                        "clusterArn": "arn:aws:ecs:us-east-1:123456789012:cluster/proof",
+                        "clusterName": "proof",
+                        "status": "ACTIVE",
+                        "capacityProviders": ["nitro-mi"],
+                    }
+                ]
+            }
         if action == "DescribeCapacityProviders":
+            if "capacityProviders" in params and "cluster" in params:
+                raise AwsApiError("ecs", action, "InvalidParameterException", "Cannot specify both")
             template = {"nitroEnclavesEnabled": self.nitro}
             return {
                 "capacityProviders": [

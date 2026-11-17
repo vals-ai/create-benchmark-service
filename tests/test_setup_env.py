@@ -12,6 +12,7 @@ from pydantic import JsonValue, ValidationError
 
 from benchmark_service.app import BenchmarkServiceApp
 from benchmark_service.client import BenchmarkServiceClient
+from benchmark_service.sandbox.command_env import CommandEnvSandbox
 from benchmark_service.sandbox.modal import ModalProviderConfig
 from benchmark_service.sandbox.types import (
     ExecResult,
@@ -36,6 +37,7 @@ class ProcessSandbox(Sandbox):
     """Runs commands as real local processes; `exec` gets no caller environment, as on every provider."""
 
     commands: list[str] = []
+    closed = 0
 
     @property
     def id(self) -> str:
@@ -64,7 +66,10 @@ class ProcessSandbox(Sandbox):
         env = {name: value for name, value in os.environ.items() if name not in PROXY_ENV} | dict(env_vars or {})
         process = await asyncio.create_subprocess_shell(command, stdout=asyncio.subprocess.PIPE, env=env, cwd=cwd)
         stdout, _ = await process.communicate()
-        yield stdout.decode()
+        try:
+            yield stdout.decode()
+        finally:
+            ProcessSandbox.closed += 1
 
     async def upload_file(self, remote_path: str, content: bytes) -> None:
         raise NotImplementedError
@@ -162,3 +167,13 @@ async def test_client_sends_setup_env_vars_only_when_set() -> None:
 
     assert sent[0]["env_vars"] == PROXY_ENV
     assert "env_vars" not in sent[1]
+
+
+async def test_closing_a_setup_stream_closes_the_providers_stream() -> None:
+    """Closing a setup command stream early closes the provider's stream at once, so its command cleanup runs."""
+    ProcessSandbox.closed = 0
+    stream = CommandEnvSandbox(ProcessSandbox(), PROXY_ENV).command("true")
+    await anext(stream)
+    await stream.aclose()
+
+    assert ProcessSandbox.closed == 1

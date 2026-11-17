@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncGenerator, Mapping
+from contextlib import aclosing
 from datetime import datetime
 from typing import Any
 
@@ -58,8 +59,9 @@ class CommandEnvSandbox(Sandbox):
         env_vars: Mapping[str, str] | None = None,
     ) -> AsyncGenerator[str, None]:
         env = self._env | validate_command_env(env_vars)
-        async for chunk in self._inner.command(command, cwd=cwd, timeout=timeout, env_vars=env):
-            yield chunk
+        async with aclosing(self._inner.command(command, cwd=cwd, timeout=timeout, env_vars=env)) as stream:
+            async for chunk in stream:
+                yield chunk
 
     async def upload_file(self, remote_path: str, content: bytes) -> None:
         await self._inner.upload_file(remote_path, content)
@@ -68,8 +70,9 @@ class CommandEnvSandbox(Sandbox):
         return await self._inner.download_file(remote_path)
 
     async def stream_download(self, remote_path: str) -> AsyncGenerator[bytes, None]:
-        async for chunk in self._inner.stream_download(remote_path):
-            yield chunk
+        async with aclosing(self._inner.stream_download(remote_path)) as stream:
+            async for chunk in stream:
+                yield chunk
 
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
         await self._inner.modify_egress_rules(allowed_addresses)

@@ -195,8 +195,9 @@ class EcsNitroSandboxProvider(SandboxProvider):
             }
             try:
                 started = await self.ecs.call("RunTask", run_params)
-            except AwsApiError:
-                run_params = None
+            except AwsApiError as error:
+                if not error.retryable:
+                    run_params = None
                 raise
             run_params = None
             tasks = started.get("tasks", [])

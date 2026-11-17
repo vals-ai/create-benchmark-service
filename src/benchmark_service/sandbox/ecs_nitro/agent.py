@@ -34,6 +34,7 @@ PORT_ENV = "CBS_AGENT_PORT"
 IDLE_TIMEOUT_ENV = "CBS_AGENT_IDLE_TIMEOUT"
 AGENT_ENV_NAMES = (TOKEN_ENV, PORT_ENV, IDLE_TIMEOUT_ENV)
 TIMEOUT_EXIT_CODE = 124
+_EXIT_POLL_SECONDS = 0.2
 _CHUNK = 1024 * 1024
 
 
@@ -178,19 +179,28 @@ class _Handler(BaseHTTPRequestHandler):
         deadline = None if timeout is None else time.monotonic() + float(timeout)
         selector = selectors.DefaultSelector()
         selector.register(process.stdout, selectors.EVENT_READ)
+        selector.register(self.connection, selectors.EVENT_READ)
+        output_open = True
         try:
-            while True:
+            while output_open or process.poll() is None:
                 wait = None if deadline is None else deadline - time.monotonic()
                 if wait is not None and wait <= 0:
                     _kill_group(process)
                     self._frame({"exit_code": TIMEOUT_EXIT_CODE})
                     return
-                if not selector.select(wait):
-                    continue
-                chunk = os.read(process.stdout.fileno(), 65536)
-                if not chunk:
-                    break
-                self._frame({"output": base64.b64encode(chunk).decode()})
+                if not output_open:
+                    wait = _EXIT_POLL_SECONDS if wait is None else min(wait, _EXIT_POLL_SECONDS)
+                for key, _ in selector.select(wait):
+                    if key.fileobj is self.connection:
+                        # The request body is fully read, so a readable socket means the client went away.
+                        _kill_group(process)
+                        return
+                    chunk = os.read(process.stdout.fileno(), 65536)
+                    if chunk:
+                        self._frame({"output": base64.b64encode(chunk).decode()})
+                    else:
+                        output_open = False
+                        selector.unregister(process.stdout)
             self._frame({"exit_code": process.wait()})
         except (BrokenPipeError, ConnectionResetError):
             _kill_group(process)

@@ -62,6 +62,7 @@ from benchmark_service.schemas import (
     DatasetVersion,
     Episode,
     ListDatasetsResponse,
+    MCPServer,
     ResolveDatasetRequest,
     ResolveDatasetResponse,
     SandboxCreatedData,
@@ -77,6 +78,7 @@ from benchmark_service.valkyrie_stage import Agents, Exhausted, SlotResult, Stag
 __all__ = [
     "DATASET_VERSION_HEADER",
     "CreditedGeneration",
+    "MCPServer",
     "Episode",
     "Agents",
     "Exhausted",

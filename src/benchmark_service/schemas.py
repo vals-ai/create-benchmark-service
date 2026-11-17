@@ -6,7 +6,15 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, assert_never, cast
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, computed_field, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StringConstraints,
+    computed_field,
+    field_validator,
+    model_validator,
+)
 
 from benchmark_service import egress_tunnel
 from benchmark_service.sandbox import SandboxProviderConfig
@@ -297,6 +305,43 @@ class Episode(BaseModel):
     parallel_agents: int = Field(ge=1)
 
 
+class MCPServer(BaseModel):
+    """One MCP server that a task gives to the agent.
+
+    The fields are the fields of `[[environment.mcp_servers]]` in a Harbor `task.toml`, so a
+    benchmark that becomes a Harbor dataset can copy its servers without a change.
+    """
+
+    name: str = Field(min_length=1, description="Name the agent registers the server under")
+    transport: Literal["sse", "streamable-http", "stdio"] = Field(
+        default="sse", description="How the agent reaches the server; 'http' is accepted as 'streamable-http'"
+    )
+    url: str | None = Field(default=None, description="Server URL, required for 'sse' and 'streamable-http'")
+    command: str | None = Field(default=None, description="Command that starts the server, required for 'stdio'")
+    args: list[str] = Field(default_factory=list, description="Arguments of the 'stdio' command")
+    headers: dict[str, str] = Field(
+        default_factory=dict,
+        exclude_if=lambda headers: not headers,
+        description="HTTP headers for 'sse' and 'streamable-http'; never put a secret value here",
+    )
+
+    @field_validator("transport", mode="before")
+    @classmethod
+    def accept_http(cls, value: object) -> object:
+        return "streamable-http" if value == "http" else value
+
+    @model_validator(mode="after")
+    def transport_has_its_target(self) -> "MCPServer":
+        if self.transport == "stdio":
+            if not self.command:
+                raise ValueError("an MCP server with transport 'stdio' needs a command")
+            if self.headers:
+                raise ValueError("headers are only for an MCP server over HTTP")
+        elif not self.url:
+            raise ValueError(f"an MCP server with transport {self.transport!r} needs a url")
+        return self
+
+
 class RetrieveTaskResponse(BaseModel):
     """
     Response containing task metadata and setup requirements.
@@ -352,6 +397,32 @@ class RetrieveTaskResponse(BaseModel):
             "the caller admits, provisions, and cleans up the sandbox"
         ),
     )
+    mcp_servers: list[MCPServer] = Field(
+        default_factory=list[MCPServer],
+        exclude_if=lambda servers: not servers,
+        description=(
+            "MCP servers the task gives to the agent; the caller hands them to the agent, "
+            "so the service writes no agent-specific configuration"
+        ),
+    )
+    skills_dir: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description="Absolute sandbox path of the task's skills folder; the caller hands the path to the agent",
+    )
+
+    @field_validator("mcp_servers")
+    @classmethod
+    def a_later_server_replaces_an_earlier_one_of_the_same_name(cls, servers: list[MCPServer]) -> list[MCPServer]:
+        # Harbor reads `[[environment.mcp_servers]]` the same way.
+        return list({server.name: server for server in servers}.values())
+
+    @field_validator("skills_dir")
+    @classmethod
+    def skills_dir_is_absolute(cls, value: str | None) -> str | None:
+        if value is not None and not value.startswith("/"):
+            raise ValueError(f"skills_dir must be an absolute sandbox path; got {value!r}")
+        return value
 
     @model_validator(mode="after")
     def require_episode_stage_protocol(self) -> "RetrieveTaskResponse":

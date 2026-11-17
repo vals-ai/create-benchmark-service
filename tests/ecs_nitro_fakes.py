@@ -39,10 +39,15 @@ class FakeEc2:
         self.ingress: dict[str, list[dict[str, Any]]] = {}
         self.deleted: list[str] = []
         self.created: list[dict[str, Any]] = []
+        self.invisible_calls = 0
 
     async def call(self, action: str, params: Mapping[str, Any]) -> dict[str, Any]:
         if action == "describe_subnets":
             return {"Subnets": [{"SubnetId": "subnet-a", "VpcId": "vpc-1", "MapPublicIpOnLaunch": False}]}
+        if action not in ("create_security_group", "delete_security_group", "describe_subnets"):
+            if self.invisible_calls:
+                self.invisible_calls -= 1
+                raise AwsApiError("ec2", action, "InvalidGroup.NotFound", "group not visible yet")
         if action == "create_security_group":
             self.created.append(dict(params))
             group = f"sg-{len(self.groups)}"

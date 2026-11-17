@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import ipaddress
 import time
+from collections.abc import Mapping
+from typing import Any
 
 from benchmark_service.sandbox.ecs_nitro.aws import AwsApiError, Ec2Api
 from benchmark_service.sandbox.ecs_nitro.config import SANDBOX_ID_TAG, EcsNitroProviderConfig
@@ -20,6 +22,18 @@ class SecurityGroups:
         self.ec2 = ec2
         self._poll = poll_seconds
         self._delete_timeout = delete_timeout
+
+    async def _call(self, action: str, params: Mapping[str, Any], visible_by: float | None) -> dict[str, Any]:
+        # EC2 is eventually consistent: a group it just created can still read as InvalidGroup.NotFound.
+        while True:
+            try:
+                return await self.ec2.call(action, params)
+            except AwsApiError as error:
+                if error.code != "InvalidGroup.NotFound" or visible_by is None:
+                    raise
+                if time.monotonic() >= visible_by:
+                    raise SandboxError(f"new security group was still not visible to {action}: {error}") from error
+            await asyncio.sleep(self._poll)
 
     def allowed_egress(self, allowed_addresses: list[str]) -> list[str]:
         cidrs, domains = resolve_allowed_addresses(allowed_addresses)
@@ -57,9 +71,10 @@ class SecurityGroups:
             },
         )
         group_id = str(created["GroupId"])
+        visible_by = time.monotonic() + self._delete_timeout
         try:
-            await self.set_egress(group_id, initial_egress)
-            await self.ec2.call(
+            await self.set_egress(group_id, initial_egress, visible_by=visible_by)
+            await self._call(
                 "authorize_security_group_ingress",
                 {
                     "GroupId": group_id,
@@ -72,26 +87,30 @@ class SecurityGroups:
                         }
                     ],
                 },
+                visible_by,
             )
         except BaseException:
             await asyncio.shield(self.delete(group_id))
             raise
         return group_id
 
-    async def set_egress(self, group_id: str, cidrs: list[str]) -> None:
+    async def set_egress(self, group_id: str, cidrs: list[str], *, visible_by: float | None = None) -> None:
         if not group_id:
             raise SandboxError("sandbox has no security group to hold its egress rules")
-        described = await self.ec2.call("describe_security_groups", {"GroupIds": [group_id]})
+        described = await self._call("describe_security_groups", {"GroupIds": [group_id]}, visible_by)
         current = described["SecurityGroups"][0].get("IpPermissionsEgress", [])
         if current:
-            await self.ec2.call("revoke_security_group_egress", {"GroupId": group_id, "IpPermissions": current})
+            await self._call(
+                "revoke_security_group_egress", {"GroupId": group_id, "IpPermissions": current}, visible_by
+            )
         if cidrs:
-            await self.ec2.call(
+            await self._call(
                 "authorize_security_group_egress",
                 {
                     "GroupId": group_id,
                     "IpPermissions": [{"IpProtocol": "-1", "IpRanges": [{"CidrIp": cidr} for cidr in cidrs]}],
                 },
+                visible_by,
             )
 
     async def delete(self, group_id: str) -> None:

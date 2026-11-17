@@ -238,3 +238,13 @@ def test_requests_need_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv(ECS_NITRO_ENABLED_ENV, "true")
     assert _request_may_use_provider(config)
     assert sandbox_provider_config_from_mapping(json.loads(config.model_dump_json())) == config
+
+
+@pytest.mark.asyncio
+async def test_group_that_never_becomes_visible_fails_before_run_task() -> None:
+    ecs, ec2 = FakeEcs(), FakeEc2()
+    ec2.invisible_calls = 10_000
+    with pytest.raises(SandboxError, match="not visible"):
+        await make_provider(ecs, ec2).create_sandbox(make_request())
+    assert not any(action == "RunTask" for action, _ in ecs.calls)
+    assert ec2.deleted == ["sg-0"]

@@ -39,3 +39,12 @@ def test_resource_tags_cannot_use_reserved_prefixes() -> None:
 def test_egress_outside_the_policy_is_refused(address: str, match: str) -> None:
     with pytest.raises(UnsupportedSandboxConfigError, match=match):
         _groups(FakeEc2()).allowed_egress([address])
+
+
+@pytest.mark.asyncio
+async def test_new_group_is_configured_once_ec2_makes_it_visible() -> None:
+    ec2 = FakeEc2()
+    ec2.invisible_calls = 3
+    group = await _groups(ec2).create("sandbox-1", ["10.0.0.0/16"])
+    assert egress_of(ec2, group) == ["10.0.0.0/16"]
+    assert ec2.ingress[group][0]["UserIdGroupPairs"] == [{"GroupId": "sg-control"}]

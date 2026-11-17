@@ -8,6 +8,7 @@ from pydantic import Field, TypeAdapter
 from benchmark_service.sandbox.compose import ComposeSandbox
 from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.daytona_v2 import DaytonaV2ProviderConfig
+from benchmark_service.sandbox.ecs_nitro import EcsNitroProviderConfig
 from benchmark_service.sandbox.local.docker import DockerProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
 from benchmark_service.sandbox.types import (
@@ -38,7 +39,7 @@ from benchmark_service.sandbox.types import (
 )
 
 SandboxProviderConfig = Annotated[
-    DaytonaProviderConfig | DaytonaV2ProviderConfig | ModalProviderConfig | DockerProviderConfig,
+    DaytonaProviderConfig | DaytonaV2ProviderConfig | ModalProviderConfig | DockerProviderConfig | EcsNitroProviderConfig,
     Field(discriminator="type"),
 ]
 
@@ -61,6 +62,7 @@ __all__ = [
     "DaytonaProviderConfig",
     "DaytonaV2ProviderConfig",
     "DockerProviderConfig",
+    "EcsNitroProviderConfig",
     "DockerfileSource",
     "ExecResult",
     "ImageSource",

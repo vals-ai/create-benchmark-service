@@ -133,6 +133,7 @@ def test_a_subclass_can_declare_the_fields_with_its_own_types() -> None:
     )
     assert response.mcp_servers == {"playwright": {"type": "sse", "url": "http://playwright-mcp:3080/sse"}}
     assert response.skills_dir == "skills"
+    assert OwnShape.model_validate_json(response.model_dump_json()) == response
 
 
 def test_a_legacy_response_reads_as_a_task_without_tools() -> None:

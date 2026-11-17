@@ -410,6 +410,14 @@ class RetrieveTaskResponse(BaseModel):
         exclude_if=lambda value: value is None,
         description="Sandbox path of the task's skills folder; the caller hands the path to the agent",
     )
+    task_dir: str | None = Field(
+        default=None,
+        exclude_if=lambda value: value is None,
+        description=(
+            "Sandbox path of a folder of task files that setup writes for the agent; "
+            "the caller hands the path to the agent, so no agent has a fixed path"
+        ),
+    )
 
     @model_validator(mode="after")
     def require_episode_stage_protocol(self) -> "RetrieveTaskResponse":

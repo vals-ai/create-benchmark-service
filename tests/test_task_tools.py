@@ -26,6 +26,7 @@ def test_a_task_without_tools_keeps_the_wire_shape() -> None:
     data = task_response().model_dump(mode="json")
     assert "mcp_servers" not in data
     assert "skills_dir" not in data
+    assert "task_dir" not in data
 
 
 def test_tools_and_skills_survive_the_wire() -> None:
@@ -38,6 +39,7 @@ def test_tools_and_skills_survive_the_wire() -> None:
             MCPServer(name="docs", url="http://docs:3080/sse", headers={"Authorization": "Bearer ${DOCS_TOKEN}"}),
         ],
         skills_dir="/opt/skills",
+        task_dir="/opt/task",
     )
     data = response.model_dump(mode="json")
     assert data["mcp_servers"] == [
@@ -65,6 +67,7 @@ def test_tools_and_skills_survive_the_wire() -> None:
         },
     ]
     assert data["skills_dir"] == "/opt/skills"
+    assert data["task_dir"] == "/opt/task"
     assert RetrieveTaskResponse.model_validate(data) == response
 
 
@@ -147,9 +150,11 @@ def test_a_legacy_response_reads_as_a_task_without_tools() -> None:
     )
     assert response.mcp_servers == []
     assert response.skills_dir is None
+    assert response.task_dir is None
 
 
 def test_the_service_response_has_no_tool_fields_when_unset(client: TestClient) -> None:
     data = client.get("/retrieve-task/", params={"task_id": "task-1"}).json()
     assert "mcp_servers" not in data
     assert "skills_dir" not in data
+    assert "task_dir" not in data

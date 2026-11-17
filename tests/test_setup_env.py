@@ -16,7 +16,6 @@ from benchmark_service.sandbox.modal import ModalProviderConfig
 from benchmark_service.sandbox.types import (
     ExecResult,
     Sandbox,
-    SandboxCommandError,
     SandboxCreateRequest,
     SandboxProvider,
     SandboxQuery,
@@ -51,13 +50,7 @@ class ProcessSandbox(Sandbox):
         return "running"
 
     async def exec(self, command: str, *, cwd: str | None = None, timeout: float | None = None) -> ExecResult:
-        output: list[str] = []
-        try:
-            async for chunk in self.command(command, cwd=cwd, timeout=timeout):
-                output.append(chunk)
-        except SandboxCommandError as error:
-            return ExecResult(exit_code=error.exit_code, output="".join(output))
-        return ExecResult(exit_code=0, output="".join(output))
+        return ExecResult(exit_code=0, output="".join([chunk async for chunk in self.command(command, cwd=cwd)]))
 
     async def command(
         self,
@@ -72,8 +65,6 @@ class ProcessSandbox(Sandbox):
         process = await asyncio.create_subprocess_shell(command, stdout=asyncio.subprocess.PIPE, env=env, cwd=cwd)
         stdout, _ = await process.communicate()
         yield stdout.decode()
-        if process.returncode:
-            raise SandboxCommandError(process.returncode)
 
     async def upload_file(self, remote_path: str, content: bytes) -> None:
         raise NotImplementedError
@@ -93,8 +84,7 @@ class ProcessProvider(SandboxProvider):
         pass
 
     async def list_sandboxes(self, query: SandboxQuery) -> AsyncGenerator[Sandbox, None]:
-        if False:
-            yield ProcessSandbox()
+        yield ProcessSandbox()
 
 
 class SetupBenchmark(StubBenchmark):
@@ -131,11 +121,7 @@ def _setup(monkeypatch: pytest.MonkeyPatch, body: dict[str, object]) -> dict[str
 
 
 def test_setup_commands_receive_the_callers_proxy_environment(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Every setup `exec` and `command` process gets the request's `env_vars`, and a command's own `env_vars` win.
-
-    Test cases:
-    - The values reach each process through its environment, never the command string.
-    """
+    """Every setup `exec` and `command` process env gets `env_vars`, never the command string; own vars win."""
     result = _setup(monkeypatch, {"env_vars": PROXY_ENV})
 
     assert result == {

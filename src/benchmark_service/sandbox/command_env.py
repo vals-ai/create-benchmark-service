@@ -8,11 +8,7 @@ from benchmark_service.sandbox.types import ExecResult, Sandbox, SandboxCommandE
 
 
 class CommandEnvSandbox(Sandbox):
-    """Runs every command of a wrapped sandbox with caller environment variables.
-
-    Values reach each process through the provider's command environment, never the command string.
-    A command's own ``env_vars`` win over the caller's.
-    """
+    """Runs every command of a wrapped sandbox with caller env vars; a command's own ``env_vars`` win."""
 
     def __init__(self, inner: Sandbox, env_vars: Mapping[str, str]) -> None:
         self._inner = inner
@@ -32,22 +28,6 @@ class CommandEnvSandbox(Sandbox):
     @property
     def state(self) -> str:
         return self._inner.state
-
-    @property
-    def labels(self) -> Mapping[str, str] | None:
-        return self._inner.labels
-
-    @labels.setter
-    def labels(self, value: Mapping[str, str] | None) -> None:
-        self._inner.labels = value
-
-    @property
-    def created_at(self) -> datetime | None:
-        return self._inner.created_at
-
-    @created_at.setter
-    def created_at(self, value: datetime | None) -> None:
-        self._inner.created_at = value
 
     @property
     def provider_metadata(self) -> Mapping[str, str]:

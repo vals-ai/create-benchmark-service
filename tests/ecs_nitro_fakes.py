@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 import time
 from collections.abc import Mapping
 from typing import Any
@@ -85,7 +86,9 @@ def run_task_params() -> dict[str, Any]:
 
 
 class FakeEcs:
-    def __init__(self, *, nitro: bool = True, run_status: str = "RUNNING", place: bool = True) -> None:
+    def __init__(
+        self, *, nitro: bool = True, run_status: str = "RUNNING", place: bool = True, cluster_name: str | None = "proof"
+    ) -> None:
         self.calls: list[tuple[str, dict[str, Any]]] = []
         self.tasks: dict[str, dict[str, Any]] = {}
         self.definitions: dict[str, dict[str, Any]] = {}
@@ -94,12 +97,22 @@ class FakeEcs:
         self.place = place
         self.tokens: dict[str, str] = {}
         self.describe_lag = 0
+        self.cluster_name = cluster_name
 
     async def call(self, action: str, params: Mapping[str, Any]) -> dict[str, Any]:
         self.calls.append((action, dict(params)))
         if action == "DescribeClusters":
-            return {"clusters": [{"status": "ACTIVE", "capacityProviders": ["nitro-mi"]}]}
+            cluster = {
+                "clusterArn": "arn:aws:ecs:us-east-1:123456789012:cluster/proof",
+                "status": "ACTIVE",
+                "capacityProviders": ["nitro-mi"],
+            }
+            if self.cluster_name is not None:
+                cluster["clusterName"] = self.cluster_name
+            return {"clusters": [cluster]}
         if action == "DescribeCapacityProviders":
+            if not re.fullmatch(r"[a-zA-Z0-9\-_]+", params.get("cluster", "")):
+                raise AwsApiError("ecs", action, "ClientException", "cluster name must match ^[a-zA-Z0-9\\-_]+$")
             template = {"nitroEnclavesEnabled": self.nitro}
             return {
                 "capacityProviders": [

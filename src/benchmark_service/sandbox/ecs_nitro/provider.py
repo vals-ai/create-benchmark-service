@@ -193,7 +193,11 @@ class EcsNitroSandboxProvider(SandboxProvider):
                 "clientToken": sandbox_id,
                 "tags": [{"key": key, "value": value} for key, value in tags.items()],
             }
-            started = await self.ecs.call("RunTask", run_params)
+            try:
+                started = await self.ecs.call("RunTask", run_params)
+            except AwsApiError:
+                run_params = None
+                raise
             run_params = None
             tasks = started.get("tasks", [])
             if not tasks:
@@ -230,8 +234,11 @@ class EcsNitroSandboxProvider(SandboxProvider):
         try:
             if task_arn is None and run_params is not None:
                 # Replaying RunTask with the same clientToken returns the task ECS accepted, or one we stop at once.
-                replayed = (await self.ecs.call("RunTask", run_params)).get("tasks", [])
-                task_arn = str(replayed[0]["taskArn"]) if replayed else None
+                try:
+                    replayed = (await self.ecs.call("RunTask", run_params)).get("tasks", [])
+                    task_arn = str(replayed[0]["taskArn"]) if replayed else None
+                except Exception:
+                    logger.exception("ecs_nitro could not replay RunTask to find a task whose launch response was lost")
             if task_arn is not None:
                 await self._stop_and_wait(task_arn)
             await self.network.delete(group_id)

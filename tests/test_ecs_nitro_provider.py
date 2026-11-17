@@ -15,6 +15,7 @@ from benchmark_service.app import (
 )
 from benchmark_service.sandbox import sandbox_provider_config_from_mapping
 from benchmark_service.sandbox.ecs_nitro import EcsNitroProviderConfig, EcsNitroSandboxProvider
+from benchmark_service.sandbox.ecs_nitro.aws import AwsApiError
 from benchmark_service.sandbox.ecs_nitro.config import ISOLATION_MODE, SANDBOX_ID_TAG
 from benchmark_service.sandbox.types import (
     ImageSource,
@@ -262,3 +263,20 @@ async def test_describe_lag_after_run_task_does_not_fail_the_create(agent_port: 
     ecs.describe_lag = 2
     sandbox = await make_provider(ecs, ec2, agent_port).create_sandbox(make_request())
     assert (await sandbox.exec("echo ok")).output == "ok\n"
+
+
+class RejectingEcs(FakeEcs):
+    async def call(self, action: str, params: Mapping[str, Any]) -> dict[str, Any]:
+        result = await super().call(action, params)
+        if action == "RunTask":
+            raise AwsApiError("ecs", action, "InvalidParameterException", "rejected")
+        return result
+
+
+@pytest.mark.asyncio
+async def test_rejected_run_task_is_not_replayed_and_deletes_the_group() -> None:
+    ecs, ec2 = RejectingEcs(), FakeEc2()
+    with pytest.raises(AwsApiError, match="rejected"):
+        await make_provider(ecs, ec2).create_sandbox(make_request())
+    assert [action for action, _ in ecs.calls].count("RunTask") == 1
+    assert ec2.deleted == ["sg-0"]

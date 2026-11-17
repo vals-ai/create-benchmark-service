@@ -312,7 +312,7 @@ class MCPServer(BaseModel):
     benchmark that becomes a Harbor dataset can copy its servers without a change.
     """
 
-    name: str = Field(min_length=1, description="Name the agent registers the server under")
+    name: str = Field(description="Name the agent registers the server under")
     transport: Literal["sse", "streamable-http", "stdio"] = Field(
         default="sse", description="How the agent reaches the server; 'http' is accepted as 'streamable-http'"
     )
@@ -408,21 +408,8 @@ class RetrieveTaskResponse(BaseModel):
     skills_dir: str | None = Field(
         default=None,
         exclude_if=lambda value: value is None,
-        description="Absolute sandbox path of the task's skills folder; the caller hands the path to the agent",
+        description="Sandbox path of the task's skills folder; the caller hands the path to the agent",
     )
-
-    @field_validator("mcp_servers")
-    @classmethod
-    def a_later_server_replaces_an_earlier_one_of_the_same_name(cls, servers: list[MCPServer]) -> list[MCPServer]:
-        # Harbor reads `[[environment.mcp_servers]]` the same way.
-        return list({server.name: server for server in servers}.values())
-
-    @field_validator("skills_dir")
-    @classmethod
-    def skills_dir_is_absolute(cls, value: str | None) -> str | None:
-        if value is not None and not value.startswith("/"):
-            raise ValueError(f"skills_dir must be an absolute sandbox path; got {value!r}")
-        return value
 
     @model_validator(mode="after")
     def require_episode_stage_protocol(self) -> "RetrieveTaskResponse":

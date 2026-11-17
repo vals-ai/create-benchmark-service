@@ -7,11 +7,14 @@ import json
 import logging
 from collections.abc import Mapping
 from datetime import UTC, datetime
-from typing import Any, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 from pydantic import BaseModel, Field, field_validator
 
 from benchmark_service.sandbox.types import UnsupportedSandboxConfigError
+
+if TYPE_CHECKING:
+    from benchmark_service.sandbox.types import SandboxProvider
 
 logger = logging.getLogger("benchmark_service.sandbox.ecs_nitro")
 
@@ -83,6 +86,10 @@ class EcsNitroProviderConfig(BaseModel):
     def _validate_ceiling(cls, value: list[str]) -> list[str]:
         return [str(ipaddress.IPv4Network(cidr, strict=False)) for cidr in value]
 
+    def create_provider(self) -> SandboxProvider:
+        from benchmark_service.sandbox.ecs_nitro.provider import EcsNitroSandboxProvider
+
+        return EcsNitroSandboxProvider(self)
 
 
 def agent_token(key: str, sandbox_id: str) -> str:

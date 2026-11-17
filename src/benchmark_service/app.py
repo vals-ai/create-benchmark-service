@@ -59,6 +59,7 @@ from benchmark_service.schemas import (
 from benchmark_service.sandbox import (
     DaytonaProviderConfig,
     DockerProviderConfig,
+    EcsNitroProviderConfig,
     SandboxProviderConfig,
 )
 
@@ -120,13 +121,18 @@ def _request_sandbox_provider_config(
 
 
 DOCKER_ENABLED_ENV = "CBS_DOCKER_ENABLED"
-_DOCKER_DISABLED_REASON = "Docker sandboxes are disabled on this service"
+ECS_NITRO_ENABLED_ENV = "CBS_ECS_NITRO_ENABLED"
+_DOCKER_DISABLED_REASON = "This sandbox provider is disabled on this service"
 _AUTH_UNAVAILABLE_DETAIL = "Authentication is unavailable; this request was not started"
 
 
 def _request_may_use_provider(config: SandboxProviderConfig | None) -> bool:
     """Docker needs no caller credentials and drives this host's daemon, so only an opted-in service accepts it."""
-    return not isinstance(config, DockerProviderConfig) or os.environ.get(DOCKER_ENABLED_ENV, "").lower() == "true"
+    if isinstance(config, DockerProviderConfig):
+        return os.environ.get(DOCKER_ENABLED_ENV, "").lower() == "true"
+    if isinstance(config, EcsNitroProviderConfig):
+        return os.environ.get(ECS_NITRO_ENABLED_ENV, "").lower() == "true"
+    return True
 
 
 def _grading_credentials(

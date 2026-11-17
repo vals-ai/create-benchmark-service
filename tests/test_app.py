@@ -842,7 +842,7 @@ def test_request_docker_provider_requires_service_opt_in(
                 ws.receive_json()
     assert exc_info.value.code == 1008
     assert exc_info.value.reason == (
-        "Dataset not allowed" if enabled else "Docker sandboxes are disabled on this service"
+        "Dataset not allowed" if enabled else "This sandbox provider is disabled on this service"
     )
 
 
@@ -863,7 +863,7 @@ def test_evaluate_response_docker_provider_requires_service_opt_in(
         )
     assert response.status_code == 403
     assert response.json() == {
-        "detail": "Dataset not allowed" if enabled else "Docker sandboxes are disabled on this service"
+        "detail": "Dataset not allowed" if enabled else "This sandbox provider is disabled on this service"
     }
 
 

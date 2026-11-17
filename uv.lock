@@ -491,6 +491,9 @@ dependencies = [
 ]
 
 [package.optional-dependencies]
+ecs = [
+    { name = "boto3" },
+]
 vals-ai = [
     { name = "boto3" },
     { name = "cachetools" },
@@ -515,6 +518,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "aiodocker", specifier = ">=0.26,<1" },
+    { name = "boto3", marker = "extra == 'ecs'", specifier = ">=1.34" },
     { name = "boto3", marker = "extra == 'vals-ai'", specifier = ">=1.34" },
     { name = "cachetools", marker = "extra == 'vals-ai'", specifier = ">=5.5.0" },
     { name = "certifi", specifier = ">=2026.10.19" },
@@ -535,7 +539,7 @@ requires-dist = [
     { name = "tenacity", specifier = ">=8.3.0" },
     { name = "websockets", specifier = ">=15.0.1" },
 ]
-provides-extras = ["vals-ai"]
+provides-extras = ["ecs", "vals-ai"]
 
 [package.metadata.requires-dev]
 dev = [

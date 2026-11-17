@@ -7,7 +7,7 @@ import inspect
 import logging
 import os
 import time
-from collections.abc import Awaitable, Callable, Generator
+from collections.abc import Awaitable, Callable, Generator, Mapping
 from typing import Any, TypeVar, cast
 
 import httpx
@@ -628,6 +628,7 @@ class BenchmarkServiceClient:
         dataset: str | None = None,
         child_egress: dict[str, ChildEgress] | None = None,
         remote_grading_authorization: RemoteGradingAuthorization | None = None,
+        env_vars: Mapping[str, str] | None = None,
     ) -> SetupTaskResponse:
         """Set up a task instance via WebSocket.
 
@@ -636,6 +637,7 @@ class BenchmarkServiceClient:
             instance_id: The instance to set up.
             sandbox_provider: Sandbox provider config for the task sandbox.
             on_message: Optional callback for intermediate progress messages.
+            env_vars: Environment for every setup command in the task sandbox; a command's own env_vars win.
         """
         request = SetupTaskRequest(
             task_id=task_id,
@@ -643,6 +645,7 @@ class BenchmarkServiceClient:
             sandbox_provider=sandbox_provider,
             dataset=dataset,
             child_egress=child_egress or {},
+            env_vars=dict(env_vars or {}),
         )
         result = await self._websocket_request(
             "setup-task", request, on_message, remote_grading_authorization=remote_grading_authorization
@@ -718,7 +721,11 @@ class BenchmarkServiceClient:
             child_egress=child_egress or {},
         )
         return await self._websocket_request(
-            "evaluate-response", request, on_message, on_eval_resume_state, on_sandbox_created,
+            "evaluate-response",
+            request,
+            on_message,
+            on_eval_resume_state,
+            on_sandbox_created,
             remote_grading_authorization=remote_grading_authorization,
         )
 
@@ -756,7 +763,11 @@ class BenchmarkServiceClient:
             child_egress=child_egress or {},
         )
         return await self._websocket_request(
-            "evaluate-instance", request, on_message, on_eval_resume_state, on_sandbox_created,
+            "evaluate-instance",
+            request,
+            on_message,
+            on_eval_resume_state,
+            on_sandbox_created,
             remote_grading_authorization=remote_grading_authorization,
         )
 

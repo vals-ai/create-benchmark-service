@@ -6,7 +6,7 @@ from pathlib import Path
 from typing import Annotated, Any, Literal, assert_never, cast
 from urllib.parse import urlsplit
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, computed_field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, computed_field, field_validator, model_validator
 
 from benchmark_service import egress_tunnel
 from benchmark_service.sandbox import SandboxProviderConfig
@@ -21,6 +21,7 @@ from benchmark_service.sandbox.types import (
     SnapshotSource,
     TargetedSnapshotSource,
     VolumeMount,
+    validate_command_env,
 )
 
 _COMPOSE_LEGACY_DOCKER_IMAGE = "compose+source-required"
@@ -384,6 +385,8 @@ class RetrieveTaskResponse(BaseModel):
 class SetupTaskRequest(BaseModel):
     """Request to setup a task in a sandbox environment."""
 
+    model_config = ConfigDict(hide_input_in_errors=True)
+
     task_id: str = Field(description="Unique identifier for the task")
     instance_id: str = Field(description="Unique identifier for the sandbox instance")
     sandbox_provider: SandboxProviderConfig | None = Field(default=None, description="Sandbox provider config")
@@ -393,6 +396,20 @@ class SetupTaskRequest(BaseModel):
         exclude_if=lambda value: not value,
         description="Proxy access by child profile for sandboxes the service creates; older clients omit it",
     )
+    env_vars: dict[str, str] = Field(
+        default={},
+        repr=False,
+        exclude_if=lambda value: not value,
+        description=(
+            "Environment for every setup command in the task sandbox, such as proxy and CA settings; "
+            "a command's own env_vars win"
+        ),
+    )
+
+    @field_validator("env_vars")
+    @classmethod
+    def validate_env_vars(cls, env_vars: dict[str, str]) -> dict[str, str]:
+        return validate_command_env(env_vars)
 
 
 class SetupTaskResponse(BaseModel):

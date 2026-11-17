@@ -20,7 +20,13 @@ from websockets.exceptions import ConnectionClosed
 from benchmark_service._version import __version__ as _framework_version
 from benchmark_service.auth import UNAUTHENTICATED_TENANT_SENTINEL, AuthenticationUnavailableError, is_auth_required
 from benchmark_service.base import BenchmarkService
-from benchmark_service.draining import DRAIN_STATE_PATH_ENV, DrainMiddleware, DrainState, reject_unstarted, unstarted_response
+from benchmark_service.draining import (
+    DRAIN_STATE_PATH_ENV,
+    DrainMiddleware,
+    DrainState,
+    reject_unstarted,
+    unstarted_response,
+)
 from benchmark_service.grading_credentials import evaluation_caller_scope, grading_credentials
 from benchmark_service.observability import ATTEMPT_ID_HEADER, EMAIL_HEADER, RUN_ID_HEADER
 from benchmark_service.context import child_egress_scope, sandbox_provider_scope, tenant_scope
@@ -28,6 +34,7 @@ from benchmark_service.remote_grading import (
     remote_grading_authorization_from_headers,
     remote_grading_authorization_scope,
 )
+from benchmark_service.sandbox.command_env import CommandEnvSandbox
 from benchmark_service.sandbox.created import AnnouncedSandboxProvider, SandboxCreatedHook, sandbox_created_scope
 from benchmark_service.schemas import (
     DATASET_VERSION_HEADER,
@@ -524,6 +531,8 @@ class BenchmarkServiceApp(FastAPI):
             async with self._dataset_scope(websocket, tenant, request.dataset, task_id=request.task_id):
                 async with sandbox_config.create_provider() as provider:
                     sandbox = await provider.get_sandbox(request.instance_id)
+                    if request.env_vars:
+                        sandbox = CommandEnvSandbox(sandbox, request.env_vars)
 
                     with (
                         evaluation_caller_scope(

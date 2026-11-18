@@ -213,6 +213,21 @@ allocate capacity or enforce a caller's scheduling policy.
 - Egress is set only at creation (`network_block_all`). `modify_egress_rules`, `block_all_egress` and `clear_egress_rules` raise, so eval resume with a non-empty `egress.evaluation` list fails right after it creates the sandbox.
 - Does not send `sandbox_created` announcements yet: `SandboxCreatedData.provider` only accepts `daytona`.
 
+`lambda_microvm` is opt-in (AWS Lambda MicroVMs, Firecracker; MVP):
+
+```json
+{"type": "lambda_microvm", "LAMBDA_MICROVM_REGION": "us-east-1", "LAMBDA_MICROVM_IMAGE": "arn:aws:lambda:...:microvm-image:...", "LAMBDA_MICROVM_BUILD_BUCKET": "...", "LAMBDA_MICROVM_BUILD_ROLE_ARN": "...", "LAMBDA_MICROVM_EXECUTION_ROLE_ARN": "..."}
+```
+
+- AWS credentials come from the SDK's default chain, not the config.
+- Each sandbox is one MicroVM. The image runs `sandbox/lambda_microvm/agent.py`, which serves exec and file routes on port 8080 behind the MicroVM's HTTPS endpoint and Lambda's lifecycle hooks on port 9000. Auth tokens cover port 8080 only.
+- An `image` source that is a MicroVM image ARN, or any `snapshot`, starts that image. A container `image` reference or a `dockerfile` source (with its folder as build context) is built into a MicroVM image named by a hash of its inputs, then reused. Building needs `LAMBDA_MICROVM_BUILD_BUCKET` and `LAMBDA_MICROVM_BUILD_ROLE_ARN`, and the image needs `python3`.
+- Size: an image has a fixed baseline of 0.5 to 8 GiB (2 GiB per vCPU) and bursts to 4x. A build picks the smallest baseline whose peak covers the request. Disk is at most 32 GiB, and a MicroVM lives at most 8 hours.
+- Labels, name, and `env_vars` travel in the run-hook payload, because MicroVMs carry no tags. Listing reads them back from each running MicroVM's agent.
+- `auto_stop_interval` becomes the idle timeout, after which Lambda terminates the MicroVM. `network_block_all` starts it without internet egress.
+- Rejects GPUs, nested Docker, volumes, and sandbox secrets. Egress can't change after creation. `cost_usd` is not priced yet.
+- Try it from a shell: `python -m benchmark_service.sandbox.lambda_microvm build-image | up | exec | upload | download | down | ls`.
+
 When a setup or evaluate-instance request omits `sandbox_provider`, the Daytona header fallback reads
 `x-api-key`, `x-api-url`, and `x-target`, plus optional `x-organization-id`. The
 `daytona_api_key`, `daytona_api_url`, and `daytona_target` aliases are also accepted.
@@ -658,7 +673,7 @@ Pydantic models used across requests and responses:
 - **`SandboxSource`** — `ImageSource`, `SnapshotSource`, top-level Daytona-only `TargetedSnapshotSource`, `DockerfileSource`, or `ComposeSource` with an outer image/snapshot
 - **`EvalSandboxSpec`** — grading overrides whose optional `source` is an image or snapshot, never `ComposeSource`
 - **`GradingSubmission`** — typed `TextGradingSubmission` or `ArtifactGradingSubmission` passed only to the sandbox-grading hook
-- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`: `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET, DAYTONA_ORGANIZATION_ID=None)`, `DaytonaV2ProviderConfig(type="daytona_v2", DAYTONA_V2_API_KEY, DAYTONA_V2_API_URL="https://api.daytona.com", DAYTONA_V2_REGION=None, DAYTONA_V2_SPOT=False)`, `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)`, or `DockerProviderConfig(type="docker")`. Docker requests require `CBS_DOCKER_ENABLED=true` on the benchmark service.
+- **`SandboxProviderConfig`** — request-scoped provider config selected by `type`: `DaytonaProviderConfig(type="daytona", DAYTONA_API_KEY, DAYTONA_API_URL, DAYTONA_TARGET, DAYTONA_ORGANIZATION_ID=None)`, `DaytonaV2ProviderConfig(type="daytona_v2", DAYTONA_V2_API_KEY, DAYTONA_V2_API_URL="https://api.daytona.com", DAYTONA_V2_REGION=None, DAYTONA_V2_SPOT=False)`, `ModalProviderConfig(type="modal", MODAL_TOKEN_ID, MODAL_TOKEN_SECRET)`, `DockerProviderConfig(type="docker")`, or `LambdaMicrovmProviderConfig(type="lambda_microvm", LAMBDA_MICROVM_REGION="us-east-1", LAMBDA_MICROVM_IMAGE=None, LAMBDA_MICROVM_EXECUTION_ROLE_ARN=None, LAMBDA_MICROVM_BUILD_BUCKET=None, LAMBDA_MICROVM_BUILD_ROLE_ARN=None, LAMBDA_MICROVM_ARCHITECTURE="ARM_64", LAMBDA_MICROVM_MAX_DURATION_SECONDS=28800)`. Docker requests require `CBS_DOCKER_ENABLED=true` on the benchmark service.
 - **`Resources`** — `vcpu`, `memory`, `disk`, optional `gpu` (count, default 0) and `gpu_type` (one type or a list of acceptable types, in order of preference; requires `gpu >= 1`)
 - **`VolumeMount`** — named persistent volume, absolute `mount_path`, optional `read_only`, `create_if_missing`, and relative `subpath`; `{run_id}` in a subpath resolves from the sandbox's `run-id` or `run_id` label and fails when that label is absent
 - **`GradingRequirementsRequest`** / **`GradingRequirementsResponse`** — task ID and nullable dataset select the complete Gateway model keys for that task

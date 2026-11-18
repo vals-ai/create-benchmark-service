@@ -5,6 +5,9 @@ Run: uv run pytest tests/test_vals_sandbox.py
 
 from __future__ import annotations
 
+import asyncio
+import base64
+import ipaddress
 import json
 import threading
 import zipfile
@@ -397,3 +400,46 @@ async def test_egress_policy_decisions(policy: EgressPolicy, host: str, allowed:
 
     address = await EgressProxy("admin", resolve=resolve).choose_address(policy, host, 443)
     assert (address is not None) == allowed
+
+
+async def test_deny_all_never_resolves_names() -> None:
+    resolved: list[str] = []
+
+    async def resolve(host: str, _port: int) -> list[str]:
+        resolved.append(host)
+        return ["93.184.216.34"]
+
+    proxy = EgressProxy("admin", resolve=resolve)
+    assert await proxy.choose_address(EgressPolicy(token="t", mode="deny_all"), "secret.attacker.test", 443) is None
+    assert resolved == []
+
+
+async def test_policy_change_closes_open_tunnels() -> None:
+    """An open CONNECT tunnel is closed when its sandbox's policy changes, so revocation covers it."""
+    echo = await asyncio.start_server(lambda r, w: None, "127.0.0.1", 0)
+    echo_port = echo.sockets[0].getsockname()[1]
+
+    async def resolve(_host: str, _port: int) -> list[str]:
+        return ["127.0.0.1"]
+
+    proxy = EgressProxy("admin", resolve=resolve)
+    proxy.policies["sb"] = EgressPolicy(token="tok", mode="allowlist", cidrs=[ipaddress.IPv4Network("127.0.0.1/32")])
+    proxy_server, admin_server = await egress_serve(proxy, host="127.0.0.1", proxy_port=0, admin_port=0)
+    try:
+        reader, writer = await asyncio.open_connection("127.0.0.1", proxy_server.sockets[0].getsockname()[1])
+        auth = base64.b64encode(b"sb:tok").decode()
+        writer.write(f"CONNECT echo.test:{echo_port} HTTP/1.1\r\nProxy-Authorization: Basic {auth}\r\n\r\n".encode())
+        assert (await reader.readuntil(b"\r\n\r\n")).startswith(b"HTTP/1.1 200")
+        async with httpx.AsyncClient() as client:
+            response = await client.put(
+                f"http://127.0.0.1:{admin_server.sockets[0].getsockname()[1]}/sandboxes/sb",
+                headers={"Authorization": "Bearer admin"},
+                json={"mode": "deny_all"},
+            )
+        assert response.status_code == 204
+        assert await asyncio.wait_for(reader.read(), 5) == b""
+        assert proxy.policies["sb"].token == "tok"
+        writer.close()
+    finally:
+        for server in (proxy_server, admin_server, echo):
+            server.close()

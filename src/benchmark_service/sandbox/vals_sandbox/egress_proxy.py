@@ -23,6 +23,7 @@ import ipaddress
 import json
 import os
 import socket
+import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Literal
@@ -40,6 +41,7 @@ class EgressPolicy:
     mode: Mode = "allow_all"
     domains: list[str] = field(default_factory=list)
     cidrs: list[ipaddress.IPv4Network] = field(default_factory=list)
+    expires_at: float = float("inf")
 
     def allows_host(self, host: str) -> bool:
         host = host.lower().rstrip(".")
@@ -75,9 +77,23 @@ class EgressProxy:
         self._admin_token = admin_token
         self._resolve = resolve
         self.policies: dict[str, EgressPolicy] = {}
+        self._tunnels: dict[str, set[asyncio.StreamWriter]] = {}
+
+    def _drop(self, sandbox_id: str) -> None:
+        """Close a sandbox's open connections, so a policy change also applies to traffic already flowing."""
+        for writer in self._tunnels.pop(sandbox_id, set()):
+            writer.close()
+
+    def _expire(self) -> None:
+        now = time.monotonic()
+        for sandbox_id in [key for key, policy in self.policies.items() if policy.expires_at <= now]:
+            del self.policies[sandbox_id]
+            self._drop(sandbox_id)
 
     async def choose_address(self, policy: EgressPolicy, host: str, port: int) -> str | None:
         """The address to connect to, or None when the policy refuses every address the host has."""
+        if policy.mode == "deny_all":
+            return None
         host_allowed = policy.allows_host(host)
         try:
             addresses = [ipaddress.ip_address(host)]
@@ -93,7 +109,7 @@ class EgressProxy:
                 return str(address)
         return None
 
-    def _authenticate(self, headers: dict[str, str]) -> EgressPolicy | None:
+    def _authenticate(self, headers: dict[str, str]) -> tuple[str, EgressPolicy] | None:
         scheme, _, credentials = headers.get("proxy-authorization", "").partition(" ")
         if scheme.lower() != "basic":
             return None
@@ -101,19 +117,21 @@ class EgressProxy:
             sandbox_id, _, token = base64.b64decode(credentials).decode().partition(":")
         except ValueError:
             return None
+        self._expire()
         policy = self.policies.get(sandbox_id)
         if policy is None or not hmac.compare_digest(policy.token, token):
             return None
-        return policy
+        return sandbox_id, policy
 
     async def handle_proxy(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
         try:
             request_line, headers, raw = await _read_head(reader)
             method, target, version = request_line.split(" ", 2)
-            policy = self._authenticate(headers)
-            if policy is None:
+            authenticated = self._authenticate(headers)
+            if authenticated is None:
                 await _respond(writer, 407, extra='Proxy-Authenticate: Basic realm="vals-sandbox"\r\n')
                 return
+            sandbox_id, policy = authenticated
             if method == "CONNECT":
                 host, _, port_text = target.rpartition(":")
                 upstream_head = b""
@@ -126,8 +144,12 @@ class EgressProxy:
                 path = url.path or "/"
                 if url.query:
                     path += f"?{url.query}"
-                kept = [line for line in raw.split(b"\r\n")[1:] if not line.lower().startswith(b"proxy-")]
-                upstream_head = f"{method} {path} {version}\r\n".encode() + b"\r\n".join(kept)
+                # One request per connection: a reused connection must not reach this origin unparsed.
+                dropped = (b"proxy-", b"connection:", b"keep-alive:")
+                kept = [line for line in raw.split(b"\r\n")[1:-2] if not line.lower().startswith(dropped)]
+                upstream_head = b"\r\n".join(
+                    [f"{method} {path} {version}".encode(), *kept, b"Connection: close", b"", b""]
+                )
             host = host.strip("[]")
             port = int(port_text)
             address = await self.choose_address(policy, host, port)
@@ -141,12 +163,19 @@ class EgressProxy:
             except (OSError, TimeoutError):
                 await _respond(writer, 502)
                 return
+            tunnels = self._tunnels.setdefault(sandbox_id, set())
+            tunnels.add(writer)
             if method == "CONNECT":
                 writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
                 await writer.drain()
             else:
                 upstream_writer.write(upstream_head)
-            await asyncio.gather(_pipe(reader, upstream_writer), _pipe(upstream_reader, writer))
+            if method == "CONNECT":
+                await asyncio.gather(_pipe(reader, upstream_writer), _pipe(upstream_reader, writer))
+            else:
+                await _pipe(upstream_reader, writer)
+                upstream_writer.close()
+            tunnels.discard(writer)
         except (ValueError, asyncio.IncompleteReadError, ConnectionError):
             pass
         finally:
@@ -168,15 +197,19 @@ class EgressProxy:
             sandbox_id = target[len(prefix) :]
             if method == "PUT":
                 spec = json.loads(body)
+                self._expire()
                 existing = self.policies.get(sandbox_id)
                 self.policies[sandbox_id] = EgressPolicy(
                     token=str(spec["token"] if "token" in spec or existing is None else existing.token),
                     mode=spec.get("mode", "allow_all"),
                     domains=[str(d) for d in spec.get("domains", [])],
                     cidrs=[ipaddress.IPv4Network(c) for c in spec.get("cidrs", [])],
+                    expires_at=_expiry(spec, existing),
                 )
+                self._drop(sandbox_id)
             elif method == "DELETE":
                 self.policies.pop(sandbox_id, None)
+                self._drop(sandbox_id)
             else:
                 await _respond(writer, 405)
                 return
@@ -185,6 +218,13 @@ class EgressProxy:
             await _respond(writer, 400)
         finally:
             writer.close()
+
+
+def _expiry(spec: dict[str, object], existing: EgressPolicy | None) -> float:
+    ttl = spec.get("ttl_seconds")
+    if isinstance(ttl, (int, float)):
+        return time.monotonic() + float(ttl)
+    return existing.expires_at if existing is not None else float("inf")
 
 
 async def _read_head(reader: asyncio.StreamReader) -> tuple[str, dict[str, str], bytes]:

@@ -259,6 +259,7 @@ class ValsSandboxProvider(SandboxProvider):
         self._s3 = s3
         self.http = http or httpx.AsyncClient(timeout=httpx.Timeout(60.0))
         self._tokens: dict[str, tuple[str, str, float]] = {}
+        self._egress_ids: dict[str, str] = {}
 
     def _client(self, service: str) -> Any:
         return aws_client(service, self.config.VALS_SANDBOX_REGION)
@@ -343,7 +344,9 @@ class ValsSandboxProvider(SandboxProvider):
             egress_id = f"egress-{uuid.uuid4().hex}"
             token = secrets.token_urlsafe(32)
             mode = "deny_all" if request.network_block_all else "allow_all"
-            await self.put_egress_policy(egress_id, {"token": token, "mode": mode})
+            # The TTL lets the proxy drop a policy whose MicroVM ended without being deleted.
+            ttl = self.config.VALS_SANDBOX_MAX_DURATION_SECONDS + 600
+            await self.put_egress_policy(egress_id, {"token": token, "mode": mode, "ttl_seconds": ttl})
             payload["egress_id"] = egress_id
             payload["env_vars"] = {**request.env_vars, **self._proxy_env(egress_id, token)}
             egress_connectors = [self.config.VALS_SANDBOX_EGRESS_CONNECTOR or ""]
@@ -370,6 +373,8 @@ class ValsSandboxProvider(SandboxProvider):
                 await asyncio.shield(self._delete_egress_quietly(egress_id))
             raise
         sandbox = ValsSandbox(self, data)
+        if egress_id is not None:
+            self._egress_ids[sandbox.id] = egress_id
         try:
             await self._wait_ready(sandbox, request.create_timeout)
         except BaseException:
@@ -435,8 +440,8 @@ class ValsSandboxProvider(SandboxProvider):
         return sandbox
 
     async def delete_sandbox(self, instance_id: str) -> None:
-        egress_id: str | None = None
-        if self.config.proxied_egress:
+        egress_id = self._egress_ids.pop(instance_id, None)
+        if self.config.proxied_egress and egress_id is None:
             try:
                 egress_id = (await self.get_sandbox(instance_id)).egress_id
             except SandboxError:

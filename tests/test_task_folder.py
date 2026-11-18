@@ -120,10 +120,37 @@ def test_snap_and_medicaid_task_toml_match_service(benchmark: str) -> None:
     assert "agent" not in tomllib.loads(text)
 
 
-def test_task_toml_escapes_strings() -> None:
-    task_id = 'id "quoted" \\ é\nline'
-    folder = TaskFolder(instruction="q", metadata={"task_id": task_id})
-    assert tomllib.loads(folder.task_toml())["metadata"]["task_id"] == task_id
+@pytest.mark.parametrize(
+    "task_id",
+    [
+        'quote " and backslash \\ and é and\na line break',
+        'odd"id\\x',
+        "tab\tand bell\x07and delete\x7f",
+        "astral \U0001f600",
+        "",
+    ],
+)
+def test_task_toml_escapes_strings(task_id: str) -> None:
+    folder = TaskFolder(instruction="q", metadata={"task_id": task_id, "key with space": task_id})
+    metadata = tomllib.loads(folder.task_toml())["metadata"]
+    assert metadata == {"task_id": task_id, "key with space": task_id}
+
+
+def test_task_toml_text_for_plain_values() -> None:
+    folder = TaskFolder(
+        instruction="q",
+        metadata={"benchmark": "a2j", "task_id": "both__abc", "n": 3, "ok": True, "f": 1.5},
+        agent_timeout_sec=10800,
+    )
+    assert folder.task_toml() == (
+        'schema_version = "1.3"\n\n[metadata]\nbenchmark = "a2j"\ntask_id = "both__abc"\n'
+        "n = 3\nok = true\nf = 1.5\n\n[agent]\ntimeout_sec = 10800.0\n"
+    )
+
+
+def test_task_toml_refuses_a_value_that_does_not_read_back() -> None:
+    with pytest.raises(ValueError, match="does not round-trip"):
+        TaskFolder(instruction="q", metadata={"score": float("nan")}).task_toml()
 
 
 async def test_write_task_folder_creates_directories_and_uploads_each_file() -> None:

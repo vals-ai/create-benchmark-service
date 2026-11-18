@@ -148,6 +148,26 @@ def test_task_toml_text_for_plain_values() -> None:
     )
 
 
+@pytest.mark.parametrize("key", ["", "a.b", "é", "1", '"', "bare-key_1"])
+def test_task_toml_keeps_each_key_as_one_key(key: str) -> None:
+    folder = TaskFolder(instruction="q", metadata={key: "v"})
+    assert tomllib.loads(folder.task_toml())["metadata"] == {key: "v"}
+
+
+def test_task_toml_keeps_number_and_bool_types() -> None:
+    metadata: dict[str, str | int | float | bool] = {
+        "yes": True,
+        "no": False,
+        "count": -3,
+        "small": 1e-7,
+        "big": 1e16,
+        "inf": float("inf"),
+    }
+    parsed = tomllib.loads(TaskFolder(instruction="q", metadata=metadata).task_toml())["metadata"]
+    assert parsed == metadata
+    assert {key: type(value) for key, value in parsed.items()} == {key: type(value) for key, value in metadata.items()}
+
+
 def test_task_toml_refuses_a_value_that_does_not_read_back() -> None:
     with pytest.raises(ValueError, match="does not round-trip"):
         TaskFolder(instruction="q", metadata={"score": float("nan")}).task_toml()

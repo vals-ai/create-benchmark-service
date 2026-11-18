@@ -10,16 +10,18 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import secrets
 import time
 import uuid
 from collections.abc import AsyncGenerator, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Literal, Self
 
 import httpx
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 
+from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.vals_sandbox.image import (
     DEFAULT_BASE_DOCKERFILE,
     aws_client,
@@ -66,6 +68,26 @@ class ValsSandboxProviderConfig(BaseModel):
     VALS_SANDBOX_BUILD_ROLE_ARN: str | None = None
     VALS_SANDBOX_ARCHITECTURE: Literal["ARM_64", "X86_64"] = "ARM_64"
     VALS_SANDBOX_MAX_DURATION_SECONDS: int = MAX_DURATION_SECONDS
+    VALS_SANDBOX_EGRESS_CONNECTOR: str | None = None
+    VALS_SANDBOX_EGRESS_PROXY_URL: str | None = None
+    VALS_SANDBOX_EGRESS_ADMIN_URL: str | None = None
+    VALS_SANDBOX_EGRESS_ADMIN_TOKEN: str | None = None
+
+    @model_validator(mode="after")
+    def _validate_egress(self) -> Self:
+        egress = (
+            self.VALS_SANDBOX_EGRESS_CONNECTOR,
+            self.VALS_SANDBOX_EGRESS_PROXY_URL,
+            self.VALS_SANDBOX_EGRESS_ADMIN_URL,
+            self.VALS_SANDBOX_EGRESS_ADMIN_TOKEN,
+        )
+        if any(egress) and not all(egress):
+            raise ValueError("Set all of VALS_SANDBOX_EGRESS_* or none of them")
+        return self
+
+    @property
+    def proxied_egress(self) -> bool:
+        return bool(self.VALS_SANDBOX_EGRESS_CONNECTOR)
 
     @classmethod
     def from_env(cls) -> "ValsSandboxProviderConfig":
@@ -99,6 +121,7 @@ class ValsSandbox(Sandbox):
         self._provider = provider
         self.data = dict(data)
         self._name = self.id
+        self.egress_id: str | None = None
         started = self.data.get("startedAt")
         self.created_at = started.astimezone(UTC) if isinstance(started, datetime) else None
 
@@ -125,6 +148,7 @@ class ValsSandbox(Sandbox):
 
     def _apply_info(self, info: Mapping[str, Any]) -> None:
         self._name = str(info.get("name") or self.id)
+        self.egress_id = str(info["egress_id"]) if info.get("egress_id") else None
         labels: Mapping[str, Any] = info.get("labels") or {}
         self.labels = {str(key): str(value) for key, value in labels.items()}
 
@@ -194,6 +218,21 @@ class ValsSandbox(Sandbox):
 
     async def download_file(self, remote_path: str) -> bytes:
         return (await self._request("GET", "/files", params={"path": remote_path})).content
+
+    async def _set_egress(self, policy: dict[str, Any]) -> None:
+        if self.egress_id is None:
+            raise SandboxError("Egress rules need a provider configured with VALS_SANDBOX_EGRESS_*")
+        await self._provider.put_egress_policy(self.egress_id, policy)
+
+    async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
+        cidrs, domains = resolve_allowed_addresses(allowed_addresses)
+        await self._set_egress({"mode": "allowlist", "domains": domains, "cidrs": cidrs})
+
+    async def block_all_egress(self) -> None:
+        await self._set_egress({"mode": "deny_all"})
+
+    async def clear_egress_rules(self) -> None:
+        await self._set_egress({"mode": "allow_all"})
 
 
 def _raise_for_status(response: httpx.Response, sandbox_id: str, path: str) -> None:
@@ -292,12 +331,22 @@ class ValsSandboxProvider(SandboxProvider):
 
         image_arn = await self._image_arn(request)
         region = self.config.VALS_SANDBOX_REGION
-        payload = {
+        payload: dict[str, Any] = {
             "name": request.name,
             "labels": request.labels,
             "env_vars": request.env_vars,
             "created_at": datetime.now(UTC).isoformat(),
         }
+        egress_connectors = [] if request.network_block_all else [network_connector(region, "INTERNET_EGRESS")]
+        egress_id: str | None = None
+        if self.config.proxied_egress:
+            egress_id = f"egress-{uuid.uuid4().hex}"
+            token = secrets.token_urlsafe(32)
+            mode = "deny_all" if request.network_block_all else "allow_all"
+            await self.put_egress_policy(egress_id, {"token": token, "mode": mode})
+            payload["egress_id"] = egress_id
+            payload["env_vars"] = {**request.env_vars, **self._proxy_env(egress_id, token)}
+            egress_connectors = [self.config.VALS_SANDBOX_EGRESS_CONNECTOR or ""]
         idle_seconds = request.auto_stop_interval * 60 or self.config.VALS_SANDBOX_MAX_DURATION_SECONDS
         kwargs: dict[str, Any] = {
             "imageIdentifier": image_arn,
@@ -309,14 +358,17 @@ class ValsSandboxProvider(SandboxProvider):
                 "autoResumeEnabled": False,
             },
             "ingressNetworkConnectors": [network_connector(region, "HTTP_INGRESS")],
-            "egressNetworkConnectors": []
-            if request.network_block_all
-            else [network_connector(region, "INTERNET_EGRESS")],
+            "egressNetworkConnectors": egress_connectors,
             "clientToken": str(uuid.uuid4()),
         }
         if self.config.VALS_SANDBOX_EXECUTION_ROLE_ARN:
             kwargs["executionRoleArn"] = self.config.VALS_SANDBOX_EXECUTION_ROLE_ARN
-        data = await self._aws("run MicroVM", "run_microvm", **kwargs)
+        try:
+            data = await self._aws("run MicroVM", "run_microvm", **kwargs)
+        except BaseException:
+            if egress_id is not None:
+                await asyncio.shield(self._delete_egress_quietly(egress_id))
+            raise
         sandbox = ValsSandbox(self, data)
         try:
             await self._wait_ready(sandbox, request.create_timeout)
@@ -372,7 +424,7 @@ class ValsSandboxProvider(SandboxProvider):
             self._tokens[sandbox.id] = cached
         return cached[0], {"X-aws-proxy-auth": cached[1], "X-aws-proxy-port": str(APP_PORT)}
 
-    async def get_sandbox(self, instance_id: str) -> Sandbox:
+    async def get_sandbox(self, instance_id: str) -> ValsSandbox:
         data = await self._aws(f"get MicroVM {instance_id}", "get_microvm", microvmIdentifier=instance_id)
         sandbox = ValsSandbox(self, data)
         if sandbox.state == "running":
@@ -383,8 +435,45 @@ class ValsSandboxProvider(SandboxProvider):
         return sandbox
 
     async def delete_sandbox(self, instance_id: str) -> None:
+        egress_id: str | None = None
+        if self.config.proxied_egress:
+            try:
+                egress_id = (await self.get_sandbox(instance_id)).egress_id
+            except SandboxError:
+                pass
         self._tokens.pop(instance_id, None)
         await self._aws(f"terminate MicroVM {instance_id}", "terminate_microvm", microvmIdentifier=instance_id)
+        if egress_id is not None:
+            await self._delete_egress_quietly(egress_id)
+
+    def _proxy_env(self, egress_id: str, token: str) -> dict[str, str]:
+        proxy = httpx.URL(self.config.VALS_SANDBOX_EGRESS_PROXY_URL or "")
+        url = str(proxy.copy_with(username=egress_id, password=token))
+        no_proxy = "localhost,127.0.0.1"
+        return {
+            name: value
+            for names, value in ((("HTTP_PROXY", "HTTPS_PROXY"), url), (("NO_PROXY",), no_proxy))
+            for upper in names
+            for name in (upper, upper.lower())
+        }
+
+    async def _egress_admin(self, method: str, egress_id: str, body: dict[str, Any] | None = None) -> None:
+        url = f"{(self.config.VALS_SANDBOX_EGRESS_ADMIN_URL or '').rstrip('/')}/sandboxes/{egress_id}"
+        headers = {"Authorization": f"Bearer {self.config.VALS_SANDBOX_EGRESS_ADMIN_TOKEN}"}
+        try:
+            response = await self.http.request(method, url, headers=headers, json=body)
+        except httpx.HTTPError as error:
+            raise SandboxConnectionError(f"Egress proxy {method} {egress_id}: {error}") from error
+        _raise_for_status(response, egress_id, "egress policy")
+
+    async def put_egress_policy(self, egress_id: str, policy: dict[str, Any]) -> None:
+        await self._egress_admin("PUT", egress_id, policy)
+
+    async def _delete_egress_quietly(self, egress_id: str) -> None:
+        try:
+            await self._egress_admin("DELETE", egress_id)
+        except SandboxError:
+            pass
 
     async def list_sandboxes(self, query: SandboxQuery) -> AsyncGenerator[Sandbox, None]:
         token: str | None = None

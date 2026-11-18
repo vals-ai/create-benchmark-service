@@ -6,9 +6,11 @@ Run: uv run pytest tests/test_vals_sandbox.py
 from __future__ import annotations
 
 import json
+import threading
 import zipfile
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -34,6 +36,8 @@ from benchmark_service.sandbox.vals_sandbox import (
     ValsSandboxProvider,
 )
 from benchmark_service.sandbox.vals_sandbox import agent
+from benchmark_service.sandbox.vals_sandbox.egress_proxy import EgressPolicy, EgressProxy
+from benchmark_service.sandbox.vals_sandbox.egress_proxy import serve as egress_serve
 from benchmark_service.sandbox.vals_sandbox.image import (
     AGENT_FILE,
     baseline_memory_mib,
@@ -302,3 +306,94 @@ def test_agent_run_hook_rejects_unknown_hooks(agent_ports: tuple[int, int]) -> N
     _, hook_port = agent_ports
     response = httpx.post(f"http://127.0.0.1:{hook_port}{agent.HOOK_PREFIX}bogus", content=json.dumps({}))
     assert response.status_code == 404
+
+
+class _Target(BaseHTTPRequestHandler):
+    def do_GET(self) -> None:
+        body = b"reached"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, format: str, *args: Any) -> None:
+        pass
+
+
+async def test_egress_goes_through_the_proxy_and_follows_each_sandboxes_policy(agent_ports: tuple[int, int]) -> None:
+    """Verify proxy-enforced egress end to end through the agent, the provider, and the proxy.
+
+    Test cases:
+    - A proxied sandbox runs on the VPC egress connector, and its commands get proxy credentials.
+    - Allow-all still refuses private addresses, even for a hostname that resolves to one.
+    - A CIDR rule allows the address, a deny-all blocks it again, and deleting drops the policy.
+    """
+    target = ThreadingHTTPServer(("127.0.0.1", 0), _Target)
+    threading.Thread(target=target.serve_forever, daemon=True).start()
+
+    async def resolve(host: str, port: int) -> list[str]:
+        return ["127.0.0.1"] if host == "target.test" else []
+
+    proxy = EgressProxy("admin-token", resolve=resolve)
+    proxy_server, admin_server = await egress_serve(proxy, host="127.0.0.1", proxy_port=0, admin_port=0)
+    proxy_port = proxy_server.sockets[0].getsockname()[1]
+    admin_port = admin_server.sockets[0].getsockname()[1]
+    connector = "arn:aws:lambda:us-east-1:123456789012:network-connector:nc-1"
+    config = ValsSandboxProviderConfig(
+        VALS_SANDBOX_IMAGE=IMAGE_ARN,
+        VALS_SANDBOX_EGRESS_CONNECTOR=connector,
+        VALS_SANDBOX_EGRESS_PROXY_URL=f"http://127.0.0.1:{proxy_port}",
+        VALS_SANDBOX_EGRESS_ADMIN_URL=f"http://127.0.0.1:{admin_port}",
+        VALS_SANDBOX_EGRESS_ADMIN_TOKEN="admin-token",
+    )
+    fetch = (
+        'python3 -c "import urllib.request; '
+        f"print(urllib.request.urlopen('http://target.test:{target.server_address[1]}/').read().decode())\""
+    )
+    fake = FakeMicrovms(*agent_ports)
+    try:
+        async with ValsSandboxProvider(config, microvms=fake) as provider:
+            sandbox = await provider.create_sandbox(_request())
+            assert isinstance(sandbox, ValsSandbox)
+            assert fake.run_calls[0]["egressNetworkConnectors"] == [connector]
+            assert sandbox.egress_id in proxy.policies
+
+            assert (await sandbox.exec(fetch)).exit_code != 0
+            await sandbox.modify_egress_rules(["127.0.0.1/32"])
+            assert (await sandbox.exec(fetch)).output.strip() == "reached"
+            await sandbox.modify_egress_rules(["target.test"])
+            assert (await sandbox.exec(fetch)).exit_code != 0
+            await sandbox.block_all_egress()
+            assert (await sandbox.exec(fetch)).exit_code != 0
+
+            await provider.delete_sandbox(sandbox.id)
+            assert proxy.policies == {}
+    finally:
+        proxy_server.close()
+        admin_server.close()
+        target.shutdown()
+
+
+def test_egress_config_is_all_or_nothing() -> None:
+    with pytest.raises(ValueError, match="VALS_SANDBOX_EGRESS"):
+        ValsSandboxProviderConfig(VALS_SANDBOX_IMAGE=IMAGE_ARN, VALS_SANDBOX_EGRESS_CONNECTOR="arn")
+
+
+@pytest.mark.parametrize(
+    ("policy", "host", "allowed"),
+    [
+        (EgressPolicy(token="t", mode="allowlist", domains=["*.example.com"]), "api.example.com", True),
+        (EgressPolicy(token="t", mode="allowlist", domains=["*.example.com"]), "example.org", False),
+        (EgressPolicy(token="t", mode="allowlist", domains=["example.com"]), "a.example.com", False),
+        (EgressPolicy(token="t", mode="allow_all"), "93.184.216.34", True),
+        (EgressPolicy(token="t", mode="allow_all"), "169.254.169.254", False),
+        (EgressPolicy(token="t", mode="allow_all"), "10.0.0.5", False),
+        (EgressPolicy(token="t", mode="deny_all"), "93.184.216.34", False),
+    ],
+)
+async def test_egress_policy_decisions(policy: EgressPolicy, host: str, allowed: bool) -> None:
+    async def resolve(_host: str, _port: int) -> list[str]:
+        return ["93.184.216.34"]
+
+    address = await EgressProxy("admin", resolve=resolve).choose_address(policy, host, 443)
+    assert (address is not None) == allowed

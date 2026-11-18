@@ -28,7 +28,7 @@ _CHUNK_BYTES = 64 * 1024
 _POLL_SECONDS = 0.1
 
 _state_lock = threading.Lock()
-_state: dict[str, Any] = {"name": "", "labels": {}, "env_vars": {}, "microvm_id": "", "created_at": ""}
+_state: dict[str, Any] = {"name": "", "labels": {}, "env_vars": {}, "microvm_id": "", "created_at": "", "egress_id": ""}
 
 
 def _shell() -> list[str]:
@@ -71,6 +71,7 @@ class HookHandler(_Handler):
                     labels=dict(payload.get("labels") or {}),
                     env_vars=dict(payload.get("env_vars") or {}),
                     created_at=str(payload.get("created_at") or ""),
+                    egress_id=str(payload.get("egress_id") or ""),
                     microvm_id=str(request.get("microvmId") or ""),
                 )
         if hook in ("suspend", "terminate"):
@@ -88,7 +89,7 @@ class AppHandler(_Handler):
             self._json(200, {"ok": True})
         elif url.path == "/info":
             with _state_lock:
-                info = {key: _state[key] for key in ("name", "labels", "microvm_id", "created_at")}
+                info = {key: _state[key] for key in ("name", "labels", "microvm_id", "created_at", "egress_id")}
             self._json(200, info)
         elif url.path == "/files":
             self._download(_query_path(url.query))

@@ -811,22 +811,39 @@ def test_verify_task_ids_403_for_disallowed_dataset(auth_client: TestClient) -> 
     assert response.json() == {"detail": "Dataset not allowed"}
 
 
+_OPT_IN_PROVIDERS = [
+    ({"type": "docker"}, "CBS_DOCKER_ENABLED", "Docker sandboxes are disabled on this service"),
+    (
+        {"type": "lambda_microvm", "LAMBDA_MICROVM_IMAGE": "arn:aws:lambda:us-east-1:1:microvm-image:x"},
+        "CBS_LAMBDA_MICROVM_ENABLED",
+        "Lambda MicroVM sandboxes are disabled on this service",
+    ),
+]
+
+
 @pytest.mark.parametrize("path", ["/ws/setup-task", "/ws/evaluate-instance", "/ws/evaluate-response"])
 @pytest.mark.parametrize("enabled", [False, True])
-def test_request_docker_provider_requires_service_opt_in(
-    auth_client: TestClient, monkeypatch: pytest.MonkeyPatch, path: str, enabled: bool
+@pytest.mark.parametrize(("provider", "env_name", "disabled_reason"), _OPT_IN_PROVIDERS)
+def test_request_opt_in_provider_requires_service_opt_in(
+    auth_client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+    path: str,
+    enabled: bool,
+    provider: dict[str, str],
+    env_name: str,
+    disabled_reason: str,
 ) -> None:
     """
-    Verify that a request can select the Docker provider only on a service that opts in.
+    Verify that a request can select a provider that uses this host's daemon or credentials only on a service that opts in.
 
     Test cases:
-    - Without `CBS_DOCKER_ENABLED`, each websocket endpoint closes with a policy violation before provider work.
-    - With `CBS_DOCKER_ENABLED=true`, the request passes the Docker check and reaches the dataset check.
+    - Without `CBS_DOCKER_ENABLED` / `CBS_LAMBDA_MICROVM_ENABLED`, each websocket endpoint closes with a policy violation before provider work.
+    - With the variable set to `true`, the request passes the provider check and reaches the dataset check.
     """
     if enabled:
-        monkeypatch.setenv("CBS_DOCKER_ENABLED", "true")
+        monkeypatch.setenv(env_name, "true")
     else:
-        monkeypatch.delenv("CBS_DOCKER_ENABLED", raising=False)
+        monkeypatch.delenv(env_name, raising=False)
     with _patch_descope(["acme-corp"]):
         with pytest.raises(WebSocketDisconnect) as exc_info:
             with auth_client.websocket_connect(path, headers={"x-descope-api-key": "key-acme"}) as ws:
@@ -835,15 +852,13 @@ def test_request_docker_provider_requires_service_opt_in(
                         "task_id": "task-1",
                         "instance_id": "i-1",
                         "eval_resume_state": {"checkpoint": "saved"},
-                        "sandbox_provider": {"type": "docker"},
+                        "sandbox_provider": provider,
                         "dataset": "alt",
                     }
                 )
                 ws.receive_json()
     assert exc_info.value.code == 1008
-    assert exc_info.value.reason == (
-        "Dataset not allowed" if enabled else "Docker sandboxes are disabled on this service"
-    )
+    assert exc_info.value.reason == ("Dataset not allowed" if enabled else disabled_reason)
 
 
 @pytest.mark.parametrize("enabled", [False, True])

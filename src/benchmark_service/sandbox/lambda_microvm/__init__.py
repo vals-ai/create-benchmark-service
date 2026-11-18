@@ -201,8 +201,6 @@ def _raise_for_status(response: httpx.Response, sandbox_id: str, path: str) -> N
     if status < 400:
         return
     detail = response.text[:500]
-    if status == 404:
-        raise SandboxNotFoundError(f"MicroVM {sandbox_id} {path}: {detail}")
     if status in (408, 429) or status >= 500:
         raise SandboxConnectionError(f"MicroVM {sandbox_id} {path}: HTTP {status} {detail}")
     raise SandboxError(f"MicroVM {sandbox_id} {path}: HTTP {status} {detail}")

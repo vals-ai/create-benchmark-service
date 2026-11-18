@@ -23,6 +23,7 @@ from benchmark_service.sandbox import (
     Resources,
     SandboxCreateRequest,
     SandboxError,
+    SandboxNotFoundError,
     SandboxQuery,
     UnsupportedSandboxConfigError,
     sandbox_provider_config_from_mapping,
@@ -152,12 +153,15 @@ async def test_sandbox_lifecycle_runs_commands_and_moves_files(agent_ports: tupl
         chunks = [chunk async for chunk in sandbox.command("echo $EXTRA", env_vars={"EXTRA": "x"})]
         assert "".join(chunks) == "x\n"
         assert (await sandbox.exec("sleep 5", timeout=0.5)).exit_code == agent.TIMEOUT_EXIT_CODE
+        closed = await sandbox.exec("echo early; exec >&- 2>&-; sleep 5", timeout=0.5)
+        assert (closed.exit_code, closed.output) == (agent.TIMEOUT_EXIT_CODE, "early\n")
 
         target = tmp_path / "nested" / "data.bin"
         await sandbox.upload_file(str(target), b"\x00\x01payload")
         assert await sandbox.download_file(str(target)) == b"\x00\x01payload"
-        with pytest.raises(SandboxError):
+        with pytest.raises(SandboxError) as missing:
             await sandbox.download_file(str(tmp_path / "missing"))
+        assert not isinstance(missing.value, SandboxNotFoundError)
 
         assert [s.id async for s in provider.list_sandboxes(SandboxQuery(labels={"run-id": "r1"}))] == ["mvm-1"]
         assert [s.id async for s in provider.list_sandboxes(SandboxQuery(labels={"run-id": "other"}))] == []
@@ -213,14 +217,29 @@ def test_baseline_memory_is_smallest_size_whose_peak_fits() -> None:
 
 
 def test_build_artifact_wraps_dockerfile_with_agent(tmp_path: Path) -> None:
-    (tmp_path / "app.txt").write_text("context")
-    artifact = build_artifact("FROM python:3.12-slim\n", tmp_path)
-    assert artifact == build_artifact("FROM python:3.12-slim\n", tmp_path)
+    """Verify the uploaded build context.
+
+    Test cases:
+    - The artifact is deterministic and holds the context, the wrapped Dockerfile, and the agent.
+    - The agent replaces any inherited ENTRYPOINT, and Python is installed when the image lacks it.
+    - Executable context files keep their mode; symlinks leaving the context are not uploaded.
+    """
+    context = tmp_path / "context"
+    context.mkdir()
+    (context / "run.sh").write_text("#!/bin/sh\n")
+    (context / "run.sh").chmod(0o755)
+    (tmp_path / "secret").write_text("outside")
+    (context / "leak").symlink_to(tmp_path / "secret")
+    artifact = build_artifact("FROM python:3.12-slim\n", context)
+    assert artifact == build_artifact("FROM python:3.12-slim\n", context)
     with zipfile.ZipFile(BytesIO(artifact)) as archive:
-        assert sorted(archive.namelist()) == sorted(["Dockerfile", AGENT_FILE, "app.txt"])
+        assert sorted(archive.namelist()) == sorted(["Dockerfile", AGENT_FILE, "run.sh"])
+        assert (archive.getinfo("run.sh").external_attr >> 16) & 0o777 == 0o755
         dockerfile = archive.read("Dockerfile").decode()
-    assert dockerfile.startswith("FROM python:3.12-slim\n")
-    assert f'CMD ["python3", "/opt/cbs/{AGENT_FILE}"]' in dockerfile
+    lines = dockerfile.splitlines()
+    assert lines[0] == "FROM python:3.12-slim"
+    assert lines[1].startswith("RUN command -v python3")
+    assert lines[-2:] == ["ENTRYPOINT []", f'CMD ["python3", "/opt/cbs/{AGENT_FILE}"]']
 
 
 class FakeImages:

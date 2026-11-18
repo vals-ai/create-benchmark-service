@@ -46,28 +46,50 @@ def baseline_memory_mib(vcpu: float, memory_gib: float) -> int:
     raise SandboxError(f"Lambda MicroVMs cannot fit {vcpu} vCPU / {memory_gib} GiB (max peak 16 vCPU / 32 GiB)")
 
 
+# Images without Python get it from whichever package manager they have; the agent needs python3.
+_ENSURE_PYTHON = (
+    "RUN command -v python3 >/dev/null 2>&1 || "
+    "(apt-get update && apt-get install -y --no-install-recommends python3 && rm -rf /var/lib/apt/lists/*) || "
+    "dnf install -y python3 || yum install -y python3 || apk add --no-cache python3 || "
+    '(echo "cbs: the MicroVM sandbox agent needs python3 in the image" >&2; exit 1)'
+)
+
+
 def image_dockerfile(dockerfile: str) -> str:
-    """The user's Dockerfile with the agent appended as the container command."""
+    """The user's Dockerfile with the agent as the only startup process, replacing any inherited ENTRYPOINT."""
     return (
         dockerfile.rstrip("\n")
-        + f"\nCOPY {AGENT_FILE} /opt/cbs/{AGENT_FILE}\n"
+        + f"\n{_ENSURE_PYTHON}\n"
+        + f"COPY {AGENT_FILE} /opt/cbs/{AGENT_FILE}\n"
+        + "ENTRYPOINT []\n"
         + f'CMD ["python3", "/opt/cbs/{AGENT_FILE}"]\n'
     )
 
 
+def _context_files(context_dir: Path) -> dict[str, tuple[bytes, int]]:
+    """Regular files under the context with their permission bits; symlinks leaving the context are skipped."""
+    root = context_dir.resolve()
+    files: dict[str, tuple[bytes, int]] = {}
+    for path in sorted(context_dir.rglob("*")):
+        if not path.is_file() or not path.resolve().is_relative_to(root):
+            continue
+        files[path.relative_to(context_dir).as_posix()] = (path.read_bytes(), path.stat().st_mode & 0o777)
+    return files
+
+
 def build_artifact(dockerfile: str, context_dir: Path | None = None) -> bytes:
-    """Zip the build context, the wrapped Dockerfile, and the agent, with stable timestamps."""
-    files: dict[str, bytes] = {}
-    if context_dir is not None:
-        for path in sorted(context_dir.rglob("*")):
-            if path.is_file():
-                files[path.relative_to(context_dir).as_posix()] = path.read_bytes()
-    files["Dockerfile"] = image_dockerfile(dockerfile).encode()
-    files[AGENT_FILE] = AGENT_PATH.read_bytes()
+    """Zip the build context, the wrapped Dockerfile, and the agent, with stable timestamps and file modes."""
+    files = _context_files(context_dir) if context_dir is not None else {}
+    files["Dockerfile"] = (image_dockerfile(dockerfile).encode(), 0o644)
+    files[AGENT_FILE] = (AGENT_PATH.read_bytes(), 0o644)
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
         for name in sorted(files):
-            archive.writestr(zipfile.ZipInfo(name, date_time=(2020, 1, 1, 0, 0, 0)), files[name])
+            content, mode = files[name]
+            info = zipfile.ZipInfo(name, date_time=(2020, 1, 1, 0, 0, 0))
+            info.external_attr = (0o100000 | mode) << 16
+            info.compress_type = zipfile.ZIP_DEFLATED
+            archive.writestr(info, content)
     return buffer.getvalue()
 
 

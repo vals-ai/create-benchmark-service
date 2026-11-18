@@ -25,6 +25,7 @@ HOOK_PREFIX = "/aws/lambda-microvms/runtime/v1/"
 TIMEOUT_EXIT_CODE = 124
 HEARTBEAT_SECONDS = 15.0
 _CHUNK_BYTES = 64 * 1024
+_POLL_SECONDS = 0.1
 
 _state_lock = threading.Lock()
 _state: dict[str, Any] = {"name": "", "labels": {}, "env_vars": {}, "microvm_id": "", "created_at": ""}
@@ -169,8 +170,9 @@ class AppHandler(_Handler):
         deadline = time.monotonic() + float(timeout) if timeout else None
         last_sent = time.monotonic()
         exit_code: int | None = None
+        output_open = True
         try:
-            while True:
+            while output_open or process.poll() is None:
                 wait = HEARTBEAT_SECONDS
                 if deadline is not None:
                     wait = min(wait, deadline - time.monotonic())
@@ -178,17 +180,24 @@ class AppHandler(_Handler):
                     _kill(process)
                     exit_code = TIMEOUT_EXIT_CODE
                     break
-                try:
-                    data = chunks.get(timeout=wait)
-                except queue.Empty:
-                    if time.monotonic() - last_sent >= HEARTBEAT_SECONDS:
-                        self._chunk(b'{"heartbeat":true}\n')
-                        last_sent = time.monotonic()
-                    continue
-                if data is None:
-                    break
-                self._chunk((json.dumps({"output": data.decode("utf-8", errors="replace")}) + "\n").encode())
-                last_sent = time.monotonic()
+                data = b""
+                if output_open:
+                    try:
+                        chunk = chunks.get(timeout=wait)
+                    except queue.Empty:
+                        chunk = b""
+                    if chunk is None:
+                        output_open = False
+                        continue
+                    data = chunk
+                else:
+                    time.sleep(min(wait, _POLL_SECONDS))
+                if data:
+                    self._chunk((json.dumps({"output": data.decode("utf-8", errors="replace")}) + "\n").encode())
+                    last_sent = time.monotonic()
+                elif time.monotonic() - last_sent >= HEARTBEAT_SECONDS:
+                    self._chunk(b'{"heartbeat":true}\n')
+                    last_sent = time.monotonic()
             if exit_code is None:
                 returncode = process.wait()
                 exit_code = 128 - returncode if returncode < 0 else returncode

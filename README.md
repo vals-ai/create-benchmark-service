@@ -219,9 +219,9 @@ allocate capacity or enforce a caller's scheduling policy.
 {"type": "lambda_microvm", "LAMBDA_MICROVM_REGION": "us-east-1", "LAMBDA_MICROVM_IMAGE": "arn:aws:lambda:...:microvm-image:...", "LAMBDA_MICROVM_BUILD_BUCKET": "...", "LAMBDA_MICROVM_BUILD_ROLE_ARN": "...", "LAMBDA_MICROVM_EXECUTION_ROLE_ARN": "..."}
 ```
 
-- AWS credentials come from the SDK's default chain, not the config.
+- AWS credentials come from the service's SDK default chain, not the request, so a service accepts `lambda_microvm` requests only with `CBS_LAMBDA_MICROVM_ENABLED=true`.
 - Each sandbox is one MicroVM. The image runs `sandbox/lambda_microvm/agent.py`, which serves exec and file routes on port 8080 behind the MicroVM's HTTPS endpoint and Lambda's lifecycle hooks on port 9000. Auth tokens cover port 8080 only.
-- An `image` source that is a MicroVM image ARN, or any `snapshot`, starts that image. A container `image` reference or a `dockerfile` source (with its folder as build context) is built into a MicroVM image named by a hash of its inputs, then reused. Building needs `LAMBDA_MICROVM_BUILD_BUCKET` and `LAMBDA_MICROVM_BUILD_ROLE_ARN`, and the image needs `python3`.
+- An `image` source that is a MicroVM image ARN, or any `snapshot`, starts that image. A container `image` reference or a `dockerfile` source (with its folder as build context) is built into a MicroVM image named by a hash of its inputs, then reused. Building needs `LAMBDA_MICROVM_BUILD_BUCKET` and `LAMBDA_MICROVM_BUILD_ROLE_ARN`. The build installs `python3` when the image lacks it and replaces any `ENTRYPOINT` with the agent. It does not read `.dockerignore`, and it skips symlinks that point outside the context.
 - Size: an image has a fixed baseline of 0.5 to 8 GiB (2 GiB per vCPU) and bursts to 4x. A build picks the smallest baseline whose peak covers the request. Disk is at most 32 GiB, and a MicroVM lives at most 8 hours.
 - Labels, name, and `env_vars` travel in the run-hook payload, because MicroVMs carry no tags. Listing reads them back from each running MicroVM's agent.
 - `auto_stop_interval` becomes the idle timeout, after which Lambda terminates the MicroVM. `network_block_all` starts it without internet egress.

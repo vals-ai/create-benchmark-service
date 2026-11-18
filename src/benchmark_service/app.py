@@ -59,6 +59,7 @@ from benchmark_service.schemas import (
 from benchmark_service.sandbox import (
     DaytonaProviderConfig,
     DockerProviderConfig,
+    LambdaMicrovmProviderConfig,
     SandboxProviderConfig,
 )
 
@@ -121,12 +122,25 @@ def _request_sandbox_provider_config(
 
 DOCKER_ENABLED_ENV = "CBS_DOCKER_ENABLED"
 _DOCKER_DISABLED_REASON = "Docker sandboxes are disabled on this service"
+LAMBDA_MICROVM_ENABLED_ENV = "CBS_LAMBDA_MICROVM_ENABLED"
+_LAMBDA_MICROVM_DISABLED_REASON = "Lambda MicroVM sandboxes are disabled on this service"
 _AUTH_UNAVAILABLE_DETAIL = "Authentication is unavailable; this request was not started"
 
 
-def _request_may_use_provider(config: SandboxProviderConfig | None) -> bool:
-    """Docker needs no caller credentials and drives this host's daemon, so only an opted-in service accepts it."""
-    return not isinstance(config, DockerProviderConfig) or os.environ.get(DOCKER_ENABLED_ENV, "").lower() == "true"
+def _provider_disabled_reason(config: SandboxProviderConfig | None) -> str | None:
+    """Why this service refuses the provider, or None when it may use it.
+
+    Docker drives this host's daemon and lambda_microvm uses this host's AWS credentials, not the caller's,
+    so only a service that opts in accepts them.
+    """
+    if isinstance(config, DockerProviderConfig) and os.environ.get(DOCKER_ENABLED_ENV, "").lower() != "true":
+        return _DOCKER_DISABLED_REASON
+    if (
+        isinstance(config, LambdaMicrovmProviderConfig)
+        and os.environ.get(LAMBDA_MICROVM_ENABLED_ENV, "").lower() != "true"
+    ):
+        return _LAMBDA_MICROVM_DISABLED_REASON
+    return None
 
 
 def _grading_credentials(
@@ -511,8 +525,8 @@ class BenchmarkServiceApp(FastAPI):
                     sandbox_id=request.instance_id,
                 )
             sandbox_config = _request_sandbox_provider_config(request, websocket)
-            if not _request_may_use_provider(sandbox_config):
-                await websocket.close(code=1008, reason=_DOCKER_DISABLED_REASON)
+            if (disabled_reason := _provider_disabled_reason(sandbox_config)) is not None:
+                await websocket.close(code=1008, reason=disabled_reason)
                 return
 
             async with self._dataset_scope(websocket, tenant, request.dataset, task_id=request.task_id):
@@ -539,8 +553,8 @@ class BenchmarkServiceApp(FastAPI):
             raise HTTPException(status_code=400, detail="grading_token is supported only on WebSocket evaluation")
         if self._sentry is not None:
             self._sentry.bind_request_context(request.headers, task_id=body.task_id, dataset=body.dataset)
-        if not _request_may_use_provider(body.sandbox_provider):
-            raise HTTPException(status_code=403, detail=_DOCKER_DISABLED_REASON)
+        if (disabled_reason := _provider_disabled_reason(body.sandbox_provider)) is not None:
+            raise HTTPException(status_code=403, detail=disabled_reason)
         async with self._dataset_scope(request, request.state.tenant, body.dataset, task_id=body.task_id):
             await self.consume_evaluation_request(cast(str, request.state.tenant))
             async with _grading_credentials(request.headers, body.task_id):
@@ -561,8 +575,8 @@ class BenchmarkServiceApp(FastAPI):
             request = EvaluateResponseRequest(**data)
             if self._sentry is not None:
                 self._sentry.bind_request_context(websocket.headers, task_id=request.task_id, dataset=request.dataset)
-            if not _request_may_use_provider(request.sandbox_provider):
-                await websocket.close(code=1008, reason=_DOCKER_DISABLED_REASON)
+            if (disabled_reason := _provider_disabled_reason(request.sandbox_provider)) is not None:
+                await websocket.close(code=1008, reason=disabled_reason)
                 return
 
             async with self._dataset_scope(websocket, tenant, request.dataset, task_id=request.task_id):
@@ -607,8 +621,8 @@ class BenchmarkServiceApp(FastAPI):
                     sandbox_id=request.instance_id,
                 )
             sandbox_config = _request_sandbox_provider_config(request, websocket)
-            if not _request_may_use_provider(sandbox_config):
-                await websocket.close(code=1008, reason=_DOCKER_DISABLED_REASON)
+            if (disabled_reason := _provider_disabled_reason(sandbox_config)) is not None:
+                await websocket.close(code=1008, reason=disabled_reason)
                 return
 
             async with self._dataset_scope(websocket, tenant, request.dataset, task_id=request.task_id):

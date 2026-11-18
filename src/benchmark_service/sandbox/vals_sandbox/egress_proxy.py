@@ -134,12 +134,16 @@ class EgressProxy:
             sandbox_id, policy = authenticated
             if method == "CONNECT":
                 host, _, port_text = target.rpartition(":")
-                upstream_head = b""
+                upstream_head = body = b""
             else:
                 url = urlsplit(target)
                 if url.scheme != "http" or not url.hostname:
                     await _respond(writer, 400)
                     return
+                if "transfer-encoding" in headers:
+                    await _respond(writer, 411)
+                    return
+                body = await reader.readexactly(int(headers.get("content-length") or 0))
                 host, port_text = url.hostname, str(url.port or 80)
                 path = url.path or "/"
                 if url.query:
@@ -169,7 +173,7 @@ class EgressProxy:
                 writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
                 await writer.drain()
             else:
-                upstream_writer.write(upstream_head)
+                upstream_writer.write(upstream_head + body)
             if method == "CONNECT":
                 await asyncio.gather(_pipe(reader, upstream_writer), _pipe(upstream_reader, writer))
             else:
@@ -241,7 +245,14 @@ async def _read_head(reader: asyncio.StreamReader) -> tuple[str, dict[str, str],
 
 
 async def _respond(writer: asyncio.StreamWriter, status: int, *, extra: str = "") -> None:
-    reasons = {204: "No Content", 400: "Bad Request", 401: "Unauthorized", 403: "Forbidden", 404: "Not Found"}
+    reasons = {
+        204: "No Content",
+        400: "Bad Request",
+        401: "Unauthorized",
+        403: "Forbidden",
+        404: "Not Found",
+        411: "Length Required",
+    }
     reasons |= {405: "Method Not Allowed", 407: "Proxy Authentication Required", 502: "Bad Gateway"}
     writer.write(
         f"HTTP/1.1 {status} {reasons[status]}\r\n{extra}Content-Length: 0\r\nConnection: close\r\n\r\n".encode()

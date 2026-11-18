@@ -312,6 +312,13 @@ def test_agent_run_hook_rejects_unknown_hooks(agent_ports: tuple[int, int]) -> N
 
 
 class _Target(BaseHTTPRequestHandler):
+    def do_POST(self) -> None:
+        body = self.rfile.read(int(self.headers["Content-Length"]))
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def do_GET(self) -> None:
         body = b"reached"
         self.send_response(200)
@@ -364,6 +371,8 @@ async def test_egress_goes_through_the_proxy_and_follows_each_sandboxes_policy(a
             assert (await sandbox.exec(fetch)).exit_code != 0
             await sandbox.modify_egress_rules(["127.0.0.1/32"])
             assert (await sandbox.exec(fetch)).output.strip() == "reached"
+            upload = fetch.replace("/')", "/', data=b'uploaded')")
+            assert (await sandbox.exec(upload)).output.strip() == "uploaded"
             await sandbox.modify_egress_rules(["target.test"])
             assert (await sandbox.exec(fetch)).exit_code != 0
             await sandbox.block_all_egress()

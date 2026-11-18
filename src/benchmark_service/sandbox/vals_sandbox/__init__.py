@@ -1,4 +1,4 @@
-"""Opt-in sandbox provider on AWS Lambda MicroVMs (Firecracker).
+"""Vals Sandbox: our own opt-in sandbox provider, backed by AWS Lambda MicroVMs (Firecracker).
 
 Each sandbox is one MicroVM started from an image that runs ``agent.py``. The agent serves
 exec and file routes on port 8080 behind the MicroVM's authenticated HTTPS endpoint;
@@ -20,7 +20,7 @@ from typing import Any, Literal
 import httpx
 from pydantic import BaseModel
 
-from benchmark_service.sandbox.lambda_microvm.image import (
+from benchmark_service.sandbox.vals_sandbox.image import (
     DEFAULT_BASE_DOCKERFILE,
     aws_client,
     aws_error_code,
@@ -57,32 +57,32 @@ _ENDED_STATES = frozenset({"TERMINATING", "TERMINATED"})
 _IMAGE_ARN_MARKER = ":microvm-image:"
 
 
-class LambdaMicrovmProviderConfig(BaseModel):
-    type: Literal["lambda_microvm"] = "lambda_microvm"
-    LAMBDA_MICROVM_REGION: str = "us-east-1"
-    LAMBDA_MICROVM_IMAGE: str | None = None
-    LAMBDA_MICROVM_EXECUTION_ROLE_ARN: str | None = None
-    LAMBDA_MICROVM_BUILD_BUCKET: str | None = None
-    LAMBDA_MICROVM_BUILD_ROLE_ARN: str | None = None
-    LAMBDA_MICROVM_ARCHITECTURE: Literal["ARM_64", "X86_64"] = "ARM_64"
-    LAMBDA_MICROVM_MAX_DURATION_SECONDS: int = MAX_DURATION_SECONDS
+class ValsSandboxProviderConfig(BaseModel):
+    type: Literal["vals_sandbox"] = "vals_sandbox"
+    VALS_SANDBOX_REGION: str = "us-east-1"
+    VALS_SANDBOX_IMAGE: str | None = None
+    VALS_SANDBOX_EXECUTION_ROLE_ARN: str | None = None
+    VALS_SANDBOX_BUILD_BUCKET: str | None = None
+    VALS_SANDBOX_BUILD_ROLE_ARN: str | None = None
+    VALS_SANDBOX_ARCHITECTURE: Literal["ARM_64", "X86_64"] = "ARM_64"
+    VALS_SANDBOX_MAX_DURATION_SECONDS: int = MAX_DURATION_SECONDS
 
     @classmethod
-    def from_env(cls) -> "LambdaMicrovmProviderConfig":
+    def from_env(cls) -> "ValsSandboxProviderConfig":
         values = {name: os.environ[name] for name in cls.model_fields if name.isupper() and os.environ.get(name)}
         config = cls.model_validate(values)
-        if not config.LAMBDA_MICROVM_IMAGE and not config.can_build:
+        if not config.VALS_SANDBOX_IMAGE and not config.can_build:
             raise MissingSandboxConfigError(
-                "Set LAMBDA_MICROVM_IMAGE, or LAMBDA_MICROVM_BUILD_BUCKET and LAMBDA_MICROVM_BUILD_ROLE_ARN"
+                "Set VALS_SANDBOX_IMAGE, or VALS_SANDBOX_BUILD_BUCKET and VALS_SANDBOX_BUILD_ROLE_ARN"
             )
         return config
 
     @property
     def can_build(self) -> bool:
-        return bool(self.LAMBDA_MICROVM_BUILD_BUCKET and self.LAMBDA_MICROVM_BUILD_ROLE_ARN)
+        return bool(self.VALS_SANDBOX_BUILD_BUCKET and self.VALS_SANDBOX_BUILD_ROLE_ARN)
 
     def create_provider(self) -> SandboxProvider:
-        return LambdaMicrovmSandboxProvider(self)
+        return ValsSandboxProvider(self)
 
 
 def _aws_error(error: Exception, what: str) -> SandboxError:
@@ -94,8 +94,8 @@ def _aws_error(error: Exception, what: str) -> SandboxError:
     return SandboxError(f"{what}: {error}")
 
 
-class LambdaMicrovmSandbox(Sandbox):
-    def __init__(self, provider: LambdaMicrovmSandboxProvider, data: Mapping[str, Any]) -> None:
+class ValsSandbox(Sandbox):
+    def __init__(self, provider: ValsSandboxProvider, data: Mapping[str, Any]) -> None:
         self._provider = provider
         self.data = dict(data)
         self._name = self.id
@@ -206,10 +206,10 @@ def _raise_for_status(response: httpx.Response, sandbox_id: str, path: str) -> N
     raise SandboxError(f"MicroVM {sandbox_id} {path}: HTTP {status} {detail}")
 
 
-class LambdaMicrovmSandboxProvider(SandboxProvider):
+class ValsSandboxProvider(SandboxProvider):
     def __init__(
         self,
-        config: LambdaMicrovmProviderConfig,
+        config: ValsSandboxProviderConfig,
         *,
         microvms: Any = None,
         s3: Any = None,
@@ -222,7 +222,7 @@ class LambdaMicrovmSandboxProvider(SandboxProvider):
         self._tokens: dict[str, tuple[str, str, float]] = {}
 
     def _client(self, service: str) -> Any:
-        return aws_client(service, self.config.LAMBDA_MICROVM_REGION)
+        return aws_client(service, self.config.VALS_SANDBOX_REGION)
 
     @property
     def microvms(self) -> Any:
@@ -240,7 +240,7 @@ class LambdaMicrovmSandboxProvider(SandboxProvider):
 
     def validate_sandbox_config(self, *, requires_nested_docker: bool, resources: Resources) -> None:
         if requires_nested_docker:
-            raise UnsupportedSandboxConfigError("The lambda_microvm provider does not run nested Docker yet")
+            raise UnsupportedSandboxConfigError("The vals_sandbox provider does not run nested Docker yet")
         if resources.gpu:
             raise UnsupportedSandboxConfigError("Lambda MicroVMs have no GPUs")
         if resources.disk > MAX_DISK_GIB:
@@ -260,13 +260,13 @@ class LambdaMicrovmSandboxProvider(SandboxProvider):
         if isinstance(source, DockerfileSource):
             path = Path(source.dockerfile)
             return await self._build(path.read_text(), path.parent, request)
-        raise UnsupportedSandboxConfigError(f"lambda_microvm does not support {source.type} sources")
+        raise UnsupportedSandboxConfigError(f"vals_sandbox does not support {source.type} sources")
 
     async def _build(self, dockerfile: str, context_dir: Path | None, request: SandboxCreateRequest) -> str:
         config = self.config
-        if not (config.LAMBDA_MICROVM_BUILD_BUCKET and config.LAMBDA_MICROVM_BUILD_ROLE_ARN):
+        if not (config.VALS_SANDBOX_BUILD_BUCKET and config.VALS_SANDBOX_BUILD_ROLE_ARN):
             raise MissingSandboxConfigError(
-                "Building MicroVM images needs LAMBDA_MICROVM_BUILD_BUCKET and LAMBDA_MICROVM_BUILD_ROLE_ARN"
+                "Building MicroVM images needs VALS_SANDBOX_BUILD_BUCKET and VALS_SANDBOX_BUILD_ROLE_ARN"
             )
         if self._s3 is None:
             self._s3 = self._client("s3")
@@ -277,47 +277,47 @@ class LambdaMicrovmSandboxProvider(SandboxProvider):
             dockerfile=dockerfile,
             context_dir=context_dir,
             memory_mib=baseline_memory_mib(request.resources.vcpu, request.resources.memory),
-            bucket=config.LAMBDA_MICROVM_BUILD_BUCKET,
-            build_role_arn=config.LAMBDA_MICROVM_BUILD_ROLE_ARN,
-            architecture=config.LAMBDA_MICROVM_ARCHITECTURE,
+            bucket=config.VALS_SANDBOX_BUILD_BUCKET,
+            build_role_arn=config.VALS_SANDBOX_BUILD_ROLE_ARN,
+            architecture=config.VALS_SANDBOX_ARCHITECTURE,
             timeout=float(request.provider_timeout),
         )
 
     async def create_sandbox(self, request: SandboxCreateRequest) -> Sandbox:
         self.validate_sandbox_config(requires_nested_docker=request.requires_nested_docker, resources=request.resources)
         if request.volumes:
-            raise UnsupportedSandboxConfigError("lambda_microvm does not support volumes yet")
+            raise UnsupportedSandboxConfigError("vals_sandbox does not support volumes yet")
         if request.sandbox_secrets:
-            raise UnsupportedSandboxConfigError("lambda_microvm does not support provider-managed secrets yet")
+            raise UnsupportedSandboxConfigError("vals_sandbox does not support provider-managed secrets yet")
 
         image_arn = await self._image_arn(request)
-        region = self.config.LAMBDA_MICROVM_REGION
+        region = self.config.VALS_SANDBOX_REGION
         payload = {
             "name": request.name,
             "labels": request.labels,
             "env_vars": request.env_vars,
             "created_at": datetime.now(UTC).isoformat(),
         }
-        idle_seconds = request.auto_stop_interval * 60 or self.config.LAMBDA_MICROVM_MAX_DURATION_SECONDS
+        idle_seconds = request.auto_stop_interval * 60 or self.config.VALS_SANDBOX_MAX_DURATION_SECONDS
         kwargs: dict[str, Any] = {
             "imageIdentifier": image_arn,
             "runHookPayload": json.dumps(payload),
-            "maximumDurationInSeconds": self.config.LAMBDA_MICROVM_MAX_DURATION_SECONDS,
+            "maximumDurationInSeconds": self.config.VALS_SANDBOX_MAX_DURATION_SECONDS,
             "idlePolicy": {
-                "maxIdleDurationSeconds": min(idle_seconds, self.config.LAMBDA_MICROVM_MAX_DURATION_SECONDS),
+                "maxIdleDurationSeconds": min(idle_seconds, self.config.VALS_SANDBOX_MAX_DURATION_SECONDS),
                 "suspendedDurationSeconds": 0,
                 "autoResumeEnabled": False,
             },
-            "ingressNetworkConnectors": [network_connector(region, "ALL_INGRESS")],
+            "ingressNetworkConnectors": [network_connector(region, "HTTP_INGRESS")],
             "egressNetworkConnectors": []
             if request.network_block_all
             else [network_connector(region, "INTERNET_EGRESS")],
             "clientToken": str(uuid.uuid4()),
         }
-        if self.config.LAMBDA_MICROVM_EXECUTION_ROLE_ARN:
-            kwargs["executionRoleArn"] = self.config.LAMBDA_MICROVM_EXECUTION_ROLE_ARN
+        if self.config.VALS_SANDBOX_EXECUTION_ROLE_ARN:
+            kwargs["executionRoleArn"] = self.config.VALS_SANDBOX_EXECUTION_ROLE_ARN
         data = await self._aws("run MicroVM", "run_microvm", **kwargs)
-        sandbox = LambdaMicrovmSandbox(self, data)
+        sandbox = ValsSandbox(self, data)
         try:
             await self._wait_ready(sandbox, request.create_timeout)
         except BaseException:
@@ -325,7 +325,7 @@ class LambdaMicrovmSandboxProvider(SandboxProvider):
             raise
         return sandbox
 
-    async def _wait_ready(self, sandbox: LambdaMicrovmSandbox, timeout: float) -> None:
+    async def _wait_ready(self, sandbox: ValsSandbox, timeout: float) -> None:
         deadline = time.monotonic() + timeout
         while sandbox.state != "running":
             if sandbox.has_ended:
@@ -349,7 +349,7 @@ class LambdaMicrovmSandboxProvider(SandboxProvider):
         except SandboxError:
             pass
 
-    async def endpoint(self, sandbox: LambdaMicrovmSandbox) -> tuple[str, dict[str, str]]:
+    async def endpoint(self, sandbox: ValsSandbox) -> tuple[str, dict[str, str]]:
         cached = self._tokens.get(sandbox.id)
         if cached is None or cached[2] - time.monotonic() < _TOKEN_REFRESH_SECONDS:
             response = await self._aws(
@@ -374,7 +374,7 @@ class LambdaMicrovmSandboxProvider(SandboxProvider):
 
     async def get_sandbox(self, instance_id: str) -> Sandbox:
         data = await self._aws(f"get MicroVM {instance_id}", "get_microvm", microvmIdentifier=instance_id)
-        sandbox = LambdaMicrovmSandbox(self, data)
+        sandbox = ValsSandbox(self, data)
         if sandbox.state == "running":
             try:
                 await sandbox.info()
@@ -412,7 +412,7 @@ class LambdaMicrovmSandboxProvider(SandboxProvider):
 
 __all__ = [
     "DEFAULT_BASE_DOCKERFILE",
-    "LambdaMicrovmProviderConfig",
-    "LambdaMicrovmSandbox",
-    "LambdaMicrovmSandboxProvider",
+    "ValsSandboxProviderConfig",
+    "ValsSandbox",
+    "ValsSandboxProvider",
 ]

@@ -814,9 +814,9 @@ def test_verify_task_ids_403_for_disallowed_dataset(auth_client: TestClient) -> 
 _OPT_IN_PROVIDERS = [
     ({"type": "docker"}, "CBS_DOCKER_ENABLED", "Docker sandboxes are disabled on this service"),
     (
-        {"type": "lambda_microvm", "LAMBDA_MICROVM_IMAGE": "arn:aws:lambda:us-east-1:1:microvm-image:x"},
-        "CBS_LAMBDA_MICROVM_ENABLED",
-        "Lambda MicroVM sandboxes are disabled on this service",
+        {"type": "vals_sandbox", "VALS_SANDBOX_IMAGE": "arn:aws:lambda:us-east-1:1:microvm-image:x"},
+        "CBS_VALS_SANDBOX_ENABLED",
+        "Vals Sandbox is disabled on this service",
     ),
 ]
 
@@ -837,7 +837,7 @@ def test_request_opt_in_provider_requires_service_opt_in(
     Verify that a request can select a provider that uses this host's daemon or credentials only on a service that opts in.
 
     Test cases:
-    - Without `CBS_DOCKER_ENABLED` / `CBS_LAMBDA_MICROVM_ENABLED`, each websocket endpoint closes with a policy violation before provider work.
+    - Without `CBS_DOCKER_ENABLED` / `CBS_VALS_SANDBOX_ENABLED`, each websocket endpoint closes with a policy violation before provider work.
     - With the variable set to `true`, the request passes the provider check and reaches the dataset check.
     """
     if enabled:

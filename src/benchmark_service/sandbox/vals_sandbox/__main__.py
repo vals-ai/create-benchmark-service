@@ -1,11 +1,11 @@
-"""Try Lambda MicroVM sandboxes from a shell.
+"""Try Vals Sandbox from a shell.
 
-    python -m benchmark_service.sandbox.lambda_microvm build-image
-    python -m benchmark_service.sandbox.lambda_microvm up --image <arn>
-    python -m benchmark_service.sandbox.lambda_microvm exec <id> -- python3 -c 'print(1)'
-    python -m benchmark_service.sandbox.lambda_microvm down <id>
+    python -m benchmark_service.sandbox.vals_sandbox build-image
+    python -m benchmark_service.sandbox.vals_sandbox up --image <arn>
+    python -m benchmark_service.sandbox.vals_sandbox exec <id> -- python3 -c 'print(1)'
+    python -m benchmark_service.sandbox.vals_sandbox down <id>
 
-Configuration comes from the LAMBDA_MICROVM_* environment variables and the AWS SDK's usual credentials.
+Configuration comes from the VALS_SANDBOX_* environment variables and the AWS SDK's usual credentials.
 """
 
 from __future__ import annotations
@@ -18,8 +18,8 @@ from typing import Any
 
 import click
 
-from benchmark_service.sandbox.lambda_microvm import LambdaMicrovmProviderConfig, LambdaMicrovmSandboxProvider
-from benchmark_service.sandbox.lambda_microvm.image import (
+from benchmark_service.sandbox.vals_sandbox import ValsSandboxProviderConfig, ValsSandboxProvider
+from benchmark_service.sandbox.vals_sandbox.image import (
     DEFAULT_BASE_DOCKERFILE,
     aws_client,
     baseline_memory_mib,
@@ -36,9 +36,9 @@ from benchmark_service.sandbox.types import (
 )
 
 
-def _run[T](work: Callable[[LambdaMicrovmSandboxProvider], Awaitable[T]]) -> T:
+def _run[T](work: Callable[[ValsSandboxProvider], Awaitable[T]]) -> T:
     async def main() -> T:
-        provider = LambdaMicrovmSandboxProvider(LambdaMicrovmProviderConfig.from_env())
+        provider = ValsSandboxProvider(ValsSandboxProviderConfig.from_env())
         async with provider:
             return await work(provider)
 
@@ -47,7 +47,7 @@ def _run[T](work: Callable[[LambdaMicrovmSandboxProvider], Awaitable[T]]) -> T:
 
 @click.group()
 def cli() -> None:
-    """Spin up, use, and tear down Lambda MicroVM sandboxes."""
+    """Spin up, use, and tear down Vals Sandbox sandboxes."""
 
 
 @cli.command("build-image")
@@ -56,26 +56,26 @@ def cli() -> None:
 @click.option("--memory", type=int, default=4, show_default=True, help="Peak memory in GiB")
 def build_image(dockerfile: Path | None, vcpu: float, memory: int) -> None:
     """Build (or reuse) a MicroVM image and print its ARN; defaults to Amazon Linux 2023 with Python."""
-    config = LambdaMicrovmProviderConfig.from_env()
-    if not (config.LAMBDA_MICROVM_BUILD_BUCKET and config.LAMBDA_MICROVM_BUILD_ROLE_ARN):
-        raise click.UsageError("Set LAMBDA_MICROVM_BUILD_BUCKET and LAMBDA_MICROVM_BUILD_ROLE_ARN")
-    region = config.LAMBDA_MICROVM_REGION
+    config = ValsSandboxProviderConfig.from_env()
+    if not (config.VALS_SANDBOX_BUILD_BUCKET and config.VALS_SANDBOX_BUILD_ROLE_ARN):
+        raise click.UsageError("Set VALS_SANDBOX_BUILD_BUCKET and VALS_SANDBOX_BUILD_ROLE_ARN")
+    region = config.VALS_SANDBOX_REGION
     arn = ensure_image(
         aws_client("lambda-microvms", region),
         aws_client("s3", region),
         dockerfile=dockerfile.read_text() if dockerfile else DEFAULT_BASE_DOCKERFILE,
         context_dir=dockerfile.parent if dockerfile else None,
         memory_mib=baseline_memory_mib(vcpu, memory),
-        bucket=config.LAMBDA_MICROVM_BUILD_BUCKET,
-        build_role_arn=config.LAMBDA_MICROVM_BUILD_ROLE_ARN,
-        architecture=config.LAMBDA_MICROVM_ARCHITECTURE,
+        bucket=config.VALS_SANDBOX_BUILD_BUCKET,
+        build_role_arn=config.VALS_SANDBOX_BUILD_ROLE_ARN,
+        architecture=config.VALS_SANDBOX_ARCHITECTURE,
         log=lambda message: click.echo(message, err=True),
     )
     click.echo(arn)
 
 
 @cli.command()
-@click.option("--image", default=None, help="MicroVM image ARN, container image, or omit for LAMBDA_MICROVM_IMAGE")
+@click.option("--image", default=None, help="MicroVM image ARN, container image, or omit for VALS_SANDBOX_IMAGE")
 @click.option("--dockerfile", type=click.Path(exists=True, dir_okay=False, resolve_path=True), default=None)
 @click.option("--label", "labels", multiple=True, help="key=value, repeatable")
 @click.option("--env", "env_vars", multiple=True, help="KEY=VALUE, repeatable")
@@ -94,14 +94,14 @@ def up(
     no_internet: bool,
 ) -> None:
     """Start a sandbox and print its id."""
-    config = LambdaMicrovmProviderConfig.from_env()
+    config = ValsSandboxProviderConfig.from_env()
     source: SandboxSource
     if dockerfile:
         source = DockerfileSource(dockerfile=dockerfile)
-    elif image or config.LAMBDA_MICROVM_IMAGE:
-        source = ImageSource(image=image or config.LAMBDA_MICROVM_IMAGE or "")
+    elif image or config.VALS_SANDBOX_IMAGE:
+        source = ImageSource(image=image or config.VALS_SANDBOX_IMAGE or "")
     else:
-        raise click.UsageError("Pass --image or --dockerfile, or set LAMBDA_MICROVM_IMAGE")
+        raise click.UsageError("Pass --image or --dockerfile, or set VALS_SANDBOX_IMAGE")
     request = SandboxCreateRequest(
         source=source,
         resources=Resources(vcpu=vcpu, memory=memory, disk=8),
@@ -113,7 +113,7 @@ def up(
         network_block_all=no_internet,
     )
 
-    async def work(provider: LambdaMicrovmSandboxProvider) -> str:
+    async def work(provider: ValsSandboxProvider) -> str:
         return (await provider.create_sandbox(request)).id
 
     click.echo(_run(work))
@@ -127,7 +127,7 @@ def up(
 def exec_command(sandbox_id: str, command: tuple[str, ...], cwd: str | None, timeout: float | None) -> None:
     """Run a shell command and stream its output; exits with the command's exit code."""
 
-    async def work(provider: LambdaMicrovmSandboxProvider) -> int:
+    async def work(provider: ValsSandboxProvider) -> int:
         sandbox = await provider.get_sandbox(sandbox_id)
         try:
             async for chunk in sandbox.command(" ".join(command), cwd=cwd, timeout=timeout):
@@ -147,7 +147,7 @@ def exec_command(sandbox_id: str, command: tuple[str, ...], cwd: str | None, tim
 def upload(sandbox_id: str, local: Path, remote: str) -> None:
     """Copy a local file into the sandbox."""
 
-    async def work(provider: LambdaMicrovmSandboxProvider) -> None:
+    async def work(provider: ValsSandboxProvider) -> None:
         await (await provider.get_sandbox(sandbox_id)).upload_file(remote, local.read_bytes())
 
     _run(work)
@@ -160,7 +160,7 @@ def upload(sandbox_id: str, local: Path, remote: str) -> None:
 def download(sandbox_id: str, remote: str, local: Path) -> None:
     """Copy a file out of the sandbox."""
 
-    async def work(provider: LambdaMicrovmSandboxProvider) -> None:
+    async def work(provider: ValsSandboxProvider) -> None:
         local.write_bytes(await (await provider.get_sandbox(sandbox_id)).download_file(remote))
 
     _run(work)
@@ -171,7 +171,7 @@ def download(sandbox_id: str, remote: str, local: Path) -> None:
 def down(sandbox_id: str) -> None:
     """Terminate the sandbox."""
 
-    async def work(provider: LambdaMicrovmSandboxProvider) -> str:
+    async def work(provider: ValsSandboxProvider) -> str:
         await provider.delete_sandbox(sandbox_id)
         return (await provider.get_sandbox(sandbox_id)).state
 
@@ -183,7 +183,7 @@ def down(sandbox_id: str) -> None:
 def list_command(labels: tuple[str, ...]) -> None:
     """List live sandboxes."""
 
-    async def work(provider: LambdaMicrovmSandboxProvider) -> list[dict[str, Any]]:
+    async def work(provider: ValsSandboxProvider) -> list[dict[str, Any]]:
         return [
             {"id": sandbox.id, "name": sandbox.name, "state": sandbox.state, "labels": dict(sandbox.labels or {})}
             async for sandbox in provider.list_sandboxes(SandboxQuery(labels=_pairs(labels), page_size=50))

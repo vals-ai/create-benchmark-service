@@ -59,7 +59,7 @@ from benchmark_service.schemas import (
 from benchmark_service.sandbox import (
     DaytonaProviderConfig,
     DockerProviderConfig,
-    LambdaMicrovmProviderConfig,
+    ValsSandboxProviderConfig,
     SandboxProviderConfig,
 )
 
@@ -122,24 +122,24 @@ def _request_sandbox_provider_config(
 
 DOCKER_ENABLED_ENV = "CBS_DOCKER_ENABLED"
 _DOCKER_DISABLED_REASON = "Docker sandboxes are disabled on this service"
-LAMBDA_MICROVM_ENABLED_ENV = "CBS_LAMBDA_MICROVM_ENABLED"
-_LAMBDA_MICROVM_DISABLED_REASON = "Lambda MicroVM sandboxes are disabled on this service"
+VALS_SANDBOX_ENABLED_ENV = "CBS_VALS_SANDBOX_ENABLED"
+_VALS_SANDBOX_DISABLED_REASON = "Vals Sandbox is disabled on this service"
 _AUTH_UNAVAILABLE_DETAIL = "Authentication is unavailable; this request was not started"
 
 
 def _provider_disabled_reason(config: SandboxProviderConfig | None) -> str | None:
     """Why this service refuses the provider, or None when it may use it.
 
-    Docker drives this host's daemon and lambda_microvm uses this host's AWS credentials, not the caller's,
+    Docker drives this host's daemon and vals_sandbox uses this host's AWS credentials, not the caller's,
     so only a service that opts in accepts them.
     """
     if isinstance(config, DockerProviderConfig) and os.environ.get(DOCKER_ENABLED_ENV, "").lower() != "true":
         return _DOCKER_DISABLED_REASON
     if (
-        isinstance(config, LambdaMicrovmProviderConfig)
-        and os.environ.get(LAMBDA_MICROVM_ENABLED_ENV, "").lower() != "true"
+        isinstance(config, ValsSandboxProviderConfig)
+        and os.environ.get(VALS_SANDBOX_ENABLED_ENV, "").lower() != "true"
     ):
-        return _LAMBDA_MICROVM_DISABLED_REASON
+        return _VALS_SANDBOX_DISABLED_REASON
     return None
 
 

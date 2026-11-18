@@ -1,6 +1,6 @@
-"""Tests for the Lambda MicroVM provider against the real in-VM agent on localhost.
+"""Tests for the Vals Sandbox provider (Lambda MicroVM backend) against the real in-VM agent on localhost.
 
-Run: uv run pytest tests/test_lambda_microvm.py
+Run: uv run pytest tests/test_vals_sandbox.py
 """
 
 from __future__ import annotations
@@ -28,13 +28,13 @@ from benchmark_service.sandbox import (
     UnsupportedSandboxConfigError,
     sandbox_provider_config_from_mapping,
 )
-from benchmark_service.sandbox.lambda_microvm import (
-    LambdaMicrovmProviderConfig,
-    LambdaMicrovmSandbox,
-    LambdaMicrovmSandboxProvider,
+from benchmark_service.sandbox.vals_sandbox import (
+    ValsSandboxProviderConfig,
+    ValsSandbox,
+    ValsSandboxProvider,
 )
-from benchmark_service.sandbox.lambda_microvm import agent
-from benchmark_service.sandbox.lambda_microvm.image import (
+from benchmark_service.sandbox.vals_sandbox import agent
+from benchmark_service.sandbox.vals_sandbox.image import (
     AGENT_FILE,
     baseline_memory_mib,
     build_artifact,
@@ -123,8 +123,8 @@ def _request(**overrides: Any) -> SandboxCreateRequest:
     return SandboxCreateRequest(**values)
 
 
-def _provider(fake: FakeMicrovms) -> LambdaMicrovmSandboxProvider:
-    return LambdaMicrovmSandboxProvider(LambdaMicrovmProviderConfig(LAMBDA_MICROVM_IMAGE=IMAGE_ARN), microvms=fake)
+def _provider(fake: FakeMicrovms) -> ValsSandboxProvider:
+    return ValsSandboxProvider(ValsSandboxProviderConfig(VALS_SANDBOX_IMAGE=IMAGE_ARN), microvms=fake)
 
 
 async def test_sandbox_lifecycle_runs_commands_and_moves_files(agent_ports: tuple[int, int], tmp_path: Path) -> None:
@@ -139,7 +139,7 @@ async def test_sandbox_lifecycle_runs_commands_and_moves_files(agent_ports: tupl
     fake = FakeMicrovms(*agent_ports)
     async with _provider(fake) as provider:
         sandbox = await provider.create_sandbox(_request())
-        assert isinstance(sandbox, LambdaMicrovmSandbox)
+        assert isinstance(sandbox, ValsSandbox)
         assert (sandbox.id, sandbox.name, sandbox.state) == ("mvm-1", "task-1", "running")
         assert sandbox.labels == {"run-id": "r1"}
         call = fake.run_calls[0]
@@ -198,14 +198,14 @@ async def test_failed_start_terminates_the_microvm(agent_ports: tuple[int, int])
     ],
 )
 def test_unsupported_configs_are_rejected_before_provisioning(nested: bool, resources: Resources) -> None:
-    provider = LambdaMicrovmProviderConfig(LAMBDA_MICROVM_IMAGE=IMAGE_ARN).create_provider()
+    provider = ValsSandboxProviderConfig(VALS_SANDBOX_IMAGE=IMAGE_ARN).create_provider()
     with pytest.raises(UnsupportedSandboxConfigError):
         provider.validate_sandbox_config(requires_nested_docker=nested, resources=resources)
 
 
 def test_config_decodes_from_provider_mapping() -> None:
-    config = sandbox_provider_config_from_mapping({"type": "lambda_microvm", "LAMBDA_MICROVM_IMAGE": IMAGE_ARN})
-    assert isinstance(config, LambdaMicrovmProviderConfig)
+    config = sandbox_provider_config_from_mapping({"type": "vals_sandbox", "VALS_SANDBOX_IMAGE": IMAGE_ARN})
+    assert isinstance(config, ValsSandboxProviderConfig)
 
 
 def test_baseline_memory_is_smallest_size_whose_peak_fits() -> None:
@@ -294,7 +294,7 @@ async def test_dockerfile_source_without_build_config_is_rejected(agent_ports: t
     dockerfile = tmp_path / "Dockerfile"
     dockerfile.write_text("FROM python:3.12-slim\n")
     async with _provider(FakeMicrovms(*agent_ports)) as provider:
-        with pytest.raises(MissingSandboxConfigError, match="LAMBDA_MICROVM_BUILD_BUCKET"):
+        with pytest.raises(MissingSandboxConfigError, match="VALS_SANDBOX_BUILD_BUCKET"):
             await provider.create_sandbox(_request(source=DockerfileSource(dockerfile=str(dockerfile))))
 
 

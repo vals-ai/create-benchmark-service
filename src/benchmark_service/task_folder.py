@@ -6,13 +6,14 @@ the root), the `task.toml` writer, the directory creation, and the uploads. The 
 instruction text, the metadata, and any extra files, which go in by path relative to the folder.
 """
 
+import json
+import re
 import shlex
 import tomllib
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Iterable, Mapping
 from pathlib import PurePosixPath
-from typing import Any, cast
+from typing import Any
 
-import toml
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from benchmark_service.sandbox import Sandbox
@@ -24,8 +25,27 @@ TASK_SCHEMA_VERSION = "1.3"
 
 MetadataValue = str | int | float | bool
 
-# `toml` ships no type stubs.
-_dump_toml = cast(Callable[[Mapping[str, Any]], str], toml.dumps)  # pyright: ignore[reportUnknownMemberType]
+_BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
+
+
+def _toml_string(value: str) -> str:
+    # A JSON string is a TOML basic string, except for DEL, which TOML does not allow unescaped.
+    return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
+
+
+def _toml_value(value: MetadataValue) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, str):
+        return _toml_string(value)
+    return repr(value)
+
+
+def _toml_table(name: str, table: Mapping[str, MetadataValue]) -> str:
+    lines = [f"[{name}]"]
+    for key, value in table.items():
+        lines.append(f"{key if _BARE_KEY.fullmatch(key) else _toml_string(key)} = {_toml_value(value)}")
+    return "\n".join(lines) + "\n"
 
 
 class TaskFolder(BaseModel):
@@ -55,9 +75,15 @@ class TaskFolder(BaseModel):
         data: dict[str, Any] = {"schema_version": TASK_SCHEMA_VERSION, "metadata": dict(self.metadata)}
         if self.agent_timeout_sec is not None:
             data["agent"] = {"timeout_sec": self.agent_timeout_sec}
-        text = _dump_toml(data)
-        # The `toml` writer is old. Refuse its output if it does not read back as the same data.
-        if tomllib.loads(text) != data:
+        text = f"schema_version = {_toml_string(TASK_SCHEMA_VERSION)}\n\n" + _toml_table("metadata", self.metadata)
+        if self.agent_timeout_sec is not None:
+            text += "\n" + _toml_table("agent", {"timeout_sec": self.agent_timeout_sec})
+        # Refuse the text if it does not read back as the same data, for example for a NaN value.
+        try:
+            parsed = tomllib.loads(text)
+        except tomllib.TOMLDecodeError as error:
+            raise ValueError(f"task.toml is not valid TOML for metadata {self.metadata!r}: {error}") from error
+        if parsed != data:
             raise ValueError(f"task.toml does not round-trip for metadata {self.metadata!r}")
         return text
 

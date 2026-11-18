@@ -487,7 +487,6 @@ dependencies = [
     { name = "pyyaml" },
     { name = "starlette" },
     { name = "tenacity" },
-    { name = "toml" },
     { name = "websockets" },
 ]
 
@@ -534,7 +533,6 @@ requires-dist = [
     { name = "sentry-sdk", extras = ["fastapi"], marker = "extra == 'vals-ai'", specifier = ">=2.58.0,<3.0" },
     { name = "starlette", specifier = ">=1.0.1" },
     { name = "tenacity", specifier = ">=8.3.0" },
-    { name = "toml", specifier = ">=0.10.2" },
     { name = "websockets", specifier = ">=15.0.1" },
 ]
 provides-extras = ["vals-ai"]

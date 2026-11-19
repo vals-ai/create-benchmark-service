@@ -38,6 +38,8 @@ from benchmark_service.sandbox.types import (
     SandboxError,
     UnsupportedSandboxConfigError,
     SandboxNotFoundError,
+    SandboxAccountRejectedError,
+    SandboxRejectedError,
     SandboxQuery,
     SnapshotSource,
     TargetedSnapshotSource,
@@ -970,6 +972,28 @@ async def test_create_sandbox_reports_a_missing_dockerfile_as_a_sandbox_error(
 
     with pytest.raises(SandboxError, match="Cannot read the Dockerfile"):
         await provider.create_sandbox(_request(DockerfileSource(dockerfile=str(tmp_path / "Dockerfile"))))
+
+
+async def test_create_sandbox_reports_an_invalid_image_as_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        raise ModalInvalidError("'cyber-range-kali-v3' is not a valid Image ID.")
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    with pytest.raises(SandboxRejectedError, match="not a valid Image ID"):
+        await provider.create_sandbox(_request())
+
+
+async def test_create_sandbox_reports_a_spent_workspace_limit_as_an_account_rejection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        raise ModalResourceExhaustedError("Workspace ac-1 has exceeded its spend limit")
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+
+    with pytest.raises(SandboxAccountRejectedError, match="spend limit"):
+        await provider.create_sandbox(_request())
 
 
 async def test_create_sandbox_maps_a_failed_registry_image_build_to_a_build_error(

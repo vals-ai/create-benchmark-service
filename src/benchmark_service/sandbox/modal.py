@@ -39,6 +39,8 @@ from benchmark_service.sandbox.types import (
     SandboxBuildError,
     SandboxCommandError,
     SandboxConnectionError,
+    SandboxAccountRejectedError,
+    SandboxRejectedError,
     SandboxCreateRequest,
     SandboxError,
     UnsupportedSandboxConfigError,
@@ -157,6 +159,10 @@ def _sandbox_error(exc: Exception) -> SandboxError:
     if isinstance(exc, ModalConnectionError):
         return SandboxConnectionError(str(exc))
     return SandboxError(str(exc))
+
+
+def _is_spend_limit(exc: ModalResourceExhaustedError) -> bool:
+    return "spend limit" in str(exc).lower()
 
 
 def _is_missing_volume_error(exc: ModalNotFoundError) -> bool:
@@ -580,7 +586,7 @@ class ModalSandboxProvider(SandboxProvider):
                     except ModalResourceExhaustedError as exc:
                         creation = None
                         delay = next(delays, None)
-                        if delay is None:
+                        if delay is None or _is_spend_limit(exc):
                             raise
                         logger.warning("Modal sandbox capacity exhausted, retrying in %ds: %s", delay, exc)
                         await asyncio.sleep(delay)
@@ -598,11 +604,15 @@ class ModalSandboxProvider(SandboxProvider):
                 ) from exc
             raise SandboxError(f"Failed to create Modal sandbox within {request.provider_timeout}s") from exc
         except ModalResourceExhaustedError as exc:
+            if _is_spend_limit(exc):
+                raise SandboxAccountRejectedError(f"Modal rejected the sandbox request: {exc}") from exc
             raise SandboxError(f"Modal sandbox resources exhausted: {exc}") from exc
         except ModalNotFoundError as exc:
             if request.volumes and _is_missing_volume_error(exc):
                 raise SandboxError(f"Modal volume mount failed: {exc}") from exc
             raise _sandbox_error(exc) from exc
+        except ModalInvalidError as exc:
+            raise SandboxRejectedError(f"Modal rejected the sandbox request: {exc}") from exc
         except _PROVIDER_ERRORS as exc:
             raise _sandbox_error(exc) from exc
         return ModalSandbox(inner, name=request.name, labels=request.labels)

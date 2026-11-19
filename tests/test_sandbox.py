@@ -10,7 +10,8 @@ from types import SimpleNamespace
 from typing import Any, Awaitable, Callable, cast
 
 import pytest
-from aiohttp import ClientConnectionError, ClientPayloadError, ClientResponseError, InvalidURL, RequestInfo
+from aiohttp import ClientConnectionError, ClientPayloadError, ClientResponseError, InvalidURL, RequestInfo, web
+from aiohttp.test_utils import TestServer
 from daytona import DaytonaConfig, GpuType, SandboxState
 from daytona.common.errors import (
     SOURCE_API,
@@ -3919,65 +3920,160 @@ async def test_daytona_provider_builds_a_dockerfile_source_from_its_folder(tmp_p
     assert [(context.source_path, context.archive_path) for context in image._context_list] == [  # pyright: ignore[reportPrivateUsage]
         (str(tmp_path / "data.txt"), "data.txt")
     ]
-    assert callable(daytona.create_kwargs["on_snapshot_create_logs"])
+    assert "on_snapshot_create_logs" not in daytona.create_kwargs
 
 
-async def test_daytona_gives_a_dockerfile_build_its_own_time_on_top_of_the_creation_timeout(tmp_path: Path) -> None:
+async def test_daytona_waits_for_a_dockerfile_build_by_polling_under_the_whole_build_budget(tmp_path: Path) -> None:
     inner = InnerSandbox()
     daytona = DaytonaClient(inner)
     request = _dockerfile_request(tmp_path, inner.name, build_timeout=600)
 
     await _provider(daytona).create_sandbox(request)
 
-    assert daytona.create_kwargs["timeout"] == request.create_timeout + 600
+    assert daytona.create_kwargs == {"timeout": request.create_timeout + 600}
 
 
-async def test_daytona_build_failure_carries_the_build_log_and_deletes_the_failed_sandbox(tmp_path: Path) -> None:
+class BuildLogServer:
+    def __init__(self, body: str = "", *, hang: bool = False) -> None:
+        self.body = body
+        self.hang = hang
+        self.requests: list[tuple[str, str | None]] = []
+        self.events: list[str] = []
+        app = web.Application()
+        app.router.add_get("/build-logs", self._serve)
+        self.server = TestServer(app)
+
+    async def _serve(self, request: web.Request) -> web.StreamResponse:
+        self.requests.append((request.query_string, request.headers.get("Authorization")))
+        self.events.append("read build log")
+        response = web.StreamResponse()
+        await response.prepare(request)
+        await response.write(self.body.encode())
+        if self.hang:
+            await asyncio.sleep(3600)
+        return response
+
+    def install(self, monkeypatch: pytest.MonkeyPatch, provider: DaytonaSandboxProvider) -> None:
+        server = self
+
+        class ApiClient:
+            def __init__(self, configuration: Any) -> None:
+                assert configuration.access_token == "test-key"
+
+            async def __aenter__(self) -> "ApiClient":
+                return self
+
+            async def __aexit__(self, *_args: object) -> None:
+                return None
+
+        class SandboxApi:
+            def __init__(self, api_client: object) -> None:
+                assert isinstance(api_client, ApiClient)
+
+            async def get_build_logs_url(self, sandbox_id: str) -> SimpleNamespace:
+                assert sandbox_id == "sandbox-id"
+                return SimpleNamespace(url=str(server.server.make_url("/build-logs")))
+
+        monkeypatch.setattr(daytona_module, "DaytonaApiClient", ApiClient)
+        monkeypatch.setattr(daytona_module, "SandboxApi", SandboxApi)
+        provider._target_api_configuration = cast(Any, SimpleNamespace(access_token="test-key"))  # pyright: ignore[reportPrivateUsage]
+
+
+class FailingBuildClient(DaytonaClient):
+    def __init__(self, sandbox: InnerSandbox, error: DaytonaError, events: list[str]) -> None:
+        super().__init__(sandbox)
+        self.error = error
+        self.events = events
+        self.create_attempts = 0
+
+    async def get(self, instance_id: str) -> InnerSandbox:
+        return self.sandbox
+
+    async def create(self, params: object, *_args: object, **kwargs: object) -> InnerSandbox:
+        self.create_attempts += 1
+        self.create_kwargs = kwargs
+        raise self.error
+
+    async def delete(self, sandbox: InnerSandbox) -> None:
+        self.events.append("delete sandbox")
+        await super().delete(sandbox)
+
+
+async def test_daytona_build_failure_reads_the_build_log_once_before_deleting_the_failed_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     inner = InnerSandbox()
     inner.state = SandboxState.BUILD_FAILED
+    logs = BuildLogServer("Step 1/2 : FROM python:3.12-slim\nCOPY failed: file not found\n")
+    daytona = FailingBuildClient(inner, DaytonaError("Failed to build snapshot"), logs.events)
+    provider = _provider(daytona)
+    logs.install(monkeypatch, provider)
 
-    class FailingBuildClient(DaytonaClient):
-        async def get(self, instance_id: str) -> InnerSandbox:
-            return self.sandbox
-
-        async def create(self, params: object, *_args: object, **kwargs: Any) -> InnerSandbox:
-            kwargs["on_snapshot_create_logs"]("Step 1/2 : FROM python:3.12-slim")
-            kwargs["on_snapshot_create_logs"]("COPY failed: file not found")
-            raise DaytonaError("Failed to build snapshot")
-
-    daytona = FailingBuildClient(inner)
-
-    with pytest.raises(SandboxBuildError, match="Failed to build snapshot") as error:
-        await _provider(daytona).create_sandbox(_dockerfile_request(tmp_path, inner.name))
+    async with logs.server:
+        with pytest.raises(SandboxBuildError, match="Failed to build snapshot") as error:
+            await provider.create_sandbox(_dockerfile_request(tmp_path, inner.name))
 
     assert error.value.build_log == "Step 1/2 : FROM python:3.12-slim\nCOPY failed: file not found"
-    assert daytona.deleted is True
+    assert logs.requests == [("", "Bearer test-key")]
+    assert logs.events == ["read build log", "delete sandbox"]
 
 
-async def test_daytona_build_timeout_is_a_build_error_and_is_not_retried(
+async def test_daytona_build_timeout_is_a_build_error_with_the_log_so_far_and_is_not_retried(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     inner = InnerSandbox()
     inner.state = SandboxState.BUILDING_SNAPSHOT
-    attempts: list[int] = []
+    logs = BuildLogServer("Step 1/2 : RUN sleep 9999\n")
+    daytona = FailingBuildClient(
+        inner, DaytonaTimeoutError("Sandbox failed to become ready within the timeout period"), logs.events
+    )
+    provider = _provider(daytona)
+    logs.install(monkeypatch, provider)
 
-    class TimingOutClient(DaytonaClient):
-        async def get(self, instance_id: str) -> InnerSandbox:
-            return self.sandbox
+    async with logs.server:
+        with pytest.raises(SandboxBuildError, match="Timed out building .* after 960s") as error:
+            await provider.create_sandbox(_dockerfile_request(tmp_path, inner.name, build_timeout=600))
 
-        async def create(self, params: object, *_args: object, **kwargs: Any) -> InnerSandbox:
-            attempts.append(1)
-            kwargs["on_snapshot_create_logs"]("Step 1/2 : RUN sleep 9999")
-            raise DaytonaTimeoutError("Sandbox failed to become ready within the timeout period")
-
-    daytona = TimingOutClient(inner)
-
-    with pytest.raises(SandboxBuildError, match="Timed out building") as error:
-        await _provider(daytona).create_sandbox(_dockerfile_request(tmp_path, inner.name))
-
-    assert len(attempts) == 1
+    assert daytona.create_attempts == 1
     assert error.value.build_log == "Step 1/2 : RUN sleep 9999"
+    assert logs.events == ["read build log", "delete sandbox"]
+
+
+async def test_daytona_build_log_that_never_finishes_keeps_what_arrived_and_still_deletes_the_sandbox(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    inner = InnerSandbox()
+    inner.state = SandboxState.BUILD_FAILED
+    logs = BuildLogServer("Step 1/2 : RUN apt-get install texlive\n", hang=True)
+    daytona = FailingBuildClient(inner, DaytonaError("Failed to build snapshot"), logs.events)
+    provider = _provider(daytona)
+    logs.install(monkeypatch, provider)
+    monkeypatch.setattr(daytona_module, "_BUILD_LOG_READ_TIMEOUT_SECONDS", 0.2)
+
+    async with logs.server:
+        with pytest.raises(SandboxBuildError, match="Failed to build snapshot") as error:
+            await provider.create_sandbox(_dockerfile_request(tmp_path, inner.name))
+
+    assert error.value.build_log == "Step 1/2 : RUN apt-get install texlive"
     assert daytona.deleted is True
+
+
+async def test_daytona_build_log_keeps_only_its_last_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    inner = InnerSandbox()
+    inner.state = SandboxState.BUILD_FAILED
+    body = "".join(f"Step {step}/400 : RUN true\n" for step in range(1, 401))
+    logs = BuildLogServer(body)
+    daytona = FailingBuildClient(inner, DaytonaError("Failed to build snapshot"), logs.events)
+    provider = _provider(daytona)
+    logs.install(monkeypatch, provider)
+    monkeypatch.setattr(daytona_module, "_BUILD_LOG_TAIL_BYTES", 64)
+
+    async with logs.server:
+        with pytest.raises(SandboxBuildError) as error:
+            await provider.create_sandbox(_dockerfile_request(tmp_path, inner.name))
+
+    assert error.value.build_log == body.encode()[-64:].decode().strip()
+    assert error.value.build_log.endswith("Step 400/400 : RUN true")
 
 
 async def test_daytona_registry_image_creation_never_collects_a_build_log() -> None:
@@ -3993,7 +4089,7 @@ async def test_daytona_registry_image_creation_never_collects_a_build_log() -> N
     with pytest.raises(SandboxError, match="Failed to pull the image") as error:
         await _provider(daytona).create_sandbox(_request(inner.name))
 
-    assert daytona.create_kwargs["on_snapshot_create_logs"] is None
+    assert "on_snapshot_create_logs" not in daytona.create_kwargs
     assert not isinstance(error.value, SandboxBuildError)
 
 

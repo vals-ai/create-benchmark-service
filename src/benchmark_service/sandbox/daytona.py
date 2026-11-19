@@ -13,7 +13,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, Literal, TypeVar, cast
 
-from aiohttp import ClientConnectionError, ClientError, ClientPayloadError, ClientResponseError, InvalidURL
+from aiohttp import (
+    ClientConnectionError,
+    ClientError,
+    ClientPayloadError,
+    ClientResponseError,
+    ClientSession,
+    InvalidURL,
+)
 from daytona import (
     AsyncDaytona,
     AsyncSandbox,
@@ -30,6 +37,7 @@ from daytona_api_client_async import (
     GpuType as ApiGpuType,
     OrganizationsApi,
     RegionType,
+    SandboxApi,
     SandboxClass,
 )
 from daytona_api_client_async.exceptions import NotFoundException, OpenApiException
@@ -170,6 +178,9 @@ _TOOLBOX_CALL_TIMEOUT_SECONDS = 120.0
 # create budget in this service (grading's _GRADING_CREATE_TIMEOUT_S), so a start that a concurrent
 # create is still legitimately waiting on is never aborted early.
 _SANDBOX_START_TIMEOUT_SECONDS = 600.0
+
+_BUILD_LOG_READ_TIMEOUT_SECONDS = 15.0
+_BUILD_LOG_TAIL_BYTES = 64 * 1024
 
 _T = TypeVar("_T")
 
@@ -1367,17 +1378,10 @@ class DaytonaSandboxProvider(SandboxProvider):
                 raise SandboxError("ComposeSource must be unwrapped before provider.create_sandbox")
 
         builds_dockerfile = isinstance(request.source, DockerfileSource)
-        build_log: list[str] = []
         try:
-            if isinstance(params, CreateSandboxFromImageParams):
-                inner = await daytona.create(
-                    params,
-                    timeout=request.provider_timeout,
-                    on_snapshot_create_logs=build_log.append if builds_dockerfile else None,
-                )
-            else:
-                inner = await daytona.create(params, timeout=request.provider_timeout)
+            inner = await daytona.create(params, timeout=request.provider_timeout)
         except DaytonaError as exc:
+            build_log = ""
             # A name conflict means an earlier attempt of this same request
             # created the sandbox but the response was lost (transport retry).
             # Recover it by name so the retry doesn't strand an orphan and fail
@@ -1388,33 +1392,61 @@ class DaytonaSandboxProvider(SandboxProvider):
                     await notify_sandbox_created("daytona", existing.id)
                     return DaytonaSandbox(existing, daytona)
             elif _is_transient_daytona_error(exc) or builds_dockerfile:
-                await self._delete_failed_sandbox(
-                    request.name, daytona, abandoned_build=builds_dockerfile and isinstance(exc, DaytonaTimeoutError)
+                build_log = await self._delete_failed_sandbox(
+                    request.name,
+                    daytona,
+                    abandoned_build=builds_dockerfile and isinstance(exc, DaytonaTimeoutError),
+                    read_build_log=builds_dockerfile,
                 )
             error = self._sandbox_error(exc)
             if isinstance(request.source, DockerfileSource):
                 if isinstance(exc, DaytonaTimeoutError):
                     raise SandboxBuildError(
                         f"Timed out building {request.source.dockerfile} after {request.provider_timeout:g}s",
-                        "\n".join(build_log),
+                        build_log,
                     ) from exc
                 if build_log and type(error) is SandboxError:
-                    raise SandboxBuildError(str(error), "\n".join(build_log)) from exc
+                    raise SandboxBuildError(str(error), build_log) from exc
             raise error from exc
 
         await notify_sandbox_created("daytona", inner.id)
         return DaytonaSandbox(inner, daytona)
 
-    async def _delete_failed_sandbox(self, name: str, daytona: AsyncDaytona, *, abandoned_build: bool = False) -> None:
+    async def _delete_failed_sandbox(
+        self, name: str, daytona: AsyncDaytona, *, abandoned_build: bool = False, read_build_log: bool = False
+    ) -> str:
         try:
             sandbox = await _bounded("daytona.get", daytona.get(name), _TOOLBOX_CALL_TIMEOUT_SECONDS)
         except DaytonaNotFoundError:
-            return
+            return ""
         except DaytonaError as exc:
             raise self._sandbox_error(exc) from exc
 
         if sandbox.state in _FAILED_SANDBOX_STATES or (abandoned_build and sandbox.state not in _REMOVED_SANDBOX_STATES):
+            build_log = await self._read_build_log(sandbox.id) if read_build_log else ""
             await self.delete_sandbox(sandbox.id)
+            return build_log
+        return ""
+
+    async def _read_build_log(self, sandbox_id: str) -> str:
+        tail = bytearray()
+        try:
+            async with asyncio.timeout(_BUILD_LOG_READ_TIMEOUT_SECONDS):
+                async with DaytonaApiClient(self._target_api_configuration) as api_client:
+                    url = (await SandboxApi(api_client).get_build_logs_url(sandbox_id)).url
+                async with (
+                    ClientSession(trust_env=True) as session,
+                    session.get(
+                        url, headers={"Authorization": f"Bearer {self._target_api_configuration.access_token}"}
+                    ) as response,
+                ):
+                    response.raise_for_status()
+                    async for chunk in response.content.iter_any():
+                        tail += chunk
+                        del tail[:-_BUILD_LOG_TAIL_BYTES]
+        except (TimeoutError, ClientError, OpenApiException) as exc:
+            logger.warning("daytona.build_log_unavailable sandbox=%s error=%s", sandbox_id, exc)
+        return tail.decode(errors="replace").strip()
 
     async def _find_existing_sandbox(self, name: str, daytona: AsyncDaytona) -> AsyncSandbox | None:
         try:

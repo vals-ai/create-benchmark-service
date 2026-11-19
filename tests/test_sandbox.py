@@ -4058,6 +4058,24 @@ async def test_daytona_build_log_that_never_finishes_keeps_what_arrived_and_stil
     assert daytona.deleted is True
 
 
+async def test_daytona_build_log_keeps_only_its_last_bytes(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    inner = InnerSandbox()
+    inner.state = SandboxState.BUILD_FAILED
+    body = "".join(f"Step {step}/400 : RUN true\n" for step in range(1, 401))
+    logs = BuildLogServer(body)
+    daytona = FailingBuildClient(inner, DaytonaError("Failed to build snapshot"), logs.events)
+    provider = _provider(daytona)
+    logs.install(monkeypatch, provider)
+    monkeypatch.setattr(daytona_module, "_BUILD_LOG_TAIL_BYTES", 64)
+
+    async with logs.server:
+        with pytest.raises(SandboxBuildError) as error:
+            await provider.create_sandbox(_dockerfile_request(tmp_path, inner.name))
+
+    assert error.value.build_log == body.encode()[-64:].decode().strip()
+    assert error.value.build_log.endswith("Step 400/400 : RUN true")
+
+
 async def test_daytona_registry_image_creation_never_collects_a_build_log() -> None:
     inner = InnerSandbox()
 

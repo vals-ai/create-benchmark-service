@@ -180,7 +180,7 @@ _TOOLBOX_CALL_TIMEOUT_SECONDS = 120.0
 _SANDBOX_START_TIMEOUT_SECONDS = 600.0
 
 _BUILD_LOG_READ_TIMEOUT_SECONDS = 15.0
-_BUILD_LOG_TAIL_CHARS = 64 * 1024
+_BUILD_LOG_TAIL_BYTES = 64 * 1024
 
 _T = TypeVar("_T")
 
@@ -1429,7 +1429,7 @@ class DaytonaSandboxProvider(SandboxProvider):
         return ""
 
     async def _read_build_log(self, sandbox_id: str) -> str:
-        chunks: list[bytes] = []
+        tail = bytearray()
         try:
             async with asyncio.timeout(_BUILD_LOG_READ_TIMEOUT_SECONDS):
                 async with DaytonaApiClient(self._target_api_configuration) as api_client:
@@ -1442,10 +1442,11 @@ class DaytonaSandboxProvider(SandboxProvider):
                 ):
                     response.raise_for_status()
                     async for chunk in response.content.iter_any():
-                        chunks.append(chunk)
+                        tail += chunk
+                        del tail[:-_BUILD_LOG_TAIL_BYTES]
         except (TimeoutError, ClientError, OpenApiException) as exc:
             logger.warning("daytona.build_log_unavailable sandbox=%s error=%s", sandbox_id, exc)
-        return b"".join(chunks).decode(errors="replace").strip()[-_BUILD_LOG_TAIL_CHARS:]
+        return tail.decode(errors="replace").strip()
 
     async def _find_existing_sandbox(self, name: str, daytona: AsyncDaytona) -> AsyncSandbox | None:
         try:

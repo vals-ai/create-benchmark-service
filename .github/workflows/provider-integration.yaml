@@ -15,13 +15,18 @@ jobs:
     env:
       TEST_AWS_REGION: ${{ secrets.TEST_AWS_REGION }}
       TEST_DAYTONA_SECRET_NAME: ${{ secrets.TEST_DAYTONA_SECRET_NAME }}
+      TEST_DAYTONA_V2_SECRET_NAME: CbsDaytonaV2SmokeSecrets
       TEST_MODAL_SECRET_NAME: ${{ secrets.TEST_MODAL_SECRET_NAME }}
     strategy:
       fail-fast: false
       matrix:
-        provider:
-          - daytona
-          - modal
+        include:
+          - provider: daytona
+            select: daytona and not daytona_v2
+          - provider: daytona_v2
+            select: daytona_v2
+          - provider: modal
+            select: modal
 
     steps:
       - uses: actions/checkout@v4
@@ -46,4 +51,4 @@ jobs:
           aws-region: ${{ env.TEST_AWS_REGION }}
 
       - name: Run provider integration tests
-        run: uv run pytest tests/integration/test_sandbox_provider.py -v -k "${{ matrix.provider }}"
+        run: uv run pytest tests/integration/test_sandbox_provider.py -v -k "${{ matrix.select }}"

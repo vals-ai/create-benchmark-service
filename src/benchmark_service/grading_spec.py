@@ -4,6 +4,7 @@ import math
 from dataclasses import dataclass
 
 from benchmark_service.sandbox import (
+    Checkpoint,
     ComposeSource,
     DockerfileSource,
     Resources,
@@ -25,7 +26,7 @@ def auto_stop_minutes(budget_s: float) -> int:
 class ResolvedSpec:
     """The task's eval-sandbox spec with generation-value fallbacks applied."""
 
-    source: BaseSandboxSource | TargetedSnapshotSource | DockerfileSource
+    source: BaseSandboxSource | TargetedSnapshotSource | DockerfileSource | Checkpoint
     resources: Resources
     volumes: list[VolumeMount]
     network_block_all: bool
@@ -40,7 +41,7 @@ def resolve_grading_spec(task: RetrieveTaskResponse) -> ResolvedSpec:
             "sandbox grading does not support ComposeSource; set eval_sandbox.source to an image or snapshot"
         )
     if spec is not None and spec.resources is not None and isinstance(
-        source, (SnapshotSource, TargetedSnapshotSource)
+        source, (SnapshotSource, TargetedSnapshotSource, Checkpoint)
     ):
         raise ValueError(
             "eval_sandbox.resources cannot override a snapshot-backed sandbox; use an image source with explicit resources"

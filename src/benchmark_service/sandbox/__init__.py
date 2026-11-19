@@ -11,6 +11,8 @@ from benchmark_service.sandbox.daytona_v2 import DaytonaV2ProviderConfig
 from benchmark_service.sandbox.local.docker import DockerProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
 from benchmark_service.sandbox.types import (
+    Checkpoint,
+    CheckpointKind,
     ComposeSource,
     DockerfileSource,
     ExecResult,
@@ -21,6 +23,7 @@ from benchmark_service.sandbox.types import (
     Sandbox,
     SandboxCapacity,
     SandboxBuildError,
+    SandboxCapabilities,
     SandboxCapacityDomain,
     SandboxCommandError,
     SandboxConnectionError,
@@ -56,6 +59,8 @@ def priced_provider_types() -> list[str]:
 
 
 __all__ = [
+    "Checkpoint",
+    "CheckpointKind",
     "ComposeSource",
     "ComposeSandbox",
     "DaytonaProviderConfig",
@@ -70,6 +75,7 @@ __all__ = [
     "Resources",
     "Sandbox",
     "SandboxBuildError",
+    "SandboxCapabilities",
     "SandboxCapacity",
     "SandboxCapacityDomain",
     "SandboxCommandError",

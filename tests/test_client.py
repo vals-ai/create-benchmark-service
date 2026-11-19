@@ -1075,6 +1075,7 @@ async def test_evaluate_response_includes_optional_provider_config(
             "sandbox_provider": {
                 "type": "modal",
                 "runtime": "gvisor",
+                "memory_snapshots": False,
                 "MODAL_TOKEN_ID": "id",
                 "MODAL_TOKEN_SECRET": "secret",
             },

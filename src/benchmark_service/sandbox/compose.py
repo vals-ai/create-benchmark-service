@@ -6,6 +6,8 @@ from collections.abc import AsyncGenerator, Iterable, Mapping
 from datetime import datetime
 
 from benchmark_service.sandbox.types import (
+    Checkpoint,
+    CheckpointKind,
     ComposeSource,
     ExecResult,
     Sandbox,
@@ -37,6 +39,7 @@ _COMPOSE_EXEC_ENV_ARGS = (
 class ComposeSandbox(Sandbox):
     def __init__(self, outer: Sandbox, source: ComposeSource) -> None:
         self._outer = outer
+        self._source = source
         self._service = source.service
         self._compose_command_prefix = source.compose_command
         self.labels = outer.labels
@@ -172,3 +175,10 @@ class ComposeSandbox(Sandbox):
 
     async def clear_egress_rules(self) -> None:
         await self._outer.clear_egress_rules()
+
+    async def checkpoint(self, kind: CheckpointKind, name: str) -> Checkpoint:
+        """Checkpoints the outer sandbox; a restore returns that outer sandbox for the caller to wrap again."""
+        return await self._outer.checkpoint(kind, name)
+
+    async def fork(self, name: str) -> "ComposeSandbox":
+        return ComposeSandbox(await self._outer.fork(name), self._source)

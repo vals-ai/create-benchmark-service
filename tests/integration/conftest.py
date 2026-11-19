@@ -17,10 +17,11 @@ from benchmark_service import (
     sandbox_provider_config_from_mapping,
 )
 
-ProviderType = Literal["daytona", "modal"]
+ProviderType = Literal["daytona", "daytona_v2", "modal"]
 
 _PROVIDER_SECRET_ENV_NAMES: dict[ProviderType, str] = {
     "daytona": "TEST_DAYTONA_SECRET_NAME",
+    "daytona_v2": "TEST_DAYTONA_V2_SECRET_NAME",
     "modal": "TEST_MODAL_SECRET_NAME",
 }
 

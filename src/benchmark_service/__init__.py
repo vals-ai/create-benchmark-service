@@ -22,6 +22,8 @@ from benchmark_service.client import (
 from benchmark_service.inflight import InflightMiddleware
 from benchmark_service.sandbox_recovery import SandboxProviders, run_with_sandbox_recovery
 from benchmark_service.sandbox import (
+    Checkpoint,
+    CheckpointKind,
     ComposeSource,
     ComposeSandbox,
     DaytonaProviderConfig,
@@ -35,6 +37,7 @@ from benchmark_service.sandbox import (
     Resources,
     Sandbox,
     SandboxBuildError,
+    SandboxCapabilities,
     SandboxCapacity,
     SandboxCapacityDomain,
     SandboxCommandError,
@@ -108,6 +111,8 @@ __all__ = [
     "SandboxRecoveryAttempt",
     "run_with_sandbox_recovery",
     "ArtifactGradingSubmission",
+    "Checkpoint",
+    "CheckpointKind",
     "ComposeSource",
     "ComposeSandbox",
     "DaytonaProviderConfig",
@@ -125,6 +130,7 @@ __all__ = [
     "Resources",
     "Sandbox",
     "SandboxBuildError",
+    "SandboxCapabilities",
     "SandboxCapacity",
     "SandboxCapacityDomain",
     "SandboxCommandError",

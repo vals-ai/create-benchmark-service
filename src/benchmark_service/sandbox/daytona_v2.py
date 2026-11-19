@@ -6,10 +6,12 @@ Talks to the v2 REST API directly so the v0 SDK pin stays unchanged.
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import math
 import os
 import signal
+import tarfile
 from collections.abc import AsyncGenerator, AsyncIterator, Mapping
 from contextlib import aclosing, asynccontextmanager, suppress
 from datetime import UTC, datetime, timedelta
@@ -23,6 +25,10 @@ from pydantic import BaseModel, Field, field_validator
 from benchmark_service.sandbox.created import notify_sandbox_created
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
 from benchmark_service.sandbox.types import (
+    CHECKPOINT_TIMEOUT_SECONDS,
+    Checkpoint,
+    CheckpointKind,
+    check_memory_restore,
     DockerfileSource,
     ExecResult,
     ImageSource,
@@ -30,6 +36,7 @@ from benchmark_service.sandbox.types import (
     Resources,
     Sandbox,
     SandboxBuildError,
+    SandboxCapabilities,
     SandboxCommandError,
     SandboxConnectionError,
     SandboxCreateRequest,
@@ -53,6 +60,7 @@ _FAILED_SANDBOX_STATUSES = frozenset({"failed", "lost", "stopped", "deleting", "
 _FAILED_IMAGE_STATUSES = frozenset({"failed", "error"})
 _DELETED_SANDBOX_STATUSES = frozenset({"deleting", "deleted"})
 _TIMEOUT_EXIT_CODE = 124
+_MAX_CONTEXT_BYTES = 64 * 1024 * 1024
 _POLICY_TIMEOUT_SECONDS = 60.0
 _RESERVED_ENV_PREFIX = "DAYTONA_"
 _ALLOWED_RESERVED_ENV = frozenset({"DAYTONA_API_URL", "DAYTONA_OTEL_ENDPOINT", "DAYTONA_DOCKER_START"})
@@ -124,6 +132,31 @@ async def _send(client: httpx.AsyncClient, method: str, url: str, what: str, **k
     except httpx.HTTPError as exc:
         raise _error(exc, what) from exc
     return response
+
+
+async def _await_status(
+    client: httpx.AsyncClient, path: str, what: str, ready: str, failed: frozenset[str], timeout: float
+) -> dict[str, Any]:
+    deadline = asyncio.get_running_loop().time() + timeout
+    while (data := (await _send(client, "GET", path, what)).json()).get("status") != ready:
+        if data.get("status") in failed or asyncio.get_running_loop().time() > deadline:
+            detail = f"{data.get('status')} {data.get('error') or ''}".strip()
+            raise SandboxError(f"Daytona v2 {what} did not become {ready}: {detail}")
+        await asyncio.sleep(_POLL_SECONDS)
+    return data
+
+
+def _build_context(folder: Path) -> bytes:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as archive:
+        archive.add(folder, arcname=".")
+    if buffer.tell() > _MAX_CONTEXT_BYTES:
+        raise SandboxBuildError(f"Build context {folder} is over the 64 MiB Daytona v2 accepts inline")
+    return buffer.getvalue()
+
+
+def _idle_delete_policy(auto_stop_minutes: int) -> dict[str, Any]:
+    return {"idle_expiry_seconds": auto_stop_minutes * 60, "on_idle_timeout": "delete"}
 
 
 def _toolbox_url(sandbox: Mapping[str, Any]) -> str:
@@ -218,6 +251,20 @@ class DaytonaV2Sandbox(Sandbox):
     def _toolbox(self) -> str:
         return _toolbox_url(self._data)
 
+    @asynccontextmanager
+    async def _sandbox_errors(self, missing_path: str | None = None) -> AsyncIterator[None]:
+        try:
+            yield
+        except SandboxError as exc:
+            sandbox = await _send(
+                self._client, "GET", f"/sandboxes/{quote(self.id, safe='')}", f"get sandbox {self.id}"
+            )
+            if sandbox.json().get("status") in _DELETED_SANDBOX_STATUSES:
+                raise SandboxNotFoundError(f"sandbox {self.id} was deleted") from exc
+            if missing_path is not None and isinstance(exc, SandboxNotFoundError):
+                raise SandboxError(f"{missing_path} not found in sandbox {self.id}") from exc
+            raise
+
     async def _start_process(
         self, command: str, cwd: str | None, timeout: float | None, env: Mapping[str, str] | None, wait_ms: int
     ) -> dict[str, Any]:
@@ -229,32 +276,35 @@ class DaytonaV2Sandbox(Sandbox):
         if timeout is not None:
             body["timeoutMs"] = math.ceil(timeout * 1000)
         params = {"waitMs": wait_ms, "logs": "text"} if wait_ms else {}
-        response = await _send(
-            self._client, "POST", f"{self._toolbox}/processes", f"exec in {self.id}", json=body, params=params
-        )
+        async with self._sandbox_errors():
+            response = await _send(
+                self._client, "POST", f"{self._toolbox}/processes", f"exec in {self.id}", json=body, params=params
+            )
         return response.json()
 
     async def _process(self, process_id: str) -> dict[str, Any]:
-        response = await _send(
-            self._client,
-            "GET",
-            f"{self._toolbox}/processes/{quote(process_id, safe='')}",
-            f"process {process_id} in {self.id}",
-            params={"waitMs": _WAIT_MS},
-        )
+        async with self._sandbox_errors():
+            response = await _send(
+                self._client,
+                "GET",
+                f"{self._toolbox}/processes/{quote(process_id, safe='')}",
+                f"process {process_id} in {self.id}",
+                params={"waitMs": _WAIT_MS},
+            )
         return response.json()
 
     async def _log_frames(self, process_id: str, cursor: str | None) -> dict[str, Any]:
         params: dict[str, Any] = {"encoding": "text"}
         if cursor:
             params["cursor"] = cursor
-        response = await _send(
-            self._client,
-            "GET",
-            f"{self._toolbox}/processes/{quote(process_id, safe='')}/logs",
-            f"logs of {process_id} in {self.id}",
-            params=params,
-        )
+        async with self._sandbox_errors():
+            response = await _send(
+                self._client,
+                "GET",
+                f"{self._toolbox}/processes/{quote(process_id, safe='')}/logs",
+                f"logs of {process_id} in {self.id}",
+                params=params,
+            )
         return response.json()
 
     async def _stream(
@@ -342,6 +392,52 @@ class DaytonaV2Sandbox(Sandbox):
             await asyncio.sleep(_POLL_SECONDS)
             policy = (await _send(self._client, "GET", url, what)).json()
 
+    async def checkpoint(self, kind: CheckpointKind, name: str) -> Checkpoint:
+        sandbox = quote(self.id, safe="")
+        if kind == CheckpointKind.FILES:
+            # An unnamed image is deleted after 7 days without a sandbox created from it.
+            created = await _send(self._client, "POST", f"/sandboxes/{sandbox}/images", f"capture {self.id}", json={})
+            path = f"/images/{quote(str(created.json()['id']), safe='')}"
+        else:
+            created = await _send(
+                self._client, "POST", f"/sandboxes/{sandbox}/snapshots", f"snapshot {self.id}", json={"name": name}
+            )
+            path = f"/snapshots/{quote(str(created.json()['id']), safe='')}"
+        try:
+            data = await _await_status(
+                self._client,
+                path,
+                f"checkpoint of {self.id}",
+                "ready",
+                _FAILED_IMAGE_STATUSES,
+                CHECKPOINT_TIMEOUT_SECONDS,
+            )
+        except BaseException:
+            with suppress(SandboxError):
+                await _send(self._client, "DELETE", path, f"delete checkpoint of {self.id}")
+            raise
+        return Checkpoint(provider="daytona_v2", kind=kind, ref=str(data["id"]))
+
+    async def fork(self, name: str) -> DaytonaV2Sandbox:
+        url = f"/sandboxes/{quote(self.id, safe='')}/fork"
+        created = await _send(self._client, "POST", url, f"fork {self.id}", json={"name": name, "memory": True})
+        fork_id = str(created.json()["id"])
+        try:
+            await notify_sandbox_created("daytona_v2", fork_id)
+            data = await _await_status(
+                self._client,
+                f"/sandboxes/{quote(fork_id, safe='')}",
+                f"fork {fork_id}",
+                _RUNNING,
+                _FAILED_SANDBOX_STATUSES,
+                CHECKPOINT_TIMEOUT_SECONDS,
+            )
+        except BaseException:
+            with suppress(SandboxError):
+                await _send(self._client, "DELETE", f"/sandboxes/{quote(fork_id, safe='')}", f"delete fork {fork_id}")
+            raise
+        return DaytonaV2Sandbox(data, self._client)
+
     async def modify_egress_rules(self, allowed_addresses: list[str]) -> None:
         cidrs, domains = resolve_allowed_addresses(allowed_addresses)
         await self._set_network_policy({"block_all": True, "allow_cidrs": cidrs, "allow_domains": domains or None})
@@ -352,17 +448,8 @@ class DaytonaV2Sandbox(Sandbox):
     async def clear_egress_rules(self) -> None:
         await self._set_network_policy({"block_all": False, "allow_cidrs": [], "allow_domains": None})
 
-    @asynccontextmanager
-    async def _missing_path_is_error(self, remote_path: str) -> AsyncIterator[None]:
-        """Raise SandboxNotFoundError on a toolbox 404 only if the sandbox is gone, so recovery skips missing files."""
-        try:
-            yield
-        except SandboxNotFoundError as exc:
-            await _send(self._client, "GET", f"/sandboxes/{quote(self.id, safe='')}", f"get sandbox {self.id}")
-            raise SandboxError(f"{remote_path} not found in sandbox {self.id}") from exc
-
     async def upload_file(self, remote_path: str, content: bytes) -> None:
-        async with self._missing_path_is_error(remote_path):
+        async with self._sandbox_errors(remote_path):
             await _send(
                 self._client,
                 "POST",
@@ -373,7 +460,7 @@ class DaytonaV2Sandbox(Sandbox):
             )
 
     async def download_file(self, remote_path: str) -> bytes:
-        async with self._missing_path_is_error(remote_path):
+        async with self._sandbox_errors(remote_path):
             response = await _send(
                 self._client,
                 "GET",
@@ -397,23 +484,50 @@ class DaytonaV2SandboxProvider(SandboxProvider):
     async def close(self) -> None:
         await self._client.aclose()
 
+    @property
+    def capabilities(self) -> SandboxCapabilities:
+        return SandboxCapabilities(checkpoints=frozenset(CheckpointKind))
+
+    async def delete_checkpoint(self, checkpoint: Checkpoint) -> None:
+        if checkpoint.provider != "daytona_v2":
+            raise SandboxError(f"Daytona v2 cannot delete a {checkpoint.provider} checkpoint")
+        kind = "images" if checkpoint.kind == CheckpointKind.FILES else "snapshots"
+        url = f"/{kind}/{quote(checkpoint.ref, safe='')}"
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + CHECKPOINT_TIMEOUT_SECONDS
+        try:
+            while (response := await self._client.delete(url)).status_code == 409 and loop.time() < deadline:
+                await asyncio.sleep(_POLL_SECONDS)
+            if response.status_code != 404:
+                response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise _error(exc, f"delete {checkpoint.ref}") from exc
+
     async def _image(self, source: SandboxSource, deadline: float) -> str:
         match source:
             case SnapshotSource(snapshot=snapshot):
                 return snapshot
+            case Checkpoint(provider="daytona_v2", kind=CheckpointKind.FILES, ref=ref):
+                return ref
             case ImageSource(image=image):
-                body: dict[str, Any] = {"source": {"type": "registry", "ref": image}}
+                fields: dict[str, Any] = {"source": {"type": "registry", "ref": image}}
+                files = None
             case DockerfileSource(dockerfile=dockerfile):
-                body = {"dockerfile": Path(dockerfile).read_text()}
+                path = Path(dockerfile)
+                fields = {"dockerfile": path.name}
+                files = {"context": ("context.tar", await asyncio.to_thread(_build_context, path.resolve().parent))}
             case _:
                 raise SandboxError(f"Daytona v2 provider does not support {type(source).__name__}")
         if self._config.DAYTONA_V2_REGION:
-            body["region_id"] = self._config.DAYTONA_V2_REGION
-        image = (await _send(self._client, "POST", "/images", "register image", json=body)).json()
+            fields["region_id"] = self._config.DAYTONA_V2_REGION
+        payload = {"json": fields} if files is None else {"data": fields, "files": files}
+        image = (await _send(self._client, "POST", "/images", "register image", **payload)).json()
         loop = asyncio.get_running_loop()
         while image.get("status") != "ready":
             if image.get("status") in _FAILED_IMAGE_STATUSES:
-                raise SandboxBuildError(f"Daytona v2 image {image.get('id')} failed: {image.get('error')}")
+                raise SandboxBuildError(
+                    f"Daytona v2 image {image.get('id')} failed: {image.get('error')}", str(image.get("error") or "")
+                )
             if loop.time() > deadline:
                 raise SandboxBuildError(f"Daytona v2 image {image.get('id')} was not ready in time")
             await asyncio.sleep(_POLL_SECONDS)
@@ -435,6 +549,24 @@ class DaytonaV2SandboxProvider(SandboxProvider):
         if unsupported:
             raise SandboxError(f"Daytona v2 provider does not support: {', '.join(unsupported)}")
 
+    def _restore_body(self, request: SandboxCreateRequest, snapshot: str) -> dict[str, Any]:
+        """Daytona's restore takes no image, resources, env or network policy; those come from the snapshot.
+
+        The saved policy is cleared once the copy runs, since an open request expects an open sandbox.
+        """
+        body: dict[str, Any] = {
+            "snapshot": snapshot,
+            "name": request.name,
+            "labels": request.labels,
+            "create_timeout_seconds": request.create_timeout,
+            "wait_seconds": 0,
+        }
+        if self._config.DAYTONA_V2_REGION:
+            body["region_id"] = self._config.DAYTONA_V2_REGION
+        if request.auto_stop_interval > 0:
+            body["lifecycle_policy"] = _idle_delete_policy(request.auto_stop_interval)
+        return body
+
     def _create_body(self, request: SandboxCreateRequest, image: str) -> dict[str, Any]:
         body: dict[str, Any] = {
             "image": image,
@@ -455,24 +587,26 @@ class DaytonaV2SandboxProvider(SandboxProvider):
         if request.network_block_all:
             body["network_policy"] = {"block_all": True}
         if request.auto_stop_interval > 0:
-            body["lifecycle_policy"] = {
-                "idle_expiry_seconds": request.auto_stop_interval * 60,
-                "on_idle_timeout": "delete",
-            }
+            body["lifecycle_policy"] = _idle_delete_policy(request.auto_stop_interval)
         return body
 
     async def create_sandbox(self, request: SandboxCreateRequest) -> DaytonaV2Sandbox:
         loop = asyncio.get_running_loop()
         deadline = loop.time() + request.provider_timeout
         self._reject_unsupported(request)
-        image = await self._image(request.source, deadline)
+        match request.source:
+            case Checkpoint(provider="daytona_v2", kind=CheckpointKind.MEMORY, ref=ref):
+                check_memory_restore(request)
+                body = self._restore_body(request, ref)
+            case source:
+                body = self._create_body(request, await self._image(source, deadline))
         data = (
             await _send(
                 self._client,
                 "POST",
                 "/sandboxes",
                 f"create {request.name}",
-                json=self._create_body(request, image),
+                json=body,
                 headers={"Idempotency-Key": request.name},
             )
         ).json()
@@ -485,11 +619,14 @@ class DaytonaV2SandboxProvider(SandboxProvider):
                     raise SandboxError(f"Daytona v2 sandbox {sandbox_id} did not start: {detail}")
                 await asyncio.sleep(_POLL_SECONDS)
                 data = await self._get(sandbox_id)
+            sandbox = DaytonaV2Sandbox(data, self._client)
+            if "snapshot" in body:
+                await sandbox.clear_egress_rules()
         except BaseException:
             with suppress(SandboxError):
                 await self.delete_sandbox(sandbox_id)
             raise
-        return DaytonaV2Sandbox(data, self._client)
+        return sandbox
 
     async def _get(self, instance_id: str) -> dict[str, Any]:
         response = await _send(
@@ -498,7 +635,10 @@ class DaytonaV2SandboxProvider(SandboxProvider):
         return response.json()
 
     async def get_sandbox(self, instance_id: str) -> DaytonaV2Sandbox:
-        return DaytonaV2Sandbox(await self._get(instance_id), self._client)
+        data = await self._get(instance_id)
+        if data.get("status") in _DELETED_SANDBOX_STATUSES:
+            raise SandboxNotFoundError(f"sandbox {instance_id} was deleted")
+        return DaytonaV2Sandbox(data, self._client)
 
     async def delete_sandbox(self, instance_id: str) -> None:
         try:
@@ -517,9 +657,10 @@ class DaytonaV2SandboxProvider(SandboxProvider):
             page = (await _send(self._client, "GET", "/sandboxes/search", "search sandboxes", params=params)).json()
             items: list[dict[str, Any]] = page.get("sandboxes") or []
             for item in items:
-                sandbox = await self.get_sandbox(str(item["id"]))
-                if sandbox.state not in _DELETED_SANDBOX_STATUSES:
-                    yield sandbox
+                try:
+                    yield await self.get_sandbox(str(item["id"]))
+                except SandboxNotFoundError:
+                    continue
             if not page.get("next_cursor"):
                 return
             params["cursor"] = page["next_cursor"]

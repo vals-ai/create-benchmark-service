@@ -33,6 +33,8 @@ Mode = Literal["allow_all", "deny_all", "allowlist"]
 _MAX_HEADER_BYTES = 64 * 1024
 _CONNECT_TIMEOUT = 15.0
 _IDLE_TIMEOUT = 600.0
+_MAX_BODY_BYTES = 64 * 1024 * 1024
+_BODY_TIMEOUT = 120.0
 
 
 @dataclass
@@ -132,6 +134,8 @@ class EgressProxy:
                 await _respond(writer, 407, extra='Proxy-Authenticate: Basic realm="vals-sandbox"\r\n')
                 return
             sandbox_id, policy = authenticated
+            tunnels = self._tunnels.setdefault(sandbox_id, set())
+            tunnels.add(writer)
             if method == "CONNECT":
                 host, _, port_text = target.rpartition(":")
                 upstream_head = body = b""
@@ -143,7 +147,15 @@ class EgressProxy:
                 if "transfer-encoding" in headers:
                     await _respond(writer, 411)
                     return
-                body = await reader.readexactly(int(headers.get("content-length") or 0))
+                length = int(headers.get("content-length") or 0)
+                if length > _MAX_BODY_BYTES:
+                    await _respond(writer, 413)
+                    return
+                body = await asyncio.wait_for(reader.readexactly(length), _BODY_TIMEOUT)
+                # The policy may have changed while the body arrived; use the current one.
+                if self.policies.get(sandbox_id) is not policy:
+                    await _respond(writer, 403)
+                    return
                 host, port_text = url.hostname, str(url.port or 80)
                 path = url.path or "/"
                 if url.query:
@@ -167,8 +179,6 @@ class EgressProxy:
             except (OSError, TimeoutError):
                 await _respond(writer, 502)
                 return
-            tunnels = self._tunnels.setdefault(sandbox_id, set())
-            tunnels.add(writer)
             if method == "CONNECT":
                 writer.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
                 await writer.drain()
@@ -180,9 +190,11 @@ class EgressProxy:
                 await _pipe(upstream_reader, writer)
                 upstream_writer.close()
             tunnels.discard(writer)
-        except (ValueError, asyncio.IncompleteReadError, ConnectionError):
+        except (ValueError, asyncio.IncompleteReadError, ConnectionError, TimeoutError):
             pass
         finally:
+            for open_tunnels in self._tunnels.values():
+                open_tunnels.discard(writer)
             writer.close()
 
     async def handle_admin(self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
@@ -252,6 +264,7 @@ async def _respond(writer: asyncio.StreamWriter, status: int, *, extra: str = ""
         403: "Forbidden",
         404: "Not Found",
         411: "Length Required",
+        413: "Content Too Large",
     }
     reasons |= {405: "Method Not Allowed", 407: "Proxy Authentication Required", 502: "Bad Gateway"}
     writer.write(

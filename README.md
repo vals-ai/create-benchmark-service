@@ -134,7 +134,7 @@ async def setup_task(self, task_id, sandbox, dataset=None):
 
 ### Harbor dataset (`harbor_dataset.py`)
 
-To publish your tasks as a dataset that grades itself, map each native task to a `HarborTask` and pass them to `write_dataset`. The same folder runs with `valkyrie dataset push` and with `harbor run --config harbor.yaml`.
+To publish your tasks as a dataset that grades itself, map each native task to a `HarborTask` and pass them to `write_dataset`. The same folder runs with `valkyrie dataset push`, and from inside it with `harbor run --config harbor.yaml --agent <agent> --model <model>`.
 
 ```python
 from benchmark_service import HarborTask, Verifier, write_dataset

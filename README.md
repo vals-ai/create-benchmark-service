@@ -132,6 +132,37 @@ async def setup_task(self, task_id, sandbox, dataset=None):
 
 `write_task_folder` creates every directory with one `mkdir -p`, then uploads `instruction.md`, `task.toml`, and each extra file in order. If the sandbox cannot create the directories, it raises `RuntimeError`. `task.toml` has `schema_version = "1.3"`, so Harbor's `TaskConfig` loads it. `TaskFolder` refuses an extra file path that is absolute, that contains `..`, that is `instruction.md` or `task.toml`, or that is below another file of the folder.
 
+### Harbor dataset (`harbor_dataset.py`)
+
+To publish your tasks as a dataset that grades itself, map each native task to a `HarborTask` and pass them to `write_dataset`. The same folder runs with `valkyrie dataset push` and with `harbor run --config harbor.yaml`.
+
+```python
+from benchmark_service import HarborTask, Verifier, write_dataset
+
+task = HarborTask(
+    task_id=task_id,
+    name=f"vals/a2j-{task_id.replace('__', '-')}",
+    instruction=query,
+    environment_dockerfile=AGENT_DOCKERFILE,
+    metadata={"benchmark": "a2j", "categories": categories},
+    agent_timeout_sec=10800,
+    verifier=Verifier(
+        image=GRADER_IMAGE,
+        command="a2j-grade --generation /logs/artifacts/generation.json",
+        files={"case.json": case_json},
+        env={"MODEL_GATEWAY_URL": "${MODEL_GATEWAY_URL:-}", "MODEL_GATEWAY_API_KEY": "${MODEL_GATEWAY_API_KEY:-}"},
+    ),
+)
+write_dataset(Path("out/a2j"), tasks, metric=metric_source)
+```
+
+- `name` is Harbor's registry name, `<org>/<task>` in lowercase. Keep it the same across exports.
+- The grader image and any `environment_image` must be pinned by digest.
+- `verifier.files` go to `tests/`, which the agent never sees. The verifier runs in its own sandbox from `FROM <image>` with those files at `/tests`.
+- The grader writes `/logs/verifier/reward.json` and its judge details to `/logs/verifier/details.json`.
+- `metadata.valkyrie` is reserved for the writer, which declares `details.json` there.
+- `write_dataset` refuses an existing folder and duplicate task IDs, and also writes `metric.py` and a `harbor.yaml` that selects it.
+
 ### FastAPI application factory (`app.py`)
 
 `BenchmarkServiceApp(service_cls)` wraps your `BenchmarkService` subclass in a fully configured FastAPI app. Pass your subclass and run the result with any ASGI server.

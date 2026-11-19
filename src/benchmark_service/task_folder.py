@@ -28,7 +28,7 @@ MetadataValue = str | int | float | bool
 _BARE_KEY = re.compile(r"[A-Za-z0-9_-]+")
 
 
-def _toml_string(value: str) -> str:
+def toml_string(value: str) -> str:
     # A JSON string is a TOML basic string, except for DEL, which TOML does not allow unescaped.
     return json.dumps(value, ensure_ascii=False).replace("\x7f", "\\u007f")
 
@@ -37,14 +37,14 @@ def _toml_value(value: MetadataValue) -> str:
     if isinstance(value, bool):
         return "true" if value else "false"
     if isinstance(value, str):
-        return _toml_string(value)
+        return toml_string(value)
     return repr(value)
 
 
 def _toml_table(name: str, table: Mapping[str, MetadataValue]) -> str:
     lines = [f"[{name}]"]
     for key, value in table.items():
-        lines.append(f"{key if _BARE_KEY.fullmatch(key) else _toml_string(key)} = {_toml_value(value)}")
+        lines.append(f"{key if _BARE_KEY.fullmatch(key) else toml_string(key)} = {_toml_value(value)}")
     return "\n".join(lines) + "\n"
 
 
@@ -67,7 +67,7 @@ class TaskFolder(BaseModel):
     @field_validator("extra_files")
     @classmethod
     def _check_extra_paths(cls, files: dict[str, bytes | str]) -> dict[str, bytes | str]:
-        _check_file_paths(files)
+        check_file_paths(files)
         return files
 
     def task_toml(self) -> str:
@@ -75,7 +75,7 @@ class TaskFolder(BaseModel):
         data: dict[str, Any] = {"schema_version": TASK_SCHEMA_VERSION, "metadata": dict(self.metadata)}
         if self.agent_timeout_sec is not None:
             data["agent"] = {"timeout_sec": self.agent_timeout_sec}
-        text = f"schema_version = {_toml_string(TASK_SCHEMA_VERSION)}\n\n" + _toml_table("metadata", self.metadata)
+        text = f"schema_version = {toml_string(TASK_SCHEMA_VERSION)}\n\n" + _toml_table("metadata", self.metadata)
         if self.agent_timeout_sec is not None:
             text += "\n" + _toml_table("agent", {"timeout_sec": self.agent_timeout_sec})
         # Refuse the text if it does not read back as the same data, for example for a NaN value.
@@ -90,7 +90,7 @@ class TaskFolder(BaseModel):
     def files(self) -> dict[str, bytes]:
         """Every file of the folder, keyed by path relative to the folder, in upload order."""
         # `frozen` does not stop a change to the mapping after construction, so check the paths again.
-        _check_file_paths(self.extra_files)
+        check_file_paths(self.extra_files)
         files = {
             INSTRUCTION_FILE: self.instruction.encode("utf-8"),
             TASK_FILE: self.task_toml().encode("utf-8"),
@@ -112,7 +112,7 @@ def _check_relative_path(path: str) -> None:
         raise ValueError(f"Extra file path is reserved by the task folder: {path!r}")
 
 
-def _check_file_paths(paths: Iterable[str]) -> None:
+def check_file_paths(paths: Iterable[str]) -> None:
     """Refuse a bad path, and a path below another file of the folder, which cannot be written."""
     files = {INSTRUCTION_FILE, TASK_FILE}
     for path in paths:

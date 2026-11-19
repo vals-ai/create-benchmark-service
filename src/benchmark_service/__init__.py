@@ -73,6 +73,7 @@ from benchmark_service.schemas import (
     SubmissionArtifactReference,
     TextGradingSubmission,
 )
+from benchmark_service.harbor_dataset import HarborTask, Verifier, write_dataset
 from benchmark_service.task_folder import DEFAULT_TASK_DIR, TaskFolder, write_task_folder
 from benchmark_service.valkyrie_stage import Agents, Exhausted, SlotResult, StageReporter, valkyrie_stage_source
 
@@ -80,6 +81,9 @@ __all__ = [
     "DEFAULT_TASK_DIR",
     "TaskFolder",
     "write_task_folder",
+    "HarborTask",
+    "Verifier",
+    "write_dataset",
     "DATASET_VERSION_HEADER",
     "CreditedGeneration",
     "MCPServer",

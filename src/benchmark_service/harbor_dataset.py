@@ -181,8 +181,9 @@ def write_dataset(root: Path, tasks: Iterable[HarborTask], *, metric: str) -> li
     task_ids = [task.task_id for task in tasks]
     if not tasks:
         raise ValueError("A dataset needs at least one task")
-    if len(set(task_ids)) != len(task_ids):
-        raise ValueError(f"Duplicate task IDs: {sorted({t for t in task_ids if task_ids.count(t) > 1})}")
+    folded = [task_id.casefold() for task_id in task_ids]
+    if len(set(folded)) != len(folded):
+        raise ValueError(f"Duplicate task IDs: {sorted({t for t in task_ids if folded.count(t.casefold()) > 1})}")
     root.mkdir(parents=True, exist_ok=False)
     for task in tasks:
         for path, content in task.files_by_path().items():

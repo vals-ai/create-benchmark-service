@@ -84,5 +84,5 @@ def test_unpinned_grader_is_refused() -> None:
 
 def test_duplicate_task_ids_are_refused_before_writing(tmp_path: Path) -> None:
     with pytest.raises(ValueError, match="Duplicate task IDs"):
-        write_dataset(tmp_path / "out", [_task(), _task()], metric="")
+        write_dataset(tmp_path / "out", [_task(), _task(task_id="BOTH__case-001")], metric="")
     assert not (tmp_path / "out").exists()

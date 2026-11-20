@@ -1,5 +1,4 @@
-import builtins
-from typing import Any
+import sys
 
 import pytest
 
@@ -18,14 +17,7 @@ def test_vals_sandbox_config_keeps_its_settings() -> None:
 
 
 def test_vals_sandbox_provider_needs_the_package(monkeypatch: pytest.MonkeyPatch) -> None:
-    real_import = builtins.__import__
-
-    def without_vals_sandbox(name: str, *args: Any, **kwargs: Any) -> Any:
-        if name.startswith("vals_sandbox"):
-            raise ImportError(name)
-        return real_import(name, *args, **kwargs)
-
-    monkeypatch.setattr(builtins, "__import__", without_vals_sandbox)
+    monkeypatch.setitem(sys.modules, "vals_sandbox", None)
 
     with pytest.raises(MissingSandboxConfigError, match="vals-sandbox package"):
         ValsSandboxProviderConfig().create_provider()

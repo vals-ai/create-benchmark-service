@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Literal
+import importlib
+from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict
 
@@ -17,9 +18,14 @@ class ValsSandboxProviderConfig(BaseModel):
 
     def create_provider(self) -> SandboxProvider:
         try:
-            from vals_sandbox.integrations.cbs import ValsSandboxProviderConfig as Config
+            module = importlib.import_module("vals_sandbox.integrations.cbs")
         except ImportError as error:
             raise MissingSandboxConfigError(
-                "The vals_sandbox provider needs the vals-sandbox package: install create-benchmark-service[vals-sandbox]"
+                "The vals_sandbox provider needs the vals-sandbox package (github.com/vals-ai/vals-sandbox)"
             ) from error
-        return Config.model_validate(self.model_dump()).create_provider()
+        config: _ProviderConfig = module.ValsSandboxProviderConfig.model_validate(self.model_dump())
+        return config.create_provider()
+
+
+class _ProviderConfig(Protocol):
+    def create_provider(self) -> SandboxProvider: ...

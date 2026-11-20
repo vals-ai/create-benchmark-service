@@ -10,6 +10,7 @@ from benchmark_service.sandbox.daytona import DaytonaProviderConfig
 from benchmark_service.sandbox.daytona_v2 import DaytonaV2ProviderConfig
 from benchmark_service.sandbox.local.docker import DockerProviderConfig
 from benchmark_service.sandbox.modal import ModalProviderConfig
+from benchmark_service.sandbox.vals_sandbox import ValsSandboxProviderConfig
 from benchmark_service.sandbox.types import (
     ComposeSource,
     DockerfileSource,
@@ -38,7 +39,11 @@ from benchmark_service.sandbox.types import (
 )
 
 SandboxProviderConfig = Annotated[
-    DaytonaProviderConfig | DaytonaV2ProviderConfig | ModalProviderConfig | DockerProviderConfig,
+    DaytonaProviderConfig
+    | DaytonaV2ProviderConfig
+    | ModalProviderConfig
+    | DockerProviderConfig
+    | ValsSandboxProviderConfig,
     Field(discriminator="type"),
 ]
 
@@ -77,6 +82,7 @@ __all__ = [
     "SandboxCreateRequest",
     "SandboxError",
     "UnsupportedSandboxConfigError",
+    "ValsSandboxProviderConfig",
     "SandboxNotFoundError",
     "SandboxProvider",
     "SandboxProviderConfig",

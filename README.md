@@ -202,7 +202,12 @@ allocate capacity or enforce a caller's scheduling policy.
 {"type": "daytona", "DAYTONA_API_KEY": "...", "DAYTONA_API_URL": "...", "DAYTONA_TARGET": "...", "DAYTONA_ORGANIZATION_ID": "..."}
 {"type": "modal", "MODAL_TOKEN_ID": "...", "MODAL_TOKEN_SECRET": "..."}
 {"type": "daytona_v2", "DAYTONA_V2_API_KEY": "...", "DAYTONA_V2_API_URL": "https://api.daytona.com", "DAYTONA_V2_REGION": "...", "DAYTONA_V2_SPOT": false}
+{"type": "vals_sandbox", "VALS_SANDBOX_REGION": "us-east-1", "VALS_SANDBOX_BUILD_BUCKET": "...", "VALS_SANDBOX_EGRESS_TABLE": "..."}
 ```
+
+`vals_sandbox` runs sandboxes on [Vals Sandbox](https://github.com/vals-ai/vals-sandbox) (AWS Lambda MicroVMs). It needs the
+`vals-sandbox` package installed next to this one. Its `VALS_SANDBOX_*` keys pass through unchanged, and keys left out are
+read from the environment, so `GRADING_SANDBOX_PROVIDER=vals_sandbox` also works. The vals-sandbox README lists the keys.
 
 `daytona_v2` is opt-in (Daytona v2 API, alpha):
 - Keeps fractional `vcpu`; v0 `daytona` rounds it up because the v0 API takes whole CPUs.

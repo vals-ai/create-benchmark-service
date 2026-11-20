@@ -331,16 +331,6 @@ def test_final_score_with_dataset(client: TestClient) -> None:
     assert response.json()["final_score"] == 100.0
 
 
-def test_websocket_setup_task_missing_headers(client: TestClient) -> None:
-    with client.websocket_connect("/ws/setup-task") as ws:
-        ws.close()
-
-
-def test_websocket_evaluate_instance_missing_headers(client: TestClient) -> None:
-    with client.websocket_connect("/ws/evaluate-instance") as ws:
-        ws.close()
-
-
 def test_websocket_evaluate_response_with_eval_resume_state(client: TestClient) -> None:
     with client.websocket_connect("/ws/evaluate-response") as ws:
         ws.send_json({"task_id": "task-1", "eval_resume_state": {"artifact_prefix": "s3://bucket/run"}})

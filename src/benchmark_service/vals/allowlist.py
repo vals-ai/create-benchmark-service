@@ -129,11 +129,6 @@ class CatalogAllowlistClient:
         """Close the underlying HTTP client and transport."""
         await self._client.aclose()
 
-    def clear_cache(self) -> None:
-        """Clear successful tenant policies."""
-        self._cache.clear()
-        self._last_good.clear()
-
     def cached_tenant_config(self, tenant: str) -> TenantConfig | None:
         """Return a cached policy without making a network request."""
         return self._cache.get(tenant)

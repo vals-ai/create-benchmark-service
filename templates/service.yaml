@@ -1,0 +1,30 @@
+# The benchmark services registry reads this file from the commit it deploys.
+# Schema: schemas/service-manifest.v1.json in vals-ai/benchmark-services-registry.
+# Uncomment what this service needs; anything left out keeps the registry default.
+manifest_version: 1
+
+# runtime:
+#   cpu: 1024
+#   memory: 2048
+#
+# platform:
+#   model_gateway: true
+#   sandboxes:
+#     provider: daytona
+#     # The registry passes the API keys only for providers listed here.
+#     credentials: [daytona]
+#
+# framework:
+#   eval_resume:
+#     prefix: my-bench/run-state
+#     bucket_env: MY_BENCH_RUN_STATE_BUCKET
+#
+# Names only; the registry picks the secret behind each one.
+# secrets:
+#   - VALS_API_KEY
+#
+# env:
+#   all:
+#     MY_BENCH_SETTING: value
+#   prod:
+#     MY_BENCH_SETTING: prod-value

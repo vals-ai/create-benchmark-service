@@ -818,7 +818,7 @@ async def test_create_sandbox_maps_request(monkeypatch: pytest.MonkeyPatch, requ
     assert captured["timeout"] == 86400
     assert captured["block_network"] is False
     assert captured["outbound_cidr_allowlist"] == ["0.0.0.0/0"]
-    assert "outbound_domain_allowlist" not in captured
+    assert captured["outbound_domain_allowlist"] == ["*"]
     assert captured["runtime"] == ("vm" if requires_nested_docker else "gvisor")
     assert captured["experimental_options"] == (None if requires_nested_docker else {"enable_docker": True})
     assert captured["gpu"] is None
@@ -1075,7 +1075,7 @@ async def test_create_sandbox_blocks_network_without_conflicting_allowlists(
 
     assert captured["block_network"] is True
     assert captured["outbound_cidr_allowlist"] is None
-    assert "outbound_domain_allowlist" not in captured
+    assert captured["outbound_domain_allowlist"] is None
 
 
 async def test_create_sandbox_uses_modal_safe_name(monkeypatch: pytest.MonkeyPatch) -> None:

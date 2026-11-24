@@ -2,6 +2,10 @@
 
 CLI tool to scaffold benchmark services.
 
+Most new benchmarks do not need a service. Publish the tasks as a Harbor dataset
+instead, as [Publish a dataset](https://docs.valkyrie.vals.ai/benchmarks/datasets) describes.
+Build a service only when a dataset cannot run the benchmark.
+
 ## Installation
 
 ```bash

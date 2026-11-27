@@ -9,6 +9,7 @@ import shlex
 import socket
 import uuid
 from collections.abc import AsyncGenerator, Awaitable, Coroutine, Mapping
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any, Literal, cast
 
@@ -23,7 +24,7 @@ from modal.exception import NotFoundError as ModalNotFoundError
 from modal.exception import ResourceExhaustedError as ModalResourceExhaustedError
 from grpclib import Status
 from grpclib.exceptions import GRPCError, ProtocolError, StreamTerminatedError
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_fixed
 
 from benchmark_service.sandbox.egress import resolve_allowed_addresses
@@ -56,6 +57,8 @@ from benchmark_service.sandbox.types import (
 _APP_NAME = "benchmark-service"
 # Modal's default sandbox timeout is 5 minutes; benchmark tasks run for hours.
 _MAX_LIFETIME_SECONDS = min(MAX_SANDBOX_LIFETIME_SECONDS, 24 * 60 * 60)
+_BURST_CPU_REQUEST = 0.125
+_BURST_MEMORY_REQUEST_MIB = 512
 _ALLOW_ALL_CIDRS = ("0.0.0.0/0",)
 _RESOLVE_IN_SANDBOX = (
     'for host in "$@"; do getent ahostsv4 "$host" 2>/dev/null | awk \'{print $1}\'; done; '
@@ -104,6 +107,7 @@ _PROVIDER_RETRY = retry(
 class ModalProviderConfig(BaseModel):
     type: Literal["modal"] = "modal"
     runtime: Literal["gvisor", "vm"] = "gvisor"
+    burst: bool = Field(default=False, exclude_if=lambda value: not value)
     MODAL_TOKEN_ID: str
     MODAL_TOKEN_SECRET: str
 
@@ -124,6 +128,7 @@ class ModalProviderConfig(BaseModel):
         return cls.model_validate(
             {
                 "runtime": os.environ.get("MODAL_RUNTIME", "gvisor"),
+                "burst": os.environ.get("MODAL_BURST", "false"),
                 "MODAL_TOKEN_ID": token_id,
                 "MODAL_TOKEN_SECRET": token_secret,
             }
@@ -131,6 +136,23 @@ class ModalProviderConfig(BaseModel):
 
     def create_provider(self) -> SandboxProvider:
         return ModalSandboxProvider(self)
+
+
+@dataclass(frozen=True)
+class _ModalSandboxSize:
+    cpu: tuple[float, float]
+    memory: int | tuple[int, int]
+
+    @classmethod
+    def from_resources(cls, resources: Resources, *, burst: bool) -> _ModalSandboxSize:
+        cpu_limit = resources.vcpu
+        memory_mib = resources.memory * 1024
+        if burst and not resources.gpu:
+            return cls(
+                cpu=(min(_BURST_CPU_REQUEST, cpu_limit), cpu_limit),
+                memory=(_BURST_MEMORY_REQUEST_MIB, memory_mib),
+            )
+        return cls(cpu=(cpu_limit, cpu_limit), memory=memory_mib)
 
 
 # Modal re-raises these raw grpclib and socket errors once its own transport retries run out.
@@ -547,14 +569,15 @@ class ModalSandboxProvider(SandboxProvider):
             if not gpu_type:
                 raise SandboxError("Modal sandbox provider requires gpu_type when gpu is requested")
             gpu = f"{gpu_type}:{request.resources.gpu}"
+        size = _ModalSandboxSize.from_resources(request.resources, burst=self._config.burst)
         create_kwargs: dict[str, Any] = {
             "app": app,
             "name": modal_name,
             "image": image,
             "env": dict(request.env_vars),
             "tags": request.labels,
-            "cpu": (request.resources.vcpu, request.resources.vcpu),
-            "memory": request.resources.memory * 1024,
+            "cpu": size.cpu,
+            "memory": size.memory,
             "gpu": gpu,
             "idle_timeout": request.auto_stop_interval * 60 if request.auto_stop_interval else None,
             "timeout": _MAX_LIFETIME_SECONDS,

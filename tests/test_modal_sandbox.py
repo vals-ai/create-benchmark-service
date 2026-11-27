@@ -279,6 +279,17 @@ def test_modal_config_reads_secrets_manager_shape() -> None:
     assert config == ModalProviderConfig(runtime="vm", MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret")
 
 
+def test_modal_config_reads_burst_from_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("MODAL_TOKEN_ID", "id")
+    monkeypatch.setenv("MODAL_TOKEN_SECRET", "secret")
+    monkeypatch.setenv("MODAL_BURST", "true")
+
+    config = ModalProviderConfig.from_env()
+
+    assert config.burst is True
+    assert config.model_dump()["burst"] is True
+
+
 def test_command_merges_stderr_and_applies_timeout_inside_cwd() -> None:
     command = modal_module._command("echo hi", "/workspace", 60)
     assert command == "{ cd /workspace && timeout 60 sh -c 'echo hi' ; } 2>&1"
@@ -1027,6 +1038,29 @@ async def test_create_sandbox_reserves_and_caps_a_fractional_cpu_exactly(monkeyp
     await provider.create_sandbox(_request(resources=Resources(vcpu=0.5, memory=8, disk=30)))
 
     assert captured["cpu"] == (0.5, 0.5)
+
+
+@pytest.mark.parametrize(
+    ("vcpu", "gpu", "cpu", "memory"),
+    [(4, 0, (0.125, 4), (512, 8192)), (0.1, 0, (0.1, 0.1), (512, 8192)), (4, 1, (4, 4), 8192)],
+)
+async def test_create_sandbox_burst_sizing(
+    monkeypatch: pytest.MonkeyPatch, vcpu: float, gpu: int, cpu: tuple[float, float], memory: int | tuple[int, int]
+) -> None:
+    captured: dict[str, Any] = {}
+
+    async def create(*args: str, **kwargs: Any) -> FakeInnerSandbox:
+        captured.update(kwargs)
+        return FakeInnerSandbox()
+
+    provider = _provider(monkeypatch, SimpleNamespace(create=_aio(create)))
+    provider._config = ModalProviderConfig(MODAL_TOKEN_ID="id", MODAL_TOKEN_SECRET="secret", burst=True)
+    resources = Resources(vcpu=vcpu, memory=8, disk=30, gpu=gpu, gpu_type="H100" if gpu else None)
+
+    await provider.create_sandbox(_request(resources=resources))
+
+    assert captured["cpu"] == cpu
+    assert captured["memory"] == memory
 
 
 async def test_create_sandbox_asks_modal_for_the_first_acceptable_gpu_type_it_knows_by_its_own_name(
